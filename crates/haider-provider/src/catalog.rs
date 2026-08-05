@@ -195,9 +195,13 @@ impl CatalogSource {
 
 /// Validates a custom profile origin and returns its exact model-list URL.
 ///
-/// This discovery-time backstop runs before a request is built. Plain HTTP
-/// is accepted only for literal loopback addresses or `localhost`; remote
-/// profiles must use HTTPS.
+/// This discovery-time backstop runs before a request is built and obeys the
+/// SAME origin matrix as the custom adapter's
+/// [`crate::CompatibleOriginPolicy::TrustedLan`] fence (G4a — the
+/// `OpenAiCompatible` source exists only for Custom-provenance profiles):
+/// loopback and RFC1918 LAN literals are accepted over http AND https;
+/// link-local `169.254.0.0/16`, multicast, and other special-use literals
+/// are refused entirely; every other remote origin must use HTTPS.
 pub fn openai_compatible_catalog_endpoint(origin: &str) -> Result<String, CatalogError> {
     let origin = origin.trim().trim_end_matches('/');
     let parsed = reqwest::Url::parse(origin).map_err(|_| CatalogError::Unavailable {
@@ -221,14 +225,27 @@ pub fn openai_compatible_catalog_endpoint(origin: &str) -> Result<String, Catalo
         })?
         .trim_start_matches('[')
         .trim_end_matches(']');
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    if parsed.scheme() == "http" && !loopback {
+    let ip = host.parse::<std::net::IpAddr>().ok();
+    if ip.is_some_and(|address| {
+        crate::openai::blocked_credential_target_with_policy(
+            address,
+            crate::CompatibleOriginPolicy::TrustedLan,
+        )
+    }) {
         return Err(CatalogError::Unavailable {
             reason:
-                "custom remote model catalog origins must use HTTPS; HTTP is allowed only for loopback hosts"
+                "custom model catalog origin must not target a link-local, multicast, or special-use IP address"
+                    .to_owned(),
+        });
+    }
+    let plain_http_host = host.eq_ignore_ascii_case("localhost")
+        || ip.is_some_and(|address| {
+            address.is_loopback() || crate::openai::rfc1918_private(address)
+        });
+    if parsed.scheme() == "http" && !plain_http_host {
+        return Err(CatalogError::Unavailable {
+            reason:
+                "custom remote model catalog origins must use HTTPS; HTTP is allowed only for loopback or RFC1918 LAN hosts"
                     .to_owned(),
         });
     }

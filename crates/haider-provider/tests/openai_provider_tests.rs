@@ -285,6 +285,66 @@ fn compatible_origin_policy_rejects_credential_ssrf_and_accepts_safe_origins() {
     }
 }
 
+/// LAW (LK3 — literal half of the origin matrix, G4a): the CUSTOM-provenance
+/// `new_custom` constructor accepts RFC1918 LAN literals over http AND https
+/// (the deliberate, scoped loosening for local OSS servers), while
+/// link-local `169.254.0.0/16` (cloud metadata), multicast, unspecified,
+/// IPv6 ULA/link-local, and PUBLIC plain-HTTP origins stay refused — and the
+/// builtin `new` constructor still refuses every private literal, so the
+/// loosening never leaks into release-owned providers.
+///
+/// MUTATION CHECK (wrongly-blocked): route `new_custom` through the Strict
+/// policy. Expected RUNTIME failure: the allowed LAN rows below error.
+/// MUTATION CHECK (wrongly-allowed): drop the link-local block under
+/// TrustedLan. Expected RUNTIME failure: the 169.254.169.254 rows construct.
+#[test]
+fn lk3_custom_origin_matrix_allows_rfc1918_and_keeps_metadata_and_public_http_blocked() {
+    // ALLOWED under TrustedLan: loopback, all three RFC1918 ranges (http and
+    // https), their IPv4-mapped IPv6 forms, and ordinary public HTTPS.
+    let allowed = [
+        "http://127.0.0.1:11434",
+        "http://192.168.1.8:11434",
+        "https://192.168.1.8:11434",
+        "http://10.0.0.8:8080",
+        "https://10.0.0.8",
+        "http://172.16.0.8:1234",
+        "https://172.31.255.254",
+        "http://[::ffff:192.168.1.8]:11434",
+        "https://api.example.com/openai",
+    ];
+    for base_url in allowed {
+        custom_provider_result("test-model", base_url)
+            .unwrap_or_else(|error| panic!("custom LAN origin `{base_url}` refused: {error}"));
+    }
+
+    // REFUSED under TrustedLan: the loosening is EXACTLY RFC1918.
+    let refused = [
+        "http://169.254.169.254",
+        "https://169.254.169.254",
+        "https://[::ffff:169.254.169.254]",
+        "http://203.0.113.7",
+        "http://224.0.0.1",
+        "https://224.0.0.1",
+        "https://0.0.0.0",
+        "https://[fe80::1]",
+        "https://[fc00::1]",
+    ];
+    for base_url in refused {
+        let error = custom_provider_result("test-model", base_url)
+            .expect_err("origin must stay refused under TrustedLan");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{base_url}");
+        assert!(!error.retryable, "{base_url}");
+    }
+
+    // BUILTIN PINNED: the release-owned constructor still refuses RFC1918
+    // entirely — the LAN policy is custom-provenance-only.
+    for base_url in ["http://192.168.1.8:11434", "https://10.0.0.8"] {
+        let error = compatible_provider_result("test-model", base_url)
+            .expect_err("builtin strict constructor must still refuse private origins");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{base_url}");
+    }
+}
+
 #[test]
 fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
     let directory = fixture_directory();
@@ -444,6 +504,20 @@ fn compatible_provider_result(
         .expect("stores fixture secret");
     let handle = vault.resolve(&alias).expect("resolves fixture secret");
     OpenAiCompatibleProvider::new(handle, model, base_url)
+        .map(|provider| provider.with_account(alias))
+}
+
+fn custom_provider_result(
+    model: &str,
+    base_url: impl AsRef<str>,
+) -> Result<OpenAiCompatibleProvider, ProviderError> {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("custom-lan-fixture");
+    vault
+        .put(&alias, b"fixture-secret")
+        .expect("stores fixture secret");
+    let handle = vault.resolve(&alias).expect("resolves fixture secret");
+    OpenAiCompatibleProvider::new_custom(handle, model, base_url)
         .map(|provider| provider.with_account(alias))
 }
 

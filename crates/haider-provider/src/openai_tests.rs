@@ -305,7 +305,7 @@ async fn plain_http_hostname_requires_every_resolved_address_to_be_loopback() {
 /// non-loopback plain-HTTP rejection.
 #[tokio::test]
 async fn configured_endpoint_probe_rejects_remote_plain_http_with_guard_vocabulary() {
-    let error = validate_openai_compatible_endpoint("http://203.0.113.7")
+    let error = validate_openai_compatible_endpoint("http://203.0.113.7", Default::default())
         .await
         .expect_err("remote plain HTTP must fail before probing");
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
@@ -335,7 +335,7 @@ async fn configured_endpoint_probe_rejects_redirects() {
             .await
             .expect("write redirect");
     });
-    let error = validate_openai_compatible_endpoint(&origin)
+    let error = validate_openai_compatible_endpoint(&origin, Default::default())
         .await
         .expect_err("redirects must not be followed");
     fixture.await.expect("redirect fixture");
@@ -630,7 +630,7 @@ async fn openai_oauth_subscription_is_codex_bearer_lite_and_fixed_origin() {
 /// Verified by revert on 2026-07-29.
 #[tokio::test]
 async fn metadata_origin_guard_prevents_credential_bearing_request() {
-    let endpoint_result = compatible_endpoints("http://169.254.169.254");
+    let endpoint_result = compatible_endpoints("http://169.254.169.254", Default::default());
     if let Err(error) = endpoint_result {
         assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
         return;
@@ -710,6 +710,107 @@ fn compatible_provider_with_resolver(
         .with_account(alias)
 }
 
+fn custom_provider_with_resolver(
+    secret: &[u8],
+    base_url: impl AsRef<str>,
+    resolver: Arc<StubDnsResolver>,
+) -> OpenAiCompatibleProvider {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("custom-lan-audit");
+    vault.put(&alias, secret).expect("store audit secret");
+    let credential = vault.resolve(&alias).expect("resolve audit secret");
+    OpenAiCompatibleProvider::new_with_policy_and_dns_resolver(
+        credential,
+        "audit-model",
+        base_url,
+        CompatibleOriginPolicy::TrustedLan,
+        resolver,
+    )
+    .expect("construct custom compatible provider")
+    .with_account(alias)
+}
+
+/// LAW (LK3 — resolved-address half of the origin matrix): under the
+/// CUSTOM-provenance `TrustedLan` policy a hostname that resolves to an
+/// RFC1918 LAN address is a VALID plain-HTTP origin (a LAN Ollama box),
+/// while resolutions to link-local metadata, IPv6 ULA, or a public address
+/// over plain HTTP stay refused. The builtin strict policy is pinned
+/// unchanged by `hostname_resolution_rejects_every_forbidden_answer_*` and
+/// `plain_http_hostname_requires_every_resolved_address_to_be_loopback`
+/// above (same resolver harness, `new` constructor).
+///
+/// MUTATION CHECK (wrongly-blocked direction): make `TrustedLan` behave like
+/// `Strict` in `blocked_credential_target_with_policy`. Expected RUNTIME
+/// failure: the allowed RFC1918 case below errors.
+/// MUTATION CHECK (wrongly-allowed direction): exempt link-local from the
+/// TrustedLan block (extend `rfc1918_private` with `is_link_local`).
+/// Expected RUNTIME failure: the 169.254.169.254 refusal below passes
+/// validation.
+#[tokio::test]
+async fn lk3_custom_lan_hostname_resolution_matrix_pins_both_directions() {
+    // ALLOWED: plain-HTTP hostname resolving to RFC1918 (all three ranges).
+    for lan in [
+        SocketAddr::from(([192, 168, 1, 20], 11434)),
+        SocketAddr::from(([10, 23, 45, 67], 11434)),
+        SocketAddr::from(([172, 16, 45, 67], 11434)),
+    ] {
+        let resolver = Arc::new(StubDnsResolver::new([vec![lan]]));
+        let provider =
+            custom_provider_with_resolver(b"lan-secret", "http://ollama.lan:11434", resolver);
+        provider
+            .http
+            .validate_compatible_origin()
+            .await
+            .unwrap_or_else(|error| panic!("RFC1918 {lan} must be a valid custom origin: {error}"));
+    }
+
+    // REFUSED: link-local metadata, IPv6 ULA/link-local, and public plain
+    // HTTP — the scoped loosening must not widen past RFC1918.
+    let refused: [(SocketAddr, &str); 4] = [
+        (
+            SocketAddr::from(([169, 254, 169, 254], 11434)),
+            "link-local metadata",
+        ),
+        (
+            SocketAddr::new(
+                "fe80::1".parse::<Ipv6Addr>().expect("link-local").into(),
+                11434,
+            ),
+            "IPv6 link-local",
+        ),
+        (
+            SocketAddr::new("fc00::1".parse::<Ipv6Addr>().expect("ULA").into(), 11434),
+            "IPv6 ULA",
+        ),
+        (
+            SocketAddr::from(([93, 184, 216, 34], 80)),
+            "public plain HTTP",
+        ),
+    ];
+    for (address, case) in refused {
+        let resolver = Arc::new(StubDnsResolver::new([vec![address]]));
+        let provider =
+            custom_provider_with_resolver(b"lan-secret", "http://ollama.lan:11434", resolver);
+        let Err(error) = provider.http.validate_compatible_origin().await else {
+            panic!("{case} resolution must stay refused under TrustedLan");
+        };
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{case}");
+    }
+
+    // A public HTTPS hostname stays valid under TrustedLan (unchanged).
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        443,
+    ))]]));
+    let provider =
+        custom_provider_with_resolver(b"lan-secret", "https://gateway.example.com", resolver);
+    provider
+        .http
+        .validate_compatible_origin()
+        .await
+        .expect("public HTTPS hostname stays valid under TrustedLan");
+}
+
 fn assert_forbidden_origin_request(result: Result<reqwest::Request, ProviderError>, method: &str) {
     match result {
         Err(error) => {
@@ -744,7 +845,7 @@ fn assert_forbidden_origin_request(result: Result<reqwest::Request, ProviderErro
 fn ipv6_literal_compatible_base_url_is_classified_as_a_literal_not_a_hostname() {
     // Loopback IPv6 over plain HTTP (the local-runtime case) is a literal:
     // origin is None (validated inline, no request-time DNS).
-    let loopback = compatible_endpoints("http://[::1]:11434")
+    let loopback = compatible_endpoints("http://[::1]:11434", Default::default())
         .expect("bracketed IPv6 loopback is a valid literal origin");
     assert!(
         loopback.origin.is_none(),
@@ -752,7 +853,7 @@ fn ipv6_literal_compatible_base_url_is_classified_as_a_literal_not_a_hostname() 
     );
 
     // A public IPv6 literal over HTTPS is likewise a literal.
-    let public = compatible_endpoints("https://[2606:4700:4700::1111]:443")
+    let public = compatible_endpoints("https://[2606:4700:4700::1111]:443", Default::default())
         .expect("bracketed public IPv6 literal is valid");
     assert!(
         public.origin.is_none(),
@@ -760,7 +861,7 @@ fn ipv6_literal_compatible_base_url_is_classified_as_a_literal_not_a_hostname() 
     );
 
     // A real hostname (no brackets) still takes the resolve-validate-pin path.
-    let domain = compatible_endpoints("https://gateway.example.com:8443")
+    let domain = compatible_endpoints("https://gateway.example.com:8443", Default::default())
         .expect("hostname base_url is valid");
     assert!(
         domain.origin.is_some(),

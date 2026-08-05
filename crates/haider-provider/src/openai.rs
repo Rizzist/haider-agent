@@ -414,6 +414,24 @@ impl Provider for OpenAiProvider {
     }
 }
 
+/// How strictly an OpenAI-compatible origin is fenced (G4a).
+///
+/// `Strict` is the release-owned default: private, link-local, and
+/// special-use targets are refused entirely and plain HTTP is loopback-only.
+/// `TrustedLan` is the DELIBERATE, SCOPED loosening for CUSTOM-provenance
+/// profiles only: RFC1918 private ranges (10/8, 172.16/12, 192.168/16)
+/// become valid credential targets over http AND https — a LAN Ollama or
+/// LM Studio box — while link-local `169.254.0.0/16` (cloud metadata),
+/// multicast, unspecified/broadcast, IPv6 ULA/link-local, and public
+/// plain-HTTP origins stay refused. Builtin providers never construct with
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompatibleOriginPolicy {
+    #[default]
+    Strict,
+    TrustedLan,
+}
+
 /// One generic OpenAI-compatible adapter parameterized by a credential base
 /// URL. It deliberately uses Chat Completions rather than assuming that a
 /// third-party endpoint implements the newer Responses API.
@@ -468,18 +486,52 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    /// Constructs the CUSTOM-provenance adapter under
+    /// [`CompatibleOriginPolicy::TrustedLan`] (G4a): RFC1918 LAN origins are
+    /// valid over http and https; the rest of the origin fence is unchanged.
+    pub fn new_custom(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_policy_and_dns_resolver(
+            credential,
+            model,
+            base_url,
+            CompatibleOriginPolicy::TrustedLan,
+            Arc::new(SystemCompatibleDnsResolver),
+        )
+    }
+
     fn new_with_dns_resolver(
         credential: SecretHandle,
         model: impl Into<String>,
         base_url: impl AsRef<str>,
         resolver: Arc<dyn CompatibleDnsResolver>,
     ) -> Result<Self, ProviderError> {
-        let endpoints = compatible_endpoints(base_url.as_ref())?;
+        Self::new_with_policy_and_dns_resolver(
+            credential,
+            model,
+            base_url,
+            CompatibleOriginPolicy::Strict,
+            resolver,
+        )
+    }
+
+    fn new_with_policy_and_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+        policy: CompatibleOriginPolicy,
+        resolver: Arc<dyn CompatibleDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        let endpoints = compatible_endpoints(base_url.as_ref(), policy)?;
         let origin_guard = endpoints.origin.map(|origin| {
             Arc::new(CompatibleOriginGuard::new(
                 origin.host,
                 origin.port,
                 origin.plain_http,
+                policy,
                 resolver,
             ))
         });
@@ -518,7 +570,7 @@ impl OpenAiCompatibleProvider {
                 "Kimi OAuth inference base URL is not sanctioned",
             ));
         }
-        let endpoints = compatible_endpoints(base_url)?;
+        let endpoints = compatible_endpoints(base_url, CompatibleOriginPolicy::Strict)?;
         let http = OpenAiHttp::new_fixed_origins(
             credential,
             model,
@@ -2272,7 +2324,10 @@ struct CompatibleHostnameOrigin {
     plain_http: bool,
 }
 
-fn compatible_endpoints(base_url: &str) -> Result<CompatibleEndpoints, ProviderError> {
+fn compatible_endpoints(
+    base_url: &str,
+    policy: CompatibleOriginPolicy,
+) -> Result<CompatibleEndpoints, ProviderError> {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
         return Err(invalid_request(
@@ -2291,7 +2346,7 @@ fn compatible_endpoints(base_url: &str) -> Result<CompatibleEndpoints, ProviderE
             "OpenAI-compatible base_url must be an http(s) URL without credentials, query, or fragment",
         ));
     }
-    validate_compatible_origin(&parsed)?;
+    validate_compatible_origin(&parsed, policy)?;
     let host = parsed
         .host_str()
         .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?;
@@ -2333,8 +2388,11 @@ fn compatible_endpoints(base_url: &str) -> Result<CompatibleEndpoints, ProviderE
 /// This is the provider-registry entry point for W5 management. It reuses the
 /// adapter's URL, SSRF, DNS pinning, timeout, and no-redirect policy so the
 /// daemon cannot grow a second, weaker endpoint validator.
-pub async fn validate_openai_compatible_endpoint(base_url: &str) -> Result<String, ProviderError> {
-    let endpoints = compatible_endpoints(base_url)?;
+pub async fn validate_openai_compatible_endpoint(
+    base_url: &str,
+    policy: CompatibleOriginPolicy,
+) -> Result<String, ProviderError> {
+    let endpoints = compatible_endpoints(base_url, policy)?;
     let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -2345,6 +2403,7 @@ pub async fn validate_openai_compatible_endpoint(base_url: &str) -> Result<Strin
             origin.host,
             origin.port,
             origin.plain_http,
+            policy,
             Arc::new(SystemCompatibleDnsResolver),
         ))
     });
@@ -2374,7 +2433,10 @@ pub async fn validate_openai_compatible_endpoint(base_url: &str) -> Result<Strin
     Ok(endpoints.base_url)
 }
 
-fn validate_compatible_origin(parsed: &reqwest::Url) -> Result<(), ProviderError> {
+fn validate_compatible_origin(
+    parsed: &reqwest::Url,
+    policy: CompatibleOriginPolicy,
+) -> Result<(), ProviderError> {
     let host = parsed
         .host_str()
         .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?;
@@ -2384,17 +2446,35 @@ fn validate_compatible_origin(parsed: &reqwest::Url) -> Result<(), ProviderError
         .unwrap_or(host)
         .parse::<IpAddr>()
         .ok();
-    if ip.is_some_and(blocked_credential_target) {
-        return Err(invalid_request(
-            "OpenAI-compatible base_url must not target a private, link-local, or special-use IP address",
-        ));
+    if ip.is_some_and(|address| blocked_credential_target_with_policy(address, policy)) {
+        return Err(invalid_request(blocked_target_message(policy)));
     }
-    if parsed.scheme() == "http" && ip.is_some_and(|address| !address.is_loopback()) {
-        return Err(invalid_request(
-            "OpenAI-compatible remote base_url must use HTTPS; HTTP is allowed only for loopback addresses",
-        ));
+    if parsed.scheme() == "http" && ip.is_some_and(|address| !plain_http_allowed(address, policy)) {
+        return Err(invalid_request(plain_http_message(policy)));
     }
     Ok(())
+}
+
+fn blocked_target_message(policy: CompatibleOriginPolicy) -> &'static str {
+    match policy {
+        CompatibleOriginPolicy::Strict => {
+            "OpenAI-compatible base_url must not target a private, link-local, or special-use IP address"
+        }
+        CompatibleOriginPolicy::TrustedLan => {
+            "OpenAI-compatible base_url must not target a link-local, multicast, or special-use IP address"
+        }
+    }
+}
+
+fn plain_http_message(policy: CompatibleOriginPolicy) -> &'static str {
+    match policy {
+        CompatibleOriginPolicy::Strict => {
+            "OpenAI-compatible remote base_url must use HTTPS; HTTP is allowed only for loopback addresses"
+        }
+        CompatibleOriginPolicy::TrustedLan => {
+            "OpenAI-compatible remote base_url must use HTTPS; HTTP is allowed only for loopback or RFC1918 LAN addresses"
+        }
+    }
 }
 
 #[async_trait]
@@ -2416,6 +2496,7 @@ struct CompatibleOriginGuard {
     host: String,
     port: u16,
     plain_http: bool,
+    policy: CompatibleOriginPolicy,
     resolver: Arc<dyn CompatibleDnsResolver>,
     validated: OnceCell<Result<Arc<[SocketAddr]>, ProviderError>>,
     #[cfg(test)]
@@ -2442,12 +2523,14 @@ impl CompatibleOriginGuard {
         host: String,
         port: u16,
         plain_http: bool,
+        policy: CompatibleOriginPolicy,
         resolver: Arc<dyn CompatibleDnsResolver>,
     ) -> Self {
         Self {
             host,
             port,
             plain_http,
+            policy,
             resolver,
             validated: OnceCell::new(),
             #[cfg(test)]
@@ -2473,7 +2556,12 @@ impl CompatibleOriginGuard {
                         )
                     },
                 )?;
-                validate_resolved_compatible_origin(&self.host, self.plain_http, addresses)
+                validate_resolved_compatible_origin(
+                    &self.host,
+                    self.plain_http,
+                    self.policy,
+                    addresses,
+                )
             })
             .await
             .clone()
@@ -2526,6 +2614,7 @@ impl reqwest::dns::Resolve for CompatibleOriginGuard {
 fn validate_resolved_compatible_origin(
     host: &str,
     plain_http: bool,
+    policy: CompatibleOriginPolicy,
     addresses: Vec<SocketAddr>,
 ) -> Result<Arc<[SocketAddr]>, ProviderError> {
     if addresses.is_empty() {
@@ -2536,12 +2625,13 @@ fn validate_resolved_compatible_origin(
 
     let mut pinned = Vec::with_capacity(addresses.len());
     for address in addresses {
-        if blocked_credential_target(address.ip()) {
+        if blocked_credential_target_with_policy(address.ip(), policy) {
             return Err(invalid_request(format!(
-                "OpenAI-compatible base_url host `{host}` resolved to a private, link-local, or special-use IP address"
+                "OpenAI-compatible base_url host `{host}` resolved to a forbidden IP address ({})",
+                blocked_target_message(policy)
             )));
         }
-        if plain_http && !address.ip().is_loopback() {
+        if plain_http && !plain_http_allowed(address.ip(), policy) {
             return Err(invalid_request(format!(
                 "OpenAI-compatible remote base_url must use HTTPS; HTTP host `{host}` resolved to a non-loopback address"
             )));
@@ -2558,6 +2648,37 @@ pub(crate) fn blocked_credential_target(address: IpAddr) -> bool {
         IpAddr::V4(address) => blocked_ipv4_credential_target(address),
         IpAddr::V6(address) => blocked_ipv6_credential_target(address),
     }
+}
+
+/// Policy-aware fence: `TrustedLan` exempts exactly the RFC1918 ranges from
+/// the strict block list; everything else the strict fence refuses (link-
+/// local, multicast, unspecified, broadcast, ULA, 0/8) stays refused.
+pub(crate) fn blocked_credential_target_with_policy(
+    address: IpAddr,
+    policy: CompatibleOriginPolicy,
+) -> bool {
+    match policy {
+        CompatibleOriginPolicy::Strict => blocked_credential_target(address),
+        CompatibleOriginPolicy::TrustedLan => {
+            blocked_credential_target(address) && !rfc1918_private(address)
+        }
+    }
+}
+
+/// Exactly the RFC1918 ranges (10/8, 172.16/12, 192.168/16), including their
+/// IPv4-mapped IPv6 forms. Link-local `169.254.0.0/16` is NOT private here.
+pub(crate) fn rfc1918_private(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_private(),
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .is_some_and(|mapped| mapped.is_private()),
+    }
+}
+
+fn plain_http_allowed(address: IpAddr, policy: CompatibleOriginPolicy) -> bool {
+    address.is_loopback()
+        || (policy == CompatibleOriginPolicy::TrustedLan && rfc1918_private(address))
 }
 
 fn blocked_ipv4_credential_target(address: Ipv4Addr) -> bool {

@@ -34,11 +34,19 @@ pub struct ProductionProviderEndpointValidator;
 #[async_trait::async_trait]
 impl ProviderEndpointValidator for ProductionProviderEndpointValidator {
     async fn validate(&self, origin: &str) -> Result<String, HaiderError> {
-        haider_provider::validate_openai_compatible_endpoint(origin)
-            .await
-            .map_err(|error| {
-                HaiderError::new(ErrorCode::InvalidArgument, error.message, error.retryable)
-            })
+        // This validator runs ONLY for brand-new `provider.configure`
+        // profiles — always Custom provenance — so it validates under the
+        // scoped TrustedLan matrix (G4a): RFC1918 LAN origins are legal for
+        // custom local endpoints; link-local/metadata and public plain HTTP
+        // stay refused. Builtin providers never route through here.
+        haider_provider::validate_openai_compatible_endpoint(
+            origin,
+            haider_provider::CompatibleOriginPolicy::TrustedLan,
+        )
+        .await
+        .map_err(|error| {
+            HaiderError::new(ErrorCode::InvalidArgument, error.message, error.retryable)
+        })
     }
 }
 

@@ -328,6 +328,56 @@ fn custom_catalog_origin_policy_rejects_remote_http_before_fetch() {
     );
 }
 
+/// LAW (LK3 — catalog fetch obeys the same custom-LAN origin matrix, G4a):
+/// the discovery-time backstop for the Custom-provenance `OpenAiCompatible`
+/// source accepts RFC1918 LAN literals over http AND https, refuses
+/// link-local `169.254.0.0/16` (cloud metadata) on EITHER scheme, and keeps
+/// public plain HTTP refused.
+///
+/// MUTATION CHECK (wrongly-blocked): drop the RFC1918 arm from the
+/// backstop's plain-HTTP allowance. Expected RUNTIME failure: the LAN rows
+/// below become Unavailable.
+/// MUTATION CHECK (wrongly-allowed): drop the link-local block. Expected
+/// RUNTIME failure: the 169.254.169.254 rows return a fetchable URL.
+#[test]
+fn lk3_catalog_backstop_obeys_the_custom_lan_matrix() {
+    for (origin, endpoint) in [
+        (
+            "http://192.168.1.8:11434/v1",
+            "http://192.168.1.8:11434/v1/models",
+        ),
+        (
+            "https://192.168.1.8:11434/v1",
+            "https://192.168.1.8:11434/v1/models",
+        ),
+        ("http://10.0.0.8:8080/v1", "http://10.0.0.8:8080/v1/models"),
+        (
+            "http://172.16.0.8:1234/v1",
+            "http://172.16.0.8:1234/v1/models",
+        ),
+    ] {
+        assert_eq!(
+            openai_compatible_catalog_endpoint(origin).expect("RFC1918 LAN catalog origin"),
+            endpoint
+        );
+    }
+    for origin in [
+        "http://169.254.169.254/v1",
+        "https://169.254.169.254/v1",
+        "http://203.0.113.7/v1",
+        "https://224.0.0.1/v1",
+        "https://[fe80::1]/v1",
+    ] {
+        assert!(
+            matches!(
+                openai_compatible_catalog_endpoint(origin),
+                Err(CatalogError::Unavailable { .. })
+            ),
+            "{origin} must stay refused by the catalog backstop"
+        );
+    }
+}
+
 /// The endpoints are exactly the vendors' own — asserted so a refactor
 /// cannot quietly point discovery somewhere else.
 #[test]
