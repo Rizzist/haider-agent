@@ -2237,6 +2237,7 @@ async fn refill_queued_turns(
             worker_generation: store.worker_generation(),
             branch_id,
             disposition: haider_core::TurnAdmissionDisposition::Queued,
+            first_user_turn: false,
         }));
     }
     more

@@ -782,6 +782,7 @@ impl DelegationHandle {
                 accepted_seq: message.seq,
                 worker_generation: self.hub.worker_generation(),
                 branch_id: None,
+                first_user_turn: false,
                 disposition: match message.delivery {
                     AgentMessageDelivery::DeliveredSteer => {
                         haider_core::TurnAdmissionDisposition::SteerPending

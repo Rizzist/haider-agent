@@ -1199,9 +1199,26 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
             } => accepted = Some((run_id, accepted_seq)),
             WireFrame::Event { envelope, .. } => {
                 let seq = envelope.seq;
-                let payload =
-                    serde_json::from_value::<EventPayload>(envelope.payload).expect("typed event");
-                let terminal = payload == EventPayload::RunState(RunState::Done);
+                // G2: the first accept interleaves ONE additive
+                // session-config fact (the auto-title `session_renamed`),
+                // which is NOT core-EventPayload vocabulary by design.
+                // Everything else must still decode strictly typed.
+                let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                {
+                    Ok(payload) => Some(payload),
+                    Err(_) => {
+                        assert!(
+                                haider_protocol::session::SessionConfigEventPayload::session_renamed_from_value(
+                                    &envelope.payload
+                                )
+                                .is_some(),
+                                "only the additive session-config fact may be non-core: {:?}",
+                                envelope.payload
+                            );
+                        None
+                    }
+                };
+                let terminal = payload == Some(EventPayload::RunState(RunState::Done));
                 events.push((seq, payload));
                 if terminal {
                     break;
@@ -1234,7 +1251,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
     }
     let payloads = events
         .iter()
-        .map(|(_, payload)| payload)
+        .filter_map(|(_, payload)| payload.as_ref())
         .collect::<Vec<_>>();
     // Position, not just presence: the acceptance transaction commits Queued
     // then UserMessage, and only then may the worker commit Thinking and

@@ -815,6 +815,107 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
     store.close().await.expect("store close");
 }
 
+/// LAW (LB4, the G2 extension of the F3 tolerance law above): a delta made
+/// only of `session_renamed` config facts between the compaction's planned
+/// head and the actor's head does NOT reject the batch — a rename
+/// mid-compaction moves the journal, not the conversation tree, so the
+/// planned parent is still valid and the compaction commits instead of
+/// wedging.
+///
+/// MUTATION CHECK: narrow the `session_config_only_delta` classifier to
+/// `model_selected` only (decode `ModelSelected` instead of the whole
+/// `SessionConfigEventPayload` union). Expected runtime failure: this
+/// append is refused Busy. The reject pin above still kills the inverse
+/// (accept-everything) mutation.
+#[tokio::test]
+async fn worker_head_cas_tolerates_a_rename_fact_delta() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("compaction-head-cas-rename");
+    let run_id = RunId::new("compaction-head-cas-rename-run");
+    let generation = store.worker_generation();
+    let mut queued = [run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "rename-cas-queued",
+        RunState::Queued,
+    )];
+    hub.append(&mut queued).await.expect("queued prefix");
+    let expected_head = store.latest_seq(&session_id).await.expect("head");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("lease");
+    let actor = hub
+        .existing_actor(&session_id)
+        .expect("actor lookup")
+        .expect("actor exists");
+
+    // The interleaved journal movement is a pure rename fact: no run, no
+    // conversation-tree movement.
+    let mut fact = run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "rename-cas-session-renamed",
+        RunState::Queued,
+    );
+    fact.run_id = None;
+    fact.payload = haider_protocol::session::SessionConfigEventPayload::session_renamed_value(
+        Some("parser rewrite".into()),
+    )
+    .expect("fact serializes");
+    let (advance_completed, advance_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::Append {
+            envelopes: vec![fact],
+            completed: advance_completed,
+        })
+        .await
+        .expect("advance queues");
+    let (cas_completed, cas_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::WorkerAppend {
+            lease_id: lease.lease_id.clone(),
+            expected_head: Some(expected_head),
+            envelopes: vec![run_state_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "rename-cas-batch",
+                RunState::Streaming,
+            )],
+            completed: cas_completed,
+        })
+        .await
+        .expect("CAS queues behind advance");
+
+    advance_response
+        .await
+        .expect("advance response")
+        .expect("advance commits");
+    cas_response
+        .await
+        .expect("CAS response")
+        .expect("a rename-fact-only delta must not reject the batch");
+    let history = store.read(&session_id, 0, 16).await.expect("history");
+    assert!(
+        history
+            .iter()
+            .any(|event| event.event_id == EventId::new("rename-cas-batch")),
+        "the tolerated batch is durably committed"
+    );
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// Exact D2g handoff schedule: acceptance is durably committed, the external
 /// manager gate closes and Shutdown is enqueued before the post-commit hint
 /// can hand off. The hint receives typed Busy, while the drain sweep still
@@ -1830,6 +1931,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
         worker_generation: generation,
         branch_id: None,
         disposition: haider_store::TurnAdmissionDisposition::Queued,
+        first_user_turn: false,
     };
     let manager = crate::worker::WorkerManager::start(
         hub.clone(),

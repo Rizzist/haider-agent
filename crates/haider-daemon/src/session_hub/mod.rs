@@ -100,7 +100,8 @@ use async_trait::async_trait;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn,
     CreatedBranch, CreatedSession, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionSelectModelCommand,
+    RenamedSession, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
+    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
     StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus,
@@ -746,6 +747,10 @@ enum ActorCommand {
     SelectModel {
         command: SessionSelectModelCommand,
         completed: oneshot::Sender<Result<SessionSelectModelOutcome, HaiderError>>,
+    },
+    Rename {
+        command: SessionRenameCommand,
+        completed: oneshot::Sender<Result<SessionRenameOutcome, HaiderError>>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -1422,6 +1427,45 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::SelectModel { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_rename_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<RenamedSession>, SessionHubError> {
+        self.inner
+            .store
+            .session_rename_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// G2: a committed rename goes THROUGH the actor arm for the same
+    /// reason `select_session_model` does — the actor's in-memory head must
+    /// advance with the published `session_renamed` fact or the compaction
+    /// head CAS desyncs. `pub(crate)` because the daemon's internal
+    /// auto-title (first accept) issues the same command.
+    pub(crate) async fn rename_session(
+        &self,
+        command: SessionRenameCommand,
+    ) -> Result<SessionRenameOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::Rename { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result
