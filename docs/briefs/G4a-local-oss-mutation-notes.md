@@ -109,3 +109,25 @@ auth-None customs in `catalog_source` (LK2), blanking the credential in
 `authorization_header` (LK1 golden), dropping the keyless branch from
 `custom_add_committed` (LK10), and dropping the `keyless_local` row-hint
 branch in `render_providers` (LK10).
+
+## Review of record (coordinator, executed post-lane)
+
+Read the branch diff (origin policy, guard, keyless arm, decoder, presets).
+Verdicts:
+
+1. LAN loosening is REBINDING-SAFE by construction: CompatibleOriginGuard
+   resolves once, validates the RESOLVED addresses against the policy
+   (validate_resolved_compatible_origin), caches via OnceCell, and the
+   pinned reqwest resolver refuses unexpected hosts — connect-time targets
+   are exactly the validated set. LK3's hostname-resolution matrix pins
+   both directions; wrongly-allowed AND wrongly-blocked mutations both
+   executed and killed.
+2. M3 equivalent-mutant claim VERIFIED in source: SSE comment lines are
+   discarded by the `starts_with(':')` early return AND independently by
+   the empty-field `_ => {}` dispatch arm. Genuine equivalence, honestly
+   documented; LK5 observes the behavior either way.
+3. Keyless scoping observed (lk1_keyless_fallback_stays_scoped...), and
+   the lane's re-guard of the generic arm specifically to make the new arm
+   mutation-observable is the right instinct.
+
+No unobserved gate found. Campaign ACCEPTED.
