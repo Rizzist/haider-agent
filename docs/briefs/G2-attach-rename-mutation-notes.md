@@ -109,3 +109,26 @@ the pre-check→commit race). Both halves were executed:
 - Reverted; re-run: `ok. 1 passed`.
 
 Tree verified clean (`git status`) after the final revert.
+
+## Review of record (coordinator, executed post-lane)
+
+Read the branch diff (protocol File variant, daemon validation arm, worker
+inlining, rename txn, auto-title, TUI hydration + chips, wire re-anchors).
+Four structurally-suspect gates probed by inspection; ALL OBSERVED:
+
+1. Aggregate 16MiB cap membership for File blocks — safe BY CONSTRUCTION:
+   the File arm falls through to the shared per-file + aggregate tail in
+   validate_turn_attachments (single accounting path shared with images).
+2. Basename privacy — daemon re-gate refuses `/`, `\`, control chars,
+   >120, empty (rpc.rs File arm); client sanitizer pinned by LA2; the TUI
+   submit law pins the EXACT wire block (name equality + tagged JSON).
+3. Compaction parity — LA1 stages a real compaction and asserts the
+   summary request inlines the same `<file>` text with zero attachment
+   blocks.
+4. Wire tail re-anchors — diff-verified append-only (T1 slice shifted by
+   exactly the 3 new frames; new g2_start accounting).
+
+No unobserved gate found; no additional review mutation warranted (every
+candidate seam is literally asserted). Lane's 7 executed kills spot-checked
+against the notes, including the honestly-recorded M5 store-guard-alone
+survivor. Campaign ACCEPTED.
