@@ -101,6 +101,227 @@ fn manifest_replays_every_declared_openai_fixture_with_provenance() {
     }
 }
 
+/// LAW (LK4 — missing `[DONE]` sentinel): a compatible Chat stream that ends
+/// on EOF after delivering `finish_reason` completes cleanly — generic OSS
+/// servers (research §generic) may never send the OpenAI `[DONE]` line.
+///
+/// MUTATION CHECK: require the sentinel (error from `finish` when a
+/// finish_reason is already stored). Expected RUNTIME failure: the clean
+/// Finish below becomes a MalformedFrame error.
+#[test]
+fn lk4_chat_stream_missing_done_sentinel_completes_on_eof() {
+    let wire = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    );
+    assert_eq!(
+        replay_openai_chat_sse(wire.as_bytes()),
+        vec![
+            Ok(StreamEvent::TextDelta { text: "hi".into() }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ]
+    );
+
+    // A stream truncated BEFORE any finish_reason is still an error — the
+    // tolerance is for the absent sentinel, not for a torn turn.
+    let torn = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+    let items = replay_openai_chat_sse(torn.as_bytes());
+    assert!(
+        matches!(items.last(), Some(Err(error)) if error.kind == ProviderErrorKind::MalformedFrame),
+        "EOF before finish_reason stays a malformed stream"
+    );
+}
+
+/// LAW (LK5 — SSE comment/ping lines): `: ...` comment lines (llama.cpp
+/// keep-alives) are protocol chrome, not data — the decoder skips them
+/// without disturbing the event stream.
+///
+/// MUTATION CHECK: treat comment lines as data (drop the `:` skip in
+/// `SseFramer::accept_line`). Expected RUNTIME failure: the ping below is
+/// parsed as JSON and the clean sequence becomes an error.
+#[test]
+fn lk5_chat_stream_ignores_sse_comment_ping_lines() {
+    let wire = concat!(
+        ": ping - 2026-08-05 12:00:00\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n\n",
+        ": keep-alive\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    assert_eq!(
+        replay_openai_chat_sse(wire.as_bytes()),
+        vec![
+            Ok(StreamEvent::TextDelta { text: "a".into() }),
+            Ok(StreamEvent::TextDelta { text: "b".into() }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ]
+    );
+}
+
+/// LAW (LK6 — absent stream usage): a compatible stream that never carries a
+/// `usage` object (servers that reject or ignore `stream_options`) completes
+/// with NO UsageUpdate and no error — missing usage is normal, never fatal.
+/// The request keeps sending `stream_options.include_usage` (pinned by
+/// `compatible_payload_uses_chat_completions_lingua_franca`).
+///
+/// MUTATION CHECK: require usage before Finish in the Chat decoder. Expected
+/// RUNTIME failure: the clean sequence below gains an error item.
+#[test]
+fn lk6_chat_stream_without_usage_still_completes() {
+    let wire = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let items = replay_openai_chat_sse(wire.as_bytes());
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, Ok(StreamEvent::UsageUpdate(_)) | Err(_))),
+        "no usage and no error: {items:?}"
+    );
+    assert_eq!(
+        items.last(),
+        Some(&Ok(StreamEvent::Finish {
+            reason: FinishReason::EndTurn,
+        }))
+    );
+}
+
+/// LAW (LK7 — absent tool-call ids): vLLM/llama.cpp may stream tool-call
+/// deltas without ids. The decoder mints a STABLE per-index id
+/// (`tool-call-{index}`), keeps later deltas on the same index correlated to
+/// it, and distinct indexes get distinct ids.
+///
+/// MUTATION CHECK: restore the "started without an id" rejection. Expected
+/// RUNTIME failure: the whole sequence below becomes one error item.
+#[test]
+fn lk7_chat_tool_calls_without_ids_synthesize_stable_per_index_ids() {
+    let wire = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Tehran\\\"}\"}},{\"index\":1,\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    assert_eq!(
+        replay_openai_chat_sse(wire.as_bytes()),
+        vec![
+            Ok(StreamEvent::ToolCallStart {
+                call_id: "tool-call-0".into(),
+                name: "get_weather".into(),
+            }),
+            Ok(StreamEvent::ToolCallArgsDelta {
+                call_id: "tool-call-0".into(),
+                args_fragment: "{\"city\":".into(),
+            }),
+            Ok(StreamEvent::ToolCallArgsDelta {
+                call_id: "tool-call-0".into(),
+                args_fragment: "\"Tehran\"}".into(),
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                call_id: "tool-call-1".into(),
+                name: "get_time".into(),
+            }),
+            Ok(StreamEvent::ToolCallArgsDelta {
+                call_id: "tool-call-1".into(),
+                args_fragment: "{}".into(),
+            }),
+            Ok(StreamEvent::ToolCallEnd {
+                call_id: "tool-call-0".into(),
+            }),
+            Ok(StreamEvent::ToolCallEnd {
+                call_id: "tool-call-1".into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::ToolUse,
+            }),
+        ]
+    );
+}
+
+/// LAW (LK8 — finish_reason "stop" with tool calls present): a server that
+/// streams tool-call deltas but closes with `"stop"` still gets its calls
+/// COMPLETED — ToolCallEnd for every open call and Finish{ToolUse}, never a
+/// silently dropped invocation. Non-tool closes (max tokens) keep dropping
+/// partials (pinned by `chat_max_tokens_drops_partial_tool_call_*`).
+///
+/// MUTATION CHECK: remove the EndTurn→ToolUse upgrade in `finish_events`.
+/// Expected RUNTIME failure: the sequence below loses its tool events and
+/// finishes EndTurn.
+#[test]
+fn lk8_chat_finish_stop_with_tool_calls_still_completes_the_calls() {
+    let wire = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_native\",\"function\":{\"name\":\"list_files\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    assert_eq!(
+        replay_openai_chat_sse(wire.as_bytes()),
+        vec![
+            Ok(StreamEvent::ToolCallStart {
+                call_id: "call_native".into(),
+                name: "list_files".into(),
+            }),
+            Ok(StreamEvent::ToolCallArgsDelta {
+                call_id: "call_native".into(),
+                args_fragment: "{}".into(),
+            }),
+            Ok(StreamEvent::ToolCallEnd {
+                call_id: "call_native".into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::ToolUse,
+            }),
+        ]
+    );
+
+    // The EOF path (no [DONE]) upgrades identically.
+    let eof_wire = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_native\",\"function\":{\"name\":\"list_files\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    );
+    assert_eq!(
+        replay_openai_chat_sse(eof_wire.as_bytes()).last(),
+        Some(&Ok(StreamEvent::Finish {
+            reason: FinishReason::ToolUse,
+        }))
+    );
+}
+
+/// LAW (LK9 — unknown extra fields are ignored): OSS servers decorate chunks
+/// with fields the OpenAI schema never named (`timings`, `system_fingerprint`,
+/// vendor objects at every level). Deserialization is field-tolerant: the
+/// known events decode and the junk is invisible.
+///
+/// MUTATION CHECK: reject unknown chunk fields in the Chat decoder dispatch.
+/// Expected RUNTIME failure: the decorated stream below errors instead of
+/// producing the clean three-event sequence.
+#[test]
+fn lk9_chat_unknown_extra_fields_are_ignored() {
+    let wire = concat!(
+        "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"system_fingerprint\":\"b1\",\"timings\":{\"prompt_ms\":12.5},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\",\"vendor_extension\":{\"nested\":true}},\"logprobs\":null,\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}],\"extra_top_level\":[1,2,3]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"timings\":{\"predicted_ms\":99.0}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    assert_eq!(
+        replay_openai_chat_sse(wire.as_bytes()),
+        vec![
+            Ok(StreamEvent::TextDelta { text: "ok".into() }),
+            Ok(StreamEvent::ReasoningDelta {
+                text: "thinking".into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ]
+    );
+}
+
 #[test]
 fn responses_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
     let wire = br#"event: response.output_item.added

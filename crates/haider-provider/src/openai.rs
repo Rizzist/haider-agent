@@ -1355,6 +1355,11 @@ struct ChatFunctionCall {
     call_id: String,
     name: String,
     ended: bool,
+    /// True when the SERVER omitted the tool-call id and the decoder minted
+    /// the stable per-index one (G4a LK7 — vLLM/llama.cpp omit ids). Later
+    /// id fields on the same index are then informational, never a
+    /// consistency violation.
+    synthesized_id: bool,
 }
 
 impl ChatDecoder {
@@ -1516,24 +1521,28 @@ impl ChatDecoder {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         if let std::collections::btree_map::Entry::Vacant(entry) = self.open_calls.entry(index) {
-            let call_id = id.ok_or_else(|| {
-                malformed(format!(
-                    "OpenAI-compatible tool index {index} started without an id"
-                ))
-            })?;
+            // G4a LK7 tolerance: some OSS servers (vLLM, llama.cpp) stream
+            // tool-call deltas WITHOUT ids. The id only has to be stable and
+            // unique within this turn, so mint one from the index instead of
+            // failing the stream.
+            let (call_id, synthesized_id) = match id {
+                Some(id) => (id.to_owned(), false),
+                None => (format!("tool-call-{index}"), true),
+            };
             let name = name.ok_or_else(|| {
                 malformed(format!(
                     "OpenAI-compatible tool index {index} started without a name"
                 ))
             })?;
+            self.pending_tool_events.push(StreamEvent::ToolCallStart {
+                call_id: call_id.clone(),
+                name: name.into(),
+            });
             entry.insert(ChatFunctionCall {
-                call_id: call_id.into(),
+                call_id,
                 name: name.into(),
                 ended: false,
-            });
-            self.pending_tool_events.push(StreamEvent::ToolCallStart {
-                call_id: call_id.into(),
-                name: name.into(),
+                synthesized_id,
             });
         }
         let call = self.open_calls.get(&index).ok_or_else(|| {
@@ -1541,7 +1550,7 @@ impl ChatDecoder {
                 "OpenAI-compatible tool index {index} disappeared after start"
             ))
         })?;
-        if id.is_some_and(|id| id != call.call_id) {
+        if !call.synthesized_id && id.is_some_and(|id| id != call.call_id) {
             return Err(malformed(format!(
                 "OpenAI-compatible tool index {index} changed call id"
             )));
@@ -1580,6 +1589,16 @@ impl ChatDecoder {
     }
 
     fn finish_events(&mut self, reason: FinishReason) -> Vec<StreamEvent> {
+        // G4a LK8 tolerance: some OSS servers emit tool-call deltas yet
+        // close with finish_reason "stop" instead of "tool_calls". The calls
+        // are real — complete them and finish as tool use rather than
+        // silently discarding a tool invocation the model asked for. Every
+        // other non-tool reason (max tokens, refusal) still drops partials.
+        let reason = if reason == FinishReason::EndTurn && !self.open_calls.is_empty() {
+            FinishReason::ToolUse
+        } else {
+            reason
+        };
         let mut events = if reason == FinishReason::ToolUse {
             self.close_calls()
         } else {
