@@ -38,10 +38,11 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 pub use anthropic::{
-    ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
-    ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_OAUTH_SYSTEM_IDENTITY,
-    ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider, AnthropicRetryPolicy,
-    AnthropicTransportConfig, replay_anthropic_http_error, replay_anthropic_sse,
+    ANTHROPIC_API_URL, ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL,
+    ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME,
+    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider,
+    AnthropicRetryPolicy, AnthropicTransportConfig, replay_anthropic_http_error,
+    replay_anthropic_sse,
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,

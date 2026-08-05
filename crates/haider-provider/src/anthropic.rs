@@ -27,6 +27,10 @@ pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_OAUTH_BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_OAUTH_BETA_HEADER: &str = "anthropic-beta";
 pub const ANTHROPIC_OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
+/// Beta token the fast-mode research preview requires on `anthropic-beta`
+/// whenever the body carries `speed: "fast"` (G3). On OAuth requests it is
+/// comma-joined AFTER the subscription beta.
+pub const ANTHROPIC_FAST_BETA_VALUE: &str = "fast-mode-2026-02-01";
 const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
@@ -66,6 +70,15 @@ pub struct AnthropicProvider {
     api_url: String,
     auth_mode: AnthropicAuthMode,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+    /// Session-selected effort (G3), injected VERBATIM as
+    /// `output_config.effort`. Validation against the pair's ladder happened
+    /// at selection time; a post-switch mismatch surfaces the provider's own
+    /// error rather than being silently rewritten.
+    effort: Option<String>,
+    /// Session-selected fast mode (G3): body `speed: "fast"` plus the
+    /// `fast-mode-2026-02-01` beta header. The caller gates this on the
+    /// static model table — the adapter applies it verbatim.
+    fast: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +169,8 @@ impl AnthropicProvider {
             api_url: ANTHROPIC_API_URL.into(),
             auth_mode,
             fixed_origin_guard,
+            effort: None,
+            fast: false,
         })
     }
 
@@ -169,6 +184,22 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_account(mut self, account: CredentialAlias) -> Self {
         self.account = Some(account);
+        self
+    }
+
+    /// Sets the session-selected effort injected as `output_config.effort`.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// Enables fast mode: `speed: "fast"` in the body plus
+    /// [`ANTHROPIC_FAST_BETA_VALUE`] on the `anthropic-beta` header
+    /// (comma-joined with the OAuth beta on subscription requests).
+    #[must_use]
+    pub fn with_fast(mut self, fast: bool) -> Self {
+        self.fast = fast;
         self
     }
 
@@ -224,7 +255,7 @@ impl AnthropicProvider {
             AnthropicAuthMode::ApiKey => AnthropicSystemShape::ApiKey,
             AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
         };
-        request_json(request, system_shape)
+        request_json(request, system_shape, self.effort.as_deref(), self.fast)
     }
 
     /// Records one raw response for the ignored promotion harness.
@@ -305,10 +336,27 @@ impl AnthropicProvider {
             .header(ACCEPT, "text/event-stream")
             .header("anthropic-version", ANTHROPIC_VERSION);
         request = match self.auth_mode {
-            AnthropicAuthMode::ApiKey => request.header("x-api-key", self.api_key_header()?),
-            AnthropicAuthMode::OAuthBearer => request
-                .header(AUTHORIZATION, self.authorization_header()?)
-                .header(ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE),
+            AnthropicAuthMode::ApiKey => {
+                let request = request.header("x-api-key", self.api_key_header()?);
+                if self.fast {
+                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_FAST_BETA_VALUE)
+                } else {
+                    request
+                }
+            }
+            AnthropicAuthMode::OAuthBearer => {
+                // Fast mode APPENDS its beta to the OAuth beta in ONE
+                // comma-joined header value — the server reads the header as
+                // a token list and the subscription beta must survive.
+                let beta = if self.fast {
+                    format!("{ANTHROPIC_OAUTH_BETA_VALUE},{ANTHROPIC_FAST_BETA_VALUE}")
+                } else {
+                    ANTHROPIC_OAUTH_BETA_VALUE.to_owned()
+                };
+                request
+                    .header(AUTHORIZATION, self.authorization_header()?)
+                    .header(ANTHROPIC_OAUTH_BETA_HEADER, beta)
+            }
         };
         request.json(payload).build().map_err(transport_error)
     }

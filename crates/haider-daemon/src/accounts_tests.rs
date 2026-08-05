@@ -1150,6 +1150,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         vault.resolve(&wrong_alias).expect("resolve crosswire key"),
         "gpt-oauth",
         &wrong_alias,
+        &crate::accounts::ProviderTuning::default(),
     );
     let Err(error) = result else {
         panic!("OAuth provider ID must reject API-key mode");
@@ -6704,4 +6705,43 @@ async fn unsupported_candidate_is_honest_not_guessed() {
 
     actor.shutdown().await;
     store.close().await.expect("close");
+}
+
+/// LAW (LE4, construction-gate half): the per-turn tuning derived from
+/// session metadata carries effort/fast verbatim, and the CONSTRUCTION fast
+/// gate filters a stale flag on any pair outside the static table — a model
+/// switch after `/fast on` must yield standard requests, never the
+/// documented 4.7 hard error or 4.6 silent-standard billing.
+#[test]
+fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
+    use crate::accounts::{ProviderTuning, anthropic_fast_for};
+
+    let metadata = haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp".into(),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5".into(),
+        max_tokens: 4096,
+        system_prompt_version: None,
+        permission_overrides: None,
+        effort: Some("xhigh".into()),
+        fast: true,
+        created_at_ms: 1,
+    };
+    let tuning = ProviderTuning::from_metadata(&metadata);
+    assert_eq!(tuning.effort.as_deref(), Some("xhigh"));
+    assert!(tuning.fast);
+
+    assert!(anthropic_fast_for(&tuning, "claude-opus-5"));
+    assert!(anthropic_fast_for(&tuning, "claude-opus-4-8"));
+    for stale in ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"] {
+        assert!(
+            !anthropic_fast_for(&tuning, stale),
+            "a stale fast flag on {stale} must not reach the wire"
+        );
+    }
+    let off = ProviderTuning {
+        effort: None,
+        fast: false,
+    };
+    assert!(!anthropic_fast_for(&off, "claude-opus-5"));
 }

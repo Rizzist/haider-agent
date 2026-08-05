@@ -306,6 +306,10 @@ impl OpenAiHttp {
 pub struct OpenAiProvider {
     http: OpenAiHttp,
     api_url: String,
+    /// Session-selected reasoning effort (G3), MERGED into the existing
+    /// `reasoning` object for reasoning models — never replacing
+    /// `summary`/`context`, never adding `max_output_tokens` on lite.
+    effort: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -313,6 +317,7 @@ impl OpenAiProvider {
         Ok(Self {
             http: OpenAiHttp::new(credential, model)?,
             api_url: OPENAI_RESPONSES_API_URL.into(),
+            effort: None,
         })
     }
 
@@ -348,6 +353,7 @@ impl OpenAiProvider {
                 resolver,
             )?,
             api_url: OPENAI_SUBSCRIPTION_RESPONSES_URL.into(),
+            effort: None,
         })
     }
 
@@ -359,6 +365,13 @@ impl OpenAiProvider {
     #[must_use]
     pub fn with_account(mut self, account: CredentialAlias) -> Self {
         self.http.account = Some(account);
+        self
+    }
+
+    /// Sets the session-selected reasoning effort merged into `reasoning`.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
         self
     }
 
@@ -374,7 +387,11 @@ impl OpenAiProvider {
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.http.validate_model(request)?;
-        responses_request_json(request, self.http.codex_responses_lite)
+        responses_request_json(
+            request,
+            self.http.codex_responses_lite,
+            self.effort.as_deref(),
+        )
     }
 
     pub async fn capture_response(
@@ -425,6 +442,11 @@ pub struct OpenAiCompatibleProvider {
     models_url: String,
     dialect: CompatibleDialect,
     kimi_thinking: Option<KimiThinkingConfig>,
+    /// Kimi k3-style top-level `reasoning_effort` (G3): always-thinking
+    /// models whose catalog declares an effort ladder but NO thinking-type
+    /// toggle take the documented top-level knob instead of
+    /// `thinking.effort`.
+    kimi_reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,6 +512,7 @@ impl OpenAiCompatibleProvider {
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::Generic,
             kimi_thinking: None,
+            kimi_reasoning_effort: None,
         })
     }
 
@@ -534,6 +557,7 @@ impl OpenAiCompatibleProvider {
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::KimiOAuth,
             kimi_thinking: None,
+            kimi_reasoning_effort: None,
         })
     }
 
@@ -549,6 +573,22 @@ impl OpenAiCompatibleProvider {
             ));
         }
         self.kimi_thinking = Some(thinking);
+        Ok(self)
+    }
+
+    /// Sets the k3-style top-level `reasoning_effort` (G3). Kimi-only, like
+    /// [`Self::with_kimi_thinking`]; the caller injects only what the
+    /// catalog declared for the model.
+    pub fn with_kimi_reasoning_effort(
+        mut self,
+        effort: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        if self.dialect != CompatibleDialect::KimiOAuth {
+            return Err(invalid_request(
+                "Kimi reasoning_effort requires the Kimi OAuth adapter",
+            ));
+        }
+        self.kimi_reasoning_effort = Some(effort.into());
         Ok(self)
     }
 
@@ -578,7 +618,12 @@ impl OpenAiCompatibleProvider {
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.http.validate_model(request)?;
-        chat_request_json(request, self.dialect, self.kimi_thinking.as_ref())
+        chat_request_json(
+            request,
+            self.dialect,
+            self.kimi_thinking.as_ref(),
+            self.kimi_reasoning_effort.as_deref(),
+        )
     }
 
     /// Probes `GET /v1/models` and derives only conservative capabilities from
@@ -1780,6 +1825,7 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
 fn responses_request_json(
     request: &TurnRequest,
     codex_responses_lite: bool,
+    effort: Option<&str>,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let mut input = Vec::new();
@@ -1952,6 +1998,12 @@ fn responses_request_json(
         if codex_responses_lite {
             reasoning.insert("context".into(), serde_json::json!("all_turns"));
         }
+        // G3: the session's effort MERGES into this one reasoning object for
+        // reasoning models — `summary` and the lite-required `context` are
+        // never dropped, and lite still never carries `max_output_tokens`.
+        if reasoning_model && let Some(effort) = effort {
+            reasoning.insert("effort".into(), serde_json::json!(effort));
+        }
         object.insert("reasoning".into(), serde_json::Value::Object(reasoning));
         if reasoning_model {
             object.insert(
@@ -1986,6 +2038,7 @@ fn chat_request_json(
     request: &TurnRequest,
     dialect: CompatibleDialect,
     kimi_thinking: Option<&KimiThinkingConfig>,
+    kimi_reasoning_effort: Option<&str>,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let mut messages = Vec::new();
@@ -2151,6 +2204,11 @@ fn chat_request_json(
                 // `extra_body={"thinking": ...}` seam. SDK extra-body fields
                 // are merged into the HTTP JSON, so the wire key is top-level.
                 object.insert("thinking".into(), serde_json::json!(thinking));
+            }
+            if let Some(effort) = kimi_reasoning_effort {
+                // k3-style always-thinking models take the documented
+                // top-level knob; catalog gating happens at the factory.
+                object.insert("reasoning_effort".into(), serde_json::json!(effort));
             }
         }
     }

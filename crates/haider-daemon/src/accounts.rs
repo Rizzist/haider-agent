@@ -4883,6 +4883,24 @@ async fn finalize_and_respond(
 
 // ─────────────────── accounts-backed provider factory ──────────────────────
 
+/// Per-turn provider tuning derived from session metadata (G3): the
+/// session's explicit effort selection and fast-mode flag, threaded from
+/// `ProviderFactory::resolve_for_turn` into the provider constructors.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTuning {
+    pub effort: Option<String>,
+    pub fast: bool,
+}
+
+impl ProviderTuning {
+    pub(crate) fn from_metadata(metadata: &haider_protocol::session::SessionMetadataV1) -> Self {
+        Self {
+            effort: metadata.effort.clone(),
+            fast: metadata.fast,
+        }
+    }
+}
+
 /// Constructs a provider adapter from a vault-resolved credential — the
 /// injectable half of the production factory, so the login→next-turn law is
 /// testable with a fake provider while the RESOLUTION path (active
@@ -4923,6 +4941,21 @@ pub trait AccountProviderBuilder: Send + Sync {
         let _ = profile;
         self.build_descriptor(descriptor, credential, model)
     }
+
+    /// Tuning-aware construction (G3): the per-turn provider carries the
+    /// session's effort/fast selection. Injected builders remain source
+    /// compatible and may ignore the tuning.
+    fn build_tuned(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+        tuning: &ProviderTuning,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        let _ = tuning;
+        self.build_profile_descriptor(profile, descriptor, credential, model)
+    }
 }
 
 /// Production builder for every account-backed adapter shipped in this lane.
@@ -4951,6 +4984,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             credential,
             model,
             alias,
+            &ProviderTuning::default(),
         )
     }
 
@@ -4968,6 +5002,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             credential,
             model,
             &descriptor.alias,
+            &ProviderTuning::default(),
         )
     }
 
@@ -4986,10 +5021,32 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             credential,
             model,
             &descriptor.alias,
+            &ProviderTuning::default(),
+        )
+    }
+
+    fn build_tuned(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+        tuning: &ProviderTuning,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        build_account_provider(
+            &descriptor.provider,
+            profile,
+            descriptor.base_url.as_deref(),
+            descriptor.auth_method,
+            credential,
+            model,
+            &descriptor.alias,
+            tuning,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_account_provider(
     provider: &str,
     profile: Option<&ProviderSummaryWire>,
@@ -4998,23 +5055,29 @@ fn build_account_provider(
     credential: haider_accounts::SecretHandle,
     model: &str,
     alias: &CredentialAlias,
+    tuning: &ProviderTuning,
 ) -> Result<Arc<dyn Provider>, HaiderError> {
     let compatible_base_url = account_openai_compatible_base_url(provider, profile, base_url);
+    let anthropic_fast = anthropic_fast_for(tuning, model);
     let adapter: Arc<dyn Provider> = match (provider, auth_method) {
         (ANTHROPIC_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             AnthropicProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
-                .with_account(alias.clone()),
+                .with_account(alias.clone())
+                .with_effort(tuning.effort.clone())
+                .with_fast(anthropic_fast),
         ),
         (OPENAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
-                .with_account(alias.clone()),
+                .with_account(alias.clone())
+                .with_effort(tuning.effort.clone()),
         ),
         (GEMINI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             GeminiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
-                .with_account(alias.clone()),
+                .with_account(alias.clone())
+                .with_effort(tuning.effort.clone()),
         ),
         (OPENAI_COMPATIBLE_PROVIDER_NAME, AuthMethod::ApiKey) => {
             let base_url = compatible_base_url.ok_or_else(|| {
@@ -5071,7 +5134,8 @@ fn build_account_provider(
             Arc::new(
                 OpenAiProvider::new_subscription(credential, model, inference.base_url)
                     .map_err(|error| adapter_construction_error(provider, error))?
-                    .with_account(alias.clone()),
+                    .with_account(alias.clone())
+                    .with_effort(tuning.effort.clone()),
             )
         }
         (ANTHROPIC_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {
@@ -5094,7 +5158,9 @@ fn build_account_provider(
             Arc::new(
                 AnthropicProvider::new_subscription(credential, model, inference.base_url)
                     .map_err(|error| adapter_construction_error(provider, error))?
-                    .with_account(alias.clone()),
+                    .with_account(alias.clone())
+                    .with_effort(tuning.effort.clone())
+                    .with_fast(anthropic_fast),
             )
         }
         (KIMI_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {
@@ -5114,15 +5180,41 @@ fn build_account_provider(
                     false,
                 ));
             }
-            Arc::new(
-                OpenAiCompatibleProvider::new_kimi_subscription(
-                    credential,
-                    model,
-                    inference.base_url,
-                )
-                .map_err(|error| adapter_construction_error(provider, error))?
-                .with_account(alias.clone()),
+            let mut adapter = OpenAiCompatibleProvider::new_kimi_subscription(
+                credential,
+                model,
+                inference.base_url,
             )
+            .map_err(|error| adapter_construction_error(provider, error))?
+            .with_account(alias.clone());
+            // G3: inject ONLY what the kimi catalog declared for this model
+            // (think_efforts membership), in the shape it declared: models
+            // with a thinking-type toggle take `thinking.effort`; k3-style
+            // always-thinking models take top-level `reasoning_effort`.
+            if let Some(effort) = &tuning.effort
+                && let Some(detail) = profile.and_then(|profile| {
+                    profile
+                        .model_details
+                        .iter()
+                        .find(|detail| detail.name == model)
+                })
+                && detail.supported_efforts.iter().any(|level| level == effort)
+            {
+                adapter = if detail.supports_thinking_type == Some(true) {
+                    adapter
+                        .with_kimi_thinking(haider_provider::KimiThinkingConfig {
+                            thinking_type: haider_provider::KimiThinkingType::Enabled,
+                            effort: Some(effort.clone()),
+                            keep: None,
+                        })
+                        .map_err(|error| adapter_construction_error(provider, error))?
+                } else {
+                    adapter
+                        .with_kimi_reasoning_effort(effort.clone())
+                        .map_err(|error| adapter_construction_error(provider, error))?
+                };
+            }
+            Arc::new(adapter)
         }
         _ => {
             return Err(HaiderError::new(
@@ -5135,6 +5227,15 @@ fn build_account_provider(
         }
     };
     Ok(adapter)
+}
+
+/// G3 fast gate at construction: fast is validated at TOGGLE time, but a
+/// later model switch can leave a stale flag on a pair outside the static
+/// gate — 4.7 hard-errors on `speed: "fast"` and 4.6 silently bills
+/// standard, so an out-of-gate pair sends a standard request instead of a
+/// request the API documents as broken for it.
+pub(crate) fn anthropic_fast_for(tuning: &ProviderTuning, model: &str) -> bool {
+    tuning.fast && haider_provider::anthropic_fast_mode_supported(model)
 }
 
 fn account_openai_compatible_base_url<'a>(
@@ -5273,11 +5374,16 @@ impl AccountsProviderFactory {
         &self,
         descriptor: &CredentialDescriptor,
         credential: haider_accounts::SecretHandle,
-        model: &str,
+        metadata: &haider_protocol::session::SessionMetadataV1,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         let profile = self.provider_profile(&descriptor.provider);
-        self.builder
-            .build_profile_descriptor(profile.as_ref(), descriptor, credential, model)
+        self.builder.build_tuned(
+            profile.as_ref(),
+            descriptor,
+            credential,
+            &metadata.model,
+            &ProviderTuning::from_metadata(metadata),
+        )
     }
 
     async fn resolve_account(
@@ -5399,7 +5505,7 @@ impl AccountsProviderFactory {
             KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME
         ) && resolved.descriptor.auth_method == AuthMethod::OAuth)
             .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
-        let provider = self.build_provider(&resolved.descriptor, credential, &metadata.model)?;
+        let provider = self.build_provider(&resolved.descriptor, credential, metadata)?;
         Ok((resolved, provider, oauth_access_fingerprint))
     }
 }
@@ -5481,7 +5587,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                             let provider = self.factory.build_provider(
                                 &current,
                                 credential,
-                                &self.metadata.model,
+                                &self.metadata,
                             )?;
                             return Ok(haider_core::ProviderAttemptDecision::Retry {
                                 provider,
@@ -5544,7 +5650,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
         let credential = self.factory.resolve_secret(&resolved.descriptor).await?;
         let provider =
             self.factory
-                .build_provider(&resolved.descriptor, credential, &self.metadata.model)?;
+                .build_provider(&resolved.descriptor, credential, &self.metadata)?;
         Ok(haider_core::ProviderAttemptDecision::Rotate(
             haider_core::ResolvedProviderAttempt {
                 provider,

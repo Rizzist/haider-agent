@@ -41,6 +41,8 @@ pub(crate) enum AnthropicSystemShape {
 pub(crate) fn request_json(
     request: &TurnRequest,
     system_shape: AnthropicSystemShape,
+    effort: Option<&str>,
+    fast: bool,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let messages = request
@@ -104,6 +106,20 @@ pub(crate) fn request_json(
     }
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
+    }
+    // G3 effort rides `output_config.effort` VERBATIM when set (GA, no beta
+    // header). NEVER `thinking.budget_tokens` — that shape 400s on 4.7+ and
+    // every 5-family model — and no `thinking` field is emitted otherwise.
+    if let Some(effort) = effort {
+        object.insert(
+            "output_config".into(),
+            serde_json::json!({"effort": effort}),
+        );
+    }
+    // G3 fast mode: top-level `speed: "fast"`; the paired
+    // `fast-mode-2026-02-01` beta header is applied by the HTTP adapter.
+    if fast {
+        object.insert("speed".into(), serde_json::json!("fast"));
     }
     Ok(payload)
 }

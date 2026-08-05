@@ -668,6 +668,7 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
         models_url: endpoints.models_url,
         dialect: CompatibleDialect::Generic,
         kimi_thinking: None,
+        kimi_reasoning_effort: None,
     };
     let capture = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("proxy request");
@@ -790,7 +791,7 @@ fn probe_request(model: &str) -> TurnRequest {
 #[test]
 fn codex_lite_payload_meets_the_subscription_contract() {
     let payload =
-        responses_request_json(&probe_request("gpt-5.6-sol"), true).expect("lite payload");
+        responses_request_json(&probe_request("gpt-5.6-sol"), true, None).expect("lite payload");
     let object = payload.as_object().expect("object");
     assert!(
         !object.contains_key("max_output_tokens"),
@@ -811,12 +812,83 @@ fn codex_lite_payload_meets_the_subscription_contract() {
     );
 }
 
+/// LAW (LE3, openai half): the session effort MERGES into the ONE reasoning
+/// object — on lite the live-confirmed contract survives intact
+/// (`summary: auto` kept, `context: all_turns` kept, `max_output_tokens`
+/// still absent, `parallel_tool_calls` still false), on the API-key path
+/// `summary` survives beside the merged effort, and a NON-reasoning model
+/// never grows an effort key.
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): replace the merge
+/// with `object.insert("reasoning", {"effort": ...})`. Expected runtime
+/// failure: the summary/context preservation assertions below.
+#[test]
+fn effort_merges_into_reasoning_preserving_the_lite_contract() {
+    let payload = responses_request_json(&probe_request("gpt-5.6-sol"), true, Some("xhigh"))
+        .expect("lite payload with effort");
+    let object = payload.as_object().expect("object");
+    let reasoning = payload
+        .get("reasoning")
+        .and_then(serde_json::Value::as_object)
+        .expect("reasoning object");
+    assert_eq!(
+        reasoning.get("effort").and_then(serde_json::Value::as_str),
+        Some("xhigh"),
+        "the session effort merges into reasoning: {payload}"
+    );
+    assert_eq!(
+        reasoning.get("summary").and_then(serde_json::Value::as_str),
+        Some("auto"),
+        "summary must survive the effort merge: {payload}"
+    );
+    assert_eq!(
+        reasoning.get("context").and_then(serde_json::Value::as_str),
+        Some("all_turns"),
+        "the lite-required context must survive the effort merge: {payload}"
+    );
+    assert!(
+        !object.contains_key("max_output_tokens"),
+        "lite still REJECTS max_output_tokens: {payload}"
+    );
+    assert_eq!(
+        object.get("parallel_tool_calls"),
+        Some(&serde_json::Value::Bool(false)),
+        "lite still requires parallel_tool_calls=false"
+    );
+    assert_eq!(
+        payload.get("include"),
+        Some(&serde_json::json!(["reasoning.encrypted_content"])),
+        "the encrypted-content include is unchanged"
+    );
+
+    let api_key = responses_request_json(&probe_request("gpt-5.6-sol"), false, Some("medium"))
+        .expect("api-key payload with effort");
+    assert_eq!(api_key["reasoning"]["effort"], "medium");
+    assert_eq!(api_key["reasoning"]["summary"], "auto");
+    assert_eq!(
+        api_key["reasoning"].get("context"),
+        None,
+        "no lite context leaks onto the API-key path"
+    );
+
+    // A non-reasoning model on lite keeps the context-only object: effort is
+    // gated on the reasoning heuristic, never invented for a model that
+    // cannot take it.
+    let plain = responses_request_json(&probe_request("gpt-4.1-mini"), true, Some("high"))
+        .expect("non-reasoning lite payload");
+    assert_eq!(
+        plain["reasoning"],
+        serde_json::json!({"context": "all_turns"}),
+        "non-reasoning lite keeps the bare context object: {plain}"
+    );
+}
+
 /// The API-key Responses path is UNCHANGED: it still sends the output cap and
 /// never the lite-only fields.
 #[test]
 fn api_key_payload_keeps_max_output_tokens_and_no_lite_fields() {
-    let payload =
-        responses_request_json(&probe_request("gpt-5.6-sol"), false).expect("api-key payload");
+    let payload = responses_request_json(&probe_request("gpt-5.6-sol"), false, None)
+        .expect("api-key payload");
     let object = payload.as_object().expect("object");
     assert_eq!(
         object
@@ -893,6 +965,57 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
     assert_eq!(payload["thinking"]["type"], "enabled");
     assert_eq!(payload["thinking"]["effort"], "high");
     assert_eq!(payload["thinking"]["keep"], "all");
+}
+
+/// LAW (LE3, kimi half): a k3-style pair takes the documented TOP-LEVEL
+/// `reasoning_effort` knob — no `thinking` object rides along unless the
+/// catalog-gated factory also enabled it — and the seam is Kimi-only: the
+/// generic compatible dialect rejects it exactly like `with_kimi_thinking`.
+#[test]
+fn kimi_reasoning_effort_is_top_level_and_kimi_only() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("kimi-reasoning-effort-fixture");
+    vault
+        .put(&alias, b"KIMI_ACCESS_SENTINEL_8e11")
+        .expect("store Kimi bearer");
+    let credential = vault.resolve(&alias).expect("resolve Kimi bearer");
+    let provider =
+        OpenAiCompatibleProvider::new_kimi_subscription(credential, "kimi-k3", KIMI_OAUTH_BASE_URL)
+            .expect("construct Kimi adapter")
+            .with_kimi_reasoning_effort("max")
+            .expect("enable reasoning_effort");
+    let request = TurnRequest {
+        messages: vec![crate::Message::user_text("hello")],
+        model: "kimi-k3".to_owned(),
+        max_tokens: 1,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let payload = provider.request_payload(&request).expect("Kimi payload");
+    assert_eq!(payload["reasoning_effort"], "max");
+    assert!(
+        payload.get("thinking").is_none(),
+        "reasoning_effort rides alone: {payload}"
+    );
+
+    let generic_vault = MemoryVault::new();
+    let generic_alias = CredentialAlias::new("generic-reasoning-effort-fixture");
+    generic_vault
+        .put(&generic_alias, b"GENERIC_KEY_SENTINEL_71aa")
+        .expect("store generic key");
+    let generic = OpenAiCompatibleProvider::new(
+        generic_vault
+            .resolve(&generic_alias)
+            .expect("resolve generic key"),
+        "generic-model",
+        "https://api.example.invalid/v1",
+    )
+    .expect("construct generic adapter");
+    let refused = generic
+        .with_kimi_reasoning_effort("max")
+        .expect_err("generic dialect must reject the Kimi seam");
+    assert_eq!(refused.kind, ProviderErrorKind::InvalidRequest);
 }
 
 /// MUTATION CHECK: infer Kimi features from the model slug or expose stronger
@@ -1007,7 +1130,7 @@ fn assistant_history_replays_as_output_text() {
         attachments: Vec::new(),
     };
     for lite in [true, false] {
-        let payload = responses_request_json(&request, lite).expect("payload");
+        let payload = responses_request_json(&request, lite, None).expect("payload");
         let input = payload["input"].as_array().expect("input array");
         let content_type = |index: usize| {
             input[index]["content"][0]["type"]
