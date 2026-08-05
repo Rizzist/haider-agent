@@ -488,8 +488,14 @@ fn fs_receipt_lines(name: &str, args: &serde_json::Value) -> (u64, u64) {
     let text = |key: &str| args.get(key).and_then(|value| value.as_str()).unwrap_or("");
     match name {
         "fs_write" => (line_count(text("content")), 0),
-        "fs_patch" => (line_count(text("replacement")), line_count(text("preimage"))),
-        "fs_edit" => (line_count(text("new_string")), line_count(text("old_string"))),
+        "fs_patch" => (
+            line_count(text("replacement")),
+            line_count(text("preimage")),
+        ),
+        "fs_edit" => (
+            line_count(text("new_string")),
+            line_count(text("old_string")),
+        ),
         _ => (0, 0),
     }
 }
@@ -521,8 +527,10 @@ impl SessionFolder {
     }
 
     pub(crate) fn push(&mut self, envelope: &RawEnvelope) {
-        self.stats.last_committed_at_ms =
-            self.stats.last_committed_at_ms.max(envelope.committed_at_ms);
+        self.stats.last_committed_at_ms = self
+            .stats
+            .last_committed_at_ms
+            .max(envelope.committed_at_ms);
         let Some(kind) = envelope.payload.get("type").and_then(|kind| kind.as_str()) else {
             return;
         };
@@ -640,9 +648,7 @@ pub(crate) fn attribute_session(
         if let Some(cost) = tokens.est_cost_usd {
             *entry.est_cost_usd.get_or_insert(0.0) += cost;
         }
-        let beats = dominant
-            .as_ref()
-            .is_none_or(|(_, best)| magnitude > *best);
+        let beats = dominant.as_ref().is_none_or(|(_, best)| magnitude > *best);
         if beats {
             dominant = Some((alias.clone(), magnitude));
         }

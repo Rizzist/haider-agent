@@ -29,13 +29,13 @@ use haider_rpc::{
     FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
     FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, Hello,
-    LifecyclePhase, MenuInput,
-    ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionObserveDigest, SessionReadResult,
-    SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
+    LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire,
+    OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError,
+    ProviderActiveWire, ProviderApiFamilyWire, ProviderAuthRequirementWire,
+    ProviderAvailabilityWire, ProviderDefaultWire, ProviderRemoveRefusalReasonWire,
+    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SecretWire, SeqRange,
+    SessionObserveDigest, SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition,
+    Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;

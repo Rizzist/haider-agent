@@ -69,7 +69,10 @@ fn presets_gate_on_the_daemon_configure_feature() {
         .remove(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1);
     model.handle(key(KeyCode::Char('z')));
     assert!(model.custom_add.is_none(), "no card without the feature");
-    assert!(model.providers.message.is_some(), "the refusal is explained");
+    assert!(
+        model.providers.message.is_some(),
+        "the refusal is explained"
+    );
 }
 
 /// LAW (accounts_add_rows_offer_both_presets): the /accounts add buttons

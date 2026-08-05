@@ -1668,7 +1668,11 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
             )
         })
         .expect("U1 welcome frame in the golden transcript");
-    assert_eq!(frames.len() - u1_start, 3, "U1 appends exactly three frames");
+    assert_eq!(
+        frames.len() - u1_start,
+        3,
+        "U1 appends exactly three frames"
+    );
     for frame in &frames[u1_start..] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode U1 frame");
         // Key positions only: `"api_key"` the AuthMethod VALUE is legitimate;
@@ -1721,7 +1725,8 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
     // Older-peer direction: the parameterless request decodes from its bare
     // method object, and an unknown FUTURE method still lands as tolerated
     // Unknown rather than a hard error.
-    let bare_request = r#"{"v":1,"kind":"request","request_id":"r-1","body":{"method":"usage.report"}}"#;
+    let bare_request =
+        r#"{"v":1,"kind":"request","request_id":"r-1","body":{"method":"usage.report"}}"#;
     let decoded: WireFrame = serde_json::from_str(bare_request).expect("bare U1 request decode");
     assert!(matches!(
         decoded,

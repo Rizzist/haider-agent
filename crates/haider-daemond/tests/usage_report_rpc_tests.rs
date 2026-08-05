@@ -2,6 +2,7 @@
 //! real UnixStream: the welcome advertises `usage_report_v1`, and a
 //! View-only client receives a typed report — never an error — on a fresh
 //! profile with no accounts.
+#![allow(clippy::expect_used)]
 
 mod support;
 

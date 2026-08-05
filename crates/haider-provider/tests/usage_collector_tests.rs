@@ -195,8 +195,14 @@ fn endpoint_coordinates_headers_and_poll_floors_are_pinned() {
         ANTHROPIC_OAUTH_USAGE_URL,
         "https://api.anthropic.com/api/oauth/usage"
     );
-    assert_eq!(KIMI_OAUTH_USAGE_URL, "https://api.kimi.com/coding/v1/usages");
-    assert_eq!(UsageMeterEndpoint::OpenAiOauth.url(), OPENAI_OAUTH_USAGE_URL);
+    assert_eq!(
+        KIMI_OAUTH_USAGE_URL,
+        "https://api.kimi.com/coding/v1/usages"
+    );
+    assert_eq!(
+        UsageMeterEndpoint::OpenAiOauth.url(),
+        OPENAI_OAUTH_USAGE_URL
+    );
     assert!(UsageMeterEndpoint::OpenAiOauth.extra_headers().is_empty());
     assert!(UsageMeterEndpoint::KimiOauth.extra_headers().is_empty());
     let anthropic_headers = UsageMeterEndpoint::AnthropicOauth.extra_headers();
@@ -266,11 +272,15 @@ fn pricing_estimates_known_families_and_refuses_unknown_models() {
         "claude-sonnet-4"
     );
     assert_eq!(
-        model_rate("models/gemini-2.5-pro").expect("gemini priced").prefix,
+        model_rate("models/gemini-2.5-pro")
+            .expect("gemini priced")
+            .prefix,
         "gemini-2.5-pro"
     );
     assert_eq!(
-        model_rate("gpt-5.3-codex").expect("codex family priced").prefix,
+        model_rate("gpt-5.3-codex")
+            .expect("codex family priced")
+            .prefix,
         "gpt-5.3-codex",
         "longest prefix beats the gpt-5 family row"
     );

@@ -214,8 +214,8 @@ fn wham_window(window: &WhamWindow, name: &str, label: Option<&str>) -> Option<U
 /// (5 h) + secondary (weekly) windows, named per-model
 /// `additional_rate_limits`, and the subscription `plan_type`.
 pub fn parse_openai_wham_usage(body: &[u8]) -> Result<MeterReading, MeterUnavailable> {
-    let usage: WhamUsage = serde_json::from_slice(body)
-        .map_err(|_| MeterUnavailable::new("malformed_response"))?;
+    let usage: WhamUsage =
+        serde_json::from_slice(body).map_err(|_| MeterUnavailable::new("malformed_response"))?;
     let mut windows = Vec::new();
     if let Some(rate_limit) = &usage.rate_limit {
         if let Some(window) = rate_limit
@@ -304,8 +304,8 @@ fn anthropic_window(bucket: &AnthropicBucket, name: &str) -> Option<UsageWindowV
 /// each nullable) plus `extra_usage` when enabled. Utilization runs through
 /// the defensive normalizer because sources disagree on its scale.
 pub fn parse_anthropic_oauth_usage(body: &[u8]) -> Result<MeterReading, MeterUnavailable> {
-    let usage: AnthropicOauthUsage = serde_json::from_slice(body)
-        .map_err(|_| MeterUnavailable::new("malformed_response"))?;
+    let usage: AnthropicOauthUsage =
+        serde_json::from_slice(body).map_err(|_| MeterUnavailable::new("malformed_response"))?;
     let mut windows = Vec::new();
     for (bucket, name) in [
         (&usage.five_hour, "five_hour"),
@@ -313,7 +313,10 @@ pub fn parse_anthropic_oauth_usage(body: &[u8]) -> Result<MeterReading, MeterUna
         (&usage.seven_day_opus, "seven_day_opus"),
         (&usage.seven_day_sonnet, "seven_day_sonnet"),
     ] {
-        if let Some(window) = bucket.as_ref().and_then(|bucket| anthropic_window(bucket, name)) {
+        if let Some(window) = bucket
+            .as_ref()
+            .and_then(|bucket| anthropic_window(bucket, name))
+        {
             windows.push(window);
         }
     }
@@ -403,8 +406,8 @@ fn kimi_window_name(spec: Option<&KimiWindowSpec>) -> String {
 /// Parses `GET https://api.kimi.com/coding/v1/usages` bytes: the plan-level
 /// `usage` quota (string counters) plus each `limits[]` rolling window.
 pub fn parse_kimi_usages(body: &[u8]) -> Result<MeterReading, MeterUnavailable> {
-    let usages: KimiUsages = serde_json::from_slice(body)
-        .map_err(|_| MeterUnavailable::new("malformed_response"))?;
+    let usages: KimiUsages =
+        serde_json::from_slice(body).map_err(|_| MeterUnavailable::new("malformed_response"))?;
     let mut windows = Vec::new();
     if let Some(quota) = &usages.usage
         && let Some(utilization) = kimi_utilization(quota)
@@ -542,8 +545,8 @@ pub fn parse_rfc3339_to_unix_ms(value: &str) -> Option<u64> {
         + i64::try_from(minute).ok()? * 60
         + i64::try_from(second).ok()?
         - offset_minutes * 60;
-    let unix_ms = seconds.checked_mul(1_000)?.checked_add(
-        i64::try_from(millis).ok()?,
-    )?;
+    let unix_ms = seconds
+        .checked_mul(1_000)?
+        .checked_add(i64::try_from(millis).ok()?)?;
     u64::try_from(unix_ms).ok()
 }

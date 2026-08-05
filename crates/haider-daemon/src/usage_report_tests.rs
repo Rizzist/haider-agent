@@ -319,7 +319,11 @@ async fn openai_token_claims_supply_email_and_plan_with_meter_precedence() {
         (200, wham.to_vec()),
     )]));
     let service = service_with_clock(
-        vec![descriptor("openai-oauth", "work-chatgpt", AuthMethod::OAuth)],
+        vec![descriptor(
+            "openai-oauth",
+            "work-chatgpt",
+            AuthMethod::OAuth,
+        )],
         Some(Arc::new(StubTokens {
             bytes: jwt_with_claims(&serde_json::json!({
                 "email": "person@example.invalid",
@@ -447,7 +451,10 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
         Some("r-1"),
         None,
         5_000,
-        completed_tool("fs_write", serde_json::json!({"path":"new.rs","content":"x\ny\n"})),
+        completed_tool(
+            "fs_write",
+            serde_json::json!({"path":"new.rs","content":"x\ny\n"}),
+        ),
     ));
     folder.push(&envelope(
         6,
