@@ -43,7 +43,7 @@ use haider_protocol::envelope::{
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CONTINUATION_CHECKPOINT_EXTENSION_KIND, CompactionIntent,
-    CompactionResume, ContinuationCheckpoint, NodeKind, TreeNode,
+    CompactionResume, ContinuationCheckpoint, NodeKind, TodoState, TreeNode,
 };
 use haider_protocol::ids::{
     AgentId, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
@@ -60,7 +60,7 @@ use haider_provider::{
     Message, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition,
     TurnRequest,
 };
-use haider_tools::RequestInput;
+use haider_tools::{RequestInput, TodoWrite};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -693,6 +693,19 @@ pub struct HarnessActor {
     tree_head: Option<NodeId>,
     deferred_commands: VecDeque<ActorCommand>,
     pending_nudges: Vec<String>,
+    /// G1: the OPEN `todo_write` plan lifecycle. One `TurnItem::Plan` item id
+    /// per lifecycle: the first write of a run Starts it, later writes emit
+    /// Completed (replace semantics) under the same id, and completion or an
+    /// empty-list clear closes it (a later write starts a fresh id — the
+    /// projection closes finished item ids forever). Keyed by run so a stale
+    /// lifecycle from an earlier run never leaks into the next one.
+    plan: Option<PlanLifecycle>,
+}
+
+/// See [`HarnessActor::plan`].
+struct PlanLifecycle {
+    run_id: RunId,
+    item_id: ItemId,
 }
 
 impl HarnessActor {
@@ -747,6 +760,7 @@ impl HarnessActor {
                 tree_head: None,
                 deferred_commands: VecDeque::new(),
                 pending_nudges: Vec::new(),
+                plan: None,
             },
             handle,
         )
@@ -2194,6 +2208,12 @@ impl HarnessActor {
                 .await
                 .map(Some);
         }
+        if tools[index].name == "todo_write" {
+            return self
+                .complete_todo_write(run_id, tools, index)
+                .await
+                .map(Some);
+        }
         if let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) {
             let args = parse_tool_args(&tools[index])?;
             self.commit_state(run_id, RunState::RunningTool)
@@ -2448,6 +2468,131 @@ impl HarnessActor {
                 }
             }
         }
+    }
+
+    /// Settles one `todo_write` call synchronously (G1). Like
+    /// `request_input`, the tool never enters the effect broker: the actor
+    /// itself journals the `TurnItem::Plan` lifecycle facts and answers the
+    /// model with a compact count echo. A validation failure is a typed
+    /// REJECTED tool result — the model corrects its list — never a turn
+    /// failure.
+    async fn complete_todo_write(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+    ) -> Result<Message, DriveError> {
+        let args = parse_tool_args(&tools[index])?;
+        let result = match TodoWrite::from_tool_args(args) {
+            Ok(request) => {
+                self.emit_plan_facts(run_id, &request).await?;
+                BoundedResult {
+                    preview: request.result_echo().to_string(),
+                    truncated: false,
+                    artifact: None,
+                    cursor: None,
+                }
+            }
+            Err(error @ haider_tools::ToolError::InvalidArgument { .. }) => BoundedResult {
+                preview: serde_json::json!({
+                    "status": "rejected",
+                    "error": {
+                        "kind": "invalid_argument",
+                        "message": error.to_string(),
+                    }
+                })
+                .to_string(),
+                truncated: false,
+                artifact: None,
+                cursor: None,
+            },
+            Err(error) => return Err(tool_error_to_drive(error)),
+        };
+        let call_id = tools[index].call_id.clone();
+        self.commit_payload(
+            run_id,
+            EventPayload::ToolResult {
+                call_id: call_id.clone(),
+                result: result.clone(),
+            },
+            prompt_verbatim_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+            .await?;
+        tools.remove(index);
+        Ok(Message::tool_result(
+            call_id,
+            result.preview,
+            result.truncated,
+        ))
+    }
+
+    /// Journals the plan lifecycle for one accepted `todo_write` list.
+    ///
+    /// First write of a lifecycle: `Started{Plan}` under a FRESH item id
+    /// (pins the panel). Every later write: `Completed{Plan}` under the SAME
+    /// id — replace semantics; the projection keeps it pinned until every
+    /// item completes. An all-completed list closes the lifecycle (the
+    /// Completed fact also pairs a `NodeKind::Todos` commit in
+    /// `commit_item`); an empty list clears it — and when nothing was ever
+    /// listed, an empty list journals NOTHING at all.
+    async fn emit_plan_facts(
+        &mut self,
+        run_id: &RunId,
+        request: &TodoWrite,
+    ) -> Result<(), DriveError> {
+        let open = self
+            .plan
+            .as_ref()
+            .filter(|plan| plan.run_id == *run_id)
+            .map(|plan| plan.item_id.clone());
+        let item = TurnItem::Plan {
+            items: request.items.clone(),
+        };
+        match open {
+            None => {
+                if request.items.is_empty() {
+                    return Ok(());
+                }
+                let item_id = self.next_item_id();
+                self.commit_item(
+                    run_id,
+                    ItemEvent::Started {
+                        item_id: item_id.clone(),
+                        item: item.clone(),
+                    },
+                )
+                .await
+                .map_err(DriveError::Store)?;
+                if request.all_completed() {
+                    // Born finished: close the lifecycle immediately so the
+                    // projection unpins it into the transcript and the
+                    // history tree records the completed plan.
+                    self.commit_item(run_id, ItemEvent::Completed { item_id, item })
+                        .await
+                        .map_err(DriveError::Store)?;
+                    self.plan = None;
+                } else {
+                    self.plan = Some(PlanLifecycle {
+                        run_id: run_id.clone(),
+                        item_id,
+                    });
+                }
+            }
+            Some(item_id) => {
+                self.commit_item(run_id, ItemEvent::Completed { item_id, item })
+                    .await
+                    .map_err(DriveError::Store)?;
+                if request.items.is_empty() || request.all_completed() {
+                    // Finished or cleared — the projection closes this item
+                    // id forever, so a later write must mint a fresh one.
+                    self.plan = None;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn complete_request_input(
@@ -3199,6 +3344,19 @@ impl HarnessActor {
                 summary: format!("tool call settled as {status:?}"),
                 artifact: None,
             }),
+            // G1: a FINISHED plan (non-empty, every item completed) commits
+            // the durable Todos node — the "unpins into history" law. An
+            // empty list is a clear, not a completed plan: no node.
+            ItemEvent::Completed {
+                item: TurnItem::Plan { items },
+                ..
+            } if !items.is_empty()
+                && items.iter().all(|todo| todo.state == TodoState::Completed) =>
+            {
+                Some(NodeKind::Todos {
+                    items: items.clone(),
+                })
+            }
             _ => None,
         };
         if let Some(node_kind) = node_kind {
