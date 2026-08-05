@@ -1384,9 +1384,11 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
         "account_device_discovery_v1"
     );
 
-    // The appended golden frames live at the END of the transcript: every
-    // index before the D1 welcome predates this wave, so old fixture entries
-    // could not have moved.
+    // The D1 golden frames were appended at the then-END of the transcript:
+    // every index before the D1 welcome predates that wave, so old fixture
+    // entries could not have moved. Later waves (U1) append strictly AFTER
+    // the D1 block; the U1 welcome is the fence that re-proves the D1 block
+    // is still exactly its original six frames, untouched.
     let frames = transcript();
     let d1_start = frames
         .iter()
@@ -1398,8 +1400,18 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
             )
         })
         .expect("D1 welcome frame in the golden transcript");
-    assert_eq!(frames.len() - d1_start, 6, "D1 appends exactly six frames");
-    for frame in &frames[d1_start..] {
+    let d1_end = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                WireFrame::Welcome(welcome)
+                    if welcome.features.contains(haider_rpc::FEATURE_USAGE_REPORT_V1)
+            )
+        })
+        .unwrap_or(frames.len());
+    assert_eq!(d1_end - d1_start, 6, "D1 appended exactly six frames");
+    for frame in &frames[d1_start..d1_end] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode D1 frame");
         assert!(
             !encoded.contains("refresh"),
@@ -1625,4 +1637,107 @@ fn model_selection_refusals_are_typed_and_golden() {
         haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1,
         "session_model_select_v1"
     );
+}
+
+/// LAW (usage_report_goldens_are_additive_normalized_and_secret_free): the U1
+/// wave appends exactly three frames at the END of the golden transcript
+/// (welcome advertising `usage_report_v1`, the parameterless request, the
+/// report response); utilization rides the wire as the normalized 0–1
+/// fraction, never a raw percentage; unknown future fields are tolerated in
+/// both directions; and no U1 frame can carry token/key bytes.
+/// MUTATION CHECK: serialize a percentage (60 instead of 0.6), rename the
+/// method, or drop the tagged meter state. Expected RUNTIME failure: the
+/// appended golden bytes differ or the tolerance decode loses its shape.
+#[test]
+fn usage_report_goldens_are_additive_normalized_and_secret_free() {
+    use haider_protocol::usage::AccountMeterStateV1;
+    use haider_rpc::FEATURE_USAGE_REPORT_V1;
+
+    // The feature bit is a pinned wire literal.
+    assert_eq!(FEATURE_USAGE_REPORT_V1, "usage_report_v1");
+
+    // The U1 frames are the transcript tail: three frames, append-only.
+    let frames = transcript();
+    let u1_start = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                WireFrame::Welcome(welcome)
+                    if welcome.features.contains(FEATURE_USAGE_REPORT_V1)
+            )
+        })
+        .expect("U1 welcome frame in the golden transcript");
+    assert_eq!(frames.len() - u1_start, 3, "U1 appends exactly three frames");
+    for frame in &frames[u1_start..] {
+        let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode U1 frame");
+        // Key positions only: `"api_key"` the AuthMethod VALUE is legitimate;
+        // a key named like a secret is not.
+        for forbidden in [
+            "\"access_token\":",
+            "\"refresh_token\":",
+            "\"api_key\":",
+            "\"secret\":",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "secret-shaped key must not ride a U1 frame: {forbidden}"
+            );
+        }
+    }
+
+    // The response frame carries the normalized fraction — the raw provider
+    // percentage (60) must never appear as a utilization value.
+    let response = ws_codec::encode(&frames[u1_start + 2], TEST_FRAME_LIMIT).expect("encode");
+    assert!(
+        response.contains("\"utilization\":0.6"),
+        "normalized fraction on the wire: {response}"
+    );
+    assert!(
+        !response.contains("\"utilization\":60"),
+        "raw percentage must not ride the wire: {response}"
+    );
+
+    // Newer-daemon tolerance: unknown report/entry/window fields are ignored
+    // and the typed shape still lands, including the tagged meter state.
+    let future_response = r#"{"v":1,"kind":"response","request_id":"request-future-usage","body":{"method":"usage.report","report":{"generated_at_ms":1,"future_total":9,"accounts":[{"provider":"kimi-oauth","alias":"kimi-main","auth_method":"oauth","meter":{"state":"metered","windows":[{"window":"quota","utilization":0.25,"future_scope":"m"}]},"local":{"sessions":0,"total_duration_ms":0,"input_tokens":0,"output_tokens":0},"future_flag":true}]}}}"#;
+    let decoded: WireFrame = serde_json::from_str(future_response).expect("tolerant U1 decode");
+    let WireFrame::Response {
+        body: ResponseBody::UsageReport { report },
+        ..
+    } = decoded
+    else {
+        panic!("expected a typed usage.report response");
+    };
+    assert_eq!(report.accounts.len(), 1);
+    let entry = &report.accounts[0];
+    assert_eq!(entry.plan, None, "absent optional defaults");
+    let AccountMeterStateV1::Metered { windows } = &entry.meter else {
+        panic!("expected a metered state");
+    };
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].resets_at_ms, None);
+
+    // Older-peer direction: the parameterless request decodes from its bare
+    // method object, and an unknown FUTURE method still lands as tolerated
+    // Unknown rather than a hard error.
+    let bare_request = r#"{"v":1,"kind":"request","request_id":"r-1","body":{"method":"usage.report"}}"#;
+    let decoded: WireFrame = serde_json::from_str(bare_request).expect("bare U1 request decode");
+    assert!(matches!(
+        decoded,
+        WireFrame::Request {
+            body: RequestBody::UsageReport,
+            ..
+        }
+    ));
+    let future_request =
+        r#"{"v":1,"kind":"request","request_id":"r-2","body":{"method":"usage.report_v9"}}"#;
+    let decoded: WireFrame = serde_json::from_str(future_request).expect("future method decode");
+    assert!(matches!(
+        decoded,
+        WireFrame::Request {
+            body: RequestBody::Unknown,
+            ..
+        }
+    ));
 }

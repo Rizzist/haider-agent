@@ -636,6 +636,125 @@ fn oauth_wire_name_is_oauth() {
     assert_eq!(json, "\"oauth\"", "acronym must not mangle to o_auth");
 }
 
+/// LAW (golden_usage_report_v1): the U1 `usage.report` payload shape is
+/// frozen — provider/alias/identity/plan coordinates, tagged meter state,
+/// normalized windows (utilization is a 0–1 fraction on the wire), and the
+/// local counters — and it round-trips byte-for-byte. Secrets have no field
+/// to hide in.
+/// MUTATION CHECK: rename a window coordinate, collapse the tagged meter
+/// state, or serialize utilization as a percentage. Expected RUNTIME failure:
+/// this fixture differs byte-for-byte or no longer round-trips.
+#[test]
+fn golden_usage_report_v1() {
+    use haider_protocol::usage::*;
+    golden(
+        "usage_report_v1",
+        &UsageReportV1 {
+            generated_at_ms: 1_753_500_000_000,
+            accounts: vec![
+                AccountUsageReportV1 {
+                    provider: "anthropic-oauth".into(),
+                    alias: CredentialAlias::new("personal-max"),
+                    identity: Some("user@example.com".into()),
+                    plan: None,
+                    auth_method: haider_protocol::credential::AuthMethod::OAuth,
+                    meter: AccountMeterStateV1::Metered {
+                        windows: vec![
+                            UsageWindowV1 {
+                                window: "five_hour".into(),
+                                utilization: 0.6,
+                                resets_at_ms: Some(1_753_507_200_000),
+                                label: None,
+                            },
+                            UsageWindowV1 {
+                                window: "seven_day".into(),
+                                utilization: 0.12,
+                                resets_at_ms: Some(1_753_900_000_000),
+                                label: None,
+                            },
+                        ],
+                    },
+                    local: LocalUsageStatsV1 {
+                        sessions: 3,
+                        total_duration_ms: 5_400_000,
+                        input_tokens: 120_000,
+                        output_tokens: 9_500,
+                        reasoning_tokens: 2_000,
+                        cached_tokens: 80_000,
+                        est_cost_usd: None,
+                        lines_added: 240,
+                        lines_removed: 60,
+                    },
+                },
+                AccountUsageReportV1 {
+                    provider: "openai".into(),
+                    alias: CredentialAlias::new("billing-key"),
+                    identity: Some("metered".into()),
+                    plan: None,
+                    auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+                    meter: AccountMeterStateV1::LocalOnly,
+                    local: LocalUsageStatsV1 {
+                        sessions: 1,
+                        total_duration_ms: 600_000,
+                        input_tokens: 40_000,
+                        output_tokens: 3_000,
+                        reasoning_tokens: 0,
+                        cached_tokens: 0,
+                        est_cost_usd: Some(0.08),
+                        lines_added: 12,
+                        lines_removed: 4,
+                    },
+                },
+            ],
+        },
+    );
+    golden(
+        "usage_meter_unavailable",
+        &AccountMeterStateV1::Unavailable {
+            reason: "http_status_429".into(),
+        },
+    );
+}
+
+/// LAW (usage_report_fields_are_tolerant_and_additive): an old-wire account
+/// entry without the additive optional fields still decodes, and unknown
+/// future fields are ignored — the report is safe to extend.
+#[test]
+fn usage_report_fields_are_tolerant_and_additive() {
+    use haider_protocol::usage::*;
+    let old_wire = r#"{
+        "provider": "kimi-oauth",
+        "alias": "kimi-main",
+        "auth_method": "oauth",
+        "meter": {"state": "unavailable", "reason": "not_yet_polled", "future": 1},
+        "local": {
+            "sessions": 0,
+            "total_duration_ms": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+        },
+        "future_hint": true
+    }"#;
+    let entry: AccountUsageReportV1 = serde_json::from_str(old_wire).expect("tolerant decode");
+    assert_eq!(entry.identity, None);
+    assert_eq!(entry.plan, None);
+    assert_eq!(
+        entry.meter,
+        AccountMeterStateV1::Unavailable {
+            reason: "not_yet_polled".into()
+        }
+    );
+    assert_eq!(entry.local.reasoning_tokens, 0);
+    assert_eq!(entry.local.est_cost_usd, None);
+    assert!(
+        !serde_json::to_value(&entry)
+            .expect("serialize")
+            .as_object()
+            .is_some_and(|object| object.contains_key("plan")),
+        "absent plan stays absent on the wire"
+    );
+}
+
 #[test]
 fn golden_usage_account_tagged() {
     use haider_protocol::provider::*;

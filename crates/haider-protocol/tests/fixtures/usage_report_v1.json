@@ -1,0 +1,56 @@
+{
+  "generated_at_ms": 1753500000000,
+  "accounts": [
+    {
+      "provider": "anthropic-oauth",
+      "alias": "personal-max",
+      "identity": "user@example.com",
+      "auth_method": "oauth",
+      "meter": {
+        "state": "metered",
+        "windows": [
+          {
+            "window": "five_hour",
+            "utilization": 0.6,
+            "resets_at_ms": 1753507200000
+          },
+          {
+            "window": "seven_day",
+            "utilization": 0.12,
+            "resets_at_ms": 1753900000000
+          }
+        ]
+      },
+      "local": {
+        "sessions": 3,
+        "total_duration_ms": 5400000,
+        "input_tokens": 120000,
+        "output_tokens": 9500,
+        "reasoning_tokens": 2000,
+        "cached_tokens": 80000,
+        "lines_added": 240,
+        "lines_removed": 60
+      }
+    },
+    {
+      "provider": "openai",
+      "alias": "billing-key",
+      "identity": "metered",
+      "auth_method": "api_key",
+      "meter": {
+        "state": "local_only"
+      },
+      "local": {
+        "sessions": 1,
+        "total_duration_ms": 600000,
+        "input_tokens": 40000,
+        "output_tokens": 3000,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "est_cost_usd": 0.08,
+        "lines_added": 12,
+        "lines_removed": 4
+      }
+    }
+  ]
+}

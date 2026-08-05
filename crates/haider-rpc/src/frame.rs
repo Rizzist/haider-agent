@@ -230,6 +230,10 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// optional `provider` names the selected model row's provider attribute,
 /// and the next logical turn resolves through the committed pair.
 pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
+/// Daemon implements the read-only cross-provider `usage.report` snapshot:
+/// per-account OAuth meters (normalized 0–1 utilization) plus journal-derived
+/// local counters. Never carries secret material.
+pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1252,6 +1256,12 @@ pub enum RequestBody {
         provider: String,
         expected_revision: u64,
     },
+    /// Reads the cross-provider usage snapshot: one entry per known account
+    /// with normalized OAuth meter windows or honest local-only/unavailable
+    /// states, plus journal-derived local counters. Read-only, receipt-free,
+    /// and parameterless in v1.
+    #[serde(rename = "usage.report")]
+    UsageReport,
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -1509,6 +1519,12 @@ pub enum ResponseBody {
     },
     #[serde(rename = "provider.remove")]
     ProviderRemove { provider: String, revision: u64 },
+    /// Cross-provider usage snapshot (U1). Derived data only — meter
+    /// readings, aliases, display identities, local counters; never secrets.
+    #[serde(rename = "usage.report")]
+    UsageReport {
+        report: haider_protocol::usage::UsageReportV1,
+    },
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives
     /// [`ERROR_CODE_ALREADY_RESOLVED`] instead.

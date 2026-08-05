@@ -16,6 +16,9 @@ use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{
     DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
 };
+use haider_protocol::usage::{
+    AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1, UsageWindowV1,
+};
 use haider_rpc::{
     AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind,
     CommandId, DeviceCredentialCandidateWire, ERROR_CODE_ALREADY_RESOLVED,
@@ -25,7 +28,8 @@ use haider_rpc::{
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1,
     FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput,
+    FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, MenuInput,
     ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
     OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -1141,6 +1145,100 @@ pub fn transcript() -> Vec<WireFrame> {
             body: ResponseBody::AccountImportDevice {
                 descriptor: golden_oauth_descriptor(),
                 revision: 13,
+            },
+        },
+        // U1 append-only cross-provider usage report. Every earlier frame
+        // stays byte-for-byte frozen. The request is parameterless; the
+        // response carries only derived data — utilization is ALWAYS the
+        // normalized 0–1 fraction on the wire (never a raw percentage), and
+        // no field of the report can carry token/key bytes.
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-usage-report".into(),
+            daemon_generation: 13,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.70".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View]),
+            features: BTreeSet::from([FEATURE_USAGE_REPORT_V1.to_owned()]),
+        }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-usage-report"),
+            body: RequestBody::UsageReport,
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-usage-report"),
+            body: ResponseBody::UsageReport {
+                report: UsageReportV1 {
+                    generated_at_ms: 1_753_500_000_500,
+                    accounts: vec![
+                        AccountUsageReportV1 {
+                            provider: "anthropic-oauth".into(),
+                            alias: CredentialAlias::new("personal-max"),
+                            identity: Some("person@example.invalid".into()),
+                            plan: None,
+                            auth_method: AuthMethod::OAuth,
+                            meter: AccountMeterStateV1::Metered {
+                                windows: vec![
+                                    UsageWindowV1 {
+                                        window: "five_hour".into(),
+                                        utilization: 0.6,
+                                        resets_at_ms: Some(1_753_507_200_000),
+                                        label: None,
+                                    },
+                                    UsageWindowV1 {
+                                        window: "seven_day".into(),
+                                        utilization: 0.12,
+                                        resets_at_ms: Some(1_753_900_000_000),
+                                        label: None,
+                                    },
+                                ],
+                            },
+                            local: LocalUsageStatsV1 {
+                                sessions: 2,
+                                total_duration_ms: 3_600_000,
+                                input_tokens: 90_000,
+                                output_tokens: 7_000,
+                                reasoning_tokens: 1_000,
+                                cached_tokens: 60_000,
+                                est_cost_usd: None,
+                                lines_added: 120,
+                                lines_removed: 30,
+                            },
+                        },
+                        AccountUsageReportV1 {
+                            provider: "openai-oauth".into(),
+                            alias: CredentialAlias::new("work-chatgpt"),
+                            identity: Some("person@example.invalid".into()),
+                            plan: Some("plus".into()),
+                            auth_method: AuthMethod::OAuth,
+                            meter: AccountMeterStateV1::Unavailable {
+                                reason: "http_status_429".into(),
+                            },
+                            local: LocalUsageStatsV1::default(),
+                        },
+                        AccountUsageReportV1 {
+                            provider: "openai".into(),
+                            alias: CredentialAlias::new("billing-key"),
+                            identity: Some("work".into()),
+                            plan: None,
+                            auth_method: AuthMethod::ApiKey,
+                            meter: AccountMeterStateV1::LocalOnly,
+                            local: LocalUsageStatsV1 {
+                                sessions: 1,
+                                total_duration_ms: 600_000,
+                                input_tokens: 40_000,
+                                output_tokens: 3_000,
+                                reasoning_tokens: 0,
+                                cached_tokens: 0,
+                                est_cost_usd: Some(0.08),
+                                lines_added: 12,
+                                lines_removed: 4,
+                            },
+                        },
+                    ],
+                },
             },
         },
     ]
