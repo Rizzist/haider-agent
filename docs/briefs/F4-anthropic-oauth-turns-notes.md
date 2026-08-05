@@ -125,3 +125,11 @@ RESULT: ALL PASS
 Raw-byte evidence of the bold render:
 `\x1b[1m\x1b[38;2;242;242;242;48;2;15;15;15m97`. The literal `**97**`
 appears only in the echoed user message, as expected.
+
+## Review of record (coordinator, executed post-lane)
+
+| # | Mutation (seam) | Law | Observed kill |
+|---|---|---|---|
+| RV2 | Combinator strip made RECURSIVE — nested `anyOf`/`oneOf`/`allOf` silently removed from every sub-object (`wire/mod.rs anthropic_tool_schema`) | `tool_schemas_drop_top_level_combinators_for_both_auth_modes` | KILLED — running 1 test → "nested combinators are preserved (oauth=false): left: Object {}" — over-stripping would corrupt executor-validated schemas invisibly; the law pins preservation, not just top-level removal |
+
+Reverted; crate green. Lane's 4-kill campaign reviewed — no further gaps.
