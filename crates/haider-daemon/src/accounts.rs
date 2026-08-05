@@ -297,8 +297,12 @@ async fn validate_openai_compatible_key(
             kind: ValidationFailureKind::Unavailable,
             message: format!("validation staging failed: {}", error.message),
         })?;
+    // Custom-provenance origins only reach this validator (builtins keep the
+    // fixed validator set), so the G4a TrustedLan matrix applies: a stored
+    // key for a LAN Ollama/LM Studio box must validate against the origin it
+    // will actually serve from.
     let adapter =
-        OpenAiCompatibleProvider::new(handle, model, origin).map_err(map_provider_error)?;
+        OpenAiCompatibleProvider::new_custom(handle, model, origin).map_err(map_provider_error)?;
     let request = TurnRequest {
         messages: vec![Message::user_text("ping")],
         model: model.to_owned(),
@@ -5030,12 +5034,18 @@ fn build_account_provider(
                     .with_account(alias.clone()),
             )
         }
+        // G4a KEYLESS ARM: a chat-completions profile whose registry auth
+        // requirement is None (auth_methods is empty on the wire summary).
+        // Resolution supplies the placeholder bearer when no key is stored
+        // and the vault key when one exists — a stored key wins — and either
+        // way the custom adapter serves the profile origin under the
+        // TrustedLan matrix.
         (_, AuthMethod::ApiKey)
             if profile.is_some_and(|profile| {
                 matches!(
                     profile.api_family,
                     ProviderApiFamilyWire::OpenAiChatCompletions
-                )
+                ) && profile.auth_methods.is_empty()
             }) =>
         {
             let base_url = compatible_base_url.ok_or_else(|| {
@@ -5046,8 +5056,30 @@ fn build_account_provider(
                 )
             })?;
             Arc::new(
-                OpenAiCompatibleProvider::new(credential, model, base_url)
-                    .map_err(|error| adapter_construction_error(provider, error))?
+                custom_compatible_adapter(provider, credential, model, base_url)?
+                    .with_account(alias.clone()),
+            )
+        }
+        // Key-requiring custom profiles (auth requirement ApiKey). The
+        // empty-auth case belongs EXCLUSIVELY to the keyless arm above so
+        // that arm stays load-bearing.
+        (_, AuthMethod::ApiKey)
+            if profile.is_some_and(|profile| {
+                matches!(
+                    profile.api_family,
+                    ProviderApiFamilyWire::OpenAiChatCompletions
+                ) && !profile.auth_methods.is_empty()
+            }) =>
+        {
+            let base_url = compatible_base_url.ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("provider {provider} profile is missing its base_url"),
+                    false,
+                )
+            })?;
+            Arc::new(
+                custom_compatible_adapter(provider, credential, model, base_url)?
                     .with_account(alias.clone()),
             )
         }
@@ -5153,6 +5185,49 @@ fn account_openai_compatible_base_url<'a>(
             )
         })
         .and_then(|profile| profile.endpoint.as_deref().or(credential_base_url))
+}
+
+/// Builds the profile-routed compatible adapter under the provenance-correct
+/// origin policy (G4a): custom provider ids get the TrustedLan matrix; a
+/// builtin id that ever routes here (defensive — none does today) keeps the
+/// Strict fence.
+fn custom_compatible_adapter(
+    provider: &str,
+    credential: haider_accounts::SecretHandle,
+    model: &str,
+    base_url: &str,
+) -> Result<OpenAiCompatibleProvider, HaiderError> {
+    if haider_provider::BUILTIN_PROVIDER_NAMES.contains(&provider) {
+        OpenAiCompatibleProvider::new(credential, model, base_url)
+    } else {
+        OpenAiCompatibleProvider::new_custom(credential, model, base_url)
+    }
+    .map_err(|error| adapter_construction_error(provider, error))
+}
+
+/// The placeholder bearer for auth-None profiles (G4a): ollama's OpenAI
+/// compat layer wants a non-empty key — the community convention is the
+/// literal `ollama` — and LM Studio ignores the header when auth is off.
+pub(crate) const KEYLESS_PLACEHOLDER_BEARER: &[u8] = b"ollama";
+
+/// Mints the placeholder credential through the same vault machinery every
+/// real secret uses, so the handle's redaction/zeroization laws hold.
+fn keyless_placeholder_credential() -> Result<haider_accounts::SecretHandle, HaiderError> {
+    let staging = MemoryVault::default();
+    let alias = CredentialAlias::new("keyless-placeholder");
+    staging
+        .put(&alias, KEYLESS_PLACEHOLDER_BEARER)
+        .and_then(|()| staging.resolve(&alias))
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!(
+                    "could not stage the keyless placeholder credential: {}",
+                    error.message
+                ),
+                false,
+            )
+        })
 }
 
 fn adapter_construction_error(
@@ -5280,6 +5355,48 @@ impl AccountsProviderFactory {
             .build_profile_descriptor(profile.as_ref(), descriptor, credential, model)
     }
 
+    /// G4a keyless resolution: an ENABLED custom chat-completions profile
+    /// whose auth requirement is None (empty `auth_methods` on the wire
+    /// summary) serves turns WITHOUT any stored credential — a synthesized
+    /// descriptor at the profile origin plus the placeholder bearer. This
+    /// runs only after account resolution reported `CredentialMissing`, so
+    /// a stored key always wins.
+    fn keyless_account(
+        &self,
+        provider: &str,
+    ) -> Option<(ResolvedAccount, haider_accounts::SecretHandle)> {
+        if haider_provider::BUILTIN_PROVIDER_NAMES.contains(&provider) {
+            return None;
+        }
+        let profile = self.provider_profile(provider)?;
+        if !matches!(
+            profile.api_family,
+            ProviderApiFamilyWire::OpenAiChatCompletions
+        ) || !profile.auth_methods.is_empty()
+            || !profile.enabled
+        {
+            return None;
+        }
+        let base_url = profile.endpoint.clone()?;
+        let descriptor = CredentialDescriptor {
+            alias: CredentialAlias::new(format!("{provider}-keyless")),
+            provider: provider.to_owned(),
+            base_url: Some(base_url),
+            auth_method: AuthMethod::ApiKey,
+            identity: "keyless local endpoint".to_owned(),
+            status: CredentialStatus::Ok,
+            active: true,
+        };
+        let credential = keyless_placeholder_credential().ok()?;
+        Some((
+            ResolvedAccount {
+                descriptor,
+                rotation: None,
+            },
+            credential,
+        ))
+    }
+
     async fn resolve_account(
         &self,
         provider: &str,
@@ -5375,7 +5492,22 @@ impl AccountsProviderFactory {
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
     ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>), HaiderError> {
-        let mut resolved = self.resolve_account(&metadata.provider, None).await?;
+        let mut resolved = match self.resolve_account(&metadata.provider, None).await {
+            Ok(resolved) => resolved,
+            // G4a: no credential AT ALL for an auth-None custom profile is
+            // the keyless case, not an error. Any other failure — including
+            // CredentialMissing for a provider that DOES require auth —
+            // propagates unchanged.
+            Err(error) if error.code == ErrorCode::CredentialMissing => {
+                let Some((resolved, credential)) = self.keyless_account(&metadata.provider) else {
+                    return Err(error);
+                };
+                let provider =
+                    self.build_provider(&resolved.descriptor, credential, &metadata.model)?;
+                return Ok((resolved, provider, None));
+            }
+            Err(error) => return Err(error),
+        };
         let credential = match self.resolve_secret(&resolved.descriptor).await {
             Ok(credential) => credential,
             Err(error) => {

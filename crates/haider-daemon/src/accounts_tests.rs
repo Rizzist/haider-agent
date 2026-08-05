@@ -402,6 +402,250 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     );
 }
 
+fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
+    ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        endpoint: Some(origin.to_owned()),
+        models: vec!["llama3.1:8b".to_owned()],
+        model_details: vec![ModelDetailWire {
+            name: "llama3.1:8b".to_owned(),
+            context_window: None,
+        }],
+        auth_methods: Vec::new(),
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("llama3.1:8b".to_owned()),
+        enabled: true,
+    }
+}
+
+/// LAW (LK1 — keyless auth arm, G4a): an ENABLED custom chat-completions
+/// profile whose auth requirement is None resolves a turn provider WITHOUT
+/// any stored credential — the synthesized `{provider}-keyless` account with
+/// the placeholder bearer `ollama` (the compat-layer convention; LM Studio
+/// ignores it) built by the factory's keyless arm at the profile origin.
+/// When the user DOES store a key for the same profile, the stored key wins:
+/// resolution returns the vault-backed alias, never the synthesized one.
+///
+/// MUTATION CHECK: delete the `keyless_account` fallback in
+/// `resolve_provider`. Expected runtime failure: the no-credential
+/// resolution below reports CredentialMissing.
+/// MUTATION CHECK: delete the keyless (empty-auth) arm from
+/// `build_account_provider`. Expected runtime failure: both resolutions
+/// below report "no account-backed adapter" (the key-requiring arm
+/// deliberately excludes empty-auth profiles).
+/// MUTATION CHECK: change `KEYLESS_PLACEHOLDER_BEARER`. Expected runtime
+/// failure: the placeholder equality below.
+#[tokio::test]
+async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
+    let provider = "ollama";
+    let origin = "http://127.0.0.1:11434/v1";
+    let summary = keyless_summary(provider, origin);
+    let metadata = haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/keyless-dispatch".to_owned(),
+        provider: provider.to_owned(),
+        model: "llama3.1:8b".to_owned(),
+        max_tokens: 64,
+        permission_overrides: None,
+        system_prompt_version: None,
+        title: None,
+        created_at_ms: 1,
+    };
+
+    // The placeholder rides the same handle machinery as real secrets and
+    // carries exactly the compat convention bytes.
+    assert_eq!(KEYLESS_PLACEHOLDER_BEARER, b"ollama");
+    let placeholder = keyless_placeholder_credential().expect("placeholder credential");
+    assert_eq!(placeholder.expose_secret(), b"ollama");
+
+    // NO stored credential anywhere: resolution synthesizes the keyless
+    // account instead of failing CredentialMissing.
+    let vault = Arc::new(MemoryVault::default());
+    let snapshot = Arc::new(StdMutex::new(Vec::new()));
+    let management = ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]);
+    let factory = AccountsProviderFactory::new_with_management(
+        snapshot,
+        management,
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    );
+    let resolved = factory
+        .resolve_for_turn(&metadata)
+        .await
+        .expect("keyless dispatch");
+    assert_eq!(resolved.provider_name, provider);
+    assert_eq!(resolved.account_alias.as_deref(), Some("ollama-keyless"));
+    assert!(resolved.initial_rotation.is_none());
+
+    // A STORED KEY WINS: with an active vault-backed descriptor for the same
+    // auth-None profile, resolution returns it and never synthesizes.
+    let alias = CredentialAlias::new("ollama-key");
+    let vault = Arc::new(MemoryVault::default());
+    vault
+        .put(&alias, b"stored-key-sentinel")
+        .expect("seed stored key");
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: provider.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "stored ollama key".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let management = ManagementSnapshot::new(0, vec![descriptor], vec![summary]);
+    let factory = AccountsProviderFactory::new_with_management(
+        snapshot,
+        management,
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    );
+    let resolved = factory
+        .resolve_for_turn(&metadata)
+        .await
+        .expect("stored-key dispatch");
+    assert_eq!(resolved.account_alias.as_deref(), Some(alias.as_str()));
+}
+
+/// LAW (LK1 refusal edge): the keyless fallback is SCOPED — a provider whose
+/// profile requires a key (auth_methods non-empty) still fails
+/// CredentialMissing with no stored credential, and a DISABLED auth-None
+/// profile is not served either.
+#[tokio::test]
+async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
+    let keyed = ProviderSummaryWire {
+        auth_methods: vec![AuthMethod::ApiKey],
+        ..keyless_summary("hf-proxy", "http://127.0.0.1:9000/v1")
+    };
+    let disabled = ProviderSummaryWire {
+        enabled: false,
+        ..keyless_summary("ollama-off", "http://127.0.0.1:11434/v1")
+    };
+    for summary in [keyed, disabled] {
+        let provider = summary.provider.clone();
+        let factory = AccountsProviderFactory::new_with_management(
+            Arc::new(StdMutex::new(Vec::new())),
+            ManagementSnapshot::new(0, Vec::new(), vec![summary]),
+            VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+            Arc::new(ProductionAccountBuilder),
+        );
+        let Err(error) = factory
+            .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+                cwd: "/tmp/keyless-scope".to_owned(),
+                provider: provider.clone(),
+                model: "llama3.1:8b".to_owned(),
+                max_tokens: 64,
+                permission_overrides: None,
+                system_prompt_version: None,
+                title: None,
+                created_at_ms: 1,
+            })
+            .await
+        else {
+            panic!("out-of-scope profile `{provider}` must not resolve keyless");
+        };
+        assert_eq!(error.code, ErrorCode::CredentialMissing, "{provider}");
+    }
+}
+
+/// LAW (LK2 — preset configure + discovery, G4a): a keyless preset's
+/// `provider.configure` persists the registry profile with the exact
+/// identity (chat-completions family, auth None, Custom provenance, the
+/// stated origin); `catalog_source` routes it to the credential-free
+/// OpenAI-compatible source; and PRODUCTION discovery against a mock
+/// loopback `/v1/models` populates the inventory and flips the summary
+/// Available. Before discovery the enabled profile is honestly Unavailable
+/// (the inventory rule).
+///
+/// MUTATION CHECK: refuse auth-None customs in `catalog_source` (require
+/// ApiKey). Expected runtime failure: the source assertion below.
+/// MUTATION CHECK: require a credential for compatible discovery. Expected
+/// runtime failure: `discover_models(source, None, None)` errors.
+#[tokio::test]
+async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_available() {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind mock models server");
+    let origin = format!(
+        "http://127.0.0.1:{}/v1",
+        listener.local_addr().expect("mock addr").port()
+    );
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept discovery");
+        let mut request = [0_u8; 2048];
+        let _ = socket.read(&mut request).await.expect("read discovery");
+        let body = br#"{"object":"list","data":[{"id":"llama3.1:8b"},{"id":"qwen3:4b"}]}"#;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.expect("write head");
+        socket.write_all(body).await.expect("write body");
+    });
+
+    let store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let mut providers = ProviderRegistry::new(
+        store,
+        Vec::new(),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("registry");
+    let profile = providers
+        .configure(ProviderConfigureInput {
+            provider: "ollama".to_owned(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some(origin.clone()),
+            auth_requirement: Some(ProviderAuthRequirementWire::None),
+            enabled: true,
+            models: vec!["llama3.1:8b".to_owned()],
+            default_model: Some("llama3.1:8b".to_owned()),
+        })
+        .expect("keyless preset configure");
+    assert_eq!(
+        profile.api_family,
+        ProviderApiFamilyWire::OpenAiChatCompletions
+    );
+    assert_eq!(profile.auth_requirement, ProviderAuthRequirementWire::None);
+    assert_eq!(profile.provenance, ProviderProvenance::Custom);
+    assert_eq!(profile.base_url.as_deref(), Some(origin.as_str()));
+
+    let (source, auth) = catalog_source("ollama", &providers).expect("keyless catalog source");
+    assert_eq!(
+        source,
+        CatalogSource::OpenAiCompatible {
+            origin: origin.clone()
+        }
+    );
+    assert_eq!(auth, ProviderAuthRequirementWire::None);
+
+    let before = providers.summary("ollama").expect("pre-discovery summary");
+    assert_eq!(
+        before.availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable,
+        "no discovered inventory yet"
+    );
+    assert!(before.auth_methods.is_empty());
+
+    let catalog = discover_models(source, None, None)
+        .await
+        .expect("credential-free mock discovery");
+    server.await.expect("mock server served one request");
+    providers.replace_models("ollama".to_owned(), catalog.models);
+
+    let after = providers.summary("ollama").expect("post-discovery summary");
+    assert_eq!(
+        after.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert_eq!(
+        after.models,
+        vec!["llama3.1:8b".to_owned(), "qwen3:4b".to_owned()]
+    );
+    assert_eq!(after.default_model.as_deref(), Some("llama3.1:8b"));
+}
+
 /// MUTATION CHECK (review of record, W5b retrospective): weaken any component
 /// of the generation/issuer/audience/resource/subject-hash fence in
 /// `apply_oauth_refresh`, `expire_oauth_refresh`, or `begin_oauth_refresh`.

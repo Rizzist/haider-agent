@@ -710,6 +710,50 @@ fn compatible_provider_with_resolver(
         .with_account(alias)
 }
 
+/// LAW (LK1 golden half — the placeholder Bearer is SENT): a custom adapter
+/// holding the daemon's keyless placeholder secret (`ollama`) emits exactly
+/// `Authorization: Bearer ollama` on both the models probe and the chat
+/// POST at a loopback literal origin — the header shape ollama's compat
+/// layer requires and LM Studio ignores.
+///
+/// MUTATION CHECK: blank the credential bytes in `authorization_header` (or
+/// drop the secret concatenation). Expected RUNTIME failure: the exact
+/// header equality below.
+#[tokio::test]
+async fn lk1_keyless_placeholder_bearer_reaches_the_wire_header() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("ollama-keyless");
+    vault.put(&alias, b"ollama").expect("store placeholder");
+    let credential = vault.resolve(&alias).expect("resolve placeholder");
+    let provider =
+        OpenAiCompatibleProvider::new_custom(credential, "llama3.1:8b", "http://127.0.0.1:11434")
+            .expect("custom loopback adapter")
+            .with_account(alias);
+
+    let get = provider
+        .http
+        .get_request(&provider.models_url)
+        .await
+        .expect("models probe request");
+    assert_eq!(
+        get.headers().get(AUTHORIZATION).expect("bearer on GET"),
+        "Bearer ollama"
+    );
+
+    let post = provider
+        .http
+        .post_json_request(
+            &provider.chat_url,
+            &serde_json::json!({"model":"llama3.1:8b"}),
+        )
+        .await
+        .expect("chat POST request");
+    assert_eq!(
+        post.headers().get(AUTHORIZATION).expect("bearer on POST"),
+        "Bearer ollama"
+    );
+}
+
 fn custom_provider_with_resolver(
     secret: &[u8],
     base_url: impl AsRef<str>,
