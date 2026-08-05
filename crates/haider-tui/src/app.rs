@@ -3171,9 +3171,10 @@ impl AppModel {
         dropped
     }
 
-    /// `/attach <path>` (B4b): chip the draft with one image, uploaded
-    /// ahead of the submit. Every refusal is an honest notice; the read
-    /// itself is shell-owned ([`AppRequest::AttachRead`]).
+    /// `/attach <path>` (B4b + G2): chip the draft with one image or one
+    /// UTF-8 text file, uploaded ahead of the submit. Every refusal is an
+    /// honest notice; the read itself is shell-owned
+    /// ([`AppRequest::AttachRead`]).
     fn attach_command(&mut self, remainder: &str) {
         if self.screen != Screen::Session {
             self.flash = Some("· /attach — session only".to_owned());
@@ -3198,7 +3199,7 @@ impl AppModel {
         }
         let path = remainder.trim();
         if path.is_empty() {
-            self.flash = Some("· /attach — give an image path".to_owned());
+            self.flash = Some("· /attach — give a file path".to_owned());
             self.dirty = true;
             return;
         }

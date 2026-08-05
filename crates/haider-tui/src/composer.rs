@@ -48,6 +48,10 @@ pub enum PendingKind {
     /// The big-paste pill — UTF-8 pasted text stored by ref, never copied
     /// into the tree (tool.rs's intended composer-token vocabulary).
     PastedText { lines: u32 },
+    /// `/attach <path>` text fallback (G2) — a UTF-8 file stored by ref.
+    /// Carries the sanitized BASENAME because the wire block names the
+    /// file for the model; the chip shows `name · N lines`.
+    File { name: String, lines: u32 },
 }
 
 /// One attachment the draft will carry on its next submit (B4b).
@@ -84,6 +88,11 @@ impl PendingAttachment {
             },
             PendingKind::PastedText { lines } => AttachmentBlock::PastedText {
                 artifact,
+                lines: *lines,
+            },
+            PendingKind::File { name, lines } => AttachmentBlock::File {
+                artifact,
+                name: name.clone(),
                 lines: *lines,
             },
         })

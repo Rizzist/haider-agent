@@ -46,7 +46,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     // daemon-CAS truth — demo and feature-ungated daemons refuse honestly.
     session_cmd(
         "attach",
-        "Attach an image — uploaded now, rides your next message",
+        "Attach a file — image or UTF-8 text, uploaded now, rides your next message",
         "<path>",
     ),
     cmd("sessions", "List sessions — attach, or start fresh", ""),
