@@ -592,10 +592,9 @@ fn status_bar_shows_q_turn_while_queue_mode_holds() {
     );
     model.queue_mode = true;
     let rows = draw(&model, 118, 34);
-    assert!(
-        rows.iter()
-            .any(|row| row.contains("fable-5 · anthropic · main · q:turn"))
-    );
+    // F2c: the identity block moved to the composer rule; the bar keeps
+    // state · tokens · branch, and the queue tag rides the branch.
+    assert!(rows.iter().any(|row| row.contains("· main · q:turn")));
 }
 
 /// MUTATION CHECK: drop the zero-option ask interception from the

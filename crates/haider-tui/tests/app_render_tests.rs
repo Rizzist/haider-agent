@@ -152,7 +152,16 @@ fn session_screen_shows_transcript_and_meter() {
     assert!(text.contains("✓ fs_patch crates/haider-store/src/event_store.rs +4 −1"));
     assert!(text.contains("IDLE"));
     assert!(text.contains("17% of 200k"));
-    assert!(text.contains("fable-5 · anthropic"));
+    // F2c: the identity lives on the composer's TOP RULE (right end),
+    // not the status bar — and the alias never rides it.
+    assert!(
+        text.contains(" fable-5"),
+        "the top-rule identity names the model"
+    );
+    assert!(
+        !text.contains("fable-5 · anthropic"),
+        "the status bar's old model · provider block is retired"
+    );
 }
 
 #[test]
@@ -519,7 +528,13 @@ fn status_bar_has_boxed_chips_and_hint() {
     ))));
     let (text, _) = draw(&model, 118, 34);
     assert!(text.contains("[ IDLE ]"), "boxed state chip");
-    assert!(text.contains("fable-5 · anthropic"));
+    // F2c: the identity moved to the composer's top rule; the token meter
+    // sits directly right of the state.
+    assert!(text.contains(" fable-5"), "top-rule identity");
+    assert!(
+        !text.contains("fable-5 · anthropic"),
+        "no model · provider block beside the state"
+    );
     assert!(text.contains("[ ◉ voice · whisper→openai ]"), "voice chip");
     assert!(text.contains("/help · theme dark"), "launcher hint");
 }

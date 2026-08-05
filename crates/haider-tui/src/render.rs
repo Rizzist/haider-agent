@@ -4194,12 +4194,28 @@ fn render_composer(
     if row_area.height == 0 {
         return;
     }
+    // F2c: the band's TOP BORDER carries the session identity at its
+    // right end — `model · oauth|api · reasoning [· fast]`, NO alias —
+    // right above the talk chip; the status bar keeps state + tokens.
+    // Width degradation drops whole segments (reasoning first, then
+    // auth, then the line) — never mid-word garbage.
+    let rule_width = rule_area.width as usize;
+    let identity_text = model
+        .composer_identity(rule_width.saturating_sub(6))
+        .map(|identity| format!(" {identity} "));
+    let rule_line = match identity_text {
+        Some(text) if rule_width > text.chars().count() + 2 => {
+            let fill = rule_width - text.chars().count() - 2;
+            Line::from(vec![
+                Span::styled("─".repeat(fill), theme.gold_style()),
+                Span::styled(text, theme.dim_style()),
+                Span::styled("──", theme.gold_style()),
+            ])
+        }
+        _ => Line::styled("─".repeat(rule_width), theme.gold_style()),
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            "─".repeat(rule_area.width as usize),
-            theme.gold_style(),
-        ))
-        .style(theme.text_style()),
+        Paragraph::new(rule_line).style(theme.text_style()),
         rule_area,
     );
     // Ground the WHOLE region in inputBg before any text lands, so every row
@@ -4783,29 +4799,25 @@ fn render_status_bar(
     } else {
         (badge_chrome, theme.badge_style(tone))
     };
+    // F2c: token usage sits DIRECTLY right of the state — the identity
+    // block (model / auth / reasoning) moved to the composer's top rule.
+    // Narrow dignity: the meter YIELDS whole when the bar cannot hold it
+    // beside the badge (the badge always survives, never clipped chrome).
+    let badge_cells = 1 + badge.chars().count() + 4;
     left.extend(chip_two_tone(badge, badge_chrome, badge_ink));
-    // Sim `.mid`: model · provider, plus the branch name inside a session,
-    // plus ` · q:turn` while queue mode holds (tui.js:2840-2842). B2b: the
-    // ACTIVE branch's name — "main" on the main branch, the daemon-named
-    // fork otherwise.
-    let branch = if model.screen == Screen::Session {
-        format!(" · {}", model.active_branch_name())
-    } else {
-        String::new()
-    };
-    let queue_tag = if model.queue_mode && model.screen == Screen::Session {
-        " · q:turn"
-    } else {
-        ""
-    };
-    left.push(Span::styled(
-        format!(
-            "  {} · {}{branch}{queue_tag}",
-            identity.model_short, identity.provider
-        ),
-        theme.text_style(),
-    ));
-    left.push(Span::styled(format!("  {meter}  "), theme.dim_style()));
+    if badge_cells + 2 + meter.chars().count() <= area.width as usize {
+        left.push(Span::styled(format!("  {meter}  "), theme.dim_style()));
+    }
+    // The branch name inside a session, plus ` · q:turn` while queue mode
+    // holds (tui.js:2840-2842). B2b: the ACTIVE branch's name — "main" on
+    // the main branch, the daemon-named fork otherwise.
+    if model.screen == Screen::Session {
+        let queue_tag = if model.queue_mode { " · q:turn" } else { "" };
+        left.push(Span::styled(
+            format!("· {}{queue_tag}  ", model.active_branch_name()),
+            theme.text_style(),
+        ));
+    }
     // Sim `.voice` (tui.js:5511-5520): FRAME border, gold label —
     // `◉ listening…` during a talk hold, the pipeline label otherwise
     // (tui.js:2846-2850); hidden entirely while voice is off.

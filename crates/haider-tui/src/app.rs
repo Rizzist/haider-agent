@@ -2218,6 +2218,11 @@ pub struct IdentityLine {
     pub account: String,
     pub device: String,
     pub context_window: u64,
+    /// Reasoning level, when the daemon has declared one for the session
+    /// (F2c). `None` renders nothing — never a guess.
+    pub reasoning: Option<String>,
+    /// Fast-mode marker (F2c): rides the reasoning segment when active.
+    pub fast: bool,
 }
 
 impl Default for IdentityLine {
@@ -2228,6 +2233,8 @@ impl Default for IdentityLine {
             account: "none · /login".to_owned(),
             device: local_device_name().to_owned(),
             context_window: 200_000,
+            reasoning: None,
+            fast: false,
         }
     }
 }
@@ -4605,6 +4612,75 @@ impl AppModel {
             self.identity.context_window = window;
             self.dirty = true;
         }
+    }
+
+    /// The auth flavor of the CURRENT identity pair — `oauth` or `api` —
+    /// so the user knows what is getting metered (F2c). Derivation, in
+    /// truth order: the provider key's own encoding (`*-oauth`), the
+    /// selected account's method for that provider, then a provider
+    /// registry row that declares exactly one method. Ambiguity renders
+    /// nothing — never a guess.
+    #[must_use]
+    pub fn identity_auth_label(&self) -> Option<&'static str> {
+        use haider_protocol::credential::AuthMethod;
+        let provider = &self.identity.provider;
+        if provider.ends_with("-oauth") {
+            return Some("oauth");
+        }
+        if let Some(row) = self
+            .accounts
+            .rows
+            .iter()
+            .find(|row| row.provider == *provider && row.selected)
+        {
+            return Some(match row.method {
+                AuthMethod::OAuth => "oauth",
+                AuthMethod::ApiKey => "api",
+            });
+        }
+        match self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == *provider)
+            .map(|summary| summary.auth_methods.as_slice())
+        {
+            Some([AuthMethod::OAuth]) => Some("oauth"),
+            Some([AuthMethod::ApiKey]) => Some("api"),
+            _ => None,
+        }
+    }
+
+    /// The composer-top-rule identity (F2c): `model · oauth|api ·
+    /// reasoning [· fast]` — NO alias, right-aligned on the band's top
+    /// border by the renderer.
+    ///
+    /// WIDTH-DEGRADATION LAW: segments drop WHOLE, never truncated
+    /// mid-word — the reasoning segment (its fast marker riding it)
+    /// drops first, then the auth label, then the whole line; the model
+    /// name is all-or-nothing.
+    #[must_use]
+    pub fn composer_identity(&self, budget: usize) -> Option<String> {
+        let model = self.identity.model_short.as_str();
+        let auth = self.identity_auth_label();
+        let reasoning = self.identity.reasoning.as_ref().map(|level| {
+            if self.identity.fast {
+                format!("{level} · fast")
+            } else {
+                level.clone()
+            }
+        });
+        let mut candidates: Vec<String> = Vec::new();
+        if let (Some(auth), Some(reasoning)) = (auth, reasoning.as_ref()) {
+            candidates.push(format!("{model} · {auth} · {reasoning}"));
+        }
+        if let Some(auth) = auth {
+            candidates.push(format!("{model} · {auth}"));
+        }
+        candidates.push(model.to_owned());
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.chars().count() <= budget && !candidate.is_empty())
     }
 
     /// Daemon-truth identity bootstrap (W5f-2): until the user pins a
