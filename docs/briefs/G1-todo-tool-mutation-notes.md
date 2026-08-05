@@ -62,3 +62,17 @@ repair) add margin.
 Post-campaign: working tree clean against the committed implementation;
 the touched suites re-ran green (haider-tools 8/8 todo_write tests,
 haider-core todo_write_runtime_tests 5/5, haider-daemon g1 5/5).
+
+## Review of record (coordinator, executed post-lane)
+
+Read the full branch diff (tool surface, actor lifecycle, worker registry,
+laws, goldens). One structurally-unobserved gate found and closed:
+
+| # | Mutation (seam) | Verdict on lane's laws | Resolution |
+|---|---|---|---|
+| RM1 | Drop the `plan.run_id == *run_id` filter in `emit_plan_facts` (actor.rs:2549) — the documented "stale lifecycle never leaks across runs" invariant | SURVIVED — all 5 core laws, all 5 daemon laws, all 22 projection tests stay green with run-scoping deleted | New pin `an_unfinished_plan_does_not_leak_into_the_next_run` (core, stages an unfinished plan then a second run; asserts a fresh Started with a distinct item id). Kill verified: "running 1 test" observed; run 2's first plan fact became a Completed under run 1's item id, both asserts failed. Reverted; 6/6 green |
+
+Lane's own 6 kills spot-checked against the notes; no discrepancies. The
+lane's deviations (lifecycle vs run scoping, clear-commits-no-node, wider
+key repair, typed rejection, daemond inventory re-anchor) all verified
+in-diff and correctly documented. Ledger 1925 -> 1926 with this pin.

@@ -391,3 +391,83 @@ async fn empty_list_is_a_noop_when_nothing_listed_and_a_clear_after_a_list() {
         .count();
     assert_eq!(ok_echoes, 4);
 }
+
+/// Review pin (coordinator, G1 review of record): the plan lifecycle is
+/// RUN-SCOPED. An unfinished plan from run 1 does not leak into run 2 — the
+/// next run's first `todo_write` starts a FRESH lifecycle with its own
+/// Started{Plan} fact and a different item id, so every run's plan facts are
+/// self-contained (branch/checkpoint replay slices a run and must find the
+/// Started).
+/// MUTATION CHECK (executed): drop the `plan.run_id == *run_id` filter in
+/// `emit_plan_facts`. Expected RUNTIME failure: run 2's first plan fact
+/// becomes a Completed under run 1's item id — the second-Started assert and
+/// the distinct-id assert below both fail.
+#[tokio::test]
+async fn an_unfinished_plan_does_not_leak_into_the_next_run() {
+    let mut script = Vec::new();
+    script.extend(todo_call(
+        "plan-r1",
+        serde_json::json!([
+            { "id": 0, "text": "scope entrypoints", "state": "processing" },
+            { "id": 1, "text": "patch run loop", "state": "listed", "dep": 0 },
+        ]),
+    ));
+    script.extend([
+        FakeStep::EmitText {
+            text: "pausing here".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    script.extend(todo_call(
+        "plan-r2",
+        serde_json::json!([
+            { "id": 0, "text": "scope entrypoints", "state": "completed" },
+            { "id": 1, "text": "patch run loop", "state": "processing", "dep": 0 },
+        ]),
+    ));
+    script.extend([
+        FakeStep::EmitText {
+            text: "resuming the plan".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let (handle, store) = actor(script);
+    run_to_done(&handle, "start the refactor").await;
+    run_to_done(&handle, "keep going").await;
+    let payloads = typed_payloads(&store).await;
+    let plans = plan_events(&payloads);
+    assert_eq!(plans.len(), 2, "one Started per run, nothing else");
+    let (
+        ItemEvent::Started {
+            item_id: first_run_id,
+            ..
+        },
+        _,
+    ) = plans[0]
+    else {
+        panic!("run 1's plan fact must be Started, got {:?}", plans[0].0);
+    };
+    let (
+        ItemEvent::Started {
+            item_id: second_run_id,
+            item: TurnItem::Plan { items },
+        },
+        _,
+    ) = plans[1]
+    else {
+        panic!(
+            "run 2's first plan fact must be a fresh Started, got {:?}",
+            plans[1].0
+        );
+    };
+    assert_ne!(
+        first_run_id, second_run_id,
+        "a new run mints a fresh plan item id"
+    );
+    assert_eq!(items[0].state, TodoState::Completed);
+    assert_eq!(items[1].state, TodoState::Processing);
+}
