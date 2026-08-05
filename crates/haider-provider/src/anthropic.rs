@@ -23,6 +23,37 @@ use crate::{
 
 pub const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 pub const ANTHROPIC_OAUTH_PROVIDER_NAME: &str = "anthropic-oauth";
+/// G4b enterprise: Claude on AWS Bedrock over the mantle bearer surface.
+/// Classic InvokeModel + SigV4 + AWS event-stream are deliberately out of
+/// scope — the mantle endpoint speaks the REAL Messages API over standard
+/// SSE with an `x-api-key` bearer.
+pub const BEDROCK_PROVIDER_NAME: &str = "bedrock";
+/// G4b enterprise: Claude on GCP Vertex via `:streamRawPredict`.
+pub const VERTEX_PROVIDER_NAME: &str = "vertex";
+/// Mantle base URL for the default region (`us-east-1`) — the registry seed.
+pub const BEDROCK_MANTLE_DEFAULT_BASE_URL: &str =
+    "https://bedrock-mantle.us-east-1.api.aws/anthropic";
+/// The `anthropic_version` BODY field Vertex requires in place of `model`.
+pub const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
+/// Documented mantle model set (no discovery API exists) — the registry
+/// seeds `configured_models` with these; the list stays user-editable.
+pub const BEDROCK_SEED_MODELS: [&str; 6] = [
+    "anthropic.claude-fable-5",
+    "anthropic.claude-opus-5",
+    "anthropic.claude-opus-4-8",
+    "anthropic.claude-opus-4-7",
+    "anthropic.claude-sonnet-5",
+    "anthropic.claude-haiku-4-5",
+];
+/// Documented Claude-on-Vertex model set (no models API) — newer models are
+/// plain slugs, older ones carry the Vertex `@date` suffix.
+pub const VERTEX_SEED_MODELS: [&str; 5] = [
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-5@20250929",
+    "claude-haiku-4-5@20251001",
+];
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_OAUTH_BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_OAUTH_BETA_HEADER: &str = "anthropic-beta";
@@ -69,6 +100,7 @@ pub struct AnthropicProvider {
     model: String,
     api_url: String,
     auth_mode: AnthropicAuthMode,
+    endpoint_shape: AnthropicEndpointShape,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
     /// Session-selected effort (G3), injected as `output_config.effort`.
     /// The DAEMON gates it at construction: post-switch stale levels clamp
@@ -86,6 +118,21 @@ pub struct AnthropicProvider {
 enum AnthropicAuthMode {
     ApiKey,
     OAuthBearer,
+    /// G4b Vertex: a plain `Authorization: Bearer` GCP access token — no
+    /// OAuth beta header and no Claude Code system-identity shape.
+    CloudBearer,
+}
+
+/// Which endpoint dialect the adapter speaks (G4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicEndpointShape {
+    /// `POST {base}/v1/messages`, model in the body, `anthropic-version`
+    /// header. The first-party API and the Bedrock mantle both speak this.
+    Standard,
+    /// Vertex `:streamRawPredict`: the MODEL rides in the URL, the body
+    /// carries `anthropic_version` INSTEAD of `model`, and no
+    /// `anthropic-version` header is sent.
+    Vertex,
 }
 
 /// Raw response returned only to the explicit fixture-promotion harness.
@@ -139,6 +186,39 @@ impl AnthropicProvider {
         )
     }
 
+    /// Constructs the Bedrock-mantle adapter (G4b, LB2): the base URL must
+    /// match the mantle shape `https://bedrock-mantle.{region}.api.aws/
+    /// anthropic` EXACTLY — any other endpoint is refused so the `x-api-key`
+    /// bearer can never be redirected off the mantle surface. The wire is
+    /// the standard Messages dialect at `{base}/v1/messages`.
+    pub fn new_endpoint(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        let base = validate_bedrock_mantle_base_url(base_url)?;
+        let mut provider = Self::new_with_auth(credential, model, AnthropicAuthMode::ApiKey, None)?;
+        provider.api_url = format!("{base}/v1/messages");
+        Ok(provider)
+    }
+
+    /// Constructs the Claude-on-Vertex adapter (G4b, LV1): the base URL must
+    /// match the Vertex publishers-models shape; the request URL appends
+    /// `/{model}:streamRawPredict`, the body drops `model` and carries
+    /// `anthropic_version` instead, and auth is a plain GCP Bearer token.
+    pub fn new_vertex(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        let base = validate_vertex_models_base_url(base_url)?;
+        let mut provider =
+            Self::new_with_auth(credential, model, AnthropicAuthMode::CloudBearer, None)?;
+        provider.endpoint_shape = AnthropicEndpointShape::Vertex;
+        provider.api_url = format!("{base}/{}:streamRawPredict", provider.model);
+        Ok(provider)
+    }
+
     fn new_with_auth(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -169,6 +249,7 @@ impl AnthropicProvider {
             model: model.into(),
             api_url: ANTHROPIC_API_URL.into(),
             auth_mode,
+            endpoint_shape: AnthropicEndpointShape::Standard,
             fixed_origin_guard,
             effort: None,
             fast: false,
@@ -253,10 +334,30 @@ impl AnthropicProvider {
     ) -> Result<serde_json::Value, ProviderError> {
         self.validate_model(request)?;
         let system_shape = match self.auth_mode {
-            AnthropicAuthMode::ApiKey => AnthropicSystemShape::ApiKey,
+            AnthropicAuthMode::ApiKey | AnthropicAuthMode::CloudBearer => {
+                AnthropicSystemShape::ApiKey
+            }
             AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
         };
-        request_json(request, system_shape, self.effort.as_deref(), self.fast)
+        let mut payload = request_json(request, system_shape, self.effort.as_deref(), self.fast)?;
+        // G4b Vertex wire deltas (LV1): the model is URL-addressed, so the
+        // body DROPS `model` and carries `anthropic_version` in its place —
+        // the Vertex replacement for the standard `anthropic-version`
+        // header, which this shape never sends.
+        if self.endpoint_shape == AnthropicEndpointShape::Vertex {
+            let Some(object) = payload.as_object_mut() else {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "Anthropic request payload was not a JSON object",
+                ));
+            };
+            object.remove("model");
+            object.insert(
+                "anthropic_version".into(),
+                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.into()),
+            );
+        }
+        Ok(payload)
     }
 
     /// Records one raw response for the ignored promotion harness.
@@ -334,8 +435,13 @@ impl AnthropicProvider {
             .client
             .post(&self.api_url)
             .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "text/event-stream")
-            .header("anthropic-version", ANTHROPIC_VERSION);
+            .header(ACCEPT, "text/event-stream");
+        // The `anthropic-version` header belongs to the Standard dialect
+        // (first-party API and Bedrock mantle alike, LB1); Vertex versions
+        // through the `anthropic_version` BODY field instead (LV1).
+        if self.endpoint_shape == AnthropicEndpointShape::Standard {
+            request = request.header("anthropic-version", ANTHROPIC_VERSION);
+        }
         request = match self.auth_mode {
             AnthropicAuthMode::ApiKey => {
                 let request = request.header("x-api-key", self.api_key_header()?);
@@ -357,6 +463,11 @@ impl AnthropicProvider {
                 request
                     .header(AUTHORIZATION, self.authorization_header()?)
                     .header(ANTHROPIC_OAUTH_BETA_HEADER, beta)
+            }
+            // G4b Vertex: a bare GCP Bearer token — no beta header ever
+            // (fast is Claude-API-only and the factory never sets it here).
+            AnthropicAuthMode::CloudBearer => {
+                request.header(AUTHORIZATION, self.authorization_header()?)
             }
         };
         request.json(payload).build().map_err(transport_error)
@@ -386,6 +497,7 @@ impl Provider for AnthropicProvider {
             AnthropicAuthMode::OAuthBearer => {
                 crate::ProviderCredentialSurface::OAuthSubscriptionBearer
             }
+            AnthropicAuthMode::CloudBearer => crate::ProviderCredentialSurface::CloudBearer,
         }
     }
 
@@ -436,6 +548,10 @@ struct ModelCapabilities {
 }
 
 fn model_capabilities(model: &str) -> ModelCapabilities {
+    // G4b: enterprise spellings (`anthropic.` prefix, `@date` suffix) carry
+    // the same models — normalize before the family match so a Bedrock or
+    // Vertex slug reports its real context window.
+    let model = crate::effort::base_model(model);
     if model == "claude-fable-5"
         || model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-5")
@@ -549,6 +665,105 @@ fn response_open_timeout_error(timeout: Duration) -> ProviderError {
             timeout.as_secs()
         ),
     )
+}
+
+/// One DNS-safe label: non-empty, bounded, lowercase ASCII letters, digits,
+/// and hyphens only — deliberately excludes `.`, `/`, `@`, and `:` so a
+/// crafted label can never smuggle extra host or path structure into a
+/// templated URL.
+fn valid_url_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Pins the Bedrock mantle base-URL shape (G4b, LB2):
+/// `https://bedrock-mantle.{region}.api.aws/anthropic` with a DNS-safe
+/// region label. Returns the canonical base (trailing slash trimmed).
+/// EVERYTHING else — plain http, other hosts, dotted or empty regions,
+/// extra path segments — is refused, so [`AnthropicProvider::new_endpoint`]
+/// can never aim a bearer credential off the mantle surface.
+pub fn validate_bedrock_mantle_base_url(base_url: &str) -> Result<String, ProviderError> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let region = trimmed
+        .strip_prefix("https://bedrock-mantle.")
+        .and_then(|rest| rest.strip_suffix(".api.aws/anthropic"));
+    match region {
+        Some(region) if valid_url_label(region) => Ok(trimmed.to_owned()),
+        _ => Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Bedrock endpoint must match https://bedrock-mantle.{region}.api.aws/anthropic",
+        )),
+    }
+}
+
+/// Builds the mantle base URL for one validated region (the TUI card's
+/// region field routes through this so URL construction has ONE authority).
+pub fn bedrock_mantle_base_url(region: &str) -> Result<String, ProviderError> {
+    validate_bedrock_mantle_base_url(&format!(
+        "https://bedrock-mantle.{}.api.aws/anthropic",
+        region.trim()
+    ))
+}
+
+/// Pins the Claude-on-Vertex models base-URL shape (G4b, LV1):
+/// `https://aiplatform.googleapis.com/v1/projects/{p}/locations/global/publishers/anthropic/models`
+/// for the global endpoint, or
+/// `https://{loc}-aiplatform.googleapis.com/v1/projects/{p}/locations/{loc}/publishers/anthropic/models`
+/// for a regional one (host and path location must AGREE). The adapter
+/// appends `/{model}:streamRawPredict`. Returns the canonical base.
+pub fn validate_vertex_models_base_url(base_url: &str) -> Result<String, ProviderError> {
+    let refused = || {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Vertex endpoint must match https://{loc-}aiplatform.googleapis.com/v1/projects/{project}/locations/{loc}/publishers/anthropic/models",
+        )
+    };
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let rest = trimmed.strip_prefix("https://").ok_or_else(refused)?;
+    let (host, path) = rest.split_once('/').ok_or_else(refused)?;
+    let host_location = match host.strip_suffix("aiplatform.googleapis.com") {
+        Some("") => None,
+        Some(prefix) => Some(prefix.strip_suffix('-').ok_or_else(refused)?),
+        None => return Err(refused()),
+    };
+    let project = path
+        .strip_prefix("v1/projects/")
+        .and_then(|rest| rest.split_once("/locations/"))
+        .ok_or_else(refused)?;
+    let (project, rest) = project;
+    let location = rest
+        .strip_suffix("/publishers/anthropic/models")
+        .ok_or_else(refused)?;
+    if !valid_url_label(project) || !valid_url_label(location) {
+        return Err(refused());
+    }
+    match host_location {
+        None if location == "global" => Ok(trimmed.to_owned()),
+        Some(host_location) if host_location == location && location != "global" => {
+            Ok(trimmed.to_owned())
+        }
+        _ => Err(refused()),
+    }
+}
+
+/// Builds the Vertex models base URL from card coordinates (ONE authority
+/// for the global/regional template split).
+pub fn vertex_models_base_url(project: &str, location: &str) -> Result<String, ProviderError> {
+    let project = project.trim();
+    let location = location.trim();
+    let candidate = if location == "global" || location.is_empty() {
+        format!(
+            "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/anthropic/models"
+        )
+    } else {
+        format!(
+            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models"
+        )
+    };
+    validate_vertex_models_base_url(&candidate)
 }
 
 /// Replays captured SSE bytes through the same incremental decoder used by

@@ -104,3 +104,67 @@ fn gemini_static_ladders_are_name_gated_to_3x() {
     assert!(gemini_supported_efforts("gemini-2.5-pro").is_empty());
     assert_eq!(gemini_default_effort("gemini-2.5-flash"), None);
 }
+
+/// LAW (LE-x, G4b naming half): enterprise spellings resolve their FAMILY
+/// rows — the Bedrock `anthropic.` prefix and the Vertex `@date` suffix
+/// normalize away before the table match, and an unknown family still gets
+/// the EMPTY row. Fast keeps the same normalization: the opus-5 gate admits
+/// `anthropic.claude-opus-5`; the 4.7/4.6 exclusions hold under both
+/// decorations.
+///
+/// MUTATION CHECK: drop the `anthropic.` strip (or the `@date` strip) from
+/// `base_model`. Expected RUNTIME failure: the prefixed opus-5 ladder
+/// equality (respectively the dated sonnet-4-6 ladder equality).
+#[test]
+fn le_enterprise_model_names_resolve_their_family_rows() {
+    assert_eq!(
+        anthropic_supported_efforts("anthropic.claude-opus-5"),
+        ["low", "medium", "high", "xhigh", "max"],
+        "bedrock prefix normalizes to the opus-5 family row"
+    );
+    assert_eq!(
+        anthropic_supported_efforts("anthropic.claude-opus-4-6"),
+        ["low", "medium", "high", "max"],
+        "bedrock prefix + legacy family"
+    );
+    assert_eq!(
+        anthropic_supported_efforts("claude-sonnet-4-6@20251101"),
+        ["low", "medium", "high", "max"],
+        "vertex @date suffix normalizes to the sonnet-4-6 family row"
+    );
+    assert_eq!(
+        anthropic_default_effort("anthropic.claude-opus-5"),
+        Some("high")
+    );
+    // The seeded vertex slugs whose families document NO ladder stay
+    // honestly empty — normalization never invents capability — and a
+    // MALFORMED date suffix (`@2026`, not 8 digits) is not normalized at
+    // all, so it stays a distinct unknown slug.
+    for model in [
+        "claude-sonnet-4-5@20250929",
+        "claude-haiku-4-5@20251001",
+        "anthropic.claude-haiku-4-5",
+        "anthropic.claude-nova-1",
+        "claude-opus-5@2026",
+    ] {
+        assert!(
+            anthropic_supported_efforts(model).is_empty(),
+            "no invented ladder for {model}"
+        );
+    }
+    // Fast gate under both decorations, both directions.
+    assert!(anthropic_fast_mode_supported("anthropic.claude-opus-5"));
+    assert!(anthropic_fast_mode_supported("claude-opus-4-8@20260115"));
+    assert!(!anthropic_fast_mode_supported("anthropic.claude-opus-4-7"));
+    assert!(!anthropic_fast_mode_supported("anthropic.claude-sonnet-5"));
+    // The clamp inherits the normalization: a stale xhigh on a dated 4.6
+    // row falls to high exactly like the bare slug.
+    assert_eq!(
+        anthropic_effort_clamp("claude-sonnet-4-6@20251101", Some("xhigh")).as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        anthropic_effort_clamp("anthropic.claude-opus-5", Some("xhigh")).as_deref(),
+        Some("xhigh")
+    );
+}

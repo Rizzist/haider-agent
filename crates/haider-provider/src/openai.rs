@@ -81,6 +81,16 @@ pub struct OpenAiCapture {
     pub body: Vec<u8>,
 }
 
+/// How the credential rides the request (G4b, the `AnthropicAuthMode`
+/// pattern): the OpenAI family default is `Authorization: Bearer`; Azure
+/// OpenAI's v1 surface authenticates API keys with a bare `api-key` header
+/// and NO Authorization header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiAuthHeaderMode {
+    Bearer,
+    AzureApiKey,
+}
+
 #[derive(Debug)]
 struct OpenAiHttp {
     client: reqwest::Client,
@@ -90,6 +100,7 @@ struct OpenAiHttp {
     origin_guard: Option<Arc<CompatibleOriginGuard>>,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
     codex_responses_lite: bool,
+    auth_header_mode: OpenAiAuthHeaderMode,
 }
 
 impl OpenAiHttp {
@@ -196,6 +207,7 @@ impl OpenAiHttp {
             origin_guard,
             fixed_origin_guard,
             codex_responses_lite,
+            auth_header_mode: OpenAiAuthHeaderMode::Bearer,
         })
     }
 
@@ -227,6 +239,35 @@ impl OpenAiHttp {
         Ok(value)
     }
 
+    /// The bare `api-key` header value for [`OpenAiAuthHeaderMode::AzureApiKey`].
+    fn azure_api_key_header(&self) -> Result<HeaderValue, ProviderError> {
+        let mut value = HeaderValue::from_bytes(self.credential.expose_secret()).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "resolved Azure OpenAI credential is not a valid HTTP header value",
+            )
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    /// Applies the mode's ONE auth header (G4b, LZ1): Bearer requests carry
+    /// `Authorization` and never `api-key`; Azure requests carry `api-key`
+    /// and never `Authorization`.
+    fn with_auth_header(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(match self.auth_header_mode {
+            OpenAiAuthHeaderMode::Bearer => {
+                request.header(AUTHORIZATION, self.authorization_header()?)
+            }
+            OpenAiAuthHeaderMode::AzureApiKey => {
+                request.header("api-key", self.azure_api_key_header()?)
+            }
+        })
+    }
+
     async fn post_json(
         &self,
         url: &str,
@@ -247,12 +288,12 @@ impl OpenAiHttp {
         payload: &serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
         self.validate_origin(url).await?;
-        let mut request = self
-            .client
-            .post(url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "text/event-stream")
-            .header(AUTHORIZATION, self.authorization_header()?);
+        let mut request = self.with_auth_header(
+            self.client
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "text/event-stream"),
+        )?;
         if self.codex_responses_lite {
             request = request.header(
                 OPENAI_CODEX_RESPONSES_LITE_HEADER,
@@ -274,10 +315,7 @@ impl OpenAiHttp {
 
     async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
         self.validate_origin(url).await?;
-        self.client
-            .get(url)
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, self.authorization_header()?)
+        self.with_auth_header(self.client.get(url).header(ACCEPT, "application/json"))?
             .build()
             .map_err(transport_error)
     }
@@ -523,6 +561,33 @@ impl OpenAiCompatibleProvider {
             CompatibleOriginPolicy::TrustedLan,
             Arc::new(SystemCompatibleDnsResolver),
         )
+    }
+
+    /// Constructs the Azure OpenAI v1 adapter (G4b, LZ1): the SAME Chat
+    /// Completions wire under the STRICT origin fence (Azure endpoints are
+    /// public HTTPS only), with the credential riding the bare `api-key`
+    /// header instead of `Authorization: Bearer`. Refuses any origin that
+    /// is not an Azure OpenAI resource host so the header mode can never
+    /// leak a key to an arbitrary endpoint.
+    pub fn new_azure(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+    ) -> Result<Self, ProviderError> {
+        if !azure_openai_origin(base_url.as_ref()) {
+            return Err(invalid_request(
+                "Azure OpenAI endpoints must be https on *.openai.azure.com or *.services.ai.azure.com",
+            ));
+        }
+        let mut provider = Self::new_with_policy_and_dns_resolver(
+            credential,
+            model,
+            base_url,
+            CompatibleOriginPolicy::Strict,
+            Arc::new(SystemCompatibleDnsResolver),
+        )?;
+        provider.http.auth_header_mode = OpenAiAuthHeaderMode::AzureApiKey;
+        Ok(provider)
     }
 
     fn new_with_dns_resolver(
@@ -2457,6 +2522,38 @@ fn compatible_endpoints(
         models_url: format!("{api_root}/models"),
         origin,
     })
+}
+
+/// Whether an origin is an Azure OpenAI resource endpoint (G4b): https on
+/// `{resource}.openai.azure.com` or `{resource}.services.ai.azure.com` with
+/// a non-empty resource label. ONE predicate carries every Azure decision —
+/// the `api-key` header mode, the strict origin policy, and the
+/// configured-deployment availability fallback — so they can never disagree.
+#[must_use]
+pub fn azure_openai_origin(origin: &str) -> bool {
+    let Some(rest) = origin.trim().strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["openai.azure.com", "services.ai.azure.com"]
+        .iter()
+        .any(|suffix| {
+            host.strip_suffix(suffix)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+                .is_some_and(|resource| {
+                    !resource.is_empty()
+                        && resource
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+        })
 }
 
 /// Validates and probes a configured OpenAI-compatible endpoint without

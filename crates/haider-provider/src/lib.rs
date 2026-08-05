@@ -43,8 +43,10 @@ pub use anthropic::{
     ANTHROPIC_API_URL, ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL,
     ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME,
     ANTHROPIC_OAUTH_SYSTEM_IDENTITY, ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider,
-    AnthropicRetryPolicy, AnthropicTransportConfig, replay_anthropic_http_error,
-    replay_anthropic_sse,
+    AnthropicRetryPolicy, AnthropicTransportConfig, BEDROCK_MANTLE_DEFAULT_BASE_URL,
+    BEDROCK_PROVIDER_NAME, BEDROCK_SEED_MODELS, VERTEX_ANTHROPIC_VERSION, VERTEX_PROVIDER_NAME,
+    VERTEX_SEED_MODELS, bedrock_mantle_base_url, replay_anthropic_http_error, replay_anthropic_sse,
+    validate_bedrock_mantle_base_url, validate_vertex_models_base_url, vertex_models_base_url,
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
@@ -66,9 +68,9 @@ pub use openai::{
     OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
-    OpenAiTransportConfig, replay_kimi_models_response, replay_openai_chat_sse,
-    replay_openai_http_error, replay_openai_models_response, replay_openai_responses_sse,
-    validate_openai_compatible_endpoint,
+    OpenAiTransportConfig, azure_openai_origin, replay_kimi_models_response,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_responses_sse, validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{MODEL_RATES, ModelRate, estimate_chunk_cost_usd, model_rate};
@@ -80,7 +82,8 @@ pub use usage::{
 };
 
 /// Provider classes backed by production account credentials in this release.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 7] = [
+/// G4b adds the enterprise Anthropic surfaces: Bedrock mantle and Vertex.
+pub const BUILTIN_PROVIDER_NAMES: [&str; 9] = [
     ANTHROPIC_PROVIDER_NAME,
     ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
@@ -88,6 +91,8 @@ pub const BUILTIN_PROVIDER_NAMES: [&str; 7] = [
     OPENAI_COMPATIBLE_PROVIDER_NAME,
     KIMI_OAUTH_PROVIDER_NAME,
     GEMINI_PROVIDER_NAME,
+    BEDROCK_PROVIDER_NAME,
+    VERTEX_PROVIDER_NAME,
 ];
 
 /// Crate marker used by the workspace self-test.
@@ -163,6 +168,12 @@ pub enum ProviderCredentialSurface {
     Opaque,
     ApiKey,
     OAuthSubscriptionBearer,
+    /// G4b (decision 5): a cloud-platform bearer token that is neither a
+    /// vaulted vendor API key nor a release-owned OAuth subscription —
+    /// today the Vertex GCP access token (pasted or gcloud-refreshed).
+    /// Bedrock mantle deliberately stays [`Self::ApiKey`]: its bearer rides
+    /// the EXACT `x-api-key` header path of the first-party key mode.
+    CloudBearer,
 }
 
 /// Provider-local tool definition. The protocol tool manifest has execution

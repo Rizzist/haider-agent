@@ -23,9 +23,20 @@ const GEMINI_FULL_LADDER: &[&str] = &["minimal", "low", "medium", "high"];
 /// Gemini 3.1-pro: no `minimal`.
 const GEMINI_PRO_LADDER: &[&str] = &["low", "medium", "high"];
 
-/// Strips a trailing `-YYYYMMDD` date suffix so dated release slugs share
-/// their family's capability row.
-fn base_model(model: &str) -> &str {
+/// Strips enterprise naming decorations so every spelling of a model shares
+/// its family's capability row (G4b): the Bedrock `anthropic.` prefix
+/// (`anthropic.claude-opus-5`), the Vertex `@YYYYMMDD` suffix
+/// (`claude-sonnet-4-5@20250929`), and the first-party `-YYYYMMDD` dated
+/// release suffix. Normalization is purely syntactic — an unknown family
+/// still resolves to the EMPTY row, never a guess.
+pub(crate) fn base_model(model: &str) -> &str {
+    let model = model.strip_prefix("anthropic.").unwrap_or(model);
+    let model = match model.rsplit_once('@') {
+        Some((base, date)) if date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()) => {
+            base
+        }
+        _ => model,
+    };
     match model.rsplit_once('-') {
         Some((base, date)) if date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()) => {
             base

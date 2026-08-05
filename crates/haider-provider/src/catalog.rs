@@ -179,12 +179,21 @@ impl CatalogSource {
 enum CatalogAuthMode {
     Bearer,
     XGoogApiKey,
+    /// Azure OpenAI v1 (G4b): API keys authenticate with the bare
+    /// `api-key` header — Bearer is documented only for Entra tokens.
+    AzureApiKey,
 }
 
 impl CatalogSource {
     fn auth_mode(&self) -> CatalogAuthMode {
         match self {
             Self::GeminiApiKey => CatalogAuthMode::XGoogApiKey,
+            // G4b: a custom profile at an Azure OpenAI origin discovers
+            // under the same `api-key` header its turn requests use (ONE
+            // predicate — `azure_openai_origin`).
+            Self::OpenAiCompatible { origin } if crate::openai::azure_openai_origin(origin) => {
+                CatalogAuthMode::AzureApiKey
+            }
             Self::OpenAiSubscription
             | Self::AnthropicSubscription
             | Self::KimiOAuth
@@ -585,15 +594,23 @@ pub(crate) fn apply_catalog_credential(
     match source.auth_mode() {
         CatalogAuthMode::Bearer => Ok(request.bearer_auth(credential)),
         CatalogAuthMode::XGoogApiKey => {
-            let mut value = HeaderValue::from_bytes(credential.as_bytes()).map_err(|_| {
-                CatalogError::Unavailable {
-                    reason: "model catalog credential is not a valid HTTP header value".to_owned(),
-                }
-            })?;
-            value.set_sensitive(true);
-            Ok(request.header("x-goog-api-key", value))
+            sensitive_credential_header(request, "x-goog-api-key", credential)
         }
+        CatalogAuthMode::AzureApiKey => sensitive_credential_header(request, "api-key", credential),
     }
+}
+
+fn sensitive_credential_header(
+    request: reqwest::RequestBuilder,
+    name: &'static str,
+    credential: &str,
+) -> Result<reqwest::RequestBuilder, CatalogError> {
+    let mut value =
+        HeaderValue::from_bytes(credential.as_bytes()).map_err(|_| CatalogError::Unavailable {
+            reason: "model catalog credential is not a valid HTTP header value".to_owned(),
+        })?;
+    value.set_sensitive(true);
+    Ok(request.header(name, value))
 }
 
 /// Picker order: provider priority first, then display name. Hidden models

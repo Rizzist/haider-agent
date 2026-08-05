@@ -19,7 +19,9 @@ use crate::anthropic::{
     stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
-use crate::{Message, ProviderError, ProviderErrorKind, ToolDefinition, TurnRequest};
+use crate::{
+    Message, Provider as _, ProviderError, ProviderErrorKind, ToolDefinition, TurnRequest,
+};
 
 struct HangingFixture {
     first_chunk: Option<Vec<u8>>,
@@ -594,4 +596,244 @@ async fn fast_mode_sets_speed_body_and_comma_joined_beta_header() {
         1,
         "the betas comma-join into ONE header value"
     );
+}
+
+// ───────────────────────── G4b enterprise endpoints ─────────────────────────
+
+fn secret_credential(alias: &str, secret: &[u8]) -> haider_accounts::SecretHandle {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new(alias);
+    vault.put(&alias, secret).expect("store test secret");
+    vault.resolve(&alias).expect("resolve test secret")
+}
+
+fn one_line_turn(model: &str) -> TurnRequest {
+    TurnRequest {
+        messages: vec![Message::user_text("ping")],
+        model: model.into(),
+        max_tokens: 16,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    }
+}
+
+/// LAW (LB1 — the mantle golden): the Bedrock adapter POSTs
+/// `{base}/v1/messages` with the bearer riding `x-api-key`, the standard
+/// `anthropic-version: 2023-06-01` header, NO Authorization header, the
+/// `anthropic.`-prefixed model IN THE BODY, and decodes a scripted standard
+/// SSE stream — the mantle wire is the first-party Messages wire verbatim.
+///
+/// MUTATION CHECK: swap the mantle URL template, move the credential to
+/// Authorization, drop the version header, or drop body.model. Expected
+/// RUNTIME failure: the named equalities below.
+#[tokio::test]
+async fn lb1_bedrock_mantle_golden_url_headers_body_and_sse() {
+    let provider = AnthropicProvider::new_endpoint(
+        secret_credential("bedrock-mantle-audit", b"BEDROCK_BEARER_SENTINEL_44aa"),
+        "anthropic.claude-opus-5",
+        "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+    )
+    .expect("bedrock mantle adapter");
+    let payload = provider
+        .request_payload(&one_line_turn("anthropic.claude-opus-5"))
+        .expect("mantle payload");
+    assert_eq!(
+        payload.get("model").and_then(serde_json::Value::as_str),
+        Some("anthropic.claude-opus-5"),
+        "the mantle model rides IN THE BODY"
+    );
+    let request = provider.request(&payload).await.expect("mantle request");
+    assert_eq!(
+        request.url().as_str(),
+        "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("x-api-key")
+            .expect("x-api-key bearer"),
+        "BEDROCK_BEARER_SENTINEL_44aa"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("anthropic-version")
+            .expect("standard version header"),
+        "2023-06-01"
+    );
+    assert!(
+        !request.headers().contains_key(AUTHORIZATION),
+        "mantle bearer must never ride Authorization"
+    );
+    assert_eq!(
+        provider.credential_surface(),
+        crate::ProviderCredentialSurface::ApiKey,
+        "the mantle surface is the EXACT x-api-key reuse (decision 5)"
+    );
+    // Scripted standard SSE decodes through the unmodified decoder.
+    let stream = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"mantle ok\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+    let items = crate::replay_anthropic_sse(stream.as_bytes());
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            Ok(StreamEvent::TextDelta { text }) if text == "mantle ok"
+        )),
+        "standard SSE text decodes"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, Ok(StreamEvent::Finish { .. }))),
+        "standard SSE finish decodes"
+    );
+}
+
+/// LAW (LB2 — endpoint pinning): `new_endpoint` accepts EXACTLY the mantle
+/// URL shape and refuses everything else, so the bearer can never be aimed
+/// at an arbitrary origin. Both directions: two valid regions construct;
+/// the refusal matrix stays refused.
+///
+/// MUTATION CHECK: accept any https URL in
+/// `validate_bedrock_mantle_base_url`. Expected RUNTIME failure: the
+/// refusal matrix below constructs adapters.
+#[test]
+fn lb2_new_endpoint_refuses_non_mantle_url_shapes() {
+    for accepted in [
+        "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        "https://bedrock-mantle.eu-central-1.api.aws/anthropic/",
+    ] {
+        AnthropicProvider::new_endpoint(
+            secret_credential("bedrock-shape-audit", b"NEVER_SENT_SHAPE_AUDIT"),
+            "anthropic.claude-opus-5",
+            accepted,
+        )
+        .unwrap_or_else(|error| panic!("mantle shape `{accepted}` must construct: {error}"));
+    }
+    for refused in [
+        "https://api.anthropic.com/v1/messages",
+        "http://bedrock-mantle.us-east-1.api.aws/anthropic",
+        "https://bedrock-mantle.us-east-1.api.aws.evil.example/anthropic",
+        "https://bedrock-mantle.us-east-1.api.aws/anthropic/extra",
+        "https://bedrock-mantle..api.aws/anthropic",
+        "https://bedrock-mantle.Us-East-1.api.aws/anthropic",
+        "https://bedrock-mantle.us.east/1.api.aws/anthropic",
+        "https://bedrock-mantle.us-east-1.api.aws",
+        "",
+    ] {
+        let error = AnthropicProvider::new_endpoint(
+            secret_credential("bedrock-shape-audit", b"NEVER_SENT_SHAPE_AUDIT"),
+            "anthropic.claude-opus-5",
+            refused,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("non-mantle shape `{refused}` must be refused"));
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    }
+}
+
+/// LAW (LV1 — the vertex golden): the Vertex adapter POSTs
+/// `{base}/{model}:streamRawPredict` (model IN THE URL), the body carries
+/// `anthropic_version: "vertex-2023-10-16"` and NO `model` field, auth is a
+/// plain `Authorization: Bearer`, and neither `x-api-key`, the OAuth beta,
+/// nor the standard `anthropic-version` HEADER is sent.
+///
+/// MUTATION CHECK: keep `model` in the body, drop the `anthropic_version`
+/// insert, or template the first-party URL. Expected RUNTIME failure: the
+/// named equalities below.
+#[tokio::test]
+async fn lv1_vertex_golden_model_in_url_version_in_body_bearer_header() {
+    let provider = AnthropicProvider::new_vertex(
+        secret_credential("vertex-audit", b"VERTEX_GCP_TOKEN_SENTINEL_77cc"),
+        "claude-sonnet-4-5@20250929",
+        "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+    )
+    .expect("vertex adapter");
+    let payload = provider
+        .request_payload(&one_line_turn("claude-sonnet-4-5@20250929"))
+        .expect("vertex payload");
+    assert!(
+        payload.get("model").is_none(),
+        "the vertex body must NOT carry a model field"
+    );
+    assert_eq!(
+        payload
+            .get("anthropic_version")
+            .and_then(serde_json::Value::as_str),
+        Some("vertex-2023-10-16"),
+        "the vertex body versions through anthropic_version"
+    );
+    let request = provider.request(&payload).await.expect("vertex request");
+    assert_eq!(
+        request.url().as_str(),
+        "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict",
+        "the model rides IN THE URL"
+    );
+    assert_eq!(
+        request.headers().get(AUTHORIZATION).expect("GCP bearer"),
+        "Bearer VERTEX_GCP_TOKEN_SENTINEL_77cc"
+    );
+    assert!(!request.headers().contains_key("x-api-key"));
+    assert!(!request.headers().contains_key(ANTHROPIC_OAUTH_BETA_HEADER));
+    assert!(
+        !request.headers().contains_key("anthropic-version"),
+        "vertex versions through the BODY, never the header"
+    );
+    assert_eq!(
+        provider.credential_surface(),
+        crate::ProviderCredentialSurface::CloudBearer,
+        "the vertex surface is CloudBearer (decision 5)"
+    );
+}
+
+/// LAW (LV1, shape half): the Vertex base-URL validator accepts the global
+/// and matching-regional templates and refuses host/path disagreement,
+/// non-Google hosts, and http — both directions.
+#[test]
+fn vertex_base_url_shape_is_pinned_global_or_matching_regional() {
+    use crate::anthropic::{validate_vertex_models_base_url, vertex_models_base_url};
+    for accepted in [
+        "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+        "https://us-east5-aiplatform.googleapis.com/v1/projects/acme-ai/locations/us-east5/publishers/anthropic/models",
+    ] {
+        validate_vertex_models_base_url(accepted)
+            .unwrap_or_else(|error| panic!("vertex shape `{accepted}` must pass: {error}"));
+    }
+    for refused in [
+        "http://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+        "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/us-east5/publishers/anthropic/models",
+        "https://us-east5-aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+        "https://us-east5-aiplatform.googleapis.com/v1/projects/acme-ai/locations/eu-west4/publishers/anthropic/models",
+        "https://evilaiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+        "https://aiplatform.googleapis.example/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+        "https://aiplatform.googleapis.com/v1/projects/acme.ai/locations/global/publishers/anthropic/models",
+        "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/google/models",
+        "",
+    ] {
+        assert!(
+            validate_vertex_models_base_url(refused).is_err(),
+            "vertex shape `{refused}` must be refused"
+        );
+    }
+    // The card-side builder routes through the SAME validator.
+    assert_eq!(
+        vertex_models_base_url("acme-ai", "global").expect("global build"),
+        "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models"
+    );
+    assert_eq!(
+        vertex_models_base_url("acme-ai", "us-east5").expect("regional build"),
+        "https://us-east5-aiplatform.googleapis.com/v1/projects/acme-ai/locations/us-east5/publishers/anthropic/models"
+    );
+    assert!(vertex_models_base_url("", "global").is_err());
 }

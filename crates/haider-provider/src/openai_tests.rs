@@ -662,6 +662,7 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
             origin_guard: None,
             fixed_origin_guard: None,
             codex_responses_lite: false,
+            auth_header_mode: OpenAiAuthHeaderMode::Bearer,
         },
         base_url: endpoints.base_url,
         chat_url: endpoints.chat_url,
@@ -1290,5 +1291,117 @@ fn assistant_history_replays_as_output_text() {
             "assistant history is OUTPUT text (lite={lite}): {payload}"
         );
         assert_eq!(content_type(2), "input_text");
+    }
+}
+
+// ───────────────────────── G4b Azure OpenAI (v1 surface) ────────────────────
+
+/// LAW (LZ1 — the azure header mode): the Azure adapter authenticates with
+/// the bare `api-key` header and NO Authorization header on BOTH the models
+/// probe and the chat POST, and the DEPLOYMENT NAME rides `body.model` on
+/// the derived `{endpoint}/openai/v1/chat/completions` URL.
+///
+/// MUTATION CHECK: route `AzureApiKey` through the Bearer arm (or drop the
+/// header-mode switch in `new_azure`). Expected RUNTIME failure: the
+/// `api-key` equality and the no-Authorization assertions below.
+#[tokio::test]
+async fn lz1_azure_request_rides_api_key_header_and_deployment_model() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("azure-openai-audit");
+    vault
+        .put(&alias, b"AZURE_API_KEY_SENTINEL_5c1e")
+        .expect("store azure key");
+    let provider = OpenAiCompatibleProvider::new_azure(
+        vault.resolve(&alias).expect("resolve azure key"),
+        "my-gpt-deployment",
+        "https://contoso.openai.azure.com/openai/v1",
+    )
+    .expect("azure adapter");
+    assert_eq!(
+        provider.models_url(),
+        "https://contoso.openai.azure.com/openai/v1/models"
+    );
+
+    let get = provider
+        .http
+        .get_request(&provider.models_url)
+        .await
+        .expect("models probe request");
+    assert_eq!(
+        get.headers().get("api-key").expect("api-key on GET"),
+        "AZURE_API_KEY_SENTINEL_5c1e"
+    );
+    assert!(
+        !get.headers().contains_key(AUTHORIZATION),
+        "azure keys never ride Authorization"
+    );
+
+    let payload = provider
+        .request_payload(&TurnRequest {
+            messages: vec![crate::Message::user_text("ping")],
+            model: "my-gpt-deployment".into(),
+            max_tokens: 16,
+            system_prompt: None,
+            tools: Vec::new(),
+            attachments: Vec::new(),
+        })
+        .expect("azure chat payload");
+    assert_eq!(
+        payload.get("model").and_then(serde_json::Value::as_str),
+        Some("my-gpt-deployment"),
+        "the DEPLOYMENT NAME rides body.model"
+    );
+    let post = provider
+        .http
+        .post_json_request(&provider.chat_url, &payload)
+        .await
+        .expect("azure chat POST");
+    assert_eq!(
+        post.url().as_str(),
+        "https://contoso.openai.azure.com/openai/v1/chat/completions"
+    );
+    assert_eq!(
+        post.headers().get("api-key").expect("api-key on POST"),
+        "AZURE_API_KEY_SENTINEL_5c1e"
+    );
+    assert!(!post.headers().contains_key(AUTHORIZATION));
+}
+
+/// LAW (LZ1, origin half): `new_azure` accepts ONLY https Azure OpenAI
+/// resource hosts, and the shared predicate agrees — the header mode can
+/// never leak a key to an arbitrary origin, and non-azure adapters keep
+/// Bearer untouched.
+#[test]
+fn azure_origin_predicate_and_constructor_agree_both_directions() {
+    for accepted in [
+        "https://contoso.openai.azure.com/openai/v1",
+        "https://acme-ai.services.ai.azure.com/openai/v1/",
+        "https://Contoso.openai.azure.com",
+    ] {
+        assert!(azure_openai_origin(accepted), "azure origin `{accepted}`");
+    }
+    for refused in [
+        "http://contoso.openai.azure.com/openai/v1",
+        "https://openai.azure.com/openai/v1",
+        "https://contoso.openai.azure.com.evil.example/openai/v1",
+        "https://contoso.evil.example/openai/v1",
+        "https://127.0.0.1:8000/v1",
+        "",
+    ] {
+        assert!(!azure_openai_origin(refused), "non-azure `{refused}`");
+        let vault = MemoryVault::new();
+        let alias = CredentialAlias::new("azure-origin-audit");
+        vault
+            .put(&alias, b"NEVER_SENT_AZURE_ORIGIN")
+            .expect("store sentinel");
+        assert!(
+            OpenAiCompatibleProvider::new_azure(
+                vault.resolve(&alias).expect("resolve sentinel"),
+                "deployment",
+                refused,
+            )
+            .is_err(),
+            "new_azure must refuse `{refused}`"
+        );
     }
 }
