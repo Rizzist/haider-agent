@@ -506,6 +506,16 @@ pub struct ProvidersState {
     pub cursor: usize,
     /// W10b: an armed removal awaiting Enter (x armed it; esc disarms).
     pub pending_remove: Option<String>,
+    /// F2b: the roster's scroll offset in lines. RENDER is the single
+    /// scroll authority (the transcript's law): the frame writes the true
+    /// max and reconciles this offset against it, so resizes and roster
+    /// growth can never bank invisible debt.
+    pub scroll: std::cell::Cell<u16>,
+    /// The frame-written maximum scroll (lines beyond the viewport).
+    pub scroll_max: std::cell::Cell<u16>,
+    /// Armed by a cursor move: the next frame scrolls the cursor's
+    /// provider block into view, then clears the latch.
+    pub follow_cursor: std::cell::Cell<bool>,
 }
 
 impl ProvidersState {
@@ -4938,6 +4948,7 @@ impl AppModel {
             }
             KeyCode::Up => {
                 self.providers.cursor = self.providers.cursor.saturating_sub(1);
+                self.providers.follow_cursor.set(true);
                 self.dirty = true;
             }
             KeyCode::Down => {
@@ -4945,6 +4956,31 @@ impl AppModel {
                     self.providers.cursor =
                         (self.providers.cursor + 1).min(self.providers.providers.len() - 1);
                 }
+                self.providers.follow_cursor.set(true);
+                self.dirty = true;
+            }
+            // F2b: the page scrolls — long rosters reach every row and the
+            // bottom-pinned add buttons stay a PageDown/End away. The
+            // frame reconciles against the true max (render authority).
+            KeyCode::PageUp => {
+                self.providers
+                    .scroll
+                    .set(self.providers.scroll.get().saturating_sub(8));
+                self.dirty = true;
+            }
+            KeyCode::PageDown => {
+                let max = self.providers.scroll_max.get();
+                self.providers
+                    .scroll
+                    .set(self.providers.scroll.get().saturating_add(8).min(max));
+                self.dirty = true;
+            }
+            KeyCode::Home => {
+                self.providers.scroll.set(0);
+                self.dirty = true;
+            }
+            KeyCode::End => {
+                self.providers.scroll.set(self.providers.scroll_max.get());
                 self.dirty = true;
             }
             _ => {}
@@ -7747,10 +7783,23 @@ impl AppModel {
     pub fn handle_wheel(&mut self, up: bool) {
         // The login gate joins the help gate (TUI6.2c finding 7 —
         // consistency: nothing scrolls beneath a modal).
-        if !matches!(self.screen, Screen::Session | Screen::Subagent)
-            || self.help_open
-            || self.login.is_some()
-        {
+        if self.help_open || self.login.is_some() {
+            return;
+        }
+        // F2b: the providers roster scrolls under the wheel too.
+        if self.screen == Screen::Providers {
+            let max = self.providers.scroll_max.get();
+            let current = self.providers.scroll.get().min(max);
+            let next = if up {
+                current.saturating_sub(3)
+            } else {
+                current.saturating_add(3).min(max)
+            };
+            self.providers.scroll.set(next);
+            self.dirty = true;
+            return;
+        }
+        if !matches!(self.screen, Screen::Session | Screen::Subagent) {
             return;
         }
         self.dirty = true;

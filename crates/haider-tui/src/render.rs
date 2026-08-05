@@ -1506,6 +1506,8 @@ fn render_providers(
     let mut lines: Vec<Line<'_>> = Vec::new();
     // (line, column, width, hit) — chips resolved to rects after layout.
     let mut chip_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
+    // F2b: each provider block's header line, for cursor-follow scrolling.
+    let mut header_lines: Vec<usize> = Vec::new();
 
     lines.push(Line::from(vec![
         Span::styled(
@@ -1559,6 +1561,7 @@ fn render_providers(
         if model.providers.cursor == index {
             header = hover_band(header, true, area.width, theme);
         }
+        header_lines.push(lines.len());
         lines.push(header);
 
         // API family · endpoint (safe display — never interpolated into a
@@ -1664,24 +1667,102 @@ fn render_providers(
     // D2: the shared buttons area carries the same "found on this device"
     // section here — digits import; the provider cursor is untouched.
     push_device_candidates_section(model, theme, area.width, None, &mut lines, &mut chip_hits);
-    push_account_add_buttons(model, theme, &mut lines, &mut chip_hits);
-    lines.push(Line::styled(
-        "click a model to set the default · e edits · x removes · h HuggingFace · esc back",
-        theme.faint_style(),
-    ));
 
-    frame.render_widget(Paragraph::new(lines), area);
+    // F2b: the add-login actions are PINNED at the bottom (owner: "the
+    // providers page I should be able to scroll it and bottom should have
+    // the add login buttons") — a fixed footer under a scrolling roster.
+    // Tiny frames keep the flowed layout instead: everything stays in the
+    // scroll body, still reachable by scrolling to the end.
+    let hint = "click a model to set the default · e edits · x removes · h HuggingFace · esc back";
+    let mut footer_lines: Vec<Line<'_>> = Vec::new();
+    let mut footer_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
+    let pinned = area.height >= 12;
+    if pinned {
+        push_account_add_buttons(model, theme, &mut footer_lines, &mut footer_hits);
+        footer_lines.push(Line::styled(hint, theme.faint_style()));
+    } else {
+        push_account_add_buttons(model, theme, &mut lines, &mut chip_hits);
+        lines.push(Line::styled(hint, theme.faint_style()));
+    }
+    let footer_height = u16::try_from(footer_lines.len()).unwrap_or(0);
+    let [roster_area, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(area);
+
+    // RENDER is the single scroll authority (the transcript's law): the
+    // frame writes the true max, reconciles the offset, and resolves a
+    // cursor-follow latch against ITS OWN line layout.
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(roster_area.height);
+    model.providers.scroll_max.set(max_scroll);
+    let mut scroll = model.providers.scroll.get().min(max_scroll);
+    if model.providers.follow_cursor.take() {
+        let header = header_lines
+            .get(model.providers.cursor)
+            .and_then(|&line| u16::try_from(line).ok())
+            .unwrap_or(0);
+        if header < scroll {
+            scroll = header;
+        } else if header + 1 >= scroll + roster_area.height {
+            scroll = (header + 2)
+                .saturating_sub(roster_area.height)
+                .min(max_scroll);
+        }
+    }
+    model.providers.scroll.set(scroll);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), roster_area);
+    // The house scroll indicator: `⋮` gutter marks on the edge rows while
+    // content hides beyond them (menu_block's vocabulary).
+    if scroll > 0 && roster_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("⋮", theme.faint_style())),
+            Rect {
+                x: roster_area.x,
+                y: roster_area.y,
+                width: 1.min(roster_area.width),
+                height: 1,
+            },
+        );
+    }
+    if scroll < max_scroll && roster_area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("⋮", theme.faint_style())),
+            Rect {
+                x: roster_area.x,
+                y: roster_area.y + roster_area.height - 1,
+                width: 1.min(roster_area.width),
+                height: 1,
+            },
+        );
+    }
+    if footer_height > 0 {
+        frame.render_widget(Paragraph::new(footer_lines), footer_area);
+    }
 
     for (line_index, x, width, hit) in chip_hits {
-        let y = area.y + line_index as u16;
-        if y >= area.y + area.height || x >= area.width {
+        let line = u16::try_from(line_index).unwrap_or(u16::MAX);
+        if line < scroll || line - scroll >= roster_area.height || x >= roster_area.width {
             continue;
         }
         hits.push((
             Rect {
-                x: area.x + x,
+                x: roster_area.x + x,
+                y: roster_area.y + (line - scroll),
+                width: width.min(roster_area.width - x),
+                height: 1,
+            },
+            hit,
+        ));
+    }
+    for (line_index, x, width, hit) in footer_hits {
+        let y = footer_area.y + line_index as u16;
+        if y >= footer_area.y + footer_area.height || x >= footer_area.width {
+            continue;
+        }
+        hits.push((
+            Rect {
+                x: footer_area.x + x,
                 y,
-                width: width.min(area.width - x),
+                width: width.min(footer_area.width - x),
                 height: 1,
             },
             hit,

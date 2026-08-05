@@ -150,9 +150,7 @@ fn block_line(line: &str) -> MdLine {
             .count();
         if (1..=3).contains(&digits) {
             let rest = &after_indent[digits..];
-            if (rest.starts_with(". ") || rest.starts_with(") "))
-                && !rest[2..].trim().is_empty()
-            {
+            if (rest.starts_with(". ") || rest.starts_with(") ")) && !rest[2..].trim().is_empty() {
                 let mark_end = indent_len + digits + 2;
                 let mut spans = vec![MdSpan::new(&line[..mark_end], MdKind::ListMark)];
                 inline_spans(&line[mark_end..], MdKind::Text, &mut spans);

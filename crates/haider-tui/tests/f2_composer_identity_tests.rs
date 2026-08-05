@@ -110,9 +110,7 @@ fn width_degradation_drops_whole_segments_in_order() {
     );
     // One short of the full form: reasoning + fast drop TOGETHER.
     assert_eq!(
-        model
-            .composer_identity(full.chars().count() - 1)
-            .as_deref(),
+        model.composer_identity(full.chars().count() - 1).as_deref(),
         Some(no_reasoning)
     );
     // One short of model · auth: the auth label drops next.
@@ -186,9 +184,12 @@ fn status_bar_keeps_tokens_directly_right_of_the_state() {
     let meter_at = after_badge.find(" tok ").expect("token meter on the bar");
     let between = &after_badge[..meter_at];
     assert!(
-        between
-            .chars()
-            .all(|c| c == ' ' || c.is_ascii_digit() || c == '~' || c == '.' || c == 'k' || c == 'M'),
+        between.chars().all(|c| c == ' '
+            || c.is_ascii_digit()
+            || c == '~'
+            || c == '.'
+            || c == 'k'
+            || c == 'M'),
         "only the token count sits between state and meter: {between:?}"
     );
     assert!(
