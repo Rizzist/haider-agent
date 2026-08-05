@@ -14,6 +14,7 @@ mod process;
 mod request_input;
 mod shell;
 mod spawn_subagent;
+mod todo_write;
 
 pub use broker::{
     AlwaysAllowRule, EffectBroker, EffectBrokerCloseError, EffectBrokerCloseReport,
@@ -39,6 +40,7 @@ pub use shell::{
     UserProcessExec,
 };
 pub use spawn_subagent::{SpawnSubagent, spawn_subagent_manifest};
+pub use todo_write::{MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TodoWrite, todo_write_manifest};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tools";
