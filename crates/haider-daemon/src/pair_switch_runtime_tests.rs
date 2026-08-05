@@ -126,6 +126,21 @@ impl PairSwitchWorld {
     }
 
     async fn run_turn(&self, label: &str, text: &str) -> RunId {
+        let (run_id, disposition) = self.submit_turn(label, text, DeliveryMode::Steer).await;
+        assert_eq!(disposition, TurnAdmissionDisposition::Started);
+        self.await_done(&run_id).await;
+        run_id
+    }
+
+    /// Accepts + hands the turn to the manager WITHOUT asserting the
+    /// disposition or awaiting the terminal — the compaction-window laws
+    /// need to observe `Queued` admissions that only run later.
+    async fn submit_turn(
+        &self,
+        label: &str,
+        text: &str,
+        mode: DeliveryMode,
+    ) -> (RunId, TurnAdmissionDisposition) {
         let run_id = RunId::new(format!("{label}-run"));
         let accepted = self
             .hub
@@ -140,7 +155,7 @@ impl PairSwitchWorld {
                 branch_id: None,
                 text: text.into(),
                 attachments: Vec::new(),
-                mode: DeliveryMode::Steer,
+                mode,
                 queued_event_id: EventId::new(format!("{label}-queued")),
                 user_event_id: EventId::new(format!("{label}-user")),
                 active_event_id: EventId::new(format!("{label}-active")),
@@ -148,14 +163,82 @@ impl PairSwitchWorld {
             })
             .await
             .expect("accept turn");
-        assert_eq!(accepted.disposition, TurnAdmissionDisposition::Started);
+        let disposition = accepted.disposition;
         self.manager
             .handle()
             .submit(accepted)
             .await
             .expect("submit turn");
-        self.await_done(&run_id).await;
-        run_id
+        (run_id, disposition)
+    }
+
+    /// Kicks off manual compaction on a background task (bounded Busy retry
+    /// through the post-Done settle window), then waits until the journal
+    /// actually says `Compacting` so callers act INSIDE the window.
+    async fn start_compaction_and_await_window(
+        &self,
+        command_id: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = self.manager.handle();
+        let session_id = self.session_id.clone();
+        let generation = self.store.worker_generation();
+        let command = command_id.to_owned();
+        let handle = tokio::spawn(async move {
+            let mut attempt = 0;
+            loop {
+                match manager
+                    .compact(session_id.clone(), command.clone(), generation, None)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) if error.code == ErrorCode::Busy && attempt < 40 => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("manual compaction failed: {error:?}"),
+                }
+            }
+        });
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if self
+                    .latest_run_states()
+                    .await
+                    .iter()
+                    .any(|(_, state)| matches!(state, RunState::Compacting))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compaction window opens (journal says Compacting)");
+        handle
+    }
+
+    /// Latest committed `RunState` per run, in journal order.
+    async fn latest_run_states(&self) -> Vec<(RunId, RunState)> {
+        let mut latest: Vec<(RunId, RunState)> = Vec::new();
+        for event in self
+            .store
+            .read(&self.session_id, 0, 2048)
+            .await
+            .expect("read journal")
+        {
+            let (Some(run_id), Ok(EventPayload::RunState(state))) = (
+                event.run_id.clone(),
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+            ) else {
+                continue;
+            };
+            if let Some(slot) = latest.iter_mut().find(|(id, _)| id == &run_id) {
+                slot.1 = state;
+            } else {
+                latest.push((run_id, state));
+            }
+        }
+        latest
     }
 
     async fn await_done(&self, run_id: &RunId) {
@@ -629,6 +712,250 @@ async fn manual_compaction_follows_the_current_selection() {
     );
     assert_eq!(b_requests[0].model, "model-b");
     assert_eq!(fake_a.requests().len(), 1, "provider A saw only turn 1");
+
+    world.shutdown().await;
+}
+
+/// LAW (submit_during_manual_compaction_queues_and_runs_after, F3): a
+/// Queue-mode submission arriving while manual compaction holds the session
+/// is admitted `Queued`, produces NO provider work inside the compaction
+/// window, and runs to Done after the compaction lands — strictly ordered
+/// behind the compaction's terminal in the journal.
+#[tokio::test]
+async fn submit_during_manual_compaction_queues_and_runs_after() {
+    let fake_a = Arc::new(FakeProvider::new(
+        [
+            text_turn("history on a"),
+            vec![
+                // The held summarizer: compaction stays open ~1.5 s.
+                FakeStep::Delay { ms: 1500 },
+                FakeStep::EmitText {
+                    text: "summary on a".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+            text_turn("queued turn answer"),
+        ]
+        .concat(),
+    ));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let world = PairSwitchWorld::boot("f3-queue", fake_a.clone(), fake_b.clone()).await;
+
+    world.run_turn("f3-queue-one", "build history").await;
+    let compaction = world
+        .start_compaction_and_await_window("f3-queue-compact")
+        .await;
+
+    // INSIDE the window: the submission queues and no provider work leaks.
+    let (queued_run, disposition) = world
+        .submit_turn(
+            "f3-queue-two",
+            "queued while compacting",
+            DeliveryMode::Queue,
+        )
+        .await;
+    assert_eq!(
+        disposition,
+        TurnAdmissionDisposition::Queued,
+        "a submission during compaction must queue"
+    );
+    assert_eq!(
+        fake_a.requests().len(),
+        2,
+        "inside the window the provider saw turn 1 + the summarizer only"
+    );
+
+    compaction.await.expect("compaction task");
+    world.await_done(&queued_run).await;
+
+    // The queued turn ran (its request reached the provider)…
+    let requests = fake_a.requests();
+    assert_eq!(requests.len(), 3, "the queued turn ran after compaction");
+    // …and the journal orders the compaction terminal strictly before the
+    // queued turn's first non-queued activity.
+    let events = world
+        .store
+        .read(&world.session_id, 0, 2048)
+        .await
+        .expect("read journal");
+    let compaction_done_seq = events
+        .iter()
+        .filter(|event| {
+            event.run_id.as_ref().is_some_and(|id| id != &queued_run)
+                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                    |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
+                )
+        })
+        .map(|event| event.seq)
+        .max()
+        .expect("compaction terminal committed");
+    let queued_active_seq = events
+        .iter()
+        .filter(|event| {
+            event.run_id.as_ref() == Some(&queued_run)
+                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::RunState(state)
+                                if !matches!(state, RunState::Queued) && !state.is_terminal()
+                        )
+                    },
+                )
+        })
+        .map(|event| event.seq)
+        .min()
+        .expect("queued turn eventually went active");
+    assert!(
+        compaction_done_seq < queued_active_seq,
+        "queued turn activity (seq {queued_active_seq}) must follow the \
+         compaction terminal (seq {compaction_done_seq})"
+    );
+
+    world.shutdown().await;
+}
+
+/// LAW (steer_during_manual_compaction_blocks_and_never_reaches_the_summarizer,
+/// F3): a Steer-mode submission during manual compaction is proper blocking —
+/// its text NEVER appears in the summarization request, and it runs after the
+/// compaction lands. "Queue steered but doesn't send until it's done."
+#[tokio::test]
+async fn steer_during_manual_compaction_blocks_and_never_reaches_the_summarizer() {
+    let steer_text = "STEER_DURING_COMPACTION_c4f1";
+    let fake_a = Arc::new(FakeProvider::new(
+        [
+            text_turn("history on a"),
+            vec![
+                FakeStep::Delay { ms: 1500 },
+                FakeStep::EmitText {
+                    text: "summary on a".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+            text_turn("post-compaction answer"),
+        ]
+        .concat(),
+    ));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let world = PairSwitchWorld::boot("f3-steer", fake_a.clone(), fake_b.clone()).await;
+
+    world.run_turn("f3-steer-one", "build history").await;
+    let compaction = world
+        .start_compaction_and_await_window("f3-steer-compact")
+        .await;
+
+    let (steer_run, disposition) = world
+        .submit_turn("f3-steer-two", steer_text, DeliveryMode::Steer)
+        .await;
+    assert_ne!(
+        disposition,
+        TurnAdmissionDisposition::Started,
+        "a steer during compaction must not start immediately"
+    );
+
+    compaction.await.expect("compaction task");
+    world.await_done(&steer_run).await;
+
+    let requests = fake_a.requests();
+    assert_eq!(requests.len(), 3, "turn 1 + summarizer + steered turn");
+    let request_text = |index: usize| -> String {
+        requests[index]
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        !request_text(1).contains(steer_text),
+        "the summarization request must never carry the steered text"
+    );
+    assert!(
+        request_text(2).contains(steer_text),
+        "the steered text delivers in the first post-compaction request"
+    );
+
+    world.shutdown().await;
+}
+
+/// LAW (switch_during_manual_compaction_lands_after_it, F3): a pair switch
+/// COMMITS while manual compaction is in flight (and the journal visibly says
+/// `Compacting` inside the window); the compaction itself finishes on the
+/// pair it started with, and the first post-compaction turn resolves through
+/// the NEW pair. Directly answers the owner's "can we switch while the
+/// compaction is happening?".
+#[tokio::test]
+async fn switch_during_manual_compaction_lands_after_it() {
+    let fake_a = Arc::new(FakeProvider::new(
+        [
+            text_turn("history on a"),
+            vec![
+                FakeStep::Delay { ms: 1500 },
+                FakeStep::EmitText {
+                    text: "summary on a".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+        ]
+        .concat(),
+    ));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("first answer on b")));
+    let world = PairSwitchWorld::boot("f3-switch", fake_a.clone(), fake_b.clone()).await;
+
+    world.run_turn("f3-switch-one", "build history").await;
+    let compaction = world
+        .start_compaction_and_await_window("f3-switch-compact")
+        .await;
+
+    // INSIDE the window: the session visibly compacts, and the switch commits
+    // through the ACTOR (the real wire path — a store-direct select would
+    // desync the actor's head and stage an impossible client).
+    assert!(
+        world
+            .latest_run_states()
+            .await
+            .iter()
+            .any(|(_, state)| matches!(state, RunState::Compacting)),
+        "the session state is Compacting inside the window"
+    );
+    let SessionSelectModelOutcome::Committed { selected, .. } = world
+        .hub
+        .select_session_model(world.select_command("f3-switch-select"))
+        .await
+        .expect("selection during compaction must commit")
+    else {
+        panic!("selection during compaction must commit, not replay");
+    };
+    assert_eq!(selected.provider, "fake-b");
+
+    compaction.await.expect("compaction task");
+
+    // The compaction finished on the OLD pair (it was in-flight provider
+    // work), and provider B never served the summarizer.
+    assert_eq!(
+        fake_a.requests().len(),
+        2,
+        "compaction summarized on the pair it started with"
+    );
+    assert_eq!(fake_a.requests()[1].model, "model-a");
+    assert!(fake_b.requests().is_empty());
+
+    // The FIRST post-compaction turn resolves through the new pair.
+    world
+        .run_turn("f3-switch-two", "first post-compaction turn")
+        .await;
+    assert_eq!(fake_b.requests().len(), 1, "next turn lands on provider B");
+    assert_eq!(fake_b.requests()[0].model, "model-b");
 
     world.shutdown().await;
 }

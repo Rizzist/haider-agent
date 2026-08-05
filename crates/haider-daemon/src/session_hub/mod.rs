@@ -1385,7 +1385,11 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
-    async fn select_session_model(
+    /// `pub(crate)` for the in-crate runtime laws (the internal-test
+    /// convention of `accept_internal_turn`): a committed selection must go
+    /// THROUGH the actor arm so the actor's in-memory head advances with the
+    /// fact — a store-direct select desyncs the compaction head CAS.
+    pub(crate) async fn select_session_model(
         &self,
         command: SessionSelectModelCommand,
     ) -> Result<SessionSelectModelOutcome, SessionHubError> {

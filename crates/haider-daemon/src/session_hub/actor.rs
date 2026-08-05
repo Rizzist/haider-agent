@@ -291,14 +291,25 @@ pub(super) async fn run_session_actor(
                 if let Some(expected_head) = expected_head
                     && head != expected_head
                 {
-                    let _ = completed.send(Err(HaiderError::new(
-                        ErrorCode::Busy,
-                        format!(
-                            "session history advanced from {expected_head} to {head} during compaction"
-                        ),
-                        true,
-                    )));
-                    continue;
+                    // A compaction batch forks its node from the tree head
+                    // captured at plan time. Session-config FACTS (e.g.
+                    // model_selected) advance the journal without moving the
+                    // conversation tree, so a delta made ONLY of such facts
+                    // keeps the planned parent valid — a pair switch commits
+                    // during compaction and the compaction still lands (F3).
+                    // Any other payload in the delta (run states, items,
+                    // nodes, unknown kinds) still rejects: committing the
+                    // summary would fork an obsolete tree parent.
+                    if !session_config_only_delta(&store, &session_id, expected_head, head).await {
+                        let _ = completed.send(Err(HaiderError::new(
+                            ErrorCode::Busy,
+                            format!(
+                                "session history advanced from {expected_head} to {head} during compaction"
+                            ),
+                            true,
+                        )));
+                        continue;
+                    }
                 }
                 // DURABLE TERMINAL TRUTH: lease identity is necessary but not
                 // sufficient. This worker-only store transaction validates the
@@ -665,4 +676,48 @@ fn publish(
     for attachment_id in orphaned {
         attachments.remove(&attachment_id);
     }
+}
+
+/// True when every envelope in `(expected_head, head]` is a session-config
+/// fact (`SessionConfigEventPayload`, e.g. `model_selected`) — journal
+/// movement with NO conversation-tree movement, so a compaction batch's
+/// planned parent node is still the tree head (F3). Bounded scan; any read
+/// failure, coverage gap, or unrecognized payload keeps the honest Busy
+/// rejection. The one await is a store call (§5.5 actor charter).
+async fn session_config_only_delta(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    expected_head: u64,
+    head: u64,
+) -> bool {
+    /// A compaction interleave is a handful of facts; anything larger is not
+    /// a metadata blip and keeps the rejection without an unbounded scan.
+    const MAX_TOLERATED_DELTA: u64 = 64;
+    if head <= expected_head || head - expected_head > MAX_TOLERATED_DELTA {
+        return false;
+    }
+    let expected_len = head - expected_head;
+    let Ok(delta) = StoreHandle::read(
+        store,
+        session_id,
+        expected_head,
+        usize::try_from(expected_len)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1),
+    )
+    .await
+    else {
+        return false;
+    };
+    delta.len() as u64 == expected_len
+        && delta
+            .first()
+            .is_some_and(|envelope| envelope.seq > expected_head)
+        && delta.last().is_some_and(|envelope| envelope.seq == head)
+        && delta.iter().all(|envelope| {
+            serde_json::from_value::<haider_protocol::session::SessionConfigEventPayload>(
+                envelope.payload.clone(),
+            )
+            .is_ok()
+        })
 }
