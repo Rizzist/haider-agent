@@ -142,6 +142,8 @@ fn bare_chip(agent: &str, callsign: &str, ros: Option<u64>) -> ChipDto {
         device: "local".to_owned(),
         state: "RUNNING".to_owned(),
         tokens: 100,
+        spawned_at_ms: None,
+        last_event_at_ms: None,
         question: None,
         closed: false,
         children: Vec::new(),

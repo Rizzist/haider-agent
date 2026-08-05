@@ -366,6 +366,10 @@ pub async fn run_demo(
             // stays quiet across ticks).
             _ = anim_tick.tick(), if model.animated() => {
                 model.anim_phase = model.anim_phase.wrapping_add(1);
+                // S4: the same tick is the live chips' elapsed clock — no
+                // second timer, and a closed gate costs nothing (terminal
+                // chips read frozen journal time, not this).
+                model.clock_ms = model.clock_ms.max(now_epoch_ms());
                 model.dirty = true;
             }
             // Guarded tick: while the model is clean this branch is disabled,
@@ -483,6 +487,19 @@ pub const IDLE_DECAY: Duration = Duration::from_secs(30);
 /// port folds them onto ONE clock: 600 ms per phase gives a 1.2 s pulse
 /// (two phases) and, via `% 3`, the shimmer's 1.8 s exactly.
 pub const ANIM_PHASE_MS: u64 = 600;
+
+/// Wall clock in epoch ms — the S4 chip clocks' runtime time base: the
+/// anim tick advances [`AppModel::clock_ms`] with it, and the demo driver
+/// stamps chip events with it (the demo fabricates locally, so its journal
+/// time IS the wall clock). Saturating: a pre-epoch clock renders 0.
+#[must_use]
+pub fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
 
 /// One terminal input event through the production dispatch — key/paste
 /// into the reducer, resize into [`AppModel::handle_resize`], mouse through
@@ -1779,7 +1796,14 @@ impl DemoDriver {
             // ---- Chip events (§2) ----
             DemoEvent::ChipAdd(seed) => {
                 let parent = seed.parent.clone();
-                let chip = crate::app::ChipModel::from_seed(*seed);
+                let mut chip = crate::app::ChipModel::from_seed(*seed);
+                // S4: the demo fabricates locally — its spawn instant IS
+                // the wall clock (the live path reads `AgentSpawned`'s
+                // `committed_at_ms` instead).
+                let now = now_epoch_ms();
+                chip.spawned_at_ms = Some(now);
+                chip.note_event_at(now);
+                model.clock_ms = model.clock_ms.max(now);
                 match parent.and_then(|agent| crate::app::find_chip_mut(&mut model.chips, &agent)) {
                     Some(parent_chip) => parent_chip.children.push(chip),
                     None => model.chips.push(chip),
@@ -1788,24 +1812,27 @@ impl DemoDriver {
             }
             DemoEvent::ChipState { agent, state } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
-                    chip.state = state;
+                    chip.set_state_at(state, now_epoch_ms());
                     model.dirty = true;
                 }
             }
             DemoEvent::ChipEmit { agent, payload } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
+                    chip.note_event_at(now_epoch_ms());
                     chip.transcript.apply(&payload);
                     model.dirty = true;
                 }
             }
             DemoEvent::ChipNote { agent, text } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
+                    chip.note_event_at(now_epoch_ms());
                     chip.transcript.push_note(text);
                     model.dirty = true;
                 }
             }
             DemoEvent::ChipTokens { agent, n } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
+                    chip.note_event_at(now_epoch_ms());
                     chip.tokens = chip.tokens.saturating_add(n);
                     model.dirty = true;
                 }
@@ -1821,11 +1848,14 @@ impl DemoDriver {
                     // `state == input_required && question` is what
                     // respondChip's steer-queue gate reads, so it must never
                     // be observable half-applied.
-                    chip.state = if recovery {
-                        crate::script::ChipDisplayState::Error
-                    } else {
-                        crate::script::ChipDisplayState::InputRequired
-                    };
+                    chip.set_state_at(
+                        if recovery {
+                            crate::script::ChipDisplayState::Error
+                        } else {
+                            crate::script::ChipDisplayState::InputRequired
+                        },
+                        now_epoch_ms(),
+                    );
                     chip.question = Some(crate::app::ChipQuestion {
                         recovery,
                         text,
@@ -1840,14 +1870,14 @@ impl DemoDriver {
                     if let Some(question) = &mut chip.question {
                         question.resolved = true;
                     }
-                    chip.state = state;
+                    chip.set_state_at(state, now_epoch_ms());
                     model.dirty = true;
                 }
             }
             DemoEvent::ChipQuestionClear { agent, state } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
                     chip.question = None;
-                    chip.state = state;
+                    chip.set_state_at(state, now_epoch_ms());
                     model.dirty = true;
                 }
             }
@@ -2023,7 +2053,12 @@ pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEv
         DemoEvent::Voice(on) => state.projection.set_voice_live(on),
         DemoEvent::ChipAdd(seed) => {
             let parent = seed.parent.clone();
-            let chip = ChipModel::from_seed(*seed);
+            let mut chip = ChipModel::from_seed(*seed);
+            // S4: law-identical with the active arm — the demo's spawn
+            // instant is the wall clock it fabricates with.
+            let now = now_epoch_ms();
+            chip.spawned_at_ms = Some(now);
+            chip.note_event_at(now);
             match parent.and_then(|agent| find_chip_mut(&mut state.chips, &agent)) {
                 Some(parent_chip) => parent_chip.children.push(chip),
                 None => state.chips.push(chip),
@@ -2031,21 +2066,24 @@ pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEv
         }
         DemoEvent::ChipState { agent, state: next } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
-                chip.state = next;
+                chip.set_state_at(next, now_epoch_ms());
             }
         }
         DemoEvent::ChipEmit { agent, payload } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.note_event_at(now_epoch_ms());
                 chip.transcript.apply(&payload);
             }
         }
         DemoEvent::ChipNote { agent, text } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.note_event_at(now_epoch_ms());
                 chip.transcript.push_note(text);
             }
         }
         DemoEvent::ChipTokens { agent, n } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.note_event_at(now_epoch_ms());
                 chip.tokens = chip.tokens.saturating_add(n);
             }
         }
@@ -2057,11 +2095,14 @@ pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEv
         } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
                 // Atomic with the state, exactly as the active arm.
-                chip.state = if recovery {
-                    crate::script::ChipDisplayState::Error
-                } else {
-                    crate::script::ChipDisplayState::InputRequired
-                };
+                chip.set_state_at(
+                    if recovery {
+                        crate::script::ChipDisplayState::Error
+                    } else {
+                        crate::script::ChipDisplayState::InputRequired
+                    },
+                    now_epoch_ms(),
+                );
                 chip.question = Some(ChipQuestion {
                     recovery,
                     text,
@@ -2075,13 +2116,13 @@ pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEv
                 if let Some(question) = &mut chip.question {
                     question.resolved = true;
                 }
-                chip.state = next;
+                chip.set_state_at(next, now_epoch_ms());
             }
         }
         DemoEvent::ChipQuestionClear { agent, state: next } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
                 chip.question = None;
-                chip.state = next;
+                chip.set_state_at(next, now_epoch_ms());
             }
         }
         DemoEvent::ChipRemove { agent } => {
@@ -2661,6 +2702,10 @@ pub async fn run_live(
             }
             _ = anim_tick.tick(), if model.animated() => {
                 model.anim_phase = model.anim_phase.wrapping_add(1);
+                // S4: the same tick is the live chips' elapsed clock — no
+                // second timer, and a closed gate costs nothing (terminal
+                // chips read frozen journal time, not this).
+                model.clock_ms = model.clock_ms.max(now_epoch_ms());
                 model.dirty = true;
             }
             () = wait_until(deadline) => {}

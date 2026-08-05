@@ -35,6 +35,27 @@ pub fn fmt_tok(n: u64) -> String {
     }
 }
 
+/// Durations for the subtree rows (S4), law-pinned h/m/s: `42s` below a
+/// minute, `25m 18s` below an hour, `1h 4m 9s` from an hour up — units
+/// descend, no zero-padding, and every lower unit present once its tier is
+/// reached (`1h 0m 42s`, never `1h 42s`). Seconds truncate (a second shows
+/// only once it has fully elapsed), so the live tick can never overshoot a
+/// later frozen final.
+#[must_use]
+pub fn fmt_elapsed(ms: u64) -> String {
+    let total = ms / 1000;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// The context meter: `pct` of `cells` rendered as `▰▰▰▱▱▱▱▱▱▱`.
 /// The sim clamps only the top; we also clamp negatives (unreachable from
 /// valid ratios) instead of panicking.

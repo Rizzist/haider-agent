@@ -7,7 +7,7 @@
 use crate::app::{AppModel, Hit, LauncherRow, Screen};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_TEXT, PALETTE_MAX_ROWS};
-use crate::format::{METER_CELLS_DEFAULT, fmt_tok, meter_cells};
+use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
 use crate::plain::status_glyph;
 use crate::projection::{ItemBlock, TranscriptEntry};
 use crate::sanctum::SanctumLine;
@@ -3264,6 +3264,27 @@ fn subtree_counts(model: &AppModel) -> String {
     parts.join(" · ")
 }
 
+/// The S4 chip-row meta — `elapsed · ↓ N tokens` for the row's right end.
+/// Segment PRESENCE is data truth: a source with nothing to say drops its
+/// segment (unknown is never rendered as `0s`/`0 tokens`). Width
+/// degradation drops WHOLE segments in law order — tokens first, then
+/// elapsed (the F2c pattern); never a mid-segment truncation. Every glyph
+/// used (`↓`, `·`, ASCII) is single-width, so char count IS cell width.
+fn chip_row_meta(elapsed: Option<&str>, tokens: Option<&str>, budget: usize) -> Option<String> {
+    let full = match (elapsed, tokens) {
+        (Some(elapsed), Some(tokens)) => format!("{elapsed} · {tokens}"),
+        (Some(elapsed), None) => elapsed.to_owned(),
+        (None, Some(tokens)) => tokens.to_owned(),
+        (None, None) => return None,
+    };
+    if full.chars().count() <= budget {
+        return Some(full);
+    }
+    // Tokens drop FIRST, elapsed survives alone — or nothing at all.
+    let elapsed = elapsed?.to_owned();
+    (elapsed.chars().count() <= budget).then_some(elapsed)
+}
+
 /// The SubTree panel (§2.9): header toggle + depth-first rows with
 /// connectors; every row opens its chip's view. Shared by the session and
 /// subagent screens (the map is one surface).
@@ -3380,6 +3401,25 @@ fn render_subtree(
                 spans.push(Span::styled(format!(" · {}", chip.device), ink));
             }
             spans.push(Span::styled(format!(" — {activity}"), ink));
+            // S4: right-aligned `elapsed · ↓ tokens` in the dim slot —
+            // live children tick on the shared anim clock's `clock_ms`,
+            // terminal children read a figure frozen from journal
+            // timestamps ([`crate::app::ChipModel::elapsed_ms`]); the
+            // token join is the chip's OWN truth chain
+            // ([`crate::app::chip_row_tokens`]).
+            let elapsed = chip.elapsed_ms(model.clock_ms).map(fmt_elapsed);
+            let tokens = crate::app::chip_row_tokens(&model.sessions, chip)
+                .map(|total| format!("↓ {} tokens", fmt_tok(total)));
+            let left = Line::from(spans.clone()).width();
+            // ≥2-cell gap: the meta must never kiss the activity text.
+            let budget = (area.width as usize).saturating_sub(left).saturating_sub(2);
+            if let Some(meta) = chip_row_meta(elapsed.as_deref(), tokens.as_deref(), budget) {
+                let pad = (area.width as usize)
+                    .saturating_sub(left)
+                    .saturating_sub(meta.chars().count());
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled(meta, theme.dim_style()));
+            }
             let line = hover_band(
                 Line::from(spans),
                 model.hovered == Some(Hit::ChipRow(chip.agent.clone())),

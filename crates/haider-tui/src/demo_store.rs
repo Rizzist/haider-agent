@@ -431,6 +431,12 @@ pub struct ChipDto {
     pub state: String,
     #[serde(default)]
     pub tokens: u64,
+    /// S4 chip clocks — additive (`default`): a pre-S4 file loads with no
+    /// time base and the row simply shows no elapsed segment.
+    #[serde(default)]
+    pub spawned_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_event_at_ms: Option<u64>,
     #[serde(default)]
     pub question: Option<QuestionDto>,
     /// Persisted so guard 4's sweep can drop chips closed before quit whose
@@ -596,6 +602,8 @@ fn chip_to_dto(chip: &ChipModel) -> ChipDto {
         device: chip.device.clone(),
         state: chip.state.label().to_owned(),
         tokens: chip.tokens,
+        spawned_at_ms: chip.spawned_at_ms,
+        last_event_at_ms: chip.last_event_at_ms,
         question: chip.question.as_ref().map(|q| QuestionDto {
             recovery: q.recovery,
             text: q.text.clone(),
@@ -833,6 +841,12 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         device: dto.device,
         state: chip_state_from_label(&dto.state),
         tokens: dto.tokens,
+        // Demo chips never carry a child session (the join is live-wire
+        // truth); the clocks reload so a terminal chip's frozen final and
+        // a live chip's running measure both survive a restart.
+        child_session: None,
+        spawned_at_ms: dto.spawned_at_ms,
+        last_event_at_ms: dto.last_event_at_ms,
         question: dto.question.map(|q| ChipQuestion {
             recovery: q.recovery,
             text: q.text,

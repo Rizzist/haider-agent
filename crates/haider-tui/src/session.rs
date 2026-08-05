@@ -238,6 +238,35 @@ impl SessionState {
         (self.projection.context_tokens(), false)
     }
 
+    /// This row's token truth or NOTHING — the S4 chip-row join's source.
+    /// Unlike [`Self::row_tokens`] (a launcher display that may honestly
+    /// show `0 tok` for a row it is looking at), a joined figure on
+    /// another surface must not collapse "unknown" into zero, so:
+    ///
+    /// * a FRESHER summary's `footprint_tokens` wins (`Some(0)` is real —
+    ///   the daemon reports it exclusively for truly empty sessions);
+    /// * else the projection's cumulative usage when any has applied;
+    /// * else a STALE summary's footprint (behind live truth but still
+    ///   this session's own journal — better than silence);
+    /// * else `None` — the caller drops the segment.
+    #[must_use]
+    pub fn known_tokens(&self) -> Option<u64> {
+        let summary_tokens = self
+            .summary_counts
+            .as_ref()
+            .and_then(|counts| counts.footprint_tokens);
+        if self.summary_is_fresher()
+            && let Some(tokens) = summary_tokens
+        {
+            return Some(tokens);
+        }
+        let live = self.projection.context_tokens();
+        if live > 0 {
+            return Some(live);
+        }
+        summary_tokens
+    }
+
     /// Route one RAW envelope into this (non-attached) session — the
     /// background half of the W3c3 router (report R11 cut 2).
     ///
@@ -281,6 +310,7 @@ impl SessionState {
                             &payload,
                             envelope.branch_id.as_ref(),
                             envelope.agent_id.as_ref(),
+                            envelope.committed_at_ms,
                         ),
                         // S3: the additive agent-event union rides raw
                         // envelopes OUTSIDE `EventPayload` — try it before
@@ -304,12 +334,14 @@ impl SessionState {
 
     /// Route one admitted content payload: aggregate session-scope types
     /// FIRST (risk 6), then branch (outer), then agent — the background
-    /// half; `AppModel::route_admitted` is the attached twin.
+    /// half; `AppModel::route_admitted` is the attached twin. `at_ms` is
+    /// the envelope's `committed_at_ms` — the chip clocks' time base (S4).
     fn route_admitted(
         &mut self,
         payload: &EventPayload,
         branch: Option<&haider_protocol::ids::BranchId>,
         agent: Option<&AgentId>,
+        at_ms: u64,
     ) {
         use crate::branch::BranchScope;
         match self.branch_state.scope_of(payload, branch) {
@@ -317,17 +349,17 @@ impl SessionState {
                 self.branch_state.apply_aggregate_to_parked(payload);
                 self.absorb_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent),
+            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent);
+                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent);
+                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -361,12 +393,12 @@ impl SessionState {
     /// One admitted payload, routed by SCOPE (report R11 cut 2) — the
     /// BACKGROUND half. [`classify`] makes the decision so this path and
     /// the attached path in `AppModel` can never diverge.
-    pub fn absorb_scoped(&mut self, payload: &EventPayload, agent: Option<&AgentId>) {
+    pub fn absorb_scoped(&mut self, payload: &EventPayload, agent: Option<&AgentId>, at_ms: u64) {
         match classify(&mut self.projection, &self.chips, payload, agent) {
-            Destination::Agent => apply_agent_payload(&mut self.chips, payload),
+            Destination::Agent => apply_agent_payload(&mut self.chips, payload, at_ms),
             Destination::Chip(target) => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &target) {
-                    chip_apply(chip, payload);
+                    chip_apply(chip, payload, at_ms);
                 }
             }
             Destination::Session => self.absorb_envelope(payload),
@@ -465,14 +497,19 @@ fn chip_or_session(chips: &[ChipModel], agent: Option<&AgentId>) -> Destination 
 /// `AgentSpawned` creates the chip from its manifest (idempotent under
 /// replay), `AgentChipState` is the SOLE chip-state authority, and
 /// `AgentReport` contributes ONLY summary/verification content — never
-/// state. Shared by the attached and background routes.
-pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload) {
+/// state. Shared by the attached and background routes. `at_ms` is the
+/// envelope's `committed_at_ms`: the spawn instant on `AgentSpawned`, an
+/// event-clock advance on the other two (S4 — replay re-derives the same
+/// figures from the same journal timestamps).
+pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload, at_ms: u64) {
     match payload {
         EventPayload::AgentSpawned(manifest) => {
             if crate::app::find_chip_mut(chips, manifest.agent.as_str()).is_some() {
                 return;
             }
             let mut chip = ChipModel::from_manifest(manifest);
+            chip.spawned_at_ms = Some(at_ms);
+            chip.note_event_at(at_ms);
             if manifest.callsign.is_none() {
                 // W6d (owner ask): live children claim honor-roll
                 // callsigns exactly like the sim — deterministically from
@@ -498,11 +535,14 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload) {
         }
         EventPayload::AgentChipState { agent, chip } => {
             if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str()) {
-                model.state = crate::script::ChipDisplayState::from_protocol(chip);
+                // S4: through the shared transition law — a terminal flip
+                // freezes the chip's clock at this envelope's timestamp.
+                model.set_state_at(crate::script::ChipDisplayState::from_protocol(chip), at_ms);
             }
         }
         EventPayload::AgentReport(report) => {
             if let Some(model) = crate::app::find_chip_mut(chips, report.agent.as_str()) {
+                model.note_event_at(at_ms);
                 model.transcript.push_note(crate::app::report_note(report));
             }
         }
@@ -522,7 +562,10 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload) {
 /// user row. The demo driver's `ChipEmit` beats apply straight to the
 /// chip projection and stay plain: the sim fabricates locally and must
 /// not dress its rows as parent-stream truth.
-pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload) {
+pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, at_ms: u64) {
+    // S4: every child-attributed envelope advances this chip's event
+    // clock (the frozen-final measure's far end) before the payload lands.
+    chip.note_event_at(at_ms);
     if let EventPayload::UserMessage {
         text, attachments, ..
     } = payload

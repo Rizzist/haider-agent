@@ -432,13 +432,14 @@ pub fn absorb_into_view(
     view: &mut BranchSurfaces,
     payload: &EventPayload,
     agent: Option<&AgentId>,
+    at_ms: u64,
 ) {
     use crate::session::Destination;
     match crate::session::classify(&mut view.projection, &view.chips, payload, agent) {
-        Destination::Agent => crate::session::apply_agent_payload(&mut view.chips, payload),
+        Destination::Agent => crate::session::apply_agent_payload(&mut view.chips, payload, at_ms),
         Destination::Chip(target) => {
             if let Some(chip) = crate::app::find_chip_mut(&mut view.chips, &target) {
-                crate::session::chip_apply(chip, payload);
+                crate::session::chip_apply(chip, payload, at_ms);
             }
         }
         Destination::Session => {

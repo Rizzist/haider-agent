@@ -389,6 +389,7 @@ fn live_chips_claim_roster_callsigns_when_the_wire_sends_none() {
             parent: None,
             coordinates: None,
         }),
+        0,
     );
     let chip = chips.first().expect("chip created");
     assert!(!chip.callsign.is_empty(), "a roster callsign was claimed");

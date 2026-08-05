@@ -636,6 +636,22 @@ pub struct ChipModel {
     pub device: String,
     pub state: ChipDisplayState,
     pub tokens: u64,
+    /// The child's own session id, from the manifest `coordinates`
+    /// (`child_session_id` — the key W6d attaches the chip view by). The
+    /// S4 row's token join reads it against the roster's session-summary
+    /// truth; `None` (older daemon, demo seeds) never joins — a figure is
+    /// never guessed off another row.
+    pub child_session: Option<String>,
+    /// Epoch-ms the child spawned: the `AgentSpawned` envelope's
+    /// `committed_at_ms` on live streams, the local wall clock at chip
+    /// creation in demo mode (the demo fabricates locally). `None` renders
+    /// no elapsed segment — never a guess (S4).
+    pub spawned_at_ms: Option<u64>,
+    /// Epoch-ms of the LATEST child-attributed event this chip applied.
+    /// [`Self::note_event_at`] stops advancing it at the terminal
+    /// transition, so `last − spawned` IS the frozen final duration (the
+    /// S4 live-tick vs frozen-final law).
+    pub last_event_at_ms: Option<u64>,
     pub question: Option<ChipQuestion>,
     pub closed: bool,
     pub removing: bool,
@@ -692,6 +708,13 @@ impl ChipModel {
             device: seed.device,
             state: seed.state,
             tokens: seed.tokens,
+            // Seeded chips carry no time base or child session: the mock's
+            // pre-seeded history has no honest spawn instant, so the row
+            // simply shows no elapsed. The demo driver's LIVE ChipAdd arm
+            // stamps `spawned_at_ms` at creation instead.
+            child_session: None,
+            spawned_at_ms: None,
+            last_event_at_ms: None,
             question: None,
             closed: false,
             removing: false,
@@ -732,6 +755,17 @@ impl ChipModel {
             device,
             state: ChipDisplayState::Idle,
             tokens: 0,
+            // S4: the child's session id rides the manifest's reserved
+            // `coordinates` blob (`delegation.rs` writes it for the W6d
+            // chip-view attach). Absent or non-string → no join, honestly.
+            child_session: manifest
+                .coordinates
+                .as_ref()
+                .and_then(|coordinates| coordinates.get("child_session_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            spawned_at_ms: None,
+            last_event_at_ms: None,
             question: None,
             closed: false,
             removing: false,
@@ -763,6 +797,64 @@ impl ChipModel {
     #[must_use]
     pub fn is_live(&self) -> bool {
         !self.closed && !matches!(self.state, ChipDisplayState::Done | ChipDisplayState::Error)
+    }
+
+    /// S4: this chip's clock is stopped — closed, or a terminal state.
+    /// Deliberately the negation of [`Self::is_live`]: the elapsed figure
+    /// freezes exactly where the tree stops counting the chip as live, so
+    /// the two laws can never disagree.
+    #[must_use]
+    pub fn elapsed_frozen(&self) -> bool {
+        !self.is_live()
+    }
+
+    /// Record one child-attributed event instant (envelope
+    /// `committed_at_ms` on live streams, local wall clock in the demo).
+    /// Monotone max — replayed/out-of-order envelopes never rewind it —
+    /// and REFUSED once the chip is terminal: the terminal transition is
+    /// where the clock stops, so `last − spawned` stays the frozen final
+    /// (S4 law). Callers note the instant BEFORE applying a state flip, so
+    /// the terminal envelope's own timestamp is the end of the measure.
+    pub fn note_event_at(&mut self, at_ms: u64) {
+        if self.elapsed_frozen() {
+            return;
+        }
+        self.last_event_at_ms = Some(self.last_event_at_ms.map_or(at_ms, |held| held.max(at_ms)));
+    }
+
+    /// One law for state flips that must carry time (S4): note the event
+    /// instant while the chip is still live, THEN apply the state — a
+    /// terminal flip freezes the clock at its own timestamp. Both demo
+    /// arms and the live `AgentChipState` reducer go through here so the
+    /// freeze can never drift between paths.
+    pub fn set_state_at(&mut self, state: ChipDisplayState, at_ms: u64) {
+        self.note_event_at(at_ms);
+        self.state = state;
+    }
+
+    /// The S4 row's elapsed figure, in ms:
+    ///
+    /// * live chip → `now − spawned`, ticking on the shared anim clock;
+    /// * terminal/closed chip → `last event − spawned`, frozen (the
+    ///   [`Self::note_event_at`] gate stopped the clock at the terminal
+    ///   transition);
+    /// * no spawn instant → `None` — the segment is dropped, never a
+    ///   fabricated `0s`.
+    ///
+    /// Saturating both ways: clock skew renders `0s`, never a panic or a
+    /// wrapped figure.
+    #[must_use]
+    pub fn elapsed_ms(&self, now_ms: u64) -> Option<u64> {
+        let spawned = self.spawned_at_ms?;
+        if self.elapsed_frozen() {
+            Some(
+                self.last_event_at_ms
+                    .unwrap_or(spawned)
+                    .saturating_sub(spawned),
+            )
+        } else {
+            Some(now_ms.saturating_sub(spawned))
+        }
     }
 
     /// `chipDisplayState` (tui.js:2810-2811): a live chip that is NOT
@@ -874,6 +966,40 @@ pub fn tree_live_count(chips: &[ChipModel]) -> usize {
         .iter()
         .map(|chip| usize::from(chip.is_live()) + tree_live_count(&chip.children))
         .sum()
+}
+
+/// The S4 row's token figure — the child's TOTAL, truth-ordered, or `None`
+/// (the segment is dropped; unknown is never rendered as zero):
+///
+/// 1. the chip transcript's own durable context footprint (`/tokens` panel
+///    truth — the two surfaces share the first source so they cannot
+///    disagree);
+/// 2. the chip's accumulated counter when it has actually accrued (the
+///    demo driver's `ChipTokens` feed; live streams never feed it, so a
+///    live chip's honest `0` falls through instead of rendering);
+/// 3. the roster join: the manifest's `child_session_id` against the
+///    session rows' summary/projection truth ([`known token truth law:
+///    crate::session::SessionState::known_tokens`]). Children are full
+///    sessions, and `session.list` is the only live wire that carries a
+///    child's token total today — the parent stream mirrors no child
+///    `Usage` (verified against the daemon's delegation mirror, S4 notes).
+///
+/// Join-correctness law: the lookup is BY THE CHIP'S OWN recorded id,
+/// exact-match — never positional, never by callsign — so a wrong child
+/// can never wear another child's tokens.
+#[must_use]
+pub fn chip_row_tokens(sessions: &[crate::session::SessionState], chip: &ChipModel) -> Option<u64> {
+    if let Some(footprint) = chip.transcript.latest_footprint() {
+        return Some(footprint.used_tokens);
+    }
+    if chip.tokens > 0 {
+        return Some(chip.tokens);
+    }
+    let child_session = chip.child_session.as_deref()?;
+    sessions
+        .iter()
+        .find(|row| row.id.as_str() == child_session)
+        .and_then(crate::session::SessionState::known_tokens)
 }
 
 /// Any non-closed chip whose DISPLAYED state pulses in the sim (running /
@@ -2603,6 +2729,14 @@ pub struct AppModel {
     /// midpoint; `% 3` drives the rail shimmer). Pure render phase:
     /// never persisted, never touching projections or arms.
     pub anim_phase: u8,
+    /// The render clock, epoch ms (S4): the LIVE chips' elapsed figures
+    /// read it at draw time. Advanced by the shared anim tick (both run
+    /// loops — no new timer) and by every applied envelope's
+    /// `committed_at_ms` (monotone max, so a first paint before the first
+    /// tick is already inside the journal's own time base). Pure display
+    /// state: never persisted, and terminal chips never read it (their
+    /// figure is frozen from journal timestamps).
+    pub clock_ms: u64,
     /// The حيدر wordmark as a real graphics-protocol image, when the terminal
     /// speaks one — set once at startup by the runtime (see
     /// [`crate::wordmark::Wordmark::detect`]) and read by render to draw a crisp
@@ -2732,6 +2866,7 @@ impl Default for AppModel {
             should_quit: false,
             dirty: true,
             anim_phase: 0,
+            clock_ms: 0,
             // No graphics wordmark until the runtime queries the terminal at
             // startup; every non-graphics terminal and all tests stay None and
             // render falls back to the half-block art in `crate::mark`.
@@ -3199,6 +3334,12 @@ impl AppModel {
                         .todos()
                         .is_some_and(|panel| panel.pinned && panel.current().is_some())
                     || chips_animated(&self.chips)
+                    // S4: ANY live chip ticks its elapsed figure on this
+                    // clock (the row is on both screens' subtree) — the
+                    // pulse set alone would park an idle/waiting child's
+                    // counter. Terminal chips are frozen and keep the
+                    // gate closed.
+                    || tree_live_count(&self.chips) > 0
                     || (self.screen == Screen::Subagent
                         && self.viewed_chip().is_some_and(|chip| {
                             chip.state == ChipDisplayState::Thinking
@@ -7505,7 +7646,13 @@ impl AppModel {
             RawOutcome::WrongSession
         };
         match outcome {
-            RawOutcome::Applied => self.dirty = true,
+            RawOutcome::Applied => {
+                self.dirty = true;
+                // S4: applied journal truth advances the render clock —
+                // the first paint after a spawn reads a clock already
+                // inside the journal's own time base, tick or no tick.
+                self.clock_ms = self.clock_ms.max(envelope.committed_at_ms);
+            }
             RawOutcome::Gap { after_seq } => self.requests.push(AppRequest::Reattach {
                 session: envelope.session_id.clone(),
                 after_seq,
@@ -7563,6 +7710,7 @@ impl AppModel {
                             &payload,
                             envelope.branch_id.as_ref(),
                             envelope.agent_id.as_ref(),
+                            envelope.committed_at_ms,
                         ),
                         // S3: the additive agent-event union rides raw
                         // envelopes OUTSIDE `EventPayload` — try it before
@@ -7594,6 +7742,7 @@ impl AppModel {
         payload: &EventPayload,
         branch: Option<&haider_protocol::ids::BranchId>,
         agent: Option<&haider_protocol::ids::AgentId>,
+        at_ms: u64,
     ) {
         use crate::branch::BranchScope;
         match self.branch_state.scope_of(payload, branch) {
@@ -7603,17 +7752,17 @@ impl AppModel {
                 // aggregate never lands in a chip transcript.
                 self.handle_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent),
+            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent);
+                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent);
+                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -7921,13 +8070,16 @@ impl AppModel {
         &mut self,
         payload: &EventPayload,
         agent: Option<&haider_protocol::ids::AgentId>,
+        at_ms: u64,
     ) {
         use crate::session::Destination;
         match crate::session::classify(&mut self.projection, &self.chips, payload, agent) {
-            Destination::Agent => crate::session::apply_agent_payload(&mut self.chips, payload),
+            Destination::Agent => {
+                crate::session::apply_agent_payload(&mut self.chips, payload, at_ms);
+            }
             Destination::Chip(target) => {
                 if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
-                    crate::session::chip_apply(chip, payload);
+                    crate::session::chip_apply(chip, payload, at_ms);
                 }
             }
             Destination::Session => self.handle_envelope(payload),
