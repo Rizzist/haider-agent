@@ -385,6 +385,21 @@ async fn run_inner(
     };
     hub.install_creatable_providers(creatable_providers)
         .map_err(DaemonError::from)?;
+    // U1: the read-only `usage.report` service shares the account snapshot
+    // and (when the vault runs) the SAME credential broker as provider
+    // construction, so meter fetches ride the broker's refresh single-flight
+    // instead of racing it.
+    hub.install_usage_report(std::sync::Arc::new(
+        crate::usage_report::UsageReportService::new(
+            std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+            accounts_runtime.broker.clone().map(|broker| {
+                std::sync::Arc::new(broker)
+                    as std::sync::Arc<dyn crate::usage_report::MeterTokenSource>
+            }),
+            std::sync::Arc::new(crate::usage_report::ReqwestUsageMeterHttp::new()),
+        ),
+    ))
+    .map_err(DaemonError::from)?;
     let worker_dependencies = crate::worker::WorkerDependencies {
         provider_factory,
         tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),

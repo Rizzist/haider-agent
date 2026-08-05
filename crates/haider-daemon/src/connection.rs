@@ -1405,6 +1405,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_SHELL_EXEC_V1.to_owned(),
         FEATURE_TOOL_INVENTORY_V1.to_owned(),
         FEATURE_TURN_CONTROL_V1.to_owned(),
+        haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
         FEATURE_VAULT_STAGE_V1.to_owned(),
     ])
 }

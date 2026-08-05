@@ -61,6 +61,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SESSION_MODEL_SELECT_V1`. Expected
 /// RUNTIME failure: pickers cannot discover the served receipted
 /// cross-provider model selection (F1).
+///
+/// MUTATION CHECK: remove `FEATURE_USAGE_REPORT_V1`. Expected RUNTIME
+/// failure: clients cannot discover the served cross-provider `usage.report`
+/// snapshot (U1).
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -89,6 +93,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_SHELL_EXEC_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
+            haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
     );

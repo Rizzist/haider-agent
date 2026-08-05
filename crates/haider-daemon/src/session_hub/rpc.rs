@@ -1371,6 +1371,18 @@ impl HubConnection {
                 }
                 self.provider_remove(request_id, command_id, provider, expected_revision)
             }
+            RequestBody::UsageReport => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.usage_report(request_id).await
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -2849,6 +2861,29 @@ impl HubConnection {
                 session_id,
                 inventory,
             },
+        })
+    }
+
+    /// Cross-provider usage snapshot (U1). No installed service is an honest
+    /// empty report (mirrors the missing-facade `account.list` answer), and
+    /// per-account meter failures NEVER fail the frame — they ride as typed
+    /// unavailability inside the report.
+    async fn usage_report(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let Some(service) = self.hub.usage_report_service()? else {
+            return self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::UsageReport {
+                    report: haider_protocol::usage::UsageReportV1 {
+                        generated_at_ms: 0,
+                        accounts: Vec::new(),
+                    },
+                },
+            });
+        };
+        let report = service.report(&self.hub.inner.store).await?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::UsageReport { report },
         })
     }
 
