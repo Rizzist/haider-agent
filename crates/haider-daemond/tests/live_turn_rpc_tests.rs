@@ -3023,6 +3023,11 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "process_exec",
             "spawn_subagent",
             "message_subagent",
+            // W-A: the background-task pack — output reads are effect-free
+            // (the request_input pattern); kill sits under the SAME process
+            // ceiling and Ask default as process_exec.
+            "task_output",
+            "task_kill",
         ]
     );
     assert!(!names.contains(&"exec"));
@@ -3034,6 +3039,20 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
         .expect("canonical process tool");
     assert_eq!(process.manifest.effects, [EffectClass::ProcessExec]);
     assert_eq!(process.default, ToolPermissionDefault::Ask);
+    let task_output = inventory
+        .tools
+        .iter()
+        .find(|entry| entry.manifest.name == "task_output")
+        .expect("task output tool");
+    assert!(task_output.manifest.effects.is_empty());
+    assert_eq!(task_output.default, ToolPermissionDefault::NotApplicable);
+    let task_kill = inventory
+        .tools
+        .iter()
+        .find(|entry| entry.manifest.name == "task_kill")
+        .expect("task kill tool");
+    assert_eq!(task_kill.manifest.effects, [EffectClass::ProcessExec]);
+    assert_eq!(task_kill.default, ToolPermissionDefault::Ask);
     let reads = inventory
         .tools
         .iter()
