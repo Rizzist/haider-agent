@@ -1,0 +1,15 @@
+{
+  "type": "task_completed",
+  "task": "task-3f9a",
+  "name": "cargo",
+  "state": {
+    "state": "completed",
+    "exit_code": 0
+  },
+  "elapsed_ms": 61000,
+  "output_bytes": 700000,
+  "tail": "test result: ok\n",
+  "artifact": "blake3:9c1185a5c5e9fc54612808977ee8f548b2258d31",
+  "truncated": true,
+  "delivery": "delivered_queued"
+}

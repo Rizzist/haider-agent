@@ -81,7 +81,7 @@ impl ProcessExec {
         }
     }
 
-    fn resolved(&self, workspace_root: &Path) -> ToolResult<Self> {
+    pub(crate) fn resolved(&self, workspace_root: &Path) -> ToolResult<Self> {
         if self.call_id.trim().is_empty() {
             return Err(ToolError::invalid_argument(
                 "process_exec call_id must not be empty",
@@ -159,14 +159,14 @@ impl EffectOperation for ProcessExec {
     }
 }
 
-struct PreparedProcessExec {
-    operation: ProcessExec,
+pub(crate) struct PreparedProcessExec {
+    pub(crate) operation: ProcessExec,
     cwd_identity: rustix::fs::Stat,
     bounds: ProcessBounds,
 }
 
 impl PreparedProcessExec {
-    fn new(
+    pub(crate) fn new(
         operation: &ProcessExec,
         workspace_root: &Path,
         workspace_dir: OwnedFd,
@@ -190,7 +190,11 @@ impl PreparedProcessExec {
     /// authorized directory outside and replace its old name with a symlink to
     /// the same inode. `O_NOFOLLOW` on every fresh component rejects that
     /// same-inode relocation before the child can `fchdir`.
-    fn cwd_for_spawn(&self, workspace_root: &Path, workspace_dir: OwnedFd) -> ToolResult<OwnedFd> {
+    pub(crate) fn cwd_for_spawn(
+        &self,
+        workspace_root: &Path,
+        workspace_dir: OwnedFd,
+    ) -> ToolResult<OwnedFd> {
         let cwd_fd = open_directory_beneath(workspace_dir, workspace_root, &self.operation.cwd)
             .map_err(|error| ToolError::PathChanged {
                 path: self.operation.cwd.clone(),
@@ -863,7 +867,7 @@ struct SupervisorCompletion {
 }
 
 #[derive(Debug)]
-enum Captured {
+pub(crate) enum Captured {
     Chunk(OutputStream, Vec<u8>),
     ReadError(OutputStream, std::io::Error),
 }
@@ -1349,8 +1353,11 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     }
 }
 
-async fn read_output<R>(mut reader: R, stream: OutputStream, sender: mpsc::Sender<Captured>)
-where
+pub(crate) async fn read_output<R>(
+    mut reader: R,
+    stream: OutputStream,
+    sender: mpsc::Sender<Captured>,
+) where
     R: AsyncRead + Unpin,
 {
     let mut buffer = vec![0_u8; PROCESS_OUTPUT_CHUNK_BYTES];
@@ -1407,7 +1414,7 @@ async fn apply_control(active: &ActiveProcess, control: &ProcessControl) -> Tool
     }
 }
 
-fn signal_group(pid: Pid, signal: Signal) -> ToolResult<()> {
+pub(crate) fn signal_group(pid: Pid, signal: Signal) -> ToolResult<()> {
     kill_process_group(pid, signal).map_err(|error| ToolError::Runtime {
         message: format!(
             "send signal {signal:?} to process group {}: {error}",
@@ -1419,7 +1426,11 @@ fn signal_group(pid: Pid, signal: Signal) -> ToolResult<()> {
 /// Signals the original group during a supervisor sweep. `ESRCH` after the
 /// zombie leader has pinned the PGID means no live member remains to signal,
 /// so the sweep is complete rather than failed.
-fn signal_group_for_sweep(pid: Pid, signal: Signal, leader_is_zombie: bool) -> ToolResult<bool> {
+pub(crate) fn signal_group_for_sweep(
+    pid: Pid,
+    signal: Signal,
+    leader_is_zombie: bool,
+) -> ToolResult<bool> {
     match kill_process_group(pid, signal) {
         Ok(()) => Ok(true),
         Err(rustix::io::Errno::SRCH) => Ok(false),
@@ -1436,7 +1447,7 @@ fn signal_group_for_sweep(pid: Pid, signal: Signal, leader_is_zombie: bool) -> T
     }
 }
 
-fn process_group_exists(pid: Pid) -> ToolResult<bool> {
+pub(crate) fn process_group_exists(pid: Pid) -> ToolResult<bool> {
     match test_kill_process_group(pid) {
         Ok(()) => Ok(true),
         Err(rustix::io::Errno::SRCH) => Ok(false),
@@ -1450,7 +1461,7 @@ fn process_group_exists(pid: Pid) -> ToolResult<bool> {
     }
 }
 
-async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
+pub(crate) async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
     let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
     loop {
         let exited = match waitid(WaitId::Pid(pid), options) {
@@ -1472,7 +1483,7 @@ async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
     }
 }
 
-async fn reap_process_leader(
+pub(crate) async fn reap_process_leader(
     child: &mut Child,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     call_id: &str,
@@ -1499,7 +1510,7 @@ async fn reap_process_leader(
 /// that zombie unreaped until this sweep reaches `GroupSweepCompleted`. The
 /// zombie keeps the PGID allocated, so every probe/signal below is guaranteed
 /// to target the original group rather than a recycled one.
-fn begin_group_termination(
+pub(crate) fn begin_group_termination(
     pid: Pid,
     leader_is_zombie: bool,
     grace: Duration,
@@ -1566,7 +1577,7 @@ fn open_directory_beneath(
 }
 
 #[allow(unsafe_code)]
-fn set_anchored_current_dir(command: &mut Command, cwd_fd: OwnedFd) {
+pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd_fd: OwnedFd) {
     // SAFETY: `pre_exec` runs after fork and before exec. This closure performs
     // only the async-signal-safe `fchdir` syscall and owns the directory fd,
     // so the child cannot follow the authorized pathname again.
@@ -1577,7 +1588,11 @@ fn set_anchored_current_dir(command: &mut Command, cwd_fd: OwnedFd) {
     }
 }
 
-fn process_arguments(command: &str, cwd: &Path, env_allowlist: &[String]) -> ToolResult<Value> {
+pub(crate) fn process_arguments(
+    command: &str,
+    cwd: &Path,
+    env_allowlist: &[String],
+) -> ToolResult<Value> {
     let cwd = cwd.to_str().ok_or_else(|| ToolError::InvalidArgument {
         message: format!("process cwd is not valid UTF-8: {}", cwd.display()),
     })?;

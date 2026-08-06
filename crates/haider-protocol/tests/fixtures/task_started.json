@@ -1,0 +1,8 @@
+{
+  "type": "task_started",
+  "task": "task-3f9a",
+  "name": "cargo",
+  "command": "cargo watch -x test",
+  "pid": 4242,
+  "started_at_ms": 1753500000000
+}

@@ -27,6 +27,7 @@ pub mod provider;
 pub mod rpc;
 pub mod session;
 pub mod state;
+pub mod task;
 pub mod tool;
 pub mod usage;
 pub mod verify;

@@ -407,6 +407,52 @@ fn golden_menu_permission() {
     );
 }
 
+/// MUTATION CHECK: fold task facts into the closed EventPayload enum, rename
+/// their additive kinds, or re-type a field. Expected RUNTIME failure: the
+/// independent golden changes or an older typed reducer unexpectedly accepts
+/// the task payload.
+#[test]
+fn golden_additive_task_facts_and_unknown_kind_tolerance() {
+    use haider_protocol::task::{
+        TaskCompleted, TaskCompletionDelivery, TaskEventPayload, TaskStarted, TaskTerminalState,
+    };
+    let started = TaskEventPayload::TaskStarted(TaskStarted {
+        task: TaskId::new("task-3f9a"),
+        name: "cargo".into(),
+        command: "cargo watch -x test".into(),
+        pid: 4242,
+        started_at_ms: 1_753_500_000_000,
+    });
+    golden("task_started", &started);
+    let completed = TaskEventPayload::TaskCompleted(TaskCompleted {
+        task: TaskId::new("task-3f9a"),
+        name: "cargo".into(),
+        state: TaskTerminalState::Completed { exit_code: Some(0) },
+        elapsed_ms: 61_000,
+        output_bytes: 700_000,
+        tail: "test result: ok\n".into(),
+        artifact: Some(ArtifactRef::new(
+            "blake3:9c1185a5c5e9fc54612808977ee8f548b2258d31",
+        )),
+        truncated: true,
+        delivery: TaskCompletionDelivery::DeliveredQueued,
+    });
+    golden("task_completed", &completed);
+    for fact in [&started, &completed] {
+        let raw = fact.to_payload_value().expect("task payload");
+        assert!(
+            serde_json::from_value::<EventPayload>(raw.clone()).is_err(),
+            "raw tolerance is what keeps exhaustive consumers source-compatible"
+        );
+        let mut envelope_value =
+            serde_json::to_value(envelope(EventPayload::IdleDecayed)).expect("envelope value");
+        envelope_value["payload"] = raw.clone();
+        let decoded: haider_protocol::envelope::RawEnvelope =
+            serde_json::from_value(envelope_value).expect("raw envelope tolerates additive kind");
+        assert_eq!(decoded.payload, raw);
+    }
+}
+
 /// MUTATION CHECK: fold hook facts into the closed EventPayload enum or rename
 /// their additive kind. Expected RUNTIME failure: the independent golden
 /// changes or an older typed reducer unexpectedly accepts the hook payload.

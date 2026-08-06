@@ -83,3 +83,7 @@ string_id!(
     #[doc = "One turn item (message/reasoning/tool-call/…) in the item lifecycle."]
     ItemId
 );
+string_id!(
+    #[doc = "A long-lived background shell task (session-scoped, durable)."]
+    TaskId
+);
