@@ -664,3 +664,38 @@ fn lst1_final_frame_equals_the_all_at_once_render() {
     );
     let _ = draw_rows(&partial, 48, 40);
 }
+
+/// Review pin (coordinator, G5 review of record): DOUBLE-WIDTH glyphs
+/// (CJK) keep the grid aligned — cell padding and border placement are
+/// computed from DISPLAY width, not char count. Every drawn line of the
+/// table block must occupy the same number of terminal cells.
+/// MUTATION CHECK: measure cells with chars().count() instead of
+/// unicode display width. Expected RUNTIME failure: the CJK row's line
+/// width diverges from the border rows below.
+#[test]
+fn double_width_glyphs_keep_the_grid_aligned() {
+    use unicode_width::UnicodeWidthChar;
+    let source = "| Name | Note |\n| --- | --- |\n| 日本語データ | ok |\n| ascii | ok |\n";
+    let rows = layout_rows(source, 80);
+    let widths: Vec<usize> = row_texts(&rows)
+        .iter()
+        .map(|line| {
+            line.chars()
+                .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+                .sum()
+        })
+        .collect();
+    assert!(
+        widths.windows(2).all(|pair| pair[0] == pair[1]),
+        "every table line must span the same display width, got {widths:?}"
+    );
+    let texts = row_texts(&rows);
+    let cjk_line = texts
+        .iter()
+        .find(|line| line.contains("日本語データ"))
+        .expect("the CJK row renders");
+    assert!(
+        cjk_line.starts_with('│') && cjk_line.ends_with('│'),
+        "borders survive on the CJK row: {cjk_line}"
+    );
+}

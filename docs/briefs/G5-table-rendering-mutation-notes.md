@@ -81,3 +81,19 @@ column floor, escaped-pipe handling, and the stacked bold labels.
 
 Full `cargo test -p haider-tui` after the final revert: 851 passed,
 0 failed. `git status` clean at every commit boundary.
+
+## Review of record (coordinator, executed post-lane)
+
+Read the branch diff (md.rs parse + pure layout_table, render.rs draw
+grouping, style slot, 17 laws). The lane's own catch of its vacuous
+first floor fixture (mutation 2) is the doctrine working as intended —
+verified in the notes. One structurally-unexercised surface found and
+closed:
+
+| # | Mutation (seam) | Verdict | Resolution |
+|---|---|---|---|
+| RM1 | spans_width measured by chars().count() instead of unicode display width | No fixture exercised double-width glyphs — the whole law set was CJK-blind (would have SURVIVED) | New pin `double_width_glyphs_keep_the_grid_aligned` (equal display width across all table lines + borders survive on the CJK row). Kill verified: widths [17,17,17,20,20,17,17] under the mutation, "running 1 test" observed, reverted, 18/18 green |
+
+Deviations (MdLine.table over a data-carrying Copy MdKind;
+floors-first+headroom distribution) verified in-diff and correctly
+reasoned. Campaign ACCEPTED. Ledger 2027 -> 2028 with the pin.
