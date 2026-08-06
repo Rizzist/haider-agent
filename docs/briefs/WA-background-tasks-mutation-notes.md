@@ -25,3 +25,19 @@ Coverage against the brief's mandatory list: immediate return (K1),
 steer delivery (K2), orphan reaping (K3), output bounding (K4), kill
 fence (K5), cap refusal (K6) — plus the single-prompt-copy law (K7) and
 the TUI transcript-row seam (K8).
+
+## Review of record (coordinator, executed post-lane)
+
+Read the branch diff (34 files: tasks.rs registry+supervision, worker
+dispatch arms, prompt-notice compiler, taskrows TUI, cli summary, 20
+laws). Two structurally-suspect gates probed:
+
+| # | Suspect (seam) | Verdict |
+|---|---|---|
+| RM1 | Cap slot-release: `running_count` filters on Running — would counting ALL entries (terminal included) survive? A session would brick after 8 lifetime tasks | OBSERVED — executed the mutation; `ninth_task_is_refused_and_shutdown_fence_kills_running_groups` FAILED at its "refusal is not sticky" tail ("running 1 test" observed), reverted green. The law's post-fence re-dispatch is load-bearing |
+| RM2 | Cancelled-spawning-run notice: does any law stage the spawning run TERMINAL before completion? | OBSERVED by construction — `idle_completion_fact_is_bounded_with_cas_artifact_and_prompt_notice` calls `terminalize_tool_run` before the task completes; the run-terminal-gate bypass is exactly what it asserts |
+
+Lane's 8 kills spot-checked against the notes; deviations 1-5 verified
+in-diff (the haider.run.v1 additive field regenerated honestly 11→12
+keys; ProcessExec ceiling reuse is within the brief's offered choice).
+No unobserved gate found. Campaign ACCEPTED. Ledger 2048 confirmed.
