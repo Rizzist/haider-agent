@@ -49,7 +49,7 @@ pub use haider_store::{
     ShellExecAcceptOutcome, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
     TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
-pub use prompt_history::{ArtifactReader, PromptHistoryCompiler};
+pub use prompt_history::{ArtifactReader, PromptHistoryCompiler, task_event_notice};
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};
 pub use sqlite_store::SqliteStoreHandle;
 

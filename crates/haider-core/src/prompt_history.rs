@@ -12,6 +12,7 @@ use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, NodeId, RunId, Sessio
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
+use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState};
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, MessageRole};
 use std::collections::{HashMap, HashSet};
@@ -723,6 +724,18 @@ fn render_journal(
         if !scoped(envelope, branch_id, agent_id) {
             continue;
         }
+        // W-A background task facts render as bounded user-role notices
+        // BEFORE the run-terminal gate: a task outlives its spawning run by
+        // design, so its completion must reach the next prompt even when
+        // that run was cancelled. `render.prompt` stays the one off switch —
+        // a steer-delivered completion journals with `Omit` because the
+        // durable steer user message already carries the prompt copy.
+        if envelope.render.prompt != PromptRender::Omit
+            && let Some(event) = TaskEventPayload::from_payload_value(&envelope.payload)
+        {
+            messages.push(Message::user_text(task_event_notice(&event)));
+            continue;
+        }
         let Some(run_id) = envelope.run_id.clone() else {
             continue;
         };
@@ -855,6 +868,61 @@ fn scoped(
     agent_id: Option<&AgentId>,
 ) -> bool {
     envelope.branch_id.as_ref() == branch_id && envelope.agent_id.as_ref() == agent_id
+}
+
+/// One bounded user-role prompt notice for a background task fact. Every
+/// interpolated field is already bounded at journal time; the tail is
+/// re-clamped here defensively so the notice can never outgrow the fact.
+///
+/// Public because the daemon's steer delivery reuses the SAME text: the
+/// mid-turn injection and the next-turn prompt notice must never diverge.
+pub fn task_event_notice(event: &TaskEventPayload) -> String {
+    match event {
+        TaskEventPayload::TaskStarted(started) => format!(
+            "[background task started] {} ({}) — {}",
+            started.name, started.task, started.command
+        ),
+        TaskEventPayload::TaskCompleted(completed) => {
+            let disposition = match &completed.state {
+                TaskTerminalState::Completed {
+                    exit_code: Some(code),
+                } => format!("exited with code {code}"),
+                TaskTerminalState::Completed { exit_code: None } => {
+                    "exited (ended by signal)".into()
+                }
+                TaskTerminalState::Failed { reason } => format!("failed: {reason}"),
+                TaskTerminalState::Killed => "was killed".into(),
+            };
+            let truncation = if completed.truncated {
+                " (truncated; full retained output in the task artifact)"
+            } else {
+                ""
+            };
+            let mut tail = completed.tail.as_str();
+            if tail.len() > TASK_TAIL_BYTES {
+                let mut end = TASK_TAIL_BYTES;
+                while !tail.is_char_boundary(end) {
+                    end -= 1;
+                }
+                tail = &tail[..end];
+            }
+            let tail_section = if tail.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\noutput tail:\n{tail}")
+            };
+            format!(
+                "[background task finished] {} ({}) {} after {}s — {} output bytes{}{}",
+                completed.name,
+                completed.task,
+                disposition,
+                completed.elapsed_ms / 1000,
+                completed.output_bytes,
+                truncation,
+                tail_section,
+            )
+        }
+    }
 }
 
 fn provider_opaque_extension(data: serde_json::Value) -> Option<Block> {

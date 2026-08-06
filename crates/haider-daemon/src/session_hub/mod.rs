@@ -533,6 +533,10 @@ struct HubInner {
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     usage_report: Mutex<Option<Arc<crate::usage_report::UsageReportService>>>,
+    /// W-A: the ONE in-memory projection of every session's background
+    /// tasks. Hub-owned so every facade clone shares it; the journal's
+    /// task facts remain the durable truth.
+    tasks: crate::tasks::TaskRegistry,
 }
 
 #[derive(Default)]
@@ -933,8 +937,32 @@ impl SessionHub {
                 creatable_providers: Mutex::new(None),
                 hooks: Arc::new(Mutex::new(None)),
                 usage_report: Mutex::new(None),
+                tasks: crate::tasks::TaskRegistry::default(),
             }),
         })
+    }
+
+    pub(crate) fn task_registry(&self) -> &crate::tasks::TaskRegistry {
+        &self.inner.tasks
+    }
+
+    /// Stores one bounded background-task output payload in the profile CAS.
+    pub(crate) async fn put_internal_artifact(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<haider_protocol::ids::ArtifactRef, HaiderError> {
+        self.inner.store.put(bytes).await
+    }
+
+    /// Direct durable read used only by the delete fence, where the session
+    /// actor is already stopped and `read_internal_session` cannot route.
+    pub(crate) async fn store_read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        haider_core::StoreHandle::read(&self.inner.store, session_id, since_seq, limit).await
     }
 
     pub(crate) fn install_worker_manager(
@@ -1826,6 +1854,9 @@ impl SessionHub {
                 .map_err(hub_error_as_store)?
                 .remove(session_id);
         }
+        // W-A fence law: session close kills every pgid the session owns,
+        // after the actor is provably stopped and before the durable delete.
+        self.fence_background_tasks(session_id).await;
         self.inner.store.delete_session(session_id.clone()).await?;
         crate::delegation::DelegationHandle::new(self.clone())
             .cleanup_handoff_for_deleted_parent(&metadata.cwd, session_id)
@@ -2288,6 +2319,10 @@ impl SessionHub {
     /// final marker is recorded and returns [`SessionHubShutdownOutcome::Forced`];
     /// it can never be mistaken for a graceful join.
     pub async fn shutdown(&self) -> Result<SessionHubShutdownOutcome, SessionHubError> {
+        // W-A fence law: background tasks die with the daemon. The kill
+        // ladders run BEFORE the drain flag so completion facts can still
+        // journal; anything unsettled is reaped by next-start adoption.
+        self.shutdown_background_tasks().await;
         self.begin_draining();
         // Install the abort-on-drop guards (each raises the forced-stop
         // fence before aborting — see OwnedTasks) plus the standalone fence
@@ -2566,6 +2601,12 @@ impl haider_core::ArtifactReader for HubStoreHandle {
 impl HubStoreHandle {
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// The owning hub — used by the worker to build hub-backed facades
+    /// (background tasks) without widening the lease surface.
+    pub(crate) fn hub(&self) -> &SessionHub {
+        &self.hub
     }
 
     pub fn worker_generation(&self) -> u64 {

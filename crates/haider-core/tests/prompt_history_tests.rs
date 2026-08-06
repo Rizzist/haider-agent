@@ -1761,3 +1761,137 @@ async fn nested_lineage_uses_every_owner_ceiling_and_virgin_head() {
     .expect("compile virgin fork");
     assert_eq!(text(&virgin_prompt), ["main prefix"]);
 }
+
+/// MUTATION CHECK (LT3): gate task facts behind the run-terminal filter,
+/// drop the `render.prompt == Omit` off switch, or stop rendering the
+/// bounded notice. Expected RUNTIME failure: the completion of a task whose
+/// spawning run was CANCELLED disappears from the next turn's prompt, the
+/// steer-delivered (Omit) completion leaks a second prompt copy, or the
+/// notice literals below change.
+#[tokio::test]
+async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
+    use haider_protocol::task::{
+        TaskCompleted, TaskCompletionDelivery, TaskEventPayload, TaskStarted, TaskTerminalState,
+    };
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("task-prompt-session");
+    let spawning_run = RunId::new("task-prompt-run-1");
+    let current_run = RunId::new("task-prompt-run-2");
+    let task_fact = |event_id: &str, payload: &TaskEventPayload, prompt: PromptRender| {
+        let mut fact = envelope(
+            &session_id,
+            &spawning_run,
+            event_id,
+            EventPayload::IdleDecayed,
+            prompt,
+        );
+        fact.payload = payload.to_payload_value().expect("task payload");
+        fact
+    };
+    let started = TaskEventPayload::TaskStarted(TaskStarted {
+        task: haider_protocol::ids::TaskId::new("task-11"),
+        name: "watcher".into(),
+        command: "cargo watch -x test".into(),
+        pid: 999,
+        started_at_ms: 1,
+    });
+    let completed = TaskEventPayload::TaskCompleted(TaskCompleted {
+        task: haider_protocol::ids::TaskId::new("task-11"),
+        name: "watcher".into(),
+        state: TaskTerminalState::Completed { exit_code: Some(0) },
+        elapsed_ms: 42_000,
+        output_bytes: 900_000,
+        tail: "test result: ok\n".into(),
+        artifact: Some(ArtifactRef::new("blake3:task-output")),
+        truncated: true,
+        delivery: TaskCompletionDelivery::DeliveredQueued,
+    });
+    let steered = TaskEventPayload::TaskCompleted(TaskCompleted {
+        task: haider_protocol::ids::TaskId::new("task-12"),
+        name: "steered".into(),
+        state: TaskTerminalState::Killed,
+        elapsed_ms: 1_000,
+        output_bytes: 0,
+        tail: String::new(),
+        artifact: None,
+        truncated: false,
+        delivery: TaskCompletionDelivery::DeliveredSteer,
+    });
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &spawning_run,
+            "task-prompt-user-1",
+            EventPayload::UserMessage {
+                text: "start the watcher".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        task_fact("task-prompt-started", &started, PromptRender::Verbatim),
+        // The spawning run was CANCELLED (esc) — the task outlives it by
+        // design, so its facts must still reach the next prompt.
+        envelope(
+            &session_id,
+            &spawning_run,
+            "task-prompt-run-1-state",
+            EventPayload::RunState(RunState::Cancelled),
+            PromptRender::Omit,
+        ),
+        task_fact("task-prompt-completed", &completed, PromptRender::Verbatim),
+        // Steer-delivered completion: the durable steer user message owns
+        // the prompt copy, so the fact itself journals with Omit.
+        task_fact("task-prompt-steered", &steered, PromptRender::Omit),
+        envelope(
+            &session_id,
+            &current_run,
+            "task-prompt-user-2",
+            EventPayload::UserMessage {
+                text: "how did it go".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append task prompt history");
+
+    let messages = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current_run)
+        .await
+        .expect("compile next turn");
+    let text = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // The cancelled run's own content (its user message) is structurally
+    // excluded by the existing run-terminal gate — ONLY the task facts
+    // bypass it, which is exactly why the bypass is load-bearing.
+    assert_eq!(
+        text[0],
+        "[background task started] watcher (task-11) — cargo watch -x test"
+    );
+    assert_eq!(
+        text[1],
+        "[background task finished] watcher (task-11) exited with code 0 after 42s — \
+         900000 output bytes (truncated; full retained output in the task artifact)\n\
+         output tail:\ntest result: ok\n"
+    );
+    assert_eq!(text[2], "how did it go");
+    assert_eq!(
+        text.len(),
+        3,
+        "the Omit (steer-delivered) fact renders nothing and the cancelled \
+         run's user message stays excluded: {text:?}"
+    );
+    assert!(
+        !text.iter().any(|line| line.contains("steered")),
+        "no second prompt copy for a steer-delivered completion: {text:?}"
+    );
+}

@@ -712,6 +712,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             device_id: DeviceId::new("message-idle-tool-device"),
             event_ids: Arc::new(EventIdGenerator::new("message-idle-tool-event")),
             delegation: delegation.clone(),
+            tasks: crate::tasks::TaskFacade::new(hub.clone()),
             agent_id: None,
         },
     )

@@ -198,6 +198,30 @@ impl std::fmt::Debug for BackgroundSpawn {
 }
 
 impl EffectBroker {
+    /// Begins one short task-control effect (`task_kill`): intent →
+    /// authorize → dispatched, exactly the `begin_agent_spawn` shape. The
+    /// caller performs the control action, then terminalizes with
+    /// [`Self::finish_task_effect`].
+    pub async fn begin_task_effect<O>(
+        &mut self,
+        operation: &O,
+        policy: &PermissionPolicy,
+    ) -> ToolResult<haider_protocol::effect::EffectIntent>
+    where
+        O: EffectOperation,
+    {
+        self.begin(operation, policy).await
+    }
+
+    /// Terminalizes a task-control effect with the action's result.
+    pub async fn finish_task_effect<T>(
+        &mut self,
+        intent: &haider_protocol::effect::EffectIntent,
+        result: ToolResult<T>,
+    ) -> ToolResult<T> {
+        self.finish(intent, result).await
+    }
+
     /// Spawns a long-lived background command through the hardened path.
     ///
     /// The four effect phases journal here and the effect terminalizes at

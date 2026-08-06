@@ -71,6 +71,9 @@ mod runtime;
 mod session_hub;
 #[cfg(test)]
 mod subagent_core_tests;
+mod tasks;
+#[cfg(test)]
+mod tasks_runtime_tests;
 mod turn_recovery;
 mod usage_report;
 mod worker;

@@ -399,6 +399,7 @@ pub struct WorkerToolContext {
     pub device_id: DeviceId,
     pub event_ids: Arc<EventIdGenerator>,
     pub(crate) delegation: DelegationHandle,
+    pub(crate) tasks: crate::tasks::TaskFacade,
     pub agent_id: Option<AgentId>,
 }
 
@@ -1534,6 +1535,17 @@ async fn run_supervisor(
     // key. Existing messages are already part of a restarted turn's compiled
     // prompt; new messages are inserted when they cross into the live harness.
     let mut delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
+    // W-A: rebuild this session's background-task projection and reap
+    // prior-generation orphans as soon as the session becomes live again.
+    {
+        let tasks = crate::tasks::TaskFacade::new(lease.hub().clone());
+        let session_id = lease.session_id().clone();
+        tokio::spawn(async move {
+            if let Err(error) = tasks.adopt_session(&session_id).await {
+                tracing::warn!(%session_id, ?error, "background-task adoption failed at supervisor start");
+            }
+        });
+    }
 
     loop {
         if active.is_none() && !stopping {
@@ -3284,6 +3296,7 @@ async fn start_turn(
             device_id: device_id.clone(),
             event_ids: Arc::clone(&event_ids),
             delegation,
+            tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
             agent_id: agent_id.clone(),
         })
         .await?;
@@ -3994,6 +4007,8 @@ pub(crate) enum RegisteredToolRoute {
     ProcessExec,
     SpawnSubagent,
     MessageSubagent,
+    TaskOutput,
+    TaskKill,
 }
 
 #[derive(Debug, Clone)]
@@ -4117,6 +4132,27 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::MessageSubagent,
             }
         },
+        {
+            // W-A: bounded task-output reads are not an effect (the
+            // request_input pattern — no broker).
+            let manifest = haider_tools::task_output_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::NotApplicable,
+                route: RegisteredToolRoute::TaskOutput,
+            }
+        },
+        {
+            // W-A: killing a task IS an effect under the existing process
+            // ceiling; same Ask default as process_exec, and the same
+            // session override (`allow_exec`) lifts both together.
+            let manifest = haider_tools::task_kill_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::Ask,
+                route: RegisteredToolRoute::TaskKill,
+            }
+        },
     ]
 }
 
@@ -4213,6 +4249,7 @@ impl TurnToolFactory for BrokerToolFactory {
             metadata: context.metadata,
             parent_agent_id: context.agent_id,
             delegation: context.delegation,
+            tasks: context.tasks,
             deferred: Mutex::new(HashMap::new()),
         })))
     }
@@ -4251,6 +4288,7 @@ struct BrokerToolDispatcher {
     metadata: SessionMetadataV1,
     parent_agent_id: Option<AgentId>,
     delegation: DelegationHandle,
+    tasks: crate::tasks::TaskFacade,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
 }
 
@@ -4519,21 +4557,57 @@ impl ToolDispatcher for BrokerToolDispatcher {
             RegisteredToolRoute::ProcessExec => {
                 let command = required_string(&args, "command")?;
                 let cwd = optional_string(&args, "cwd")?;
-                let mut operation = ProcessExec::new(call_id, command);
-                if let Some(cwd) = cwd {
-                    operation = operation.with_cwd(cwd);
+                let background = optional_bool(&args, "background")?.unwrap_or(false);
+                if background {
+                    // W-A: the detached shape returns IMMEDIATELY with the
+                    // typed running receipt; supervision is session-scoped.
+                    let name = optional_string(&args, "name")?;
+                    self.tasks
+                        .spawn_background(
+                            crate::tasks::TaskSpawnContext {
+                                session_id: self.session_id.clone(),
+                                run_id: run_id.clone(),
+                                branch_id: self.branch_id.clone(),
+                                agent_id: self.parent_agent_id.clone(),
+                                call_id: call_id.to_owned(),
+                            },
+                            command,
+                            cwd,
+                            name,
+                            broker,
+                            &policy,
+                        )
+                        .await
+                } else {
+                    let mut operation = ProcessExec::new(call_id, command);
+                    if let Some(cwd) = cwd {
+                        operation = operation.with_cwd(cwd);
+                    }
+                    let cas = self.cas.lock().await.clone();
+                    let output =
+                        self.output
+                            .sink(run_id.clone(), item_id.clone(), call_id.to_owned());
+                    match broker
+                        .process_exec(&operation, &policy, cas, output, ProcessBounds::default())
+                        .await
+                    {
+                        Ok(execution) => execution.wait().await.map(process_result),
+                        Err(error) => Err(error),
+                    }
                 }
-                let cas = self.cas.lock().await.clone();
-                let output = self
-                    .output
-                    .sink(run_id.clone(), item_id.clone(), call_id.to_owned());
-                match broker
-                    .process_exec(&operation, &policy, cas, output, ProcessBounds::default())
+            }
+            RegisteredToolRoute::TaskOutput => {
+                let task_id = required_string(&args, "task_id")?;
+                let cursor = optional_u64(&args, "cursor")?;
+                self.tasks
+                    .task_output(&self.session_id, &task_id, cursor)
                     .await
-                {
-                    Ok(execution) => execution.wait().await.map(process_result),
-                    Err(error) => Err(error),
-                }
+            }
+            RegisteredToolRoute::TaskKill => {
+                let task_id = required_string(&args, "task_id")?;
+                self.tasks
+                    .task_kill(&self.session_id, &task_id, broker, &policy)
+                    .await
             }
             RegisteredToolRoute::FsWrite => {
                 let path = required_string(&args, "path")?;
@@ -5083,7 +5157,12 @@ fn tool_definition(name: &str, description: &str, required: &[&str]) -> ToolDefi
 fn process_exec_definition() -> ToolDefinition {
     ToolDefinition {
         name: "process_exec".into(),
-        description: "Run one non-interactive shell command inside the session workspace".into(),
+        description: "Run one non-interactive shell command inside the session workspace. \
+                      Set background=true for long-lived work (servers, watchers, long \
+                      builds): the call returns immediately with a task_id, the task \
+                      outlives the turn, and its completion is reported back as a session \
+                      message; read progress with task_output and stop it with task_kill."
+            .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -5097,6 +5176,18 @@ fn process_exec_definition() -> ToolDefinition {
                     "type": "string",
                     "minLength": 1,
                     "description": "Optional workspace-relative working directory"
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Run as a long-lived background task detached from the turn"
+                },
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "Optional display label for a background task \
+                                    (defaults to the command's first token)"
                 }
             },
             "required": ["command"],
@@ -5160,6 +5251,19 @@ fn optional_bool(args: &serde_json::Value, field: &str) -> Result<Option<bool>, 
         HaiderError::new(
             ErrorCode::InvalidArgument,
             format!("tool argument `{field}` must be a boolean when provided"),
+            false,
+        )
+    })
+}
+
+fn optional_u64(args: &serde_json::Value, field: &str) -> Result<Option<u64>, HaiderError> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    value.as_u64().map(Some).ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!("tool argument `{field}` must be a non-negative integer when provided"),
             false,
         )
     })

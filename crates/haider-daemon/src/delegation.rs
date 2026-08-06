@@ -1682,7 +1682,7 @@ fn handoff_io_error(path: &Path, error: rustix::io::Errno) -> HaiderError {
     )
 }
 
-fn stable_digest(parts: &[&str]) -> String {
+pub(crate) fn stable_digest(parts: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in parts {
         hasher.update(&(part.len() as u64).to_be_bytes());
@@ -1691,7 +1691,7 @@ fn stable_digest(parts: &[&str]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn digest_bytes(bytes: &[u8]) -> String {
+pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
