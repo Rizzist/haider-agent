@@ -2628,6 +2628,11 @@ fn render_session(
     let fixed = chrome + input_height + gap;
     let waiting_line = waiting_for_agents(model);
     let mut waiting_height = u16::from(waiting_line.is_some());
+    // W-A: the running background-task band — one ambient line above the
+    // composer, shed with the waiting line's priority (a map of live work,
+    // like the SubTree, but one row).
+    let tasks_line = crate::taskrows::tasks_line(&model.tasks, model.clock_ms);
+    let mut tasks_height = u16::from(tasks_line.is_some());
     let mut todos_height = model
         .projection
         .todos()
@@ -2690,6 +2695,11 @@ fn render_session(
     } else {
         budget -= waiting_height;
     }
+    if tasks_height > budget {
+        tasks_height = 0;
+    } else {
+        budget -= tasks_height;
+    }
     if todos_height > budget {
         todos_height = 0;
     } else {
@@ -2706,7 +2716,9 @@ fn render_session(
     // it scrolls with the history instead of padding the chrome.
     // One breathing row above each block that is actually present, taken
     // last and given up first.
-    let want_lead = u16::from(waiting_height > 0);
+    // The waiting line and the task band share one breathing row (they are
+    // the same "live background work" block when both are present).
+    let want_lead = u16::from(waiting_height + tasks_height > 0);
     let want_todos_lead = u16::from(todos_height > 0);
     let want_subtree_lead = u16::from(subtree_height > 0);
     let breathe = |want: u16, budget: &mut u16| -> u16 {
@@ -2726,6 +2738,7 @@ fn render_session(
         transcript_area,
         _lead_waiting,
         waiting_area,
+        tasks_area,
         _lead_todos,
         todos_area,
         queue_area,
@@ -2742,6 +2755,7 @@ fn render_session(
         Constraint::Min(transcript_min),
         Constraint::Length(lead_waiting),
         Constraint::Length(waiting_height),
+        Constraint::Length(tasks_height),
         Constraint::Length(lead_todos),
         Constraint::Length(todos_height),
         Constraint::Length(queue_height),
@@ -3091,6 +3105,25 @@ fn render_session(
                 ),
             ])),
             waiting_area,
+        );
+    }
+
+    // W-A: the running background-task band — same ambient voice as the
+    // waiting line (gold sigil + dim text), never a hit; elapsed figures
+    // tick on the S4 clock while any task runs.
+    if let Some(line) = &tasks_line
+        && tasks_area.height > 0
+    {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("⚙", theme.gold_style()),
+                Span::styled(
+                    line.strip_prefix('⚙').unwrap_or(line).to_owned(),
+                    theme.dim_style(),
+                ),
+            ])),
+            tasks_area,
         );
     }
 

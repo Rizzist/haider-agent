@@ -64,6 +64,9 @@ pub struct SessionState {
     /// This session's journaled hook facts + decision-chip state (H4) —
     /// checked in/out with the session exactly like [`Self::branch_state`].
     pub hook_facts: crate::hooks::HookFactsLog,
+    /// W-A: the session-scoped background task rows (journal projection) —
+    /// checked in/out whole with the session; never split per branch.
+    pub tasks: crate::taskrows::TaskPanel,
     pub msg_queue: Vec<String>,
     pub queue_mode: bool,
     /// This session's turn engine is mid-turn (the per-session slice of
@@ -131,6 +134,7 @@ impl SessionState {
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
+            tasks: crate::taskrows::TaskPanel::default(),
             msg_queue: Vec::new(),
             queue_mode: false,
             turn_active: false,
@@ -312,14 +316,20 @@ impl SessionState {
                             envelope.agent_id.as_ref(),
                             envelope.committed_at_ms,
                         ),
-                        // S3: the additive agent-event union rides raw
-                        // envelopes OUTSIDE `EventPayload` — try it before
-                        // counting the payload unknown (both twins).
+                        // S3/W-A: the additive agent- and task-event unions
+                        // ride raw envelopes OUTSIDE `EventPayload` — try
+                        // them before counting the payload unknown (both
+                        // twins).
                         Err(_) => {
                             if !route_agent_event(
                                 &mut self.branch_state,
                                 &mut self.projection,
                                 &self.chips,
+                                envelope,
+                            ) && !route_task_event(
+                                &mut self.tasks,
+                                &mut self.branch_state,
+                                &mut self.projection,
                                 envelope,
                             ) {
                                 self.projection.count_unknown_payload();
@@ -618,6 +628,43 @@ pub fn route_agent_event(
         BranchScope::Orphan => branch_state.count_orphan(),
         // `content_scope` never says Aggregate (aggregate is a TYPE
         // decision, and this payload's type is agent-fact) — nothing to do.
+        BranchScope::Aggregate => {}
+    }
+    true
+}
+
+/// W-A twin of [`route_agent_event`] for the additive task-event union:
+/// the PANEL applies session-wide (tasks are session-scoped by runtime
+/// law), while the ambient NOTE lands on the branch timeline the fact was
+/// stamped with — active surface or a warm parked view.
+pub fn route_task_event(
+    tasks: &mut crate::taskrows::TaskPanel,
+    branch_state: &mut crate::branch::BranchState,
+    projection: &mut SessionProjection,
+    envelope: &RawEnvelope,
+) -> bool {
+    use crate::branch::BranchScope;
+    let Some(fact) = haider_protocol::task::TaskEventPayload::from_payload_value(&envelope.payload)
+    else {
+        return false;
+    };
+    tasks.apply(&fact);
+    let note = crate::taskrows::task_note(&fact);
+    match branch_state.content_scope(envelope.branch_id.as_ref()) {
+        BranchScope::Active => projection.push_note(note),
+        BranchScope::ParkedMain => {
+            if let Some(view) = branch_state.parked_main_mut() {
+                view.projection.push_note(note);
+            }
+        }
+        BranchScope::ParkedNamed(id) => {
+            if let Some(view) = branch_state.view_mut(&id) {
+                view.projection.push_note(note);
+            }
+        }
+        BranchScope::Orphan => branch_state.count_orphan(),
+        // `content_scope` never says Aggregate for a task fact (aggregate
+        // is a TYPE decision) — nothing to do.
         BranchScope::Aggregate => {}
     }
     true

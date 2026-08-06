@@ -3075,6 +3075,10 @@ pub struct AppModel {
     /// (H4). Checked in/out with the session exactly like `branch_state`
     /// (the A→B→A law).
     pub hook_facts: crate::hooks::HookFactsLog,
+    /// W-A: the ATTACHED session's background task rows (journal
+    /// projection). Session-scoped by runtime law — checked in/out whole
+    /// with the session, never split per branch.
+    pub tasks: crate::taskrows::TaskPanel,
     /// `/usage` screen state (U2): the `usage.report` snapshot, provider
     /// filter, group cursor, account tabs, F2b scroll cells. APP-level —
     /// the report is account truth, not session display state.
@@ -3183,6 +3187,7 @@ impl Default for AppModel {
             custom_attempt_seq: 0,
             hooks: crate::hooks::HooksScreenState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
+            tasks: crate::taskrows::TaskPanel::default(),
             usage: UsageState::default(),
         }
     }
@@ -3715,6 +3720,11 @@ impl AppModel {
                     // counter. Terminal chips are frozen and keep the
                     // gate closed.
                     || tree_live_count(&self.chips) > 0
+                    // W-A: a RUNNING background task ticks its elapsed
+                    // figure in the band above the composer on the same
+                    // clock; terminal tasks leave the band and keep the
+                    // gate closed.
+                    || self.tasks.running_count() > 0
                     || (self.screen == Screen::Subagent
                         && self.viewed_chip().is_some_and(|chip| {
                             chip.state == ChipDisplayState::Thinking
@@ -8645,14 +8655,20 @@ impl AppModel {
                             envelope.agent_id.as_ref(),
                             envelope.committed_at_ms,
                         ),
-                        // S3: the additive agent-event union rides raw
-                        // envelopes OUTSIDE `EventPayload` — try it before
-                        // counting the payload unknown (both twins).
+                        // S3/W-A: the additive agent- and task-event unions
+                        // ride raw envelopes OUTSIDE `EventPayload` — try
+                        // them before counting the payload unknown (both
+                        // twins).
                         Err(_) => {
                             if !crate::session::route_agent_event(
                                 &mut self.branch_state,
                                 &mut self.projection,
                                 &self.chips,
+                                envelope,
+                            ) && !crate::session::route_task_event(
+                                &mut self.tasks,
+                                &mut self.branch_state,
+                                &mut self.projection,
                                 envelope,
                             ) {
                                 self.projection.count_unknown_payload();
@@ -9143,6 +9159,7 @@ impl AppModel {
         self.projection = SessionProjection::new();
         self.branch_state = crate::branch::BranchState::default();
         self.hook_facts = crate::hooks::HookFactsLog::default();
+        self.tasks = crate::taskrows::TaskPanel::default();
         self.session_title = None;
         self.session_name = None;
         self.turn_active = false;
@@ -9339,6 +9356,8 @@ impl AppModel {
         // H4: the journaled hook facts + decision-chip state travel the
         // same way.
         self.hook_facts = std::mem::take(&mut slot.hook_facts);
+        // W-A: the background task rows travel whole with the session.
+        self.tasks = std::mem::take(&mut slot.tasks);
         self.msg_queue = std::mem::take(&mut slot.msg_queue);
         self.queue_mode = slot.queue_mode;
         self.turn_active = slot.turn_active;
@@ -9386,6 +9405,7 @@ impl AppModel {
             slot.chips = std::mem::take(&mut self.chips);
             slot.branch_state = std::mem::take(&mut self.branch_state);
             slot.hook_facts = std::mem::take(&mut self.hook_facts);
+            slot.tasks = std::mem::take(&mut self.tasks);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);
             slot.turn_active = std::mem::take(&mut self.turn_active);

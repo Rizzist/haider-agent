@@ -33,6 +33,7 @@ pub mod settings;
 pub mod stt_runtime;
 pub mod style;
 pub mod talk;
+pub mod taskrows;
 pub mod theme;
 pub mod wordmark;
 
