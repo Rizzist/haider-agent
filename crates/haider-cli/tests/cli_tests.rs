@@ -847,6 +847,7 @@ fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> Head
         permission_denials: Vec::new(),
         failure,
         terminal_seq: Some(9),
+        background_tasks_running: Vec::new(),
     }
 }
 
@@ -1145,14 +1146,29 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     write_final(&mut json, RunOutput::Json, &done).expect("json");
     assert_eq!(
         String::from_utf8(json.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"usage\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&json).expect("v1 JSON");
-    assert_eq!(value.as_object().expect("object").len(), 11);
+    assert_eq!(value.as_object().expect("object").len(), 12);
     assert_eq!(value["provider"], "fake");
     assert_eq!(value["model"], "fake-model");
     assert!(value["usage"].is_null());
     assert!(value["error"].is_null());
+
+    // W-A decision 8 (additive): still-running background tasks are NAMED
+    // in the v1 object — the daemon keeps ownership past the run.
+    let mut with_tasks = result(HeadlessOutcome::Done, None);
+    with_tasks
+        .background_tasks_running
+        .push(haider_client::HeadlessBackgroundTask {
+            task_id: "task-cafe".into(),
+            name: "watcher".into(),
+        });
+    let mut task_json = Vec::new();
+    write_final(&mut task_json, RunOutput::Json, &with_tasks).expect("task JSON");
+    let tasks: serde_json::Value = serde_json::from_slice(&task_json).expect("task object");
+    assert_eq!(tasks["background_tasks_running"][0]["task_id"], "task-cafe");
+    assert_eq!(tasks["background_tasks_running"][0]["name"], "watcher");
 
     done.permission_denials.push(HeadlessPermissionDenial {
         menu_id: "menu-json".into(),
@@ -1203,11 +1219,11 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
         assert_eq!(
             String::from_utf8(bytes.clone()).expect("failure utf8"),
             format!(
-                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{error}}}\n"
+                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{error}}}\n"
             )
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("failure object");
-        assert_eq!(value.as_object().expect("object").len(), 11);
+        assert_eq!(value.as_object().expect("object").len(), 12);
         assert!(value["response"].is_null());
         assert_eq!(
             value["error"].is_null(),
@@ -1312,7 +1328,7 @@ fn run_json_reports_attachments_additively() {
     write_final(&mut bytes, RunOutput::Json, &attached).expect("attachment JSON");
     assert_eq!(
         String::from_utf8(bytes.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("attachment object");
     assert_eq!(value["attachments"]["count"], 2);

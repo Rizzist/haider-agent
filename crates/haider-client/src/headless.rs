@@ -323,6 +323,15 @@ impl HeadlessFailureCode {
     }
 }
 
+/// One background task still running when the headless run finished (W-A
+/// decision 8): `haider run` exits when the TURN completes; the daemon
+/// keeps ownership and the task dies with the session per the fence law.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessBackgroundTask {
+    pub task_id: String,
+    pub name: String,
+}
+
 /// Correlated result of one accepted daemon run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeadlessRunResult {
@@ -337,6 +346,9 @@ pub struct HeadlessRunResult {
     pub permission_denials: Vec<HeadlessPermissionDenial>,
     pub failure: Option<HeadlessRunFailure>,
     pub terminal_seq: Option<u64>,
+    /// Background tasks with a durable started fact and no completed fact
+    /// when the run's terminal was observed (W-A decision 8).
+    pub background_tasks_running: Vec<HeadlessBackgroundTask>,
 }
 
 /// Failure before a correlated final result could be produced.
@@ -529,6 +541,9 @@ struct HeadlessReducer {
     actions: VecDeque<ReducerAction>,
     output: mpsc::UnboundedSender<HeadlessEvent>,
     output_closed: bool,
+    /// W-A: task id → (name, running) from the additive task facts, in
+    /// deterministic id order for the run summary.
+    background_tasks: BTreeMap<String, (String, bool)>,
 }
 
 impl HeadlessReducer {
@@ -545,6 +560,7 @@ impl HeadlessReducer {
             menu_resolutions: BTreeMap::new(),
             cancel_observed: false,
             actions: VecDeque::new(),
+            background_tasks: BTreeMap::new(),
             output,
             output_closed: false,
         }
@@ -577,6 +593,25 @@ impl HeadlessReducer {
             .await;
         self.last_applied = envelope.seq;
         let correlated = self.is_correlated(&envelope);
+        // W-A: background task facts are SESSION-scoped (they outlive turns
+        // by design) and ride the additive union outside `EventPayload` —
+        // track them regardless of run correlation so the run summary can
+        // name still-running tasks honestly at exit.
+        if let Some(fact) = haider_rpc::haider_protocol::task::TaskEventPayload::from_payload_value(
+            &envelope.payload,
+        ) {
+            match fact {
+                haider_rpc::haider_protocol::task::TaskEventPayload::TaskStarted(started) => {
+                    self.background_tasks
+                        .entry(started.task.as_str().to_owned())
+                        .or_insert((started.name, true));
+                }
+                haider_rpc::haider_protocol::task::TaskEventPayload::TaskCompleted(completed) => {
+                    self.background_tasks
+                        .insert(completed.task.as_str().to_owned(), (completed.name, false));
+                }
+            }
+        }
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
             return ApplyStatus::Applied;
         };
@@ -2453,6 +2488,15 @@ fn finalize(
             },
         ),
     };
+    let background_tasks_running = reducer
+        .background_tasks
+        .iter()
+        .filter(|(_, (_, running))| *running)
+        .map(|(task_id, (name, _))| HeadlessBackgroundTask {
+            task_id: task_id.clone(),
+            name: name.clone(),
+        })
+        .collect();
     HeadlessRunResult {
         session_id: reducer.session_id,
         run_id,
@@ -2465,6 +2509,7 @@ fn finalize(
         permission_denials: reducer.permission_denials,
         failure,
         terminal_seq,
+        background_tasks_running,
     }
 }
 

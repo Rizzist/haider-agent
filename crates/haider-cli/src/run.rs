@@ -299,6 +299,21 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 eprintln!("haider: stdout failed: {error}");
                 return ExitCode::from(EX_IOERR);
             }
+            // W-A decision 8: the run summary NAMES still-running tasks —
+            // the turn is over, the daemon keeps ownership, and they end
+            // with the session (stderr, so json pipelines stay clean).
+            if !result.background_tasks_running.is_empty() {
+                let names = result
+                    .background_tasks_running
+                    .iter()
+                    .map(|task| task.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "haider: note: {} background task(s) still running ({names}) — owned by the daemon session; they end when the session closes",
+                    result.background_tasks_running.len(),
+                );
+            }
             if result.outcome != HeadlessOutcome::Done
                 && let Some(failure) = &result.failure
             {
@@ -446,8 +461,18 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
         ),
         None => "null".into(),
     };
+    // W-A decision 8 (additive to the v1 object): tasks the daemon still
+    // owns when the TURN completed — they die with the session, not the run.
+    let background_tasks = serde_json::to_string(
+        &result
+            .background_tasks_running
+            .iter()
+            .map(|task| serde_json::json!({"task_id": task.task_id, "name": task.name}))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(io::Error::other)?;
     Ok(format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":{attachment_count},\"refs\":{attachment_refs}}},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"error\":{error}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":{attachment_count},\"refs\":{attachment_refs}}},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"background_tasks_running\":{background_tasks},\"error\":{error}}}"
     ))
 }
 
