@@ -263,16 +263,41 @@ fn lg2_wrapped_grid_distributes_with_floors_and_alignment() {
 }
 
 /// MUTATION CHECK (G5): pin the floor to the constant 3 (drop the
-/// longest-word measure). Expected runtime failure: the unbreakable word
-/// hard-splits across rows and the intact-word assertion finds no row
-/// carrying it.
+/// longest-word measure). Expected runtime failure: the prose column's
+/// larger natural headroom out-competes the word column in the
+/// distribution, the word column drops below 21 cells, the unbreakable
+/// word hard-splits, and the intact-word assertion finds no row carrying
+/// it. (A first fixture without a competing column let this mutation
+/// SURVIVE — the word column won enough width from headroom alone; the
+/// floor only binds under competition, so the law pits the two columns
+/// against each other.)
 #[test]
 fn lg2_column_floor_holds_the_longest_word_and_the_minimum() {
-    let src = "| K | Note |\n| - | ---- |\n| a | unbreakable_word_here and more prose text |";
-    // Budget 34: naturals [1→, 41] overflow; floors [3, 21] fit. The
-    // word column must get at least its longest unbreakable word (21);
-    // the tiny column sits on the minimum floor of 3.
-    let rows = layout_rows(src, 34);
+    // Competition fixture: the word column's floor IS its natural width
+    // (21), the prose column's natural (44) dwarfs it. Budget 40:
+    // naturals overflow (72), floors [21, 5] fit (33). All headroom
+    // belongs to the prose column, so the word column sits exactly on
+    // its longest-word floor — 23 border cells — and the word survives
+    // intact.
+    let src = "| A | B |\n| - | - |\n| unbreakable_word_here | lots of small words that go on and on and on |";
+    let rows = layout_rows(src, 40);
+    let texts = row_texts(&rows);
+    assert!(
+        texts[0].starts_with("┌───────────────────────┬"),
+        "the word column holds its longest-word floor of 21: {:?}",
+        texts[0]
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|row| row.contains("unbreakable_word_here")),
+        "the longest word never hard-splits: {texts:?}"
+    );
+
+    // Minimum fixture: a column of single-char cells still gets the
+    // floor of 3 (5 border cells), never its natural width of 1.
+    let tiny = "| K | Note |\n| - | ---- |\n| a | unbreakable_word_here and more prose text |";
+    let rows = layout_rows(tiny, 34);
     let texts = row_texts(&rows);
     assert!(
         texts[0].starts_with("┌─────┬"),
@@ -283,7 +308,7 @@ fn lg2_column_floor_holds_the_longest_word_and_the_minimum() {
         texts
             .iter()
             .any(|row| row.contains("unbreakable_word_here")),
-        "the longest word never hard-splits: {texts:?}"
+        "the longest word never hard-splits in the tiny fixture: {texts:?}"
     );
 }
 
