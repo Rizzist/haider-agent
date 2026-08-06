@@ -223,6 +223,9 @@ impl Theme {
             MdKind::Heading => self.bright_style().add_modifier(Modifier::BOLD),
             MdKind::ListMark => self.gold_style(),
             MdKind::Cursor => self.gold_style(),
+            // Table chrome (G5): grid borders and stacked-record rules
+            // wear the panel-frame ink — structure, never content.
+            MdKind::TableBorder => self.frame_style(),
         }
     }
 

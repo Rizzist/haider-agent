@@ -6509,21 +6509,43 @@ fn item_lines<'a>(
                 if block.streaming
                     && let Some(tail) = md_lines.last_mut()
                 {
-                    tail.spans.push(crate::md::MdSpan {
-                        text: "▮".to_owned(),
-                        kind: crate::md::MdKind::Cursor,
-                    });
+                    tail.push_cursor();
                 }
-                for md_line in md_lines {
-                    for row in crate::md::wrap_spans(&md_line.spans, budget) {
-                        let mut spans =
-                            vec![Span::raw(" "), Span::styled("▏ ", theme.rail_style())];
-                        spans.extend(
-                            row.into_iter()
-                                .map(|span| Span::styled(span.text, theme.md_style(span.kind))),
-                        );
-                        lines.push(Line::from(spans));
+                // G5: consecutive table-tagged lines are ONE table — the
+                // parser emits header/delimiter/body as a contiguous run
+                // — laid out for the CURRENT budget (natural grid /
+                // wrapped grid / stacked records; the mode is a pure
+                // function of the budget, so a resize flips it with no
+                // state). Layout rows already fit the budget: push them
+                // railed, never re-wrapped.
+                let push_row = |lines: &mut Vec<Line<'a>>, row: Vec<crate::md::MdSpan>| {
+                    let mut spans = vec![Span::raw(" "), Span::styled("▏ ", theme.rail_style())];
+                    spans.extend(
+                        row.into_iter()
+                            .map(|span| Span::styled(span.text, theme.md_style(span.kind))),
+                    );
+                    lines.push(Line::from(spans));
+                };
+                let mut idx = 0usize;
+                while idx < md_lines.len() {
+                    if md_lines[idx].table.is_some() {
+                        let start = idx;
+                        while idx < md_lines.len() && md_lines[idx].table.is_some() {
+                            idx += 1;
+                        }
+                        let rows: Vec<&crate::md::MdTableRow> = md_lines[start..idx]
+                            .iter()
+                            .filter_map(|line| line.table.as_ref())
+                            .collect();
+                        for row in crate::md::layout_table(&rows, budget) {
+                            push_row(lines, row);
+                        }
+                        continue;
                     }
+                    for row in crate::md::wrap_spans(&md_lines[idx].spans, budget) {
+                        push_row(lines, row);
+                    }
+                    idx += 1;
                 }
             }
         }
