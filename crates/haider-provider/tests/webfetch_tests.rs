@@ -263,3 +263,44 @@ async fn content_types_gate_to_text_and_json_only() {
         .expect_err("missing content-type is refused");
     assert!(error.message.contains("Content-Type"), "{error}");
 }
+
+/// Review pin (coordinator, W-B review of record): the 4 MiB SOURCE cap
+/// bounds the raw body BEFORE html reduction, independently of the 96 KiB
+/// OUTPUT cap. The observation is non-degenerate: a body that is huge at the
+/// source but reduces to almost nothing (5 MiB of dropped <script> content
+/// around a tiny marker) hits the SOURCE cap but never the output cap — so
+/// `truncated` reflects the source cap ALONE here.
+/// MUTATION CHECK (executed): neuter the source-cap clamp in
+/// `read_body_bounded` (read the whole body). Expected RUNTIME failure: the
+/// full 5 MiB reduces to the tiny marker, nothing hits the 96 KiB output cap,
+/// and `truncated` flips to false — the memory-safety valve is gone unseen.
+#[tokio::test]
+async fn oversized_source_is_capped_before_reduction_even_when_it_reduces_small() {
+    // Marker first (survives both the capped and uncapped read), then ~5 MiB
+    // of script content the reducer drops — 1 MiB past the 4 MiB source cap.
+    let filler = "x".repeat(5 * 1024 * 1024);
+    let html = format!("<html><body><p>SRCCAP_MARKER</p><script>{filler}</script></body></html>");
+    let (base, _server) = spawn_loopback_server(vec![(
+        "/big",
+        text_response("text/html; charset=utf-8", &html),
+    )])
+    .await;
+
+    let outcome = fetch_public_url(&format!("{base}/big"), None)
+        .await
+        .expect("loopback fetch succeeds");
+    assert!(
+        outcome.text.contains("SRCCAP_MARKER"),
+        "the marker survives reduction: {}",
+        &outcome.text[..outcome.text.len().min(120)]
+    );
+    assert!(
+        outcome.text.len() <= WEB_FETCH_OUTPUT_CAP_BYTES,
+        "reduced output is tiny, far under the output cap"
+    );
+    assert!(
+        outcome.truncated,
+        "the raw body exceeded the 4 MiB SOURCE cap, so the fetch is truncated \
+         even though the reduced output never approached the 96 KiB output cap"
+    );
+}

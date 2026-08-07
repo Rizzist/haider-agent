@@ -54,3 +54,36 @@ the mutation ran:
   `live_web_fetch_is_brokered_journaled_and_refusals_stay_typed_results`) but
   no executed kill this wave; the campaign's six mandated areas plus the two
   M4 areas were prioritized.
+
+## Review of record (coordinator, executed post-lane, Opus 4.8)
+
+Read the full branch diff (provider web-tool declarations + opaque
+capture, fetch engine, daemon advertisement/broker, 30+ laws). Two
+structural seams probed:
+
+1. **Cross-provider strip of the NEW web-search opaque facts** — SAFE BY
+   CONSTRUCTION and already observed: the anthropic web facts are
+   captured as `StreamEvent::ProviderOpaque` tagged `anthropic`, and
+   `strip_foreign_provider_opaque` (worker.rs) matches on
+   `Block::ProviderOpaque { provider }` with NO kind discrimination, so
+   the G3 `cross_provider_switch_strips_foreign_opaque_facts` law already
+   pins the exact code path. A web-search-specific strip law would kill
+   no mutation the G3 law doesn't — not written (no theater law; the P1
+   render-walk lesson).
+
+2. **The 4 MiB SOURCE cap** (`read_body_bounded`, distinct from the
+   96 KiB OUTPUT cap) — GENUINE UNOBSERVED GATE. It bounds the raw body
+   BEFORE html reduction (memory safety against an unbounded body), and
+   NO law observed it. The trap: `truncated` alone is degenerate (the
+   output cap sets it too — the same class as the lane's own kill-4
+   catch). Closed with a NON-degenerate pin
+   `oversized_source_is_capped_before_reduction_even_when_it_reduces_small`:
+   5 MiB of dropped `<script>` content around a tiny marker hits the
+   source cap but reduces far under the output cap, so `truncated`
+   reflects the SOURCE cap alone. Kill-executed: neutering the clamp
+   flips `truncated` to false ("running 1 test" observed), reverted,
+   6/6 green.
+
+Lane's 8 kills spot-checked against the notes; the kill-4
+degenerate-observer sharpening is exemplary. Ledger 2077 -> 2078 with
+the review pin. Campaign ACCEPTED.
