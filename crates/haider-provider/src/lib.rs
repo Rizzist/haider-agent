@@ -71,8 +71,10 @@ pub use openai::{
     KimiThinkingType, OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
     OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
-    OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
-    OpenAiTransportConfig, azure_openai_origin, replay_kimi_models_response,
+    OPENAI_ALPHA_SEARCH_URL, OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider,
+    OpenAiRetryPolicy, OpenAiTransportConfig, azure_openai_origin,
+    codex_alpha_search_request_body, codex_alpha_search_response_text,
+    replay_kimi_models_response,
     replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
     replay_openai_responses_sse, validate_openai_compatible_endpoint,
 };

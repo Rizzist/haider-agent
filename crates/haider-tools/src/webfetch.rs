@@ -129,6 +129,32 @@ impl EffectOperation for WebFetch {
     }
 }
 
+/// Registry manifest for the CLIENT `web_search` tool (W-B decision 3):
+/// advertised on responses-lite pairs only, executed daemon-side against the
+/// codex alpha/search endpoint with the SAME subscription credential as
+/// turns — provider-credential traffic, not a brokered effect (the
+/// `request_input` pattern).
+#[must_use]
+pub fn web_search_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "web_search".into(),
+        description: "Search the web and return a bounded text summary of the results.".into(),
+        effects: Vec::new(),
+        dispatch: DispatchMode::Await,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
 /// Registry manifest for the universal local `web_fetch` client tool.
 #[must_use]
 pub fn web_fetch_manifest() -> ToolManifest {

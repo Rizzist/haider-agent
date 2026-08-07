@@ -50,7 +50,9 @@ pub use tasks::{
     task_output_manifest,
 };
 pub use todo_write::{MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TodoWrite, todo_write_manifest};
-pub use webfetch::{WEB_FETCH_TOOL_OUTPUT_CAP_BYTES, WebFetch, web_fetch_manifest};
+pub use webfetch::{
+    WEB_FETCH_TOOL_OUTPUT_CAP_BYTES, WebFetch, web_fetch_manifest, web_search_manifest,
+};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tools";

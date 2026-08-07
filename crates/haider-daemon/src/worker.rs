@@ -67,7 +67,8 @@ use haider_protocol::tool::{
     ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
 };
 use haider_provider::{
-    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, Message, ResolvedAttachment,
+    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, Message,
+    ResolvedAttachment,
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
@@ -132,6 +133,49 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         metadata: &SessionMetadataV1,
     ) -> Result<ResolvedTurnProvider, HaiderError>;
+
+    /// W-B: pair resolution with the session's web-capability degrades in
+    /// hand, so a latched anthropic degrade clears the native web-tools
+    /// declaration at CONSTRUCTION. Defaulted so every existing factory —
+    /// production and test — keeps its exact behavior; the accounts factory
+    /// overrides it.
+    async fn resolve_for_turn_with_web(
+        &self,
+        metadata: &SessionMetadataV1,
+        degrade: WebCapabilityDegrade,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        let _ = degrade;
+        self.resolve_for_turn(metadata).await
+    }
+}
+
+/// W-B: session-scoped web-capability degrades (hub-owned, in-memory).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebCapabilityDegrade {
+    /// Anthropic server web tools 400ed this session: declare none and fall
+    /// back to the local `web_fetch` client tool ("local fallback on
+    /// refusal", capability matrix).
+    pub anthropic_web_tools: bool,
+    /// The codex alpha/search endpoint returned 404/410 this session: stop
+    /// advertising the client `web_search` tool (no retry storm).
+    pub openai_alpha_search: bool,
+}
+
+/// W-B (decision 3): daemon-side executor for the CLIENT `web_search` tool —
+/// a POST to the codex alpha/search endpoint under the SAME subscription
+/// credential as turns. Injectable so tests never dial the real endpoint.
+#[async_trait]
+pub(crate) trait WebSearchExecutor: Send + Sync {
+    async fn search(&self, model: &str, session_id: &str, query: &str)
+    -> Result<String, WebSearchFailure>;
+}
+
+/// Typed failure from one web-search execution. `degraded` marks the
+/// endpoint as GONE (404/410) — the session capability latch, not a retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebSearchFailure {
+    pub(crate) message: String,
+    pub(crate) degraded: bool,
 }
 
 struct DaemonContextCompactor {
@@ -407,6 +451,9 @@ pub struct WorkerToolContext {
     pub(crate) delegation: DelegationHandle,
     pub(crate) tasks: crate::tasks::TaskFacade,
     pub agent_id: Option<AgentId>,
+    /// W-B: the client web_search executor for this turn (None = typed
+    /// unavailable result).
+    pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
 }
 
 /// Injectable tool/effect boundary (R4). Production uses the shipped broker;
@@ -500,6 +547,9 @@ pub(crate) struct WorkerDependencies {
     pub(crate) provider_factory: Arc<dyn ProviderFactory>,
     pub(crate) tool_factory: Arc<dyn TurnToolFactory>,
     pub(crate) delegation: Option<DelegationHandle>,
+    /// W-B: the client `web_search` executor. `None` (test worlds without
+    /// one) makes the tool answer with a typed "unavailable" result.
+    pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
 }
 
 impl WorkerDependencies {
@@ -511,6 +561,7 @@ impl WorkerDependencies {
             provider_factory: Arc::new(UnconfiguredProviderFactory),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         }
     }
 }
@@ -1483,6 +1534,9 @@ struct ActiveTurn {
     harness: haider_core::HarnessHandle,
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     actor: Option<JoinHandle<()>>,
+    /// W-B: whether this turn declared the anthropic SERVER web tools —
+    /// the precondition for the invalid-request degrade latch.
+    anthropic_web_tools: bool,
 }
 
 impl Drop for ActiveTurn {
@@ -2722,9 +2776,10 @@ async fn perform_manual_compaction(
         )
     })?;
     let agent_id = delegation.agent_for_session(lease.session_id()).await?;
+    let web_degrade = lease.hub().web_degrade(lease.session_id());
     let resolved = dependencies
         .provider_factory
-        .resolve_for_turn(metadata)
+        .resolve_for_turn_with_web(metadata, web_degrade)
         .await?;
     if resolved.provider_name != metadata.provider {
         return Err(HaiderError::new(
@@ -2749,6 +2804,7 @@ async fn perform_manual_compaction(
         &dependencies.tool_factory,
         agent_id.is_some(),
         &resolved.provider_name,
+        web_degrade,
     );
     let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
         lease,
@@ -3213,9 +3269,13 @@ async fn start_turn(
         recovery_ready: _,
         recovering: _,
     } = pending;
+    // W-B (decision 8): the session's web-capability degrades ride into
+    // pair resolution (native declarations) AND the tool pack below — ONE
+    // per-turn derivation from the resolved pair.
+    let web_degrade = lease.hub().web_degrade(lease.session_id());
     let resolved = dependencies
         .provider_factory
-        .resolve_for_turn(metadata)
+        .resolve_for_turn_with_web(metadata, web_degrade)
         .await?;
     if resolved.provider_name != metadata.provider {
         return Err(HaiderError::new(
@@ -3307,6 +3367,7 @@ async fn start_turn(
             delegation,
             tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
             agent_id: agent_id.clone(),
+            web_search: dependencies.web_search.clone(),
         })
         .await?;
     let mut config = HarnessConfig::for_session(
@@ -3351,6 +3412,7 @@ async fn start_turn(
         &dependencies.tool_factory,
         delegated_child,
         &resolved.provider_name,
+        web_degrade,
     );
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
@@ -3459,6 +3521,12 @@ async fn start_turn(
         )),
     };
     let handle = submitted?;
+    // W-B: whether THIS turn declared the anthropic server web tools — the
+    // precondition for the invalid-request degrade latch on its outcome.
+    let anthropic_web_tools = matches!(
+        resolved.provider_name.as_str(),
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+    ) && !web_degrade.anthropic_web_tools;
     Ok(active_turn(
         accepted.run_id,
         accepted.branch_id,
@@ -3466,6 +3534,7 @@ async fn start_turn(
         actor.into_inner(),
         dispatcher,
         handle,
+        anthropic_web_tools,
     ))
 }
 
@@ -3650,6 +3719,7 @@ fn active_turn(
     actor: JoinHandle<()>,
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     handle: TurnHandle,
+    anthropic_web_tools: bool,
 ) -> ActiveTurn {
     let cancel = handle.cancel_token();
     ActiveTurn {
@@ -3660,6 +3730,7 @@ fn active_turn(
         harness,
         dispatcher,
         actor: Some(actor),
+        anthropic_web_tools,
     }
 }
 
@@ -4023,6 +4094,7 @@ pub(crate) enum RegisteredToolRoute {
     TaskOutput,
     TaskKill,
     WebFetch,
+    WebSearch,
 }
 
 #[derive(Debug, Clone)]
@@ -4180,6 +4252,18 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::WebFetch,
             }
         },
+        {
+            // W-B: the client web_search rides the SAME subscription
+            // credential as the turn itself — provider-credential traffic,
+            // not a brokered effect (the request_input pattern). Advertised
+            // on responses-lite pairs only (see the derivation seam).
+            let manifest = haider_tools::web_search_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::NotApplicable,
+                route: RegisteredToolRoute::WebSearch,
+            }
+        },
     ]
 }
 
@@ -4190,6 +4274,23 @@ pub(crate) fn registered_tool_route(name: &str) -> Option<RegisteredToolRoute> {
     registered_tools()
         .into_iter()
         .find_map(|entry| (entry.manifest.name == name).then_some(entry.route))
+}
+
+/// Bounds one web-search result for the tool result (W-B decision 3):
+/// 32 KiB on a char boundary with an honest truncation marker.
+fn bounded_search_preview(text: String) -> (String, bool) {
+    const WEB_SEARCH_RESULT_CAP_BYTES: usize = 32 * 1024;
+    if text.len() <= WEB_SEARCH_RESULT_CAP_BYTES {
+        return (text, false);
+    }
+    let mut cut = WEB_SEARCH_RESULT_CAP_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut text = text;
+    text.truncate(cut);
+    text.push_str("\n[web_search: output truncated]");
+    (text, true)
 }
 
 fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
@@ -4213,16 +4314,27 @@ pub(crate) fn advertised_tool_definitions(
     tool_factory: &Arc<dyn TurnToolFactory>,
     delegated_child: bool,
     provider_name: &str,
+    web_degrade: WebCapabilityDegrade,
 ) -> Vec<ToolDefinition> {
     let mut definitions = tool_factory.definitions();
     if delegated_child {
         definitions.retain(|definition| definition.name != "todo_write");
     }
+    // First-party Anthropic pairs carry the SERVER `web_fetch` tool, so the
+    // local client tool is withheld — UNLESS the session's server tools
+    // degraded (400), which is exactly the "local fallback on refusal".
     if matches!(
         provider_name,
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
-    ) {
+    ) && !web_degrade.anthropic_web_tools
+    {
         definitions.retain(|definition| definition.name != "web_fetch");
+    }
+    // The client `web_search` tool exists for responses-lite pairs only —
+    // every other family either has a provider-native search or honestly
+    // none — and a latched 404/410 stops advertising it for the session.
+    if provider_name != OPENAI_OAUTH_PROVIDER_NAME || web_degrade.openai_alpha_search {
+        definitions.retain(|definition| definition.name != "web_search");
     }
     definitions
 }
@@ -4276,6 +4388,7 @@ impl TurnToolFactory for BrokerToolFactory {
         };
         Ok(Some(Arc::new(BrokerToolDispatcher {
             broker: Mutex::new(Some(broker)),
+            web_search: context.web_search.clone(),
             policy: Mutex::new(policy),
             cas: Mutex::new(HubArtifactStore {
                 store: context.store,
@@ -4323,6 +4436,7 @@ pub(crate) fn effective_permission_defaults(
 
 struct BrokerToolDispatcher {
     broker: Mutex<Option<EffectBroker>>,
+    web_search: Option<Arc<dyn WebSearchExecutor>>,
     policy: Mutex<PermissionPolicy>,
     cas: Mutex<HubArtifactStore>,
     ledger: ChangeLedger,
@@ -4767,6 +4881,54 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         &self.ledger,
                     )
                     .await
+            }
+            RegisteredToolRoute::WebSearch => {
+                // W-B (decision 3): the search rides the SAME subscription
+                // credential surface as the turn itself — no broker, no
+                // menu (the request_input pattern). Failures are typed tool
+                // RESULTS; a 404/410 latches the session degrade so the
+                // tool stops advertising next turn (no retry storm).
+                let query = required_string(&args, "query")?;
+                match &self.web_search {
+                    None => Ok(BoundedResult {
+                        preview:
+                            "web_search is unavailable: no subscription search executor is configured"
+                                .into(),
+                        truncated: false,
+                        artifact: None,
+                        cursor: None,
+                    }),
+                    Some(executor) => {
+                        match executor
+                            .search(&self.metadata.model, self.session_id.as_str(), &query)
+                            .await
+                        {
+                            Ok(text) => {
+                                let (preview, truncated) = bounded_search_preview(text);
+                                Ok(BoundedResult {
+                                    preview,
+                                    truncated,
+                                    artifact: None,
+                                    cursor: None,
+                                })
+                            }
+                            Err(failure) => {
+                                if failure.degraded {
+                                    self.output
+                                        .store
+                                        .hub()
+                                        .degrade_openai_alpha_search(&self.session_id);
+                                }
+                                Ok(BoundedResult {
+                                    preview: format!("web_search failed: {}", failure.message),
+                                    truncated: false,
+                                    artifact: None,
+                                    cursor: None,
+                                })
+                            }
+                        }
+                    }
+                }
             }
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::TodoWrite

@@ -537,6 +537,11 @@ struct HubInner {
     /// tasks. Hub-owned so every facade clone shares it; the journal's
     /// task facts remain the durable truth.
     tasks: crate::tasks::TaskRegistry,
+    /// W-B: session-scoped web-capability degrades (anthropic server tools
+    /// 400ed → local fallback; codex alpha/search 404/410 → stop advertising
+    /// the client search). Deliberately IN-MEMORY: "for the session" is a
+    /// runtime scope — a daemon restart retries the capability once.
+    web_degrade: Mutex<HashMap<SessionId, crate::worker::WebCapabilityDegrade>>,
 }
 
 #[derive(Default)]
@@ -938,12 +943,50 @@ impl SessionHub {
                 hooks: Arc::new(Mutex::new(None)),
                 usage_report: Mutex::new(None),
                 tasks: crate::tasks::TaskRegistry::default(),
+                web_degrade: Mutex::new(HashMap::new()),
             }),
         })
     }
 
     pub(crate) fn task_registry(&self) -> &crate::tasks::TaskRegistry {
         &self.inner.tasks
+    }
+
+    /// W-B: this session's web-capability degrade snapshot (Default = no
+    /// degrade). Poison-tolerant like the task registry.
+    pub(crate) fn web_degrade(&self, session_id: &SessionId) -> crate::worker::WebCapabilityDegrade {
+        self.inner
+            .web_degrade
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// W-B: latches "anthropic server web tools 400ed" for this session —
+    /// the next turn declares no server tools and falls back to the local
+    /// `web_fetch` client tool.
+    pub(crate) fn degrade_anthropic_web_tools(&self, session_id: &SessionId) {
+        self.inner
+            .web_degrade
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_default()
+            .anthropic_web_tools = true;
+    }
+
+    /// W-B: latches "codex alpha/search is gone (404/410)" for this session —
+    /// the client `web_search` tool stops advertising (no retry storm).
+    pub(crate) fn degrade_openai_alpha_search(&self, session_id: &SessionId) {
+        self.inner
+            .web_degrade
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_default()
+            .openai_alpha_search = true;
     }
 
     /// Stores one bounded background-task output payload in the profile CAS.

@@ -1446,3 +1446,50 @@ fn azure_origin_predicate_and_constructor_agree_both_directions() {
         );
     }
 }
+
+/// LAW (LW4, alpha/search request-body golden): the client `web_search`
+/// SearchRequest body pins exactly the locked shape — session id, model, an
+/// empty input, ONE search command carrying the query, and the locked
+/// settings (`medium` context, `direct` caller, external access on) — and
+/// never `max_output_tokens` (the same backend bans it on lite).
+#[test]
+fn alpha_search_request_body_is_golden() {
+    let body = codex_alpha_search_request_body("session-9", "gpt-5.6-sol", "rust sse decoding");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "id": "session-9",
+            "model": "gpt-5.6-sol",
+            "input": [],
+            "commands": [{"type": "search", "query": "rust sse decoding"}],
+            "settings": {
+                "search_context_size": "medium",
+                "allowed_callers": ["direct"],
+                "external_web_access": true,
+            },
+        })
+    );
+    assert_eq!(
+        OPENAI_ALPHA_SEARCH_URL,
+        "https://chatgpt.com/backend-api/codex/alpha/search"
+    );
+
+    // Response extraction stays tolerant: output-item text, top-level
+    // text, and raw-JSON fallback all yield bounded readable text.
+    let items = serde_json::json!({
+        "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "first"}]},
+            {"type": "note", "text": "second"},
+        ],
+    });
+    let text = codex_alpha_search_response_text(items.to_string().as_bytes());
+    assert!(text.contains("first") && text.contains("second"), "{text}");
+    assert_eq!(
+        codex_alpha_search_response_text(br#"{"output_text":"top level"}"#),
+        "top level"
+    );
+    assert_eq!(
+        codex_alpha_search_response_text(b"not json at all"),
+        "not json at all"
+    );
+}

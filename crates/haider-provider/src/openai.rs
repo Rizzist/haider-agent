@@ -44,6 +44,12 @@ pub const OPENAI_SUBSCRIPTION_RESPONSES_URL: &str =
     "https://chatgpt.com/backend-api/codex/responses";
 pub const OPENAI_CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 pub const OPENAI_CODEX_RESPONSES_LITE_VALUE: &str = "true";
+/// W-B (decision 3): the UNOFFICIAL codex search endpoint the client
+/// `web_search` tool executes against on lite pairs — same origin and
+/// Bearer as subscription turns. Source-verified against codex main
+/// 2026-08; a 404/410 degrades the capability for the session.
+pub const OPENAI_ALPHA_SEARCH_URL: &str =
+    "https://chatgpt.com/backend-api/codex/alpha/search";
 const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
 const KIMI_OAUTH_HOST: &str = "api.kimi.com";
 
@@ -1558,6 +1564,72 @@ fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Ve
         }
     }
     sources
+}
+
+/// The exact SearchRequest body the daemon POSTs to
+/// [`OPENAI_ALPHA_SEARCH_URL`] for the client `web_search` tool (W-B
+/// decision 3, LW4 golden). Locked settings: `search_context_size: medium`,
+/// `allowed_callers: ["direct"]`, `external_web_access: true`. `input` stays
+/// empty (recent-history seeding is a codex nicety, not part of the locked
+/// contract) and `max_output_tokens` is omitted — the same backend bans it
+/// on lite.
+#[must_use]
+pub fn codex_alpha_search_request_body(
+    session_id: &str,
+    model: &str,
+    query: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": session_id,
+        "model": model,
+        "input": [],
+        "commands": [{"type": "search", "query": query}],
+        "settings": {
+            "search_context_size": "medium",
+            "allowed_callers": ["direct"],
+            "external_web_access": true,
+        },
+    })
+}
+
+/// Tolerantly extracts readable text from an alpha/search response body:
+/// output-item text parts first, then any top-level `output_text`/`text`
+/// field, and finally the bounded raw JSON — an unofficial endpoint's shape
+/// is never trusted enough to hard-fail a successful HTTP 200.
+#[must_use]
+pub fn codex_alpha_search_response_text(body: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return String::from_utf8_lossy(body).into_owned();
+    };
+    let mut collected = String::new();
+    if let Some(output) = value.get("output").and_then(serde_json::Value::as_array) {
+        for item in output {
+            if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                collected.push_str(text);
+                collected.push('\n');
+            }
+            if let Some(content) = item.get("content").and_then(serde_json::Value::as_array) {
+                for part in content {
+                    if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                        collected.push_str(text);
+                        collected.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    if collected.trim().is_empty()
+        && let Some(text) = value
+            .get("output_text")
+            .or_else(|| value.get("text"))
+            .and_then(serde_json::Value::as_str)
+    {
+        collected = text.to_owned();
+    }
+    if collected.trim().is_empty() {
+        collected = value.to_string();
+    }
+    collected.trim_end().to_owned()
 }
 
 #[derive(Debug)]
