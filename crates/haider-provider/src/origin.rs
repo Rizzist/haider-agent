@@ -240,6 +240,15 @@ fn validate_addresses(
     Ok(pinned.into())
 }
 
+/// W-B strict-public fence: TRUE for every address a public web fetch must
+/// refuse — loopback, RFC1918, link-local (cloud metadata), CGNAT/shared
+/// space, multicast, unspecified, broadcast, ULA, and 0/8 — exactly the
+/// fixed-credential fence. Loopback allowance for plain-HTTP fetches is the
+/// CALLER's separate rule; this predicate answers "is it public?" only.
+pub(crate) fn blocked_public_web_target(address: IpAddr) -> bool {
+    blocked_fixed_credential_target(address)
+}
+
 fn blocked_fixed_credential_target(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => blocked_fixed_ipv4_target(address),

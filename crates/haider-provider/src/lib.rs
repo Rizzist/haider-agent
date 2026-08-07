@@ -26,6 +26,9 @@ mod openai;
 mod origin;
 mod pricing;
 mod usage;
+mod webfetch;
+#[cfg(test)]
+mod webfetch_tests;
 mod wire;
 
 use async_trait::async_trait;
@@ -80,6 +83,10 @@ pub use usage::{
     MeterReading, MeterUnavailable, OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint,
     normalize_utilization, parse_anthropic_oauth_usage, parse_kimi_usages, parse_openai_wham_usage,
     parse_rfc3339_to_unix_ms,
+};
+pub use webfetch::{
+    WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchOutcome, fetch_public_url,
+    fetch_public_url_with_resolver, reduce_html_to_text,
 };
 
 /// Provider classes backed by production account credentials in this release.
