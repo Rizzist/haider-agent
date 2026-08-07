@@ -113,6 +113,24 @@ pub fn resolve_system_theme(osc: Option<termbg::Theme>, colorfgbg: Option<&str>)
     }
 }
 
+/// Whether the terminal renders 24-bit color, over an env lookup (pure so
+/// tests drive it without touching the process environment, mirroring
+/// [`crate::wordmark::graphics_terminal_likely`]). The app emits truecolor
+/// everywhere, so the ANSWER DEFAULTS TO TRUE and downgrades only on
+/// POSITIVE low-color evidence: a `COLORTERM` that names `truecolor`/`24bit`
+/// pins true; otherwise a `TERM` that tops out at 16 colors (`linux`,
+/// `dumb`, an explicit `-16color`) is the only thing that degrades the
+/// Thinking-verb shimmer to its two-tone wave (W-E decision 6 / LE6).
+#[must_use]
+pub fn truecolor_capable(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if env("COLORTERM").is_some_and(|c| c.contains("truecolor") || c.contains("24bit")) {
+        return true;
+    }
+    !env("TERM").is_some_and(|term| {
+        term == "linux" || term == "dumb" || term == "vt100" || term.ends_with("-16color")
+    })
+}
+
 /// The ONE persistence authority for the theme choice (ui-themes-fix):
 /// both runtime loops call this every beat. It keys on the model's COMMIT
 /// counter — not on a choice diff — so a commit that re-affirms the boot
@@ -274,6 +292,10 @@ pub async fn run_demo(
     // capability response is not eaten by the pump. Degrades to None (the
     // half-block art) on a non-graphics or non-answering terminal; never hangs.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
+    // Pin the truecolor capability once (read by render for the Thinking
+    // shimmer's fidelity); the default is true, so this only downgrades a
+    // proven 16-color terminal.
+    model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());
 
     // Input pump: crossterm's blocking read on a dedicated thread, forwarded
     // into the async loop (no event-stream feature needed).
@@ -2658,6 +2680,8 @@ pub async fn run_live(
     // Graphics wordmark query — after raw mode, before the input pump (see the
     // run_demo note); None on non-graphics terminals falls back to `crate::mark`.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
+    // Truecolor capability (see run_demo) — pinned once for render's shimmer.
+    model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());
 
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
     std::thread::spawn(move || {

@@ -224,19 +224,35 @@ fn chip_two_tone<'a>(
 /// pulsing on the shared clock, the dot breathing ● ↔ ◌ with it (glyph
 /// alternation is a port taste-call — a dimmed cell alone can read flat on
 /// low-contrast terminals; one law for the session and chip views).
-fn thinking_line(theme: &Theme, phase: u8) -> Line<'static> {
+fn thinking_line(theme: &Theme, phase: u8, truecolor: bool) -> Line<'static> {
     let dot = if phase.is_multiple_of(2) {
         "●"
     } else {
         "◌"
     };
-    Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            format!("{dot} thinking…"),
-            theme.pulse_ink(theme.gold, phase),
-        ),
-    ])
+    // W-E: the STATUS VERB carries a left→right brightness wave (per-glyph
+    // shimmer spans on the shared clock); the leading dot keeps its uniform
+    // pulse + ● ↔ ◌ breath (the shimmer is ADDITIVE to the verb — the dot
+    // stays as is), and the trailing `…` is decoration, base ink, never
+    // shimmered (decision 1 / LE3).
+    const VERB: &str = "thinking";
+    let len = VERB.chars().count();
+    let mut spans = Vec::with_capacity(len + 3);
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("{dot} "),
+        theme.pulse_ink(theme.gold, phase),
+    ));
+    for (index, glyph) in VERB.chars().enumerate() {
+        spans.push(Span::styled(
+            glyph.to_string(),
+            theme.shimmer_ink(phase, index, len, truecolor),
+        ));
+    }
+    // The `…` wears the shimmer BASE ink (`shimmer_inks()[0]` == the gold
+    // accent) statically — the same resting ink the verb falls back to.
+    spans.push(Span::styled("…", theme.gold_style()));
+    Line::from(spans)
 }
 
 fn pad_spans_to<'s>(mut spans: Vec<Span<'s>>, width: usize) -> Vec<Span<'s>> {
@@ -2900,7 +2916,7 @@ fn render_session(
         // S2 item 5: one breathing row above the badge — it must never
         // sit flush against the last output line.
         lines.push(Line::default());
-        lines.push(thinking_line(theme, model.anim_phase));
+        lines.push(thinking_line(theme, model.anim_phase, model.truecolor));
     }
     // S2 item 5: exactly ONE blank line between the transcript's last
     // output and the composer band. The breathing row rides the STREAM
@@ -4237,7 +4253,7 @@ fn render_subagent(
         // S2 item 5: the chip view keeps the session's rhythm — one
         // breathing row above the thinking badge.
         lines.push(Line::default());
-        lines.push(thinking_line(theme, model.anim_phase));
+        lines.push(thinking_line(theme, model.anim_phase, model.truecolor));
     }
     if display == crate::script::ChipDisplayState::Waiting && live_children > 0 {
         lines.push(Line::from(vec![

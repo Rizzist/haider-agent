@@ -3033,6 +3033,14 @@ pub struct AppModel {
     /// state: never persisted, and terminal chips never read it (their
     /// figure is frozen from journal timestamps).
     pub clock_ms: u64,
+    /// Whether the terminal renders 24-bit color — set once at startup by the
+    /// runtime (see [`crate::runtime::truecolor_capable`]) and read by render
+    /// to pick the Thinking verb's shimmer fidelity: `true` rides the full
+    /// three-step falloff, `false` degrades to the two-tone wave (W-E LE6).
+    /// Defaults to `true` (the app emits truecolor everywhere; a non-graphics
+    /// terminal only downgrades on positive low-color evidence). Never
+    /// persisted; a pure presentation capability.
+    pub truecolor: bool,
     /// The حيدر wordmark as a real graphics-protocol image, when the terminal
     /// speaks one — set once at startup by the runtime (see
     /// [`crate::wordmark::Wordmark::detect`]) and read by render to draw a crisp
@@ -3172,6 +3180,10 @@ impl Default for AppModel {
             dirty: true,
             anim_phase: 0,
             clock_ms: 0,
+            // Assume truecolor until the runtime proves otherwise at startup
+            // (the app emits 24-bit color everywhere); tests and demo stay
+            // true and render the full-fidelity shimmer.
+            truecolor: true,
             // No graphics wordmark until the runtime queries the terminal at
             // startup; every non-graphics terminal and all tests stay None and
             // render falls back to the half-block art in `crate::mark`.

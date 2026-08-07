@@ -292,4 +292,80 @@ impl Theme {
         };
         Style::default().fg(ink.into())
     }
+
+    // ---- W-E item: the Thinking verb's travelling shimmer ----
+
+    /// The three inks of the Thinking-verb shimmer, dim → bright: the gold
+    /// accent at REST (`shimmer_inks()[0]` — the word's default, exactly the
+    /// old uniform ink), a gold→emphasis MIDPOINT for the window's ±1
+    /// shoulders, and the emphasis ink at the window CENTRE. All three are
+    /// theme tokens (or a token blend), so each clears the accent contrast
+    /// floor on every ground (LE5); the wave raises PROMINENCE within the
+    /// palette and invents no hue (W-E decision 5). Sibling of the rail's
+    /// gold↔maroon in [`Self::rail_shimmer_style`], but for glyphs it lifts
+    /// brightness rather than shifting hue.
+    #[must_use]
+    pub fn shimmer_inks(&self) -> [Rgb; 3] {
+        [self.gold, self.bright.over(self.gold, 500), self.bright]
+    }
+
+    /// One Thinking-verb glyph's ink at `phase`/`index`, over a verb of
+    /// `len` glyphs. A truecolor terminal rides the full three-step falloff
+    /// (base · mid · bright); a non-truecolor terminal degrades to the
+    /// EXISTING two-tone treatment — the window centre is bright, every
+    /// other glyph is base — so the wave still travels with one fewer step
+    /// and emits no intermediate truecolor code beyond the two endpoints
+    /// (LE6). The intensity is a PURE function of (`phase`, `index`, `len`)
+    /// via [`shimmer_level`] (LE1); the caller's clock is `model.anim_phase`,
+    /// no new timer. Siblings: [`Self::pulse_ink`] (uniform pulse) and
+    /// [`Self::rail_shimmer_style`] (the rail's travelling shimmer).
+    #[must_use]
+    pub fn shimmer_ink(&self, phase: u8, index: usize, len: usize, truecolor: bool) -> Style {
+        let inks = self.shimmer_inks();
+        let level = shimmer_level(phase, index, len) as usize;
+        // Truecolor: the mid shoulder survives. Two-tone: only the centre
+        // lifts (level 2), everything else falls to base — no mid code.
+        let ink = if truecolor || level != 1 {
+            inks[level]
+        } else {
+            inks[0]
+        };
+        Style::default().fg(ink.into())
+    }
+}
+
+/// Ticks the highlight window rests OFF the right end before the sweep
+/// repeats — the short tail pause that makes the wave read as a pulse, not
+/// a strobe (W-E decision 2).
+pub const SHIMMER_TAIL: usize = 3;
+
+/// The on-glyph CENTRE of the shimmer window at `phase` over a verb of
+/// `len` glyphs, or `None` during the tail rest. PURE in (`phase`, `len`) —
+/// the probe ladder's reproducibility contract (LE1). The centre advances
+/// exactly one glyph per tick and wraps after the tail, so a sweep is
+/// `0, 1, … len-1, (rest), 0, …` (LE2 — a static "always 0" impl cannot
+/// produce this sequence). At the 600 ms shared-clock granularity one glyph
+/// per tick is the only non-strobing cadence (see the notes).
+#[must_use]
+pub fn shimmer_centre(phase: u8, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let pos = (phase as usize) % (len + SHIMMER_TAIL);
+    (pos < len).then_some(pos)
+}
+
+/// Per-glyph intensity LEVEL at `phase`: 2 = window centre (bright), 1 = the
+/// ±1 shoulder (mid), 0 = base (beyond the window, or during the tail rest).
+/// PURE (LE1); the falloff from the centre is decision 2's motion model.
+#[must_use]
+pub fn shimmer_level(phase: u8, index: usize, len: usize) -> u8 {
+    match shimmer_centre(phase, len) {
+        Some(centre) => match centre.abs_diff(index) {
+            0 => 2,
+            1 => 1,
+            _ => 0,
+        },
+        None => 0,
+    }
 }
