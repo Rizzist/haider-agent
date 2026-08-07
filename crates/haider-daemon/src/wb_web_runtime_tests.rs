@@ -7,8 +7,8 @@
 
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
-    BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, TurnToolFactory, WorkerDependencies,
-    WorkerManager, advertised_tool_definitions,
+    BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, TurnToolFactory,
+    WebCapabilityDegrade, WorkerDependencies, WorkerManager, advertised_tool_definitions,
 };
 use haider_core::{
     SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
@@ -73,6 +73,7 @@ impl WebWorld {
                 provider_factory: Arc::new(FixedProviderFactory { provider }),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,
+                web_search: None,
             },
             false,
         );
@@ -336,19 +337,22 @@ fn web_fetch_advertises_on_every_pair_except_first_party_anthropic() {
         "vertex",
         "fake",
     ] {
-        let pack = advertised_tool_definitions(&factory, false, provider);
+        let pack =
+            advertised_tool_definitions(&factory, false, provider, WebCapabilityDegrade::default());
         assert!(
             pack.iter().any(|tool| tool.name == "web_fetch"),
             "`{provider}` advertises the local web_fetch"
         );
     }
     for provider in ["anthropic", "anthropic-oauth"] {
-        let pack = advertised_tool_definitions(&factory, false, provider);
+        let pack =
+            advertised_tool_definitions(&factory, false, provider, WebCapabilityDegrade::default());
         assert!(
             !pack.iter().any(|tool| tool.name == "web_fetch"),
             "`{provider}` withholds the local tool — the server tool owns the name"
         );
-        let child = advertised_tool_definitions(&factory, true, provider);
+        let child =
+            advertised_tool_definitions(&factory, true, provider, WebCapabilityDegrade::default());
         assert!(
             !child.iter().any(|tool| tool.name == "todo_write"),
             "the child filter still applies beside the pair filter"

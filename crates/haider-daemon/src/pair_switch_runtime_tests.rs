@@ -93,6 +93,7 @@ impl PairSwitchWorld {
                 }),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,
+                web_search: None,
             },
             false,
         );

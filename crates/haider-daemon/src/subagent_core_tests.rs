@@ -404,6 +404,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -621,6 +622,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -714,6 +716,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             delegation: delegation.clone(),
             tasks: crate::tasks::TaskFacade::new(hub.clone()),
             agent_id: None,
+            web_search: None,
         },
     )
     .await
@@ -939,6 +942,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -1458,6 +1462,7 @@ async fn start_parked_child(
                 hub.clone(),
                 stall_deadline,
             )),
+            web_search: None,
         },
         false,
     );
@@ -1980,6 +1985,7 @@ async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() 
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: Some(delegation),
+            web_search: None,
         },
         false,
     );
@@ -2095,6 +2101,7 @@ async fn committed_child_progress_resets_the_stall_deadline() {
                 hub.clone(),
                 Duration::from_millis(30),
             )),
+            web_search: None,
         },
         false,
     );
@@ -2200,6 +2207,7 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: Some(delegation),
+            web_search: None,
         },
         false,
     );
@@ -2293,6 +2301,7 @@ async fn parent_cancel_sweeps_its_outstanding_child() {
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -2440,6 +2449,7 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -2556,6 +2566,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -2622,6 +2633,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 hub.clone(),
                 Duration::from_millis(30),
             )),
+            web_search: None,
         },
         false,
     );

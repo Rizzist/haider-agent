@@ -89,6 +89,7 @@ impl TestWorker {
                 }),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,
+                web_search: None,
             },
             false,
         );
@@ -753,6 +754,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );

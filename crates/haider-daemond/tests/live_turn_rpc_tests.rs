@@ -3028,6 +3028,13 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             // ceiling and Ask default as process_exec.
             "task_output",
             "task_kill",
+            // W-B: the universal local fetch is a brokered `Network { host }`
+            // effect; the lite-only client search is effect-free
+            // provider-credential traffic (the request_input pattern). Both
+            // live in the REGISTRY for every pair — the per-turn
+            // advertisement seam is what narrows them per resolved pair.
+            "web_fetch",
+            "web_search",
         ]
     );
     assert!(!names.contains(&"exec"));
@@ -3053,6 +3060,28 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
         .expect("task kill tool");
     assert_eq!(task_kill.manifest.effects, [EffectClass::ProcessExec]);
     assert_eq!(task_kill.default, ToolPermissionDefault::Ask);
+    // W-B pins: fetch is an Ask-by-default network effect (the manifest's
+    // empty host is the CLASS placeholder — the live intent carries the real
+    // host); search is effect-free and permissionless.
+    let web_fetch = inventory
+        .tools
+        .iter()
+        .find(|entry| entry.manifest.name == "web_fetch")
+        .expect("local web fetch tool");
+    assert_eq!(
+        web_fetch.manifest.effects,
+        [EffectClass::Network {
+            host: String::new()
+        }]
+    );
+    assert_eq!(web_fetch.default, ToolPermissionDefault::Ask);
+    let web_search = inventory
+        .tools
+        .iter()
+        .find(|entry| entry.manifest.name == "web_search")
+        .expect("client web search tool");
+    assert!(web_search.manifest.effects.is_empty());
+    assert_eq!(web_search.default, ToolPermissionDefault::NotApplicable);
     let reads = inventory
         .tools
         .iter()

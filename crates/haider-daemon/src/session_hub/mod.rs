@@ -954,7 +954,10 @@ impl SessionHub {
 
     /// W-B: this session's web-capability degrade snapshot (Default = no
     /// degrade). Poison-tolerant like the task registry.
-    pub(crate) fn web_degrade(&self, session_id: &SessionId) -> crate::worker::WebCapabilityDegrade {
+    pub(crate) fn web_degrade(
+        &self,
+        session_id: &SessionId,
+    ) -> crate::worker::WebCapabilityDegrade {
         self.inner
             .web_degrade
             .lock()

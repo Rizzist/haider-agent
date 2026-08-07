@@ -808,6 +808,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
             provider_factory: Arc::new(RecoveryProviderFactory { provider }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -1101,6 +1102,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
             provider_factory: Arc::new(FailingProviderFactory),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );

@@ -4464,8 +4464,10 @@ fn cancellation_fence_call_site_is_pinned_between_factories_and_harness_spawn() 
     let fence = start_turn
         .find("if cancellation_fences_start(durable_run_state(lease, &accepted.run_id).await)")
         .expect("start_turn must recheck durable cancellation at its last uncancellable boundary");
+    // W-B: the resolution await is now the degrade-aware overload
+    // (`resolve_for_turn_with_web`); the ORDER this guard pins is unchanged.
     let provider_resolution = start_turn
-        .find("resolve_for_turn(metadata)")
+        .find("resolve_for_turn_with_web(metadata, web_degrade)")
         .expect("provider resolution present");
     let tool_resolution = start_turn
         .find(".tool_factory")

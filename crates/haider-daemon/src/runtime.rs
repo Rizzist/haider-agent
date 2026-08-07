@@ -400,10 +400,22 @@ async fn run_inner(
         ),
     ))
     .map_err(DaemonError::from)?;
+    // W-B (decision 3): the client `web_search` tool on responses-lite pairs
+    // executes through the SAME credential broker as turns. Without a vault
+    // there is no broker and therefore no subscription credential — the tool
+    // then answers with a typed "unavailable" result instead of pretending.
+    let web_search: Option<std::sync::Arc<dyn crate::worker::WebSearchExecutor>> =
+        accounts_runtime.broker.clone().map(|broker| {
+            std::sync::Arc::new(crate::web_search::SubscriptionWebSearch::new(
+                broker,
+                std::sync::Arc::new(crate::web_search::ReqwestWebSearchHttp::new()),
+            )) as std::sync::Arc<dyn crate::worker::WebSearchExecutor>
+        });
     let worker_dependencies = crate::worker::WorkerDependencies {
         provider_factory,
         tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),
         delegation: None,
+        web_search,
     };
     let worker_manager = WorkerManager::start(
         hub.clone(),

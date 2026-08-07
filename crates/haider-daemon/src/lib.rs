@@ -78,6 +78,7 @@ mod turn_recovery;
 mod usage_report;
 #[cfg(test)]
 mod wb_web_runtime_tests;
+mod web_search;
 mod worker;
 
 #[cfg(test)]

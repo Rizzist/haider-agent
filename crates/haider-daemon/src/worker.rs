@@ -67,7 +67,7 @@ use haider_protocol::tool::{
     ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
 };
 use haider_provider::{
-    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, Message,
+    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, Message, OPENAI_OAUTH_PROVIDER_NAME,
     ResolvedAttachment,
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
@@ -166,8 +166,12 @@ pub struct WebCapabilityDegrade {
 /// credential as turns. Injectable so tests never dial the real endpoint.
 #[async_trait]
 pub(crate) trait WebSearchExecutor: Send + Sync {
-    async fn search(&self, model: &str, session_id: &str, query: &str)
-    -> Result<String, WebSearchFailure>;
+    async fn search(
+        &self,
+        model: &str,
+        session_id: &str,
+        query: &str,
+    ) -> Result<String, WebSearchFailure>;
 }
 
 /// Typed failure from one web-search execution. `degraded` marks the

@@ -168,6 +168,7 @@ async fn task_dispatcher(
             delegation: crate::delegation::DelegationHandle::new(hub.clone()),
             tasks: TaskFacade::with_kill_grace(hub.clone(), Duration::from_millis(300)),
             agent_id: None,
+            web_search: None,
         },
     )
     .await
@@ -634,6 +635,7 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );

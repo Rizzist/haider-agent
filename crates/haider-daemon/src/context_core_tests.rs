@@ -120,6 +120,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -494,6 +495,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -726,6 +728,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );
@@ -940,6 +943,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
+            web_search: None,
         },
         false,
     );

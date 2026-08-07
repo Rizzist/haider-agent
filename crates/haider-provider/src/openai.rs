@@ -48,8 +48,7 @@ pub const OPENAI_CODEX_RESPONSES_LITE_VALUE: &str = "true";
 /// `web_search` tool executes against on lite pairs — same origin and
 /// Bearer as subscription turns. Source-verified against codex main
 /// 2026-08; a 404/410 degrades the capability for the session.
-pub const OPENAI_ALPHA_SEARCH_URL: &str =
-    "https://chatgpt.com/backend-api/codex/alpha/search";
+pub const OPENAI_ALPHA_SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex/alpha/search";
 const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
 const KIMI_OAUTH_HOST: &str = "api.kimi.com";
 
@@ -1564,6 +1563,20 @@ fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Ve
         }
     }
     sources
+}
+
+/// The alpha/search endpoint for one subscription origin. The credential's
+/// own `base_url` wins when it carries one (an imported codex credential may
+/// point at a proxy); otherwise the sanctioned subscription base. Always
+/// `{base}/alpha/search` — the same `{provider_base}` join codex performs.
+#[must_use]
+pub fn codex_alpha_search_url(base_url: Option<&str>) -> String {
+    let base = base_url
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+        .unwrap_or(OPENAI_SUBSCRIPTION_BASE_URL)
+        .trim_end_matches('/');
+    format!("{base}/alpha/search")
 }
 
 /// The exact SearchRequest body the daemon POSTs to
