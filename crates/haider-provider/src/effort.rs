@@ -116,6 +116,15 @@ pub fn gemini_supported_efforts(model: &str) -> &'static [&'static str] {
     }
 }
 
+/// Whether `model` may combine the `google_search` + `url_context` built-in
+/// tools with function declarations (W-B decision 4): 3.x-named models ONLY —
+/// the same name gate as the thinkingLevel ladder. 2.5-era models cannot mix
+/// built-ins with function declarations, so they honestly get neither.
+#[must_use]
+pub fn gemini_web_builtins_supported(model: &str) -> bool {
+    model.starts_with("gemini-3")
+}
+
 /// Gemini's documented default thinkingLevel for models with a known ladder
 /// (`medium` on 3.6/3.5-flash, otherwise `high`).
 #[must_use]

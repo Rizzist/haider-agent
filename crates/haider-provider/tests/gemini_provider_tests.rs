@@ -558,3 +558,153 @@ fn effort_injects_thinking_level_for_3x_models_only() {
         "2.5-era models take no thinking field at all: {payload}"
     );
 }
+
+/// LAW (LW5, request half): the `google_search` + `url_context` built-ins
+/// declare BESIDE function declarations on 3.x-named models — and only
+/// there. A 2.5-era model keeps its exact pre-W-B tools array regardless of
+/// the flag (built-ins cannot mix with function declarations there), and a
+/// 3.x model without the flag declares no built-ins. Both directions of the
+/// name gate are pinned.
+#[test]
+fn web_builtins_declare_on_3x_beside_function_declarations_and_never_on_25() {
+    let request = |model: &str| TurnRequest {
+        messages: vec![Message::user_text("search the web")],
+        model: model.into(),
+        max_tokens: 64,
+        system_prompt: None,
+        tools: vec![weather_tool()],
+        attachments: Vec::new(),
+    };
+
+    let payload = provider("gemini-3-flash")
+        .with_web_builtins(true)
+        .request_payload(&request("gemini-3-flash"))
+        .expect("3.x payload with builtins");
+    let tools = payload["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 3, "declarations + both built-ins: {payload}");
+    assert!(tools[0].get("functionDeclarations").is_some());
+    assert_eq!(tools[1], serde_json::json!({"google_search": {}}));
+    assert_eq!(tools[2], serde_json::json!({"url_context": {}}));
+
+    let quarter = provider("gemini-2.5-flash")
+        .with_web_builtins(true)
+        .request_payload(&request("gemini-2.5-flash"))
+        .expect("2.5 payload with the flag");
+    let tools = quarter["tools"].as_array().expect("tools array");
+    assert_eq!(
+        tools.len(),
+        1,
+        "2.5-era models keep declarations only — built-ins cannot mix: {quarter}"
+    );
+    assert!(tools[0].get("functionDeclarations").is_some());
+
+    let ungated = provider("gemini-3-flash")
+        .request_payload(&request("gemini-3-flash"))
+        .expect("3.x payload without the flag");
+    assert_eq!(
+        ungated["tools"].as_array().map(Vec::len),
+        Some(1),
+        "no built-ins without the flag: {ungated}"
+    );
+
+    // With no client tools at all, the built-ins still declare on 3.x.
+    let mut bare = request("gemini-3-flash");
+    bare.tools = Vec::new();
+    let bare_payload = provider("gemini-3-flash")
+        .with_web_builtins(true)
+        .request_payload(&bare)
+        .expect("bare 3.x payload with builtins");
+    assert_eq!(
+        bare_payload["tools"],
+        serde_json::json!([{"google_search": {}}, {"url_context": {}}]),
+        "built-ins declare alone when no function tools exist: {bare_payload}"
+    );
+}
+
+/// LAW (LW5, decode half): groundingMetadata decodes TOLERANTLY into display
+/// facts — executed webSearchQueries become closed `web_search` rows,
+/// groundingChunks web sources and successfully retrieved url_context URLs
+/// become sources (duplicates deduped, failed retrievals skipped) — and a
+/// frame with no grounding decodes exactly as before.
+#[test]
+fn grounding_metadata_decodes_into_rows_and_sources_tolerantly() {
+    let frame = serde_json::json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "grounded answer"}]},
+            "groundingMetadata": {
+                "webSearchQueries": ["rust sse decoding"],
+                "groundingChunks": [
+                    {"web": {"uri": "https://example.com/a", "title": "A", "domain": "example.com"}},
+                    {"web": {"uri": "https://example.com/a", "title": "A duplicate"}},
+                    {"retrievedContext": {"note": "no web field — skipped, never fatal"}},
+                ],
+                "groundingSupports": [{"segment": {"startIndex": 0, "endIndex": 5}}],
+                "searchEntryPoint": {"renderedContent": "<div>chip</div>"},
+            },
+            "url_context_metadata": {
+                "url_metadata": [
+                    {"retrieved_url": "https://example.com/doc", "url_retrieval_status": "URL_RETRIEVAL_STATUS_SUCCESS"},
+                    {"retrieved_url": "https://example.com/broken", "url_retrieval_status": "URL_RETRIEVAL_STATUS_ERROR"},
+                ],
+            },
+            "finishReason": "STOP",
+        }],
+    });
+    let bytes = format!("data: {frame}\n\n");
+    let items = haider_provider::replay_gemini_sse(bytes.as_bytes());
+    assert_eq!(
+        items,
+        vec![
+            Ok(StreamEvent::TextDelta {
+                text: "grounded answer".into(),
+            }),
+            Ok(StreamEvent::ServerToolUse {
+                call_id: "gemini-search-1".into(),
+                name: "web_search".into(),
+                args: serde_json::json!({"query": "rust sse decoding"}),
+            }),
+            Ok(StreamEvent::ServerToolResult {
+                call_id: "gemini-search-1".into(),
+                preview: "grounded".into(),
+                is_error: false,
+            }),
+            Ok(StreamEvent::WebSources {
+                sources: vec![
+                    haider_protocol::provider::WebSource {
+                        url: "https://example.com/a".into(),
+                        title: Some("A".into()),
+                    },
+                    haider_protocol::provider::WebSource {
+                        url: "https://example.com/doc".into(),
+                        title: None,
+                    },
+                ],
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ],
+        "grounding decodes into rows + deduped sources, failures skipped"
+    );
+
+    // Absent grounding decodes exactly as before.
+    let plain = serde_json::json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "plain"}]},
+            "finishReason": "STOP",
+        }],
+    });
+    let bytes = format!("data: {plain}\n\n");
+    assert_eq!(
+        haider_provider::replay_gemini_sse(bytes.as_bytes()),
+        vec![
+            Ok(StreamEvent::TextDelta {
+                text: "plain".into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ],
+        "no grounding — no fabricated rows or sources"
+    );
+}

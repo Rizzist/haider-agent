@@ -936,8 +936,11 @@ fn probe_request(model: &str) -> TurnRequest {
 /// Verified by revert on 2026-07-30.
 #[test]
 fn codex_lite_payload_meets_the_subscription_contract() {
-    let payload =
-        responses_request_json(&probe_request("gpt-5.6-sol"), true, None).expect("lite payload");
+    // W-B (LW4): the hosted-web-search flag is DELIBERATELY set here — the
+    // lite contract golden now also pins that lite NEVER carries hosted
+    // tools, even when the pair-level flag asks for them.
+    let payload = responses_request_json(&probe_request("gpt-5.6-sol"), true, None, true)
+        .expect("lite payload");
     let object = payload.as_object().expect("object");
     assert!(
         !object.contains_key("max_output_tokens"),
@@ -956,6 +959,43 @@ fn codex_lite_payload_meets_the_subscription_contract() {
         Some("all_turns"),
         "lite requires reasoning.context=all_turns: {payload}"
     );
+    assert!(
+        !object.contains_key("tools"),
+        "lite REJECTS hosted tools — the web_search flag must be structurally inert: {payload}"
+    );
+}
+
+/// LAW (LW2 openai half / LW4): the hosted `{\"type\":\"web_search\"}` tool
+/// with `search_context_size: medium` declares on the API-KEY Responses path
+/// when the pair-level flag is set — exactly that shape, appended after any
+/// client function tools — and NEVER on lite (structural, asserted in the
+/// lite contract golden above). Without the flag the API-key body is
+/// byte-identical to the pre-W-B shape.
+#[test]
+fn hosted_web_search_declares_on_api_key_and_never_on_lite() {
+    let hosted = responses_request_json(&probe_request("gpt-5.6-sol"), false, None, true)
+        .expect("api-key hosted payload");
+    assert_eq!(
+        hosted.get("tools"),
+        Some(&serde_json::json!([
+            {"type": "web_search", "search_context_size": "medium"}
+        ])),
+        "the hosted tool declares with exactly this shape: {hosted}"
+    );
+
+    let without_flag = responses_request_json(&probe_request("gpt-5.6-sol"), false, None, false)
+        .expect("api-key payload");
+    assert!(
+        without_flag.get("tools").is_none(),
+        "no hosted tool without the flag"
+    );
+
+    let lite = responses_request_json(&probe_request("gpt-5.6-sol"), true, None, true)
+        .expect("lite payload");
+    assert!(
+        lite.get("tools").is_none(),
+        "lite never carries hosted tools regardless of the flag: {lite}"
+    );
 }
 
 /// LAW (LE3, openai half): the session effort MERGES into the ONE reasoning
@@ -970,7 +1010,7 @@ fn codex_lite_payload_meets_the_subscription_contract() {
 /// failure: the summary/context preservation assertions below.
 #[test]
 fn effort_merges_into_reasoning_preserving_the_lite_contract() {
-    let payload = responses_request_json(&probe_request("gpt-5.6-sol"), true, Some("xhigh"))
+    let payload = responses_request_json(&probe_request("gpt-5.6-sol"), true, Some("xhigh"), false)
         .expect("lite payload with effort");
     let object = payload.as_object().expect("object");
     let reasoning = payload
@@ -1007,8 +1047,9 @@ fn effort_merges_into_reasoning_preserving_the_lite_contract() {
         "the encrypted-content include is unchanged"
     );
 
-    let api_key = responses_request_json(&probe_request("gpt-5.6-sol"), false, Some("medium"))
-        .expect("api-key payload with effort");
+    let api_key =
+        responses_request_json(&probe_request("gpt-5.6-sol"), false, Some("medium"), false)
+            .expect("api-key payload with effort");
     assert_eq!(api_key["reasoning"]["effort"], "medium");
     assert_eq!(api_key["reasoning"]["summary"], "auto");
     assert_eq!(
@@ -1020,7 +1061,7 @@ fn effort_merges_into_reasoning_preserving_the_lite_contract() {
     // A non-reasoning model on lite keeps the context-only object: effort is
     // gated on the reasoning heuristic, never invented for a model that
     // cannot take it.
-    let plain = responses_request_json(&probe_request("gpt-4.1-mini"), true, Some("high"))
+    let plain = responses_request_json(&probe_request("gpt-4.1-mini"), true, Some("high"), false)
         .expect("non-reasoning lite payload");
     assert_eq!(
         plain["reasoning"],
@@ -1033,7 +1074,7 @@ fn effort_merges_into_reasoning_preserving_the_lite_contract() {
 /// never the lite-only fields.
 #[test]
 fn api_key_payload_keeps_max_output_tokens_and_no_lite_fields() {
-    let payload = responses_request_json(&probe_request("gpt-5.6-sol"), false, None)
+    let payload = responses_request_json(&probe_request("gpt-5.6-sol"), false, None, false)
         .expect("api-key payload");
     let object = payload.as_object().expect("object");
     assert_eq!(
@@ -1276,7 +1317,7 @@ fn assistant_history_replays_as_output_text() {
         attachments: Vec::new(),
     };
     for lite in [true, false] {
-        let payload = responses_request_json(&request, lite, None).expect("payload");
+        let payload = responses_request_json(&request, lite, None, false).expect("payload");
         let input = payload["input"].as_array().expect("input array");
         let content_type = |index: usize| {
             input[index]["content"][0]["type"]

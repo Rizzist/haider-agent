@@ -56,6 +56,7 @@ pub use catalog::{
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
     anthropic_supported_efforts, gemini_default_effort, gemini_supported_efforts,
+    gemini_web_builtins_supported,
 };
 pub use gemini::{
     GEMINI_API_BASE_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME, GeminiCapture, GeminiProvider,

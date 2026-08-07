@@ -776,3 +776,109 @@ data: {"type":"response.failed","response":{"error":{"message":"Our servers are 
     assert_eq!(failure.kind, ProviderErrorKind::Overloaded);
     assert!(failure.retryable);
 }
+
+/// LAW (LW2 openai half / decision 2): a finished hosted `web_search_call`
+/// item is captured VERBATIM through the opaque channel (the reasoning-item
+/// echo path), surfaces as one closed display row — and NEVER as a client
+/// tool call, so the turn still finishes EndTurn, not ToolUse. url_citation
+/// annotations on the finished message item decode into deduped display
+/// sources; a failed call surfaces as a failed row.
+#[test]
+fn hosted_web_search_call_captures_verbatim_and_citations_surface_as_sources() {
+    let search_item = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_abc123",
+        "status": "completed",
+        "action": {"type": "search", "query": "rust sse decoding"},
+    });
+    let message_item = serde_json::json!({
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": "cited",
+            "annotations": [
+                {"type": "url_citation", "url": "https://example.com/a", "title": "A", "start_index": 0, "end_index": 5},
+                {"type": "url_citation", "url": "https://example.com/a", "title": "A duplicate"},
+                {"type": "file_citation", "file_id": "file_1"},
+            ],
+        }],
+    });
+    let stream = format!(
+        "event: response.output_item.done\n\
+         data: {}\n\n\
+         event: response.output_text.delta\n\
+         data: {}\n\n\
+         event: response.output_item.done\n\
+         data: {}\n\n\
+         event: response.completed\n\
+         data: {}\n\n",
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": search_item}),
+        serde_json::json!({"type": "response.output_text.delta", "delta": "cited"}),
+        serde_json::json!({"type": "response.output_item.done", "output_index": 1, "item": message_item}),
+        serde_json::json!({"type": "response.completed", "response": {"id": "resp_1"}}),
+    );
+    assert_eq!(
+        replay_openai_responses_sse(stream.as_bytes()),
+        vec![
+            Ok(StreamEvent::ProviderOpaque {
+                provider: "openai".into(),
+                data: search_item,
+            }),
+            Ok(StreamEvent::ServerToolUse {
+                call_id: "ws_abc123".into(),
+                name: "web_search".into(),
+                args: serde_json::json!({"type": "search", "query": "rust sse decoding"}),
+            }),
+            Ok(StreamEvent::ServerToolResult {
+                call_id: "ws_abc123".into(),
+                preview: "search".into(),
+                is_error: false,
+            }),
+            Ok(StreamEvent::TextDelta {
+                text: "cited".into(),
+            }),
+            Ok(StreamEvent::WebSources {
+                sources: vec![haider_protocol::provider::WebSource {
+                    url: "https://example.com/a".into(),
+                    title: Some("A".into()),
+                }],
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ],
+        "hosted search captures verbatim, rows close, citations dedup, finish stays EndTurn"
+    );
+
+    // A failed call surfaces as a failed row — still no client tool call.
+    let failed_item = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_failed",
+        "status": "failed",
+    });
+    let stream = format!(
+        "event: response.output_item.done\n\
+         data: {}\n\n\
+         event: response.completed\n\
+         data: {}\n\n",
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": failed_item}),
+        serde_json::json!({"type": "response.completed", "response": {"id": "resp_2"}}),
+    );
+    let items = replay_openai_responses_sse(stream.as_bytes());
+    assert!(
+        items.contains(&Ok(StreamEvent::ServerToolResult {
+            call_id: "ws_failed".into(),
+            preview: "failed".into(),
+            is_error: true,
+        })),
+        "a failed hosted call is an honest failed row: {items:?}"
+    );
+    assert!(
+        items.contains(&Ok(StreamEvent::Finish {
+            reason: FinishReason::EndTurn,
+        })),
+        "hosted calls never flip the finish to ToolUse: {items:?}"
+    );
+}

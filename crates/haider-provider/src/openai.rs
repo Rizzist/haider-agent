@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use haider_accounts::SecretHandle;
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
-    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource,
+    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource, WebSource,
 };
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -348,6 +348,10 @@ pub struct OpenAiProvider {
     /// `reasoning` object for reasoning models — never replacing
     /// `summary`/`context`, never adding `max_output_tokens` on lite.
     effort: Option<String>,
+    /// W-B: declare the HOSTED `web_search` tool. Structurally inert on the
+    /// responses-lite surface (LW4): lite REJECTS every hosted tool, so the
+    /// request builder drops it there regardless of this flag.
+    web_search: bool,
 }
 
 impl OpenAiProvider {
@@ -356,6 +360,7 @@ impl OpenAiProvider {
             http: OpenAiHttp::new(credential, model)?,
             api_url: OPENAI_RESPONSES_API_URL.into(),
             effort: None,
+            web_search: false,
         })
     }
 
@@ -392,6 +397,7 @@ impl OpenAiProvider {
             )?,
             api_url: OPENAI_SUBSCRIPTION_RESPONSES_URL.into(),
             effort: None,
+            web_search: false,
         })
     }
 
@@ -413,6 +419,14 @@ impl OpenAiProvider {
         self
     }
 
+    /// Declares the hosted `web_search` tool (W-B). The caller gates this
+    /// per resolved pair; the lite request builder structurally ignores it.
+    #[must_use]
+    pub fn with_web_search(mut self, web_search: bool) -> Self {
+        self.web_search = web_search;
+        self
+    }
+
     /// Overrides the endpoint for an explicit capture/test harness.
     #[must_use]
     pub fn with_api_url(mut self, api_url: impl Into<String>) -> Self {
@@ -429,6 +443,7 @@ impl OpenAiProvider {
             request,
             self.http.codex_responses_lite,
             self.effort.as_deref(),
+            self.web_search,
         )
     }
 
@@ -1354,6 +1369,22 @@ impl ResponsesDecoder {
                     data: serde_json::Value::Object(item.clone()),
                 }]);
             }
+            // W-B: a HOSTED web_search_call is provider-executed — it never
+            // enters the local dispatch loop. The finished item is captured
+            // verbatim (the reasoning-item channel) so follow-up requests
+            // echo it, and surfaced as one closed display row.
+            Some("web_search_call") => {
+                return Ok(hosted_web_search_call_events(item));
+            }
+            // W-B: url_citation annotations ride the finished message item's
+            // content parts — tolerant decode into display sources.
+            Some("message") => {
+                let sources = url_citation_sources(item);
+                if sources.is_empty() {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![StreamEvent::WebSources { sources }]);
+            }
             Some("function_call") => {}
             _ => return Ok(Vec::new()),
         }
@@ -1448,6 +1479,85 @@ impl ResponsesDecoder {
         self.terminal = true;
         vec![Err(error)]
     }
+}
+
+/// One finished hosted `web_search_call` item (W-B): captured VERBATIM for
+/// the follow-up echo (the reasoning-item channel) and decoded tolerantly
+/// into a closed display row — query visible when the action carries one,
+/// failed status honest, absent fields never fatal.
+fn hosted_web_search_call_events(
+    item: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<StreamEvent> {
+    let call_id = item
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("web_search_call")
+        .to_owned();
+    let action = item
+        .get("action")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let status = item
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("completed");
+    let preview = action
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| status.to_owned(), str::to_owned);
+    vec![
+        StreamEvent::ProviderOpaque {
+            provider: OPENAI_PROVIDER_NAME.into(),
+            data: serde_json::Value::Object(item.clone()),
+        },
+        StreamEvent::ServerToolUse {
+            call_id: call_id.clone(),
+            name: "web_search".into(),
+            args: action,
+        },
+        StreamEvent::ServerToolResult {
+            call_id,
+            preview,
+            is_error: status == "failed",
+        },
+    ]
+}
+
+/// Tolerantly mines `url_citation` annotations out of one finished message
+/// item's content parts (W-B): sources dedup by URL; every field is optional
+/// except the URL itself.
+fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Vec<WebSource> {
+    let mut sources: Vec<WebSource> = Vec::new();
+    let Some(content) = item.get("content").and_then(serde_json::Value::as_array) else {
+        return sources;
+    };
+    for part in content {
+        let Some(annotations) = part
+            .get("annotations")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for annotation in annotations {
+            if annotation.get("type").and_then(serde_json::Value::as_str) != Some("url_citation") {
+                continue;
+            }
+            let Some(url) = annotation.get("url").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if sources.iter().any(|source| source.url == url) {
+                continue;
+            }
+            sources.push(WebSource {
+                url: url.to_owned(),
+                title: annotation
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+    }
+    sources
 }
 
 #[derive(Debug)]
@@ -1962,6 +2072,7 @@ fn responses_request_json(
     request: &TurnRequest,
     codex_responses_lite: bool,
     effort: Option<&str>,
+    hosted_web_search: bool,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let mut input = Vec::new();
@@ -2081,7 +2192,7 @@ fn responses_request_json(
         }
         flush_response_message(&mut input, message.role, &mut content);
     }
-    let tools = request
+    let mut tools = request
         .tools
         .iter()
         .map(|tool| {
@@ -2094,6 +2205,16 @@ fn responses_request_json(
             })
         })
         .collect::<Vec<_>>();
+    // W-B (LW4): the hosted web_search tool joins the API-KEY Responses
+    // request only. The responses-lite surface REJECTS every hosted tool
+    // (codex spec_plan returns empty hosted specs on lite), so the lite
+    // exclusion is STRUCTURAL here — the flag cannot reach a lite body.
+    if hosted_web_search && !codex_responses_lite {
+        tools.push(serde_json::json!({
+            "type": "web_search",
+            "search_context_size": "medium",
+        }));
+    }
     // The codex responses-lite endpoint (subscription OAuth) enforces its
     // own contract, confirmed against the live endpoint 2026-07-30:
     //   - `max_output_tokens` is REJECTED as unsupported;

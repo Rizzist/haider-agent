@@ -1,6 +1,6 @@
 //! Google Gemini GenerateContent API adapter.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use haider_accounts::SecretHandle;
 use haider_protocol::ids::{ArtifactRef, CredentialAlias};
 use haider_protocol::provider::{
-    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource,
+    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource, WebSource,
 };
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -70,6 +70,10 @@ pub struct GeminiProvider {
     /// whose pinned static ladder declares the value. Never `thinkingBudget`
     /// (the 2.5-era numeric knob is deliberately unmodeled) and never both.
     effort: Option<String>,
+    /// W-B: declare the `google_search` + `url_context` built-ins. The
+    /// request builder name-gates this to 3.x models (the G3 pattern) —
+    /// 2.5-era models cannot combine built-ins with function declarations.
+    web_builtins: bool,
 }
 
 impl GeminiProvider {
@@ -110,6 +114,7 @@ impl GeminiProvider {
             api_url,
             fixed_origin_guard,
             effort: None,
+            web_builtins: false,
         })
     }
 
@@ -128,6 +133,14 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_effort(mut self, effort: Option<String>) -> Self {
         self.effort = effort;
+        self
+    }
+
+    /// Declares the `google_search` + `url_context` built-ins (W-B). The
+    /// request builder still name-gates the declaration to 3.x models.
+    #[must_use]
+    pub fn with_web_builtins(mut self, web_builtins: bool) -> Self {
+        self.web_builtins = web_builtins;
         self
     }
 
@@ -159,7 +172,7 @@ impl GeminiProvider {
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.validate_model(request)?;
-        gemini_request_json(request, self.effort.as_deref())
+        gemini_request_json(request, self.effort.as_deref(), self.web_builtins)
     }
 
     pub async fn capture_response(
@@ -376,6 +389,7 @@ type ToolCallIndex = (CallNameIndex, OpaqueCallIndex);
 fn gemini_request_json(
     request: &TurnRequest,
     effort: Option<&str>,
+    web_builtins: bool,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let (tool_names, opaque_calls) = tool_call_index(request)?;
@@ -568,11 +582,20 @@ fn gemini_request_json(
             serde_json::json!({"parts": [{"text": system}]}),
         );
     }
+    // W-B (LW5): the web built-ins join the SAME `tools` array as their own
+    // entries, name-gated to 3.x models (the G3 pattern) — Gemini 3 models
+    // COMBINE built-ins with function declarations; 2.5-era models cannot,
+    // so they honestly declare neither regardless of the flag.
+    let mut tool_entries = Vec::new();
     if !declarations.is_empty() {
-        object.insert(
-            "tools".into(),
-            serde_json::json!([{"functionDeclarations": declarations}]),
-        );
+        tool_entries.push(serde_json::json!({"functionDeclarations": declarations}));
+    }
+    if web_builtins && crate::effort::gemini_web_builtins_supported(&request.model) {
+        tool_entries.push(serde_json::json!({"google_search": {}}));
+        tool_entries.push(serde_json::json!({"url_context": {}}));
+    }
+    if !tool_entries.is_empty() {
+        object.insert("tools".into(), serde_json::Value::Array(tool_entries));
     }
     Ok(payload)
 }
@@ -924,6 +947,11 @@ pub(crate) struct GeminiDecoder {
     saw_tool: bool,
     saw_refusal: bool,
     terminal: bool,
+    /// W-B: grounding facts repeat across frames — queries and source URLs
+    /// already surfaced must not mint duplicate rows or sources.
+    seen_search_queries: HashSet<String>,
+    seen_source_urls: HashSet<String>,
+    search_rows: u64,
 }
 
 impl GeminiDecoder {
@@ -935,6 +963,9 @@ impl GeminiDecoder {
             saw_tool: false,
             saw_refusal: false,
             terminal: false,
+            seen_search_queries: HashSet::new(),
+            seen_source_urls: HashSet::new(),
+            search_rows: 0,
         }
     }
 
@@ -1018,6 +1049,18 @@ impl GeminiDecoder {
             for part in parts {
                 events.extend(self.part_events(part)?);
             }
+        }
+        // W-B (LW5): groundingMetadata / url_context_metadata decode into
+        // display rows and sources — tolerant to absent fields and to either
+        // field casing (the REST casing is camelCase; snake_case is accepted
+        // because the research doc could only infer the url_context spelling).
+        if let Some(candidate) = value
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|candidates| candidates.first())
+        {
+            let grounding = self.grounding_events(candidate);
+            events.extend(grounding);
         }
         if let Some(usage) = value.get("usageMetadata") {
             events.push(StreamEvent::UsageUpdate(gemini_usage(
@@ -1147,6 +1190,107 @@ impl GeminiDecoder {
             }]);
         }
         Ok(Vec::new())
+    }
+
+    /// Decodes one candidate's grounding facts (W-B): executed search
+    /// queries become closed display rows, groundingChunks web sources and
+    /// successfully retrieved url_context URLs become display sources. Every
+    /// field is optional — absence never fails the stream — and repeats
+    /// across frames dedup.
+    fn grounding_events(&mut self, candidate: &serde_json::Value) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        let mut sources = Vec::new();
+        if let Some(grounding) = candidate
+            .get("groundingMetadata")
+            .or_else(|| candidate.get("grounding_metadata"))
+        {
+            if let Some(queries) = grounding
+                .get("webSearchQueries")
+                .or_else(|| grounding.get("web_search_queries"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for query in queries {
+                    let Some(query) = query.as_str() else {
+                        continue;
+                    };
+                    if !self.seen_search_queries.insert(query.to_owned()) {
+                        continue;
+                    }
+                    self.search_rows = self.search_rows.saturating_add(1);
+                    let call_id = format!("gemini-search-{}", self.search_rows);
+                    events.push(StreamEvent::ServerToolUse {
+                        call_id: call_id.clone(),
+                        name: "web_search".into(),
+                        args: serde_json::json!({"query": query}),
+                    });
+                    events.push(StreamEvent::ServerToolResult {
+                        call_id,
+                        preview: "grounded".into(),
+                        is_error: false,
+                    });
+                }
+            }
+            if let Some(chunks) = grounding
+                .get("groundingChunks")
+                .or_else(|| grounding.get("grounding_chunks"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for chunk in chunks {
+                    let Some(web) = chunk.get("web") else {
+                        continue;
+                    };
+                    let Some(uri) = web.get("uri").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    if !self.seen_source_urls.insert(uri.to_owned()) {
+                        continue;
+                    }
+                    sources.push(WebSource {
+                        url: uri.to_owned(),
+                        title: web
+                            .get("title")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    });
+                }
+            }
+        }
+        if let Some(entries) = candidate
+            .get("urlContextMetadata")
+            .or_else(|| candidate.get("url_context_metadata"))
+            .and_then(|metadata| {
+                metadata
+                    .get("urlMetadata")
+                    .or_else(|| metadata.get("url_metadata"))
+            })
+            .and_then(serde_json::Value::as_array)
+        {
+            for entry in entries {
+                let url = entry
+                    .get("retrievedUrl")
+                    .or_else(|| entry.get("retrieved_url"))
+                    .and_then(serde_json::Value::as_str);
+                let Some(url) = url else { continue };
+                let status = entry
+                    .get("urlRetrievalStatus")
+                    .or_else(|| entry.get("url_retrieval_status"))
+                    .and_then(serde_json::Value::as_str);
+                if status.is_some_and(|status| !status.ends_with("SUCCESS")) {
+                    continue;
+                }
+                if !self.seen_source_urls.insert(url.to_owned()) {
+                    continue;
+                }
+                sources.push(WebSource {
+                    url: url.to_owned(),
+                    title: None,
+                });
+            }
+        }
+        if !sources.is_empty() {
+            events.push(StreamEvent::WebSources { sources });
+        }
+        events
     }
 
     fn fail(&mut self, error: ProviderError) -> Vec<ProviderStreamItem> {
