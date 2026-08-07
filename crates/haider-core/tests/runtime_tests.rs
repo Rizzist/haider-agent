@@ -2778,3 +2778,238 @@ impl Provider for FairnessProvider {
         Ok(receiver.into())
     }
 }
+
+/// LAW (LW2, pause_turn resend + W-B display channels): a `pause_turn`
+/// finish resends the PAUSED ASSISTANT MESSAGE UNCHANGED — captured opaque
+/// server-tool facts included, and with NO synthesized user nudge — in the
+/// same logical run under the shared continuation checkpoint. The display
+/// channels journal exactly once and prompt-OMITTED: the server tool row
+/// commits as a closed ToolCall pair, its bounded result rides a ToolResult
+/// fact, and the deduped, bounded sources list lands under the finished
+/// message. Replay authority stays with the opaque channel alone.
+#[tokio::test]
+async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_activity() {
+    let server_use = serde_json::json!({
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "rust sse"},
+    });
+    let server_result = serde_json::json!({
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": [{"type": "web_search_result", "url": "https://example.com/a", "title": "A", "encrypted_content": "ENC_A"}],
+    });
+    let sources = vec![
+        haider_protocol::provider::WebSource {
+            url: "https://example.com/a".into(),
+            title: Some("A".into()),
+        },
+        haider_protocol::provider::WebSource {
+            url: "https://example.com/b".into(),
+            title: None,
+        },
+        // Duplicate URL — the journaled list must dedup it.
+        haider_protocol::provider::WebSource {
+            url: "https://example.com/a".into(),
+            title: Some("A again".into()),
+        },
+    ];
+    let (handle, store, provider) = runtime(vec![
+        FakeStep::EmitText {
+            text: "checking".into(),
+        },
+        FakeStep::EmitProviderOpaque {
+            provider: "anthropic".into(),
+            data: server_use.clone(),
+        },
+        FakeStep::EmitServerToolUse {
+            call_id: "srvtoolu_1".into(),
+            name: "web_search".into(),
+            args: serde_json::json!({"query": "rust sse"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::PauseTurn,
+        },
+        FakeStep::EmitProviderOpaque {
+            provider: "anthropic".into(),
+            data: server_result.clone(),
+        },
+        FakeStep::EmitServerToolResult {
+            call_id: "srvtoolu_1".into(),
+            preview: "1 result".into(),
+            is_error: false,
+        },
+        FakeStep::EmitWebSources { sources },
+        FakeStep::EmitText {
+            text: "answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("search the web"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(outcome.finish_reason, FinishReason::EndTurn);
+
+    // The paused assistant message is resent UNCHANGED, with NO user nudge.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "pause_turn continues in the same run");
+    let resumed = requests[1]
+        .messages
+        .last()
+        .expect("resumed request has messages");
+    assert_eq!(
+        resumed.role,
+        haider_provider::MessageRole::Assistant,
+        "the request ends with the paused assistant message — no synthesized user turn"
+    );
+    assert_eq!(
+        resumed.blocks,
+        vec![
+            Block::Text {
+                text: "checking".into(),
+            },
+            Block::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: server_use,
+            },
+        ],
+        "the paused assistant message replays verbatim, opaque facts included"
+    );
+    let all_text = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !all_text.contains(&"Continue exactly where you stopped. Do not repeat completed content."),
+        "pause_turn must NOT inject the MaxTokens continuation nudge"
+    );
+
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_items_closed_before_terminal(&events);
+
+    // Shared continuation checkpoint, honest reason.
+    let checkpoint = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind, data },
+                ..
+            }) if kind == CONTINUATION_CHECKPOINT_EXTENSION_KIND => {
+                serde_json::from_value::<ContinuationCheckpoint>(data).ok()
+            }
+            _ => None,
+        })
+        .expect("continuation checkpoint journaled");
+    assert_eq!(checkpoint.reason, FinishReason::PauseTurn);
+
+    // The server tool row: one closed ToolCall pair, prompt-OMITTED.
+    let row_envelopes = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                typed(event),
+                EventPayload::Item(ItemEvent::Started {
+                    item: TurnItem::ToolCall { .. },
+                    ..
+                }) | EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::ToolCall { .. },
+                    ..
+                })
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(row_envelopes.len(), 2, "exactly one closed server tool row");
+    for envelope in &row_envelopes {
+        assert_eq!(
+            envelope.render.prompt,
+            PromptRender::Omit,
+            "server rows must never re-enter prompts — replay rides the opaque channel"
+        );
+        assert!(envelope.render.ui, "server rows are UI-visible");
+    }
+    let completed_row = row_envelopes
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item:
+                    TurnItem::ToolCall {
+                        call_id,
+                        name,
+                        args,
+                        status,
+                    },
+                ..
+            }) => Some((call_id, name, args, status)),
+            _ => None,
+        })
+        .expect("completed server row");
+    assert_eq!(
+        completed_row,
+        (
+            "srvtoolu_1".into(),
+            "web_search".into(),
+            serde_json::json!({"query": "rust sse"}),
+            ToolStatus::Completed,
+        )
+    );
+
+    // The bounded result fact, prompt-OMITTED.
+    let result_fact = events
+        .iter()
+        .find(|event| {
+            matches!(
+                typed(event),
+                EventPayload::ToolResult { ref call_id, .. } if call_id == "srvtoolu_1"
+            )
+        })
+        .expect("server tool result fact");
+    assert_eq!(result_fact.render.prompt, PromptRender::Omit);
+
+    // The deduped, UI-visible sources list — journaled exactly once.
+    let sources_envelopes = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                typed(event),
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { ref kind, .. },
+                    ..
+                }) if kind == haider_protocol::provider::WEB_SOURCES_EXTENSION_KIND
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sources_envelopes.len(), 1, "sources journal exactly once");
+    assert_eq!(sources_envelopes[0].render.prompt, PromptRender::Omit);
+    assert!(sources_envelopes[0].render.ui);
+    let data = match typed(sources_envelopes[0]) {
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { data, .. },
+            ..
+        }) => data,
+        _ => unreachable!("filtered above"),
+    };
+    assert_eq!(
+        data,
+        serde_json::json!({
+            "sources": [
+                {"url": "https://example.com/a", "title": "A"},
+                {"url": "https://example.com/b"},
+            ]
+        }),
+        "sources dedup by URL and keep arrival order"
+    );
+}

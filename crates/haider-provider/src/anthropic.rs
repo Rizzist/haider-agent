@@ -112,6 +112,11 @@ pub struct AnthropicProvider {
     /// `fast-mode-2026-02-01` beta header. The caller gates this on the
     /// static model table — the adapter applies it verbatim.
     fast: bool,
+    /// W-B: declare the SERVER web tools (`web_search_20250305` +
+    /// `web_fetch_20250910`) on every request. The DAEMON gates this per
+    /// resolved pair — first-party `anthropic`/`anthropic-oauth` only, never
+    /// Bedrock/Vertex, and dropped after a session-scoped degrade.
+    web_tools: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +258,7 @@ impl AnthropicProvider {
             fixed_origin_guard,
             effort: None,
             fast: false,
+            web_tools: false,
         })
     }
 
@@ -282,6 +288,14 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_fast(mut self, fast: bool) -> Self {
         self.fast = fast;
+        self
+    }
+
+    /// Declares the Anthropic SERVER web tools on every request (W-B). The
+    /// caller gates this per resolved pair; the adapter applies it verbatim.
+    #[must_use]
+    pub fn with_web_tools(mut self, web_tools: bool) -> Self {
+        self.web_tools = web_tools;
         self
     }
 
@@ -339,7 +353,13 @@ impl AnthropicProvider {
             }
             AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
         };
-        let mut payload = request_json(request, system_shape, self.effort.as_deref(), self.fast)?;
+        let mut payload = request_json(
+            request,
+            system_shape,
+            self.effort.as_deref(),
+            self.fast,
+            self.web_tools,
+        )?;
         // G4b Vertex wire deltas (LV1): the model is URL-addressed, so the
         // body DROPS `model` and carries `anthropic_version` in its place —
         // the Vertex replacement for the standard `anthropic-version`

@@ -52,6 +52,7 @@ use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason};
 use haider_protocol::provider::{
     AccountUsage, Block, FinishReason, PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent, Usage,
+    WEB_SOURCES_EXTENSION_KIND, WebSource,
 };
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::BoundedResult;
@@ -61,13 +62,15 @@ use haider_provider::{
     TurnRequest,
 };
 use haider_tools::{RequestInput, TodoWrite};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
 const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
+/// Bounded web-sources list journaled under one finished turn (W-B).
+const WEB_SOURCES_CAP: usize = 8;
 const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
 const MAX_PROVIDER_ATTEMPTS: usize = 3;
 const RETRY_BASE_MS: u64 = 25;
@@ -1028,6 +1031,12 @@ impl HarnessActor {
         let mut forced_compaction_used = false;
         let mut provider_attempt = 0usize;
         let mut completed_usage: Option<Usage> = None;
+        // W-B: provider-executed tool rows and cited web sources are
+        // TURN-scoped — a pause_turn boundary can split a server call from
+        // its result across requests, and the bounded sources list journals
+        // exactly once, under the finished message.
+        let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut web_sources: Vec<WebSource> = Vec::new();
 
         'requests: loop {
             messages.extend(
@@ -1437,6 +1446,68 @@ impl HarnessActor {
                             Err(error) => Err(error),
                         }
                     }
+                    // W-B: a PROVIDER-executed tool call never enters the
+                    // local dispatch loop; the args are held until its result
+                    // lands so the row commits as one closed pair.
+                    StreamEvent::ServerToolUse {
+                        call_id,
+                        name,
+                        args,
+                    } => {
+                        server_calls.insert(call_id, (name, args));
+                        Ok(None)
+                    }
+                    StreamEvent::ServerToolResult {
+                        call_id,
+                        preview,
+                        is_error,
+                    } => {
+                        let (name, args) = server_calls
+                            .remove(&call_id)
+                            .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null));
+                        async {
+                            self.complete_text(&run_id, &mut message, false).await?;
+                            self.complete_text(&run_id, &mut reasoning, true).await?;
+                            let status = if is_error {
+                                ToolStatus::Failed
+                            } else {
+                                ToolStatus::Completed
+                            };
+                            self.commit_server_tool_row(&run_id, &call_id, name, args, status)
+                                .await?;
+                            self.commit_payload(
+                                &run_id,
+                                EventPayload::ToolResult {
+                                    call_id,
+                                    result: BoundedResult {
+                                        preview,
+                                        truncated: false,
+                                        artifact: None,
+                                        cursor: None,
+                                    },
+                                },
+                                prompt_omit_render(),
+                            )
+                            .await
+                            .map_err(DriveError::Store)?;
+                            Ok(None)
+                        }
+                        .await
+                    }
+                    StreamEvent::WebSources { sources } => {
+                        for source in sources {
+                            if web_sources.len() >= WEB_SOURCES_CAP {
+                                break;
+                            }
+                            if !web_sources
+                                .iter()
+                                .any(|existing| existing.url == source.url)
+                            {
+                                web_sources.push(source);
+                            }
+                        }
+                        Ok(None)
+                    }
                     StreamEvent::UsageUpdate(mut usage) => {
                         if let Some(account) = &usage_account {
                             usage.account = Some(account.clone());
@@ -1619,7 +1690,11 @@ impl HarnessActor {
                             }
                             continue 'requests;
                         }
-                        if reason == FinishReason::MaxTokens {
+                        // W-B (LW2): `pause_turn` shares the MaxTokens
+                        // continuation machinery (checkpoint + cap), but the
+                        // paused assistant message is resent UNCHANGED — no
+                        // synthesized user nudge joins the conversation.
+                        if reason == FinishReason::MaxTokens || reason == FinishReason::PauseTurn {
                             continuation_count = continuation_count.saturating_add(1);
                             if continuation_count > self.config.max_continuations_per_turn {
                                 return self
@@ -1651,7 +1726,7 @@ impl HarnessActor {
                             let request_index =
                                 u32::try_from(provider_request_count).unwrap_or(u32::MAX);
                             let checkpoint = match serde_json::to_value(ContinuationCheckpoint {
-                                reason: FinishReason::MaxTokens,
+                                reason,
                                 request_index,
                             }) {
                                 Ok(checkpoint) => checkpoint,
@@ -1683,9 +1758,11 @@ impl HarnessActor {
                             {
                                 return self.errored_state_outcome(&run_id, error).await;
                             }
-                            messages.push(Message::user_text(
-                                "Continue exactly where you stopped. Do not repeat completed content.",
-                            ));
+                            if reason == FinishReason::MaxTokens {
+                                messages.push(Message::user_text(
+                                    "Continue exactly where you stopped. Do not repeat completed content.",
+                                ));
+                            }
                             provider_attempt = 0;
                             if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
                             {
@@ -1713,6 +1790,23 @@ impl HarnessActor {
                                 return self.errored_state_outcome(&run_id, error).await;
                             }
                             continue 'requests;
+                        }
+                        // W-B (decision 6): the bounded sources list journals
+                        // once, under the finished message — UI-visible,
+                        // prompt-omitted (replay rides the opaque channel).
+                        if !web_sources.is_empty() {
+                            let sources = std::mem::take(&mut web_sources);
+                            let data = serde_json::json!({ "sources": sources });
+                            if let Err(error) = self
+                                .commit_ui_extension_marker(
+                                    &run_id,
+                                    WEB_SOURCES_EXTENSION_KIND,
+                                    data,
+                                )
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
                         }
                         return self.finish_outcome(&run_id, reason).await;
                     }
@@ -3436,6 +3530,65 @@ impl HarnessActor {
             let _ = self.events.send(committed);
         }
         self.tree_head = Some(node.node);
+        Ok(())
+    }
+
+    /// Atomically journals one PROVIDER-executed tool call as a closed,
+    /// UI-visible row (W-B decision 6).
+    ///
+    /// The render is prompt-OMIT on purpose: server tool state replays
+    /// through the provider-opaque channel, and rendering this row into a
+    /// later prompt would fabricate a client `tool_use` block with no paired
+    /// result — a live 400.
+    async fn commit_server_tool_row(
+        &mut self,
+        run_id: &RunId,
+        call_id: &str,
+        name: String,
+        args: serde_json::Value,
+        status: ToolStatus,
+    ) -> Result<(), DriveError> {
+        let item_id = self.next_item_id();
+        let started = TurnItem::ToolCall {
+            call_id: call_id.to_owned(),
+            name: name.clone(),
+            args: args.clone(),
+            status: ToolStatus::InProgress,
+        };
+        let completed = TurnItem::ToolCall {
+            call_id: call_id.to_owned(),
+            name,
+            args,
+            status,
+        };
+        let render = prompt_omit_render();
+        let mut envelopes = [
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: started,
+                }),
+                render,
+            )
+            .map_err(DriveError::Store)?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id,
+                    item: completed,
+                }),
+                render,
+            )
+            .map_err(DriveError::Store)?,
+        ];
+        self.store
+            .append(&mut envelopes)
+            .await
+            .map_err(DriveError::Store)?;
+        for committed in envelopes {
+            let _ = self.events.send(committed);
+        }
         Ok(())
     }
 

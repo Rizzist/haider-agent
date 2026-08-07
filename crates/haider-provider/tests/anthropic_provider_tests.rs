@@ -606,3 +606,439 @@ fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_reject
         .expect_err("normalized reasoning must stay rejected");
     assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
 }
+
+/// LAW (LW1, anthropic request golden): with the web-tools flag the request
+/// declares BOTH server tools with these exact shapes — basic
+/// `web_search_20250305` (max_uses 8) and `web_fetch_20250910` with
+/// citations disabled and the pinned content budget — appended after the
+/// client tools; without the flag the tools array is byte-identical to the
+/// pre-W-B shape (and absent entirely when no client tool is advertised).
+#[test]
+fn web_tools_declaration_is_exact_and_absent_without_the_flag() {
+    let request = TurnRequest {
+        model: "claude-fable-5".into(),
+        max_tokens: 512,
+        system_prompt: None,
+        tools: vec![ToolDefinition {
+            name: "fs_read".into(),
+            description: "Read a UTF-8 file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }],
+        attachments: Vec::new(),
+        messages: vec![Message::user_text("search the web")],
+    };
+
+    let with_tools = provider("claude-fable-5")
+        .with_web_tools(true)
+        .request_payload(&request)
+        .expect("web-tools payload");
+    let tools = with_tools["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 3, "client tool + exactly two server tools");
+    assert_eq!(tools[0]["name"], "fs_read");
+    assert_eq!(
+        tools[1],
+        serde_json::json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 8,
+        }),
+        "the basic 2025-03-05 search version, never the dynamic-filtering ones"
+    );
+    assert_eq!(
+        tools[2],
+        serde_json::json!({
+            "type": "web_fetch_20250910",
+            "name": "web_fetch",
+            "citations": {"enabled": false},
+            "max_content_tokens": 100000,
+            "max_uses": 10,
+        })
+    );
+
+    let without_flag = provider("claude-fable-5")
+        .request_payload(&request)
+        .expect("default payload");
+    assert_eq!(
+        without_flag["tools"].as_array().map(Vec::len),
+        Some(1),
+        "no server tools without the flag"
+    );
+
+    let mut bare = request;
+    bare.tools = Vec::new();
+    let bare_payload = provider("claude-fable-5")
+        .request_payload(&bare)
+        .expect("bare payload");
+    assert!(
+        bare_payload.get("tools").is_none(),
+        "an empty tool set still omits the array entirely"
+    );
+    let bare_with_web = provider("claude-fable-5")
+        .with_web_tools(true)
+        .request_payload(&bare)
+        .expect("bare web payload");
+    assert_eq!(
+        bare_with_web["tools"].as_array().map(Vec::len),
+        Some(2),
+        "server tools declare even with no client tools"
+    );
+}
+
+/// LAW (LW2, opaque echo — capture half): a scripted stream with a
+/// `server_tool_use` block (input streamed via split input_json_delta
+/// frames), a `web_search_tool_result` carrying `encrypted_content` plus an
+/// unknown sibling field, and a cited text block yields provider-opaque
+/// facts carrying the EXACT wire payloads — unknown fields included — plus
+/// display rows and the cited sources. The search call NEVER surfaces as a
+/// client ToolCallStart (it must not enter the dispatch loop).
+#[test]
+fn server_tool_blocks_and_cited_text_are_captured_verbatim_for_replay() {
+    let bytes = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":3}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"que\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ry\\\":\\\"rust sse\\\"}\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_1\",\"content\":[{\"type\":\"web_search_result\",\"url\":\"https://example.com/a\",\"title\":\"A\",\"encrypted_content\":\"ENC_A\",\"page_age\":\"1 day\"}],\"future_field\":\"kept\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"cited \"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"type\":\"web_search_result_location\",\"url\":\"https://example.com/a\",\"title\":\"A\",\"encrypted_index\":\"IDX_A\",\"cited_text\":\"quote\"}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+
+    let items = replay_anthropic_sse(bytes.as_bytes());
+    assert_eq!(
+        items,
+        vec![
+            Ok(StreamEvent::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: serde_json::json!({
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "rust sse"},
+                }),
+            }),
+            Ok(StreamEvent::ServerToolUse {
+                call_id: "srvtoolu_1".into(),
+                name: "web_search".into(),
+                args: serde_json::json!({"query": "rust sse"}),
+            }),
+            Ok(StreamEvent::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: serde_json::json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [{
+                        "type": "web_search_result",
+                        "url": "https://example.com/a",
+                        "title": "A",
+                        "encrypted_content": "ENC_A",
+                        "page_age": "1 day",
+                    }],
+                    "future_field": "kept",
+                }),
+            }),
+            Ok(StreamEvent::ServerToolResult {
+                call_id: "srvtoolu_1".into(),
+                preview: "1 result".into(),
+                is_error: false,
+            }),
+            Ok(StreamEvent::TextDelta {
+                text: "cited ".into(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                text: "answer".into(),
+            }),
+            Ok(StreamEvent::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: serde_json::json!({
+                    "type": "text",
+                    "text": "cited answer",
+                    "citations": [{
+                        "type": "web_search_result_location",
+                        "url": "https://example.com/a",
+                        "title": "A",
+                        "encrypted_index": "IDX_A",
+                        "cited_text": "quote",
+                    }],
+                }),
+            }),
+            Ok(StreamEvent::WebSources {
+                sources: vec![haider_protocol::provider::WebSource {
+                    url: "https://example.com/a".into(),
+                    title: Some("A".into()),
+                }],
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ],
+        "server tool blocks capture verbatim (unknown fields kept) and never open a client tool call"
+    );
+}
+
+/// LAW (LW2, opaque echo — replay half): captured server_tool_use /
+/// web_search_tool_result facts and the citation-signed text block replay
+/// VERBATIM into the follow-up request, in order — and the normalized text
+/// deltas that streamed the cited characters are CONSUMED so the text is
+/// sent exactly once. A rehydrated cross-turn message carrying the signed
+/// text alone passes through; a signed text that disagrees with normalized
+/// history is refused.
+#[test]
+fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() {
+    let server_use = serde_json::json!({
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "rust sse"},
+    });
+    let server_result = serde_json::json!({
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": [{
+            "type": "web_search_result",
+            "url": "https://example.com/a",
+            "title": "A",
+            "encrypted_content": "ENC_A",
+            "page_age": "1 day",
+        }],
+        "future_field": "kept",
+    });
+    let signed_text = serde_json::json!({
+        "type": "text",
+        "text": "cited answer",
+        "citations": [{
+            "type": "web_search_result_location",
+            "url": "https://example.com/a",
+            "title": "A",
+            "encrypted_index": "IDX_A",
+            "cited_text": "quote",
+        }],
+    });
+    let opaque = |data: &serde_json::Value| Block::ProviderOpaque {
+        provider: "anthropic".into(),
+        data: data.clone(),
+    };
+    let request = TurnRequest {
+        model: "claude-fable-5".into(),
+        max_tokens: 512,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        messages: vec![
+            Message::user_text("search the web"),
+            Message {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    opaque(&server_use),
+                    opaque(&server_result),
+                    Block::Text {
+                        text: "cited ".into(),
+                    },
+                    Block::Text {
+                        text: "answer".into(),
+                    },
+                    opaque(&signed_text),
+                ],
+            },
+            Message::user_text("thanks — continue"),
+        ],
+    };
+    let payload = provider("claude-fable-5")
+        .with_web_tools(true)
+        .request_payload(&request)
+        .expect("server-tool replay payload");
+    let content = payload["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(content[0], server_use, "server_tool_use replays VERBATIM");
+    assert_eq!(
+        content[1], server_result,
+        "the result block — encrypted_content and unknown fields included — replays VERBATIM"
+    );
+    assert_eq!(
+        content[2], signed_text,
+        "the citation-signed text replays verbatim with every encrypted_index"
+    );
+    assert_eq!(
+        content.len(),
+        3,
+        "the normalized text deltas were consumed — the cited text is sent exactly once"
+    );
+
+    // Rehydrated cross-turn shape: the signed text stands alone.
+    let rehydrated = TurnRequest {
+        model: "claude-fable-5".into(),
+        max_tokens: 512,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        messages: vec![
+            Message::user_text("search the web"),
+            Message::assistant(vec![opaque(&signed_text)]),
+            Message::user_text("next question"),
+        ],
+    };
+    let payload = provider("claude-fable-5")
+        .request_payload(&rehydrated)
+        .expect("rehydrated payload");
+    assert_eq!(
+        payload["messages"][1]["content"]
+            .as_array()
+            .expect("content")
+            .as_slice(),
+        &[signed_text.clone()],
+        "a rehydrated signed text block passes through untouched"
+    );
+
+    // A signed text disagreeing with normalized history is refused.
+    let disagreeing = TurnRequest {
+        model: "claude-fable-5".into(),
+        max_tokens: 512,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        messages: vec![
+            Message::user_text("search the web"),
+            Message::assistant(vec![
+                Block::Text {
+                    text: "different words".into(),
+                },
+                opaque(&signed_text),
+            ]),
+        ],
+    };
+    let error = provider("claude-fable-5")
+        .request_payload(&disagreeing)
+        .expect_err("disagreement is refused");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+}
+
+/// LAW (LW2, pause_turn): the `pause_turn` stop_reason normalizes to the
+/// dedicated continuation finish — never a terminal EndTurn — so the turn
+/// engine resends the paused assistant message unchanged.
+#[test]
+fn pause_turn_stop_reason_normalizes_to_a_continuation_finish() {
+    let bytes = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+    assert_eq!(
+        replay_anthropic_sse(bytes.as_bytes()),
+        vec![Ok(StreamEvent::Finish {
+            reason: FinishReason::PauseTurn,
+        })]
+    );
+}
+
+/// LAW (LW3): server tool result content decodes tolerantly on BOTH shapes —
+/// the error form is an OBJECT carrying `error_code` (HTTP still 200), the
+/// search success form is a LIST (empty = zero results, not an error), and
+/// the fetch success form is a single object. Every shape still replays
+/// verbatim through the opaque channel.
+#[test]
+fn search_error_object_and_success_list_decode_tolerantly() {
+    let error_stream = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_9\",\"content\":{\"type\":\"web_search_tool_result_error\",\"error_code\":\"max_uses_exceeded\"}}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+    assert_eq!(
+        replay_anthropic_sse(error_stream.as_bytes()),
+        vec![
+            Ok(StreamEvent::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: serde_json::json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_9",
+                    "content": {
+                        "type": "web_search_tool_result_error",
+                        "error_code": "max_uses_exceeded",
+                    },
+                }),
+            }),
+            Ok(StreamEvent::ServerToolResult {
+                call_id: "srvtoolu_9".into(),
+                preview: "max_uses_exceeded".into(),
+                is_error: true,
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ],
+        "the error OBJECT decodes as a failed row and still replays verbatim"
+    );
+
+    let empty_stream = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_9\",\"content\":[]}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+    let items = replay_anthropic_sse(empty_stream.as_bytes());
+    assert!(
+        items.contains(&Ok(StreamEvent::ServerToolResult {
+            call_id: "srvtoolu_9".into(),
+            preview: "0 results".into(),
+            is_error: false,
+        })),
+        "an EMPTY list is zero results, never an error: {items:?}"
+    );
+
+    let fetch_stream = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"web_fetch_tool_result\",\"tool_use_id\":\"srvtoolu_f\",\"content\":{\"type\":\"web_fetch_result\",\"url\":\"https://example.com/doc\",\"content\":{\"type\":\"document\",\"source\":{\"type\":\"text\",\"media_type\":\"text/plain\",\"data\":\"body\"},\"title\":\"Doc\"},\"retrieved_at\":\"2026-08-06T00:00:00Z\"}}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+    let items = replay_anthropic_sse(fetch_stream.as_bytes());
+    assert!(
+        items.contains(&Ok(StreamEvent::ServerToolResult {
+            call_id: "srvtoolu_f".into(),
+            preview: "fetched https://example.com/doc".into(),
+            is_error: false,
+        })),
+        "the fetch success OBJECT decodes as a completed row: {items:?}"
+    );
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            Ok(StreamEvent::ProviderOpaque { data, .. })
+                if data["type"] == "web_fetch_tool_result"
+                    && data["content"]["type"] == "web_fetch_result"
+        )),
+        "the fetch result replays verbatim through the opaque channel"
+    );
+}

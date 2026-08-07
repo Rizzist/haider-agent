@@ -9,6 +9,19 @@ use serde::{Deserialize, Serialize};
 /// Stable durable-extension kind used for provider-native continuation state.
 pub const PROVIDER_OPAQUE_EXTENSION_KIND: &str = "provider_opaque";
 
+/// Stable turn-item extension kind carrying the bounded web-sources list a
+/// turn's citations/grounding produced (W-B). Display-only: provider replay
+/// rides the provider-opaque channel, never this item.
+pub const WEB_SOURCES_EXTENSION_KIND: &str = "web_sources_v1";
+
+/// One cited/grounded web source surfaced by a provider-executed web tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSource {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// Canonical message content block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "block", rename_all = "snake_case")]
@@ -69,6 +82,25 @@ pub enum StreamEvent {
     ToolCallEnd {
         call_id: String,
     },
+    /// A PROVIDER-executed tool call (Anthropic server tools, OpenAI hosted
+    /// web_search, Gemini grounding). Display-only: it never enters the local
+    /// dispatch loop, and same-family replay rides `ProviderOpaque`.
+    ServerToolUse {
+        call_id: String,
+        name: String,
+        args: serde_json::Value,
+    },
+    /// The bounded, display-only outcome of one provider-executed tool call.
+    ServerToolResult {
+        call_id: String,
+        preview: String,
+        is_error: bool,
+    },
+    /// Cited/grounded web sources decoded from provider metadata (bounded by
+    /// the consumer; display-only).
+    WebSources {
+        sources: Vec<WebSource>,
+    },
     UsageUpdate(Usage),
     Finish {
         reason: FinishReason,
@@ -86,6 +118,10 @@ pub enum FinishReason {
     Refusal,
     Cancelled,
     Error,
+    /// Anthropic `pause_turn`: the server paused a long-running (server-tool)
+    /// turn. The turn engine resends the paused assistant message unchanged;
+    /// this reason is never a terminal outcome under the continuation cap.
+    PauseTurn,
 }
 
 /// Multidimensional, honest token accounting (§4): tagged by source quality

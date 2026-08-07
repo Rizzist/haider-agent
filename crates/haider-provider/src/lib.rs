@@ -345,6 +345,22 @@ pub enum FakeStep {
         provider: String,
         data: serde_json::Value,
     },
+    /// Emits a PROVIDER-executed tool call (W-B display channel).
+    EmitServerToolUse {
+        call_id: String,
+        name: String,
+        args: serde_json::Value,
+    },
+    /// Emits the display outcome of one provider-executed tool call.
+    EmitServerToolResult {
+        call_id: String,
+        preview: String,
+        is_error: bool,
+    },
+    /// Emits cited/grounded web sources (W-B display channel).
+    EmitWebSources {
+        sources: Vec<haider_protocol::provider::WebSource>,
+    },
     EmitToolCall {
         call_id: String,
         name: String,
@@ -541,6 +557,47 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
             }
             FakeStep::EmitProviderOpaque { provider, data } => {
                 if !send_event(&sender, StreamEvent::ProviderOpaque { provider, data }).await {
+                    return;
+                }
+            }
+            FakeStep::EmitServerToolUse {
+                call_id,
+                name,
+                args,
+            } => {
+                if !send_event(
+                    &sender,
+                    StreamEvent::ServerToolUse {
+                        call_id,
+                        name,
+                        args,
+                    },
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            FakeStep::EmitServerToolResult {
+                call_id,
+                preview,
+                is_error,
+            } => {
+                if !send_event(
+                    &sender,
+                    StreamEvent::ServerToolResult {
+                        call_id,
+                        preview,
+                        is_error,
+                    },
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            FakeStep::EmitWebSources { sources } => {
+                if !send_event(&sender, StreamEvent::WebSources { sources }).await {
                     return;
                 }
             }

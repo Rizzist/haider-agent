@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use haider_protocol::ids::CredentialAlias;
-use haider_protocol::provider::{Block, FinishReason, StreamEvent, Usage, UsageSource};
+use haider_protocol::provider::{Block, FinishReason, StreamEvent, Usage, UsageSource, WebSource};
 use haider_protocol::tool::AttachmentBlock;
 use serde::Deserialize;
 
@@ -43,6 +43,7 @@ pub(crate) fn request_json(
     system_shape: AnthropicSystemShape,
     effort: Option<&str>,
     fast: bool,
+    web_tools: bool,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let messages = request
@@ -53,18 +54,14 @@ pub(crate) fn request_json(
                 MessageRole::User | MessageRole::Tool => "user",
                 MessageRole::Assistant => "assistant",
             };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| content_block(message.role, block, &attachments))
-                .collect::<Result<Vec<_>, _>>()?;
+            let content = message_content(message.role, &message.blocks, &attachments)?;
             Ok(serde_json::json!({
                 "role": role,
                 "content": content,
             }))
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    let tools = request
+    let mut tools = request
         .tools
         .iter()
         .map(|tool| {
@@ -75,6 +72,26 @@ pub(crate) fn request_json(
             })
         })
         .collect::<Vec<_>>();
+    // W-B (LW1): Anthropic SERVER web tools ride the same `tools` array as
+    // typed entries with these EXACT shapes — `web_search_20250305` (the
+    // basic, all-models version; deliberately NOT the 2026 dynamic-filtering
+    // versions) and `web_fetch_20250910` with citations disabled. The daemon
+    // gates the flag per resolved pair; enterprise (Bedrock/Vertex) and
+    // non-Anthropic pairs never set it.
+    if web_tools {
+        tools.push(serde_json::json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 8,
+        }));
+        tools.push(serde_json::json!({
+            "type": "web_fetch_20250910",
+            "name": "web_fetch",
+            "citations": {"enabled": false},
+            "max_content_tokens": 100000,
+            "max_uses": 10,
+        }));
+    }
     let mut payload = serde_json::json!({
         "model": request.model,
         "max_tokens": request.max_tokens,
@@ -159,6 +176,74 @@ fn attachment_index(request: &TurnRequest) -> Result<HashMap<&str, &str>, Provid
         }
     }
     Ok(attachments)
+}
+
+/// Builds one message's content array. Almost every block maps 1:1 through
+/// [`content_block`]; the exception is a captured citation-signed TEXT block
+/// (W-B): its opaque copy is the replay authority, so the normalized text
+/// deltas that streamed the same characters are consumed instead of being
+/// sent twice.
+fn message_content(
+    role: MessageRole,
+    blocks: &[Block],
+    attachments: &HashMap<&str, &str>,
+) -> Result<Vec<serde_json::Value>, ProviderError> {
+    let mut content = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if role == MessageRole::Assistant
+            && let Block::ProviderOpaque { provider, data } = block
+            && provider == crate::ANTHROPIC_PROVIDER_NAME
+            && data.get("type").and_then(serde_json::Value::as_str) == Some("text")
+        {
+            consume_normalized_text_for_signed_block(&mut content, data)?;
+            content.push(data.clone());
+            continue;
+        }
+        content.push(content_block(role, block, attachments)?);
+    }
+    Ok(content)
+}
+
+/// A captured citation-signed text block arrives AFTER the normalized deltas
+/// that streamed its characters (capture happens at the block's stop). Those
+/// trailing plain-text entries are popped so the opaque block replays alone.
+/// A rehydrated cross-turn message carries the opaque block with NO trailing
+/// normalized text — zero pops is the tolerated shape; a PARTIAL match means
+/// the capture disagrees with normalized history and is refused.
+fn consume_normalized_text_for_signed_block(
+    content: &mut Vec<serde_json::Value>,
+    data: &serde_json::Value,
+) -> Result<(), ProviderError> {
+    let expected = data
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_request("Anthropic citation-signed text block has no text"))?;
+    let is_plain_text = |value: &serde_json::Value| {
+        value.get("type").and_then(serde_json::Value::as_str) == Some("text")
+            && value.get("citations").is_none()
+    };
+    if !content.last().is_some_and(is_plain_text) {
+        return Ok(());
+    }
+    let mut consumed = String::new();
+    while consumed != expected {
+        let piece = content
+            .last()
+            .filter(|value| is_plain_text(value))
+            .and_then(|value| value.get("text").and_then(serde_json::Value::as_str))
+            .ok_or_else(|| {
+                invalid_request("Anthropic citation-signed text disagrees with normalized history")
+            })?;
+        let candidate = format!("{piece}{consumed}");
+        if !expected.ends_with(candidate.as_str()) {
+            return Err(invalid_request(
+                "Anthropic citation-signed text disagrees with normalized history",
+            ));
+        }
+        content.pop();
+        consumed = candidate;
+    }
+    Ok(())
 }
 
 fn content_block(
@@ -286,7 +371,7 @@ impl SseDecoder {
                 if line.ends_with('\r') {
                     line.pop();
                 }
-                if let Some(item) = self.accept_line(&line) {
+                for item in self.accept_line(&line) {
                     let terminal = matches!(item, Err(_) | Ok(StreamEvent::Finish { .. }));
                     output.push(item);
                     if terminal {
@@ -310,18 +395,22 @@ impl SseDecoder {
         }
         if !self.line_buffer.is_empty() {
             let line = std::mem::take(&mut self.line_buffer);
-            if let Some(item) = self.accept_line(line.trim_end_matches('\r')) {
-                let terminal = matches!(item, Err(_) | Ok(StreamEvent::Finish { .. }));
-                self.terminal = terminal;
-                return vec![item];
+            let items = self.accept_line(line.trim_end_matches('\r'));
+            if !items.is_empty() {
+                self.terminal = items
+                    .iter()
+                    .any(|item| matches!(item, Err(_) | Ok(StreamEvent::Finish { .. })));
+                return items;
             }
         }
-        if (self.event_name.is_some() || !self.data_lines.is_empty())
-            && let Some(item) = self.dispatch_event()
-        {
-            let terminal = matches!(item, Err(_) | Ok(StreamEvent::Finish { .. }));
-            self.terminal = terminal;
-            return vec![item];
+        if self.event_name.is_some() || !self.data_lines.is_empty() {
+            let items = self.dispatch_event();
+            if !items.is_empty() {
+                self.terminal = items
+                    .iter()
+                    .any(|item| matches!(item, Err(_) | Ok(StreamEvent::Finish { .. })));
+                return items;
+            }
         }
         self.fail(malformed(
             "Anthropic SSE stream ended before a message_stop event",
@@ -332,12 +421,12 @@ impl SseDecoder {
         self.terminal
     }
 
-    fn accept_line(&mut self, line: &str) -> Option<ProviderStreamItem> {
+    fn accept_line(&mut self, line: &str) -> Vec<ProviderStreamItem> {
         if line.is_empty() {
             return self.dispatch_event();
         }
         if line.starts_with(':') {
-            return None;
+            return Vec::new();
         }
         let (field, value) = line.split_once(':').map_or((line, ""), |(field, value)| {
             (field, value.strip_prefix(' ').unwrap_or(value))
@@ -348,46 +437,49 @@ impl SseDecoder {
             "id" | "retry" => {}
             _ => {}
         }
-        None
+        Vec::new()
     }
 
-    fn dispatch_event(&mut self) -> Option<ProviderStreamItem> {
+    fn dispatch_event(&mut self) -> Vec<ProviderStreamItem> {
         let event_name = self.event_name.take();
         if self.data_lines.is_empty() {
-            return None;
+            return Vec::new();
         }
         let data = self.data_lines.join("\n");
         self.data_lines.clear();
         let Some(event_name) = event_name else {
-            return Some(Err(malformed("Anthropic SSE data frame has no event name")));
+            return vec![Err(malformed("Anthropic SSE data frame has no event name"))];
         };
         let value: serde_json::Value = match serde_json::from_str(&data) {
             Ok(value) => value,
             Err(error) => {
-                return Some(Err(malformed(format!(
+                return vec![Err(malformed(format!(
                     "Anthropic SSE `{event_name}` data is not valid JSON: {error}"
-                ))));
+                )))];
             }
         };
         let data_type = value.get("type").and_then(serde_json::Value::as_str);
         if known_event_name(&event_name) && data_type != Some(event_name.as_str()) {
-            return Some(Err(malformed(format!(
+            return vec![Err(malformed(format!(
                 "Anthropic SSE event `{event_name}` disagrees with data type `{}`",
                 data_type.unwrap_or("<missing>")
-            ))));
+            )))];
         }
         if !known_event_name(&event_name) {
-            return None;
+            return Vec::new();
         }
         let event = match serde_json::from_value(value) {
             Ok(event) => event,
             Err(error) => {
-                return Some(Err(malformed(format!(
+                return vec![Err(malformed(format!(
                     "Anthropic SSE `{event_name}` frame has an invalid shape: {error}"
-                ))));
+                )))];
             }
         };
-        self.state.apply(event).transpose()
+        match self.state.apply(event) {
+            Ok(events) => events.into_iter().map(Ok).collect(),
+            Err(error) => vec![Err(error)],
+        }
     }
 
     fn fail(&mut self, error: ProviderError) -> Vec<ProviderStreamItem> {
@@ -434,7 +526,7 @@ impl StreamState {
         }
     }
 
-    fn apply(&mut self, event: WireEvent) -> Result<Option<StreamEvent>, ProviderError> {
+    fn apply(&mut self, event: WireEvent) -> Result<Vec<StreamEvent>, ProviderError> {
         match event {
             WireEvent::MessageStart { message } => {
                 if self.started {
@@ -447,7 +539,7 @@ impl StreamState {
                 }
                 self.started = true;
                 self.input.update(&message.usage)?;
-                Ok(None)
+                Ok(Vec::new())
             }
             WireEvent::ContentBlockStart {
                 index,
@@ -461,10 +553,17 @@ impl StreamState {
                     )));
                 }
                 let (block, item) = match content_block {
-                    WireContentBlock::Text { text } => (
-                        OpenBlock::Text,
-                        (!text.is_empty()).then_some(StreamEvent::TextDelta { text }),
-                    ),
+                    WireContentBlock::Text { text } => {
+                        let item = (!text.is_empty())
+                            .then(|| StreamEvent::TextDelta { text: text.clone() });
+                        (
+                            OpenBlock::Text {
+                                text,
+                                citations: Vec::new(),
+                            },
+                            item,
+                        )
+                    }
                     WireContentBlock::ToolUse { id, name, input } => {
                         if !input.as_object().is_some_and(serde_json::Map::is_empty) {
                             return Err(malformed(format!(
@@ -478,6 +577,51 @@ impl StreamState {
                             Some(StreamEvent::ToolCallStart { call_id: id, name }),
                         )
                     }
+                    // W-B: a provider-executed tool call. It NEVER enters the
+                    // local dispatch loop (no ToolCallStart); the block is
+                    // accumulated for verbatim replay and surfaced as a
+                    // display row at its stop.
+                    WireContentBlock::ServerToolUse {
+                        id,
+                        name,
+                        input,
+                        extra,
+                    } => (
+                        OpenBlock::ServerTool {
+                            id,
+                            name,
+                            input,
+                            input_json: String::new(),
+                            extra,
+                        },
+                        None,
+                    ),
+                    WireContentBlock::WebSearchToolResult {
+                        tool_use_id,
+                        content,
+                        extra,
+                    } => (
+                        OpenBlock::ServerResult {
+                            kind: "web_search_tool_result",
+                            tool_use_id,
+                            content,
+                            extra,
+                        },
+                        None,
+                    ),
+                    WireContentBlock::WebFetchToolResult {
+                        tool_use_id,
+                        content,
+                        extra,
+                    } => (
+                        OpenBlock::ServerResult {
+                            kind: "web_fetch_tool_result",
+                            tool_use_id,
+                            content,
+                            extra,
+                        },
+                        None,
+                    ),
                     // G3 (LT1): thinking blocks accumulate their text AND
                     // signature for verbatim tool-loop replay. Display law is
                     // unchanged — only DELTAS are emitted as ReasoningDelta;
@@ -497,7 +641,7 @@ impl StreamState {
                     }
                 };
                 self.open_blocks.insert(index, block);
-                Ok(item)
+                Ok(item.into_iter().collect())
             }
             WireEvent::ContentBlockDelta { index, delta } => {
                 self.require_started("content_block_delta")?;
@@ -508,14 +652,30 @@ impl StreamState {
                     ))
                 })?;
                 match (block, delta) {
-                    (OpenBlock::Text, WireDelta::Text { text }) => {
-                        Ok(Some(StreamEvent::TextDelta { text }))
+                    (OpenBlock::Text { text: accum, .. }, WireDelta::Text { text }) => {
+                        accum.push_str(&text);
+                        Ok(vec![StreamEvent::TextDelta { text }])
+                    }
+                    // W-B: citation fragments accumulate on their text block
+                    // for verbatim replay; they are not display deltas.
+                    (OpenBlock::Text { citations, .. }, WireDelta::Citations { citation }) => {
+                        citations.push(citation);
+                        Ok(Vec::new())
                     }
                     (OpenBlock::Tool { call_id }, WireDelta::InputJson { partial_json }) => {
-                        Ok(Some(StreamEvent::ToolCallArgsDelta {
+                        Ok(vec![StreamEvent::ToolCallArgsDelta {
                             call_id: call_id.clone(),
                             args_fragment: partial_json,
-                        }))
+                        }])
+                    }
+                    // W-B: a server tool call streams its input exactly like
+                    // a client tool call, but into the replay accumulator.
+                    (
+                        OpenBlock::ServerTool { input_json, .. },
+                        WireDelta::InputJson { partial_json },
+                    ) => {
+                        input_json.push_str(&partial_json);
+                        Ok(Vec::new())
                     }
                     // Display AND capture: the delta streams to the UI as
                     // reasoning and joins the verbatim replay accumulator.
@@ -524,7 +684,7 @@ impl StreamState {
                         WireDelta::Thinking { thinking: delta },
                     ) => {
                         thinking.push_str(&delta);
-                        Ok(Some(StreamEvent::ReasoningDelta { text: delta }))
+                        Ok(vec![StreamEvent::ReasoningDelta { text: delta }])
                     }
                     // signature_delta fragments ACCUMULATE (LT1): the block's
                     // replayable signature is their concatenation.
@@ -533,9 +693,9 @@ impl StreamState {
                         WireDelta::Signature { signature: delta },
                     ) => {
                         signature.push_str(&delta);
-                        Ok(None)
+                        Ok(Vec::new())
                     }
-                    (_, WireDelta::Unknown) => Ok(None),
+                    (_, WireDelta::Unknown) => Ok(Vec::new()),
                     _ => Err(malformed(format!(
                         "Anthropic delta type does not match content block index {index}"
                     ))),
@@ -546,7 +706,78 @@ impl StreamState {
                 self.require_before_message_delta("content_block_stop")?;
                 match self.open_blocks.remove(&index) {
                     Some(OpenBlock::Tool { call_id }) => {
-                        Ok(Some(StreamEvent::ToolCallEnd { call_id }))
+                        Ok(vec![StreamEvent::ToolCallEnd { call_id }])
+                    }
+                    // W-B (LW2): the finished server tool call is captured
+                    // VERBATIM — id, name, streamed input, and every unknown
+                    // sibling field — for the API's mandatory echo, then
+                    // surfaced as a display row.
+                    Some(OpenBlock::ServerTool {
+                        id,
+                        name,
+                        input,
+                        input_json,
+                        extra,
+                    }) => {
+                        let input = if input_json.is_empty() {
+                            input
+                        } else {
+                            serde_json::from_str(&input_json).map_err(|error| {
+                                malformed(format!(
+                                    "Anthropic server tool input is not valid JSON: {error}"
+                                ))
+                            })?
+                        };
+                        let mut raw = serde_json::Map::new();
+                        raw.insert("type".into(), serde_json::json!("server_tool_use"));
+                        raw.insert("id".into(), serde_json::Value::String(id.clone()));
+                        raw.insert("name".into(), serde_json::Value::String(name.clone()));
+                        raw.insert("input".into(), input.clone());
+                        raw.extend(extra);
+                        Ok(vec![
+                            StreamEvent::ProviderOpaque {
+                                provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                                data: serde_json::Value::Object(raw),
+                            },
+                            StreamEvent::ServerToolUse {
+                                call_id: id,
+                                name,
+                                args: input,
+                            },
+                        ])
+                    }
+                    // W-B (LW2/LW3): the result block — encrypted_content and
+                    // all — replays verbatim; the display row decodes the
+                    // content TOLERANTLY (error content is an OBJECT with an
+                    // error_code, search success is a LIST, fetch success is
+                    // a web_fetch_result object; an empty list is zero
+                    // results, not an error).
+                    Some(OpenBlock::ServerResult {
+                        kind,
+                        tool_use_id,
+                        content,
+                        extra,
+                    }) => {
+                        let (preview, is_error) = server_result_preview(&content);
+                        let mut raw = serde_json::Map::new();
+                        raw.insert("type".into(), serde_json::json!(kind));
+                        raw.insert(
+                            "tool_use_id".into(),
+                            serde_json::Value::String(tool_use_id.clone()),
+                        );
+                        raw.insert("content".into(), content);
+                        raw.extend(extra);
+                        Ok(vec![
+                            StreamEvent::ProviderOpaque {
+                                provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                                data: serde_json::Value::Object(raw),
+                            },
+                            StreamEvent::ServerToolResult {
+                                call_id: tool_use_id,
+                                preview,
+                                is_error,
+                            },
+                        ])
                     }
                     // G3 (LT1): a SIGNED thinking block becomes a
                     // provider-opaque fact carrying the EXACT wire shape the
@@ -557,29 +788,54 @@ impl StreamState {
                     Some(OpenBlock::Thinking {
                         thinking,
                         signature,
-                    }) => Ok(
-                        (!signature.is_empty()).then(|| StreamEvent::ProviderOpaque {
+                    }) => Ok((!signature.is_empty())
+                        .then(|| StreamEvent::ProviderOpaque {
                             provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
                             data: serde_json::json!({
                                 "type": "thinking",
                                 "thinking": thinking,
                                 "signature": signature,
                             }),
-                        }),
-                    ),
+                        })
+                        .into_iter()
+                        .collect()),
                     // redacted_thinking replays as-is; the classic bug this
                     // pins against is filtering `type == "thinking"` and
                     // dropping these (a live 400).
-                    Some(OpenBlock::Redacted { data }) => {
-                        Ok((!data.is_empty()).then(|| StreamEvent::ProviderOpaque {
+                    Some(OpenBlock::Redacted { data }) => Ok((!data.is_empty())
+                        .then(|| StreamEvent::ProviderOpaque {
                             provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
                             data: serde_json::json!({
                                 "type": "redacted_thinking",
                                 "data": data,
                             }),
-                        }))
+                        })
+                        .into_iter()
+                        .collect()),
+                    // W-B: a citation-carrying text block is captured with
+                    // its citations (every encrypted_index included) so the
+                    // follow-up request can echo it verbatim; the sources it
+                    // cites surface for display. A plain text block captures
+                    // nothing — today's behavior.
+                    Some(OpenBlock::Text { text, citations }) => {
+                        if citations.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let sources = citation_sources(&citations);
+                        let mut events = vec![StreamEvent::ProviderOpaque {
+                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                            data: serde_json::json!({
+                                "type": "text",
+                                "text": text,
+                                "citations": citations,
+                            }),
+                        }];
+                        if !sources.is_empty() {
+                            events.push(StreamEvent::WebSources { sources });
+                        }
+                        Ok(events)
                     }
-                    Some(OpenBlock::Text | OpenBlock::Opaque) => Ok(None),
+                    Some(OpenBlock::Opaque) => Ok(Vec::new()),
                     None => Err(malformed(format!(
                         "Anthropic stop references unopened content block index {index}"
                     ))),
@@ -606,7 +862,7 @@ impl StreamState {
                 }
                 self.message_delta_seen = true;
                 let Some(usage) = usage else {
-                    return Ok(None);
+                    return Ok(Vec::new());
                 };
                 self.input.update(&usage)?;
                 let input = self
@@ -614,7 +870,7 @@ impl StreamState {
                     .input_tokens
                     .checked_add(self.input.cache_creation_input_tokens)
                     .ok_or_else(|| malformed("Anthropic input usage counter overflowed u64"))?;
-                Ok(Some(StreamEvent::UsageUpdate(Usage {
+                Ok(vec![StreamEvent::UsageUpdate(Usage {
                     input,
                     output: usage.output_tokens.unwrap_or(0),
                     reasoning: 0,
@@ -622,7 +878,7 @@ impl StreamState {
                     source: UsageSource::ProviderReported,
                     account: self.account.clone(),
                     accounts: Vec::new(),
-                })))
+                })])
             }
             WireEvent::MessageStop => {
                 self.require_started("message_stop")?;
@@ -634,9 +890,9 @@ impl StreamState {
                 let reason = self.stop_reason.ok_or_else(|| {
                     malformed("Anthropic message_stop arrived without a stop_reason")
                 })?;
-                Ok(Some(StreamEvent::Finish { reason }))
+                Ok(vec![StreamEvent::Finish { reason }])
             }
-            WireEvent::Ping | WireEvent::Unknown => Ok(None),
+            WireEvent::Ping | WireEvent::Unknown => Ok(Vec::new()),
             WireEvent::Error { error } => Err(api_error(error)),
         }
     }
@@ -689,9 +945,30 @@ impl InputUsage {
 
 #[derive(Debug)]
 enum OpenBlock {
-    Text,
+    /// Text accumulates its characters and any citation fragments (W-B): a
+    /// citation-carrying block must replay verbatim, encrypted_index and all.
+    Text {
+        text: String,
+        citations: Vec<serde_json::Value>,
+    },
     Tool {
         call_id: String,
+    },
+    /// A provider-executed tool call accumulating its streamed input plus
+    /// every unknown sibling field for verbatim replay (W-B).
+    ServerTool {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        input_json: String,
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
+    /// A server tool result block held whole for verbatim replay (W-B).
+    ServerResult {
+        kind: &'static str,
+        tool_use_id: String,
+        content: serde_json::Value,
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     /// Thinking accumulates text + signature for verbatim replay (G3/LT1).
     Thinking {
@@ -703,6 +980,58 @@ enum OpenBlock {
         data: String,
     },
     Opaque,
+}
+
+/// Bounded display decode for one server tool result's `content` (LW3):
+/// error content is an OBJECT carrying `error_code`; web_search success is a
+/// LIST (empty = zero results, not an error); web_fetch success is a
+/// `web_fetch_result` object. Anything else stays a tolerant "result".
+fn server_result_preview(content: &serde_json::Value) -> (String, bool) {
+    if let Some(items) = content.as_array() {
+        let count = items.len();
+        let preview = if count == 1 {
+            "1 result".to_owned()
+        } else {
+            format!("{count} results")
+        };
+        return (preview, false);
+    }
+    if let Some(object) = content.as_object() {
+        let kind = object.get("type").and_then(serde_json::Value::as_str);
+        if kind.is_some_and(|kind| kind.ends_with("_error")) {
+            let code = object
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("error");
+            return (code.to_owned(), true);
+        }
+        if let Some(url) = object.get("url").and_then(serde_json::Value::as_str) {
+            return (format!("fetched {url}"), false);
+        }
+    }
+    ("result".to_owned(), false)
+}
+
+/// Extracts the display sources cited by one text block's citations,
+/// deduplicated by URL; tolerant to citation shapes without url/title.
+fn citation_sources(citations: &[serde_json::Value]) -> Vec<WebSource> {
+    let mut sources: Vec<WebSource> = Vec::new();
+    for citation in citations {
+        let Some(url) = citation.get("url").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if sources.iter().any(|source| source.url == url) {
+            continue;
+        }
+        sources.push(WebSource {
+            url: url.to_owned(),
+            title: citation
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    sources
 }
 
 #[derive(Debug, Deserialize)]
@@ -768,6 +1097,30 @@ enum WireContentBlock {
         name: String,
         input: serde_json::Value,
     },
+    /// W-B: a provider-executed tool call. `extra` flatten-captures every
+    /// unknown sibling field so the block can be reconstructed verbatim.
+    ServerToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
+    WebFetchToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: serde_json::Value,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
     Thinking {
         #[serde(default)]
         thinking: String,
@@ -795,6 +1148,10 @@ enum WireDelta {
         #[serde(default)]
         signature: String,
     },
+    /// W-B: one citation landing on an open text block, kept raw so its
+    /// `encrypted_index` replays byte-exactly.
+    #[serde(rename = "citations_delta")]
+    Citations { citation: serde_json::Value },
     #[serde(other)]
     Unknown,
 }
@@ -849,7 +1206,11 @@ pub(crate) const fn provider_kind_name(kind: ProviderErrorKind) -> &'static str 
 
 fn normalize_stop_reason(reason: &str) -> Result<FinishReason, ProviderError> {
     match reason {
-        "end_turn" | "stop_sequence" | "pause_turn" => Ok(FinishReason::EndTurn),
+        "end_turn" | "stop_sequence" => Ok(FinishReason::EndTurn),
+        // W-B (LW2): `pause_turn` is a CONTINUATION signal, never a terminal
+        // end — the turn engine resends the paused assistant message
+        // unchanged.
+        "pause_turn" => Ok(FinishReason::PauseTurn),
         "tool_use" => Ok(FinishReason::ToolUse),
         "max_tokens" => Ok(FinishReason::MaxTokens),
         "model_context_window_exceeded" => Err(ProviderError::new(

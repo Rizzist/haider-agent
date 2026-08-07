@@ -240,7 +240,12 @@ impl ContextCompactor for DaemonContextCompactor {
                 // responses-lite stream emits opaque reasoning fragments on
                 // EVERY turn — rejecting them made live summarization fail
                 // 100% on openai-oauth (probe autopsy, v0.0.42 battery).
-                StreamEvent::ProviderOpaque { .. } => {}
+                // W-B: server-executed web tool activity and cited sources
+                // are equally incidental to a summarization request.
+                StreamEvent::ProviderOpaque { .. }
+                | StreamEvent::ServerToolUse { .. }
+                | StreamEvent::ServerToolResult { .. }
+                | StreamEvent::WebSources { .. } => {}
                 StreamEvent::RefusalDelta { .. } => {
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
