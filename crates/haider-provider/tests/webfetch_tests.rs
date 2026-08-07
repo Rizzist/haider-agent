@@ -5,7 +5,7 @@
 //! policy's one http allowance, which is exactly what makes these fetches
 //! testable end to end).
 
-use haider_provider::{WEB_FETCH_OUTPUT_CAP_BYTES, fetch_public_url};
+use haider_provider::{ProviderErrorKind, WEB_FETCH_OUTPUT_CAP_BYTES, fetch_public_url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -119,8 +119,11 @@ async fn redirect_hops_are_revalidated_through_the_origin_fence() {
             redirect_response("http://169.254.169.254/latest/meta-data/"),
         ),
         (
+            // TEST-NET-2 (RFC 5737): public by the fence's classification and
+            // guaranteed never routed, so even a BROKEN fence cannot turn
+            // this fixture into a real network call.
             "/to-public-http",
-            redirect_response("http://93.184.216.34/doc"),
+            redirect_response("http://198.51.100.7/doc"),
         ),
         ("/to-private", redirect_response("https://10.0.0.8/doc")),
     ])
@@ -130,6 +133,14 @@ async fn redirect_hops_are_revalidated_through_the_origin_fence() {
         let error = fetch_public_url(&format!("{base}{path}"), None)
             .await
             .expect_err("hostile redirect target must be refused");
+        // The REFUSAL kind is the discriminator: a fence that only guards
+        // the first hop would still fail — as a TRANSPORT error from dialing
+        // the hostile target — and that is exactly what must not happen.
+        assert_eq!(
+            error.kind,
+            ProviderErrorKind::InvalidRequest,
+            "the hop is refused by the fence, not by the network: {error}"
+        );
         assert!(
             error.message.contains("web_fetch"),
             "typed refusal for {path}: {error}"
