@@ -69,3 +69,33 @@ EXECUTED kills covering: the sweep advance (LE2), the scope restriction
 (LE3), the idle no-op (LE4), and the degradation path (LE6). Run
 `scripts/tui-probes/ladder.sh` BEFORE the wave is called done (standing
 ritual for any TUI-visual change). No version bumps/tags/renames.
+
+## Seam pointers (coordinator, verified on this branch)
+
+- **The verb renderer**: `thinking_line(theme: &Theme, phase: u8)` at
+  `crates/haider-tui/src/render.rs:227` — today it renders `● thinking…`
+  as ONE span with `theme.pulse_ink(theme.gold, phase)` (whole word
+  pulses uniformly). This is where the per-character shimmer replaces the
+  single styled span: split the verb into per-glyph spans, each styled by
+  a new `Theme::shimmer_ink(base, phase, index, len)`.
+- **The clock**: `model.anim_phase` (u8, the shared journal/frame tick —
+  already threaded into render). No new timer.
+- **Precedents to mirror**: `theme.pulse_ink(base, phase)` (uniform
+  pulse) and `theme.rail_shimmer_style(anim_phase)` at render.rs:698 (an
+  EXISTING travelling shimmer on the recent-sessions rail — study its
+  phase math and theme-token sourcing; `shimmer_ink` is its sibling for
+  text glyphs). Both live in `theme.rs`.
+- The dot glyph alternation `● ↔ ◌` (phase.is_multiple_of(2)) is a
+  deliberate low-contrast-terminal taste-call — KEEP it; the shimmer is
+  additive to the verb text, the dot stays as is.
+- **Reference-screenshot suffix**: the owner's screenshot shows
+  `◆ Thinking (26s · esc to interrupt)`. Adding a DIM, STATIC
+  `(<elapsed> · esc to interrupt)` suffix beside the shimmering verb is
+  in scope IF the elapsed clock is already available here (the S4/W-A
+  elapsed machinery on `model.anim`/journal clock) — but the suffix
+  NEVER shimmers (decision 1/3: base ink only). If wiring elapsed here is
+  non-trivial, ship the shimmer alone and note the suffix as a follow-up
+  rather than faking a timer. The ANIMATION is the must-have.
+- Chip view: `thinking_line` is shared by the session tail and the
+  subagent chip (`ChipDisplayState::Thinking`, render.rs:4236) — the
+  shimmer lands in both by construction; pin both.
