@@ -325,7 +325,11 @@ impl PermissionPolicy {
     }
 
     fn decision(&self, intent: &EffectIntent) -> PolicyDecision {
-        if let Some(rule) = self.denylist.iter().find(|rule| rule.class == intent.class) {
+        if let Some(rule) = self
+            .denylist
+            .iter()
+            .find(|rule| class_rule_matches(&rule.class, &intent.class))
+        {
             return PolicyDecision::Deny {
                 reason: rule.reason.clone(),
             };
@@ -335,12 +339,30 @@ impl PermissionPolicy {
             .iter()
             .any(|rule| rule.class == intent.class && rule.args_digest == intent.args_digest)
             || self.session_allow.iter().any(|grant| grant.matches(intent))
-            || self.allowlist.contains(&intent.class)
+            || self
+                .allowlist
+                .iter()
+                .any(|listed| class_rule_matches(listed, &intent.class))
         {
             return PolicyDecision::Allow;
         }
         PolicyDecision::Ask
     }
+}
+
+/// Whether one policy-list class entry covers an intent's class. Classes
+/// match exactly, with ONE deliberate widening (W-B): a `Network` rule with
+/// an EMPTY host is the class-FAMILY rule — daemon defaults cannot know the
+/// host a model will fetch before it asks, while menu-minted grants always
+/// carry the real host and stay exact.
+fn class_rule_matches(rule: &EffectClass, intent: &EffectClass) -> bool {
+    if rule == intent {
+        return true;
+    }
+    matches!(
+        (rule, intent),
+        (EffectClass::Network { host }, EffectClass::Network { .. }) if host.is_empty()
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1187,6 +1209,19 @@ impl EffectBroker {
     /// terminal transport errors retain `Dispatched` durably and are reported.
     pub async fn journal_unknown(&mut self, intent: &EffectIntent) -> ToolResult<()> {
         self.journal_outcome(intent, EffectOutcome::Unknown).await
+    }
+
+    /// Begins the brokered `web_fetch` effect (W-B, LW7): intent (URL in the
+    /// summary and canonical arguments) → authorization under the
+    /// `Network { host }` class → `Dispatched`. The daemon dispatcher owns
+    /// the guarded HTTP work between this and [`EffectBroker::journal_outcome`]
+    /// — the `spawn_subagent` begin/finish precedent.
+    pub async fn begin_web_fetch(
+        &mut self,
+        operation: &crate::WebFetch,
+        policy: &PermissionPolicy,
+    ) -> ToolResult<EffectIntent> {
+        self.begin(operation, policy).await
     }
 
     /// Begins the short `AgentSpawn` effect. The caller must establish the

@@ -5144,6 +5144,12 @@ async fn finalize_and_respond(
 pub struct ProviderTuning {
     pub effort: Option<String>,
     pub fast: bool,
+    /// W-B: whether the resolved pair may declare its PROVIDER-NATIVE web
+    /// tools (Anthropic server tools, OpenAI hosted search, Gemini
+    /// built-ins). True on real turns; the factory clears it when the
+    /// session's anthropic server tools degraded (local-fallback latch),
+    /// and probe/validation constructions leave it false via `default()`.
+    pub web_tools: bool,
 }
 
 impl ProviderTuning {
@@ -5151,6 +5157,7 @@ impl ProviderTuning {
         Self {
             effort: metadata.effort.clone(),
             fast: metadata.fast,
+            web_tools: true,
         }
     }
 }
@@ -5316,12 +5323,16 @@ fn build_account_provider(
     let anthropic_effort = anthropic_effort_for(tuning, model);
     let openai_effort = openai_effort_for(tuning, profile, model);
     let adapter: Arc<dyn Provider> = match (provider, auth_method) {
+        // W-B: FIRST-PARTY Anthropic pairs declare the server web tools;
+        // Bedrock/Vertex below deliberately never take the flag (the
+        // capability matrix keeps enterprise on the local client tool).
         (ANTHROPIC_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             AnthropicProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone())
                 .with_effort(anthropic_effort.clone())
-                .with_fast(anthropic_fast),
+                .with_fast(anthropic_fast)
+                .with_web_tools(tuning.web_tools),
         ),
         // G4b: Bedrock mantle — the endpoint-parameterized Anthropic
         // adapter at the profile's mantle base (LB1/LB2). Effort clamps
@@ -5366,13 +5377,19 @@ fn build_account_provider(
             OpenAiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone())
-                .with_effort(openai_effort.clone()),
+                .with_effort(openai_effort.clone())
+                // W-B: hosted web_search on the API-key Responses pair; the
+                // lite request builder makes this structurally inert there.
+                .with_web_search(tuning.web_tools),
         ),
         (GEMINI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             GeminiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone())
-                .with_effort(tuning.effort.clone()),
+                .with_effort(tuning.effort.clone())
+                // W-B: google_search + url_context built-ins, name-gated to
+                // 3.x models inside the request builder.
+                .with_web_builtins(tuning.web_tools),
         ),
         (OPENAI_COMPATIBLE_PROVIDER_NAME, AuthMethod::ApiKey) => {
             let base_url = compatible_base_url.ok_or_else(|| {
@@ -5483,7 +5500,12 @@ fn build_account_provider(
                     .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone())
                     .with_effort(anthropic_effort.clone())
-                    .with_fast(anthropic_fast),
+                    .with_fast(anthropic_fast)
+                    // W-B: OAuth server web tools ride the owner-accepted
+                    // subscription risk posture (the notes carry the
+                    // third-party caveat verbatim); a session-scoped 400
+                    // degrade clears the flag upstream.
+                    .with_web_tools(tuning.web_tools),
             )
         }
         (KIMI_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {

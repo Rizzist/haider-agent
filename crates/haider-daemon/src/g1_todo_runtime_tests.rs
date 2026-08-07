@@ -262,8 +262,8 @@ fn todo_write_is_registered_advertised_and_routable() {
 #[test]
 fn child_tool_pack_excludes_exactly_todo_write() {
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
-    let root = advertised_tool_definitions(&factory, false);
-    let child = advertised_tool_definitions(&factory, true);
+    let root = advertised_tool_definitions(&factory, false, "fake");
+    let child = advertised_tool_definitions(&factory, true, "fake");
     assert!(
         root.iter()
             .any(|definition| definition.name == "todo_write")

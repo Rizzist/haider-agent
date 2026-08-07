@@ -7062,6 +7062,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
     let off = ProviderTuning {
         effort: None,
         fast: false,
+        web_tools: false,
     };
     assert!(!anthropic_fast_for("anthropic", &off, "claude-opus-5"));
 }
@@ -7082,6 +7083,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
     let tuning = ProviderTuning {
         effort: Some("xhigh".to_owned()),
         fast: false,
+        web_tools: false,
     };
     assert_eq!(
         anthropic_effort_for(&tuning, "claude-fable-5").as_deref(),
@@ -7101,6 +7103,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
     let garbage = ProviderTuning {
         effort: Some("turbo".to_owned()),
         fast: false,
+        web_tools: false,
     };
     assert_eq!(
         anthropic_effort_for(&garbage, "claude-opus-5"),
@@ -7145,6 +7148,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
     let supported = ProviderTuning {
         effort: Some("medium".to_owned()),
         fast: false,
+        web_tools: false,
     };
     assert_eq!(
         openai_effort_for(&supported, Some(&summary), "gpt-5.5").as_deref(),

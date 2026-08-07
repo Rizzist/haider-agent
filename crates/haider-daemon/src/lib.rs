@@ -76,6 +76,8 @@ mod tasks;
 mod tasks_runtime_tests;
 mod turn_recovery;
 mod usage_report;
+#[cfg(test)]
+mod wb_web_runtime_tests;
 mod worker;
 
 #[cfg(test)]

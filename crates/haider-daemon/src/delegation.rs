@@ -196,12 +196,18 @@ impl DelegationHandle {
                     "process_exec".into(),
                     "spawn_subagent".into(),
                     "message_subagent".into(),
+                    // W-B: children inherit the web derivation (decision 8);
+                    // the empty-host Network entry is the class-family grant.
+                    "web_fetch".into(),
                 ],
                 effect_ceiling: vec![
                     EffectClass::FsRead,
                     EffectClass::FsWrite,
                     EffectClass::ProcessExec,
                     EffectClass::AgentSpawn,
+                    EffectClass::Network {
+                        host: String::new(),
+                    },
                 ],
             },
             budget_tokens: Some(coordinates.metadata.max_tokens),

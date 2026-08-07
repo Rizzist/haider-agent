@@ -186,7 +186,7 @@ pub(crate) async fn validate_fetch_target(
             }
         } else if !ip.is_loopback() {
             return Err(refused(format!(
-                "web_fetch allows plain HTTP only to loopback, not {ip}"
+                "web_fetch allows plain HTTP only to loopback, not {ip} for {url}"
             )));
         }
     }

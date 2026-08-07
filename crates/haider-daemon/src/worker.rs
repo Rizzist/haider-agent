@@ -75,6 +75,7 @@ use haider_tools::{
     FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, JournalSink, MessageSubagent,
     PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds, SessionGrant,
     SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
+    WebFetch,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -2744,8 +2745,11 @@ async fn perform_manual_compaction(
         &instruction_entries,
         handoff_dir.as_deref(),
     );
-    let post_compaction_tools =
-        advertised_tool_definitions(&dependencies.tool_factory, agent_id.is_some());
+    let post_compaction_tools = advertised_tool_definitions(
+        &dependencies.tool_factory,
+        agent_id.is_some(),
+        &resolved.provider_name,
+    );
     let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
         lease,
         lease,
@@ -3343,7 +3347,11 @@ async fn start_turn(
         &instruction_entries,
         handoff_dir.as_deref(),
     ));
-    config.tools = advertised_tool_definitions(&dependencies.tool_factory, delegated_child);
+    config.tools = advertised_tool_definitions(
+        &dependencies.tool_factory,
+        delegated_child,
+        &resolved.provider_name,
+    );
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
     // result at the cap; hiding the tool would turn that recoverable model
@@ -4014,6 +4022,7 @@ pub(crate) enum RegisteredToolRoute {
     MessageSubagent,
     TaskOutput,
     TaskKill,
+    WebFetch,
 }
 
 #[derive(Debug, Clone)]
@@ -4158,6 +4167,19 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::TaskKill,
             }
         },
+        {
+            // W-B: the universal LOCAL web fetch IS an effect under the
+            // `Network { host }` class — Ask by default, per-host grants
+            // from the menu, auto-allowed under the exec override (a
+            // process can reach the network anyway, so `allow_exec` is the
+            // honest auto-mode gate; delegated children carry it).
+            let manifest = haider_tools::web_fetch_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::Ask,
+                route: RegisteredToolRoute::WebFetch,
+            }
+        },
     ]
 }
 
@@ -4178,17 +4200,29 @@ fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
     }
 }
 
-/// The tool pack one turn advertises (G1). The plan surface is root-only:
-/// a delegated child session never sees `todo_write` — the pinned panel and
-/// the Todos history nodes belong to the root planning timeline. This is the
-/// single advertisement seam; delegation `Grant` lists stay untouched.
+/// The tool pack one turn advertises (G1, W-B). The plan surface is
+/// root-only: a delegated child session never sees `todo_write` — the pinned
+/// panel and the Todos history nodes belong to the root planning timeline.
+///
+/// W-B (decision 8 / LW8): the pack derives from the RESOLVED pair per turn.
+/// First-party Anthropic pairs carry the SERVER `web_fetch` tool, so the
+/// LOCAL `web_fetch` client tool is withheld there (two tools cannot share
+/// the name); every other pair advertises it. Subagents inherit the same
+/// derivation — this is the single advertisement seam.
 pub(crate) fn advertised_tool_definitions(
     tool_factory: &Arc<dyn TurnToolFactory>,
     delegated_child: bool,
+    provider_name: &str,
 ) -> Vec<ToolDefinition> {
     let mut definitions = tool_factory.definitions();
     if delegated_child {
         definitions.retain(|definition| definition.name != "todo_write");
+    }
+    if matches!(
+        provider_name,
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+    ) {
+        definitions.retain(|definition| definition.name != "web_fetch");
     }
     definitions
 }
@@ -4270,6 +4304,12 @@ pub(crate) fn effective_permission_defaults(
             entry.manifest.effects.into_iter().map(move |class| {
                 let default = if (overrides.allow_writes && class == EffectClass::FsWrite)
                     || (overrides.allow_exec && class == EffectClass::ProcessExec)
+                    // W-B: the exec override is the honest auto-mode gate for
+                    // network fetches too — an allowed process can already
+                    // reach the network, so hiding fetch behind a second menu
+                    // would be security theater. The empty-host template is
+                    // the policy's Network class-family rule.
+                    || (overrides.allow_exec && matches!(class, EffectClass::Network { .. }))
                 {
                     ToolPermissionDefault::Allow
                 } else {
@@ -4613,6 +4653,71 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 self.tasks
                     .task_kill(&self.session_id, &task_id, broker, &policy)
                     .await
+            }
+            RegisteredToolRoute::WebFetch => {
+                // W-B (LW7): intent → authorization → dispatch journal
+                // through the broker, the guarded engine in between, and an
+                // HONEST terminal outcome either way. A failed fetch is a
+                // typed tool RESULT the model can react to, never a turn
+                // failure; only journal-append failures abort.
+                let operation = WebFetch::from_tool_args(&args).map_err(tool_error)?;
+                match broker.begin_web_fetch(&operation, &policy).await {
+                    Ok(intent) => {
+                        let fetched = tokio::select! {
+                            () = cancel.cancelled() => {
+                                broker
+                                    .journal_outcome(&intent, EffectOutcome::Cancelled)
+                                    .await
+                                    .map_err(tool_error)?;
+                                return Err(HaiderError::new(
+                                    ErrorCode::Internal,
+                                    "web_fetch was cancelled mid-flight",
+                                    false,
+                                ));
+                            }
+                            fetched = haider_provider::fetch_public_url(
+                                operation.url(),
+                                operation.max_bytes(),
+                            ) => fetched,
+                        };
+                        match fetched {
+                            Ok(outcome) => {
+                                broker
+                                    .journal_outcome(&intent, EffectOutcome::Ok)
+                                    .await
+                                    .map_err(tool_error)?;
+                                Ok(BoundedResult {
+                                    preview: format!(
+                                        "[{} · {}]\n{}",
+                                        outcome.final_url, outcome.content_type, outcome.text
+                                    ),
+                                    truncated: outcome.truncated,
+                                    artifact: None,
+                                    cursor: None,
+                                })
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                broker
+                                    .journal_outcome(
+                                        &intent,
+                                        EffectOutcome::Failed {
+                                            error: message.clone(),
+                                        },
+                                    )
+                                    .await
+                                    .map_err(tool_error)?;
+                                Ok(BoundedResult {
+                                    preview: format!("web_fetch failed: {message}"),
+                                    truncated: false,
+                                    artifact: None,
+                                    cursor: None,
+                                })
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
             }
             RegisteredToolRoute::FsWrite => {
                 let path = required_string(&args, "path")?;
