@@ -407,7 +407,8 @@ async fn run_inner(
     let web_search: Option<std::sync::Arc<dyn crate::worker::WebSearchExecutor>> =
         accounts_runtime.broker.clone().map(|broker| {
             std::sync::Arc::new(crate::web_search::SubscriptionWebSearch::new(
-                broker,
+                std::sync::Arc::new(broker)
+                    as std::sync::Arc<dyn crate::web_search::WebSearchCredentials>,
                 std::sync::Arc::new(crate::web_search::ReqwestWebSearchHttp::new()),
             )) as std::sync::Arc<dyn crate::worker::WebSearchExecutor>
         });

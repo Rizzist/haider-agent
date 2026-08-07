@@ -5842,11 +5842,16 @@ impl AccountsProviderFactory {
             .and_then(|detail| detail.context_window)
     }
 
+    /// Builds the adapter under an EXPLICIT tuning. W-B threads the tuning
+    /// in rather than deriving it here, so one turn's web-capability degrade
+    /// reaches every construction on that turn — the first attempt, an
+    /// auth-refresh retry, and a rotation alike.
     fn build_provider(
         &self,
         descriptor: &CredentialDescriptor,
         credential: haider_accounts::SecretHandle,
         metadata: &haider_protocol::session::SessionMetadataV1,
+        tuning: &ProviderTuning,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         let profile = self.provider_profile(&descriptor.provider);
         self.builder.build_tuned(
@@ -5854,7 +5859,7 @@ impl AccountsProviderFactory {
             descriptor,
             credential,
             &metadata.model,
-            &ProviderTuning::from_metadata(metadata),
+            tuning,
         )
     }
 
@@ -5994,6 +5999,7 @@ impl AccountsProviderFactory {
     async fn resolve_provider(
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
+        tuning: &ProviderTuning,
     ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>), HaiderError> {
         let mut resolved = match self.resolve_account(&metadata.provider, None).await {
             Ok(resolved) => resolved,
@@ -6005,7 +6011,8 @@ impl AccountsProviderFactory {
                 let Some((resolved, credential)) = self.keyless_account(&metadata.provider) else {
                     return Err(error);
                 };
-                let provider = self.build_provider(&resolved.descriptor, credential, metadata)?;
+                let provider =
+                    self.build_provider(&resolved.descriptor, credential, metadata, tuning)?;
                 return Ok((resolved, provider, None));
             }
             Err(error) => return Err(error),
@@ -6033,7 +6040,7 @@ impl AccountsProviderFactory {
             KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME
         ) && resolved.descriptor.auth_method == AuthMethod::OAuth)
             .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
-        let provider = self.build_provider(&resolved.descriptor, credential, metadata)?;
+        let provider = self.build_provider(&resolved.descriptor, credential, metadata, tuning)?;
         Ok((resolved, provider, oauth_access_fingerprint))
     }
 }
@@ -6041,6 +6048,11 @@ impl AccountsProviderFactory {
 struct AccountsAttemptResolver {
     factory: AccountsProviderFactory,
     metadata: haider_protocol::session::SessionMetadataV1,
+    /// The tuning the turn RESOLVED with (W-B: including whether this pair
+    /// may declare its provider-native web tools). A mid-turn rotation or
+    /// auth-refresh rebuild must not silently re-enable a degraded
+    /// capability, so the resolver replays this tuning verbatim.
+    tuning: ProviderTuning,
     auth_refresh_attempted: AtomicBool,
     oauth_access_fingerprint: Option<[u8; 32]>,
 }
@@ -6049,11 +6061,13 @@ impl AccountsAttemptResolver {
     fn new(
         factory: AccountsProviderFactory,
         metadata: haider_protocol::session::SessionMetadataV1,
+        tuning: ProviderTuning,
         oauth_access_fingerprint: Option<[u8; 32]>,
     ) -> Self {
         Self {
             factory,
             metadata,
+            tuning,
             auth_refresh_attempted: AtomicBool::new(false),
             oauth_access_fingerprint,
         }
@@ -6120,6 +6134,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                                 &current,
                                 credential,
                                 &self.metadata,
+                                &self.tuning,
                             )?;
                             return Ok(haider_core::ProviderAttemptDecision::Retry {
                                 provider,
@@ -6180,9 +6195,12 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             return Ok(haider_core::ProviderAttemptDecision::Stop);
         };
         let credential = self.factory.resolve_secret(&resolved.descriptor).await?;
-        let provider =
-            self.factory
-                .build_provider(&resolved.descriptor, credential, &self.metadata)?;
+        let provider = self.factory.build_provider(
+            &resolved.descriptor,
+            credential,
+            &self.metadata,
+            &self.tuning,
+        )?;
         Ok(haider_core::ProviderAttemptDecision::Rotate(
             haider_core::ResolvedProviderAttempt {
                 provider,
@@ -6193,14 +6211,18 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::worker::ProviderFactory for AccountsProviderFactory {
-    async fn resolve_for_turn(
+impl AccountsProviderFactory {
+    /// The one resolution body. `tuning` is the turn's explicit tuning —
+    /// W-B's web-capability degrade is expressed there and nowhere else, so
+    /// the native declaration, the auth-refresh rebuild, and the rotation
+    /// rebuild all agree by construction.
+    async fn resolve_turn_tuned(
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
+        tuning: ProviderTuning,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
         let (resolved, provider, oauth_access_fingerprint) =
-            self.resolve_provider(metadata).await?;
+            self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
         let context_window = self.model_context_window(&metadata.provider, &metadata.model);
         Ok(crate::worker::ResolvedTurnProvider {
@@ -6215,10 +6237,46 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
                 Arc::new(AccountsAttemptResolver::new(
                     self.clone(),
                     metadata.clone(),
+                    tuning.clone(),
                     oauth_access_fingerprint,
                 )) as Arc<dyn haider_core::ProviderAttemptResolver>
             }),
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::worker::ProviderFactory for AccountsProviderFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
+        self.resolve_turn_tuned(metadata, ProviderTuning::from_metadata(metadata))
+            .await
+    }
+
+    /// W-B (decision 1, "local fallback on refusal"): once this session's
+    /// Anthropic SERVER web tools have 400ed, the next turn on an Anthropic
+    /// pair is built with `web_tools` CLEARED — no declaration, and the
+    /// advertisement seam hands the model the local `web_fetch` instead. The
+    /// latch is Anthropic-specific: a session that switches to another pair
+    /// still gets that pair's own native web capability.
+    async fn resolve_for_turn_with_web(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        degrade: crate::worker::WebCapabilityDegrade,
+    ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
+        let mut tuning = ProviderTuning::from_metadata(metadata);
+        if degrade.anthropic_web_tools
+            && matches!(
+                metadata.provider.as_str(),
+                haider_provider::ANTHROPIC_PROVIDER_NAME
+                    | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
+            )
+        {
+            tuning.web_tools = false;
+        }
+        self.resolve_turn_tuned(metadata, tuning).await
     }
 }
 

@@ -1,18 +1,21 @@
 //! W-B daemon-boundary web laws: the LOCAL `web_fetch` tool end to end
 //! through a live daemon run (broker journal + typed refusal results, LW6/
-//! LW7 daemon halves) and the per-pair advertisement seam (LW8 half).
-//! Loopback mock servers only — nothing here dials the real network.
+//! LW7 daemon halves), the lite-only CLIENT `web_search` tool and its
+//! session degrade (LW4 client half), and the per-pair advertisement seam
+//! including a live mid-session pair switch (LW8). Loopback mock servers and
+//! injected stubs only — nothing here dials the real network.
 
 #![allow(clippy::expect_used)]
 
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, TurnToolFactory,
-    WebCapabilityDegrade, WorkerDependencies, WorkerManager, advertised_tool_definitions,
+    WebCapabilityDegrade, WebSearchExecutor, WebSearchFailure, WorkerDependencies, WorkerManager,
+    advertised_tool_definitions,
 };
 use haider_core::{
-    SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
-    TurnAdmissionDisposition,
+    SessionCreateCommand, SessionSelectModelCommand, SessionSelectModelOutcome, SqliteStoreHandle,
+    StoreHandle, TurnAcceptCommand, TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -22,14 +25,29 @@ use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::RunState;
-use haider_provider::{FakeProvider, FakeStep, Provider};
-use std::sync::Arc;
+use haider_provider::{
+    ANTHROPIC_OAUTH_PROVIDER_NAME, FakeProvider, FakeStep, OPENAI_OAUTH_PROVIDER_NAME, Provider,
+};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
 
+/// Routes each turn to the fake registered under `metadata.provider`, so a
+/// mid-session pair switch is an OBSERVED landing rather than an inference.
+/// `provider_name` mirrors the session metadata (the R6 contract), which is
+/// exactly what the advertisement seam derives from.
 struct FixedProviderFactory {
-    provider: Arc<FakeProvider>,
+    providers: HashMap<String, Arc<FakeProvider>>,
+}
+
+impl FixedProviderFactory {
+    fn single(pair: &str, provider: Arc<FakeProvider>) -> Self {
+        Self {
+            providers: HashMap::from([(pair.to_owned(), provider)]),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -38,8 +56,15 @@ impl ProviderFactory for FixedProviderFactory {
         &self,
         metadata: &SessionMetadataV1,
     ) -> Result<ResolvedTurnProvider, HaiderError> {
+        let provider = self.providers.get(&metadata.provider).ok_or_else(|| {
+            HaiderError::new(
+                haider_protocol::error::ErrorCode::ProviderError,
+                format!("no injected fake for provider {}", metadata.provider),
+                false,
+            )
+        })?;
         Ok(ResolvedTurnProvider {
-            provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
+            provider: Arc::clone(provider) as Arc<dyn Provider>,
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
             context_window: None,
@@ -48,6 +73,51 @@ impl ProviderFactory for FixedProviderFactory {
             rotation_budget_consumed: false,
             attempt_resolver: None,
         })
+    }
+}
+
+/// Scripted stand-in for the subscription search executor: records every
+/// call and answers from a queue, so the alpha/search endpoint is never
+/// dialed and a 404/410 degrade is expressible as a fixture.
+#[derive(Default)]
+struct StubWebSearch {
+    calls: Mutex<Vec<(String, String, String)>>,
+    answers: Mutex<VecDeque<Result<String, WebSearchFailure>>>,
+}
+
+impl StubWebSearch {
+    fn with_answers(answers: Vec<Result<String, WebSearchFailure>>) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            answers: Mutex::new(answers.into()),
+        })
+    }
+
+    fn calls(&self) -> Vec<(String, String, String)> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl WebSearchExecutor for StubWebSearch {
+    async fn search(
+        &self,
+        model: &str,
+        session_id: &str,
+        query: &str,
+    ) -> Result<String, WebSearchFailure> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((model.to_owned(), session_id.to_owned(), query.to_owned()));
+        self.answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| Ok(String::from("no scripted answer")))
     }
 }
 
@@ -60,20 +130,48 @@ struct WebWorld {
 }
 
 impl WebWorld {
-    /// Boots a live daemon world whose session carries the EXEC override —
-    /// the auto-mode shape under which network fetches auto-allow.
+    /// Boots a live daemon world on the `fake` pair whose session carries the
+    /// EXEC override — the auto-mode shape under which network fetches
+    /// auto-allow.
     async fn boot(prefix: &str, provider: Arc<FakeProvider>) -> Self {
+        Self::boot_with(
+            prefix,
+            "fake",
+            "fake-model",
+            FixedProviderFactory::single("fake", provider),
+            None,
+        )
+        .await
+    }
+
+    /// The general form: an explicit starting pair, an explicit routing
+    /// factory, and an optional injected `web_search` executor.
+    async fn boot_with(
+        prefix: &str,
+        pair: &str,
+        model: &str,
+        factory: FixedProviderFactory,
+        web_search: Option<Arc<dyn WebSearchExecutor>>,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp profile");
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
         std::mem::forget(root);
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        hub.install_creatable_providers(
+            factory
+                .providers
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<String>>(),
+        )
+        .expect("install creatable providers");
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
-                provider_factory: Arc::new(FixedProviderFactory { provider }),
+                provider_factory: Arc::new(factory),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,
-                web_search: None,
+                web_search,
             },
             false,
         );
@@ -91,8 +189,8 @@ impl WebWorld {
             request_json: format!(r#"{{"session":"{prefix}"}}"#),
             session_id: session_id.clone(),
             cwd,
-            provider: "fake".into(),
-            model: "fake-model".into(),
+            provider: pair.into(),
+            model: model.into(),
             max_tokens: 4096,
             permission_overrides: Some(SessionPermissionOverridesV1 {
                 allow_writes: false,
@@ -115,7 +213,45 @@ impl WebWorld {
         }
     }
 
+    /// Commits a mid-session pair switch through the durable selection path
+    /// (the same command the RPC surface issues).
+    async fn switch_pair(&self, command_id: &str, provider: &str, model: &str) {
+        let worker_generation = self.store.worker_generation();
+        let request_json = serde_json::json!({
+            "session_id": self.session_id,
+            "worker_generation": worker_generation,
+            "model": model,
+            "provider": provider,
+        })
+        .to_string();
+        let outcome = self
+            .store
+            .select_session_model(SessionSelectModelCommand {
+                command_id: command_id.to_owned(),
+                request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                request_json,
+                session_id: self.session_id.clone(),
+                worker_generation,
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                event_id: EventId::new(format!("{command_id}-event")),
+                device_id: self.device_id.clone(),
+            })
+            .await
+            .expect("select model");
+        assert!(
+            matches!(outcome, SessionSelectModelOutcome::Committed { .. }),
+            "the switch must commit before the next turn"
+        );
+    }
+
     async fn run_turn(&self, label: &str, text: &str) -> RunId {
+        self.run_turn_until(label, text, RunState::Done).await
+    }
+
+    /// Runs one turn and waits for an EXPECTED terminal — `Done` for the
+    /// happy paths, `Failed` for the provider-refusal law.
+    async fn run_turn_until(&self, label: &str, text: &str, terminal: RunState) -> RunId {
         let run_id = RunId::new(format!("{label}-run"));
         let accepted = self
             .hub
@@ -154,7 +290,9 @@ impl WebWorld {
                 if events.iter().any(|event| {
                     event.run_id.as_ref() == Some(&run_id)
                         && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                            |payload| matches!(payload, EventPayload::RunState(RunState::Done)),
+                            |payload| {
+                                matches!(payload, EventPayload::RunState(state) if state == terminal)
+                            },
                         )
                 }) {
                     break;
@@ -163,7 +301,7 @@ impl WebWorld {
             }
         })
         .await
-        .expect("run reaches Done");
+        .unwrap_or_else(|_| panic!("run reaches {terminal:?}"));
         run_id
     }
 
@@ -357,5 +495,395 @@ fn web_fetch_advertises_on_every_pair_except_first_party_anthropic() {
             !child.iter().any(|tool| tool.name == "todo_write"),
             "the child filter still applies beside the pair filter"
         );
+        // Decision 1's "local fallback on refusal": once this session's
+        // SERVER web tools 400ed, the local tool returns to the pack.
+        let fallback = advertised_tool_definitions(
+            &factory,
+            false,
+            provider,
+            WebCapabilityDegrade {
+                anthropic_web_tools: true,
+                openai_alpha_search: false,
+            },
+        );
+        assert!(
+            fallback.iter().any(|tool| tool.name == "web_fetch"),
+            "`{provider}` falls back to the local tool once the server tools degrade"
+        );
     }
+}
+
+/// LAW (LW4 client half, advertisement): the CLIENT `web_search` function
+/// tool exists for responses-lite pairs ONLY — every other family either has
+/// a provider-native search or honestly none — children inherit the same
+/// derivation, and a 404/410 from the unofficial endpoint takes it out of
+/// the pack for the rest of the session.
+#[test]
+fn client_web_search_advertises_on_lite_only_and_a_gone_endpoint_unadvertises_it() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let lite = advertised_tool_definitions(
+        &factory,
+        false,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        WebCapabilityDegrade::default(),
+    );
+    assert!(
+        lite.iter().any(|tool| tool.name == "web_search"),
+        "the responses-lite pair carries the client search"
+    );
+    // Decision 8: subagents inherit the same derivation.
+    let child = advertised_tool_definitions(
+        &factory,
+        true,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        WebCapabilityDegrade::default(),
+    );
+    assert!(
+        child.iter().any(|tool| tool.name == "web_search"),
+        "a delegated child on the lite pair keeps the client search"
+    );
+    for provider in [
+        "openai",
+        "anthropic",
+        "anthropic-oauth",
+        "openai-compatible",
+        "kimi-oauth",
+        "gemini",
+        "bedrock",
+        "vertex",
+        "fake",
+    ] {
+        let pack =
+            advertised_tool_definitions(&factory, false, provider, WebCapabilityDegrade::default());
+        assert!(
+            !pack.iter().any(|tool| tool.name == "web_search"),
+            "`{provider}` must NOT carry the lite-only client search"
+        );
+    }
+    let degraded = advertised_tool_definitions(
+        &factory,
+        false,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        WebCapabilityDegrade {
+            anthropic_web_tools: false,
+            openai_alpha_search: true,
+        },
+    );
+    assert!(
+        !degraded.iter().any(|tool| tool.name == "web_search"),
+        "a gone alpha/search endpoint stops the advertisement (no retry storm)"
+    );
+    // The degrade is capability-scoped: the local fetch is untouched.
+    assert!(degraded.iter().any(|tool| tool.name == "web_fetch"));
+}
+
+/// LAW (LW4 client half, execution): on a responses-lite pair the client
+/// `web_search` call reaches the subscription executor with THIS turn's
+/// model and session id, and its answer lands in the tool result bounded by
+/// the 32 KiB cap with an honest truncation marker.
+#[tokio::test]
+async fn live_web_search_executes_on_lite_with_the_turn_identity_and_bounds_its_text() {
+    let long_answer = "s".repeat(40 * 1024);
+    let executor = StubWebSearch::with_answers(vec![Ok(long_answer)]);
+    let script = vec![
+        FakeStep::EmitToolCall {
+            call_id: "search-one".into(),
+            name: "web_search".into(),
+            args: serde_json::json!({ "query": "rust sse decoding" }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "search-one".into(),
+        },
+        FakeStep::EmitText {
+            text: "done".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ];
+    let fake = Arc::new(FakeProvider::new(script));
+    let world = WebWorld::boot_with(
+        "wb-search",
+        OPENAI_OAUTH_PROVIDER_NAME,
+        "gpt-5.6-sol",
+        FixedProviderFactory::single(OPENAI_OAUTH_PROVIDER_NAME, Arc::clone(&fake)),
+        Some(Arc::clone(&executor) as Arc<dyn WebSearchExecutor>),
+    )
+    .await;
+    world.run_turn("wb-search", "search the web").await;
+
+    // The tool WAS advertised to the model on this pair.
+    let requests = fake.requests();
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "web_search"),
+        "the lite pair advertises the client search"
+    );
+
+    // Exactly one execution, carrying the turn's identity.
+    assert_eq!(
+        executor.calls(),
+        vec![(
+            "gpt-5.6-sol".to_owned(),
+            "wb-search-session".to_owned(),
+            "rust sse decoding".to_owned(),
+        )]
+    );
+
+    let result = world
+        .typed_payloads()
+        .await
+        .into_iter()
+        .find_map(|payload| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "search-one" => Some(result),
+            _ => None,
+        })
+        .expect("search result");
+    assert!(result.truncated, "40 KiB of answer exceeds the 32 KiB cap");
+    assert!(
+        result.preview.ends_with("[web_search: output truncated]"),
+        "the cap is honest: {}",
+        &result.preview[result.preview.len().saturating_sub(80)..]
+    );
+    assert!(result.preview.len() <= 32 * 1024 + 64);
+}
+
+/// LAW (LW4 client half, degrade): a 404/410 from the unofficial
+/// alpha/search endpoint is a TYPED tool result, not a turn failure, and it
+/// latches the session capability off — the NEXT turn's advertised pack no
+/// longer contains `web_search`, so the model cannot start a retry storm.
+#[tokio::test]
+async fn a_gone_alpha_search_endpoint_degrades_the_session_for_the_next_turn() {
+    let executor = StubWebSearch::with_answers(vec![Err(WebSearchFailure {
+        message: "the subscription search endpoint answered HTTP 404".into(),
+        degraded: true,
+    })]);
+    let script = vec![
+        FakeStep::EmitToolCall {
+            call_id: "search-gone".into(),
+            name: "web_search".into(),
+            args: serde_json::json!({ "query": "anything" }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "search-gone".into(),
+        },
+        FakeStep::EmitText {
+            text: "gave up".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "second turn".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ];
+    let fake = Arc::new(FakeProvider::new(script));
+    let world = WebWorld::boot_with(
+        "wb-gone",
+        OPENAI_OAUTH_PROVIDER_NAME,
+        "gpt-5.6-sol",
+        FixedProviderFactory::single(OPENAI_OAUTH_PROVIDER_NAME, Arc::clone(&fake)),
+        Some(Arc::clone(&executor) as Arc<dyn WebSearchExecutor>),
+    )
+    .await;
+    world.run_turn("wb-gone-one", "search the web").await;
+
+    let result = world
+        .typed_payloads()
+        .await
+        .into_iter()
+        .find_map(|payload| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "search-gone" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("gone-endpoint result");
+    assert!(
+        result.preview.starts_with("web_search failed:"),
+        "a dead endpoint is a typed result: {}",
+        result.preview
+    );
+    assert!(result.preview.contains("404"), "the reason surfaces");
+
+    world.run_turn("wb-gone-two", "try again").await;
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 3, "two turns, the first with a tool round");
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "web_search"),
+        "turn 1 still advertised the capability"
+    );
+    assert!(
+        !requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "web_search"),
+        "turn 2 must not re-offer the gone capability"
+    );
+    assert_eq!(
+        executor.calls().len(),
+        1,
+        "the endpoint is probed once per session, never in a storm"
+    );
+}
+
+/// LAW (LW8): the per-turn tool advertisement derives from the RESOLVED
+/// pair, so a mid-session switch reshapes it on the NEXT turn — in BOTH
+/// directions at once. Leaving responses-lite drops the client `web_search`;
+/// arriving on a first-party Anthropic pair also drops the local
+/// `web_fetch`, whose name the SERVER tool owns there.
+#[tokio::test]
+async fn pair_switch_reshapes_the_web_tool_advertisement_on_the_next_turn() {
+    let lite = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "from lite".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let anthropic = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "from anthropic".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let world = WebWorld::boot_with(
+        "wb-switch",
+        OPENAI_OAUTH_PROVIDER_NAME,
+        "gpt-5.6-sol",
+        FixedProviderFactory {
+            providers: HashMap::from([
+                (OPENAI_OAUTH_PROVIDER_NAME.to_owned(), Arc::clone(&lite)),
+                (
+                    ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+                    Arc::clone(&anthropic),
+                ),
+            ]),
+        },
+        Some(StubWebSearch::with_answers(Vec::new()) as Arc<dyn WebSearchExecutor>),
+    )
+    .await;
+
+    world.run_turn("wb-switch-one", "first").await;
+    let lite_tools = &lite.requests()[0].tools;
+    assert!(
+        lite_tools.iter().any(|tool| tool.name == "web_search"),
+        "the lite pair carries the client search"
+    );
+    assert!(
+        lite_tools.iter().any(|tool| tool.name == "web_fetch"),
+        "…and the universal local fetch"
+    );
+
+    world
+        .switch_pair(
+            "wb-switch-select",
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            "claude-web",
+        )
+        .await;
+
+    world.run_turn("wb-switch-two", "second").await;
+    let anthropic_tools = &anthropic.requests()[0].tools;
+    assert!(
+        !anthropic_tools.iter().any(|tool| tool.name == "web_search"),
+        "the client search does not follow the session off responses-lite"
+    );
+    assert!(
+        !anthropic_tools.iter().any(|tool| tool.name == "web_fetch"),
+        "the anthropic pair withholds the local fetch — the SERVER tool owns the name"
+    );
+    assert_eq!(lite.requests().len(), 1, "turn 2 did not land on lite");
+}
+
+/// LAW (W-B decision 1, "local fallback on refusal" — daemon half): an org
+/// can disable the Anthropic server web tools, and the DECLARED tool then
+/// 400s. That failure surfaces verbatim as an errored turn, AND it latches
+/// the session's web degrade — so the next turn stops declaring the server
+/// tools and hands the model the local `web_fetch` instead. The latch needs
+/// an INVALID-REQUEST refusal: a rate limit or transport blip must never
+/// spend the capability.
+#[tokio::test]
+async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch() {
+    let script = vec![
+        // Turn 1: a NON-refusal failure — the capability survives it.
+        // (Not a retryable kind: this law is about the discriminator, not
+        // about the retry ladder.)
+        FakeStep::Error {
+            kind: haider_provider::ProviderErrorKind::ContextExceeded,
+            message: "prompt is too long".into(),
+            retry_after_ms: None,
+        },
+        // Turn 2: the org-disabled shape.
+        FakeStep::Error {
+            kind: haider_provider::ProviderErrorKind::InvalidRequest,
+            message: "tool `web_search_20250305` is not available for this organization".into(),
+            retry_after_ms: None,
+        },
+        // Turn 3: runs on the degraded declaration.
+        FakeStep::EmitText {
+            text: "fetched locally".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ];
+    let fake = Arc::new(FakeProvider::new(script));
+    let world = WebWorld::boot_with(
+        "wb-degrade",
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        "claude-web",
+        FixedProviderFactory::single(ANTHROPIC_OAUTH_PROVIDER_NAME, Arc::clone(&fake)),
+        None,
+    )
+    .await;
+
+    world
+        .run_turn_until("wb-degrade-one", "first", RunState::Errored)
+        .await;
+    world
+        .run_turn_until("wb-degrade-two", "second", RunState::Errored)
+        .await;
+    world.run_turn("wb-degrade-three", "third").await;
+
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "web_fetch"),
+        "the server tool owns the name while the capability is healthy"
+    );
+    assert!(
+        !requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "web_fetch"),
+        "a non-refusal failure must not spend the capability"
+    );
+    assert!(
+        requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "web_fetch"),
+        "after the refusal the pair falls back to the LOCAL fetch tool"
+    );
 }

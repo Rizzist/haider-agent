@@ -1046,6 +1046,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             fast: false,
             created_at_ms: 1,
         },
+        ProviderTuning::default(),
         None,
     );
 
@@ -1380,7 +1381,10 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         created_at_ms: 1,
     };
     let (_, _, openai_access_fingerprint) = factory
-        .resolve_provider(&metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"))
+        .resolve_provider(
+            &metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"),
+            &ProviderTuning::default(),
+        )
         .await
         .expect("OpenAI OAuth fingerprint handoff");
     assert_eq!(
@@ -1388,7 +1392,10 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         Some(*blake3::hash(b"OPENAI_FACTORY_ACCESS_SENTINEL_18a4").as_bytes())
     );
     let (_, _, anthropic_access_fingerprint) = factory
-        .resolve_provider(&metadata(ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-oauth"))
+        .resolve_provider(
+            &metadata(ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-oauth"),
+            &ProviderTuning::default(),
+        )
         .await
         .expect("Anthropic conservative OAuth handoff");
     assert_eq!(anthropic_access_fingerprint, None);
@@ -7808,4 +7815,161 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         1
     );
     store.close().await.expect("close store");
+}
+
+/// Records the [`ProviderTuning`] each construction was given, so the W-B
+/// web-capability degrade is an OBSERVED build input rather than an
+/// inference about a downstream request body.
+struct TuningRecordingBuilder {
+    tunings: StdMutex<Vec<(String, ProviderTuning)>>,
+}
+
+impl TuningRecordingBuilder {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tunings: StdMutex::new(Vec::new()),
+        })
+    }
+
+    fn recorded(&self) -> Vec<(String, ProviderTuning)> {
+        self.tunings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl AccountProviderBuilder for TuningRecordingBuilder {
+    fn providers(&self) -> std::collections::BTreeSet<String> {
+        haider_provider::BUILTIN_PROVIDER_NAMES
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn build(
+        &self,
+        _provider: &str,
+        _credential: haider_accounts::SecretHandle,
+        _model: &str,
+        _alias: &CredentialAlias,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        Ok(Arc::new(haider_provider::FakeProvider::new(Vec::new())) as Arc<dyn Provider>)
+    }
+
+    fn build_tuned(
+        &self,
+        _profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        _credential: haider_accounts::SecretHandle,
+        _model: &str,
+        tuning: &ProviderTuning,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        self.tunings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((descriptor.provider.clone(), tuning.clone()));
+        Ok(Arc::new(haider_provider::FakeProvider::new(Vec::new())) as Arc<dyn Provider>)
+    }
+}
+
+/// LAW (W-B decision 1, "local fallback on refusal" — native half): an
+/// ordinary turn is built with `web_tools` ON, so the pair declares its
+/// provider-native web tools. Once the session latches the Anthropic
+/// server-tool degrade, the NEXT Anthropic turn is built with `web_tools`
+/// CLEARED — and the latch is pair-scoped: a session that switches to
+/// OpenAI still gets that pair's own native web capability.
+///
+/// MUTATION CHECK: drop the `tuning.web_tools = false` assignment in
+/// `AccountsProviderFactory::resolve_for_turn_with_web`. Expected runtime
+/// failure: the third assertion below still sees `web_tools: true`.
+#[tokio::test]
+async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs_only() {
+    let vault = Arc::new(MemoryVault::default());
+    let anthropic_alias = CredentialAlias::new("anthropic-web-degrade");
+    let openai_alias = CredentialAlias::new("openai-web-degrade");
+    for alias in [&anthropic_alias, &openai_alias] {
+        vault
+            .put(alias, b"web-degrade-fixture-secret")
+            .unwrap_or_else(|error| panic!("{error:?}"));
+    }
+    let snapshot = Arc::new(StdMutex::new(vec![
+        CredentialDescriptor {
+            alias: anthropic_alias,
+            provider: ANTHROPIC_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "anthropic fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+        CredentialDescriptor {
+            alias: openai_alias,
+            provider: OPENAI_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "openai fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+    ]));
+    let builder = TuningRecordingBuilder::new();
+    let factory = AccountsProviderFactory::new(
+        snapshot,
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::clone(&builder) as Arc<dyn AccountProviderBuilder>,
+    );
+    let metadata = |provider: &str| haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/haider-web-degrade".into(),
+        provider: provider.into(),
+        model: "web-test".into(),
+        max_tokens: 64,
+        permission_overrides: None,
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        created_at_ms: 1,
+    };
+    let clean = crate::worker::WebCapabilityDegrade::default();
+    let latched = crate::worker::WebCapabilityDegrade {
+        anthropic_web_tools: true,
+        openai_alpha_search: false,
+    };
+
+    factory
+        .resolve_for_turn_with_web(&metadata(ANTHROPIC_PROVIDER_NAME), clean)
+        .await
+        .expect("undegraded anthropic turn");
+    factory
+        .resolve_for_turn(&metadata(ANTHROPIC_PROVIDER_NAME))
+        .await
+        .expect("plain resolution keeps the native declaration");
+    factory
+        .resolve_for_turn_with_web(&metadata(ANTHROPIC_PROVIDER_NAME), latched)
+        .await
+        .expect("degraded anthropic turn");
+    factory
+        .resolve_for_turn_with_web(&metadata(OPENAI_PROVIDER_NAME), latched)
+        .await
+        .expect("the SAME latch on a different pair");
+
+    let recorded = builder.recorded();
+    assert_eq!(recorded.len(), 4);
+    assert!(
+        recorded[0].1.web_tools,
+        "an undegraded anthropic turn declares its server web tools"
+    );
+    assert!(
+        recorded[1].1.web_tools,
+        "the plain resolution path is unchanged"
+    );
+    assert!(
+        !recorded[2].1.web_tools,
+        "a latched session stops declaring the server web tools"
+    );
+    assert!(
+        recorded[3].1.web_tools,
+        "the latch is anthropic-scoped: another pair keeps its own native search"
+    );
 }

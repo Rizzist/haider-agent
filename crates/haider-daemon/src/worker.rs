@@ -1551,6 +1551,21 @@ impl Drop for ActiveTurn {
     }
 }
 
+/// W-B: does a turn failure carry the provider's INVALID-REQUEST kind? The
+/// core actor stamps the kind into the error details; that is the only
+/// honest discriminator for "the request shape was refused" as opposed to
+/// auth, rate limits, or transport. Used exclusively to decide whether to
+/// stop re-declaring the Anthropic server web tools for this session — the
+/// error itself is never rewritten.
+fn is_invalid_request_failure(error: &HaiderError) -> bool {
+    error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("provider_error_kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("InvalidRequest")
+}
+
 trait FutureTurn:
     std::future::Future<Output = Result<haider_core::TurnOutcome, HaiderError>> + Send
 {
@@ -1888,10 +1903,28 @@ async fn run_supervisor(
                 }
                 outcome = turn.outcome.as_mut() => {
                     if let Some(mut finished) = active.take() {
-                        let (outcome_state, drive_error) = match outcome {
-                            Ok(outcome) => (Some(outcome.state), None),
-                            Err(error) => (None, Some(error)),
+                        let (outcome_state, outcome_error, drive_error) = match outcome {
+                            Ok(outcome) => (Some(outcome.state), outcome.error, None),
+                            Err(error) => (None, None, Some(error)),
                         };
+                        // W-B (decision 1, "local fallback on refusal"): an
+                        // org can disable the Anthropic server web tools, and
+                        // the DECLARED tool then 400s every turn forever. A
+                        // turn that declared them and ended on an INVALID
+                        // REQUEST latches the session degrade: the error still
+                        // surfaces verbatim, but the NEXT turn declares none
+                        // and advertises the local `web_fetch` instead. A
+                        // committed `Errored` outcome is the ordinary shape
+                        // here; a drive error is the same fact escaping
+                        // before the turn could commit one.
+                        if finished.anthropic_web_tools
+                            && outcome_error
+                                .as_ref()
+                                .or(drive_error.as_ref())
+                                .is_some_and(is_invalid_request_failure)
+                        {
+                            lease.hub().degrade_anthropic_web_tools(lease.session_id());
+                        }
                         if let Some(dispatcher) = finished.dispatcher.take()
                             && let Err(error) = dispatcher.close().await
                         {
