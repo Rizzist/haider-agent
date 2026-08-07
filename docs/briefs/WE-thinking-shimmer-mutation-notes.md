@@ -91,3 +91,29 @@ Covers the four brief-required laws: sweep advance (LE2), scope restriction
 After all four reverts: `cargo test -p haider-tui --test
 we_thinking_shimmer_tests` → `7 passed`; `cargo fmt --all -- --check`
 clean; working tree clean.
+
+## Review of record (coordinator, executed post-lane, Opus 4.8)
+
+Read the branch diff (style.rs shimmer_inks/shimmer_ink + pure
+shimmer_centre/shimmer_level, render.rs per-glyph spans + call sites,
+app/runtime truecolor plumbing, 7 laws). Two structural suspects probed;
+BOTH properly observed:
+
+1. **Mid-blend contrast (LE5)** — the mid ink `bright.over(gold, 500)` is
+   a NEW blend, not a pre-existing floor-verified token. LE5 checks all
+   three inks against the 3.2:1 accent floor on every ThemeKey AND
+   asserts a strict brightness ladder (base < mid < bright contrast), so
+   the blend is genuinely verified on both grounds. No gap.
+2. **Render call-site truecolor wiring** — the class that bit G3 (law
+   tests the helper, render passes a literal). CONFIRMED observed:
+   `tail_inks` drives the full `draw()` path and LE6 sets
+   `model.truecolor=false` through it. Executed the mutation (session-tail
+   call site `model.truecolor` → literal `true`): LE6 FAILED with the
+   mid-code panic ("running 1 test" observed), reverted. The wiring is
+   pinned end to end.
+
+Lane's 4 kills + 7 laws are comprehensive and driven through the real
+render buffer, not helper-only. Deviation 3 (elapsed·esc suffix not
+wired) is honestly disclosed and matches the brief's "optional /
+elapsed-dependent" scoping — the animation, the must-have, shipped.
+No unobserved gate; no review pin warranted. Campaign ACCEPTED.
