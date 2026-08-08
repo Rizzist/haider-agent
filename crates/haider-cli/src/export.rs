@@ -1,0 +1,1161 @@
+//! W-C M3 — `haider export`: a pure rendering pass over the durable journal.
+//!
+//! The journal IS the transcript; export never captures anything new. It reads
+//! the committed conversation-tree facts (`NodeCommitted` user/assistant/tool
+//! nodes) for a session and renders them to a chosen format:
+//!
+//! - `markdown` (default) — a readable, shareable transcript;
+//! - `json` — the fact list projected to a stable public schema;
+//! - `codex` — a codex-cli rollout JSONL (filename uuid == `session_meta` id);
+//! - `claude-code` — a uuid/parentUuid-chained JSONL in the native Anthropic
+//!   message shape (highest fidelity — we already speak it);
+//! - `opencode` — a guarded SQLite INSERT (behind `--confirm`, refused if the
+//!   db is missing or locked).
+//!
+//! `--masked` runs the P1 masking pass (identities hidden) — our streamer-safe
+//! differentiator. The uuid-v7 / uuid-v4 identities and every timestamp are
+//! DERIVED deterministically from the session's own id + `created_at` fact, so
+//! a given session always exports to the same bytes (which is also what makes
+//! the "never overwrite a foreign session file" collision refusal meaningful).
+
+use std::path::{Path, PathBuf};
+
+use haider_protocol::EventPayload;
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::history::NodeKind;
+use haider_tui::notify::mask_text;
+use serde_json::{Value, json};
+
+/// The session-level facts an export needs, sourced from the durable
+/// `SessionMetadataV1` (cwd/provider/model/created_at) and the daemon title.
+#[derive(Debug, Clone)]
+pub struct ExportMeta {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub cwd: String,
+    pub provider: String,
+    pub model: String,
+    pub created_at_ms: u64,
+    /// The exporting harness version, stamped into foreign `*_meta` records.
+    pub cli_version: String,
+}
+
+/// A projected transcript turn — the reduced, format-agnostic unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Turn {
+    User {
+        text: String,
+        at_ms: u64,
+    },
+    Assistant {
+        text: String,
+        at_ms: u64,
+    },
+    Tool {
+        name: String,
+        summary: String,
+        at_ms: u64,
+    },
+}
+
+impl Turn {
+    fn at_ms(&self) -> u64 {
+        match self {
+            Self::User { at_ms, .. } | Self::Assistant { at_ms, .. } | Self::Tool { at_ms, .. } => {
+                *at_ms
+            }
+        }
+    }
+}
+
+/// The projected session — the single source every renderer reads.
+#[derive(Debug, Clone)]
+pub struct SessionExport {
+    pub meta: ExportMeta,
+    pub turns: Vec<Turn>,
+}
+
+/// The export formats. `markdown` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Markdown,
+    Json,
+    Codex,
+    ClaudeCode,
+    OpenCode,
+}
+
+impl Format {
+    /// Parse a `--format` value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "markdown" | "md" => Ok(Self::Markdown),
+            "json" => Ok(Self::Json),
+            "codex" => Ok(Self::Codex),
+            "claude-code" | "claude" => Ok(Self::ClaudeCode),
+            "opencode" => Ok(Self::OpenCode),
+            other => Err(format!(
+                "unknown format `{other}` (markdown|json|codex|claude-code|opencode)"
+            )),
+        }
+    }
+}
+
+/// A hard failure surfaced to the CLI.
+#[derive(Debug)]
+pub enum ExportError {
+    /// A foreign session file already exists — never overwrite it.
+    Collision(String),
+    /// The opencode db is absent (we never create a harness's store).
+    OpenCodeMissing(String),
+    /// The opencode db is locked (a live opencode) — never risk corruption.
+    OpenCodeLocked(String),
+    /// The opencode writer needs an explicit confirmation flag.
+    OpenCodeUnconfirmed,
+    /// A filesystem/sqlite IO failure.
+    Io(String),
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Collision(path) => write!(
+                formatter,
+                "refusing to overwrite an existing session file: {path}"
+            ),
+            Self::OpenCodeMissing(path) => {
+                write!(formatter, "opencode database not found: {path}")
+            }
+            Self::OpenCodeLocked(path) => write!(
+                formatter,
+                "opencode database is locked (close opencode and retry): {path}"
+            ),
+            Self::OpenCodeUnconfirmed => write!(
+                formatter,
+                "exporting into opencode's live database mutates a foreign app's store — pass --confirm to proceed"
+            ),
+            Self::Io(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Projection
+// ---------------------------------------------------------------------------
+
+impl SessionExport {
+    /// Project the durable envelopes into a transcript. Only committed
+    /// conversation-tree nodes (`UserTurn` / `AssistantCommit` / `ToolExchange`)
+    /// become turns; every other fact is skipped (an export is a transcript,
+    /// not a raw journal dump). Envelopes are read in `seq` order.
+    #[must_use]
+    pub fn project(meta: ExportMeta, events: &[RawEnvelope]) -> Self {
+        let mut ordered: Vec<&RawEnvelope> = events.iter().collect();
+        ordered.sort_by_key(|envelope| envelope.seq);
+        let mut turns = Vec::new();
+        for envelope in ordered {
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            let EventPayload::NodeCommitted(node) = payload else {
+                continue;
+            };
+            let at_ms = envelope.committed_at_ms;
+            match node.kind {
+                NodeKind::UserTurn { text, .. } => turns.push(Turn::User { text, at_ms }),
+                NodeKind::AssistantCommit { text, .. } => {
+                    turns.push(Turn::Assistant { text, at_ms });
+                }
+                NodeKind::ToolExchange { tool, summary, .. } => {
+                    turns.push(Turn::Tool {
+                        name: tool,
+                        summary,
+                        at_ms,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Self { meta, turns }
+    }
+
+    fn title(&self, masked: bool) -> Option<String> {
+        self.meta
+            .title
+            .as_deref()
+            .map(|title| apply_mask(title, masked))
+    }
+
+    fn text(&self, raw: &str, masked: bool) -> String {
+        apply_mask(raw, masked)
+    }
+
+    /// The last user prompt (for foreign picker rows), masked as requested.
+    fn last_user_prompt(&self, masked: bool) -> Option<String> {
+        self.turns.iter().rev().find_map(|turn| match turn {
+            Turn::User { text, .. } => Some(apply_mask(text, masked)),
+            _ => None,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Native renderers
+    // -----------------------------------------------------------------------
+
+    /// A readable markdown transcript — the shareable artifact.
+    #[must_use]
+    pub fn to_markdown(&self, masked: bool) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("# Session {}\n\n", self.meta.session_id));
+        if let Some(title) = self.title(masked) {
+            out.push_str(&format!("**{title}**\n\n"));
+        }
+        out.push_str(&format!(
+            "- workspace: `{}`\n- model: `{}` · `{}`\n- created: {}\n\n",
+            self.meta.cwd,
+            self.meta.provider,
+            self.meta.model,
+            iso8601_ms(self.meta.created_at_ms),
+        ));
+        out.push_str("---\n\n");
+        for turn in &self.turns {
+            match turn {
+                Turn::User { text, at_ms } => {
+                    out.push_str(&format!("## User · {}\n\n", iso8601_ms(*at_ms)));
+                    out.push_str(&self.text(text, masked));
+                    out.push_str("\n\n");
+                }
+                Turn::Assistant { text, at_ms } => {
+                    out.push_str(&format!("## Assistant · {}\n\n", iso8601_ms(*at_ms)));
+                    out.push_str(&self.text(text, masked));
+                    out.push_str("\n\n");
+                }
+                Turn::Tool { name, summary, .. } => {
+                    out.push_str(&format!(
+                        "> tool `{}` — {}\n\n",
+                        name,
+                        self.text(summary, masked)
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// The structured export schema — a documented, stable public shape (NOT
+    /// the raw envelope).
+    #[must_use]
+    pub fn to_json(&self, masked: bool) -> String {
+        let turns: Vec<Value> = self
+            .turns
+            .iter()
+            .map(|turn| match turn {
+                Turn::User { text, at_ms } => json!({
+                    "role": "user",
+                    "text": self.text(text, masked),
+                    "at_ms": at_ms,
+                }),
+                Turn::Assistant { text, at_ms } => json!({
+                    "role": "assistant",
+                    "text": self.text(text, masked),
+                    "at_ms": at_ms,
+                }),
+                Turn::Tool {
+                    name,
+                    summary,
+                    at_ms,
+                } => json!({
+                    "role": "tool",
+                    "name": name,
+                    "summary": self.text(summary, masked),
+                    "at_ms": at_ms,
+                }),
+            })
+            .collect();
+        let document = json!({
+            "schema": "haider.export.v1",
+            "session_id": self.meta.session_id,
+            "title": self.title(masked),
+            "cwd": self.meta.cwd,
+            "provider": self.meta.provider,
+            "model": self.meta.model,
+            "created_at_ms": self.meta.created_at_ms,
+            "masked": masked,
+            "turns": turns,
+        });
+        serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-harness renderers
+    // -----------------------------------------------------------------------
+
+    /// The codex rollout export: a `rollout-*.jsonl` (filename uuid ==
+    /// `session_meta` id) plus a `history.jsonl` append.
+    #[must_use]
+    pub fn to_codex(&self, masked: bool) -> CodexExport {
+        let uuid = derive_uuid(&self.meta.session_id, self.meta.created_at_ms, 7);
+        let stamp = filename_stamp(self.meta.created_at_ms);
+        let (y, m, d) = civil_date(self.meta.created_at_ms);
+        let relpath = format!("sessions/{y:04}/{m:02}/{d:02}/rollout-{stamp}-{uuid}.jsonl");
+        let created_iso = iso8601_ms(self.meta.created_at_ms);
+
+        let mut lines: Vec<String> = Vec::new();
+        // Line 1: session_meta — id MUST equal the filename uuid.
+        lines.push(
+            json!({
+                "timestamp": created_iso,
+                "type": "session_meta",
+                "payload": {
+                    "session_id": uuid,
+                    "id": uuid,
+                    "timestamp": created_iso,
+                    "cwd": self.meta.cwd,
+                    "originator": "haider",
+                    "cli_version": self.meta.cli_version,
+                    "source": "export",
+                    "model_provider": self.meta.provider,
+                    "history_mode": "legacy",
+                }
+            })
+            .to_string(),
+        );
+        let mut history = Vec::new();
+        for turn in &self.turns {
+            let iso = iso8601_ms(turn.at_ms());
+            match turn {
+                Turn::User { text, .. } => {
+                    let text = self.text(text, masked);
+                    // event_msg feeds codex's resume-picker preview.
+                    lines.push(
+                        json!({
+                            "timestamp": iso,
+                            "type": "event_msg",
+                            "payload": { "type": "user_message", "message": text },
+                        })
+                        .to_string(),
+                    );
+                    lines.push(
+                        json!({
+                            "timestamp": iso,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{ "type": "input_text", "text": text }],
+                            }
+                        })
+                        .to_string(),
+                    );
+                    history.push(
+                        json!({
+                            "session_id": uuid,
+                            "ts": self.meta.created_at_ms / 1000,
+                            "text": text,
+                        })
+                        .to_string(),
+                    );
+                }
+                Turn::Assistant { text, .. } => {
+                    let text = self.text(text, masked);
+                    lines.push(
+                        json!({
+                            "timestamp": iso,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "assistant",
+                                "id": format!("msg_{}", short_hash(&format!("{uuid}{iso}"))),
+                                "content": [{ "type": "output_text", "text": text }],
+                            }
+                        })
+                        .to_string(),
+                    );
+                }
+                Turn::Tool { name, summary, .. } => {
+                    lines.push(
+                        json!({
+                            "timestamp": iso,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call",
+                                "name": name,
+                                "arguments": self.text(summary, masked),
+                                "call_id": format!("call_{}", short_hash(&format!("{name}{iso}"))),
+                            }
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+        CodexExport {
+            uuid,
+            rollout_relpath: relpath,
+            rollout_jsonl: with_trailing_newline(&lines.join("\n")),
+            history_jsonl: with_trailing_newline(&history.join("\n")),
+        }
+    }
+
+    /// The claude-code export: `projects/<cwd-slug>/<sessionId>.jsonl`, a
+    /// uuid/parentUuid chain of user + assistant records in the native
+    /// Anthropic message shape, plus ai-title / last-prompt picker rows.
+    #[must_use]
+    pub fn to_claude_code(&self, masked: bool) -> ClaudeCodeExport {
+        let session_uuid = derive_uuid(&self.meta.session_id, self.meta.created_at_ms, 4);
+        let slug = claude_slug(&self.meta.cwd);
+        let relpath = format!("projects/{slug}/{session_uuid}.jsonl");
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut parent: Option<String> = None;
+        let mut index = 0u64;
+        let mut leaf = session_uuid.clone();
+        for turn in &self.turns {
+            let uuid = derive_uuid(
+                &format!("{session_uuid}:{index}"),
+                self.meta.created_at_ms,
+                4,
+            );
+            index += 1;
+            let iso = iso8601_ms(turn.at_ms());
+            let (kind, message) = match turn {
+                Turn::User { text, .. } => (
+                    "user",
+                    json!({ "role": "user", "content": self.text(text, masked) }),
+                ),
+                Turn::Assistant { text, .. } => (
+                    "assistant",
+                    json!({
+                        "role": "assistant",
+                        "model": self.meta.model,
+                        "id": format!("msg_{}", short_hash(&uuid)),
+                        "type": "message",
+                        "content": [{ "type": "text", "text": self.text(text, masked) }],
+                        "stop_reason": "end_turn",
+                    }),
+                ),
+                Turn::Tool { name, summary, .. } => (
+                    "assistant",
+                    json!({
+                        "role": "assistant",
+                        "model": self.meta.model,
+                        "id": format!("msg_{}", short_hash(&uuid)),
+                        "type": "message",
+                        "content": [{
+                            "type": "text",
+                            "text": format!("[tool {}] {}", name, self.text(summary, masked)),
+                        }],
+                        "stop_reason": "end_turn",
+                    }),
+                ),
+            };
+            lines.push(
+                json!({
+                    "parentUuid": parent,
+                    "isSidechain": false,
+                    "type": kind,
+                    "uuid": uuid,
+                    "timestamp": iso,
+                    "sessionId": session_uuid,
+                    "cwd": self.meta.cwd,
+                    "version": self.meta.cli_version,
+                    "userType": "external",
+                    "message": message,
+                })
+                .to_string(),
+            );
+            parent = Some(uuid.clone());
+            leaf = uuid;
+        }
+        // Session-state rows (no uuid chain): a good picker row.
+        if let Some(title) = self.title(masked) {
+            lines.push(json!({ "type": "ai-title", "aiTitle": title }).to_string());
+        }
+        if let Some(prompt) = self.last_user_prompt(masked) {
+            lines.push(
+                json!({ "type": "last-prompt", "lastPrompt": prompt, "leafUuid": leaf })
+                    .to_string(),
+            );
+        }
+        ClaudeCodeExport {
+            session_uuid,
+            relpath,
+            jsonl: with_trailing_newline(&lines.join("\n")),
+        }
+    }
+
+    /// The opencode row set: a session, its messages, and text parts — ids in
+    /// COLUMNS (opencode's shape). The db INSERT is a separate guarded step.
+    #[must_use]
+    pub fn to_opencode(&self, masked: bool) -> OpenCodeExport {
+        let session_id = format!("ses_{}", short_hash(&self.meta.session_id));
+        let mut messages = Vec::new();
+        let mut index = 0u64;
+        for turn in &self.turns {
+            let seed = format!("{session_id}:{index}");
+            index += 1;
+            let message_id = format!("msg_{}", short_hash(&seed));
+            let part_id = format!("prt_{}", short_hash(&format!("{seed}:part")));
+            let (role, text) = match turn {
+                Turn::User { text, .. } => ("user", self.text(text, masked)),
+                Turn::Assistant { text, .. } => ("assistant", self.text(text, masked)),
+                Turn::Tool { name, summary, .. } => (
+                    "assistant",
+                    format!("[tool {}] {}", name, self.text(summary, masked)),
+                ),
+            };
+            let message_data = json!({
+                "role": role,
+                "time": { "created": turn.at_ms() },
+                "modelID": self.meta.model,
+                "providerID": self.meta.provider,
+            })
+            .to_string();
+            let part_data = json!({ "type": "text", "text": text }).to_string();
+            messages.push(OpenCodeMessage {
+                id: message_id,
+                data: message_data,
+                part_id,
+                part_data,
+            });
+        }
+        OpenCodeExport {
+            session_id,
+            project_id: "global".to_owned(),
+            slug: claude_slug(&self.meta.cwd),
+            directory: self.meta.cwd.clone(),
+            title: self
+                .title(masked)
+                .unwrap_or_else(|| "haider export".to_owned()),
+            version: self.meta.cli_version.clone(),
+            time_created: i64::try_from(self.meta.created_at_ms).unwrap_or(0),
+            time_updated: i64::try_from(self.meta.created_at_ms).unwrap_or(0),
+            messages,
+        }
+    }
+}
+
+/// The codex rollout output.
+#[derive(Debug, Clone)]
+pub struct CodexExport {
+    pub uuid: String,
+    pub rollout_relpath: String,
+    pub rollout_jsonl: String,
+    pub history_jsonl: String,
+}
+
+/// The claude-code output.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeExport {
+    pub session_uuid: String,
+    pub relpath: String,
+    pub jsonl: String,
+}
+
+/// One opencode message plus its single text part.
+#[derive(Debug, Clone)]
+pub struct OpenCodeMessage {
+    pub id: String,
+    pub data: String,
+    pub part_id: String,
+    pub part_data: String,
+}
+
+/// The opencode row set to INSERT.
+#[derive(Debug, Clone)]
+pub struct OpenCodeExport {
+    pub session_id: String,
+    pub project_id: String,
+    pub slug: String,
+    pub directory: String,
+    pub title: String,
+    pub version: String,
+    pub time_created: i64,
+    pub time_updated: i64,
+    pub messages: Vec<OpenCodeMessage>,
+}
+
+/// A report of what an opencode INSERT wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeWriteReport {
+    pub session_id: String,
+    pub messages: usize,
+    pub parts: usize,
+}
+
+/// INSERT the row set into an existing opencode SQLite db (WAL). REFUSES if
+/// the db is missing (never creates a harness's store) or locked (never risks
+/// corrupting a live opencode), and refuses a session-id collision.
+pub fn write_opencode(
+    db_path: &Path,
+    rows: &OpenCodeExport,
+) -> Result<OpenCodeWriteReport, ExportError> {
+    use rusqlite::{Connection, OpenFlags, params};
+    if !db_path.is_file() {
+        return Err(ExportError::OpenCodeMissing(db_path.display().to_string()));
+    }
+    // READ_WRITE without CREATE — we never bring a harness store into being.
+    let connection = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| classify_sqlite(error, db_path))?;
+    // Fail fast on a lock rather than blocking behind a live opencode.
+    connection
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .map_err(|error| classify_sqlite(error, db_path))?;
+
+    let exists: bool = connection
+        .query_row(
+            "SELECT 1 FROM session WHERE id = ?1",
+            params![rows.session_id],
+            |_| Ok(true),
+        )
+        .optional_lock(db_path)?
+        .unwrap_or(false);
+    if exists {
+        return Err(ExportError::Collision(format!(
+            "opencode session {}",
+            rows.session_id
+        )));
+    }
+
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| classify_sqlite(error, db_path))?;
+    transaction
+        .execute(
+            "INSERT INTO session(id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                rows.session_id,
+                rows.project_id,
+                rows.slug,
+                rows.directory,
+                rows.title,
+                rows.version,
+                rows.time_created,
+                rows.time_updated,
+            ],
+        )
+        .map_err(|error| classify_sqlite(error, db_path))?;
+    let mut parts = 0usize;
+    for message in &rows.messages {
+        transaction
+            .execute(
+                "INSERT INTO message(id, session_id, data) VALUES (?1, ?2, ?3)",
+                params![message.id, rows.session_id, message.data],
+            )
+            .map_err(|error| classify_sqlite(error, db_path))?;
+        transaction
+            .execute(
+                "INSERT INTO part(id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    message.part_id,
+                    message.id,
+                    rows.session_id,
+                    message.part_data
+                ],
+            )
+            .map_err(|error| classify_sqlite(error, db_path))?;
+        parts += 1;
+    }
+    transaction
+        .commit()
+        .map_err(|error| classify_sqlite(error, db_path))?;
+    Ok(OpenCodeWriteReport {
+        session_id: rows.session_id.clone(),
+        messages: rows.messages.len(),
+        parts,
+    })
+}
+
+/// Map a rusqlite error to a lock vs generic IO failure.
+fn classify_sqlite(error: rusqlite::Error, db_path: &Path) -> ExportError {
+    if is_lock_error(&error) {
+        ExportError::OpenCodeLocked(db_path.display().to_string())
+    } else {
+        ExportError::Io(format!("opencode sqlite: {error}"))
+    }
+}
+
+fn is_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy
+                    | rusqlite::ffi::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    )
+}
+
+/// A tiny extension turning a `SELECT` that itself hit a lock into the typed
+/// locked error rather than a generic IO one.
+trait OptionalLock<T> {
+    fn optional_lock(self, db_path: &Path) -> Result<Option<T>, ExportError>;
+}
+
+impl<T> OptionalLock<T> for rusqlite::Result<T> {
+    fn optional_lock(self, db_path: &Path) -> Result<Option<T>, ExportError> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(classify_sqlite(error, db_path)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: masking, slugs, ids, time
+// ---------------------------------------------------------------------------
+
+fn apply_mask(text: &str, masked: bool) -> String {
+    if masked {
+        mask_text(text)
+    } else {
+        text.to_owned()
+    }
+}
+
+/// The claude-code / opencode cwd slug: `/` and `.` → `-`.
+#[must_use]
+pub fn claude_slug(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+fn with_trailing_newline(text: &str) -> String {
+    if text.is_empty() {
+        String::new()
+    } else if text.ends_with('\n') {
+        text.to_owned()
+    } else {
+        format!("{text}\n")
+    }
+}
+
+/// A stable 64-bit FNV-1a hash, hex-formatted — deterministic ids without a
+/// wall clock or an RNG (tests need reproducible bytes).
+fn fnv1a(seed: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn short_hash(seed: &str) -> String {
+    format!("{:016x}", fnv1a(seed))
+}
+
+/// Derive a valid-shaped uuid (`version` in {4,7}) deterministically from a
+/// seed + the session's `created_at` ms. v7 stamps the 48-bit ms prefix; both
+/// set the RFC-4122 variant. Deterministic so a session always exports to the
+/// same filename (which is what makes collision refusal meaningful).
+#[must_use]
+pub fn derive_uuid(seed: &str, ms: u64, version: u8) -> String {
+    let mut bytes = [0u8; 16];
+    let a = fnv1a(seed).to_be_bytes();
+    let b = fnv1a(&format!("{seed}:{ms}:salt")).to_be_bytes();
+    bytes[..8].copy_from_slice(&a);
+    bytes[8..].copy_from_slice(&b);
+    if version == 7 {
+        let stamp = (ms & 0xffff_ffff_ffff).to_be_bytes();
+        bytes[..6].copy_from_slice(&stamp[2..]);
+    }
+    // Version nibble and RFC-4122 variant (10xx).
+    bytes[6] = (bytes[6] & 0x0f) | (version << 4);
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32],
+    )
+}
+
+/// Civil (year, month, day) UTC from unix ms — Howard Hinnant's algorithm.
+fn civil_date(ms: u64) -> (i64, u32, u32) {
+    let (y, m, d, _, _, _, _) = civil_from_ms(ms);
+    (y, m, d)
+}
+
+#[allow(clippy::many_single_char_names)]
+fn civil_from_ms(ms: u64) -> (i64, u32, u32, u32, u32, u32, u32) {
+    let secs = (ms / 1000) as i64;
+    let millis = (ms % 1000) as u32;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hour = (rem / 3600) as u32;
+    let minute = ((rem % 3600) / 60) as u32;
+    let second = (rem % 60) as u32;
+    // days since 1970-01-01 → civil date.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day, hour, minute, second, millis)
+}
+
+/// ISO-8601 UTC with milliseconds: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+#[must_use]
+pub fn iso8601_ms(ms: u64) -> String {
+    let (y, mo, d, h, mi, s, milli) = civil_from_ms(ms);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{milli:03}Z")
+}
+
+/// The codex filename time stamp: `YYYY-MM-DDTHH-MM-SS` (dashes in the time).
+fn filename_stamp(ms: u64) -> String {
+    let (y, mo, d, h, mi, s, _) = civil_from_ms(ms);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}")
+}
+
+// ---------------------------------------------------------------------------
+// File-writing (native + foreign), with collision refusal
+// ---------------------------------------------------------------------------
+
+/// Write `contents` to `path`, refusing to overwrite an existing file.
+pub fn write_new_file(path: &Path, contents: &str) -> Result<(), ExportError> {
+    if path.exists() {
+        return Err(ExportError::Collision(path.display().to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ExportError::Io(format!("cannot create {}: {error}", parent.display()))
+        })?;
+    }
+    std::fs::write(path, contents)
+        .map_err(|error| ExportError::Io(format!("cannot write {}: {error}", path.display())))
+}
+
+/// Append `contents` to `path` (used for codex `history.jsonl`).
+pub fn append_file(path: &Path, contents: &str) -> Result<(), ExportError> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ExportError::Io(format!("cannot create {}: {error}", parent.display()))
+        })?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| ExportError::Io(format!("cannot open {}: {error}", path.display())))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| ExportError::Io(format!("cannot append {}: {error}", path.display())))
+}
+
+/// The default codex sessions root (`~/.codex`).
+#[must_use]
+pub fn codex_root(home: &Path) -> PathBuf {
+    home.join(".codex")
+}
+
+/// The default claude-code projects root (`~/.claude`).
+#[must_use]
+pub fn claude_root(home: &Path) -> PathBuf {
+    home.join(".claude")
+}
+
+/// The default opencode db path (`~/.local/share/opencode/opencode.db`).
+#[must_use]
+pub fn opencode_db_path(home: &Path) -> PathBuf {
+    home.join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db")
+}
+
+// ---------------------------------------------------------------------------
+// CLI command
+// ---------------------------------------------------------------------------
+
+use std::process::ExitCode;
+
+const EX_USAGE: u8 = 2;
+const EX_UNAVAILABLE: u8 = 69;
+const EX_IOERR: u8 = 74;
+const EX_BLOCKED: u8 = 77;
+
+/// Parsed `haider export` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportOptions {
+    pub session_id: String,
+    pub format: Format,
+    pub out: Option<PathBuf>,
+    pub masked: bool,
+    pub confirm: bool,
+    pub no_spawn: bool,
+}
+
+/// Parse `<session-id> [--format FMT] [--out PATH] [--masked] [--confirm]
+/// [--no-spawn]`.
+pub fn parse_export_options(rest: &[String]) -> Result<ExportOptions, String> {
+    let mut session_id: Option<String> = None;
+    let mut format = Format::Markdown;
+    let mut out: Option<PathBuf> = None;
+    let mut masked = false;
+    let mut confirm = false;
+    let mut no_spawn = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--format" => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--format requires a value".to_owned())?;
+                format = Format::parse(value)?;
+            }
+            "--out" => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--out requires a path".to_owned())?;
+                if value.is_empty() {
+                    return Err("--out requires a non-empty path".into());
+                }
+                out = Some(PathBuf::from(value));
+            }
+            "--masked" if !masked => masked = true,
+            "--confirm" if !confirm => confirm = true,
+            "--no-spawn" if !no_spawn => no_spawn = true,
+            "--masked" | "--confirm" | "--no-spawn" => {
+                return Err(format!("duplicate {} flag", rest[index]));
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown flag `{flag}`")),
+            value if session_id.is_none() && !value.is_empty() => {
+                session_id = Some(value.to_owned());
+            }
+            _ => {
+                return Err(
+                    "usage: haider export <session-id> [--format FMT] [--out PATH] [--masked] [--confirm]"
+                        .into(),
+                );
+            }
+        }
+        index += 1;
+    }
+    Ok(ExportOptions {
+        session_id: session_id.ok_or_else(|| {
+            "usage: haider export <session-id> [--format markdown|json|codex|claude-code|opencode] [--out PATH] [--masked] [--confirm]"
+                .to_owned()
+        })?,
+        format,
+        out,
+        masked,
+        confirm,
+        no_spawn,
+    })
+}
+
+/// `haider export` — render a session's durable journal to a chosen format.
+pub async fn export_command(rest: &[String]) -> ExitCode {
+    let options = match parse_export_options(rest) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("haider export: {message}");
+            return ExitCode::from(EX_USAGE);
+        }
+    };
+    let profile = match haider_client::resolve_profile(&haider_client::ProfileEnv::capture()) {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!("haider: {error}");
+            return ExitCode::from(EX_UNAVAILABLE);
+        }
+    };
+    let session_id = haider_protocol::ids::SessionId::new(options.session_id.clone());
+
+    // 1) Session-level facts from the daemon digest (cwd/provider/model/created).
+    let observer = match haider_client::ObserveClient::connect(&profile, !options.no_spawn).await {
+        Ok(observer) => observer,
+        Err(error) => {
+            eprintln!("haider export: {error}");
+            return ExitCode::from(EX_UNAVAILABLE);
+        }
+    };
+    let digest = observer.session(session_id.clone(), 0).await;
+    observer.close();
+    let digest = match digest {
+        Ok(digest) => digest,
+        Err(error) => {
+            eprintln!("haider export: {error}");
+            return ExitCode::from(EX_UNAVAILABLE);
+        }
+    };
+    let Some(metadata) = digest.metadata.clone() else {
+        eprintln!(
+            "haider export: session {} has no durable metadata to export",
+            options.session_id
+        );
+        return ExitCode::from(EX_UNAVAILABLE);
+    };
+    let title = if digest.title.trim().is_empty() {
+        metadata.title.clone()
+    } else {
+        Some(digest.title.clone())
+    };
+    let meta = ExportMeta {
+        session_id: options.session_id.clone(),
+        title,
+        cwd: metadata.cwd.clone(),
+        provider: metadata.provider.clone(),
+        model: metadata.model.clone(),
+        created_at_ms: metadata.created_at_ms,
+        cli_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+
+    // 2) The durable envelopes (a bounded full replay, follow off).
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(envelope) = receiver.recv().await {
+            events.push(envelope);
+        }
+        events
+    });
+    let stream = haider_client::observe_stream_session(
+        &profile,
+        !options.no_spawn,
+        session_id,
+        false,
+        sender,
+    )
+    .await;
+    let events = collector.await.unwrap_or_default();
+    if let Err(error) = stream {
+        eprintln!("haider export: {error}");
+        return ExitCode::from(EX_UNAVAILABLE);
+    }
+
+    // 3) Project + render + write.
+    let export = SessionExport::project(meta, &events);
+    match write_export(&export, &options) {
+        Ok(summary) => {
+            if !summary.is_empty() {
+                eprintln!("haider export: {summary}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("haider export: {error}");
+            ExitCode::from(match error {
+                ExportError::Collision(_)
+                | ExportError::OpenCodeUnconfirmed
+                | ExportError::OpenCodeLocked(_) => EX_BLOCKED,
+                ExportError::OpenCodeMissing(_) => EX_UNAVAILABLE,
+                ExportError::Io(_) => EX_IOERR,
+            })
+        }
+    }
+}
+
+/// Render the chosen format and write it to `--out`, stdout, or the target
+/// harness dir. Returns a short human summary of what was written (empty for
+/// a native stdout render).
+pub fn write_export(
+    export: &SessionExport,
+    options: &ExportOptions,
+) -> Result<String, ExportError> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match options.format {
+        Format::Markdown | Format::Json => {
+            let body = if options.format == Format::Markdown {
+                export.to_markdown(options.masked)
+            } else {
+                export.to_json(options.masked)
+            };
+            match &options.out {
+                Some(path) => {
+                    std::fs::write(path, &body).map_err(|error| {
+                        ExportError::Io(format!("cannot write {}: {error}", path.display()))
+                    })?;
+                    Ok(format!("wrote {}", path.display()))
+                }
+                None => {
+                    print!("{body}");
+                    Ok(String::new())
+                }
+            }
+        }
+        Format::Codex => {
+            let codex = export.to_codex(options.masked);
+            let (rollout_path, history_path) = match &options.out {
+                Some(path) => {
+                    let history = path.parent().map_or_else(
+                        || PathBuf::from("history.jsonl"),
+                        |parent| parent.join("history.jsonl"),
+                    );
+                    (path.clone(), history)
+                }
+                None => {
+                    let root = codex_root(require_home(home.as_ref())?);
+                    (
+                        root.join(&codex.rollout_relpath),
+                        root.join("history.jsonl"),
+                    )
+                }
+            };
+            write_new_file(&rollout_path, &codex.rollout_jsonl)?;
+            append_file(&history_path, &codex.history_jsonl)?;
+            Ok(format!(
+                "wrote codex rollout {} (id {})",
+                rollout_path.display(),
+                codex.uuid
+            ))
+        }
+        Format::ClaudeCode => {
+            let claude = export.to_claude_code(options.masked);
+            let path = match &options.out {
+                Some(path) => path.clone(),
+                None => claude_root(require_home(home.as_ref())?).join(&claude.relpath),
+            };
+            write_new_file(&path, &claude.jsonl)?;
+            Ok(format!(
+                "wrote claude-code session {} ({})",
+                path.display(),
+                claude.session_uuid
+            ))
+        }
+        Format::OpenCode => {
+            if !options.confirm {
+                return Err(ExportError::OpenCodeUnconfirmed);
+            }
+            let rows = export.to_opencode(options.masked);
+            let db_path = match &options.out {
+                Some(path) => path.clone(),
+                None => opencode_db_path(require_home(home.as_ref())?),
+            };
+            let report = write_opencode(&db_path, &rows)?;
+            Ok(format!(
+                "inserted opencode session {} ({} messages, {} parts) into {}",
+                report.session_id,
+                report.messages,
+                report.parts,
+                db_path.display(),
+            ))
+        }
+    }
+}
+
+fn require_home(home: Option<&PathBuf>) -> Result<&Path, ExportError> {
+    home.map(PathBuf::as_path)
+        .ok_or_else(|| ExportError::Io("HOME is not set; pass --out with an explicit path".into()))
+}

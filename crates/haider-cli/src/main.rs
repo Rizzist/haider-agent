@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+pub(crate) mod export;
 pub(crate) mod hooks;
 pub(crate) mod observe;
 pub(crate) mod run;
@@ -57,6 +58,7 @@ async fn main() -> ExitCode {
         [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
         [command, rest @ ..] if command == "events" => observe::events_command(rest).await,
+        [command, rest @ ..] if command == "export" => export::export_command(rest).await,
         [command, rest @ ..] if command == "hooks" => hooks::hooks_command(rest).await,
         [command, rest @ ..] if command == "update" => update::update_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
@@ -70,6 +72,7 @@ async fn main() -> ExitCode {
                  status [--json] [--no-spawn], sessions [--json] [--no-spawn], \
                  session <id> [--json|--watch] [--no-spawn], \
                  events [--follow] [--no-spawn], \
+                 export <session-id> [--format markdown|json|codex|claude-code|opencode] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \
                  tui [--theme system|light|dark|desert|oasis], tui --demo [--plain], \

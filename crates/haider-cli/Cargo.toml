@@ -21,6 +21,7 @@ haider-accounts = { path = "../haider-accounts" }
 haider-client = { path = "../haider-client" }
 haider-rpc = { path = "../haider-rpc" }
 haider-tui = { path = "../haider-tui" }
+rusqlite.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
