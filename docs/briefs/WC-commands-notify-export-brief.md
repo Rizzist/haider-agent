@@ -157,3 +157,65 @@ completed work (this run has seen many lane deaths). Do them in order.
   anything under ~/.codex/sessions or the user's real ~/.claude. Disk is
   tight (~6G) — STOP and report on any "No space left on device" rather
   than retrying.
+
+────────────────────────────────────────────────────────────────────────
+## M4 — API-error retry with visible attempt counter (owner add-on)
+────────────────────────────────────────────────────────────────────────
+
+Owner ask (with screenshot): automatic retry on API errors like Claude
+Code — a status line `✻ API error · Retrying in <N>s · attempt <K>/10`
+during the backoff wait, then the turn proceeds if a retry succeeds.
+
+18. WHAT EXISTS: `ProviderError` already carries `retryable: bool` +
+    `retry_after_ms: Option<u64>` with per-kind `default_retryable()`
+    (haider-provider/src/lib.rs:243-266). Today a retryable provider
+    failure just latches `RunState::Errored` (worker.rs ~3815, ~260) —
+    there is NO retry loop and NO Retrying state. M4 adds both.
+19. RETRY LOOP: at the provider-request seam in the worker turn path
+    (the `start_turn` / provider stream call — the point BEFORE any
+    assistant content or tool side-effect is committed), when the request
+    fails with `error.retryable == true`, WAIT then re-issue, up to
+    `MAX_API_RETRIES = 10` attempts. SAFETY: only retry failures that
+    occurred with NO committed output for this turn (handshake / early
+    stream / connection / 429 / 5xx / stream-disconnect-before-content).
+    A failure AFTER partial content was committed is NOT auto-retried
+    (retrying would duplicate output) — it latches Errored as today.
+    A non-retryable error (`retryable == false` — 400 invalid_request,
+    401 unauthorized) surfaces IMMEDIATELY, no wait, no counter.
+20. BACKOFF: exponential with jitter-free deterministic base for tests —
+    e.g. `min(cap, base * 2^(attempt-1))` capped at ~30s; when
+    `retry_after_ms` is present (429/529 Retry-After) it OVERRIDES the
+    computed delay (honor the server). Attempt 1 is the original try;
+    the counter shown is the NEXT attempt (matches the screenshot's
+    "attempt 2/10" while waiting to retry after the first failure).
+    NOTE: scripts/tests must not depend on wall-clock; make the delay
+    schedule a pure function of attempt (+ retry_after_ms) so a law can
+    assert the sequence, and inject the sleeper (a trait/seam) so tests
+    don't actually wait.
+21. STATE + RENDER: add `RunState::Retrying { attempt, max, delay_ms,
+    reason }` (additive to the enum — mind the exhaustive matches;
+    `is_terminal()` stays false for it) OR a retry FACT if that fits the
+    journal-as-truth model better (a Retrying run-state is the cleaner
+    fit — the TUI already switches on RunState). The TUI status line
+    renders `✻ API error · Retrying in <N>s · attempt <K>/<max>` in the
+    warn/ember tone, on the same status surface as the thinking line;
+    the countdown may tick with the shared anim clock or show the initial
+    delay (pick the simpler correct one; do NOT add a new timer if the
+    shared clock suffices). Plain mode prints an equivalent line.
+    esc during a retry wait CANCELS the turn (session-scoped esc law).
+22. NOTIFICATION interplay (M2): a retry wait is NOT a terminal/park
+    state — it must NOT fire a desktop notification. Only the FINAL
+    Errored (retries exhausted) does. Pin this.
+23. LAWS: retryable error → Retrying state with attempt/max/delay
+    (scripted fake-provider failure then success → turn completes after
+    N retries, attempt counter observed); non-retryable → immediate
+    Errored, no Retrying; retry_after_ms overrides the computed backoff;
+    exhausted retries (10 fails) → Errored once; backoff schedule is a
+    pure function (assert the sequence); committed-content failure is NOT
+    retried; M2 does not notify during a retry wait. The fake-provider
+    seam (`emit_text`/`finish`/`hang` + a fail/error step) is the
+    vehicle — add a scripted retryable-then-ok step if one isn't there.
+
+M4 COMMIT after M3's commit; it is its own milestone. Include ≥2 of the
+wave's ≥6 executed kills from M4 (the retry-vs-terminal classification and
+the retry_after override are the strongest anchors).
