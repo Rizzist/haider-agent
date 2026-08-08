@@ -174,6 +174,14 @@ pub enum PaletteItem {
         value: String,
         desc: String,
     },
+    /// W-C M1: a user-loaded custom command from `.haider/commands`. OWNED
+    /// (the names/descs are read from disk), rendered visually distinct from
+    /// the built-ins so a dropped-in command reads as the user's, not core.
+    Custom {
+        /// The slash name WITHOUT the leading `/` (may be namespaced).
+        name: String,
+        desc: String,
+    },
 }
 
 impl PaletteItem {
@@ -183,6 +191,7 @@ impl PaletteItem {
         match self {
             Self::Cmd(spec) => format!("/{}", spec.name),
             Self::Arg { value, .. } => (*value).to_owned(),
+            Self::Custom { name, .. } => format!("/{name}"),
         }
     }
 
@@ -191,8 +200,15 @@ impl PaletteItem {
     pub fn desc(&self) -> &str {
         match self {
             Self::Cmd(spec) => spec.desc,
-            Self::Arg { desc, .. } => desc.as_str(),
+            Self::Arg { desc, .. } | Self::Custom { desc, .. } => desc.as_str(),
         }
+    }
+
+    /// W-C M1: whether this row is a user-loaded custom command (the palette
+    /// paints these with a distinct marker so they never masquerade as core).
+    #[must_use]
+    pub fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
     }
 }
 
@@ -309,6 +325,9 @@ pub struct DynamicSlots {
     /// pair's daemon-declared ladder (G3). Empty means the pair declares no
     /// ladder, which renders no rows rather than invented ones.
     pub efforts: Vec<(String, String)>,
+    /// W-C M1: `(name, description)` for user-loaded custom commands, merged
+    /// OVER the built-in registry. Already ordered by name (the loader sorts).
+    pub custom_commands: Vec<(String, String)>,
 }
 
 fn dynamic_args(
@@ -339,12 +358,25 @@ pub fn palette_items(query: &str, in_session: bool, slots: &DynamicSlots) -> Vec
     let first = tokens.next().unwrap_or("").to_ascii_lowercase();
     let rest: Vec<&str> = tokens.collect();
     if !ends_space && rest.is_empty() {
-        let matches: Vec<PaletteItem> = COMMANDS
+        let mut matches: Vec<PaletteItem> = COMMANDS
             .iter()
             .filter(|spec| in_session || !spec.session_only)
             .filter(|spec| spec.name.starts_with(&first))
             .map(PaletteItem::Cmd)
             .collect();
+        // W-C M1: user-loaded custom commands merge OVER the built-ins —
+        // listed after them, name-prefix filtered, available everywhere
+        // (a custom command expands to a prompt, so it is never session-only).
+        matches.extend(
+            slots
+                .custom_commands
+                .iter()
+                .filter(|(name, _)| name.starts_with(&first))
+                .map(|(name, desc)| PaletteItem::Custom {
+                    name: name.clone(),
+                    desc: desc.clone(),
+                }),
+        );
         // Exact arg-command fully typed → its slot candidates, unfiltered.
         if matches.len() == 1
             && has_arg_slots(&first)

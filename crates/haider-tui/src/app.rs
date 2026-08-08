@@ -2921,6 +2921,14 @@ pub struct AppModel {
     /// The checked-out session's PROTOCOL id (sim `activeId`; `None` =
     /// launcher's no-session state, exactly the sim's `setActiveId(null)`).
     pub active_session: Option<SessionId>,
+    /// W-C M1: user-loaded custom slash commands (`.haider/commands` project +
+    /// global), merged OVER the built-in registry. Loaded once at live startup
+    /// (shell-owned IO — the reducer never touches disk); tests inject via
+    /// [`AppModel::set_custom_commands`].
+    pub custom_commands: Vec<crate::custom_commands::CustomCommand>,
+    /// W-C M1: skip warnings for malformed command files, surfaced once at
+    /// startup so a bad drop-in is visible, never a silent loss.
+    pub custom_command_warnings: Vec<String>,
     /// The most recently detached session — the empty-⏎ re-attach target.
     pub last_detached: Option<SessionId>,
     /// Local generation allocator (seeds take 1-3; `0` is the scratch
@@ -3152,6 +3160,8 @@ impl Default for AppModel {
             // `next_ui_generation` continues at 4.
             sessions: seed_session_states(UiGeneration::FIRST.get()),
             active_session: None,
+            custom_commands: Vec::new(),
+            custom_command_warnings: Vec::new(),
             last_detached: None,
             next_ui_generation: UiGeneration::FIRST.get() + SEED_SESSION_COUNT,
             roster: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -3873,12 +3883,52 @@ impl AppModel {
                 rows
             })
             .unwrap_or_default();
+        // W-C M1: the loaded custom commands, as `(name, palette-desc)` rows
+        // already ordered by name (the loader sorts). The palette merges them
+        // OVER the built-ins and paints them visually distinct.
+        let custom_commands = self
+            .custom_commands
+            .iter()
+            .map(|command| (command.name.clone(), command.palette_desc()))
+            .collect();
         crate::commands::DynamicSlots {
             providers,
             models,
             accounts,
             efforts,
+            custom_commands,
         }
+    }
+
+    /// W-C M1: install the loaded custom commands (shell-owned IO does the
+    /// disk read; the reducer only ever sees the parsed data). A non-empty
+    /// warning list is surfaced once as a flash so a malformed drop-in is
+    /// visible instead of silently lost.
+    pub fn set_custom_commands(
+        &mut self,
+        commands: Vec<crate::custom_commands::CustomCommand>,
+        warnings: Vec<String>,
+    ) {
+        self.custom_commands = commands;
+        if !warnings.is_empty() {
+            let first = warnings.first().cloned().unwrap_or_default();
+            self.flash = Some(if warnings.len() == 1 {
+                format!("· custom command skipped — {first}")
+            } else {
+                format!("· {} custom commands skipped — {first}", warnings.len())
+            });
+        }
+        self.custom_command_warnings = warnings;
+    }
+
+    /// W-C M1: the loaded custom command matching `name` (namespaced,
+    /// case-insensitive), if any.
+    #[must_use]
+    pub fn custom_command(&self, name: &str) -> Option<&crate::custom_commands::CustomCommand> {
+        let lowered = name.to_ascii_lowercase();
+        self.custom_commands
+            .iter()
+            .find(|command| command.name == lowered)
     }
 
     /// The CURRENT pair's daemon-projected detail row (G3): the one source
@@ -3926,6 +3976,12 @@ impl AppModel {
             // token, so the whole body is the fragment.
             PaletteItem::Cmd(spec) => {
                 let rest = spec.name.strip_prefix(body)?;
+                (!rest.is_empty()).then(|| rest.to_owned())
+            }
+            // W-C M1: a custom command ghosts like a built-in — the whole
+            // body is the fragment, so complete the remainder of the name.
+            PaletteItem::Custom { name, .. } => {
+                let rest = name.strip_prefix(body)?;
                 (!rest.is_empty()).then(|| rest.to_owned())
             }
             PaletteItem::Arg { cmd, value, .. } => {
@@ -4444,6 +4500,12 @@ impl AppModel {
                         }
                         Some(PaletteItem::Arg { cmd, value, .. }) => {
                             self.composer.set_text(format!("/{cmd} {value}"));
+                        }
+                        // W-C M1: tab on a custom command completes the name
+                        // and opens an argument slot (a trailing space) so
+                        // positionals can follow.
+                        Some(PaletteItem::Custom { name, .. }) => {
+                            self.composer.set_text(format!("/{name} "));
                         }
                         None => {}
                     }
@@ -7998,6 +8060,25 @@ impl AppModel {
                 self.composer.set_text(format!("/{cmd} {value}"));
                 self.execute_slash();
             }
+            // W-C M1: activating a custom command preserves any args the user
+            // already typed, then runs it (execute_slash resolves the loaded
+            // command and submits its expanded body as a user turn).
+            PaletteItem::Custom { name, .. } => {
+                let args: String = self
+                    .composer
+                    .text()
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.composer.set_text(if args.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {args}")
+                });
+                self.execute_slash();
+            }
         }
     }
 
@@ -8459,6 +8540,14 @@ impl AppModel {
             }
             "" => {}
             other => {
+                // W-C M1: a user-loaded custom command merges OVER (never
+                // replaces) the built-ins, so it is resolved only after every
+                // built-in arm missed. Found → expand + submit as a turn;
+                // otherwise fall through to the stub/typo notes.
+                if let Some(command) = self.custom_command(other).cloned() {
+                    self.run_custom_command(&command, &remainder);
+                    return;
+                }
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
                     "fork" => Some("the daemon wave (W3)"),
@@ -8470,6 +8559,131 @@ impl AppModel {
                     Some(wave) => format!("· /{other} — UI ready; lands with {wave}"),
                     None => format!("· unknown command /{other} — /help lists commands"),
                 });
+            }
+        }
+    }
+
+    /// W-C M1: expand a custom command and submit its body as a user turn.
+    ///
+    /// There is NO inline shell execution this wave — a custom command becomes
+    /// a PROMPT ONLY. A `model:` frontmatter override is applied through the
+    /// SAME G3 `session.select_model` path `/model` uses (never a new one); an
+    /// unknown model is ignored with a note.
+    fn run_custom_command(
+        &mut self,
+        command: &crate::custom_commands::CustomCommand,
+        arg_str: &str,
+    ) {
+        self.dirty = true;
+        let expansion = command.expand(arg_str);
+        let body = expansion.body.trim().to_owned();
+        if body.is_empty() {
+            self.flash = Some(format!(
+                "· /{} — nothing to send (empty after expansion)",
+                command.name
+            ));
+            return;
+        }
+        // The per-command model/pair override, resolved BEFORE the turn so the
+        // select rides ahead of the submit on the request queue.
+        let note = expansion
+            .model
+            .as_deref()
+            .map(|model| self.apply_custom_command_model(command, model));
+        // Submit the expanded body as an ordinary user turn — never re-parsed
+        // as a slash command.
+        let submitted = self.submit_custom_command_body(body);
+        // A model note wins the flash only when the turn actually went out;
+        // an unsubmitted turn keeps the submit helper's own explanation.
+        if submitted && let Some(note) = note {
+            self.flash = Some(note);
+        }
+    }
+
+    /// W-C M1: resolve a custom command's `model:` override against the
+    /// discovered catalog (like `/model`) and apply it via the receipted
+    /// `session.select_model`. Returns the human note either way.
+    fn apply_custom_command_model(
+        &mut self,
+        command: &crate::custom_commands::CustomCommand,
+        model: &str,
+    ) -> String {
+        let resolved = self.providers.providers.iter().find_map(|summary| {
+            summary
+                .models
+                .iter()
+                .find(|slug| slug.eq_ignore_ascii_case(model))
+                .map(|slug| (summary.provider.clone(), slug.clone()))
+        });
+        let Some((provider, resolved_model)) = resolved else {
+            return format!(
+                "· /{} — model “{model}” unknown; using the current model",
+                command.name
+            );
+        };
+        // The G3 path applies to an ATTACHED live session, exactly like the
+        // picker: the launcher/demo has no session to select on yet.
+        let live_session = (!self.mode.fabricates_locally() && self.screen == Screen::Session)
+            .then(|| self.active_session.clone())
+            .flatten();
+        match live_session {
+            Some(session) => {
+                // Reuse the G3 gate: a stale daemon that cannot serve
+                // cross-provider selection gets an honest note, never a
+                // request it will reject.
+                if !self.daemon_serves(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1) {
+                    return format!("· /{} — model override needs a newer daemon", command.name);
+                }
+                self.requests.push(AppRequest::SelectModel {
+                    session,
+                    model: resolved_model.clone(),
+                    provider: provider.clone(),
+                });
+                format!(
+                    "· /{} — model → {resolved_model} · {provider}",
+                    command.name
+                )
+            }
+            None => format!(
+                "· /{} — model “{resolved_model}” applies once the session exists",
+                command.name
+            ),
+        }
+    }
+
+    /// W-C M1: submit `body` as an ordinary user turn. Returns whether a turn
+    /// was actually issued. Only the Session and Launcher surfaces submit;
+    /// other screens (and the demo, which has no daemon) say so honestly.
+    fn submit_custom_command_body(&mut self, body: String) -> bool {
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· custom commands run live — they submit a turn to the daemon".to_owned());
+            return false;
+        }
+        match self.screen {
+            Screen::Session => {
+                self.turn_active = true;
+                self.scroll_back.set(0);
+                self.requests.push(AppRequest::SubmitText {
+                    text: body,
+                    voice: false,
+                    title: self.session_title.is_none(),
+                    branch: self.branch_state.active().cloned(),
+                    attachments: Vec::new(),
+                });
+                true
+            }
+            Screen::Launcher => {
+                // Mirror the launcher submit (R11 cut 4): nothing local
+                // happens — the daemon mints the session and its events drive
+                // the screen flip, so no fabricated row can need reconciling.
+                self.requests.push(AppRequest::CreateSession { text: body });
+                true
+            }
+            _ => {
+                self.flash =
+                    Some("· custom commands run from a session or the launcher".to_owned());
+                false
             }
         }
     }

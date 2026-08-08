@@ -12,6 +12,7 @@ pub mod browser;
 pub mod clipboard;
 pub mod commands;
 pub mod composer;
+pub mod custom_commands;
 pub mod demo_store;
 pub mod format;
 pub mod hooks;

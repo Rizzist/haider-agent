@@ -95,7 +95,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         }
     }
     if model.help_open {
-        render_help(theme, frame, body);
+        render_help(model, theme, frame, body);
         hits.clear();
     }
     if status_height > 0 {
@@ -5978,8 +5978,12 @@ fn palette_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'stati
         };
         let name = format!("{:<PALETTE_NAME_COL$}", item.label());
         let desc_budget = width.saturating_sub(2 + PALETTE_NAME_COL + 2);
+        // W-C M1: custom commands wear a `✎` marker in the gutter so they read
+        // as the user's, not core — the built-ins keep the plain two-space
+        // gutter (identical column alignment either way).
+        let gutter = if item.is_custom() { "✎ " } else { "  " };
         let mut spans = vec![
-            Span::raw("  "),
+            Span::styled(gutter, name_style),
             Span::styled(name, name_style),
             Span::raw("  "),
             Span::styled(ellipsize(item.desc(), desc_budget), theme.dim_style()),
@@ -6028,13 +6032,7 @@ fn palette_row_hits(model: &AppModel, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
 }
 
 /// The /help overlay: sim HELP_TEXT panel over the body.
-fn render_help(theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    let height = u16::try_from(HELP_TEXT.len() + 2).unwrap_or(area.height);
-    let [_, panel] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(height.min(area.height)),
-    ])
-    .areas(area);
+fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![Line::from(vec![
         Span::styled("help", theme.gold_style()),
         Span::styled("  esc closes", theme.faint_style()),
@@ -6042,6 +6040,32 @@ fn render_help(theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     for entry in HELP_TEXT {
         lines.push(Line::styled(*entry, theme.dim_style()));
     }
+    // W-C M1: user-loaded custom commands are listed under their OWN heading,
+    // visually distinct from the built-ins (the maroon `✎ /name` marker), so
+    // a dropped-in `.haider/commands` file never reads as core.
+    if !model.custom_commands.is_empty() {
+        lines.push(Line::styled(
+            "custom — from .haider/commands:",
+            theme.gold_style(),
+        ));
+        for command in &model.custom_commands {
+            let hint = command
+                .argument_hint
+                .as_deref()
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!("  ✎ /{}{hint}", command.name), theme.maroon_style()),
+                Span::styled(format!("  {}", command.palette_desc()), theme.dim_style()),
+            ]));
+        }
+    }
+    let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
+    let [_, panel] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height.min(area.height)),
+    ])
+    .areas(area);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,

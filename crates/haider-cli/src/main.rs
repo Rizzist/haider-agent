@@ -444,6 +444,15 @@ fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
         model.sanctum_tier = SanctumTier::Translit;
     }
     apply_cwd(&mut model);
+    // W-C M1: load custom slash commands from `.haider/commands` (project,
+    // walked up from cwd) + `~/.haider/commands` (global). This is shell-owned
+    // IO at construction — the reducer never touches disk; a malformed file is
+    // skipped and surfaced, never fatal.
+    let commands_cwd = std::env::current_dir().ok();
+    let commands_home = std::env::var_os("HOME").map(PathBuf::from);
+    let loaded =
+        haider_tui::custom_commands::load_for(commands_cwd.as_deref(), commands_home.as_deref());
+    model.set_custom_commands(loaded.commands, loaded.warnings);
     // Same choice ladder as the demo, minus the flag and the legacy demo
     // file: settings file, else `system` against the boot-time detection.
     model.detected_system = detect_system_theme();

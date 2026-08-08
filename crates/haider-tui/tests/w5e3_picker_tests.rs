@@ -29,7 +29,7 @@ fn values(items: &[PaletteItem]) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             PaletteItem::Arg { value, .. } => Some(value.clone()),
-            PaletteItem::Cmd(_) => None,
+            PaletteItem::Cmd(_) | PaletteItem::Custom { .. } => None,
         })
         .collect()
 }
