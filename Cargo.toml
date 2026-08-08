@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.79"
+version = "0.0.80"
 edition = "2024"
 license = "LicenseRef-Proprietary-Undecided"
 repository = "https://github.com/Rizzist/haider-agent"
