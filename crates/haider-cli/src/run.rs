@@ -327,6 +327,11 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                     );
                 }
             }
+            // W-C M2: the built-in headless attention signal — the same OSC 9
+            // the TUI fires, but to stderr's tty. The daemon has no controlling
+            // terminal, so the CLIENT emits it; a piped/redirected stderr gets
+            // NO escape bytes (non-interactive runs emit nothing).
+            emit_headless_attention(&result);
             ExitCode::from(exit_code_for_result(&result))
         }
         Err(error) => {
@@ -474,6 +479,27 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
     Ok(format!(
         "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":{attachment_count},\"refs\":{attachment_refs}}},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"background_tasks_running\":{background_tasks},\"error\":{error}}}"
     ))
+}
+
+/// W-C M2: emit the headless desktop-notification attention signal (OSC 9) to
+/// stderr — but ONLY when stderr is a real terminal. A turn that reached a
+/// terminal state (Done / Errored) or the input-required attention park fires;
+/// everything else stays silent. Non-interactive/piped runs emit nothing (the
+/// non-tty suppression law).
+fn emit_headless_attention(result: &HeadlessRunResult) {
+    use haider_tui::notify::{self, Attention};
+    let attention = match result.outcome {
+        HeadlessOutcome::Done => Attention::Done,
+        HeadlessOutcome::Errored => Attention::Errored,
+        HeadlessOutcome::InputRequired => Attention::Input,
+        HeadlessOutcome::Cancelled | HeadlessOutcome::Timeout => return,
+    };
+    let is_tty = io::IsTerminal::is_terminal(&io::stderr());
+    let line = notify::notification_line(attention, None);
+    let mut err = io::stderr();
+    // Non-tty stderr yields no bytes — a captured/piped run stays clean.
+    let _ = err.write_all(&notify::osc9_for_tty(&line, is_tty));
+    let _ = err.flush();
 }
 
 pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {

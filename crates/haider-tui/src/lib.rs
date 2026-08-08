@@ -22,6 +22,7 @@ pub mod live;
 pub mod mark;
 pub mod md;
 pub mod mock;
+pub mod notify;
 pub mod plain;
 pub mod projection;
 pub mod render;

@@ -2929,6 +2929,22 @@ pub struct AppModel {
     /// W-C M1: skip warnings for malformed command files, surfaced once at
     /// startup so a bad drop-in is visible, never a silent loss.
     pub custom_command_warnings: Vec<String>,
+    /// W-C M2: terminal focus, for the desktop-notification gate. `focused`
+    /// defaults true; `focus_reported` flips once ANY crossterm focus event
+    /// arrives, so the fire-anyway fallback holds only on emulators that never
+    /// report focus.
+    pub focused: bool,
+    pub focus_reported: bool,
+    /// W-C M2: the desktop-notification on/off toggle (default on), plus a
+    /// commit counter the runtime watches to persist a change.
+    pub notifications_enabled: bool,
+    pub notification_commits: u64,
+    /// W-C M2: the attached session's last-seen run state — the edge the
+    /// notification fires on (one per turn, never mid-stream).
+    pub notification_run_state: Option<RunState>,
+    /// W-C M2: pending notification lines the runtime drains and emits as
+    /// OSC 9 (bounded, masked; the runtime gates emission on a tty).
+    pub notifications: Vec<String>,
     /// The most recently detached session — the empty-⏎ re-attach target.
     pub last_detached: Option<SessionId>,
     /// Local generation allocator (seeds take 1-3; `0` is the scratch
@@ -3162,6 +3178,12 @@ impl Default for AppModel {
             active_session: None,
             custom_commands: Vec::new(),
             custom_command_warnings: Vec::new(),
+            focused: true,
+            focus_reported: false,
+            notifications_enabled: true,
+            notification_commits: 0,
+            notification_run_state: None,
+            notifications: Vec::new(),
             last_detached: None,
             next_ui_generation: UiGeneration::FIRST.get() + SEED_SESSION_COUNT,
             roster: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -3929,6 +3951,67 @@ impl AppModel {
         self.custom_commands
             .iter()
             .find(|command| command.name == lowered)
+    }
+
+    /// W-C M2: record terminal focus and latch that focus IS reported (so the
+    /// fire-anyway fallback only holds on emulators that never report it).
+    pub fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        self.focus_reported = true;
+    }
+
+    /// W-C M2: seed the notification toggle from persisted settings.
+    pub fn set_notifications_enabled(&mut self, enabled: bool) {
+        self.notifications_enabled = enabled;
+    }
+
+    /// W-C M2: flip (or set) the desktop-notification toggle and bump the
+    /// commit counter the runtime watches to persist the change.
+    pub fn toggle_notifications(&mut self, enable: Option<bool>) {
+        let next = enable.unwrap_or(!self.notifications_enabled);
+        if next != self.notifications_enabled {
+            self.notifications_enabled = next;
+            self.notification_commits += 1;
+        }
+        self.flash = Some(format!(
+            "· notifications {}",
+            if next { "on" } else { "off" }
+        ));
+        self.dirty = true;
+    }
+
+    /// W-C M2: the desktop-notification decision for the ATTACHED session's
+    /// run state. Edge-triggered — only a NEW transition into a trigger state
+    /// (Done / Errored / a permission·input·device-wait park) fires, so a
+    /// replay of the same state never re-notifies (one per turn, never
+    /// mid-stream). Gated on the toggle and on the terminal being UNFOCUSED
+    /// (or focus never reported). The masked line is queued for the runtime,
+    /// which owns the tty-gated OSC 9 emission.
+    pub fn note_run_state_for_notifications(&mut self, state: &RunState) {
+        let previous = self.notification_run_state.replace(state.clone());
+        if previous.as_ref() == Some(state) {
+            return;
+        }
+        let Some(attention) = crate::notify::attention_for(state) else {
+            return;
+        };
+        if !self.notifications_enabled {
+            return;
+        }
+        // Fire only when unfocused; a terminal that never reports focus fires
+        // regardless (a redundant ping beats a missed one).
+        if self.focus_reported && self.focused {
+            return;
+        }
+        let title = self.session_title.as_deref();
+        self.notifications
+            .push(crate::notify::notification_line(attention, title));
+    }
+
+    /// W-C M2: drain the queued notification lines (the runtime emits each as
+    /// OSC 9 to the tty).
+    pub fn take_notifications(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notifications)
     }
 
     /// The CURRENT pair's daemon-projected detail row (G3): the one source
@@ -8109,6 +8192,18 @@ impl AppModel {
             .map(str::to_ascii_lowercase);
         match name.as_str() {
             "help" => self.help_open = true,
+            // W-C M2: the desktop-notification toggle. Works everywhere (it is
+            // a display preference, not a session command); bare `/notifications`
+            // flips it, `on`/`off` set it explicitly, and the runtime persists
+            // the change to the TUI settings file.
+            "notifications" | "notify" => match arg.as_deref() {
+                Some("on") => self.toggle_notifications(Some(true)),
+                Some("off") => self.toggle_notifications(Some(false)),
+                None | Some("toggle") => self.toggle_notifications(None),
+                Some(other) => {
+                    self.flash = Some(format!("· /notifications {other} — try on · off"));
+                }
+            },
             // THE REDUCER MAY NOT OPEN A CARD IT CANNOT CLOSE (W3c3.1,
             // review D1-2). `/voice` and `/tools` mint a LOCAL `MenuOpened`
             // with no committed opening envelope, so live mode has no
@@ -9277,16 +9372,19 @@ impl AppModel {
             // user-row envelope pre-empted that callback, so its note never
             // landed (review P2-12).
         }
-        if let EventPayload::RunState(state) = payload
-            && state.is_terminal()
-        {
-            self.turn_active = false;
-            self.auto_resuming = false;
-            // The `♪ speaking` tag ends where the TURN ends. A trailing
-            // `Voice(false)` beat could not: a branch parked on a menu
-            // never reaches its own tail, so later ordinary rows kept
-            // rendering as spoken (review P2-10).
-            self.projection.set_voice_live(false);
+        if let EventPayload::RunState(state) = payload {
+            // W-C M2: the desktop-notification edge — terminal + attention-park
+            // states only, never mid-stream, gated on the focus/toggle inside.
+            self.note_run_state_for_notifications(state);
+            if state.is_terminal() {
+                self.turn_active = false;
+                self.auto_resuming = false;
+                // The `♪ speaking` tag ends where the TURN ends. A trailing
+                // `Voice(false)` beat could not: a branch parked on a menu
+                // never reaches its own tail, so later ordinary rows kept
+                // rendering as spoken (review P2-10).
+                self.projection.set_voice_live(false);
+            }
         }
         if matches!(payload, EventPayload::MenuOpened(_)) {
             self.menu_selection = 0;

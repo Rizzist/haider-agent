@@ -18,8 +18,8 @@ use haider_protocol::state::{HarnessStatus, RunState};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyEventKind, MouseButton, MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -151,6 +151,38 @@ pub fn sync_theme_persistence(
     }
 }
 
+/// W-C M2: persist a notification-toggle change (mirrors the theme sync).
+pub fn sync_notification_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.notification_commits == *seen_commits {
+        return;
+    }
+    *seen_commits = model.notification_commits;
+    if let Some(store) = settings.as_mut() {
+        store.save_notifications_if_changed(model.theme_choice, model.notifications_enabled);
+    }
+}
+
+/// W-C M2: emit each queued desktop notification as an OSC 9 sequence — but
+/// ONLY to a real terminal. A piped/redirected stdout receives NO escape
+/// bytes (the non-tty suppression law), so a captured run stays clean.
+fn emit_notifications(model: &mut crate::app::AppModel) {
+    let pending = model.take_notifications();
+    if pending.is_empty() {
+        return;
+    }
+    let is_tty = std::io::IsTerminal::is_terminal(&stdout());
+    let mut out = stdout();
+    for line in pending {
+        // Non-tty stdout yields no bytes (the suppression law's single home).
+        let _ = out.write_all(&crate::notify::osc9_for_tty(&line, is_tty));
+    }
+    let _ = out.flush();
+}
+
 /// Parse the `COLORFGBG` convention (`"<fg>;<bg>"`, sometimes
 /// `"<fg>;default;<bg>"`): the LAST field is the background's 16-color
 /// index — 0-6 and 8 are dark grounds, 7 and 15 light. Anything else
@@ -201,7 +233,10 @@ impl TerminalGuard {
             stdout(),
             EnterAlternateScreen,
             EnableBracketedPaste,
-            EnableMouseCapture
+            EnableMouseCapture,
+            // W-C M2: report focus so the notification gate can suppress a
+            // ping while the terminal is focused.
+            EnableFocusChange
         ) {
             // Roll back the partial setup: raw mode is on, and the alternate
             // screen may or may not have been entered before the failure —
@@ -235,6 +270,7 @@ fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
         stdout(),
+        DisableFocusChange,
         DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
@@ -671,6 +707,12 @@ pub fn dispatch_input(
                 _ => {}
             }
         }
+        // W-C M2: crossterm focus reporting drives the notification focus gate
+        // (a notification fires only when the terminal is UNFOCUSED). Seeing
+        // ANY focus event also flips the "focus is reported" latch, so the
+        // fire-anyway fallback only holds on emulators that never report it.
+        Event::FocusGained => model.set_focus(true),
+        Event::FocusLost => model.set_focus(false),
         _ => {}
     }
 }
@@ -2674,7 +2716,18 @@ pub async fn run_live(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // W-C M2: seed the desktop-notification toggle from the persisted setting
+    // (default on) so a prior `/notifications off` survives a restart, and
+    // mirror it into the store so a later theme save never drops it.
+    let notifications_on = settings
+        .as_ref()
+        .map_or(true, crate::settings::SettingsStore::load_notifications);
+    model.set_notifications_enabled(notifications_on);
+    if let Some(store) = settings.as_mut() {
+        store.set_notifications(notifications_on);
+    }
     let mut seen_theme_commits = model.theme_commits;
+    let mut seen_notification_commits = model.notification_commits;
     let mut active_title = model.window_title();
 
     // Graphics wordmark query — after raw mode, before the input pump (see the
@@ -2808,6 +2861,10 @@ pub async fn run_live(
             }
         }
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
+        // W-C M2: persist a toggle change, then flush any queued desktop
+        // notifications as OSC 9 to the terminal (tty-gated inside).
+        sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);
+        emit_notifications(&mut model);
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
