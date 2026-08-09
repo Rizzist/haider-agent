@@ -742,6 +742,9 @@ impl HeadlessReducer {
             | RunState::Streaming
             | RunState::RunningTool
             | RunState::Waiting { .. }
+            // M4: a retry wait is mid-run, non-terminal work — it never blocks
+            // or ends a headless run (and never a terminal notification).
+            | RunState::Retrying { .. }
             | RunState::PermissionRequired { .. }
             | RunState::Compacting
             | RunState::Verifying { .. }

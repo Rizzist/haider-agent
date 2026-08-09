@@ -364,6 +364,7 @@ fn observe_run_state(state: &RunState) -> haider_rpc::ObserveRunStateWire {
         | RunState::Streaming
         | RunState::RunningTool
         | RunState::Waiting { .. }
+        | RunState::Retrying { .. }
         | RunState::Compacting
         | RunState::Verifying { .. }
         | RunState::Concluding

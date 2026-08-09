@@ -255,6 +255,23 @@ fn thinking_line(theme: &Theme, phase: u8, truecolor: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// M4: the transcript-tail retry line, the warn/ember-toned neighbor of
+/// `thinking_line`. `✻ API error · Retrying in <N>s · attempt <K>/<max>` while
+/// the actor backs off after a retryable provider failure. The countdown shows
+/// the committed backoff (the shared clock ticks the render, not a new timer);
+/// the whole line wears the warn ink so a transient API error reads distinct
+/// from healthy thinking.
+fn retrying_line(theme: &Theme, attempt: u32, max: u32, delay_ms: u64) -> Line<'static> {
+    let seconds = delay_ms.div_ceil(1_000);
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("✻ API error · Retrying in {seconds}s · attempt {attempt}/{max}"),
+            theme.warn_style(),
+        ),
+    ])
+}
+
 fn pad_spans_to<'s>(mut spans: Vec<Span<'s>>, width: usize) -> Vec<Span<'s>> {
     let pad = width.saturating_sub(Line::from(spans.clone()).width());
     if pad > 0 {
@@ -2917,6 +2934,12 @@ fn render_session(
         // sit flush against the last output line.
         lines.push(Line::default());
         lines.push(thinking_line(theme, model.anim_phase, model.truecolor));
+    }
+    // M4: a retryable provider failure backs off with a visible attempt
+    // counter, on the same transcript-tail surface as the thinking line.
+    if let Some((attempt, max, delay_ms)) = model.projection.retrying() {
+        lines.push(Line::default());
+        lines.push(retrying_line(theme, attempt, max, delay_ms));
     }
     // S2 item 5: exactly ONE blank line between the transcript's last
     // output and the composer band. The breathing row rides the STREAM

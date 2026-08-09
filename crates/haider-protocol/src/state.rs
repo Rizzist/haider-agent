@@ -61,6 +61,21 @@ pub enum RunState {
     Waiting {
         reason: WaitReason,
     },
+    /// A retryable provider request failed before committing any content for
+    /// this turn; the actor is backing off before re-issuing it (W-C M4,
+    /// Claude-Code-style visible retry). `attempt` is the NEXT attempt number
+    /// (a first failure shows `attempt 2`), `max` the ceiling, `delay_ms` the
+    /// backoff being waited, and `reason` distinguishes rate-limit from
+    /// generic provider backoff. Non-terminal and auto-continuing: it either
+    /// re-enters `Thinking` on the next try or latches `Errored` once the
+    /// attempts are exhausted. Distinct from `Waiting { ProviderBackoff }`
+    /// because only this variant carries the visible attempt counter.
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay_ms: u64,
+        reason: WaitReason,
+    },
     /// Blocked on a typed menu (question/choice/secret/file/conflict).
     InputRequired {
         menu: MenuId,
@@ -134,6 +149,7 @@ impl RunState {
         matches!(
             self,
             RunState::Waiting { .. }
+                | RunState::Retrying { .. }
                 | RunState::InputRequired { .. }
                 | RunState::PermissionRequired { .. }
                 | RunState::Compacting

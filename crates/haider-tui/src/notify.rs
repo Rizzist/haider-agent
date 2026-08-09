@@ -54,6 +54,9 @@ pub fn attention_for(state: &RunState) -> Option<Attention> {
         RunState::Waiting {
             reason: WaitReason::DeviceUnreachable,
         } => Some(Attention::WaitingDevice),
+        // M4: a retry backoff is mid-run work, never a terminal/park — it must
+        // stay silent (only the final Errored, once retries exhaust, notifies).
+        RunState::Retrying { .. } => None,
         _ => None,
     }
 }

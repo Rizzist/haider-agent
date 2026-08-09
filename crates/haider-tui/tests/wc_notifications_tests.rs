@@ -61,6 +61,38 @@ fn attention_fires_on_terminal_and_park_states_only() {
         }),
         None
     );
+    // M4: a retry backoff is mid-run work, NEVER a terminal/park — it must
+    // not fire a desktop notification (only the FINAL Errored does).
+    assert_eq!(
+        notify::attention_for(&RunState::Retrying {
+            attempt: 2,
+            max: 10,
+            delay_ms: 1_000,
+            reason: WaitReason::ProviderBackoff,
+        }),
+        None
+    );
+}
+
+#[test]
+fn retry_wait_fires_no_notification() {
+    // M4 × M2 interplay: a run backing off after a retryable failure queues
+    // nothing; only a real terminal (Done/Errored) or a park does.
+    let mut model = attached_model();
+    model.note_run_state_for_notifications(&RunState::Retrying {
+        attempt: 2,
+        max: 10,
+        delay_ms: 1_000,
+        reason: WaitReason::ProviderBackoff,
+    });
+    assert!(
+        model.notifications.is_empty(),
+        "a retry wait must stay silent: {:?}",
+        model.notifications
+    );
+    // The FINAL Errored (retries exhausted) still notifies.
+    model.note_run_state_for_notifications(&RunState::Errored);
+    assert_eq!(model.notifications.len(), 1, "the terminal Errored fires");
 }
 
 #[test]

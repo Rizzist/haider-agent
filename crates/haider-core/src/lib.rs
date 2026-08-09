@@ -26,11 +26,11 @@ mod sqlite_store;
 pub use actor::{
     CancelToken, ChildWaitCheckpoint, ContextCompactor, DeferredTicket, DeferredToolCheckpoint,
     DeferredToolResult, EventIdGenerator, HarnessActor, HarnessConfig, HarnessHandle,
-    ProviderAttemptDecision, ProviderAttemptResolver, RequestInputCheckpoint,
-    ResolvedProviderAttempt, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome,
+    ProviderAttemptDecision, ProviderAttemptResolver, RealRetrySleeper, RequestInputCheckpoint,
+    ResolvedProviderAttempt, RetrySleeper, SubmitCheckpointTurn, SubmitChildWaitTurn,
+    SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome,
     VISION_IMAGE_ESTIMATE_TOKENS, context_soft_threshold_tokens,
-    estimate_provider_request_input_tokens, sanitized_failure_message,
+    estimate_provider_request_input_tokens, retry_backoff_ms, sanitized_failure_message,
 };
 pub use fake_store::MemoryStore;
 pub use haider_store::{

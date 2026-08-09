@@ -1467,6 +1467,7 @@ fn chip_for_run_state(state: &RunState) -> Option<ChipState> {
         RunState::Queued
         | RunState::Thinking
         | RunState::Waiting { .. }
+        | RunState::Retrying { .. }
         | RunState::Compacting
         | RunState::Verifying { .. }
         | RunState::Concluding

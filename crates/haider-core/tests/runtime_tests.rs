@@ -1853,9 +1853,11 @@ async fn cancellation_wins_provider_retry_backoff_without_second_request() {
         .expect("turn accepted");
     loop {
         let envelope = events.recv().await.expect("waiting event");
+        // M4: the pre-first-event backoff now commits the visible `Retrying`
+        // state (with the attempt counter) in place of a bare `Waiting`.
         if matches!(
             typed(&envelope),
-            EventPayload::RunState(RunState::Waiting { .. })
+            EventPayload::RunState(RunState::Retrying { .. })
         ) {
             break;
         }

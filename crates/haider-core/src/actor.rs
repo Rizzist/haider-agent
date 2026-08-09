@@ -14,12 +14,15 @@
 //!   `RunState::Cancelled` as its final envelope and emits nothing after it,
 //!   even when cancellation wins a race with a buffered provider event.
 //! - **Retry owner (R6, authoritative site).** Provider retry lives here and
-//!   ONLY here (adapters keep `RetryPolicy::Never`): at most three attempts
-//!   per individual provider request, only retryable transport/rate-limit/
-//!   overload errors, and never after that request emitted a stream event —
-//!   which also fences effects, since a tool can only run after events.
-//!   `wait_before_provider_retry` commits durable `Waiting` state around the
-//!   backoff and cancellation wins every wait.
+//!   ONLY here (adapters keep `RetryPolicy::Never`): up to `MAX_API_RETRIES`
+//!   attempts per individual provider request, only retryable transport/
+//!   rate-limit/overload errors, and never after that request emitted a stream
+//!   event — which also fences effects, since a tool can only run after
+//!   events. `wait_before_provider_retry` commits durable `Retrying` state
+//!   (W-C M4: a visible `attempt K/max` counter, Claude-Code style) around the
+//!   backoff and cancellation wins every wait. The backoff is a PURE function
+//!   of the attempt (`retry_backoff_ms`), and the wait is served through the
+//!   injected [`RetrySleeper`] so laws assert the sequence without waiting.
 //!
 //! General tool calls run through the injected [`ToolDispatcher`] (W3c);
 //! with no dispatcher installed they are surfaced completed-as-
@@ -72,9 +75,15 @@ const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
 /// Bounded web-sources list journaled under one finished turn (W-B).
 const WEB_SOURCES_CAP: usize = 8;
 const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
-const MAX_PROVIDER_ATTEMPTS: usize = 3;
-const RETRY_BASE_MS: u64 = 25;
-const RETRY_CEILING_MS: u64 = 2_000;
+/// W-C M4: Claude-Code-style visible API-error retry ceiling. Attempt 1 is
+/// the original try; up to nine more re-issues follow before the failure
+/// latches `Errored`, and the status line counts `attempt K/MAX_API_RETRIES`.
+const MAX_API_RETRIES: usize = 10;
+/// Deterministic (jitter-free) exponential backoff base — see
+/// [`retry_backoff_ms`]. One second reads cleanly as `Retrying in 1s`.
+const RETRY_BASE_MS: u64 = 1_000;
+/// Backoff cap: a single wait never exceeds ~30s of computed delay.
+const RETRY_CEILING_MS: u64 = 30_000;
 /// Provider instructions are respected beyond the computed-jitter ceiling,
 /// but a daemon must not park one request indefinitely on an untrusted value.
 /// Values above one minute terminalize as retryable exhaustion.
@@ -120,6 +129,9 @@ pub struct HarnessConfig {
     pub rotation_budget_consumed: bool,
     /// Daemon-owned resolver consulted only at a pre-first-event boundary.
     pub provider_attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    /// Injected backoff wait for the M4 provider-retry seam. Defaults to a
+    /// real `tokio` timer; laws swap in an instant recording sleeper.
+    pub retry_sleeper: Arc<dyn RetrySleeper>,
     /// Durable compaction implementation installed by the daemon. Standalone
     /// actors surface context overflow when none is configured.
     pub context_compactor: Option<Arc<dyn ContextCompactor>>,
@@ -168,6 +180,7 @@ impl HarnessConfig {
             initial_rotation: None,
             rotation_budget_consumed: false,
             provider_attempt_resolver: None,
+            retry_sleeper: Arc::new(RealRetrySleeper),
             context_compactor: None,
             command_capacity: 8,
             broadcast_capacity: 128,
@@ -337,6 +350,42 @@ pub trait ProviderAttemptResolver: Send + Sync + std::fmt::Debug {
         current_account: &CredentialAlias,
         error: &ProviderError,
     ) -> Result<ProviderAttemptDecision, HaiderError>;
+}
+
+/// Injectable backoff wait for the provider-retry seam (W-C M4). Production
+/// installs [`RealRetrySleeper`] (a real `tokio` sleep); laws inject a sleeper
+/// that returns immediately and records the requested delays, so the retry
+/// schedule is asserted without any wall-clock wait. Cancellation is layered
+/// OVER this by the caller — a sleeper never needs to observe the token.
+#[async_trait]
+pub trait RetrySleeper: Send + Sync + std::fmt::Debug {
+    async fn sleep(&self, delay_ms: u64);
+}
+
+/// The production [`RetrySleeper`]: an ordinary `tokio` timer (respects paused
+/// time in `#[tokio::test(start_paused = true)]` laws).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RealRetrySleeper;
+
+#[async_trait]
+impl RetrySleeper for RealRetrySleeper {
+    async fn sleep(&self, delay_ms: u64) {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+}
+
+/// Pure, jitter-free backoff schedule for the provider-retry seam (W-C M4):
+/// `min(RETRY_CEILING_MS, RETRY_BASE_MS * 2^(attempt-1))`. `attempt` is the
+/// 1-based number of the request that FAILED (attempt 1 = the original try),
+/// so a first failure waits `RETRY_BASE_MS`. A present `retry_after_ms`
+/// OVERRIDES this at the call site (the server's instruction wins). Being a
+/// pure function of the attempt lets a law assert the exact sequence.
+#[must_use]
+pub fn retry_backoff_ms(attempt: usize) -> u64 {
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    RETRY_BASE_MS
+        .saturating_mul(2_u64.saturating_pow(exponent))
+        .min(RETRY_CEILING_MS)
 }
 
 /// Two-phase compaction port. `plan` is journaled before `compact` performs
@@ -1972,7 +2021,7 @@ impl HarnessActor {
                 }
             }
         }
-        if provider_error_allows_retry(&error) && provider_attempt < MAX_PROVIDER_ATTEMPTS {
+        if provider_error_allows_retry(&error) && provider_attempt < MAX_API_RETRIES {
             self.wait_before_provider_retry(
                 context.run_id,
                 context.cancel,
@@ -2122,13 +2171,16 @@ impl HarnessActor {
         Ok(true)
     }
 
-    /// Commits `Waiting { RateLimit | ProviderBackoff }`, sleeps, then
-    /// commits `Thinking` — the R6 backoff between provider attempts.
+    /// Commits `Retrying { attempt, max, delay_ms, reason }` (W-C M4: the
+    /// visible `attempt K/max` counter), waits through the injected sleeper,
+    /// then commits `Thinking` — the R6 backoff between provider attempts.
     ///
-    /// The delay honors `retry_after_ms` exactly through the one-minute
-    /// respect cap. The two-second ceiling applies only to locally computed
-    /// deterministic full jitter. Instructions beyond the respect cap are
+    /// The delay is the PURE [`retry_backoff_ms`] schedule UNLESS the provider
+    /// sent a `retry_after_ms`, which OVERRIDES it exactly through the
+    /// one-minute respect cap. Instructions beyond the respect cap are
     /// terminalized as retryable exhaustion instead of silently shortened.
+    /// The committed `attempt` is `failed_attempt + 1` — the NEXT try — so a
+    /// first failure renders `attempt 2` (matching the screenshot).
     async fn wait_before_provider_retry(
         &mut self,
         run_id: &RunId,
@@ -2156,28 +2208,26 @@ impl HarnessActor {
         } else {
             WaitReason::ProviderBackoff
         };
-        self.commit_state(run_id, RunState::Waiting { reason })
-            .await
-            .map_err(DriveError::Store)?;
-        let delay_ms = error.retry_after_ms.unwrap_or_else(|| {
-            let exponent = u32::try_from(failed_attempt.saturating_sub(1)).unwrap_or(u32::MAX);
-            let ceiling = RETRY_BASE_MS
-                .saturating_mul(2_u64.saturating_pow(exponent))
-                .min(RETRY_CEILING_MS);
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(run_id.as_str().as_bytes());
-            hasher.update(&failed_attempt.to_be_bytes());
-            let bytes = hasher.finalize();
-            let mut sample = [0_u8; 8];
-            sample.copy_from_slice(&bytes.as_bytes()[..8]);
-            u64::from_be_bytes(sample) % ceiling.saturating_add(1)
-        });
+        // `retry_after_ms` (429/529 Retry-After) OVERRIDES the computed
+        // backoff; otherwise use the pure exponential schedule.
+        let delay_ms = error
+            .retry_after_ms
+            .unwrap_or_else(|| retry_backoff_ms(failed_attempt));
+        self.commit_state(
+            run_id,
+            RunState::Retrying {
+                attempt: u32::try_from(failed_attempt.saturating_add(1)).unwrap_or(u32::MAX),
+                max: u32::try_from(MAX_API_RETRIES).unwrap_or(u32::MAX),
+                delay_ms,
+                reason,
+            },
+        )
+        .await
+        .map_err(DriveError::Store)?;
         tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(DriveError::Cancelled),
-            () = tokio::time::sleep(std::time::Duration::from_millis(
-                delay_ms,
-            )) => {}
+            () = self.config.retry_sleeper.sleep(delay_ms) => {}
         }
         if cancel.is_cancelled() {
             return Err(DriveError::Cancelled);

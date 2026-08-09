@@ -722,6 +722,25 @@ impl SessionProjection {
         matches!(self.run, Some(RunState::Thinking))
     }
 
+    /// M4: the visible retry view — `(attempt, max, delay_ms)` while the run
+    /// is backing off after a retryable provider failure, so the transcript
+    /// tail can render `✻ API error · Retrying in Ns · attempt K/max`. `None`
+    /// in every other state.
+    #[must_use]
+    pub const fn retrying(&self) -> Option<(u32, u32, u64)> {
+        if let Some(RunState::Retrying {
+            attempt,
+            max,
+            delay_ms,
+            ..
+        }) = self.run
+        {
+            Some((attempt, max, delay_ms))
+        } else {
+            None
+        }
+    }
+
     /// True while the idle(i) marker is set (esc interrupted the last turn).
     #[must_use]
     pub const fn interrupted(&self) -> bool {
@@ -833,6 +852,16 @@ impl SessionProjection {
             RunState::Streaming => "▮ STREAMING".to_owned(),
             RunState::RunningTool => "⚒ TOOL_RUNNING".to_owned(),
             RunState::Waiting { reason } => format!("◔ WAITING · {}", wait_reason_label(reason)),
+            // M4: the plain/greppable equivalent of the warn-toned retry line.
+            RunState::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                ..
+            } => format!(
+                "✻ API error · Retrying in {}s · attempt {attempt}/{max}",
+                delay_ms.div_ceil(1_000)
+            ),
             RunState::InputRequired { .. } => "? INPUT_REQUIRED".to_owned(),
             RunState::PermissionRequired { .. } => "? PERMISSION_REQUIRED".to_owned(),
             RunState::Compacting => "⊟ COMPACTING".to_owned(),
@@ -883,7 +912,9 @@ impl SessionProjection {
         }
         match &self.run {
             None | Some(RunState::Done | RunState::Cancelled) => BadgeTone::Idle,
-            Some(RunState::Queued | RunState::Waiting { .. }) => BadgeTone::Restful,
+            Some(RunState::Queued | RunState::Waiting { .. } | RunState::Retrying { .. }) => {
+                BadgeTone::Restful
+            }
             Some(
                 RunState::Thinking
                 | RunState::Streaming
