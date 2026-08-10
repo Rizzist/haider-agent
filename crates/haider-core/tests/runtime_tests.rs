@@ -1834,6 +1834,46 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
     );
 }
 
+/// H2: a resolver that decides `Retry` (credential refresh) on EVERY 401 must
+/// not loop forever. The refresh is budgeted under `MAX_API_RETRIES`, so a
+/// persistently-failing 401 falls through to `Errored` within a bound instead
+/// of spinning. The resolver carries a safety hatch (returns `Stop` after 50
+/// calls) so a REGRESSED build still terminates the test — the assertion on the
+/// consulted count is what distinguishes fixed (≤ the cap) from broken (50).
+#[tokio::test]
+async fn persistent_401_refresh_terminates_in_errored_within_a_bound() {
+    let auth_error = || ProviderError::new(ProviderErrorKind::Authentication, "401 unauthorized");
+    let provider = Arc::new(CountingOpeningErrorProvider::new(auth_error()));
+    let resolver = Arc::new(RefreshingAttemptResolver {
+        calls: AtomicUsize::new(0),
+        provider: provider.clone(),
+        escape_after: 50,
+    });
+    let mut cfg = config();
+    cfg.usage_account = Some(CredentialAlias::new("acct-401"));
+    cfg.provider_attempt_resolver = Some(resolver.clone());
+    let handle = HarnessActor::spawn(cfg, provider.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("keep failing 401"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(
+        outcome.state,
+        RunState::Errored,
+        "a persistently-failing 401 must terminate, not loop"
+    );
+    let calls = resolver.calls.load(Ordering::SeqCst);
+    // MAX_API_RETRIES is 10; the refresh budget caps the resolver consultations
+    // at that. An unbudgeted (regressed) build hits the 50-call safety hatch.
+    assert!(
+        (1..=10).contains(&calls),
+        "the refresh must be budgeted under MAX_API_RETRIES (consulted {calls} times)"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn cancellation_wins_provider_retry_backoff_without_second_request() {
     let (handle, store, provider) = runtime(vec![
@@ -2613,6 +2653,44 @@ impl ProviderAttemptResolver for WaitingAttemptResolver {
     ) -> Result<ProviderAttemptDecision, HaiderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(ProviderAttemptDecision::Wait)
+    }
+}
+
+/// H2: a resolver that keeps deciding `Retry` (credential refresh) — the exact
+/// shape a persistently-failing 401 produces. The `escape_after` hatch returns
+/// `Stop` once the call count crosses it so an UNBUDGETED (regressed) build
+/// still terminates the test rather than spinning forever.
+struct RefreshingAttemptResolver {
+    calls: AtomicUsize,
+    provider: Arc<dyn Provider>,
+    escape_after: usize,
+}
+
+impl std::fmt::Debug for RefreshingAttemptResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RefreshingAttemptResolver")
+            .field("calls", &self.calls.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderAttemptResolver for RefreshingAttemptResolver {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call >= self.escape_after {
+            return Ok(ProviderAttemptDecision::Stop);
+        }
+        // Same provider + same account = a pure credential refresh (no rotation).
+        Ok(ProviderAttemptDecision::Retry {
+            provider: Arc::clone(&self.provider),
+            account: current_account.clone(),
+        })
     }
 }
 

@@ -1988,9 +1988,20 @@ impl HarnessActor {
                             "credential refresh changed account without a rotation event",
                         )));
                     }
-                    *provider = refreshed;
-                    *account = Some(refreshed_account);
-                    return Ok(());
+                    // H2: BUDGET the credential refresh under the same
+                    // `MAX_API_RETRIES` cap as an ordinary retry. Without this
+                    // gate a resolver that keeps deciding `Retry` on a
+                    // persistently-failing 401 loops forever — the arm returned
+                    // Ok before the cap check below was ever reached. Once the
+                    // attempt budget is spent, DON'T refresh again: fall through
+                    // to the capped-retry / Errored path so a non-recovering
+                    // 401 terminates. The legitimate refresh-then-succeed path
+                    // (a refresh at a low attempt count) is unaffected.
+                    if provider_attempt < MAX_API_RETRIES {
+                        *provider = refreshed;
+                        *account = Some(refreshed_account);
+                        return Ok(());
+                    }
                 }
                 ProviderAttemptDecision::Rotate(resolved) => {
                     if resolved.account != resolved.rotation.to
@@ -2224,10 +2235,37 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(DriveError::Cancelled),
-            () = self.config.retry_sleeper.sleep(delay_ms) => {}
+        // Clone the sleeper Arc into a local so the pinned backoff future
+        // borrows IT, not `self` — the loop below services commands through
+        // `&mut self` while the same sleep deadline is still pending.
+        let sleeper = Arc::clone(&self.config.retry_sleeper);
+        let sleep = sleeper.sleep(delay_ms);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                // L1: a Stop (or a closed command channel) during a long
+                // Retry-After backoff must not block shutdown for the full
+                // delay — treat it as a cancel. Other commands are serviced and
+                // the SAME sleep deadline is re-awaited, so the backoff clock
+                // never restarts.
+                command = self.commands.recv() => {
+                    match command {
+                        None => return Err(DriveError::Cancelled),
+                        Some(ActorCommand::Stop { completed }) => {
+                            cancel.cancel();
+                            let _ = completed.send(());
+                            return Err(DriveError::Cancelled);
+                        }
+                        Some(other) => {
+                            self.service_command_without_menu(other);
+                            continue;
+                        }
+                    }
+                }
+                () = &mut sleep => break,
+            }
         }
         if cancel.is_cancelled() {
             return Err(DriveError::Cancelled);
