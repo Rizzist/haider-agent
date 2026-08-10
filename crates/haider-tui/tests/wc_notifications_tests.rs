@@ -112,6 +112,49 @@ fn masked_text_hides_an_email_via_the_one_authority() {
 }
 
 #[test]
+fn mask_text_hides_api_keys_and_bearer_tokens_not_just_emails() {
+    // H3: secret-shaped tokens (API keys, bearer JWTs) are masked too — the
+    // old pass masked only `@`-tokens, so an `sk-…` sailed through. Ordinary
+    // prose words are still left alone.
+    let key = "sk-ant-api03-SEKRET1234567890abcd";
+    let masked = notify::mask_text(&format!("deploy {key} for prod"));
+    assert!(!masked.contains(key), "sk- key leaked: {masked}");
+    assert!(
+        masked.contains("deploy") && masked.contains("for") && masked.contains("prod"),
+        "prose kept: {masked}"
+    );
+    // A bearer JWT is masked as well.
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.payloadpart123.sigpart456";
+    let masked_jwt = notify::mask_text(&format!("token {jwt}"));
+    assert!(!masked_jwt.contains(jwt), "jwt leaked: {masked_jwt}");
+}
+
+#[test]
+fn notification_osc9_bytes_mask_an_api_key_in_the_title() {
+    // H3 end-to-end: an `sk-…` in a session title never reaches the OSC 9 bytes
+    // (nor the OS notification history) in the clear.
+    let mut model = attached_model();
+    let secret = "sk-ant-api03-DEADBEEFsecret0001x";
+    model.session_title = Some(format!("release {secret}"));
+    model.note_run_state_for_notifications(&RunState::Done);
+    let line = model.notifications.first().cloned().unwrap_or_default();
+    assert!(
+        !line.contains(secret),
+        "raw key leaked into the line: {line}"
+    );
+    let bytes = notify::osc9_for_tty(&line, true);
+    let emitted = String::from_utf8_lossy(&bytes);
+    assert!(
+        !emitted.contains(secret),
+        "raw key in OSC 9 bytes: {emitted}"
+    );
+    assert!(
+        emitted.contains("turn done"),
+        "still names the outcome: {emitted}"
+    );
+}
+
+#[test]
 fn osc9_wraps_and_strips_control_bytes() {
     // A stray BEL/ESC in the text can never terminate or inject the sequence.
     let seq = notify::osc9("done\u{7}\u{1b}[31m here");

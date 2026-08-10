@@ -82,14 +82,19 @@ pub fn notification_line(attention: Attention, session_title: Option<&str>) -> S
     truncate(&line, MAX_NOTIFICATION_LEN)
 }
 
-/// Mask identity-like tokens (emails) inside free text, delegating to the ONE
-/// masking authority (`format::mask_identity`) so no second dialect exists.
-/// Non-identity words pass through unchanged.
+/// Mask identity- AND secret-like tokens inside free text, delegating the
+/// length-preserving mask to the ONE masking authority (`format::mask_identity`)
+/// so no second dialect exists. Ordinary prose words pass through unchanged.
+///
+/// H3: a notification line goes into OSC 9 *and* the OS notification history,
+/// so it must not carry a leaked credential. An earlier pass masked ONLY
+/// `@`-tokens (emails); an API key / bearer token / `sk-…` in a session title
+/// sailed straight through. [`looks_like_secret`] now catches those too.
 #[must_use]
 pub fn mask_text(text: &str) -> String {
     text.split_whitespace()
         .map(|token| {
-            if token.contains('@') {
+            if looks_like_secret(token) {
                 mask_identity(token)
             } else {
                 token.to_owned()
@@ -97,6 +102,51 @@ pub fn mask_text(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether a whitespace token should be masked before it reaches a
+/// notification sink: an identity (email), a known credential prefix (OpenAI/
+/// Anthropic `sk-…`, GitHub PAT, Slack, AWS, Google, a `eyJ…` bearer JWT), or a
+/// long high-entropy credential-shaped run. Deliberately conservative on the
+/// generic rule so ordinary long words are not masked.
+fn looks_like_secret(token: &str) -> bool {
+    // Emails / identities (the original behaviour, kept).
+    if token.contains('@') {
+        return true;
+    }
+    // Known credential prefixes. `sk-`/`pk-`/`rk-`/PAT prefixes match
+    // case-insensitively; the mixed-case cloud keys keep their exact casing.
+    const CI_PREFIXES: &[&str] = &[
+        "sk-",
+        "sk_",
+        "pk-",
+        "pk_",
+        "rk-",
+        "rk_",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "ghr_",
+        "github_pat_",
+        "xox",
+    ];
+    const CS_PREFIXES: &[&str] = &["AKIA", "ASIA", "AIza", "ya29.", "eyJ"];
+    let lower = token.to_ascii_lowercase();
+    if CI_PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+        || CS_PREFIXES.iter().any(|prefix| token.starts_with(prefix))
+    {
+        return true;
+    }
+    // A long credential-shaped run: only key characters, ≥ 24 long, mixing
+    // letters and digits (prose words almost never do all three).
+    let core = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    core.len() >= 24
+        && core
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && core.chars().any(|c| c.is_ascii_digit())
+        && core.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// Wrap `text` in an OSC 9 desktop-notification sequence. The text is stripped
