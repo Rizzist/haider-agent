@@ -225,10 +225,12 @@ fn chip_two_tone<'a>(
 /// alternation is a port taste-call — a dimmed cell alone can read flat on
 /// low-contrast terminals; one law for the session and chip views).
 fn thinking_line(theme: &Theme, phase: u8, truecolor: bool) -> Line<'static> {
+    // The dot glyph carries its trailing space statically (`● `/`◌ `) so the
+    // pulse span costs no per-frame allocation.
     let dot = if phase.is_multiple_of(2) {
-        "●"
+        "● "
     } else {
-        "◌"
+        "◌ "
     };
     // W-E: the STATUS VERB carries a left→right brightness wave (per-glyph
     // shimmer spans on the shared clock); the leading dot keeps its uniform
@@ -236,16 +238,22 @@ fn thinking_line(theme: &Theme, phase: u8, truecolor: bool) -> Line<'static> {
     // stays as is), and the trailing `…` is decoration, base ink, never
     // shimmered (decision 1 / LE3).
     const VERB: &str = "thinking";
-    let len = VERB.chars().count();
+    // W-E render allocs: static per-glyph `&str`s replace 8 one-char `String`s
+    // per repaint (~240/s at 30 fps). Kept in lockstep with VERB — the shimmer
+    // laws pin `VERB.chars()`, and the debug_assert catches any drift.
+    const VERB_GLYPHS: [&str; 8] = ["t", "h", "i", "n", "k", "i", "n", "g"];
+    debug_assert_eq!(
+        VERB_GLYPHS.concat(),
+        VERB,
+        "the glyph table must spell the verb"
+    );
+    let len = VERB_GLYPHS.len();
     let mut spans = Vec::with_capacity(len + 3);
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("{dot} "),
-        theme.pulse_ink(theme.gold, phase),
-    ));
-    for (index, glyph) in VERB.chars().enumerate() {
+    spans.push(Span::styled(dot, theme.pulse_ink(theme.gold, phase)));
+    for (index, glyph) in VERB_GLYPHS.iter().enumerate() {
         spans.push(Span::styled(
-            glyph.to_string(),
+            *glyph,
             theme.shimmer_ink(phase, index, len, truecolor),
         ));
     }

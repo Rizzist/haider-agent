@@ -351,6 +351,17 @@ pub fn shimmer_centre(phase: u8, len: usize) -> Option<usize> {
     if len == 0 {
         return None;
     }
+    // W-E phase-totality (accepted cosmetic): the shared clock wraps at 256,
+    // which is NOT a multiple of `period`, so the centre jumps once per wrap
+    // (~154 animated seconds at the 600 ms cadence) — a single-frame hiccup,
+    // documented rather than chased (the verb is 8 glyphs; the cadence is a
+    // taste-call, not a correctness contract). The one real hazard is the
+    // `len + SHIMMER_TAIL` overflow, which `len == "thinking".len()` can never
+    // reach; the debug_assert pins the invariant.
+    debug_assert!(
+        len <= usize::MAX - SHIMMER_TAIL,
+        "shimmer period must not overflow usize"
+    );
     let pos = (phase as usize) % (len + SHIMMER_TAIL);
     (pos < len).then_some(pos)
 }
