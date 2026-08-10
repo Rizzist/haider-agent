@@ -38,6 +38,34 @@ use crate::worker::{WebSearchExecutor, WebSearchFailure};
 /// How much of a failing response body is quoted back verbatim.
 const ERROR_BODY_QUOTE_BYTES: usize = 2 * 1024;
 
+/// Hard ceiling on the raw search response body streamed off the endpoint
+/// (H4). `response.bytes()` buffers the WHOLE body first; a compromised or
+/// runaway `chatgpt.com` could hand back an unbounded response and exhaust
+/// memory before the 32 KiB downstream result cap ever applies. The extracted
+/// text is re-capped to 32 KiB downstream, so this bounds the raw JSON
+/// generously — legitimate results still parse, a hostile body cannot.
+const SEARCH_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
+
+/// Streaming, bounded body read: never buffers more than `cap` bytes off the
+/// unofficial endpoint (H4). Mirrors the webfetch `read_body_bounded` shape —
+/// a chunk that would cross the cap is clamped and the read stops.
+async fn read_body_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "search response body could not be read".to_owned())?
+    {
+        let remaining = cap.saturating_sub(body.len());
+        if chunk.len() >= remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Injected credential seam: which subscription credential one search rides,
 /// and at which origin. Production is the SAME [`CredentialBroker`] provider
 /// construction uses, so a search shares its refresh single-flight; laws
@@ -124,11 +152,9 @@ impl WebSearchHttp for ReqwestWebSearchHttp {
                 }
             })?;
         let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| "search response body could not be read".to_owned())?;
-        Ok((status, bytes.to_vec()))
+        // H4: stream the body under a hard cap instead of buffering it whole.
+        let bytes = read_body_capped(response, SEARCH_RESPONSE_CAP_BYTES).await?;
+        Ok((status, bytes))
     }
 }
 
@@ -395,6 +421,55 @@ mod web_search_tests {
             .expect_err("no credential, no search");
         assert!(!failure.degraded);
         assert!(failure.message.contains("no active credential"));
+    }
+
+    /// LAW (W-F H4, bounded body read): the production transport STREAMS the
+    /// search response under `SEARCH_RESPONSE_CAP_BYTES` rather than buffering
+    /// the whole body (`response.bytes()`) — a runaway/compromised endpoint
+    /// cannot exhaust memory before the 32 KiB downstream cap applies. Driven
+    /// over a LOOPBACK server (never chatgpt.com): an oversized body is
+    /// clamped to exactly the cap.
+    #[tokio::test]
+    async fn production_transport_caps_the_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let over = SEARCH_RESPONSE_CAP_BYTES + 64 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Drain the (small) request head so the client's write unblocks.
+                let mut scratch = vec![0u8; 4096];
+                let _ = socket.read(&mut scratch).await;
+                let body = "x".repeat(over);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let http = ReqwestWebSearchHttp::new();
+        let (status, bytes) = http
+            .post_json(
+                &format!("http://{addr}/alpha/search"),
+                &secret(b"TOKEN"),
+                &serde_json::json!({"q": "hi"}),
+            )
+            .await
+            .expect("loopback POST succeeds");
+        assert_eq!(status, 200);
+        assert_eq!(
+            bytes.len(),
+            SEARCH_RESPONSE_CAP_BYTES,
+            "an oversized body is clamped to exactly the cap, never buffered whole"
+        );
+        server.abort();
     }
 
     /// The verbatim quote is BOUNDED and stays on a char boundary — an
