@@ -38,6 +38,12 @@ pub const OPENAI_OAUTH_PROVIDER_NAME: &str = "openai-oauth";
 pub const OPENAI_COMPATIBLE_PROVIDER_NAME: &str = "openai-compatible";
 pub const KIMI_OAUTH_PROVIDER_NAME: &str = "kimi-oauth";
 pub const KIMI_OAUTH_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+pub const DEEPSEEK_PROVIDER_NAME: &str = "deepseek";
+pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+/// Documented compatibility aliases used only until authenticated discovery
+/// returns the live inventory. V4 slugs deliberately come from `/models`
+/// rather than this fallback.
+pub const DEEPSEEK_SEED_MODELS: [&str; 2] = ["deepseek-chat", "deepseek-reasoner"];
 pub const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
 pub const OPENAI_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const OPENAI_SUBSCRIPTION_RESPONSES_URL: &str =
@@ -51,6 +57,7 @@ pub const OPENAI_CODEX_RESPONSES_LITE_VALUE: &str = "true";
 pub const OPENAI_ALPHA_SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex/alpha/search";
 const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
 const KIMI_OAUTH_HOST: &str = "api.kimi.com";
+const DEEPSEEK_HOST: &str = "api.deepseek.com";
 
 const STREAM_CAPACITY: usize = 32;
 const MODELS_BODY_LIMIT: usize = 1024 * 1024;
@@ -529,6 +536,7 @@ pub struct OpenAiCompatibleProvider {
 enum CompatibleDialect {
     Generic,
     KimiOAuth,
+    DeepSeekApi,
 }
 
 /// Kimi's opt-in `extra_body.thinking` request extension.
@@ -698,6 +706,54 @@ impl OpenAiCompatibleProvider {
         })
     }
 
+    /// Constructs the release-owned DeepSeek API-key Chat Completions
+    /// dialect. Unlike a custom compatible profile, this is fixed to the
+    /// vendor's root `/chat/completions` and `/models` paths.
+    pub fn new_deepseek_api(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        Self::new_deepseek_api_with_dns_resolver(
+            credential,
+            model,
+            base_url,
+            Arc::new(SystemFixedDnsResolver),
+        )
+    }
+
+    fn new_deepseek_api_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if base_url != DEEPSEEK_BASE_URL {
+            return Err(invalid_request(
+                "DeepSeek inference base URL is not sanctioned",
+            ));
+        }
+        let chat_url = format!("{base_url}/chat/completions");
+        let models_url = format!("{base_url}/models");
+        let http = OpenAiHttp::new_fixed_origins(
+            credential,
+            model,
+            &[&chat_url, &models_url],
+            DEEPSEEK_HOST,
+            resolver,
+            false,
+        )?;
+        Ok(Self {
+            http,
+            base_url: base_url.to_owned(),
+            chat_url,
+            models_url,
+            dialect: CompatibleDialect::DeepSeekApi,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
+    }
+
     /// Enables or explicitly disables Kimi thinking passthrough. Generic
     /// compatible adapters reject this provider-specific seam.
     pub fn with_kimi_thinking(
@@ -763,7 +819,7 @@ impl OpenAiCompatibleProvider {
         )
     }
 
-    /// Probes `GET /v1/models` and derives only conservative capabilities from
+    /// Probes `GET /models` and derives only conservative capabilities from
     /// the presence and name of the configured model. The models endpoint does
     /// not itself prove tool/vision/reasoning support.
     pub async fn probe_capabilities(&self) -> Result<CapabilityDoc, ProviderError> {
@@ -772,10 +828,13 @@ impl OpenAiCompatibleProvider {
             return Err(http_error_from_response(response).await);
         }
         let body =
-            read_body_bounded(response, MODELS_BODY_LIMIT, "OpenAI-compatible /v1/models").await?;
+            read_body_bounded(response, MODELS_BODY_LIMIT, "OpenAI-compatible /models").await?;
         match self.dialect {
             CompatibleDialect::Generic => replay_openai_models_response(&self.http.model, &body),
             CompatibleDialect::KimiOAuth => replay_kimi_models_response(&self.http.model, &body),
+            CompatibleDialect::DeepSeekApi => {
+                replay_deepseek_models_response(&self.http.model, &body)
+            }
         }
     }
 
@@ -800,7 +859,9 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         match self.dialect {
-            CompatibleDialect::Generic => crate::ProviderCredentialSurface::ApiKey,
+            CompatibleDialect::Generic | CompatibleDialect::DeepSeekApi => {
+                crate::ProviderCredentialSurface::ApiKey
+            }
             CompatibleDialect::KimiOAuth => {
                 crate::ProviderCredentialSurface::OAuthSubscriptionBearer
             }
@@ -811,6 +872,7 @@ impl Provider for OpenAiCompatibleProvider {
         let provider = match self.dialect {
             CompatibleDialect::Generic => OPENAI_COMPATIBLE_PROVIDER_NAME,
             CompatibleDialect::KimiOAuth => KIMI_OAUTH_PROVIDER_NAME,
+            CompatibleDialect::DeepSeekApi => DEEPSEEK_PROVIDER_NAME,
         };
         self.probe_capabilities()
             .await
@@ -1956,9 +2018,27 @@ pub fn replay_openai_models_response(
     model: &str,
     body: &[u8],
 ) -> Result<CapabilityDoc, ProviderError> {
+    replay_compatible_models_response(OPENAI_COMPATIBLE_PROVIDER_NAME, model, body)
+}
+
+/// Replays DeepSeek's OpenAI-shaped `/models` response while retaining the
+/// named builtin identity. The endpoint declares availability only, so the
+/// resulting capability document remains deliberately conservative.
+pub fn replay_deepseek_models_response(
+    model: &str,
+    body: &[u8],
+) -> Result<CapabilityDoc, ProviderError> {
+    replay_compatible_models_response(DEEPSEEK_PROVIDER_NAME, model, body)
+}
+
+fn replay_compatible_models_response(
+    provider: &str,
+    model: &str,
+    body: &[u8],
+) -> Result<CapabilityDoc, ProviderError> {
     let models: ModelsEnvelope = serde_json::from_slice(body).map_err(|error| {
         malformed(format!(
-            "OpenAI-compatible /v1/models response is not valid JSON: {error}"
+            "OpenAI-compatible /models response is not valid JSON: {error}"
         ))
     })?;
     if !models.data.iter().any(|entry| entry.id == model) {
@@ -1966,7 +2046,7 @@ pub fn replay_openai_models_response(
             "OpenAI-compatible endpoint does not advertise configured model `{model}`"
         )));
     }
-    Ok(compatible_capabilities(model))
+    Ok(compatible_capabilities(provider))
 }
 
 /// Replays Kimi's richer `/coding/v1/models` document into an honest
@@ -2538,7 +2618,7 @@ fn chat_request_json(
         .as_object_mut()
         .ok_or_else(|| internal("Chat request payload was not an object"))?;
     match dialect {
-        CompatibleDialect::Generic => {
+        CompatibleDialect::Generic | CompatibleDialect::DeepSeekApi => {
             object.insert("max_tokens".into(), serde_json::json!(request.max_tokens));
         }
         CompatibleDialect::KimiOAuth => {
@@ -2621,10 +2701,10 @@ fn native_capabilities(model: &str) -> CapabilityDoc {
     }
 }
 
-fn compatible_capabilities(_model: &str) -> CapabilityDoc {
+fn compatible_capabilities(provider: &str) -> CapabilityDoc {
     CapabilityDoc {
-        provider: OPENAI_COMPATIBLE_PROVIDER_NAME.into(),
-        // `/v1/models` proves availability only. The generic OpenAI schema
+        provider: provider.into(),
+        // The models endpoint proves availability only. The generic OpenAI schema
         // carries none of these feature or limit facts, so do not infer them
         // from a vendor-controlled model identifier.
         parallel_tools: FeatureResolve::Unsupported,
@@ -3136,19 +3216,33 @@ fn chat_usage(
     value: &serde_json::Value,
     account: Option<CredentialAlias>,
 ) -> Result<Usage, ProviderError> {
+    let prompt_tokens = required_u64(value, "prompt_tokens", "Chat usage")?;
+    // DeepSeek reports cache accounting as two top-level counters. Its
+    // `prompt_tokens` is their sum, while Haider's `input` is the uncached
+    // portion whenever a provider exposes that split.
+    let input = value
+        .get("prompt_cache_miss_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(prompt_tokens);
+    let cached = value
+        .get("prompt_cache_hit_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            value
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0);
     Ok(Usage {
-        input: required_u64(value, "prompt_tokens", "Chat usage")?,
+        input,
         output: required_u64(value, "completion_tokens", "Chat usage")?,
         reasoning: value
             .get("completion_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        cached: value
-            .get("prompt_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
+        cached,
         source: UsageSource::ProviderReported,
         account,
         accounts: Vec::new(),

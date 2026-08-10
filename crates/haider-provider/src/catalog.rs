@@ -123,6 +123,8 @@ pub enum CatalogSource {
     GeminiApiKey,
     /// An OpenAI-compatible custom profile's stored API origin.
     OpenAiCompatible { origin: String },
+    /// DeepSeek's fixed OpenAI-compatible API-key catalog.
+    DeepSeekApi,
 }
 
 /// The final request URL for a source's model catalog.
@@ -141,7 +143,8 @@ pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
         CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
         | CatalogSource::GeminiApiKey
-        | CatalogSource::OpenAiCompatible { .. } => endpoint.to_owned(),
+        | CatalogSource::OpenAiCompatible { .. }
+        | CatalogSource::DeepSeekApi => endpoint.to_owned(),
     }
 }
 
@@ -161,6 +164,7 @@ impl CatalogSource {
             Self::OpenAiCompatible { origin } => {
                 format!("{}/models", origin.trim().trim_end_matches('/'))
             }
+            Self::DeepSeekApi => format!("{}/models", crate::DEEPSEEK_BASE_URL),
         }
     }
 
@@ -171,6 +175,7 @@ impl CatalogSource {
             Self::KimiOAuth => Some("api.kimi.com"),
             Self::GeminiApiKey => Some("generativelanguage.googleapis.com"),
             Self::OpenAiCompatible { .. } => None,
+            Self::DeepSeekApi => Some("api.deepseek.com"),
         }
     }
 }
@@ -197,7 +202,8 @@ impl CatalogSource {
             Self::OpenAiSubscription
             | Self::AnthropicSubscription
             | Self::KimiOAuth
-            | Self::OpenAiCompatible { .. } => CatalogAuthMode::Bearer,
+            | Self::OpenAiCompatible { .. }
+            | Self::DeepSeekApi => CatalogAuthMode::Bearer,
         }
     }
 }
@@ -289,7 +295,8 @@ pub async fn discover_models_with_resolver(
         CatalogSource::OpenAiSubscription
         | CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
-        | CatalogSource::GeminiApiKey => {
+        | CatalogSource::GeminiApiKey
+        | CatalogSource::DeepSeekApi => {
             let endpoint = source.endpoint();
             let Some(trusted_host) = source.trusted_host() else {
                 return Err(CatalogError::Unavailable {
@@ -415,7 +422,8 @@ pub fn parse_catalog(
         // Anthropic and OpenAI-compatible: `{ "data": [ … ] }`
         CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
-        | CatalogSource::OpenAiCompatible { .. } => value.get("data"),
+        | CatalogSource::OpenAiCompatible { .. }
+        | CatalogSource::DeepSeekApi => value.get("data"),
     }
     .and_then(serde_json::Value::as_array)
     .ok_or_else(|| CatalogError::Unavailable {
@@ -449,7 +457,10 @@ pub fn parse_catalog(
             });
             continue;
         }
-        if matches!(source, CatalogSource::OpenAiCompatible { .. }) {
+        if matches!(
+            source,
+            CatalogSource::OpenAiCompatible { .. } | CatalogSource::DeepSeekApi
+        ) {
             let Some(slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
@@ -516,7 +527,8 @@ pub fn parse_catalog(
                 .filter(|window| *window > 0),
             CatalogSource::AnthropicSubscription
             | CatalogSource::GeminiApiKey
-            | CatalogSource::OpenAiCompatible { .. } => None,
+            | CatalogSource::OpenAiCompatible { .. }
+            | CatalogSource::DeepSeekApi => None,
         };
         let kimi_extensions =
             matches!(source, CatalogSource::KimiOAuth).then(|| DiscoveredModelExtensions {

@@ -67,15 +67,17 @@ pub use gemini::{
     replay_gemini_sse_for_request,
 };
 pub use openai::{
-    CompatibleOriginPolicy, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig,
-    KimiThinkingType, OPENAI_ALPHA_SEARCH_URL, OPENAI_CODEX_RESPONSES_LITE_HEADER,
-    OPENAI_CODEX_RESPONSES_LITE_VALUE, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL,
-    OPENAI_SUBSCRIPTION_RESPONSES_URL, OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider,
-    OpenAiRetryPolicy, OpenAiTransportConfig, azure_openai_origin, codex_alpha_search_request_body,
-    codex_alpha_search_response_text, codex_alpha_search_url, replay_kimi_models_response,
-    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
-    replay_openai_responses_sse, validate_openai_compatible_endpoint,
+    CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
+    KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig, KimiThinkingType,
+    OPENAI_ALPHA_SEARCH_URL, OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
+    OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
+    OpenAiTransportConfig, azure_openai_origin, codex_alpha_search_request_body,
+    codex_alpha_search_response_text, codex_alpha_search_url, replay_deepseek_models_response,
+    replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
+    replay_openai_models_response, replay_openai_responses_sse,
+    validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{MODEL_RATES, ModelRate, estimate_chunk_cost_usd, model_rate};
@@ -91,8 +93,9 @@ pub use webfetch::{
 };
 
 /// Provider classes backed by production account credentials in this release.
-/// G4b adds the enterprise Anthropic surfaces: Bedrock mantle and Vertex.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 9] = [
+/// New named providers append to this stable roster; custom endpoint profiles
+/// remain a separate registry concern.
+pub const BUILTIN_PROVIDER_NAMES: [&str; 10] = [
     ANTHROPIC_PROVIDER_NAME,
     ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
@@ -102,6 +105,7 @@ pub const BUILTIN_PROVIDER_NAMES: [&str; 9] = [
     GEMINI_PROVIDER_NAME,
     BEDROCK_PROVIDER_NAME,
     VERTEX_PROVIDER_NAME,
+    DEEPSEEK_PROVIDER_NAME,
 ];
 
 /// Crate marker used by the workspace self-test.

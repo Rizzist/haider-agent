@@ -472,6 +472,19 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             Some("llama-3-70b"),
             true,
         ),
+        // DeepSeek is a named fixed-origin builtin. The documented aliases
+        // are fallback rows only; no context/effort/speed facts are guessed.
+        summary(
+            "deepseek",
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            Some("https://api.deepseek.com"),
+            &["deepseek-chat", "deepseek-reasoner"],
+            &[AuthMethod::ApiKey],
+            ProviderAvailabilityWire::Unavailable,
+            Some("provider has no credential"),
+            Some("deepseek-chat"),
+            true,
+        ),
     ]
 }
 

@@ -218,10 +218,9 @@ fn device_section_lists_candidates_with_freshness() {
     model.handle(key(KeyCode::Esc));
     run_slash(&mut model, "/providers");
     assert_eq!(model.screen, Screen::Providers);
-    // G4b widened the pinned footer (a sixth button row + the enterprise
-    // hint line), so the same walk needs two more rows to keep the device
-    // section on screen.
-    let (text, _, _) = draw(&model, 118, 46);
+    // The named DeepSeek registry card adds one provider block above the
+    // pinned footer, so keep enough height for the shared device section.
+    let (text, _, _) = draw(&model, 118, 54);
     assert!(
         text.contains("found on this device") && text.contains("[1] Codex CLI · openai"),
         "the providers buttons area shares the section:\n{text}"

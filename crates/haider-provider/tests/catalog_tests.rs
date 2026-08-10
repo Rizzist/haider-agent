@@ -399,6 +399,35 @@ fn endpoints_are_the_vendor_paths() {
         CatalogSource::GeminiApiKey.endpoint(),
         "https://generativelanguage.googleapis.com/v1beta/models"
     );
+    assert_eq!(
+        CatalogSource::DeepSeekApi.endpoint(),
+        "https://api.deepseek.com/models"
+    );
+}
+
+/// WH3 parser/golden half: DeepSeek's `/models` response is deliberately
+/// IDs-only. No context window or tuning ladder may be inferred from a slug.
+#[test]
+fn deepseek_catalog_golden_preserves_only_discovered_model_facts() {
+    let payload: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/catalog/deepseek_models.json"))
+            .expect("DeepSeek models fixture");
+    let models =
+        parse_catalog(CatalogSource::DeepSeekApi, &payload).expect("DeepSeek catalog parses");
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        ["deepseek-chat", "deepseek-reasoner"]
+    );
+    assert!(models.iter().all(|model| {
+        model.display_name == model.slug
+            && model.context_window.is_none()
+            && model.supported_efforts.is_empty()
+            && model.default_effort.is_none()
+            && model.extensions.is_none()
+    }));
 }
 
 /// Gemini is the first catalog here whose provider-owned response carries

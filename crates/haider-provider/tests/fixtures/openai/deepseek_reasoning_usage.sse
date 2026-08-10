@@ -1,0 +1,8 @@
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"check the invariant"},"finish_reason":null}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":94,"completion_tokens":13,"total_tokens":107,"prompt_cache_hit_tokens":71,"prompt_cache_miss_tokens":23}}
+
+data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}
+
+data: [DONE]
+

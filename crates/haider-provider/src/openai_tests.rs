@@ -1154,6 +1154,105 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
     assert_eq!(payload["thinking"]["keep"], "all");
 }
 
+/// WH2 — a named DeepSeek turn is rooted at `/chat/completions`, carries a
+/// sensitive Bearer key, and sends the selected DeepSeek slug in `model`.
+///
+/// MUTATION CHECK: route through generic compatible endpoint expansion,
+/// remove Bearer, or substitute the configured model. The exact URL/header
+/// and request golden below all fail independently.
+#[tokio::test]
+async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("deepseek-request-golden");
+    vault
+        .put(&alias, b"DEEPSEEK_API_KEY_SENTINEL_3d72")
+        .expect("store DeepSeek key");
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        443,
+    ))]]));
+    let provider = OpenAiCompatibleProvider::new_deepseek_api_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve DeepSeek key"),
+        "deepseek-reasoner",
+        DEEPSEEK_BASE_URL,
+        resolver,
+    )
+    .expect("construct named DeepSeek adapter");
+    let request = TurnRequest {
+        messages: vec![crate::Message::user_text("hello")],
+        model: "deepseek-reasoner".to_owned(),
+        max_tokens: 17,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let payload = provider
+        .request_payload(&request)
+        .expect("DeepSeek request payload");
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/openai/deepseek_request.json"
+    ))
+    .expect("DeepSeek request golden");
+    assert_eq!(payload, expected);
+    assert_eq!(payload["model"], "deepseek-reasoner");
+    assert!(payload.get("temperature").is_none());
+
+    let outbound = provider
+        .http
+        .post_json_request(&provider.chat_url, &payload)
+        .await
+        .expect("build fixed DeepSeek request");
+    assert_eq!(
+        outbound.url().as_str(),
+        "https://api.deepseek.com/chat/completions"
+    );
+    let authorization = outbound
+        .headers()
+        .get(AUTHORIZATION)
+        .expect("DeepSeek bearer header");
+    assert_eq!(
+        authorization.as_bytes(),
+        b"Bearer DEEPSEEK_API_KEY_SENTINEL_3d72"
+    );
+    assert!(authorization.is_sensitive());
+}
+
+/// WH4 — DeepSeek's top-level cache counters are the accounting authority:
+/// miss tokens are uncached input and hit tokens are cache reads.
+///
+/// MUTATION CHECK: swap the two fields or fall back to aggregate
+/// `prompt_tokens`; the unequal 23/71/94 assertions kill the mutation.
+#[test]
+fn wh4_deepseek_cache_usage_maps_hit_and_miss_tokens() {
+    let items = replay_openai_chat_sse(include_bytes!(
+        "../tests/fixtures/openai/deepseek_reasoning_usage.sse"
+    ));
+    let usage = items
+        .iter()
+        .find_map(|item| match item {
+            Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+            _ => None,
+        })
+        .expect("DeepSeek usage event");
+    assert_eq!(usage.input, 23, "cache miss is uncached input");
+    assert_eq!(usage.cached, 71, "cache hit is cache-read input");
+    assert_eq!(usage.input + usage.cached, 94, "matches prompt total");
+    assert_eq!(usage.output, 13);
+}
+
+/// WH5 — DeepSeek reasoner streams non-namespaced `reasoning_content`; it
+/// must surface as normalized reasoning rather than disappearing.
+#[test]
+fn wh5_deepseek_reasoning_content_surfaces_as_reasoning() {
+    let items = replay_openai_chat_sse(include_bytes!(
+        "../tests/fixtures/openai/deepseek_reasoning_usage.sse"
+    ));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ReasoningDelta { text }) if text == "check the invariant"
+    )));
+}
+
 /// LAW (LE3, kimi half): a k3-style pair takes the documented TOP-LEVEL
 /// `reasoning_effort` knob — no `thinking` object rides along unless the
 /// catalog-gated factory also enabled it — and the seam is Kimi-only: the

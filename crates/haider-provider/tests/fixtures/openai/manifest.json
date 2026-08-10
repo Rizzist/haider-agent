@@ -1,7 +1,7 @@
 {
   "schema": "haider.openai-fixtures.v1",
   "provisional": true,
-  "provenance": "Synthetic OpenAI Responses and OpenAI-compatible Chat Completions streams maintained in-tree; all IDs, refusal text, encrypted content, errors, and usage are non-secret test values.",
+  "provenance": "Synthetic OpenAI Responses and OpenAI-compatible Chat Completions streams maintained in-tree, including DeepSeek's documented reasoning_content and cache-usage fields; all IDs, refusal text, encrypted content, errors, and usage are non-secret test values.",
   "fixtures": [
     {
       "name": "native_responses",
@@ -14,6 +14,12 @@
       "family": "chat_completions",
       "wire": "chat.sse",
       "golden": "chat.events.json"
+    },
+    {
+      "name": "deepseek_reasoning_usage",
+      "family": "chat_completions",
+      "wire": "deepseek_reasoning_usage.sse",
+      "golden": "deepseek_reasoning_usage.events.json"
     },
     {
       "name": "native_concurrent_tools",

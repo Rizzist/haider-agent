@@ -1444,6 +1444,7 @@ fn opaque_tag_table_and_strip_are_exact() {
         ("gemini", "gemini"),
         ("openai-compatible", "openai-compatible"),
         ("kimi-oauth", "openai-compatible"),
+        ("deepseek", "openai-compatible"),
         ("custom-lab", "openai-compatible"),
     ] {
         assert_eq!(accepted_opaque_provider(provider), accepted, "{provider}");
@@ -1483,4 +1484,13 @@ fn opaque_tag_table_and_strip_are_exact() {
         ],
         "same-family facts and text pass through verbatim"
     );
+}
+
+/// WH4 daemon half — DeepSeek's adapter already splits prompt misses and
+/// cache hits, so the core must not subtract cache reads from uncached input
+/// a second time. OpenAI remains subset-shaped to make this mutation-killable.
+#[test]
+fn wh4_deepseek_cache_usage_is_disjoint_at_the_worker_boundary() {
+    assert!(!super::cached_input_is_subset_for_provider("deepseek"));
+    assert!(super::cached_input_is_subset_for_provider("openai"));
 }

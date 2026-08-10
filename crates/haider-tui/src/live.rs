@@ -1725,12 +1725,25 @@ impl LiveDriver {
                 let owns = self.login_command.as_ref() == Some(&command_id)
                     && self.login_attempt.is_some()
                     && model.login.as_ref().map(|card| card.attempt) == self.login_attempt;
+                let provider = owns
+                    .then(|| model.login.as_ref().map(|card| card.provider.clone()))
+                    .flatten();
                 if owns {
                     self.close_login(&command_id);
                     self.login_attempt = None;
                     model.login_result(Ok(identity));
                 }
-                Vec::new()
+                if provider.as_deref() == Some("deepseek") {
+                    self.models_requested.insert("deepseek".to_owned());
+                    vec![
+                        LiveCommand::AccountList,
+                        LiveCommand::RefreshProviderModels {
+                            provider: "deepseek".to_owned(),
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                }
             }
             LiveReply::Accounts {
                 descriptors,

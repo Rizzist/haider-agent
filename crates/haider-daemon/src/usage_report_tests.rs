@@ -592,6 +592,7 @@ fn meter_routing_is_flavor_and_provider_strict() {
         ("openai", None),
         ("anthropic", None),
         ("gemini", None),
+        ("deepseek", None),
         ("opencode-zen", None),
     ];
     for (provider, expected) in cases {

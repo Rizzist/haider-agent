@@ -2481,6 +2481,9 @@ pub enum AccountAddKind {
     /// import).
     Vertex,
     Custom,
+    /// Named DeepSeek builtin — masked API-key entry at the fixed vendor
+    /// endpoint, followed by authenticated model discovery.
+    DeepSeekApi,
 }
 
 /// One answer on its way to the client, tagged with the SURFACE GENERATION
@@ -6915,6 +6918,13 @@ impl AppModel {
             KeyCode::Char('a') => self.open_azure_card(),
             KeyCode::Char('b') => self.open_bedrock_card(),
             KeyCode::Char('v') => self.open_vertex_card(),
+            // Named API-key builtin. The login card is owned/rendered by
+            // /accounts, so the provider shortcut takes the same route as
+            // clicking its shared add button.
+            KeyCode::Char('d') => {
+                self.enter_accounts();
+                self.handle_hit(Hit::AccountAdd(AccountAddKind::DeepSeekApi));
+            }
             // G4a: `f` re-runs model discovery for the selected provider —
             // the affordance behind the local presets' "start the server,
             // then refresh" hint. Live-only vocabulary; the daemon answers
@@ -7014,7 +7024,8 @@ impl AppModel {
             | AccountAddKind::AzureOpenAi
             | AccountAddKind::Bedrock
             | AccountAddKind::Vertex
-            | AccountAddKind::Custom => return,
+            | AccountAddKind::Custom
+            | AccountAddKind::DeepSeekApi => return,
         };
         let alias = smallest_free_alias(provider, &self.accounts.rows);
         self.oauth_attempt_seq += 1;
@@ -10165,6 +10176,15 @@ impl AppModel {
                             self.open_login_card("gemini", None);
                         } else {
                             self.accounts.message = Some(self.stale_daemon_note("Gemini accounts"));
+                            self.dirty = true;
+                        }
+                    }
+                    AccountAddKind::DeepSeekApi => {
+                        if self.daemon_lists_provider("deepseek") {
+                            self.open_login_card("deepseek", None);
+                        } else {
+                            self.accounts.message =
+                                Some(self.stale_daemon_note("DeepSeek accounts"));
                             self.dirty = true;
                         }
                     }

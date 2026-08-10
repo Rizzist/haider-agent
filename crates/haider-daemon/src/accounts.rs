@@ -46,11 +46,11 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
-    BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog,
-    GEMINI_PROVIDER_NAME, GeminiProvider, KIMI_OAUTH_PROVIDER_NAME, Message,
-    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
-    VERTEX_PROVIDER_NAME, azure_openai_origin, discover_models,
+    BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DEEPSEEK_BASE_URL,
+    DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, GEMINI_PROVIDER_NAME, GeminiProvider,
+    KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
+    TurnRequest, VERTEX_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -188,6 +188,7 @@ impl CredentialValidator for ProviderCredentialValidator {
                 | GEMINI_PROVIDER_NAME
                 | BEDROCK_PROVIDER_NAME
                 | VERTEX_PROVIDER_NAME
+                | DEEPSEEK_PROVIDER_NAME
         )
     }
 
@@ -204,8 +205,44 @@ impl CredentialValidator for ProviderCredentialValidator {
                 message: format!("no validator for provider {provider}"),
             });
         }
-        validate_provider_api_key(provider, model, secret, endpoint).await
+        if provider == DEEPSEEK_PROVIDER_NAME {
+            validate_deepseek_api_key(secret).await
+        } else {
+            validate_provider_api_key(provider, model, secret, endpoint).await
+        }
     }
+}
+
+/// DeepSeek key validation uses the same fixed-origin catalog source as
+/// model refresh. A successful authenticated `/models` response proves the
+/// key without spending tokens on a synthetic chat turn.
+async fn validate_deepseek_api_key(secret: &[u8]) -> Result<ValidatedIdentity, ValidationError> {
+    let secret = std::str::from_utf8(secret).map_err(|_| ValidationError {
+        kind: ValidationFailureKind::Unauthorized,
+        message: "DeepSeek API key is not valid UTF-8".to_owned(),
+    })?;
+    discover_models(CatalogSource::DeepSeekApi, Some(secret), None)
+        .await
+        .map_err(|error| {
+            let kind = match &error {
+                CatalogError::Unavailable { reason } if reason.contains("(401)") => {
+                    ValidationFailureKind::Unauthorized
+                }
+                CatalogError::Unavailable { reason } if reason.contains("(403)") => {
+                    ValidationFailureKind::PermissionDenied
+                }
+                CatalogError::NotModified
+                | CatalogError::Unavailable { .. }
+                | CatalogError::Transport { .. } => ValidationFailureKind::Unavailable,
+            };
+            ValidationError {
+                kind,
+                message: "DeepSeek credential validation could not read /models".to_owned(),
+            }
+        })?;
+    Ok(ValidatedIdentity {
+        identity: "deepseek api key".to_owned(),
+    })
 }
 
 async fn validate_provider_api_key(
@@ -287,6 +324,9 @@ fn custom_login_target(
     management: Option<&ManagementSnapshot>,
     provider: &str,
 ) -> Option<(String, Option<String>)> {
+    if provider == DEEPSEEK_PROVIDER_NAME {
+        return None;
+    }
     let view = management?.read()?;
     let profile = view
         .providers
@@ -298,8 +338,9 @@ fn custom_login_target(
     ) {
         return None;
     }
-    // Builtins never carry this family, so family + endpoint identifies
-    // the custom rows without a provenance field on the wire.
+    // The named DeepSeek builtin is excluded above. For the generic
+    // compatible card, family + endpoint identifies custom rows without a
+    // provenance field on the wire.
     let origin = profile.endpoint?;
     Some((origin, profile.default_model))
 }
@@ -1758,6 +1799,10 @@ fn catalog_source(
         KIMI_OAUTH_PROVIDER_NAME => {
             Some((CatalogSource::KimiOAuth, ProviderAuthRequirementWire::OAuth))
         }
+        DEEPSEEK_PROVIDER_NAME => Some((
+            CatalogSource::DeepSeekApi,
+            ProviderAuthRequirementWire::ApiKey,
+        )),
         GEMINI_PROVIDER_NAME => Some((
             CatalogSource::GeminiApiKey,
             ProviderAuthRequirementWire::ApiKey,
@@ -5390,6 +5435,11 @@ fn build_account_provider(
                 // W-B: google_search + url_context built-ins, name-gated to
                 // 3.x models inside the request builder.
                 .with_web_builtins(tuning.web_tools),
+        ),
+        (DEEPSEEK_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
+            OpenAiCompatibleProvider::new_deepseek_api(credential, model, DEEPSEEK_BASE_URL)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
         ),
         (OPENAI_COMPATIBLE_PROVIDER_NAME, AuthMethod::ApiKey) => {
             let base_url = compatible_base_url.ok_or_else(|| {

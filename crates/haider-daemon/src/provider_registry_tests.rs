@@ -417,6 +417,59 @@ fn kimi_oauth_is_a_builtin_chat_completions_subscription_provider() {
     assert_eq!(summary.model_details[0].context_window, Some(262_144));
 }
 
+/// WH1 — `deepseek` is release-owned Chat Completions at the fixed vendor
+/// base with API-key auth. Its documented aliases are only a fallback, so
+/// they carry no guessed context window or effort ladder and stay
+/// unavailable until a credential exists.
+#[test]
+fn wh1_deepseek_registry_is_builtin_chat_completions_api_key() {
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([DEEPSEEK_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        model_source([]),
+    )
+    .expect("DeepSeek provider registry");
+    let profile = registry
+        .get(DEEPSEEK_PROVIDER_NAME)
+        .expect("DeepSeek profile");
+    assert_eq!(profile.provenance, ProviderProvenance::BuiltIn);
+    assert_eq!(profile.configured_models, DEEPSEEK_SEED_MODELS);
+
+    let signed_out = registry
+        .summary(DEEPSEEK_PROVIDER_NAME, &|_| false)
+        .expect("signed-out DeepSeek summary");
+    assert_eq!(signed_out.provider, DEEPSEEK_PROVIDER_NAME);
+    assert_eq!(
+        signed_out.api_family,
+        ProviderApiFamilyWire::OpenAiChatCompletions
+    );
+    assert_eq!(signed_out.endpoint.as_deref(), Some(DEEPSEEK_BASE_URL));
+    assert_eq!(signed_out.auth_methods, vec![AuthMethod::ApiKey]);
+    assert_eq!(signed_out.models, DEEPSEEK_SEED_MODELS);
+    assert_eq!(
+        signed_out.availability,
+        ProviderAvailabilityWire::Unavailable
+    );
+    assert!(signed_out.model_details.iter().all(|detail| {
+        detail.context_window.is_none()
+            && detail.supported_efforts.is_empty()
+            && detail.supported_speeds.is_empty()
+    }));
+
+    let credentialed = registry
+        .summary(DEEPSEEK_PROVIDER_NAME, &|provider| {
+            provider == DEEPSEEK_PROVIDER_NAME
+        })
+        .expect("credentialed DeepSeek summary");
+    assert_eq!(
+        credentialed.availability,
+        ProviderAvailabilityWire::Available
+    );
+}
+
 /// MUTATION CHECK (W5g-5 live fix): revert `configured_profiles` to
 /// validating against the bare discovery cache (no stated-inventory
 /// fallback). Expected runtime failure: the one-shot enabled create below

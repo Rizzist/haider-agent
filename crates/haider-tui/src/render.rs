@@ -1243,6 +1243,7 @@ fn push_account_add_buttons<'a>(
             ),
             ("+ Kimi (OAuth)", crate::app::AccountAddKind::KimiOAuth),
             ("+ Gemini (API)", crate::app::AccountAddKind::GeminiApi),
+            ("+ DeepSeek (API)", crate::app::AccountAddKind::DeepSeekApi),
         ],
         &[
             ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
@@ -1845,7 +1846,7 @@ fn render_providers(
         "click a model to set the default · e edits · x removes · f refresh · esc back"
     };
     let preset_hint = "presets: h HuggingFace · z Zen · g Go · o Ollama · l LM Studio";
-    let enterprise_hint = "enterprise: a Azure · b Bedrock · v Vertex";
+    let enterprise_hint = "named: d DeepSeek · enterprise: a Azure · b Bedrock · v Vertex";
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
     let mut footer_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
     let pinned = area.height >= 12;

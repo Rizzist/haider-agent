@@ -100,6 +100,8 @@ fn bare_model_opens_the_full_screen_picker_with_every_pair() {
         ("claude-opus-5", "anthropic"),
         ("claude-sonnet-5", "anthropic"),
         ("gemini-3", "gemini"),
+        ("deepseek-chat", "deepseek"),
+        ("deepseek-reasoner", "deepseek"),
         ("qwen3-coder", "local"),
         ("llama-3-70b", "huggingface"),
     ] {
@@ -117,6 +119,18 @@ fn bare_model_opens_the_full_screen_picker_with_every_pair() {
     assert_eq!(
         kimi.reason.as_deref(),
         Some("provider model inventory is unavailable")
+    );
+    let deepseek = rows
+        .iter()
+        .find(|row| row.provider == "deepseek" && row.model == "deepseek-reasoner")
+        .expect("DeepSeek pair row");
+    assert!(
+        deepseek.selectable && !deepseek.available,
+        "discovered pairs stay visible/selectable while availability gates the switch"
+    );
+    assert_eq!(
+        deepseek.reason.as_deref(),
+        Some("provider has no credential")
     );
     // Full screen: title + search bar + rows render over the launcher.
     let rows_text = draw_rows(&model, 110, 30);
@@ -259,6 +273,11 @@ fn rows_carry_the_auth_flavor_and_context_window() {
         .find(|row| row.provider == "kimi-oauth")
         .expect("kimi row");
     assert_eq!(kimi.auth, "oauth", "the provider key encodes the flavor");
+    let deepseek = rows
+        .iter()
+        .find(|row| row.model == "deepseek-chat")
+        .expect("DeepSeek row");
+    assert_eq!(deepseek.auth, "api", "DeepSeek is a Bearer API-key pair");
 }
 
 /// MUTATION CHECK (F2a): make `apply_model_selected` keep the REQUESTED

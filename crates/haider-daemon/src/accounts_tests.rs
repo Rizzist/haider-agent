@@ -298,6 +298,49 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
     );
 }
 
+/// WH1 factory half — the named DeepSeek API-key pair constructs through
+/// the dedicated compatible adapter surface; OAuth cannot cross-wire it.
+#[test]
+fn wh1_deepseek_factory_builds_api_key_adapter() {
+    let validator = ProviderCredentialValidator;
+    assert!(validator.supports(DEEPSEEK_PROVIDER_NAME));
+    let vault = MemoryVault::default();
+    let alias = CredentialAlias::new("deepseek-factory");
+    vault
+        .put(&alias, b"DEEPSEEK_FACTORY_KEY_SENTINEL_7ad1")
+        .expect("store DeepSeek factory key");
+    let adapter = build_account_provider(
+        DEEPSEEK_PROVIDER_NAME,
+        None,
+        None,
+        AuthMethod::ApiKey,
+        vault.resolve(&alias).expect("resolve DeepSeek key"),
+        "deepseek-reasoner",
+        &alias,
+        &ProviderTuning::default(),
+    )
+    .expect("build DeepSeek adapter");
+    assert_eq!(
+        adapter.credential_surface(),
+        haider_provider::ProviderCredentialSurface::ApiKey
+    );
+
+    let oauth = build_account_provider(
+        DEEPSEEK_PROVIDER_NAME,
+        None,
+        None,
+        AuthMethod::OAuth,
+        vault.resolve(&alias).expect("resolve DeepSeek key again"),
+        "deepseek-reasoner",
+        &alias,
+        &ProviderTuning::default(),
+    );
+    let Err(oauth) = oauth else {
+        panic!("DeepSeek OAuth must not cross-wire");
+    };
+    assert_eq!(oauth.code, ErrorCode::InvalidArgument);
+}
+
 /// The production validation path deliberately remains a real provider
 /// smoke: it creates the native Gemini adapter and sends the one-token ping
 /// built by `validate_provider_api_key`. It is ignored unless explicitly
@@ -4258,6 +4301,96 @@ enum ModelDiscoveryFixture {
     Panic,
 }
 
+/// WH3 registry/refresh projection half — the named source resolves to the
+/// fixed DeepSeek catalog and an authenticated mocked discovery replaces
+/// the fallback inventory while lighting the pair Available.
+#[tokio::test]
+async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let providers = ProviderRegistry::new(
+        provider_store,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([DEEPSEEK_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("DeepSeek provider registry");
+    let (source, auth) =
+        catalog_source(DEEPSEEK_PROVIDER_NAME, &providers).expect("DeepSeek catalog source");
+    assert_eq!(source, CatalogSource::DeepSeekApi);
+    assert_eq!(source.endpoint(), "https://api.deepseek.com/models");
+    assert_eq!(auth, ProviderAuthRequirementWire::ApiKey);
+
+    let before = providers
+        .summary(DEEPSEEK_PROVIDER_NAME, &|_| false)
+        .expect("signed-out DeepSeek");
+    assert_eq!(
+        before.availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable
+    );
+
+    let discoverer = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "deepseek-live-fixture".to_owned(),
+                    display_name: "DeepSeek Live Fixture".to_owned(),
+                    context_window: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    extensions: None,
+                }],
+                etag: None,
+            })),
+        ])),
+    });
+    let discovery = {
+        let discoverer = Arc::clone(&discoverer);
+        let source = source.clone();
+        tokio::spawn(async move {
+            discoverer
+                .discover(source, Some("DEEPSEEK_DISCOVERY_KEY_SENTINEL_43af"), None)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("mock DeepSeek GET started");
+    discoverer.release.notify_one();
+    let discovered = discovery
+        .await
+        .expect("mock DeepSeek discovery task")
+        .expect("mock DeepSeek /models response");
+    assert_eq!(
+        discoverer.seen.lock().expect("seen").as_slice(),
+        [(
+            CatalogSource::DeepSeekApi,
+            Some("DEEPSEEK_DISCOVERY_KEY_SENTINEL_43af".to_owned()),
+            None,
+        )]
+    );
+    providers.replace_models(DEEPSEEK_PROVIDER_NAME.to_owned(), discovered.models);
+    let after = providers
+        .summary(DEEPSEEK_PROVIDER_NAME, &|provider| {
+            provider == DEEPSEEK_PROVIDER_NAME
+        })
+        .expect("discovered DeepSeek");
+    assert_eq!(after.models, ["deepseek-live-fixture"]);
+    assert_eq!(
+        after.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(after.model_details[0].supported_efforts.is_empty());
+    assert!(after.model_details[0].supported_speeds.is_empty());
+}
+
 #[async_trait::async_trait]
 impl ProviderModelDiscoverer for BlockingModelDiscoverer {
     async fn discover(
@@ -6620,6 +6753,21 @@ fn custom_login_targets_only_chat_completions_profiles() {
                 default_model: None,
                 enabled: true,
             },
+            ProviderSummaryWire {
+                provider: DEEPSEEK_PROVIDER_NAME.to_owned(),
+                api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+                endpoint: Some(DEEPSEEK_BASE_URL.to_owned()),
+                models: haider_provider::DEEPSEEK_SEED_MODELS
+                    .iter()
+                    .map(|model| (*model).to_owned())
+                    .collect(),
+                model_details: Vec::new(),
+                auth_methods: vec![AuthMethod::ApiKey],
+                availability: haider_rpc::ProviderAvailabilityWire::Unavailable,
+                availability_reason: Some("provider has no credential".to_owned()),
+                default_model: Some(haider_provider::DEEPSEEK_SEED_MODELS[0].to_owned()),
+                enabled: true,
+            },
         ],
     );
     let target = custom_login_target(Some(&management), "custom-llama")
@@ -6629,6 +6777,10 @@ fn custom_login_targets_only_chat_completions_profiles() {
     assert!(
         custom_login_target(Some(&management), "openai").is_none(),
         "a vendor-family profile NEVER validates against a stored origin"
+    );
+    assert!(
+        custom_login_target(Some(&management), DEEPSEEK_PROVIDER_NAME).is_none(),
+        "the named DeepSeek builtin never routes through custom validation"
     );
     assert!(custom_login_target(None, "custom-llama").is_none());
 }

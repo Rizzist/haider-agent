@@ -67,8 +67,8 @@ use haider_protocol::tool::{
     ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
 };
 use haider_provider::{
-    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, Message, OPENAI_OAUTH_PROVIDER_NAME,
-    ResolvedAttachment,
+    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
+    OPENAI_OAUTH_PROVIDER_NAME, ResolvedAttachment,
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
@@ -3414,10 +3414,7 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
-    config.cached_input_is_subset = !matches!(
-        resolved.provider_name.as_str(),
-        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
-    );
+    config.cached_input_is_subset = cached_input_is_subset_for_provider(&resolved.provider_name);
     config.context_compaction_v1 = true;
     config.model = resolved.model;
     config.context_window = resolved.context_window;
@@ -3573,6 +3570,16 @@ async fn start_turn(
         handle,
         anthropic_web_tools,
     ))
+}
+
+/// Whether a provider's reported cache-read count is already included in its
+/// input count. DeepSeek is deliberately disjoint: its adapter maps cache
+/// misses to `input` and cache hits to `cached` from separate wire fields.
+fn cached_input_is_subset_for_provider(provider: &str) -> bool {
+    !matches!(
+        provider,
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME | DEEPSEEK_PROVIDER_NAME
+    )
 }
 
 async fn find_committed_menu_answer(

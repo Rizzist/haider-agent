@@ -1,0 +1,34 @@
+[
+  {
+    "result": "ok",
+    "value": {
+      "event": "reasoning_delta",
+      "text": "check the invariant"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "usage_update",
+      "input": 23,
+      "output": 13,
+      "reasoning": 0,
+      "cached": 71,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "text_delta",
+      "text": "done"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "finish",
+      "reason": "end_turn"
+    }
+  }
+]

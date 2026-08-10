@@ -11,11 +11,11 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_provider::{
     ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
     ANTHROPIC_PROVIDER_NAME, BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME,
-    BEDROCK_SEED_MODELS, DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME,
-    KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME,
-    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
-    OPENAI_SUBSCRIPTION_RESPONSES_URL, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS,
-    azure_openai_origin, pickable,
+    BEDROCK_SEED_MODELS, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
+    DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME, KIMI_OAUTH_BASE_URL,
+    KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
+    VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS, azure_openai_origin, pickable,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -564,10 +564,10 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         has_credential: &dyn Fn(&str) -> bool,
     ) -> ProviderSummaryWire {
         let discovered = self.discovered_details(&profile.provider_id);
-        // G4b seeded-inventory fallback (decision 6 + LZ2): with nothing
-        // discovered, a seeded-list profile's configured models ARE its
-        // inventory — projected through the same detail enrichment so the
-        // effort ladders ride the wire.
+        // Seeded-inventory fallback: with nothing discovered, a seeded-list
+        // profile's configured models ARE its inventory. DeepSeek uses this
+        // only until authenticated `/models` speaks; enterprise and Azure
+        // profiles retain their documented/manual fallback behavior.
         let seeded_fallback = discovered.is_empty() && seeded_inventory(profile);
         let model_details = if seeded_fallback {
             profile
@@ -591,17 +591,17 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
 }
 
 /// Whether this profile's CONFIGURED model list may serve as its inventory
-/// when discovery has nothing (G4b): the two enterprise builtins seed the
-/// documented sets (bedrock mantle and vertex expose no models API), and an
-/// Azure-origin custom keeps its manually entered deployments (LZ2 — Azure
-/// has no confirmed deployment-listing endpoint either). Every OTHER custom
-/// keeps the G4a rule: discovery is the only inventory truth.
+/// when discovery has nothing: DeepSeek keeps its documented aliases only
+/// until authenticated discovery succeeds; the two enterprise builtins seed
+/// documented sets because they expose no models API; and an Azure-origin
+/// custom keeps manually entered deployments. Every OTHER custom keeps the
+/// G4a rule: discovery is the only inventory truth.
 fn seeded_inventory(profile: &ProviderProfileV1) -> bool {
     if profile.configured_models.is_empty() {
         return false;
     }
     match profile.provider_id.as_str() {
-        BEDROCK_PROVIDER_NAME | VERTEX_PROVIDER_NAME => true,
+        BEDROCK_PROVIDER_NAME | VERTEX_PROVIDER_NAME | DEEPSEEK_PROVIDER_NAME => true,
         _ => {
             matches!(profile.provenance, ProviderProvenance::Custom)
                 && profile.base_url.as_deref().is_some_and(azure_openai_origin)
@@ -809,6 +809,22 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
                 .map(|slug| (*slug).to_owned())
                 .collect(),
             default_model: Some(VERTEX_SEED_MODELS[0].to_owned()),
+            provenance: ProviderProvenance::BuiltIn,
+        };
+    }
+    if provider == DEEPSEEK_PROVIDER_NAME {
+        return ProviderProfileV1 {
+            provider_id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some(DEEPSEEK_BASE_URL.to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: DEEPSEEK_SEED_MODELS
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect(),
+            default_model: Some(DEEPSEEK_SEED_MODELS[0].to_owned()),
             provenance: ProviderProvenance::BuiltIn,
         };
     }

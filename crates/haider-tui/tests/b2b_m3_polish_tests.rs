@@ -143,7 +143,7 @@ fn slash_login_oauth_refuses_a_provider_without_a_flow() {
 
 // ---- palette + help rosters ------------------------------------------
 
-/// LAW — the palette's `/login` slot 0 names the real four-provider roster
+/// LAW — the palette's `/login` slot 0 names the real named-provider roster
 /// and slot 1's oauth row no longer promises a post-v0.0.12 landing.
 ///
 /// MUTATION CHECK: restore the anthropic-only slot-0 table in
@@ -156,7 +156,10 @@ fn palette_login_slots_name_the_real_roster() {
         .iter()
         .map(haider_tui::commands::PaletteItem::label)
         .collect();
-    assert_eq!(providers, ["anthropic", "openai", "gemini", "kimi"]);
+    assert_eq!(
+        providers,
+        ["anthropic", "openai", "gemini", "kimi", "deepseek"]
+    );
     let methods = palette_items("login anthropic ", true, &slots);
     let oauth = methods
         .iter()
