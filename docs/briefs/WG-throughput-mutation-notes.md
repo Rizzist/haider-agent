@@ -91,3 +91,17 @@ After all four reverts: `git status` clean; the pure suite
 `cargo test -p haider-tui --lib throughput` → `13 passed`; the render suite
 `cargo test -p haider-tui --test wg_throughput_tests` → `7 passed`;
 `cargo fmt --all -- --check` exit 0.
+
+## Review of record (coordinator, Fable)
+
+Re-executed the WG1 p95 kill myself (the stat core): `div_ceil(100)` →
+`div_ceil(50)` in `percentile()` → `wg1_percentile_is_nearest_rank_and_
+correct_on_a_known_distribution` FAILED with `left: Some(100)` vs
+`right: Some(95)` — the law genuinely observes nearest-rank correctness.
+Reverted; 13/13 throughput unit laws green. The lane's other 3 kills
+(sparkline mapping, idle no-op, fallback honesty) spot-checked against the
+notes; consistent. Honest ledger note: the 13 pure-tracker laws are inline
+in src/throughput.rs (xtask counts only tests/ + *_tests.rs, so +7 counted
+from wg_throughput_tests.rs; the 13 inline are disclosed, same class as the
+G3 inline-module blindspot — a future move to throughput_tests.rs would
+surface them). Campaign ACCEPTED.
