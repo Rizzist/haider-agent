@@ -453,6 +453,73 @@ fn never_overwrites_an_existing_foreign_file() {
 }
 
 #[test]
+#[cfg(unix)]
+fn write_new_file_refuses_to_follow_a_symlink() {
+    // M2: `create_new` (O_CREAT|O_EXCL) refuses a symlink atomically. The old
+    // exists()+write followed a DANGLING symlink and wrote THROUGH it to an
+    // arbitrary target (a symlink-swap TOCTOU). With the fix the write is
+    // refused and no file is created behind the link.
+    let temp = tempfile::tempdir().expect("temp");
+    let link = temp.path().join("rollout.jsonl");
+    let target = temp.path().join("outside.jsonl");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    assert!(!target.exists(), "target starts absent");
+    let err = export::write_new_file(&link, "payload").expect_err("must refuse the symlink");
+    assert!(matches!(err, export::ExportError::Collision(_)), "{err}");
+    assert!(
+        !target.exists(),
+        "no file was created through the dangling symlink"
+    );
+}
+
+#[test]
+fn codex_pair_rolls_back_the_rollout_when_history_fails() {
+    // M3: the rollout + history.jsonl are two ops. If the history append fails,
+    // the just-created rollout must be REMOVED so a retry isn't blocked by a
+    // false collision. We force the append to fail by pointing history at a
+    // DIRECTORY (open-for-append on a dir is an IO error).
+    let temp = tempfile::tempdir().expect("temp");
+    let rollout = temp.path().join("rollout.jsonl");
+    let history_dir = temp.path().join("history.jsonl");
+    std::fs::create_dir(&history_dir).expect("dir in the history file's place");
+    let err = export::write_codex_pair(&rollout, "rollout-body", &history_dir, "hist-line")
+        .expect_err("history append must fail");
+    assert!(matches!(err, export::ExportError::Io(_)), "{err}");
+    assert!(
+        !rollout.exists(),
+        "the rollout was rolled back so a retry is not a false collision"
+    );
+}
+
+#[tokio::test]
+async fn replay_buffer_is_bounded() {
+    // M4: the export replay is capped so a huge/hostile session cannot OOM the
+    // exporter. Past the bound the channel keeps draining but items stop being
+    // retained (truncated=true) — peak memory is the bound, not the session.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    for i in 0..10u32 {
+        tx.send(i).expect("send");
+    }
+    drop(tx);
+    let (events, truncated) = export::collect_bounded_replay(rx, 3).await;
+    assert_eq!(
+        events,
+        vec![0, 1, 2],
+        "only the first max_events are retained"
+    );
+    assert!(truncated, "the surplus is reported as truncated");
+    // Under the bound, everything is kept and nothing is flagged.
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    for i in 0..3u32 {
+        tx2.send(i).expect("send");
+    }
+    drop(tx2);
+    let (all, trunc2) = export::collect_bounded_replay(rx2, 100).await;
+    assert_eq!(all.len(), 3);
+    assert!(!trunc2, "under the bound → not truncated");
+}
+
+#[test]
 fn parse_defaults_to_markdown_and_reads_flags() {
     let options =
         export::parse_export_options(&["sess-1".to_owned(), "--masked".to_owned()]).expect("parse");
