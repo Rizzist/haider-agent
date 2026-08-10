@@ -99,3 +99,20 @@ compile error) → `git checkout --` revert → re-run green.
 | M9 | Restore `if chunk.len() >= remaining { … return (body, true) }` (flag at the boundary, no extra read). | `webfetch_tests::source_cap_boundary_truncation_is_off_by_one_honest` | An exactly-4-MiB body with clean EOF is flagged truncated → `assert!(!at.truncated)` fails. |
 | W7 | Change the shimmer period so `shimmer_centre` no longer advances one glyph per tick. | `we_thinking_shimmer_tests::le2_the_sweep_travels_and_wraps` (unchanged; the doc/debug_assert edit keeps it green as coverage) | The `0,1,…,len-1,(rest)` sequence assertion fails. |
 | W8 | Feed the shimmer loop a glyph table that mis-spells `VERB`. | `debug_assert_eq!(VERB_GLYPHS.concat(), VERB, …)` in `render.rs` (debug/test builds) + `we_thinking_shimmer_tests::le2` | The debug_assert fires ("the glyph table must spell the verb"); the rendered crest columns diverge from 0→1→2. |
+
+## Review of record (coordinator, Fable)
+
+Verified the H1 downgrade-fence design in-code (webfetch.rs:115-122,256-260):
+the loop records `chain_started_public` on the first validated hop and,
+once public, `validate_fetch_target(forbid_public_downgrade=true)` refuses
+any non-public target — closing public→loopback SSRF at the ENGINE (the
+authoritative socket-reaching layer), independent of the broker's per-host
+approval, while loopback→loopback (chain_started_public=Some(false)) stays
+allowed so the loopback mock-server laws work. Correct placement.
+
+The lane executed all four HIGH kills with exact predicted failures (H1
+expect_err, H2 5.03s timeout vs budget, H3 "byte index 12 is not a char
+boundary; inside 'é'", H4 whole-body 1114112 vs cap 1048576). Spot-checked
+against the notes — consistent. M5's deliberate TEST-NET exclusion (those
+ranges are safe public stand-ins used by existing origin laws) is correct
+reasoning, not a gap. Campaign ACCEPTED.
