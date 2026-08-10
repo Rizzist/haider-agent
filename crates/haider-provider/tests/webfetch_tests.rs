@@ -5,7 +5,9 @@
 //! policy's one http allowance, which is exactly what makes these fetches
 //! testable end to end).
 
-use haider_provider::{ProviderErrorKind, WEB_FETCH_OUTPUT_CAP_BYTES, fetch_public_url};
+use haider_provider::{
+    ProviderErrorKind, WEB_FETCH_OUTPUT_CAP_BYTES, fetch_public_url, fetch_public_url_with_deadline,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -225,6 +227,99 @@ async fn output_caps_with_an_honest_truncation_marker() {
         .expect("small fetch succeeds");
     assert_eq!(outcome.text, "tiny body");
     assert!(!outcome.truncated);
+}
+
+/// LAW (W-F M6, whole-fetch wall-clock deadline): the per-chunk idle timeout
+/// resets every chunk, so a slow drip (headers, then silence) never trips it.
+/// An ABSOLUTE deadline across all hops+chunks aborts the fetch anyway — a
+/// server that sends headers then holds the body open is cut off as a typed
+/// Transport error naming the overall deadline. Driven with a SHORT injected
+/// deadline over loopback (never the real network).
+#[tokio::test]
+async fn slow_drip_body_is_aborted_by_the_overall_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds loopback listener");
+    let base = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server = tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut scratch = vec![0u8; 1024];
+            let _ = socket.read(&mut scratch).await;
+            // Headers promise a 1 MB body; the server then goes silent, sending
+            // only a sliver and holding the connection open past the deadline.
+            let head =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 1000000\r\n\r\n";
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(b"partial").await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let error = fetch_public_url_with_deadline(
+        &format!("{base}/slow"),
+        None,
+        std::time::Duration::from_millis(300),
+    )
+    .await
+    .expect_err("a slow-drip body must be aborted by the overall deadline");
+    assert_eq!(error.kind, ProviderErrorKind::Transport, "{error}");
+    assert!(
+        error.message.contains("overall"),
+        "names the overall deadline: {error}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "aborted promptly at the deadline, not after the 30s per-chunk idle"
+    );
+    server.abort();
+}
+
+/// LAW (W-F M9, honest truncation at the source-cap boundary): a source body
+/// of EXACTLY the 4 MiB cap with a clean EOF is NOT truncated; one byte past
+/// it IS. The reducer drops the huge `<script>` body so the OUTPUT never
+/// nears its own 96 KiB cap — the `truncated` flag reflects the SOURCE
+/// boundary alone.
+#[tokio::test]
+async fn source_cap_boundary_truncation_is_off_by_one_honest() {
+    const SOURCE_CAP: usize = 4 * 1024 * 1024;
+    let prefix = "<html><body><p>BOUNDARY_MARKER</p><script>";
+    let suffix = "</script></body></html>";
+    let make = |total: usize| {
+        let filler = "x".repeat(total - prefix.len() - suffix.len());
+        format!("{prefix}{filler}{suffix}")
+    };
+    let exact = make(SOURCE_CAP);
+    assert_eq!(
+        exact.len(),
+        SOURCE_CAP,
+        "the exact body is the cap to the byte"
+    );
+    let over = make(SOURCE_CAP + 1);
+    let (base, _server) = spawn_loopback_server(vec![
+        ("/exact", text_response("text/html", &exact)),
+        ("/over", text_response("text/html", &over)),
+    ])
+    .await;
+
+    let at = fetch_public_url(&format!("{base}/exact"), None)
+        .await
+        .expect("exact-cap fetch succeeds");
+    assert!(
+        at.text.contains("BOUNDARY_MARKER"),
+        "marker survives: {}",
+        &at.text[..at.text.len().min(80)]
+    );
+    assert!(
+        !at.truncated,
+        "a body EXACTLY at the source cap with a clean EOF is NOT truncated"
+    );
+
+    let past = fetch_public_url(&format!("{base}/over"), None)
+        .await
+        .expect("over-cap fetch succeeds");
+    assert!(past.truncated, "one byte past the source cap IS truncated");
 }
 
 /// LAW (LW6, content-type gate): `text/*` and `application/json` pass;

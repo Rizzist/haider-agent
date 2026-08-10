@@ -36,6 +36,11 @@ const MAX_DROP_STACK_DEPTH: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// M6 (W-F): whole-fetch WALL-CLOCK ceiling across ALL hops and chunks. The
+/// per-chunk idle timeout resets every chunk, so a 1-byte-per-29-seconds drip
+/// (slowloris) never trips it; this absolute deadline aborts the entire fetch
+/// no matter how the bytes are paced.
+const WEB_FETCH_TOTAL_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The bounded, reduced result of one guarded fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +60,13 @@ pub async fn fetch_public_url(
     url: &str,
     max_bytes: Option<u64>,
 ) -> Result<WebFetchOutcome, ProviderError> {
-    fetch_public_url_with_resolver(url, max_bytes, Arc::new(SystemFixedDnsResolver)).await
+    fetch_public_url_inner(
+        url,
+        max_bytes,
+        Arc::new(SystemFixedDnsResolver),
+        WEB_FETCH_TOTAL_DEADLINE,
+    )
+    .await
 }
 
 /// Resolver-injectable variant of [`fetch_public_url`] (tests use stub
@@ -65,6 +76,34 @@ pub async fn fetch_public_url_with_resolver(
     max_bytes: Option<u64>,
     resolver: Arc<dyn FixedDnsResolver>,
 ) -> Result<WebFetchOutcome, ProviderError> {
+    fetch_public_url_inner(url, max_bytes, resolver, WEB_FETCH_TOTAL_DEADLINE).await
+}
+
+/// Deadline-injectable variant (M6): laws drive a slow-drip loopback server
+/// against a SHORT overall deadline to prove the whole-fetch wall-clock abort;
+/// the public entry points use [`WEB_FETCH_TOTAL_DEADLINE`].
+pub async fn fetch_public_url_with_deadline(
+    url: &str,
+    max_bytes: Option<u64>,
+    total_deadline: Duration,
+) -> Result<WebFetchOutcome, ProviderError> {
+    fetch_public_url_inner(
+        url,
+        max_bytes,
+        Arc::new(SystemFixedDnsResolver),
+        total_deadline,
+    )
+    .await
+}
+
+async fn fetch_public_url_inner(
+    url: &str,
+    max_bytes: Option<u64>,
+    resolver: Arc<dyn FixedDnsResolver>,
+    total_deadline: Duration,
+) -> Result<WebFetchOutcome, ProviderError> {
+    // M6: one ABSOLUTE deadline anchors every hop and chunk read below.
+    let deadline = tokio::time::Instant::now() + total_deadline;
     let mut current = reqwest::Url::parse(url)
         .map_err(|error| refused(format!("web_fetch URL does not parse: {error}")))?;
     let output_cap = max_bytes
@@ -81,7 +120,7 @@ pub async fn fetch_public_url_with_resolver(
         let forbid_downgrade = chain_started_public == Some(true);
         let target = validate_fetch_target(&current, resolver.as_ref(), forbid_downgrade).await?;
         chain_started_public.get_or_insert(target.is_public);
-        let response = open_response(&current, &target).await?;
+        let response = open_response(&current, &target, deadline).await?;
         if response.status().is_redirection() {
             let location = response
                 .headers()
@@ -107,7 +146,7 @@ pub async fn fetch_public_url_with_resolver(
             ));
         }
         let content_type = declared_media_type(&response)?;
-        let (bytes, source_truncated) = read_body_bounded(response).await?;
+        let (bytes, source_truncated) = read_body_bounded(response, deadline).await?;
         let text = if content_type == "text/html" {
             reduce_html_to_text(&String::from_utf8_lossy(&bytes))
         } else {
@@ -233,6 +272,7 @@ pub(crate) async fn validate_fetch_target(
 async fn open_response(
     url: &reqwest::Url,
     target: &ValidatedFetchTarget,
+    deadline: tokio::time::Instant,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -257,23 +297,33 @@ async fn open_response(
             "text/html, application/json;q=0.9, text/*;q=0.8",
         )
         .send();
-    tokio::time::timeout(RESPONSE_OPEN_TIMEOUT, opening)
-        .await
-        .map_err(|_| {
-            ProviderError::new(
-                ProviderErrorKind::Transport,
-                format!(
-                    "web_fetch response did not open within {} seconds",
-                    RESPONSE_OPEN_TIMEOUT.as_secs()
-                ),
-            )
-        })?
-        .map_err(|error| {
-            ProviderError::new(
-                ProviderErrorKind::Transport,
-                format!("web_fetch transport failed: {error}"),
-            )
-        })
+    // M6: bound the open by whichever comes first — the per-open timeout or
+    // the whole-fetch deadline.
+    within_fetch_deadline(opening, deadline, RESPONSE_OPEN_TIMEOUT, || {
+        ProviderError::new(
+            ProviderErrorKind::Transport,
+            format!(
+                "web_fetch response did not open within {} seconds",
+                RESPONSE_OPEN_TIMEOUT.as_secs()
+            ),
+        )
+    })
+    .await?
+    .map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::Transport,
+            format!("web_fetch transport failed: {error}"),
+        )
+    })
+}
+
+/// The typed abort for the whole-fetch wall-clock deadline (M6). Phrased
+/// without the second count because the deadline is injectable for laws.
+fn overall_deadline_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        "web_fetch exceeded its overall fetch deadline".to_owned(),
+    )
 }
 
 /// Content-type gate (decision 5): `text/*` and `application/json` pass;
@@ -301,36 +351,78 @@ fn declared_media_type(response: &reqwest::Response) -> Result<String, ProviderE
 
 async fn read_body_bounded(
     mut response: reqwest::Response,
+    deadline: tokio::time::Instant,
 ) -> Result<(Vec<u8>, bool), ProviderError> {
     let mut body = Vec::new();
     loop {
-        let chunk = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, response.chunk())
-            .await
-            .map_err(|_| {
-                ProviderError::new(
-                    ProviderErrorKind::Transport,
-                    format!(
-                        "web_fetch body stalled for {} seconds",
-                        CHUNK_IDLE_TIMEOUT.as_secs()
-                    ),
-                )
-            })?
-            .map_err(|error| {
-                ProviderError::new(
-                    ProviderErrorKind::Transport,
-                    format!("web_fetch body read failed: {error}"),
-                )
-            })?;
-        let Some(chunk) = chunk else {
-            return Ok((body, false));
+        let Some(chunk) = next_chunk(&mut response, deadline).await? else {
+            return Ok((body, false)); // Clean EOF: nothing was truncated.
         };
-        let remaining = WEB_FETCH_SOURCE_CAP_BYTES.saturating_sub(body.len());
-        if chunk.len() >= remaining {
+        // body.len() < cap here — the `== cap` branch always returns below.
+        let remaining = WEB_FETCH_SOURCE_CAP_BYTES - body.len();
+        if chunk.len() > remaining {
             body.extend_from_slice(&chunk[..remaining]);
-            return Ok((body, true));
+            return Ok((body, true)); // More bytes than the cap can hold.
         }
         body.extend_from_slice(&chunk);
+        if body.len() == WEB_FETCH_SOURCE_CAP_BYTES {
+            // M9 off-by-one: a body that lands EXACTLY on the cap is only
+            // truncated if MORE bytes follow — one honest extra read decides,
+            // instead of blindly flagging truncation at the boundary.
+            let more = next_chunk(&mut response, deadline).await?.is_some();
+            return Ok((body, more));
+        }
     }
+}
+
+/// One chunk read bounded by whichever fires first: the per-chunk idle timeout
+/// or the whole-fetch wall-clock `deadline` (M6). A stall past the deadline is
+/// the overall-deadline abort; a stall inside it is the per-chunk idle abort.
+/// Returns the inferred chunk type unnamed — reqwest does not re-export it.
+async fn next_chunk(
+    response: &mut reqwest::Response,
+    deadline: tokio::time::Instant,
+    // `use<>`: the owned chunk captures no borrow of `response`, so the caller
+    // may read the next chunk while a prior one is still in scope.
+) -> Result<Option<impl std::ops::Deref<Target = [u8]> + use<>>, ProviderError> {
+    within_fetch_deadline(response.chunk(), deadline, CHUNK_IDLE_TIMEOUT, || {
+        ProviderError::new(
+            ProviderErrorKind::Transport,
+            format!(
+                "web_fetch body stalled for {} seconds",
+                CHUNK_IDLE_TIMEOUT.as_secs()
+            ),
+        )
+    })
+    .await?
+    .map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::Transport,
+            format!("web_fetch body read failed: {error}"),
+        )
+    })
+}
+
+/// Runs `future` bounded by whichever fires first — `per_op` from now, or the
+/// whole-fetch wall-clock `deadline` (M6). A timeout at/after the deadline is
+/// the overall-deadline abort; a timeout inside it is `stalled` (the per-op
+/// abort). Generic so the chunk type never needs naming.
+async fn within_fetch_deadline<F: std::future::Future>(
+    future: F,
+    deadline: tokio::time::Instant,
+    per_op: Duration,
+    stalled: impl FnOnce() -> ProviderError,
+) -> Result<F::Output, ProviderError> {
+    let op_deadline = deadline.min(tokio::time::Instant::now() + per_op);
+    tokio::time::timeout_at(op_deadline, future)
+        .await
+        .map_err(|_| {
+            if tokio::time::Instant::now() >= deadline {
+                overall_deadline_error()
+            } else {
+                stalled()
+            }
+        })
 }
 
 /// Cuts `text` at the byte cap on a character boundary.
