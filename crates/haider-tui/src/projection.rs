@@ -207,6 +207,12 @@ pub struct SessionProjection {
     menu_owner: std::collections::HashMap<haider_protocol::ids::MenuId, MenuScopeOwner>,
     todos: Option<TodoPanel>,
     usage: Option<Usage>,
+    /// W-G: assistant OUTPUT text characters streamed this turn — the honest
+    /// fallback source for the throughput row when the provider reports no
+    /// incremental usage. A cheap monotonic counter (bumped on each text
+    /// delta), reset at each new turn's start; approximate tokens are derived
+    /// as `chars / 4`.
+    streamed_output_chars: u64,
     /// Latest durable context-occupancy snapshot (W7b), consumed from the
     /// journal's `context_footprint_v1` extension items — never a
     /// transcript row (one arrives per provider round).
@@ -364,6 +370,14 @@ impl SessionProjection {
                 }
             }
             EventPayload::RunState(run) => {
+                // W-G: a genuine turn OPENING (idle/none → non-terminal) resets
+                // the streamed-output char tally so the throughput fallback
+                // starts each turn from zero — a mid-turn RunState update
+                // (Streaming → RunningTool → Streaming) must NOT reset it.
+                let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
+                if was_idle && !run.is_terminal() {
+                    self.streamed_output_chars = 0;
+                }
                 if matches!(run, RunState::Cancelled) {
                     self.interrupted = true;
                 } else if !run.is_terminal() {
@@ -663,45 +677,53 @@ impl SessionProjection {
     }
 
     fn apply_delta(&mut self, item_id: &ItemId, delta: &ItemDelta) {
-        let Some(block) = self.open_block_mut(item_id) else {
-            self.orphan_deltas += 1;
-            return;
-        };
-        match delta {
-            ItemDelta::Text { text } => {
-                if let TurnItem::AgentMessage { text: body } = &mut block.item {
-                    body.push_str(text);
-                }
-            }
-            ItemDelta::Reasoning { text } => {
-                if let TurnItem::Reasoning { summary } = &mut block.item {
-                    summary.push_str(text);
-                }
-            }
-            ItemDelta::ToolArgs { fragment } => block.args_fragments.push_str(fragment),
-            ItemDelta::CommandOutput { chunk_b64, .. } => {
-                match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
-                    Ok(bytes) => {
-                        // Bound BEFORE appending so the tail's capacity never
-                        // grows past the cap (efficiency rider #4: append-
-                        // then-drain retained chunk-sized high-water marks).
-                        let keep = bytes.len().min(OUTPUT_TAIL_MAX);
-                        let incoming = &bytes[bytes.len() - keep..];
-                        if bytes.len() > keep {
-                            block.output_truncated = true;
-                        }
-                        let overflow = (block.output_tail.len() + incoming.len())
-                            .saturating_sub(OUTPUT_TAIL_MAX);
-                        if overflow > 0 {
-                            block.output_tail.drain(..overflow);
-                            block.output_truncated = true;
-                        }
-                        block.output_tail.extend_from_slice(incoming);
+        // W-G: OUTPUT text characters that actually land on the open assistant
+        // block, tallied AFTER the block borrow ends (the counter and the
+        // block are both fields of `self`). Reasoning text is NOT output.
+        let mut output_chars = 0u64;
+        {
+            let Some(block) = self.open_block_mut(item_id) else {
+                self.orphan_deltas += 1;
+                return;
+            };
+            match delta {
+                ItemDelta::Text { text } => {
+                    if let TurnItem::AgentMessage { text: body } = &mut block.item {
+                        body.push_str(text);
+                        output_chars = text.chars().count() as u64;
                     }
-                    Err(_) => block.output_decode_error = true,
+                }
+                ItemDelta::Reasoning { text } => {
+                    if let TurnItem::Reasoning { summary } = &mut block.item {
+                        summary.push_str(text);
+                    }
+                }
+                ItemDelta::ToolArgs { fragment } => block.args_fragments.push_str(fragment),
+                ItemDelta::CommandOutput { chunk_b64, .. } => {
+                    match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
+                        Ok(bytes) => {
+                            // Bound BEFORE appending so the tail's capacity never
+                            // grows past the cap (efficiency rider #4: append-
+                            // then-drain retained chunk-sized high-water marks).
+                            let keep = bytes.len().min(OUTPUT_TAIL_MAX);
+                            let incoming = &bytes[bytes.len() - keep..];
+                            if bytes.len() > keep {
+                                block.output_truncated = true;
+                            }
+                            let overflow = (block.output_tail.len() + incoming.len())
+                                .saturating_sub(OUTPUT_TAIL_MAX);
+                            if overflow > 0 {
+                                block.output_tail.drain(..overflow);
+                                block.output_truncated = true;
+                            }
+                            block.output_tail.extend_from_slice(incoming);
+                        }
+                        Err(_) => block.output_decode_error = true,
+                    }
                 }
             }
         }
+        self.streamed_output_chars = self.streamed_output_chars.saturating_add(output_chars);
     }
 
     /// The most recent still-streaming block for `item_id` (deltas always
@@ -720,6 +742,24 @@ impl SessionProjection {
     #[must_use]
     pub const fn is_thinking(&self) -> bool {
         matches!(self.run, Some(RunState::Thinking))
+    }
+
+    /// W-G: true while the turn is actively producing OUTPUT — `Streaming`
+    /// (assistant text) or `RunningTool` (a tool call mid-turn). The
+    /// throughput row shows only in these states; every other state (idle,
+    /// thinking, waiting, terminal) hides it so idle frames cost nothing.
+    #[must_use]
+    pub const fn is_streaming(&self) -> bool {
+        matches!(self.run, Some(RunState::Streaming | RunState::RunningTool))
+    }
+
+    /// W-G: an APPROXIMATE output-token count for this turn, derived from the
+    /// streamed assistant-text characters (~4 chars per token). Used only as
+    /// the honest fallback when the provider reports no incremental usage —
+    /// the readout is marked `~` when it feeds the tracker.
+    #[must_use]
+    pub const fn streamed_output_tokens_approx(&self) -> u64 {
+        self.streamed_output_chars / 4
     }
 
     /// M4: the visible retry view — `(attempt, max, delay_ms)` while the run

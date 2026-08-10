@@ -3116,6 +3116,11 @@ pub struct AppModel {
     /// projection). Session-scoped by runtime law — checked in/out whole
     /// with the session, never split per branch.
     pub tasks: crate::taskrows::TaskPanel,
+    /// W-G: the live token-throughput sampler for the ACTIVE session. Fed on
+    /// the existing frame clock (`note_throughput`) while a turn streams,
+    /// reset to empty when idle — a pure ring buffer, so idle frames cost
+    /// nothing and the readout is probe-reproducible.
+    pub throughput: crate::throughput::ThroughputTracker,
     /// `/usage` screen state (U2): the `usage.report` snapshot, provider
     /// filter, group cursor, account tabs, F2b scroll cells. APP-level —
     /// the report is account truth, not session display state.
@@ -3238,6 +3243,7 @@ impl Default for AppModel {
             hooks: crate::hooks::HooksScreenState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
             tasks: crate::taskrows::TaskPanel::default(),
+            throughput: crate::throughput::ThroughputTracker::new(),
             usage: UsageState::default(),
         }
     }
@@ -8936,6 +8942,38 @@ impl AppModel {
         self.menu_selection = 0;
     }
 
+    /// W-G: feed the throughput tracker one observation on the frame clock —
+    /// called at the existing clock-advance sites (every applied ACTIVE-session
+    /// envelope and the live anim tick), so there is NO new timer. While the
+    /// turn streams it samples the cumulative output-token count at
+    /// `clock_ms`, preferring provider usage and falling back to an
+    /// approximate text-derived count (rendered `~`) when no incremental usage
+    /// is reported. Off-stream it resets the tracker ONCE to the empty resting
+    /// shape, so idle frames stay byte-identical (WG3).
+    pub fn note_throughput(&mut self) {
+        if self.projection.is_streaming() {
+            let now = self.clock_ms;
+            let (tokens, exact) = match self.projection.usage().map(|usage| usage.output) {
+                Some(output) if output > 0 => (output, true),
+                _ => (self.projection.streamed_output_tokens_approx(), false),
+            };
+            self.throughput.observe(now, tokens, exact);
+        } else if !self.throughput.is_empty() {
+            self.throughput.reset();
+        }
+    }
+
+    /// W-G: the throughput row's data, or `None` when the row must not show —
+    /// off-stream (the WG3 gate) or before a rate is established. The render
+    /// and plain layers both build their line from this readout.
+    #[must_use]
+    pub fn throughput_readout(&self) -> Option<crate::throughput::ThroughputReadout> {
+        if !self.projection.is_streaming() {
+            return None;
+        }
+        self.throughput.readout()
+    }
+
     /// Route one RAW envelope to whichever session owns it (W3c3, report
     /// R11 cut 2) — the single live entry point for the event stream.
     ///
@@ -8986,6 +9024,13 @@ impl AppModel {
                         &state,
                         title.as_deref(),
                     );
+                }
+                // W-G: sample throughput for the ACTIVE session on the same
+                // applied-envelope clock that just advanced (the frame clock —
+                // no new timer). A background session's stream never feeds the
+                // active row.
+                if self.active_session.as_ref() == Some(&envelope.session_id) {
+                    self.note_throughput();
                 }
             }
             RawOutcome::Gap { after_seq } => self.requests.push(AppRequest::Reattach {
@@ -9555,6 +9600,7 @@ impl AppModel {
         self.branch_state = crate::branch::BranchState::default();
         self.hook_facts = crate::hooks::HookFactsLog::default();
         self.tasks = crate::taskrows::TaskPanel::default();
+        self.throughput.reset();
         self.session_title = None;
         self.session_name = None;
         self.turn_active = false;

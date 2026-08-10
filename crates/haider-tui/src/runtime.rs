@@ -2825,6 +2825,10 @@ pub async fn run_live(
                 // second timer, and a closed gate costs nothing (terminal
                 // chips read frozen journal time, not this).
                 model.clock_ms = model.clock_ms.max(now_epoch_ms());
+                // W-G: the same clock samples throughput — so the rate keeps
+                // breathing (and honestly dips) while a tool runs mid-turn or
+                // deltas pause, with no timer of its own.
+                model.note_throughput();
                 model.dirty = true;
             }
             () = wait_until(deadline) => {}
