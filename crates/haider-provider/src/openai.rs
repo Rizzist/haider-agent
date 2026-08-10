@@ -3069,6 +3069,15 @@ fn blocked_ipv4_credential_target(address: Ipv4Addr) -> bool {
         || address.is_multicast()
         || address == Ipv4Addr::BROADCAST
         || octets[0] == 0
+        // M5 (W-F): CGNAT / RFC 6598 shared address space 100.64.0.0/10 —
+        // routable inside carrier NATs and home cloud metadata twins.
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 0x40)
+        // M5: RFC 2544 benchmarking range 198.18.0.0/15.
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        // M5: IETF protocol assignments 192.0.0.0/24 (special-use).
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        // M5: reserved / Class E 240.0.0.0/4 (240.0.0.0 – 255.255.255.255).
+        || octets[0] >= 240
 }
 
 fn blocked_ipv6_credential_target(address: Ipv6Addr) -> bool {
@@ -3080,6 +3089,14 @@ fn blocked_ipv6_credential_target(address: Ipv6Addr) -> bool {
         || address.is_multicast()
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] & 0xfe00) == 0xfc00
+        // M5 (W-F): NAT64 well-known prefix 64:ff9b::/96 — an embedded IPv4
+        // (e.g. 64:ff9b::7f00:1 == 127.0.0.1) must never dodge the fence.
+        || (segments[0] == 0x0064
+            && segments[1] == 0xff9b
+            && segments[2] == 0
+            && segments[3] == 0
+            && segments[4] == 0
+            && segments[5] == 0)
 }
 
 #[derive(Debug, Deserialize)]

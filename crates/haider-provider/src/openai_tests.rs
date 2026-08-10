@@ -1493,3 +1493,61 @@ fn alpha_search_request_body_is_golden() {
         "not json at all"
     );
 }
+
+/// LAW (W-F M5, public-IP classifier sweep — BOTH directions): the special-use
+/// ranges added in W-F are BLOCKED, and a representative public address just
+/// outside each stays ALLOWED. The web_fetch public fence and the fixed-origin
+/// fence both derive from this classifier, so extending it here closes them
+/// all at once. TEST-NET (192.0.2/24, 198.51.100/24, 203.0.113/24) stays
+/// classified PUBLIC on purpose — those are guaranteed-never-routed
+/// documentation ranges used as safe public stand-ins by the origin laws.
+#[test]
+fn m5_classifier_blocks_added_special_use_ranges_both_directions() {
+    let v4 = |a, b, c, d| std::net::IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+    // BLOCKED: in-range representatives (low + high edges where they matter).
+    for blocked in [
+        v4(100, 64, 0, 1),      // CGNAT / RFC 6598 low edge (100.64/10)
+        v4(100, 127, 255, 254), // CGNAT high edge
+        v4(198, 18, 0, 1),      // RFC 2544 benchmarking low (198.18/15)
+        v4(198, 19, 255, 254),  // RFC 2544 benchmarking high
+        v4(192, 0, 0, 1),       // IETF protocol assignments (192.0.0/24)
+        v4(240, 0, 0, 1),       // Class E / reserved low (240/4)
+        v4(255, 255, 255, 254), // Class E high, below broadcast
+    ] {
+        assert!(
+            blocked_credential_target(blocked),
+            "{blocked} is special-use and must be blocked"
+        );
+    }
+    // ALLOWED: nearest public neighbours just outside each added range, plus an
+    // ordinary routable literal — the sweep is EXACT, not over-broad.
+    for public in [
+        v4(100, 63, 255, 254), // just below CGNAT
+        v4(100, 128, 0, 1),    // just above CGNAT
+        v4(198, 17, 255, 254), // just below 198.18/15
+        v4(198, 20, 0, 1),     // just above 198.18/15
+        v4(192, 0, 1, 1),      // just above 192.0.0/24
+        v4(93, 184, 216, 34),  // ordinary public (example.com)
+    ] {
+        assert!(
+            !blocked_credential_target(public),
+            "{public} is public and must stay allowed"
+        );
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 embedding 127.0.0.1 is blocked; an
+    // ordinary global-unicast v6 is not.
+    let nat64 = "64:ff9b::7f00:1"
+        .parse::<std::net::IpAddr>()
+        .expect("nat64 literal");
+    assert!(
+        blocked_credential_target(nat64),
+        "NAT64-embedded loopback must be blocked"
+    );
+    let public_v6 = "2606:2800:220:1:248:1893:25c8:1946"
+        .parse::<std::net::IpAddr>()
+        .expect("public v6 literal");
+    assert!(
+        !blocked_credential_target(public_v6),
+        "ordinary public v6 must stay allowed"
+    );
+}
