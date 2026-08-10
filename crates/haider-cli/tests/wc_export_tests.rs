@@ -194,6 +194,63 @@ fn codex_export_is_deterministic() {
     );
 }
 
+#[test]
+fn codex_session_meta_source_is_an_accepted_interactive_value() {
+    // H4: codex's `codex resume` picker filters rollouts by an interactive
+    // source allowlist AND by `model_provider`. A literal `source:"export"`
+    // (or an Anthropic `model_provider`) is filtered out, so the export never
+    // lists. We write an ACCEPTED source + the resuming runtime's provider,
+    // and keep Haider's true origin in explicit provenance fields.
+    let codex = fixture_export().to_codex(false);
+    let meta: Value =
+        serde_json::from_str(codex.rollout_jsonl.lines().next().expect("meta")).expect("meta json");
+    // codex's interactive/resumable sources.
+    const ACCEPTED: &[&str] = &["cli", "vscode", "exec"];
+    let source = meta["payload"]["source"].as_str().expect("source string");
+    assert!(
+        ACCEPTED.contains(&source),
+        "session_meta source must be codex-accepted, got {source:?}"
+    );
+    // The resuming runtime's provider is what codex lists on.
+    assert_eq!(meta["payload"]["model_provider"], "openai");
+    // Provenance is preserved — Haider's true origin is never lost.
+    assert_eq!(meta["payload"]["origin_provider"], "anthropic");
+    assert_eq!(meta["payload"]["origin_model"], "fable-5");
+    assert_eq!(meta["payload"]["originator"], "haider");
+}
+
+#[test]
+fn codex_tool_turn_emits_a_paired_call_and_output() {
+    // M1: a `function_call` with no matching `function_call_output` breaks a
+    // resumed codex turn, and the projected summary is not guaranteed-valid
+    // JSON for `arguments`. Every function_call must be paired with a
+    // function_call_output on the SAME call_id, and `arguments` must parse.
+    let codex = fixture_export().to_codex(false);
+    let items: Vec<Value> = codex
+        .rollout_jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value["type"] == "response_item")
+        .map(|value| value["payload"].clone())
+        .collect();
+    let calls: Vec<&Value> = items
+        .iter()
+        .filter(|p| p["type"] == "function_call")
+        .collect();
+    assert!(!calls.is_empty(), "the fixture has a tool turn");
+    for call in &calls {
+        let call_id = call["call_id"].as_str().expect("call_id");
+        // `arguments` is well-formed JSON, never a bare summary string.
+        let args = call["arguments"].as_str().expect("arguments string");
+        serde_json::from_str::<Value>(args).expect("arguments parse as JSON");
+        // A matching function_call_output closes the call.
+        let paired = items
+            .iter()
+            .any(|p| p["type"] == "function_call_output" && p["call_id"].as_str() == Some(call_id));
+        assert!(paired, "function_call {call_id} has a matching output");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // claude-code
 // ---------------------------------------------------------------------------
@@ -241,10 +298,14 @@ fn claude_code_slug_and_uuid_chain() {
 
 fn make_opencode_db(path: &std::path::Path) {
     let conn = rusqlite::Connection::open(path).expect("open");
+    // H1: mirror the REAL opencode 1.17.x schema — `message` AND `part` carry
+    // NOT NULL `time_created`/`time_updated` columns. The old reduced fixture
+    // dropped them, which is exactly what hid the writer omitting them (the
+    // first message INSERT fails on a real db and rolls the whole export back).
     conn.execute_batch(
-        "CREATE TABLE session(id TEXT PRIMARY KEY, project_id TEXT, slug TEXT, directory TEXT, title TEXT, version TEXT, time_created INTEGER, time_updated INTEGER);
-         CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
-         CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);",
+        "CREATE TABLE session(id TEXT PRIMARY KEY, project_id TEXT, slug TEXT, directory TEXT, title TEXT, version TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+         CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+         CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);",
     )
     .expect("schema");
 }
@@ -287,6 +348,31 @@ fn opencode_inserts_and_reads_back() {
     assert!(
         first_part.contains("\"type\":\"text\""),
         "part is a text part: {first_part}"
+    );
+    // H1: the message AND part time columns are POPULATED from the turn
+    // timestamp — never left out (a NOT NULL omission would have failed the
+    // INSERT above and rolled the whole export back on a real store).
+    let message_time: i64 = conn
+        .query_row(
+            "SELECT time_created FROM message ORDER BY time_created LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("message time_created");
+    assert!(
+        message_time >= CREATED_MS as i64,
+        "message time_created populated from the turn ts: {message_time}"
+    );
+    let part_time: i64 = conn
+        .query_row(
+            "SELECT time_created FROM part ORDER BY time_created LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("part time_created");
+    assert!(
+        part_time >= CREATED_MS as i64,
+        "part time_created populated: {part_time}"
     );
 }
 

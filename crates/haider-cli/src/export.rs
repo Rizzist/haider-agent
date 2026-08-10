@@ -314,8 +314,19 @@ impl SessionExport {
                     "cwd": self.meta.cwd,
                     "originator": "haider",
                     "cli_version": self.meta.cli_version,
-                    "source": "export",
-                    "model_provider": self.meta.provider,
+                    // H4: codex's resume picker filters rollouts by an
+                    // interactive-source allowlist and by `model_provider`. A
+                    // literal `source:"export"` is NOT on that allowlist, so an
+                    // exported rollout never appears in `codex resume`. Write an
+                    // ACCEPTED interactive source (`cli`) and the provider the
+                    // resuming runtime actually speaks (`openai`), and keep
+                    // Haider's true origin in explicit provenance fields so the
+                    // transcript's real lineage is never lost.
+                    "source": "cli",
+                    "model_provider": "openai",
+                    "origin": "haider-export",
+                    "origin_provider": self.meta.provider,
+                    "origin_model": self.meta.model,
                     "history_mode": "legacy",
                 }
             })
@@ -374,6 +385,14 @@ impl SessionExport {
                     );
                 }
                 Turn::Tool { name, summary, .. } => {
+                    // M1: a `function_call` with no matching `function_call_output`
+                    // is a malformed turn a resumed codex session chokes on, and
+                    // our projected `summary` is not guaranteed-valid JSON for the
+                    // `arguments` slot. Emit a VALID paired call + output: wrap the
+                    // summary in a well-formed JSON object for `arguments`, then
+                    // close the call with its `function_call_output` (same call_id).
+                    let summary = self.text(summary, masked);
+                    let call_id = format!("call_{}", short_hash(&format!("{name}{iso}")));
                     lines.push(
                         json!({
                             "timestamp": iso,
@@ -381,8 +400,20 @@ impl SessionExport {
                             "payload": {
                                 "type": "function_call",
                                 "name": name,
-                                "arguments": self.text(summary, masked),
-                                "call_id": format!("call_{}", short_hash(&format!("{name}{iso}"))),
+                                "arguments": json!({ "summary": summary }).to_string(),
+                                "call_id": call_id,
+                            }
+                        })
+                        .to_string(),
+                    );
+                    lines.push(
+                        json!({
+                            "timestamp": iso,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": summary,
                             }
                         })
                         .to_string(),
@@ -513,11 +544,16 @@ impl SessionExport {
             })
             .to_string();
             let part_data = json!({ "type": "text", "text": text }).to_string();
+            // H1: the message/part rows carry their own NOT NULL time columns
+            // (opencode's real schema). Use the turn's own timestamp.
+            let at = i64::try_from(turn.at_ms()).unwrap_or(0);
             messages.push(OpenCodeMessage {
                 id: message_id,
                 data: message_data,
                 part_id,
                 part_data,
+                time_created: at,
+                time_updated: at,
             });
         }
         OpenCodeExport {
@@ -560,6 +596,12 @@ pub struct OpenCodeMessage {
     pub data: String,
     pub part_id: String,
     pub part_data: String,
+    /// The per-message `time_created`/`time_updated` (ms). opencode's
+    /// `message` AND `part` tables carry these as NOT NULL columns; omitting
+    /// them from the INSERT makes the first row fail on a real store and rolls
+    /// the whole export back (H1).
+    pub time_created: i64,
+    pub time_updated: i64,
 }
 
 /// The opencode row set to INSERT.
@@ -644,18 +686,28 @@ pub fn write_opencode(
     for message in &rows.messages {
         transaction
             .execute(
-                "INSERT INTO message(id, session_id, data) VALUES (?1, ?2, ?3)",
-                params![message.id, rows.session_id, message.data],
+                "INSERT INTO message(id, session_id, data, time_created, time_updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    message.id,
+                    rows.session_id,
+                    message.data,
+                    message.time_created,
+                    message.time_updated,
+                ],
             )
             .map_err(|error| classify_sqlite(error, db_path))?;
         transaction
             .execute(
-                "INSERT INTO part(id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO part(id, message_id, session_id, data, time_created, time_updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     message.part_id,
                     message.id,
                     rows.session_id,
-                    message.part_data
+                    message.part_data,
+                    message.time_created,
+                    message.time_updated,
                 ],
             )
             .map_err(|error| classify_sqlite(error, db_path))?;
@@ -832,16 +884,55 @@ fn filename_stamp(ms: u64) -> String {
 
 /// Write `contents` to `path`, refusing to overwrite an existing file.
 pub fn write_new_file(path: &Path, contents: &str) -> Result<(), ExportError> {
-    if path.exists() {
-        return Err(ExportError::Collision(path.display().to_string()));
-    }
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             ExportError::Io(format!("cannot create {}: {error}", parent.display()))
         })?;
     }
-    std::fs::write(path, contents)
+    // M2: `create_new` makes existence-check + create ONE atomic, symlink-safe
+    // syscall (O_CREAT|O_EXCL) — no check-then-write TOCTOU window where a
+    // foreign file (or a symlink to one) could slip in between. An existing
+    // target is the collision refusal; any other error is a plain IO failure.
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ExportError::Collision(path.display().to_string()));
+        }
+        Err(error) => {
+            return Err(ExportError::Io(format!(
+                "cannot write {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    file.write_all(contents.as_bytes())
         .map_err(|error| ExportError::Io(format!("cannot write {}: {error}", path.display())))
+}
+
+/// M3: write the codex rollout and append its `history.jsonl` as a RECOVERABLE
+/// pair. The rollout is created first (collision-refusing); if the history
+/// append then fails, the just-created rollout is REMOVED so a retry is not
+/// blocked by a half-written export (a stranded rollout would make the next
+/// attempt a false collision). On success both sit on disk.
+pub fn write_codex_pair(
+    rollout_path: &Path,
+    rollout_jsonl: &str,
+    history_path: &Path,
+    history_jsonl: &str,
+) -> Result<(), ExportError> {
+    write_new_file(rollout_path, rollout_jsonl)?;
+    if let Err(error) = append_file(history_path, history_jsonl) {
+        // `write_new_file` returns Ok only when it CREATED the file, so removing
+        // it here can never delete a pre-existing foreign rollout.
+        let _ = std::fs::remove_file(rollout_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Append `contents` to `path` (used for codex `history.jsonl`).
@@ -892,6 +983,33 @@ const EX_USAGE: u8 = 2;
 const EX_UNAVAILABLE: u8 = 69;
 const EX_IOERR: u8 = 74;
 const EX_BLOCKED: u8 = 77;
+
+/// A hard cap on the envelopes retained for one export replay (M4). Export is
+/// a full, bounded, follow-off replay; a hostile or enormous session must not
+/// be able to OOM the exporter by streaming an unbounded number of facts.
+const MAX_REPLAY_EVENTS: usize = 500_000;
+
+/// Drain `receiver` into a BOUNDED buffer of at most `max_events` items,
+/// returning the retained items and whether the replay was truncated. The
+/// channel keeps being drained past the bound (so the unbounded producer never
+/// wedges on a full queue), the surplus items are simply not retained — the
+/// peak memory is `max_events`, not the whole session. Generic so the bound is
+/// exercised by a law without a live daemon.
+pub async fn collect_bounded_replay<T>(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<T>,
+    max_events: usize,
+) -> (Vec<T>, bool) {
+    let mut events = Vec::new();
+    let mut truncated = false;
+    while let Some(item) = receiver.recv().await {
+        if events.len() >= max_events {
+            truncated = true;
+            continue;
+        }
+        events.push(item);
+    }
+    (events, truncated)
+}
 
 /// Parsed `haider export` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1022,15 +1140,13 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
         cli_version: env!("CARGO_PKG_VERSION").to_owned(),
     };
 
-    // 2) The durable envelopes (a bounded full replay, follow off).
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let collector = tokio::spawn(async move {
-        let mut events = Vec::new();
-        while let Some(envelope) = receiver.recv().await {
-            events.push(envelope);
-        }
-        events
-    });
+    // 2) The durable envelopes (a bounded full replay, follow off). The client
+    // API requires an UNBOUNDED sender, so the BOUNDED buffer lives in the
+    // collector: it keeps draining the channel (the producer never wedges on a
+    // full queue) but retains at most `MAX_REPLAY_EVENTS`, so a huge or hostile
+    // session can never OOM the exporter (M4).
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let collector = tokio::spawn(collect_bounded_replay(receiver, MAX_REPLAY_EVENTS));
     let stream = haider_client::observe_stream_session(
         &profile,
         !options.no_spawn,
@@ -1039,10 +1155,16 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
         sender,
     )
     .await;
-    let events = collector.await.unwrap_or_default();
+    let (events, truncated) = collector.await.unwrap_or_default();
     if let Err(error) = stream {
         eprintln!("haider export: {error}");
         return ExitCode::from(EX_UNAVAILABLE);
+    }
+    if truncated {
+        eprintln!(
+            "haider export: session replay truncated at {MAX_REPLAY_EVENTS} events — the export covers the first {} of them",
+            events.len()
+        );
     }
 
     // 3) Project + render + write.
@@ -1113,8 +1235,12 @@ pub fn write_export(
                     )
                 }
             };
-            write_new_file(&rollout_path, &codex.rollout_jsonl)?;
-            append_file(&history_path, &codex.history_jsonl)?;
+            write_codex_pair(
+                &rollout_path,
+                &codex.rollout_jsonl,
+                &history_path,
+                &codex.history_jsonl,
+            )?;
             Ok(format!(
                 "wrote codex rollout {} (id {})",
                 rollout_path.display(),
