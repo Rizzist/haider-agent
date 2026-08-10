@@ -191,6 +191,29 @@ fn html_reducer_is_bounded_on_adversarial_nested_drop_tags() {
     );
 }
 
+/// LAW (W-F H3, entity decode is codepoint-safe): a `&`…candidate whose
+/// 12-byte terminator window would fall mid-codepoint (`&aaaaaaaaaaé;`, where
+/// the `é`'s second byte lands exactly on byte 12) must NOT slice a
+/// non-char-boundary and panic — the decoder scans by char boundaries. Real
+/// short entities beside such input still decode.
+#[test]
+fn entity_decode_does_not_panic_on_multibyte_boundary() {
+    let reduced = reduce_html_to_text("<p>&aaaaaaaaaaé;</p>");
+    assert!(
+        reduced.contains('é'),
+        "the multibyte char survives: {reduced:?}"
+    );
+    assert!(
+        reduced.contains('&'),
+        "the over-long (non-)entity stays literal: {reduced:?}"
+    );
+    let mixed = reduce_html_to_text("prefix &aaaaaaaaaaé; and &amp; tail");
+    assert!(
+        mixed.contains("and & tail"),
+        "real entities still decode beside the hostile candidate: {mixed:?}"
+    );
+}
+
 /// LAW (LW6, html reduction): script/style/nav CONTENT is dropped, headings
 /// keep a `#` prefix, list items a `-` marker, links keep their href,
 /// pre/code keeps its shape, entities decode, and blank runs collapse.

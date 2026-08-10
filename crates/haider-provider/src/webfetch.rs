@@ -571,7 +571,16 @@ fn decode_entities(text: impl AsRef<str>) -> String {
     while let Some(position) = rest.find('&') {
         output.push_str(&rest[..position]);
         rest = &rest[position..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // H3: scan for the terminating ';' within the first 12 bytes WITHOUT
+        // a raw byte slice — `rest[..12]` can fall mid-codepoint (`&aaaa…é;`)
+        // and panic. `char_indices` never yields a non-boundary index, and
+        // ';' is ASCII so its index equals its byte offset.
+        let Some(end) = rest
+            .char_indices()
+            .take_while(|(index, _)| *index < 12)
+            .find(|(_, character)| *character == ';')
+            .map(|(index, _)| index)
+        else {
             output.push('&');
             rest = &rest[1..];
             continue;
