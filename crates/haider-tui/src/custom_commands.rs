@@ -105,6 +105,10 @@ pub struct ParsedCommandFile {
 pub enum ParseError {
     /// A `---` frontmatter fence was opened but never closed.
     UnterminatedFrontmatter,
+    /// A non-blank frontmatter line was not a `key: value` pair (M5): the
+    /// frontmatter is malformed, so the whole file is skipped with a warning
+    /// rather than silently accepting a half-parsed header.
+    MalformedFrontmatter,
     /// The prompt body was empty (nothing to run).
     EmptyBody,
 }
@@ -114,6 +118,7 @@ impl ParseError {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::UnterminatedFrontmatter => "unterminated `---` frontmatter",
+            Self::MalformedFrontmatter => "malformed frontmatter (expected `key: value`)",
             Self::EmptyBody => "empty command body",
         }
     }
@@ -132,6 +137,13 @@ const MAX_ANCESTORS: usize = 256;
 const MAX_NAMESPACE_DEPTH: usize = 16;
 /// Bound on the number of command files loaded per source.
 const MAX_FILES_PER_SOURCE: usize = 512;
+/// M8: hard cap on directory entries the walk will EXAMINE per source. Applied
+/// during the walk (not after collecting everything), so a directory holding
+/// millions of entries can never stall or OOM TUI startup.
+const MAX_WALK_ENTRIES: usize = 20_000;
+/// M8: per-file byte cap — a command file is a small prompt template; a giant
+/// `.md` is skipped with a warning rather than read whole into memory.
+const MAX_COMMAND_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Parse one command file's contents into frontmatter + body.
 ///
@@ -145,21 +157,35 @@ pub fn parse_command_file(contents: &str) -> Result<ParsedCommandFile, ParseErro
     let mut allowed_tools = Vec::new();
 
     // The frontmatter fence must be the very first line (CC convention).
-    let mut lines = contents.lines();
+    // M6: walk lines WITH their terminators (`split_inclusive`) so the body
+    // byte offset is exact for BOTH `\n` and `\r\n`. The old `line.len() + 1`
+    // undercounted every CRLF ending by one byte, which bled part of the
+    // closing `---` fence into the prompt.
     let body = if matches!(contents.lines().next().map(str::trim), Some("---")) {
-        // Consume the opening fence.
-        lines.next();
+        let mut pieces = contents.split_inclusive('\n');
+        // Consume the opening fence line; `opening` is its exact byte length.
+        let opening = pieces.next().map_or(0, str::len);
         let mut closed = false;
+        let mut malformed = false;
         let mut consumed = 0usize;
-        for line in lines.by_ref() {
-            consumed += line.len() + 1;
+        for piece in pieces.by_ref() {
+            consumed += piece.len();
+            let line = piece.trim_end_matches(['\n', '\r']);
             if line.trim() == "---" {
                 closed = true;
                 break;
             }
+            if line.trim().is_empty() {
+                // A blank line inside frontmatter is fine.
+                continue;
+            }
             let Some((key, value)) = line.split_once(':') else {
-                // A blank line inside frontmatter is fine; any other
-                // non key:value line is ignored (CC-lenient).
+                // M5: a non-blank, non `key: value` line is MALFORMED. The
+                // brief requires skip-with-warning, not the old silent accept.
+                // Remember it but keep scanning: a fence that never closes is
+                // reported as UNTERMINATED (that verdict wins) so the existing
+                // unterminated-frontmatter law is preserved.
+                malformed = true;
                 continue;
             };
             let key = key.trim().to_ascii_lowercase();
@@ -175,8 +201,10 @@ pub fn parse_command_file(contents: &str) -> Result<ParsedCommandFile, ParseErro
         if !closed {
             return Err(ParseError::UnterminatedFrontmatter);
         }
+        if malformed {
+            return Err(ParseError::MalformedFrontmatter);
+        }
         // The body is everything after the closing fence.
-        let opening = contents.lines().next().map_or(0, |line| line.len() + 1);
         contents
             .get(opening + consumed..)
             .unwrap_or("")
@@ -312,18 +340,36 @@ fn match_arguments_indexed(chars: &[char], start: usize) -> Option<(usize, usize
 }
 
 /// The nearest ancestor `.haider/commands` directory, from `start` upward.
+///
+/// M7: the discovered directory must stay CONTAINED within its project root —
+/// an untrusted checkout could make `.haider/commands` a symlink pointing
+/// outside the repo (at `/etc`, a huge tree, …) to redirect command loading.
+/// We canonicalize the candidate and require it to live under the (canonical)
+/// ancestor it was found in; an escaping symlink is skipped, and the walk
+/// continues upward rather than loading through it.
 #[must_use]
 pub fn discover_project_commands_dir(start: &Path) -> Option<PathBuf> {
     let mut current: Option<&Path> = Some(start);
     for _ in 0..MAX_ANCESTORS {
         let dir = current?;
         let candidate = dir.join(".haider").join("commands");
-        if candidate.is_dir() {
+        if candidate.is_dir() && path_is_contained(&candidate, dir) {
             return Some(candidate);
         }
         current = dir.parent();
     }
     None
+}
+
+/// M7: whether `candidate`'s CANONICAL target stays under `root`'s canonical
+/// path — i.e. following every symlink in `candidate` never escapes the project
+/// tree it was found in. A canonicalization failure (a race, a broken link) is
+/// treated as NOT contained (fail closed).
+fn path_is_contained(candidate: &Path, root: &Path) -> bool {
+    match (candidate.canonicalize(), root.canonicalize()) {
+        (Ok(real_candidate), Ok(real_root)) => real_candidate.starts_with(&real_root),
+        _ => false,
+    }
 }
 
 /// The global `~/.haider/commands` directory (not required to exist).
@@ -370,9 +416,23 @@ fn load_dir(
     warnings: &mut Vec<String>,
 ) {
     let mut files = Vec::new();
-    collect_md_files(root, root, 0, &mut files);
+    // M8: bound the WALK (entries examined + files collected) so a directory
+    // with millions of files can't stall/OOM startup — the cap must apply
+    // DURING the walk, not after collecting everything.
+    let mut entry_budget = MAX_WALK_ENTRIES;
+    collect_md_files(root, root, 0, &mut files, &mut entry_budget);
     files.sort();
     for (name, path) in files.into_iter().take(MAX_FILES_PER_SOURCE) {
+        // M8: skip a giant file rather than read it whole into memory.
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.len() > MAX_COMMAND_FILE_BYTES
+        {
+            warnings.push(format!(
+                "{}: skipped (over {MAX_COMMAND_FILE_BYTES}-byte command-file cap)",
+                path.display()
+            ));
+            continue;
+        }
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(error) => {
@@ -404,20 +464,32 @@ fn load_dir(
 
 /// Recursively collect `(namespaced-name, path)` for every `.md` file under
 /// `root`, using the path relative to `root` for the `:` namespace.
-fn collect_md_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) {
-    if depth > MAX_NAMESPACE_DEPTH {
+fn collect_md_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<(String, PathBuf)>,
+    entry_budget: &mut usize,
+) {
+    if depth > MAX_NAMESPACE_DEPTH || out.len() >= MAX_FILES_PER_SOURCE || *entry_budget == 0 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        // M8: stop the moment either bound is hit — total entries EXAMINED, or
+        // command files collected — so a hostile tree can't run the walk away.
+        if *entry_budget == 0 || out.len() >= MAX_FILES_PER_SOURCE {
+            return;
+        }
+        *entry_budget -= 1;
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_dir() {
-            collect_md_files(root, &path, depth + 1, out);
+            collect_md_files(root, &path, depth + 1, out, entry_budget);
         } else if file_type.is_file()
             && path
                 .extension()

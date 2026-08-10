@@ -7,7 +7,8 @@ use haider_protocol::ids::SessionId;
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode, Screen};
 use haider_tui::commands::{DynamicSlots, palette_items};
 use haider_tui::custom_commands::{
-    CommandSource, CustomCommand, ParseError, load, load_for, parse_command_file, substitute,
+    CommandSource, CustomCommand, ParseError, discover_project_commands_dir, load, load_for,
+    parse_command_file, substitute,
 };
 use std::fs;
 use std::path::Path;
@@ -158,6 +159,121 @@ fn load_for_walks_up_to_the_project_root() {
             .iter()
             .map(|command| command.name.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn malformed_frontmatter_line_is_rejected_not_silently_accepted() {
+    // M5: a non-blank, non `key: value` line inside a CLOSED frontmatter is
+    // malformed — the brief requires skip-with-warning, not the old silent
+    // `continue`.
+    assert_eq!(
+        parse_command_file("---\nthis is not yaml\n---\nBody\n"),
+        Err(ParseError::MalformedFrontmatter)
+    );
+    // A blank line inside frontmatter is still fine, and valid pairs parse.
+    let parsed = parse_command_file("---\ndescription: ok\n\nmodel: fable-5\n---\nBody\n")
+        .expect("blank line ok");
+    assert_eq!(parsed.description.as_deref(), Some("ok"));
+    assert_eq!(parsed.model.as_deref(), Some("fable-5"));
+    // An UNTERMINATED fence still reports as unterminated even if it also has a
+    // malformed line (that verdict wins) — the pre-existing law is preserved.
+    assert_eq!(
+        parse_command_file("---\ndescription: x\nno closing fence"),
+        Err(ParseError::UnterminatedFrontmatter)
+    );
+}
+
+#[test]
+fn a_malformed_frontmatter_file_is_skipped_with_a_warning() {
+    let temp = tempfile::tempdir().expect("temp");
+    let dir = temp.path();
+    write(dir, "good.md", "A fine command");
+    write(dir, "bad.md", "---\nnot a yaml pair\n---\nBody\n");
+    let result = load(Some(dir), None);
+    assert!(result.commands.iter().any(|command| command.name == "good"));
+    assert!(
+        !result.commands.iter().any(|command| command.name == "bad"),
+        "malformed file must be skipped: {:?}",
+        result.commands
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("bad.md")),
+        "warning names the malformed file: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn crlf_frontmatter_does_not_bleed_the_closing_fence_into_the_body() {
+    // M6: str::lines() strips the 2-byte CRLF, so the old `line.len() + 1`
+    // offset undercounted every `\r\n` ending and bled part of the closing
+    // `---` fence into the prompt. The body is exactly the text after the fence.
+    let parsed = parse_command_file("---\r\ndescription: Ship\r\n---\r\nShip it now\r\n")
+        .expect("parse crlf");
+    assert_eq!(parsed.description.as_deref(), Some("Ship"));
+    assert_eq!(parsed.body.trim(), "Ship it now");
+    assert!(
+        !parsed.body.starts_with('-'),
+        "no closing-fence dash bled into the body: {:?}",
+        parsed.body
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn project_discovery_refuses_a_commands_symlink_escaping_the_repo() {
+    // M7: an untrusted checkout could symlink `.haider/commands` OUTSIDE the
+    // repo to redirect command loading at external/huge files. Discovery must
+    // refuse a symlink whose canonical target escapes the project root.
+    let repo = tempfile::tempdir().expect("repo");
+    let outside = tempfile::tempdir().expect("outside");
+    write(outside.path(), "leak.md", "Leaked command");
+    let haider = repo.path().join(".haider");
+    fs::create_dir_all(&haider).expect("mkdir .haider");
+    std::os::unix::fs::symlink(outside.path(), haider.join("commands")).expect("symlink");
+    assert_eq!(
+        discover_project_commands_dir(repo.path()),
+        None,
+        "an escaping .haider/commands symlink is not discovered"
+    );
+    // ...and load_for never loads the external command through it.
+    let result = load_for(Some(repo.path()), None);
+    assert!(
+        !result.commands.iter().any(|command| command.name == "leak"),
+        "external command must not load: {:?}",
+        result.commands
+    );
+}
+
+#[test]
+fn a_giant_command_file_is_skipped_with_a_warning() {
+    // M8: a command file is a small prompt template. A giant `.md` is skipped
+    // (never read whole into memory) with a surfaced warning.
+    let temp = tempfile::tempdir().expect("temp");
+    let dir = temp.path();
+    write(dir, "ok.md", "A fine command");
+    let big = "x".repeat(1024 * 1024 + 16); // over the 1 MiB per-file cap.
+    write(dir, "huge.md", &big);
+    let result = load(Some(dir), None);
+    assert!(
+        result.commands.iter().any(|command| command.name == "ok"),
+        "small command still loads"
+    );
+    assert!(
+        !result.commands.iter().any(|command| command.name == "huge"),
+        "the giant command is skipped"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("huge.md")),
+        "warning names the giant file: {:?}",
+        result.warnings
     );
 }
 
