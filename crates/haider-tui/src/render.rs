@@ -263,6 +263,30 @@ fn thinking_line(theme: &Theme, phase: u8, truecolor: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// W-G: the live token-throughput row shown above the composer while a turn
+/// streams — `Throughput ▁▂▃▄▅ 126 tps · μ 119 · p95 154`. The label, sparkline
+/// and current rate wear the gold accent; μ/p95 are dim, and the `~` (present
+/// on `readout.approx`) rides the rate so an estimated figure never reads as a
+/// measured one. Built from the pure [`crate::throughput::ThroughputReadout`],
+/// the same data the plain renderer prints — WG6 parity by construction.
+fn throughput_line(theme: &Theme, readout: &crate::throughput::ThroughputReadout) -> Line<'static> {
+    let tilde = if readout.approx { "~" } else { "" };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled("Throughput ", theme.dim_style()),
+        Span::styled(readout.spark.clone(), theme.gold_style()),
+        Span::raw(" "),
+        Span::styled(format!("{tilde}{} tps", readout.tps), theme.gold_style()),
+    ];
+    if let Some(mean) = readout.mean {
+        spans.push(Span::styled(format!(" · μ {mean}"), theme.dim_style()));
+    }
+    if let Some(p95) = readout.p95 {
+        spans.push(Span::styled(format!(" · p95 {p95}"), theme.dim_style()));
+    }
+    Line::from(spans)
+}
+
 /// M4: the transcript-tail retry line, the warn/ember-toned neighbor of
 /// `thinking_line`. `✻ API error · Retrying in <N>s · attempt <K>/<max>` while
 /// the actor backs off after a retryable provider failure. The countdown shows
@@ -2674,6 +2698,11 @@ fn render_session(
     // like the SubTree, but one row).
     let tasks_line = crate::taskrows::tasks_line(&model.tasks, model.clock_ms);
     let mut tasks_height = u16::from(tasks_line.is_some());
+    // W-G: the live token-throughput row — one ambient line in the live-work
+    // block, present only while the turn streams and a rate is established.
+    // Lowest shed priority: an ephemeral gauge yields before the task band.
+    let throughput_readout = model.throughput_readout();
+    let mut throughput_height = u16::from(throughput_readout.is_some());
     let mut todos_height = model
         .projection
         .todos()
@@ -2746,6 +2775,13 @@ fn render_session(
     } else {
         budget -= todos_height;
     }
+    // W-G: the throughput row sheds FIRST when space is tight (checked last =
+    // lowest claim on the budget) — the task band and todos outrank it.
+    if throughput_height > budget {
+        throughput_height = 0;
+    } else {
+        budget -= throughput_height;
+    }
     // The closing rule was reserved ABOVE, before the panels (TUI6.1
     // fix 2 — sim anatomy: the border-top of whatever follows the
     // InputBar, SubTree tui.js:4764 / StatusBar tui.js:5497).
@@ -2759,7 +2795,7 @@ fn render_session(
     // last and given up first.
     // The waiting line and the task band share one breathing row (they are
     // the same "live background work" block when both are present).
-    let want_lead = u16::from(waiting_height + tasks_height > 0);
+    let want_lead = u16::from(waiting_height + tasks_height + throughput_height > 0);
     let want_todos_lead = u16::from(todos_height > 0);
     let want_subtree_lead = u16::from(subtree_height > 0);
     let breathe = |want: u16, budget: &mut u16| -> u16 {
@@ -2780,6 +2816,7 @@ fn render_session(
         _lead_waiting,
         waiting_area,
         tasks_area,
+        throughput_area,
         _lead_todos,
         todos_area,
         queue_area,
@@ -2797,6 +2834,7 @@ fn render_session(
         Constraint::Length(lead_waiting),
         Constraint::Length(waiting_height),
         Constraint::Length(tasks_height),
+        Constraint::Length(throughput_height),
         Constraint::Length(lead_todos),
         Constraint::Length(todos_height),
         Constraint::Length(queue_height),
@@ -3171,6 +3209,18 @@ fn render_session(
                 ),
             ])),
             tasks_area,
+        );
+    }
+
+    // W-G: the live throughput row — gold label/spark/rate, dim aggregates —
+    // in the same ambient voice as the task band. Only painted while the turn
+    // streams (the height is zero otherwise), so idle frames never carry it.
+    if let Some(readout) = &throughput_readout
+        && throughput_area.height > 0
+    {
+        frame.render_widget(
+            Paragraph::new(throughput_line(theme, readout)),
+            throughput_area,
         );
     }
 

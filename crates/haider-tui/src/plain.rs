@@ -21,9 +21,16 @@ pub const fn status_glyph(status: ToolStatus) -> &'static str {
 }
 
 /// Render the whole session view as plain lines: transcript, pinned todos,
-/// open menu, status line. `window` sizes the context meter (0 = no meter).
+/// open menu, throughput row, status line. `window` sizes the context meter
+/// (0 = no meter). `throughput` is the live token-rate readout when a turn is
+/// streaming (WG6 parity — the same figures the styled row shows), `None`
+/// otherwise so idle plain output is unchanged.
 #[must_use]
-pub fn render_plain(projection: &SessionProjection, window: u64) -> String {
+pub fn render_plain(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+) -> String {
     let mut out = String::new();
     for entry in projection.entries() {
         match entry {
@@ -101,6 +108,13 @@ pub fn render_plain(projection: &SessionProjection, window: u64) -> String {
         for (index, option) in menu.options.iter().enumerate() {
             out.push_str(&format!("  {}. {}\n", index + 1, option.label));
         }
+    }
+    // W-G: the live throughput row sits in the band above the status line —
+    // present only while the turn streams (the caller passes `None` at rest),
+    // printing the SAME figures as the styled render row.
+    if let Some(readout) = throughput {
+        out.push_str(&readout.plain_text());
+        out.push('\n');
     }
     out.push_str(&status_line(projection, window));
     out.push('\n');

@@ -381,9 +381,9 @@ fn le7_plain_mode_carries_no_shimmer() {
     // animate, and the shimmer never leaks into the pipe/CI oracle.
     let mut model = thinking_model();
     model.anim_phase = 0;
-    let at_zero = render_plain(&model.projection, 80);
+    let at_zero = render_plain(&model.projection, 80, None);
     model.anim_phase = 200;
-    let at_tick = render_plain(&model.projection, 80);
+    let at_tick = render_plain(&model.projection, 80, None);
     assert_eq!(at_zero, at_tick, "plain output is clock-invariant");
     assert!(
         !at_zero.contains('\u{1b}'),

@@ -2538,7 +2538,11 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
     for payload in demo_script() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
-    crate::plain::render_plain(&model.projection, model.identity.context_window)
+    crate::plain::render_plain(
+        &model.projection,
+        model.identity.context_window,
+        model.throughput_readout().as_ref(),
+    )
 }
 
 /// Sleep until `deadline`, or forever when there is none.

@@ -257,7 +257,7 @@ fn plain_mode_prints_the_same_task_lines() {
             "error: linking failed\n",
         ),
     ));
-    let plain = haider_tui::plain::render_plain(&model.projection, 200);
+    let plain = haider_tui::plain::render_plain(&model.projection, 200, None);
     assert!(
         plain.contains("⚙ task started — build · cargo build"),
         "plain prints the started line: {plain}"

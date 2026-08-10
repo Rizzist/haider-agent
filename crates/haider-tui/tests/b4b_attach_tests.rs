@@ -273,7 +273,7 @@ fn attach_uploads_then_submit_carries_refs() {
         )),
         RawOutcome::Applied
     );
-    let plain = haider_tui::plain::render_plain(&model.projection, 0);
+    let plain = haider_tui::plain::render_plain(&model.projection, 0, None);
     assert!(
         plain.contains("what is in this image? [+1 attachment(s)]"),
         "the transcript names the real attachment: {plain}"

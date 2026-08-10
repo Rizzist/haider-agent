@@ -14,7 +14,7 @@ fn demo_script_renders_the_full_plain_story() {
     for payload in &demo_script() {
         projection.apply(payload);
     }
-    let text = render_plain(&projection, 200_000);
+    let text = render_plain(&projection, 200_000, None);
     assert!(text.contains("❯ fix the failing boundary test in haider-store"));
     assert!(text.contains("the boundary check rejects seq 0"));
     assert!(text.contains("⚒ fs_read ✓"));
@@ -44,7 +44,7 @@ fn streaming_agent_text_shows_the_cursor_block() {
             text: "stream".to_owned(),
         },
     }));
-    assert!(render_plain(&projection, 0).contains("stream▮"));
+    assert!(render_plain(&projection, 0, None).contains("stream▮"));
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn command_blocks_render_output_tail_and_truncation_notice() {
             exit_code: Some(101),
         },
     }));
-    let text = render_plain(&projection, 0);
+    let text = render_plain(&projection, 0, None);
     assert!(text.contains("$ cargo test ✗ · exit 101"));
     assert!(text.contains("⋯ earlier output truncated"));
 }
