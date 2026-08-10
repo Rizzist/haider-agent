@@ -25,6 +25,14 @@ pub const WEB_FETCH_MAX_REDIRECTS: usize = 5;
 pub const WEB_FETCH_OUTPUT_CAP_BYTES: usize = 96 * 1024;
 /// Hard cap on raw bytes read off the wire before reduction.
 const WEB_FETCH_SOURCE_CAP_BYTES: usize = 4 * 1024 * 1024;
+/// Max nested DROP_CONTENT elements tracked at once (H2). A closing tag scans
+/// this stack (`rposition`), so an UNBOUNDED stack makes `<script>`×N then
+/// `</style>`×N (each a full scan that matches nothing) O(N²) within the 4 MiB
+/// source cap → CPU exhaustion. Bounding the depth keeps every close O(1);
+/// opens past the cap are ignored (their content is still dropped while the
+/// stack is non-empty) — this is a reduction of hostile input, not a fidelity
+/// contract, and legitimate documents never nest drop-chrome this deep.
+const MAX_DROP_STACK_DEPTH: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -417,7 +425,10 @@ pub fn reduce_html_to_text(html: &str) -> String {
                 if let Some(position) = drop_stack.iter().rposition(|open| *open == name) {
                     drop_stack.truncate(position);
                 }
-            } else if !tag.ends_with('/') {
+            } else if !tag.ends_with('/') && drop_stack.len() < MAX_DROP_STACK_DEPTH {
+                // H2: opens past the depth cap are IGNORED — the stack is still
+                // non-empty so content stays dropped, but the O(1) close bound
+                // holds. Never let a hostile page grow this scan unboundedly.
                 drop_stack.push(name);
             }
             continue;

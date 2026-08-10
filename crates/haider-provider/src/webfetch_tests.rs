@@ -161,6 +161,36 @@ async fn public_chain_refuses_a_downgrade_redirect_to_non_public() {
     .expect("public->public stays allowed");
 }
 
+/// LAW (W-F H2, reducer DoS bound): the HTML reducer stays bounded on
+/// adversarial input. `<script>`×N (opens) then `</style>`×N (each a scan of
+/// the drop stack that matches NOTHING) is O(N²) with an unbounded stack;
+/// capping the drop-stack depth keeps every close O(1), so a ~3.2 MiB crafted
+/// document reduces in well under a wall-clock budget an O(N²) impl could
+/// never meet. The reduce runs on its own thread so a regressed (quadratic)
+/// build FAILS at the budget instead of hanging the suite.
+#[test]
+fn html_reducer_is_bounded_on_adversarial_nested_drop_tags() {
+    const N: usize = 200_000;
+    let mut html = String::with_capacity(N * 16);
+    for _ in 0..N {
+        html.push_str("<script>");
+    }
+    for _ in 0..N {
+        html.push_str("</style>");
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(reduce_html_to_text(&html).len());
+    });
+    let reduced_len = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("adversarial reduce must finish within the bound — an O(N^2) impl would not");
+    assert_eq!(
+        reduced_len, 0,
+        "every character sits inside a dropped element, so nothing survives"
+    );
+}
+
 /// LAW (LW6, html reduction): script/style/nav CONTENT is dropped, headings
 /// keep a `#` prefix, list items a `-` marker, links keep their href,
 /// pre/code keeps its shape, entities decode, and blank runs collapse.
