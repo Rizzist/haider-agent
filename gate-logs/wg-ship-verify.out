@@ -1,0 +1,22 @@
+=== FMT ===
+fmt: OK (exit 0)
+=== LADDER ===
+PASS  pty-probe.py 118x36
+PASS  pty-probe.py 90x10
+PASS  pty-probe.py 90x7
+PASS  pty-probe.py 90x5
+PASS  pty-probe.py 90x1
+PASS  pty-probe-ml.py 118x36
+PASS  pty-probe-ml.py 90x10
+PASS  pty-probe-sub.py 118x36
+PASS  pty-probe-sub.py 90x10
+PASS  pty-probe-persist.py 118x36
+PASS  pty-probe-anim.py 118x36
+PASS  pty-probe-anim.py 90x10
+PASS  pty-probe-cursor.py 118x36
+PASS  pty-probe-cursor.py 90x10
+PASS  pty-probe-live.py 118x36 (live)
+PASS  pty-probe-live.py 90x10 (live)
+----
+ladder: 16/16 PASS (14 demo + 2 live)
+=== LADDER EXIT: 0 ===
