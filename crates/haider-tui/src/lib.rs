@@ -37,6 +37,7 @@ pub mod style;
 pub mod talk;
 pub mod taskrows;
 pub mod theme;
+pub mod throughput;
 pub mod wordmark;
 
 /// Crate marker used by the workspace self-test.
