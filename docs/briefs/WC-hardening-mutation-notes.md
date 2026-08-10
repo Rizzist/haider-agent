@@ -75,3 +75,27 @@ production-mutation → observing-law pairs.
 | M9 | Restore the note-only launcher branch (no identity set). | `wc_custom_commands_tests::launcher_custom_command_model_override_precedes_create_session` | `identity.provider`/`model_short` stay at the default (`anthropic`/`fable-5`); the override never reaches `CreateSession`. |
 | M10 | Remove the `route_raw` background-notification evaluation. | `wc_notifications_tests::background_session_terminal_fires_a_desktop_notification` | The background session's terminal transition queues no notification (`notifications` empty). |
 | L1 | Drop the `self.commands.recv()` arm from the retry-backoff select. | `runtime_tests::cancellation_wins_provider_retry_backoff_without_second_request` (stays green as coverage) | A Stop during a long Retry-After blocks shutdown for the full delay instead of returning `Cancelled` promptly. |
+
+## Review of record (coordinator, Fable, executed post-lane)
+
+The lane executed the H2 and H3 kills; it could not execute H1/H4 (their
+code landed in the coordinator's earlier export checkpoint a9a4108). I
+executed both here to close the HIGH set:
+
+- **H1** (opencode time cols): reverted the message INSERT to the pre-fix
+  column list (dropped time_created/time_updated). `wc_export_tests`
+  opencode laws FAILED with `NOT NULL constraint failed:
+  message.time_created` — proving the CORRECTED test schema now observes
+  the omission the old reduced fixture hid (the degenerate-fixture class).
+  Reverted; green.
+- **H4** (codex source): reverted `source:"cli"` → `"export"`.
+  `codex_session_meta_source_is_an_accepted_interactive_value` FAILED
+  ("session_meta source must be codex-accepted, got \"export\"").
+  Reverted; green.
+
+All four HIGH fixes are now executed-kill-verified (H2/H3 by the lane,
+H1/H4 by the coordinator). Spot-checked the lane's H2 kill note (panic
+"refresh must be budgeted … consulted 51 times") and H3 (sk-/raw-key
+leaks) against the notes — consistent. The M10 driver-vs-route_raw note
+is a correct observation (the DemoDriver bypasses route_raw). Campaign
+ACCEPTED.
