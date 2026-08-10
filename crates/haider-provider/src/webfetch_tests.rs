@@ -19,9 +19,21 @@ impl FixedDnsResolver for StubResolver {
 }
 
 async fn validate(url: &str, answers: Vec<SocketAddr>) -> Result<(), crate::ProviderError> {
+    validate_with_origin(url, answers, false).await
+}
+
+/// As [`validate`], but lets the caller assert the H1 downgrade fence by
+/// stating whether the chain STARTED from a public host.
+async fn validate_with_origin(
+    url: &str,
+    answers: Vec<SocketAddr>,
+    chain_started_public: bool,
+) -> Result<(), crate::ProviderError> {
     let url = reqwest::Url::parse(url).expect("test URL parses");
     let resolver = StubResolver { answers };
-    validate_fetch_target(&url, &resolver).await.map(|_| ())
+    validate_fetch_target(&url, &resolver, chain_started_public)
+        .await
+        .map(|_| ())
 }
 
 /// LAW (LW6, origin matrix — BOTH directions): public HTTPS passes (IP
@@ -105,6 +117,48 @@ async fn origin_matrix_allows_public_and_refuses_hostile_targets_both_directions
     )
     .await
     .expect("loopback-resolving hostname passes over plain http");
+}
+
+/// LAW (W-F H1, SSRF downgrade fence — BOTH directions): once a fetch chain
+/// has STARTED from a PUBLIC host, a redirect whose target resolves to
+/// loopback/private/link-local is REFUSED (InvalidRequest) — an approved
+/// public fetch can never be bounced by a 302 onto `127.0.0.1:<port>` to
+/// reach an unapproved local service. A chain that started on LOOPBACK still
+/// redirects loopback→loopback (the mock-server path), and public→public is
+/// untouched.
+#[tokio::test]
+async fn public_chain_refuses_a_downgrade_redirect_to_non_public() {
+    // REFUSED: public → loopback (the SSRF the fence closes), IPv4 and IPv6.
+    for loopback in ["http://127.0.0.1:8080/service", "http://[::1]:9000/service"] {
+        let error = validate_with_origin(loopback, Vec::new(), true)
+            .await
+            .expect_err("public->loopback downgrade must be refused");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{loopback}");
+        assert!(error.message.contains("web_fetch"), "{loopback}: {error}");
+    }
+    // REFUSED: public → private (the whole non-public class, not just loopback).
+    let error = validate_with_origin(
+        "https://internal.example.com/",
+        vec![SocketAddr::from(([10, 0, 0, 8], 443))],
+        true,
+    )
+    .await
+    .expect_err("public->private downgrade must be refused");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+
+    // ALLOWED: loopback → loopback (the test mock-server path stays green).
+    validate_with_origin("http://127.0.0.1:8080/next", Vec::new(), false)
+        .await
+        .expect("loopback->loopback stays allowed");
+
+    // ALLOWED: public → public (the fence never touches a public hop).
+    validate_with_origin(
+        "https://example.com/next",
+        vec![SocketAddr::from(([93, 184, 216, 34], 443))],
+        true,
+    )
+    .await
+    .expect("public->public stays allowed");
 }
 
 /// LAW (LW6, html reduction): script/style/nav CONTENT is dropped, headings

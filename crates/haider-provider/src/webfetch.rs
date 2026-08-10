@@ -65,8 +65,14 @@ pub async fn fetch_public_url_with_resolver(
         .map_or(WEB_FETCH_OUTPUT_CAP_BYTES, |bytes| {
             bytes.min(WEB_FETCH_OUTPUT_CAP_BYTES)
         });
+    // H1 downgrade fence: once the chain's FIRST hop is a public host, no
+    // later hop may be redirected onto loopback/private/link-local. `None`
+    // until the origin is classified on hop 0.
+    let mut chain_started_public: Option<bool> = None;
     for _hop in 0..=WEB_FETCH_MAX_REDIRECTS {
-        let target = validate_fetch_target(&current, resolver.as_ref()).await?;
+        let forbid_downgrade = chain_started_public == Some(true);
+        let target = validate_fetch_target(&current, resolver.as_ref(), forbid_downgrade).await?;
+        chain_started_public.get_or_insert(target.is_public);
         let response = open_response(&current, &target).await?;
         if response.status().is_redirection() {
             let location = response
@@ -123,6 +129,10 @@ pub async fn fetch_public_url_with_resolver(
 pub(crate) struct ValidatedFetchTarget {
     host: String,
     pinned: Option<Vec<SocketAddr>>,
+    /// TRUE iff EVERY validated address for this hop is a public target.
+    /// The caller records the first hop's value as the chain origin and
+    /// forbids a later public→non-public downgrade (H1).
+    is_public: bool,
 }
 
 /// The strict-public origin fence, applied to EVERY hop (LW6):
@@ -132,10 +142,15 @@ pub(crate) struct ValidatedFetchTarget {
 ///   unspecified, broadcast, and 0/8 are refused under BOTH schemes;
 /// - userinfo never rides a fetch;
 /// - hostnames resolve first, EVERY answer must pass, and the answers are
-///   pinned onto the connection (DNS-rebinding defense).
+///   pinned onto the connection (DNS-rebinding defense);
+/// - H1 downgrade fence: when `forbid_public_downgrade` is set (the chain
+///   STARTED from a public host), a target that resolves to a non-public
+///   address (loopback/private/link-local) is REFUSED — an approved public
+///   fetch can never be bounced by a 302 onto `127.0.0.1:<port>`.
 pub(crate) async fn validate_fetch_target(
     url: &reqwest::Url,
     resolver: &dyn FixedDnsResolver,
+    forbid_public_downgrade: bool,
 ) -> Result<ValidatedFetchTarget, ProviderError> {
     let scheme = url.scheme();
     if scheme != "https" && scheme != "http" {
@@ -176,8 +191,10 @@ pub(crate) async fn validate_fetch_target(
             (answers.clone(), Some(answers))
         }
     };
+    let mut all_public = true;
     for address in &addresses {
         let ip = address.ip();
+        let public = !blocked_public_web_target(ip);
         if scheme == "https" {
             if blocked_public_web_target(ip) {
                 return Err(refused(format!(
@@ -189,8 +206,20 @@ pub(crate) async fn validate_fetch_target(
                 "web_fetch allows plain HTTP only to loopback, not {ip} for {url}"
             )));
         }
+        // H1 downgrade fence: a chain that started PUBLIC may not be redirected
+        // onto a loopback/private/link-local target (SSRF via 302).
+        if forbid_public_downgrade && !public {
+            return Err(refused(format!(
+                "web_fetch refuses redirect onto non-public target {ip} for {url}: a chain that started from a public host cannot be downgraded to loopback/private/link-local"
+            )));
+        }
+        all_public &= public;
     }
-    Ok(ValidatedFetchTarget { host, pinned })
+    Ok(ValidatedFetchTarget {
+        host,
+        pinned,
+        is_public: all_public,
+    })
 }
 
 async fn open_response(
