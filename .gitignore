@@ -8,3 +8,4 @@ scripts/run-journal/
 # Python bytecode from the PTY probe harness (scripts/tui-probes/probelib.py)
 __pycache__/
 *.pyc
+gate-logs/
