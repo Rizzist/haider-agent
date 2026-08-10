@@ -9,3 +9,4 @@ scripts/run-journal/
 __pycache__/
 *.pyc
 gate-logs/
+dist-*/
