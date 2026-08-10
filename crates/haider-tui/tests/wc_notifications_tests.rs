@@ -296,3 +296,80 @@ fn settings_persist_the_toggle_and_preserve_the_theme() {
         "theme preserved across the toggle write"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M10 — background-session terminal notification (route_raw, the real runtime
+// entry point for the event stream)
+// ---------------------------------------------------------------------------
+
+fn run_state_envelope(
+    session: &SessionId,
+    seq: u64,
+    state: RunState,
+) -> haider_protocol::envelope::RawEnvelope {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
+    use haider_protocol::ids::{DeviceId, EventId};
+    EventEnvelope {
+        schema_version: 1,
+        event_id: EventId::new(format!("evt-{seq}")),
+        seq,
+        session_id: session.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("dev"),
+        authority_epoch: 1,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(haider_protocol::EventPayload::RunState(state))
+            .expect("payload serializes"),
+    }
+}
+
+#[test]
+fn background_session_terminal_fires_a_desktop_notification() {
+    // M10: a turn in a BACKGROUND session (one not checked out on screen) still
+    // fires a desktop notification when it reaches a terminal state. `route_raw`
+    // is the real runtime's single entry point for the event stream; the
+    // attached reducer (`handle_envelope`) only ever evaluated the ACTIVE
+    // session, so a backgrounded turn's Done/Errored used to notify never.
+    use haider_tui::identity::UiGeneration;
+    use haider_tui::session::SessionState;
+
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    // A DIFFERENT session is attached, so the one under test is truly
+    // background. Focus starts unreported → the focus gate does not suppress.
+    model.active_session = Some(SessionId::new("attached"));
+    let bg = SessionId::new("bg-session");
+    let mut slot = SessionState::neutral(bg.clone(), UiGeneration::new(9));
+    slot.title = Some("nightly deploy".to_owned());
+    model.sessions.push(slot);
+
+    // The background turn reaches a terminal state.
+    model.route_raw(&run_state_envelope(&bg, 1, RunState::Done));
+    assert!(
+        model
+            .notifications
+            .iter()
+            .any(|line| line.contains("turn done")),
+        "a background terminal transition fires a notification: {:?}",
+        model.notifications
+    );
+    // Per-session edge: the SAME terminal state (a later envelope) does not
+    // re-notify — one ping per background turn.
+    model.route_raw(&run_state_envelope(&bg, 2, RunState::Done));
+    assert_eq!(
+        model.notifications.len(),
+        1,
+        "one notification per background turn: {:?}",
+        model.notifications
+    );
+}

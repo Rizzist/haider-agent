@@ -419,6 +419,49 @@ fn custom_command_model_override_reaches_the_turn() {
 }
 
 #[test]
+fn launcher_custom_command_model_override_precedes_create_session() {
+    // M9: on the LAUNCHER there is no session to select on yet — the next
+    // `CreateSession` mints one from the identity pair. The override must be
+    // applied to that pair BEFORE the create is queued, or the first turn runs
+    // on the stale default. (The old code only returned a note.)
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Launcher;
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned());
+    model.providers.apply_snapshot(
+        vec![provider_summary("openai", vec!["gpt-5.6".to_owned()])],
+        1,
+    );
+    // Sanity: the default pair is NOT the override before the command runs.
+    assert_ne!(model.identity.provider, "openai");
+    let mut command = custom("audit", "Audit $ARGUMENTS");
+    command.model = Some("gpt-5.6".to_owned());
+    model.set_custom_commands(vec![command], Vec::new());
+    run_line(&mut model, "/audit the crate");
+    // The new session is created...
+    assert!(
+        model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::CreateSession { .. })),
+        "a session is created: {:?}",
+        model.requests
+    );
+    // ...and CreateSession reads identity.provider/model_short, which the
+    // override set FIRST — so the first turn mints on gpt-5.6 · openai.
+    assert_eq!(
+        model.identity.provider, "openai",
+        "provider override applied before create"
+    );
+    assert_eq!(
+        model.identity.model_short, "gpt-5.6",
+        "model override applied before create"
+    );
+}
+
+#[test]
 fn custom_command_unknown_model_is_ignored_with_a_note() {
     let mut model = live_session_model();
     model

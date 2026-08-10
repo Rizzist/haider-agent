@@ -2942,6 +2942,11 @@ pub struct AppModel {
     /// W-C M2: the attached session's last-seen run state — the edge the
     /// notification fires on (one per turn, never mid-stream).
     pub notification_run_state: Option<RunState>,
+    /// W-C M10: per-BACKGROUND-session last-seen run state. The attached
+    /// reducer only ever evaluated the active session, so a backgrounded /
+    /// parked turn reaching Done/Errored used to notify never; this map gives
+    /// each non-active session its own notification edge tracker.
+    pub background_notification_states: std::collections::HashMap<SessionId, RunState>,
     /// W-C M2: pending notification lines the runtime drains and emits as
     /// OSC 9 (bounded, masked; the runtime gates emission on a tty).
     pub notifications: Vec<String>,
@@ -3183,6 +3188,7 @@ impl Default for AppModel {
             notifications_enabled: true,
             notification_commits: 0,
             notification_run_state: None,
+            background_notification_states: std::collections::HashMap::new(),
             notifications: Vec::new(),
             last_detached: None,
             next_ui_generation: UiGeneration::FIRST.get() + SEED_SESSION_COUNT,
@@ -4004,6 +4010,37 @@ impl AppModel {
             return;
         }
         let title = self.session_title.as_deref();
+        self.notifications
+            .push(crate::notify::notification_line(attention, title));
+    }
+
+    /// W-C M10: the desktop-notification edge for a BACKGROUND session (one not
+    /// checked out on screen). Same trigger set, toggle, and focus gate as the
+    /// attached path [`Self::note_run_state_for_notifications`], but keyed per
+    /// session so each backgrounded/parked turn's terminal or attention-park
+    /// transition is observed exactly once. `title` is the background session's
+    /// own title (masked downstream, like the attached line).
+    pub fn note_background_run_state_for_notifications(
+        &mut self,
+        session: &SessionId,
+        state: &RunState,
+        title: Option<&str>,
+    ) {
+        let previous = self
+            .background_notification_states
+            .insert(session.clone(), state.clone());
+        if previous.as_ref() == Some(state) {
+            return;
+        }
+        let Some(attention) = crate::notify::attention_for(state) else {
+            return;
+        };
+        if !self.notifications_enabled {
+            return;
+        }
+        if self.focus_reported && self.focused {
+            return;
+        }
         self.notifications
             .push(crate::notify::notification_line(attention, title));
     }
@@ -8739,10 +8776,23 @@ impl AppModel {
                     command.name
                 )
             }
-            None => format!(
-                "· /{} — model “{resolved_model}” applies once the session exists",
-                command.name
-            ),
+            None => {
+                // M9: the launcher has no attached session YET, but the very
+                // next `CreateSession` mints the session from the identity pair
+                // (live.rs reads `identity.provider`/`identity.model_short`).
+                // Set that pair NOW — exactly like the `/model` picker's
+                // launcher branch — so the FIRST turn uses the override instead
+                // of the stale default. (The old code only returned a note and
+                // the first turn ran on the old pair.)
+                self.identity.provider = provider.clone();
+                self.identity.model_short = resolved_model.clone();
+                self.identity_pinned = true;
+                self.refresh_context_window();
+                format!(
+                    "· /{} — model → {resolved_model} · {provider} (applies to the new session)",
+                    command.name
+                )
+            }
         }
     }
 
@@ -8916,6 +8966,27 @@ impl AppModel {
                 // the first paint after a spawn reads a clock already
                 // inside the journal's own time base, tick or no tick.
                 self.clock_ms = self.clock_ms.max(envelope.committed_at_ms);
+                // M10: a BACKGROUND session's terminal/park transition also
+                // warrants a desktop notification. The attached reducer
+                // (`handle_envelope`) only ever evaluated the ACTIVE session, so
+                // a backgrounded turn reaching Done/Errored used to notify
+                // never. The active session keeps its own edge tracker, so only
+                // NON-active sessions are evaluated here (no double-fire).
+                if self.active_session.as_ref() != Some(&envelope.session_id)
+                    && let Ok(EventPayload::RunState(state)) =
+                        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                {
+                    let title = self
+                        .sessions
+                        .iter()
+                        .find(|entry| entry.id == envelope.session_id)
+                        .and_then(|entry| entry.title.clone());
+                    self.note_background_run_state_for_notifications(
+                        &envelope.session_id,
+                        &state,
+                        title.as_deref(),
+                    );
+                }
             }
             RawOutcome::Gap { after_seq } => self.requests.push(AppRequest::Reattach {
                 session: envelope.session_id.clone(),
