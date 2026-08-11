@@ -1592,6 +1592,71 @@ async fn summaries_report_turns_and_tokens_for_unattached_sessions() {
     store.close().await.expect("store closes");
 }
 
+/// The roster carries a compact replace-by-head snapshot rebuilt from the
+/// sealed journal; tool lifecycle duplication does not inflate attempts.
+#[tokio::test]
+async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-agent-metrics");
+    let generation = store.worker_generation();
+    let run_id = RunId::new("metrics-run");
+    let tool = |status| haider_protocol::item::TurnItem::ToolCall {
+        call_id: "tool-call".into(),
+        name: "fs_read".into(),
+        args: serde_json::json!({}),
+        status,
+    };
+    let mut started = envelope(&session_id, "metrics-started", generation);
+    started.run_id = Some(run_id.clone());
+    started.committed_at_ms = 100;
+    started.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("run state");
+    let mut tool_started = envelope(&session_id, "metrics-tool-started", generation);
+    tool_started.run_id = Some(run_id.clone());
+    tool_started.committed_at_ms = 200;
+    tool_started.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Started {
+        item_id: ItemId::new("tool-item"),
+        item: tool(haider_protocol::item::ToolStatus::InProgress),
+    }))
+    .expect("tool started");
+    let mut tool_completed = envelope(&session_id, "metrics-tool-completed", generation);
+    tool_completed.run_id = Some(run_id.clone());
+    tool_completed.committed_at_ms = 300;
+    tool_completed.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("tool-item"),
+        item: tool(haider_protocol::item::ToolStatus::Completed),
+    }))
+    .expect("tool completed");
+    let mut done = envelope(&session_id, "metrics-done", generation);
+    done.run_id = Some(run_id);
+    done.committed_at_ms = 400;
+    done.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("done state");
+    hub.append(&mut [started, tool_started, tool_completed, done])
+        .await
+        .expect("metrics journal");
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("metrics summary");
+    let snapshot = summary.agent_metrics.expect("compact metrics");
+    assert_eq!(snapshot.head_seq, summary.head_seq);
+    assert!(snapshot.started_at_ms > 0);
+    assert!(
+        snapshot
+            .terminal_at_ms
+            .is_some_and(|terminal| terminal >= snapshot.started_at_ms)
+    );
+    assert!(!snapshot.live);
+    assert_eq!(snapshot.tool_attempts, 1);
+    assert!(snapshot.usage.is_none(), "no usage fact stays unknown");
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// Zero-honesty law: zero turns/tokens appear EXCLUSIVELY for truly empty
 /// sessions (no committed user turn, no durable snapshot — zero is then
 /// exact truth). A session WITH committed turns but no snapshot reports

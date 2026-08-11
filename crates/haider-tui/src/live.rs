@@ -3337,7 +3337,12 @@ impl LiveDriver {
                 vec![LiveCommand::HooksList { cwd }]
             }
             // U2: a read — never outboxed (the hooks.list discipline).
-            AppRequest::UsageRefresh => vec![LiveCommand::UsageReport],
+            AppRequest::UsageRefresh => vec![
+                // Refresh direct/root agent snapshots through the additive
+                // SessionSummary field at the same time as account totals.
+                LiveCommand::List { cursor: None },
+                LiveCommand::UsageReport,
+            ],
             AppRequest::HooksTrust { digest, trusted } => {
                 let command_id = self.mint();
                 self.pending_hook_trust = Some((command_id.clone(), digest.clone()));

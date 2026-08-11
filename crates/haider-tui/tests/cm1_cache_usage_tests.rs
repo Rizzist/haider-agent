@@ -200,14 +200,14 @@ fn part_a_unknown_auth_is_unknown_price_not_a_subscription_plan() {
     assert!(!plain.contains(" · plan"), "{plain}");
 }
 
-/// LAW (Part A): OAuth lanes retain tokens/cache/hit-rate but contribute no
-/// dollar estimate. A mixed session renders only the API-key subtotal and
-/// labels it as the metered portion.
+/// LAW (Part A): OAuth lanes retain tokens/cache/hit-rate and carry a clearly
+/// labeled API-rate equivalent. A mixed session keeps that equivalent
+/// separate from the real API-key subtotal.
 ///
 /// MUTATION CHECK (executed): classify `oauth_subscription` as API-key in
-/// `scope_auth_method`; the exact subtotal and no-dollar plan lane fail.
+/// `scope_auth_method`; the separate real/equivalent ledgers fail.
 #[test]
-fn part_a_mixed_session_displays_only_metered_lane_cost() {
+fn part_a_mixed_session_separates_metered_and_all_lane_api_rate() {
     let priced = |run: &str, epoch: &str, auth: &str, cost: f64| {
         let mut value = usage(
             run,
@@ -246,5 +246,47 @@ fn part_a_mixed_session_displays_only_metered_lane_cost() {
     assert!(plain.contains("$0.2500"), "{plain}");
     assert!(plain.contains("metered lanes"), "{plain}");
     assert!(plain.contains("plan"), "{plain}");
-    assert!(!plain.contains("$9.9900"), "{plain}");
+    assert!(plain.contains("≈$10.2400/$20.4800 API rate"), "{plain}");
+    assert!(plain.contains("≈$9.9900/$19.9800 API rate"), "{plain}");
+    assert!(!plain.contains("input $10.2400"), "{plain}");
+}
+
+#[test]
+fn part_a_mixed_unpriced_oauth_lane_keeps_labeled_unknown_all_lane_rate() {
+    let mut api = usage(
+        "api-known",
+        "openai",
+        UsageRequestKind::MainTurn,
+        present(200, 800, 10),
+    );
+    api.scope.as_mut().expect("api scope").auth_scope = "api_key".into();
+    api.cache_cost = Some(haider_protocol::provider::CacheCostEstimate {
+        input_with_cache_usd: 0.25,
+        input_without_cache_usd: 0.50,
+        estimated_savings_usd: 0.25,
+        explicit_storage_usd: 0.0,
+    });
+    let mut oauth = usage(
+        "oauth-unknown",
+        "unknown-provider",
+        UsageRequestKind::DelegatedAgent,
+        present(200, 800, 10),
+    );
+    let scope = oauth.scope.as_mut().expect("oauth scope");
+    scope.auth_scope = "oauth_subscription".into();
+    scope.model = "unknown-model".into();
+
+    let mut model = AppModel::new();
+    model.screen = Screen::Usage;
+    model.cache_usage.note(&api);
+    model.cache_usage.note(&oauth);
+    let rich = draw(&model, 180);
+    assert!(rich.contains("$0.2500"), "{rich}");
+    assert!(rich.contains("$— API rate (all lanes)"), "{rich}");
+    assert!(rich.contains("plan · input $— API rate"), "{rich}");
+
+    let plain =
+        render_plain_with_cache(&SessionProjection::new(), 200_000, None, &model.cache_usage);
+    assert!(plain.contains("$— API rate (all lanes)"), "{plain}");
+    assert!(plain.contains("plan · input $— API rate"), "{plain}");
 }

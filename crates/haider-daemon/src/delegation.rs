@@ -15,6 +15,7 @@
 //! without the result paired to the call that created the child.
 
 use crate::session_hub::SessionHub;
+use crate::usage_report::SessionFolder;
 use haider_core::{
     AcceptedTurn, CancelToken, DeferredTicket, DeferredToolResult, DelegationCreateOutcome,
     DelegationRecord, DelegationState, SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand,
@@ -32,7 +33,7 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{AgentId, BranchId, EventId, ItemId, LeaseId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session::SessionMetadataV1;
-use haider_protocol::state::RunState;
+use haider_protocol::state::{RunState, SessionState};
 use haider_tools::{MessageSubagent, SpawnSubagent};
 use rustix::fs::{Mode, OFlags};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -371,7 +372,9 @@ impl DelegationHandle {
                 })?;
             self.mirror_child_chip_states(&record, &mut chip_mirror)
                 .await?;
-            if let Some(report) = record.report {
+            if let Some(report) = record.report.clone() {
+                self.mirror_until_child_terminal(&record, &mut chip_mirror)
+                    .await?;
                 let chip = if report.verified == ReportVerification::Red {
                     ChipState::Error
                 } else {
@@ -384,6 +387,8 @@ impl DelegationHandle {
                 });
             }
             if let Some(completion) = self.derive_terminal_report(&record).await? {
+                self.mirror_until_child_terminal(&record, &mut chip_mirror)
+                    .await?;
                 let stored = self
                     .hub
                     .record_delegation_report(record.agent_id.clone(), completion.report)
@@ -422,6 +427,7 @@ impl DelegationHandle {
                 biased;
                 () = cancel.cancelled() => {
                     self.cancel_subtree(&record, CancelCause::Parent).await?;
+                    self.mirror_until_child_terminal(&record, &mut chip_mirror).await?;
                     return Err(HaiderError::new(
                         ErrorCode::RunNotActive,
                         "parent cancelled while waiting for local child",
@@ -444,7 +450,30 @@ impl DelegationHandle {
         let Some(record) = self.hub.delegation(ticket.manifest.agent.clone()).await? else {
             return Ok(());
         };
-        self.cancel_subtree(&record, CancelCause::Parent).await
+        self.cancel_subtree(&record, CancelCause::Parent).await?;
+        // This cleanup hook runs inside parent terminalization, so waiting for
+        // the child here would deadlock the cancellation handoff. The active
+        // collector normally performs the flush; this detached rebuild is the
+        // durable fallback when cancellation drops that collector first.
+        let coordinator = self.clone();
+        let ticket = ticket.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut mirror = coordinator.load_chip_mirror(&ticket).await?;
+                coordinator
+                    .mirror_until_child_terminal(&record, &mut mirror)
+                    .await
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    agent = %record.agent_id,
+                    ?error,
+                    "terminal child metrics flush failed"
+                );
+            }
+        });
+        Ok(())
     }
 
     pub(crate) async fn agent_for_session(
@@ -1207,6 +1236,10 @@ impl DelegationHandle {
                         .event_id
                         .as_str()
                         .starts_with(&format!("delegation-prompt-{}-", record.agent_id.as_str()))
+                    || envelope
+                        .event_id
+                        .as_str()
+                        .starts_with(&format!("delegation-metrics-{}-", record.agent_id.as_str()))
                 {
                     projected_events.insert(envelope.event_id.as_str().to_owned());
                 }
@@ -1223,10 +1256,17 @@ impl DelegationHandle {
                 }
             }
         }
+        let initial_model = self
+            .hub
+            .session_metadata(&record.child_session_id)
+            .await?
+            .map_or_else(String::new, |metadata| metadata.model);
         Ok(ChipMirror {
             child_cursor: 0,
             projected_events,
             last_chip,
+            metrics_folder: SessionFolder::new(&initial_model),
+            terminal_idle_seen: false,
         })
     }
 
@@ -1246,16 +1286,24 @@ impl DelegationHandle {
             let next_cursor = page
                 .last()
                 .map_or(mirror.child_cursor, |envelope| envelope.seq);
+            let page_causation = page.last().map(|envelope| envelope.event_id.clone());
             let mut projections = Vec::new();
             for envelope in page {
-                if envelope.run_id.as_ref() != Some(&record.child_run_id) {
-                    continue;
-                }
+                mirror.metrics_folder.push(&envelope);
                 let Ok(payload) =
                     serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
                 else {
                     continue;
                 };
+                if matches!(
+                    &payload,
+                    haider_protocol::EventPayload::SessionState(SessionState::Idle { .. })
+                ) {
+                    mirror.terminal_idle_seen = true;
+                }
+                if envelope.run_id.as_ref() != Some(&record.child_run_id) {
+                    continue;
+                }
                 if let haider_protocol::EventPayload::UserMessage { text, .. } = payload {
                     let event_id = format!(
                         "delegation-prompt-{}-{}",
@@ -1303,10 +1351,57 @@ impl DelegationHandle {
                 mirror.projected_events.insert(event_id);
                 mirror.last_chip = Some(chip);
             }
+            let metrics_event_id = format!(
+                "delegation-metrics-{}-{next_cursor}",
+                record.agent_id.as_str()
+            );
+            if !mirror.projected_events.contains(&metrics_event_id)
+                && let Some(snapshot) = mirror.metrics_folder.agent_snapshot(
+                    &record.child_session_id,
+                    Some(&record.agent_id),
+                    next_cursor,
+                )
+                && let Some(causation_id) = page_causation
+            {
+                projections.push(metrics_projection_envelope(
+                    record,
+                    &metrics_event_id,
+                    causation_id,
+                    snapshot,
+                    self.hub.device_id(),
+                    self.hub.worker_generation(),
+                )?);
+                mirror.projected_events.insert(metrics_event_id);
+            }
             if !projections.is_empty() {
                 self.hub.append(&mut projections).await?;
             }
             mirror.child_cursor = next_cursor;
+        }
+    }
+
+    /// Keep folding through the terminal run state and the following durable
+    /// session-idle fence, then publish the settled snapshot at that head.
+    async fn mirror_until_child_terminal(
+        &self,
+        record: &DelegationRecord,
+        mirror: &mut ChipMirror,
+    ) -> Result<(), HaiderError> {
+        loop {
+            self.mirror_child_chip_states(record, mirror).await?;
+            if mirror.terminal_idle_seen
+                && mirror
+                    .metrics_folder
+                    .agent_snapshot(
+                        &record.child_session_id,
+                        Some(&record.agent_id),
+                        mirror.child_cursor,
+                    )
+                    .is_some_and(|snapshot| !snapshot.live)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(CHILD_POLL_INTERVAL).await;
         }
     }
 
@@ -1454,6 +1549,8 @@ struct ChipMirror {
     child_cursor: u64,
     projected_events: HashSet<String>,
     last_chip: Option<ChipState>,
+    metrics_folder: SessionFolder,
+    terminal_idle_seen: bool,
 }
 
 struct ChildSessionSnapshot {
@@ -1527,6 +1624,40 @@ pub(crate) fn chip_projection_envelope(
         chip,
     })
     .map_err(internal_serialization)?;
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: record.parent_session_id.clone(),
+        branch_id: record.parent_branch_id.clone(),
+        run_id: Some(record.parent_run_id.clone()),
+        agent_id: record.parent_agent_id.clone(),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: Some(causation_id),
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    })
+}
+
+pub(crate) fn metrics_projection_envelope(
+    record: &DelegationRecord,
+    event_id: &str,
+    causation_id: EventId,
+    snapshot: haider_protocol::agent::AgentMetricsSnapshot,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    let payload = snapshot
+        .to_payload_value()
+        .map_err(internal_serialization)?;
     Ok(EventEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id: EventId::new(event_id),

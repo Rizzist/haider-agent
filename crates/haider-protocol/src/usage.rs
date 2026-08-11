@@ -92,6 +92,10 @@ pub struct LocalUsageStatsV1 {
     /// model matched. Never a bill — an estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub est_cost_usd: Option<f64>,
+    /// Hypothetical API-rate equivalent across all known-auth lanes. Kept
+    /// separate from `est_cost_usd`, which remains real API-key spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_est_cost_usd: Option<f64>,
     /// Lines added/removed summed from completed fs tool receipts.
     #[serde(default)]
     pub lines_added: u64,
@@ -115,9 +119,8 @@ pub struct CacheUsageStatsV1 {
     pub billed_output_tokens: u64,
     /// Logical input backed by a provider-reported cache split.
     pub telemetry_covered_input_tokens: u64,
-    /// Logical input attributed to API-key (pay-as-you-go) lanes. Dollar
-    /// estimates cover only these tokens; OAuth/subscription lanes are plan
-    /// covered and intentionally never receive API-equivalent dollar values.
+    /// Logical input attributed to API-key (pay-as-you-go) lanes. The legacy
+    /// cost fields below remain the real metered subtotal.
     #[serde(default)]
     pub metered_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +129,13 @@ pub struct CacheUsageStatsV1 {
     pub input_without_cache_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_savings_usd: Option<f64>,
+    /// Separately carried API-rate equivalents across every known-auth lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_input_with_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_input_without_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_estimated_savings_usd: Option<f64>,
     #[serde(default)]
     pub breakdowns: Vec<CacheUsageBreakdownV1>,
 }
@@ -145,6 +155,9 @@ impl CacheUsageStatsV1 {
             && self.input_with_cache_usd.is_none()
             && self.input_without_cache_usd.is_none()
             && self.estimated_savings_usd.is_none()
+            && self.api_equivalent_input_with_cache_usd.is_none()
+            && self.api_equivalent_input_without_cache_usd.is_none()
+            && self.api_equivalent_estimated_savings_usd.is_none()
             && self.breakdowns.is_empty()
     }
 }
@@ -177,4 +190,10 @@ pub struct CacheUsageBreakdownV1 {
     pub input_without_cache_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_savings_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_input_with_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_input_without_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_estimated_savings_usd: Option<f64>,
 }

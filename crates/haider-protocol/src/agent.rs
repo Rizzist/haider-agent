@@ -2,7 +2,9 @@
 //! same object local or remote; placement is a manifest field. Callsigns are
 //! display identity ONLY — the wire keys everything by opaque id.
 
-use crate::ids::{AgentId, DeviceId, LeaseId, RunId, WorkspaceRevision};
+use crate::credential::AuthMethod;
+use crate::ids::{AgentId, DeviceId, LeaseId, RunId, SessionId, WorkspaceRevision};
+use crate::provider::UsageRequestKind;
 use crate::state::RunState;
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +127,82 @@ pub struct AgentMessaged {
     pub delivery: AgentMessageDelivery,
 }
 
+/// Compact direct/exclusive metrics for one agent session at a committed
+/// journal head. This is a replace-by-`head_seq` projection: consumers never
+/// add snapshots together for the same agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMetricsSnapshot {
+    /// `None` names the root/head agent; delegated sessions carry their
+    /// durable opaque agent id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+    pub session_id: SessionId,
+    /// Greatest child-session sequence included in this snapshot.
+    pub head_seq: u64,
+    pub started_at_ms: u64,
+    /// The committed terminal instant. Absent while the totals are partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_at_ms: Option<u64>,
+    pub live: bool,
+    /// Attempted model tool calls, unique by durable item id.
+    pub tool_attempts: u64,
+    /// Absent means no durable usage truth, not zero usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentUsageMetrics>,
+}
+
+/// Normalized direct usage and separately-accounted real/API-equivalent
+/// costs. Cached reads are already included in `logical_input_tokens`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentUsageMetrics {
+    pub logical_input_tokens: u64,
+    pub billed_output_tokens: u64,
+    /// Reasoning detail billed in addition to provider-reported output.
+    pub additional_reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// Present only when the complete logical-input fold has authoritative
+    /// cache coverage. 10_000 basis points is 100.00%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_basis_points: Option<u32>,
+    /// Real pay-as-you-go spend over API-key lanes only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metered_cost_microusd: Option<u64>,
+    /// Hypothetical API-rate equivalent over every known-auth lane. Never
+    /// merged into `metered_cost_microusd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_cost_microusd: Option<u64>,
+    /// False when any lane has unknown auth or no matching price.
+    pub all_lanes_priced: bool,
+    pub has_metered_lanes: bool,
+    pub has_oauth_lanes: bool,
+    #[serde(default)]
+    pub breakdowns: Vec<AgentUsageBreakdown>,
+}
+
+/// Provider/model/cache-epoch/request-lane detail for an agent snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentUsageBreakdown {
+    pub provider: String,
+    pub model: String,
+    pub cache_epoch: String,
+    #[serde(default)]
+    pub request_kind: UsageRequestKind,
+    /// Absent is legacy/unknown auth and therefore never rendered as plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<AuthMethod>,
+    pub logical_input_tokens: u64,
+    pub billed_output_tokens: u64,
+    pub additional_reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metered_cost_microusd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_equivalent_cost_microusd: Option<u64>,
+    pub priced: bool,
+}
+
 /// Additive agent-event union kept separate from [`crate::EventPayload`] so
 /// existing exhaustive consumers stay source-compatible. Raw-envelope
 /// readers preserve this newer event kind for S3 timeline rendering.
@@ -132,6 +210,7 @@ pub struct AgentMessaged {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEventPayload {
     AgentMessaged(AgentMessaged),
+    AgentMetrics(AgentMetricsSnapshot),
 }
 
 impl AgentMessaged {
@@ -143,6 +222,21 @@ impl AgentMessaged {
     pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
         match serde_json::from_value::<AgentEventPayload>(value.clone()).ok()? {
             AgentEventPayload::AgentMessaged(messaged) => Some(messaged),
+            AgentEventPayload::AgentMetrics(_) => None,
+        }
+    }
+}
+
+impl AgentMetricsSnapshot {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(AgentEventPayload::AgentMetrics(self.clone()))
+    }
+
+    #[must_use]
+    pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
+        match serde_json::from_value::<AgentEventPayload>(value.clone()).ok()? {
+            AgentEventPayload::AgentMetrics(metrics) => Some(metrics),
+            AgentEventPayload::AgentMessaged(_) => None,
         }
     }
 }

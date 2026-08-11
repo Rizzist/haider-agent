@@ -105,6 +105,39 @@ async fn session_summary_truth(
     Ok((turns, latest))
 }
 
+/// Compact direct-agent metrics from the same sealed journal head carried by
+/// `SessionSummary`. The live child path publishes the identical shape into
+/// the parent journal; this summary copy is the cold/reconnect and `/usage`
+/// main-agent fallback.
+async fn session_agent_metrics_truth(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    through_seq: u64,
+    initial_model: &str,
+) -> Result<Option<haider_protocol::agent::AgentMetricsSnapshot>, HaiderError> {
+    let mut folder = crate::usage_report::SessionFolder::new(initial_model);
+    let mut since_seq = 0;
+    while since_seq < through_seq {
+        let page = store.read(session_id, since_seq, REPLAY_PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        let mut advanced = false;
+        for envelope in page {
+            if envelope.seq > through_seq {
+                return Ok(folder.primary_agent_snapshot(session_id, through_seq));
+            }
+            since_seq = envelope.seq;
+            advanced = true;
+            folder.push(&envelope);
+        }
+        if !advanced {
+            break;
+        }
+    }
+    Ok(folder.primary_agent_snapshot(session_id, through_seq))
+}
+
 /// Projects one replayed truth into the summary's additive wire fields.
 ///
 /// Zero-honesty law: `Some(0)` tokens are reported EXCLUSIVELY for truly
@@ -3377,6 +3410,7 @@ impl HubConnection {
                 changed_fields: warning.changed_fields.clone(),
                 invalidated_stable_tokens: warning.invalidated_stable_tokens,
                 rewarm_cost_microusd: warning.rewarm_cost_microusd,
+                rewarm_api_equivalent_cost_microusd: warning.rewarm_api_equivalent_cost_microusd,
                 rewarm_base_input_equivalent_tokens: warning.rewarm_base_input_equivalent_tokens,
                 policy: policy.to_owned(),
             }),
@@ -4221,6 +4255,7 @@ impl HubConnection {
         let mut sessions = Vec::with_capacity(selected.len());
         for session_id in &selected {
             let head_seq = self.hub.inner.store.latest_seq(session_id).await?;
+            let metadata = self.hub.inner.store.session_metadata(session_id).await?;
             // Roster truth for unattached sessions: replay the same sealed
             // journal the observe surface reads. The launcher must never
             // show "0 turns · 0 tok" for a session that merely lacks an
@@ -4229,7 +4264,16 @@ impl HubConnection {
                 session_summary_truth(&self.hub.inner.store, session_id, head_seq).await?;
             let (footprint_tokens, footprint_truth) =
                 summary_footprint_fields(turns, footprint.as_ref());
-            let metadata = self.hub.inner.store.session_metadata(session_id).await?;
+            let initial_model = metadata
+                .as_ref()
+                .map_or("", |metadata| metadata.model.as_str());
+            let agent_metrics = session_agent_metrics_truth(
+                &self.hub.inner.store,
+                session_id,
+                head_seq,
+                initial_model,
+            )
+            .await?;
             // G2: the committed title rides the summary top-level so
             // rosters name rows without decoding metadata.
             let title = metadata
@@ -4244,6 +4288,7 @@ impl HubConnection {
                 footprint_tokens,
                 footprint_truth,
                 title,
+                agent_metrics,
             });
         }
         let next_cursor = has_more

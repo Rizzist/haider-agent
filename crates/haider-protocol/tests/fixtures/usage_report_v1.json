@@ -28,6 +28,7 @@
         "output_tokens": 9500,
         "reasoning_tokens": 2000,
         "cached_tokens": 80000,
+        "api_equivalent_est_cost_usd": 0.42,
         "lines_added": 240,
         "lines_removed": 60
       }
@@ -48,6 +49,7 @@
         "reasoning_tokens": 0,
         "cached_tokens": 0,
         "est_cost_usd": 0.08,
+        "api_equivalent_est_cost_usd": 0.08,
         "lines_added": 12,
         "lines_removed": 4
       }

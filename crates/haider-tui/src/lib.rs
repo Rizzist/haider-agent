@@ -5,6 +5,7 @@
 //! reads [`theme::Theme`] tokens and [`format`] helpers so the four themes
 //! stay one identity. Tests live in `tests/` — never inline (workspace rule).
 
+pub mod agent_metrics;
 pub mod app;
 pub mod boot;
 pub mod branch;

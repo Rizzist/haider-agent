@@ -1,6 +1,6 @@
 # Per-subagent metrics view — proposal (elapsed · tools · tokens · cost)
 
-> gpt-5.6 Sol read-only research, 2026-08-11. No-code proposal. Sequenced AFTER parallel tool calls. Cost is cache-aware (CM1) and — per owner — gated on metered/API-key auth (OAuth/subscription accounts omit $).
+> gpt-5.6 Sol read-only research, 2026-08-11. No-code proposal. Sequenced AFTER parallel tool calls. Cost is cache-aware (CM1). Owner reversal recorded in §8: OAuth/subscription lanes now show a clearly labeled hypothetical API-rate equivalent, kept separate from real metered spend.
 
 # Recommended first slice
 
@@ -188,29 +188,32 @@ Delegated spawning has an additional current constraint: its coordinator explici
 
 5. **Polish and compatibility — small.** Preserve the old S4 elapsed/token row when connected to an older daemon with no metrics snapshot; add wide/narrow rendering laws, unknown-price cases, mixed-price subtree cases, replay idempotency, live-to-settled transitions, failures/cancellation, and parallel N-call batches.
 
-No files were modified and no builds were run.
+## 8. OAuth / subscription auth — owner reversal: show labeled API equivalent
 
-## 8. OAuth / subscription auth — omit $ (owner requirement)
+The earlier omit-dollar rule shipped in v0.0.901 is superseded. OAuth /
+subscription accounts remain plan-covered, but the API-rate equivalent is
+useful because it shows the value delivered by the plan. It must therefore be
+visible as a clearly hypothetical, separately carried figure.
 
-Per-token `$` is only meaningful for **metered / API-key** accounts. OAuth /
-subscription accounts (Claude Pro/Max, ChatGPT Plus, Kimi Code Plan, Codex)
-pay a flat plan, so a per-token dollar figure priced at the pay-as-you-go API
-rate is misleading — the marginal cost is plan-covered.
+Pinned grammar:
 
-Rule: **gate the `$` on auth-method = ApiKey.** For an OAuth/subscription lane
-show `elapsed · tools · tokens` and omit the dollar segment (optionally a quiet
-`· plan` marker). This is the same "don't render a misleading number"
-discipline CM1 already applies for missing telemetry (`n/a`) and unknown price
-(`$—`) — an OAuth lane is not "unknown price", it is "not metered".
+- Metered/API-key lane: `est $4.12` — real estimated spend.
+- OAuth/subscription lane: `plan · ≈$4.12 API rate` — `≈` and `API rate`
+  make the hypothetical status explicit. Never render a bare unlabeled `$` for
+  an OAuth lane.
+- Mixed totals: keep `est $0.57 (metered lanes)` for real spend and add
+  `≈$4.69 API rate (all lanes)`. Never add the real subtotal to the
+  hypothetical equivalent or expose one merged unlabeled number.
+- Cache-change warnings use `re-warm ≈$0.23 API rate (plan)` for OAuth.
+- Unknown price remains `$—`; unknown auth is unknown-price, not plan; missing
+  telemetry remains `n/a`.
 
-Mechanism: `UsageScope` already carries `auth_scope`; the per-(run,agent) fold
-should also carry the credential's `AuthMethod` per lane. Aggregation: a subtree
-that mixes metered and OAuth lanes shows `$` for the metered portion only and
-labels it partial (e.g. `$0.27 (metered lanes)`), or omits `$` entirely if the
-head agent is OAuth — pick one rule and pin it. Tokens/tools/elapsed always show
-regardless of auth.
+Mechanism: preserve `UsageScope.auth_scope` / `AuthMethod` per lane and carry
+two independent cost families through the fold: real metered spend and the
+all-lane API-rate equivalent. The equivalent includes priced API-key and OAuth
+lanes so mixed totals describe the same complete token set, but it is never
+merged into the real-spend field. Tokens/tools/elapsed remain auth-independent.
 
-Applies to BOTH the new per-subagent view AND the already-shipped CM1 `/usage`
-cost display — verify whether `/usage` currently gates cost on auth; if not, the
-same OAuth-omit-$ fix belongs there (small follow-up), so we never show an
-API-equivalent dollar cost for a subscription session.
+This applies to the per-agent snapshot, S4 rows, detail and `/usage`, the
+existing CM1 cache display (rich and plain), device totals, and CM3 cache-change
+warnings.

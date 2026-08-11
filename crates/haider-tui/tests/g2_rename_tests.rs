@@ -45,6 +45,7 @@ fn summary(
         footprint_tokens: None,
         footprint_truth: None,
         title: title.map(str::to_owned),
+        agent_metrics: None,
     }
 }
 

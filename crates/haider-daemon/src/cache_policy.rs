@@ -13,6 +13,7 @@ pub(crate) struct CacheChangeWarning {
     pub changed_fields: Vec<String>,
     pub invalidated_stable_tokens: u64,
     pub rewarm_cost_microusd: Option<u64>,
+    pub rewarm_api_equivalent_cost_microusd: Option<u64>,
     pub rewarm_base_input_equivalent_tokens: Option<u64>,
     pub policy: CachePolicyMode,
     pub confirmation_required: bool,
@@ -21,16 +22,13 @@ pub(crate) struct CacheChangeWarning {
 impl CacheChangeWarning {
     pub(crate) fn message(&self) -> String {
         let fields = self.changed_fields.join(", ");
-        let cost = self.rewarm_cost_microusd.map_or_else(
-            || {
-                if self.rewarm_base_input_equivalent_tokens.is_some() {
-                    "plan".to_owned()
-                } else {
-                    "$—".to_owned()
-                }
-            },
-            |microusd| format!("${:.4}", microusd as f64 / 1_000_000.0),
-        );
+        let cost = if let Some(microusd) = self.rewarm_cost_microusd {
+            format!("${:.4}", microusd as f64 / 1_000_000.0)
+        } else if let Some(microusd) = self.rewarm_api_equivalent_cost_microusd {
+            format!("≈${:.4} API rate (plan)", microusd as f64 / 1_000_000.0)
+        } else {
+            "$—".to_owned()
+        };
         format!(
             "cache epoch change: {fields}; {} stable-prefix tokens invalidated; estimated next-turn re-warm {cost}; repeat the same selection to confirm a new epoch",
             self.invalidated_stable_tokens
@@ -64,6 +62,10 @@ pub(crate) fn combine_cache_change_warnings(
         combined.rewarm_cost_microusd = combined
             .rewarm_cost_microusd
             .zip(warning.rewarm_cost_microusd)
+            .map(|(left, right)| left.saturating_add(right));
+        combined.rewarm_api_equivalent_cost_microusd = combined
+            .rewarm_api_equivalent_cost_microusd
+            .zip(warning.rewarm_api_equivalent_cost_microusd)
             .map(|(left, right)| left.saturating_add(right));
         combined.rewarm_base_input_equivalent_tokens = combined
             .rewarm_base_input_equivalent_tokens
@@ -119,8 +121,14 @@ pub(crate) fn assess_cache_change(
             .round()
             .min(u64::MAX as f64) as u64
     });
-    let api_key = target_auth_scope.unwrap_or(&scope.auth_scope) == "api_key";
+    let target_auth_scope = target_auth_scope.unwrap_or(&scope.auth_scope);
+    let api_key = target_auth_scope == "api_key";
+    let known_auth = matches!(
+        target_auth_scope,
+        "api_key" | "oauth" | "oauth_subscription"
+    );
     let display_microusd = api_key.then_some(estimated_microusd).flatten();
+    let api_equivalent_microusd = known_auth.then_some(estimated_microusd).flatten();
     let settings = metadata.cache_policy;
     let confirmation_required = tuning_change
         || match settings.mode {
@@ -134,6 +142,7 @@ pub(crate) fn assess_cache_change(
         changed_fields,
         invalidated_stable_tokens: stable,
         rewarm_cost_microusd: display_microusd,
+        rewarm_api_equivalent_cost_microusd: api_equivalent_microusd,
         rewarm_base_input_equivalent_tokens: equivalent_tokens,
         policy: settings.mode,
         confirmation_required,

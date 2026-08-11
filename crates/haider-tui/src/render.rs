@@ -2070,9 +2070,25 @@ fn render_usage(
                 let qualifier = (cache.metered_input_tokens < cache.logical_input_tokens)
                     .then_some(" · metered lanes only")
                     .unwrap_or("");
+                let equivalent = if cache.breakdowns.iter().any(|breakdown| {
+                    breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
+                }) {
+                    match (
+                        cache.api_equivalent_input_with_cache_usd,
+                        cache.api_equivalent_input_without_cache_usd,
+                        cache.api_equivalent_estimated_savings_usd,
+                    ) {
+                        (Some(api_with), Some(api_without), Some(api_savings)) => format!(
+                            " · ≈${api_with:.4}/${api_without:.4} API rate (all lanes) · ≈${api_savings:.4} savings"
+                        ),
+                        _ => " · $— API rate (all lanes)".to_owned(),
+                    }
+                } else {
+                    String::new()
+                };
                 lines.push(Line::styled(
                     format!(
-                        "    input cost — ${with:.4} with caching · ${without:.4} without · ${savings:.4} estimated savings{qualifier}"
+                        "    input cost — ${with:.4} with caching · ${without:.4} without · ${savings:.4} estimated savings{qualifier}{equivalent}"
                     ),
                     theme.dim_style(),
                 ));
@@ -2082,7 +2098,17 @@ fn render_usage(
                     breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
                 }) =>
             {
-                lines.push(Line::styled("    input cost — plan", theme.dim_style()));
+                let equivalent = match (
+                    cache.api_equivalent_input_with_cache_usd,
+                    cache.api_equivalent_input_without_cache_usd,
+                    cache.api_equivalent_estimated_savings_usd,
+                ) {
+                    (Some(with), Some(without), Some(savings)) => format!(
+                        "    input cost — plan · ≈${with:.4}/${without:.4} API rate · ≈${savings:.4} savings"
+                    ),
+                    _ => "    input cost — plan · $— API rate".to_owned(),
+                };
+                lines.push(Line::styled(equivalent, theme.dim_style()));
             }
             _ => lines.push(Line::styled(
                 "    input cost — $— · without caching $— · savings $—",
@@ -2138,7 +2164,16 @@ fn render_usage(
                 _ if breakdown.auth_method
                     == Some(haider_protocol::credential::AuthMethod::OAuth) =>
                 {
-                    " · plan".to_owned()
+                    match (
+                        breakdown.api_equivalent_input_with_cache_usd,
+                        breakdown.api_equivalent_input_without_cache_usd,
+                        breakdown.api_equivalent_estimated_savings_usd,
+                    ) {
+                        (Some(with), Some(without), Some(savings)) => format!(
+                            " · plan · ≈${with:.4}/${without:.4} API rate · save ≈${savings:.4}"
+                        ),
+                        _ => " · plan · input $— API rate".to_owned(),
+                    }
                 }
                 _ => " · input $—".to_owned(),
             };
@@ -2157,6 +2192,89 @@ fn render_usage(
                     theme.dim_style()
                 },
             ));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // Direct/exclusive daemon snapshots. This block is independent of cache
+    // telemetry and account-report availability: a tool-only agent is still
+    // real work, while absent usage remains `n/a` rather than zero.
+    let main_metrics = model.main_agent_metrics();
+    let child_metrics = model
+        .chips
+        .iter()
+        .map(|chip| (chip, model.chip_metrics(chip)))
+        .collect::<Vec<_>>();
+    if main_metrics.is_some() || child_metrics.iter().any(|(_, metrics)| metrics.is_some()) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "AGENTS",
+                theme
+                    .bright_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(" — CURRENT SESSION", theme.dim_style()),
+        ]));
+        let all_snapshots = main_metrics.into_iter().chain(
+            child_metrics
+                .iter()
+                .filter_map(|(_, metrics)| metrics.as_ref().copied()),
+        );
+        if main_metrics.is_some()
+            && child_metrics.iter().all(|(_, metrics)| metrics.is_some())
+            && let Some(total) = crate::agent_metrics::aggregate(all_snapshots)
+        {
+            let (tokens, cost) = total.usage.as_ref().map_or_else(
+                || ("n/a tokens".to_owned(), "cost n/a".to_owned()),
+                |usage| {
+                    (
+                        format!(
+                            "{} tokens",
+                            fmt_tok(crate::agent_metrics::normalized_tokens(usage))
+                        ),
+                        crate::agent_metrics::detailed_cost(usage),
+                    )
+                },
+            );
+            lines.push(Line::styled(
+                format!(
+                    "    session total — {} tools · {tokens} · {cost}",
+                    total.tool_attempts
+                ),
+                theme.dim_style(),
+            ));
+        }
+        let row = |label: &str, metrics: Option<&haider_protocol::agent::AgentMetricsSnapshot>| {
+            metrics.map_or_else(
+                || format!("    {label} — metrics n/a"),
+                |metrics| {
+                    let (tokens, cost) = metrics.usage.as_ref().map_or_else(
+                        || ("n/a tokens".to_owned(), "cost n/a".to_owned()),
+                        |usage| {
+                            (
+                                format!(
+                                    "{} tokens",
+                                    fmt_tok(crate::agent_metrics::normalized_tokens(usage))
+                                ),
+                                crate::agent_metrics::detailed_cost(usage),
+                            )
+                        },
+                    );
+                    format!(
+                        "    {label} — {} tools · {tokens} · {cost}",
+                        metrics.tool_attempts
+                    )
+                },
+            )
+        };
+        lines.push(Line::styled(row("main", main_metrics), theme.dim_style()));
+        for (chip, metrics) in child_metrics {
+            let label = if chip.callsign.is_empty() {
+                chip.agent.as_str()
+            } else {
+                chip.callsign.as_str()
+            };
+            lines.push(Line::styled(row(label, metrics), theme.dim_style()));
         }
         lines.push(Line::raw(""));
     }
@@ -2327,7 +2445,10 @@ fn render_usage(
                     .est_cost_usd
                     .map_or_else(|| "est $—".to_owned(), |usd| format!("est ${usd:.2}"))
             } else {
-                "plan".to_owned()
+                local.api_equivalent_est_cost_usd.map_or_else(
+                    || "plan · $— API rate".to_owned(),
+                    |usd| format!("plan · ≈${usd:.2} API rate"),
+                )
             };
             lines.push(Line::styled(
                 format!(
@@ -2384,10 +2505,19 @@ fn render_usage(
                         theme.dim_style(),
                     )),
                     _ if account.auth_method
-                        == haider_protocol::credential::AuthMethod::OAuth => lines.push(Line::styled(
-                        "    input cost — plan",
-                        theme.dim_style(),
-                    )),
+                        == haider_protocol::credential::AuthMethod::OAuth => {
+                            let equivalent = match (
+                                local.cache.api_equivalent_input_with_cache_usd,
+                                local.cache.api_equivalent_input_without_cache_usd,
+                                local.cache.api_equivalent_estimated_savings_usd,
+                            ) {
+                                (Some(with), Some(without), Some(savings)) => format!(
+                                    "    input cost — plan · ≈${with:.4} cached · ≈${without:.4} without · ≈${savings:.4} API-rate savings"
+                                ),
+                                _ => "    input cost — plan · $— API rate".to_owned(),
+                            };
+                            lines.push(Line::styled(equivalent, theme.dim_style()));
+                        }
                     _ => lines.push(Line::styled(
                         "    input $ — caching $— · without $— · savings $—",
                         theme.dim_style(),
@@ -2416,26 +2546,61 @@ fn render_usage(
                 .iter()
                 .map(|account| account.local.lines_removed)
                 .sum();
-            let costs: Vec<f64> = shown
+            // Credentials with no durable token/cost fact are not usage
+            // lanes and therefore do not poison a complete total. Once an
+            // account has any token truth, an absent price remains `$—`.
+            let cost_lanes = shown
+                .iter()
+                .copied()
+                .filter(|account| {
+                    let local = &account.local;
+                    local.input_tokens > 0
+                        || local.output_tokens > 0
+                        || local.reasoning_tokens > 0
+                        || local.cached_tokens > 0
+                        || local.cache.logical_input_tokens > 0
+                        || local.est_cost_usd.is_some()
+                        || local.api_equivalent_est_cost_usd.is_some()
+                })
+                .collect::<Vec<_>>();
+            let costs: Vec<f64> = cost_lanes
                 .iter()
                 .filter(|account| {
                     account.auth_method == haider_protocol::credential::AuthMethod::ApiKey
                 })
                 .filter_map(|account| account.local.est_cost_usd)
                 .collect();
-            let metered_accounts = shown
+            let metered_accounts = cost_lanes
                 .iter()
                 .filter(|account| {
                     account.auth_method == haider_protocol::credential::AuthMethod::ApiKey
                 })
                 .count();
-            let cost = if metered_accounts == 0 {
+            let real_cost = if metered_accounts == 0 {
                 "plan".to_owned()
             } else if costs.len() != metered_accounts {
                 "est $— (metered lanes)".to_owned()
             } else {
                 format!("est ${:.2} (metered lanes)", costs.iter().sum::<f64>())
             };
+            let has_oauth = cost_lanes.iter().any(|account| {
+                account.auth_method == haider_protocol::credential::AuthMethod::OAuth
+            });
+            let api_costs = cost_lanes
+                .iter()
+                .filter_map(|account| account.local.api_equivalent_est_cost_usd)
+                .collect::<Vec<_>>();
+            let api_equivalent = if !has_oauth {
+                String::new()
+            } else if api_costs.len() == cost_lanes.len() {
+                format!(
+                    " · ≈${:.2} API rate (all lanes)",
+                    api_costs.iter().sum::<f64>()
+                )
+            } else {
+                " · $— API rate (all lanes)".to_owned()
+            };
+            let cost = format!("{real_cost}{api_equivalent}");
             lines.push(Line::from(vec![
                 Span::styled(
                     "THIS DEVICE",
@@ -4056,8 +4221,40 @@ fn subtree_needed(model: &AppModel, on_subagent: bool) -> u16 {
     // The ⌂ main row is part of the map on BOTH screens (owner item 3), so
     // it always costs a row while the panel is open.
     let _ = on_subagent;
-    let rows = crate::app::flatten_chips(&model.chips).len() + 1;
+    let summary = usize::from(subtree_metrics_summary(model).is_some());
+    let rows = crate::app::flatten_chips(&model.chips).len() + 1 + summary;
     u16::try_from(rows + 1).unwrap_or(u16::MAX)
+}
+
+fn direct_metrics<'a>(
+    model: &'a AppModel,
+) -> Option<Vec<&'a haider_protocol::agent::AgentMetricsSnapshot>> {
+    let snapshots = model
+        .chips
+        .iter()
+        .map(|chip| model.chip_metrics(chip))
+        .collect::<Option<Vec<_>>>()?;
+    (!snapshots.is_empty()).then_some(snapshots)
+}
+
+fn subtree_metrics_summary(model: &AppModel) -> Option<String> {
+    let aggregate = crate::agent_metrics::aggregate(direct_metrics(model)?)?;
+    let (tokens, cost) = aggregate.usage.as_ref().map_or_else(
+        || ("n/a tokens".to_owned(), "cost n/a".to_owned()),
+        |usage| {
+            (
+                format!(
+                    "{} tokens",
+                    fmt_tok(crate::agent_metrics::normalized_tokens(usage))
+                ),
+                crate::agent_metrics::compact_cost(usage),
+            )
+        },
+    );
+    Some(format!(
+        "subagents total — {} tools · {tokens} · {cost}",
+        aggregate.tool_attempts
+    ))
 }
 
 /// `subCounts` (tui.js:2908-2944): non-zero categories joined ` · `.
@@ -4102,13 +4299,17 @@ fn subtree_counts(model: &AppModel) -> String {
     parts.join(" · ")
 }
 
-/// The S4 chip-row meta — `elapsed · ↓ N tokens` for the row's right end.
+/// The legacy S4 chip-row meta — `elapsed · ↓ N tokens` for old daemons.
 /// Segment PRESENCE is data truth: a source with nothing to say drops its
 /// segment (unknown is never rendered as `0s`/`0 tokens`). Width
 /// degradation drops WHOLE segments in law order — tokens first, then
 /// elapsed (the F2c pattern); never a mid-segment truncation. Every glyph
 /// used (`↓`, `·`, ASCII) is single-width, so char count IS cell width.
-fn chip_row_meta(elapsed: Option<&str>, tokens: Option<&str>, budget: usize) -> Option<String> {
+fn legacy_chip_row_meta(
+    elapsed: Option<&str>,
+    tokens: Option<&str>,
+    budget: usize,
+) -> Option<String> {
     let full = match (elapsed, tokens) {
         (Some(elapsed), Some(tokens)) => format!("{elapsed} · {tokens}"),
         (Some(elapsed), None) => elapsed.to_owned(),
@@ -4121,6 +4322,68 @@ fn chip_row_meta(elapsed: Option<&str>, tokens: Option<&str>, budget: usize) -> 
     // Tokens drop FIRST, elapsed survives alone — or nothing at all.
     let elapsed = elapsed?.to_owned();
     (elapsed.chars().count() <= budget).then_some(elapsed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricSegment {
+    Elapsed,
+    Live,
+    Tools,
+    Tokens,
+    Cost,
+}
+
+fn metrics_chip_row_meta(
+    elapsed: String,
+    live: bool,
+    tools: u64,
+    usage: Option<&haider_protocol::agent::AgentUsageMetrics>,
+    budget: usize,
+) -> Option<String> {
+    let mut segments = vec![(MetricSegment::Elapsed, elapsed)];
+    if live {
+        segments.push((MetricSegment::Live, "live".to_owned()));
+    }
+    segments.push((MetricSegment::Tools, format!("{tools} tools")));
+    if let Some(usage) = usage {
+        segments.push((
+            MetricSegment::Tokens,
+            format!(
+                "{} tokens",
+                fmt_tok(crate::agent_metrics::normalized_tokens(usage))
+            ),
+        ));
+        segments.push((
+            MetricSegment::Cost,
+            crate::agent_metrics::compact_cost(usage),
+        ));
+    }
+    let width = |segments: &[(MetricSegment, String)]| {
+        segments
+            .iter()
+            .map(|(_, segment)| segment.chars().count())
+            .sum::<usize>()
+            .saturating_add(segments.len().saturating_sub(1) * 3)
+    };
+    for drop in [
+        MetricSegment::Live,
+        MetricSegment::Elapsed,
+        MetricSegment::Cost,
+        MetricSegment::Tools,
+        MetricSegment::Tokens,
+    ] {
+        if width(&segments) <= budget {
+            break;
+        }
+        segments.retain(|(kind, _)| *kind != drop);
+    }
+    (!segments.is_empty() && width(&segments) <= budget).then(|| {
+        segments
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    })
 }
 
 /// The SubTree panel (§2.9): header toggle + depth-first rows with
@@ -4148,6 +4411,9 @@ fn render_subtree(
     ])];
     let mut row_hits: Vec<(usize, Hit)> = vec![(0, Hit::SubTreeToggle)];
     if !model.subtree_collapsed {
+        if let Some(summary) = subtree_metrics_summary(model) {
+            lines.push(Line::styled(format!("  {summary}"), theme.dim_style()));
+        }
         // Owner item 3: the main row is ALWAYS in the map, not just in the
         // subagent view, and whichever node is being VIEWED is bold — so the
         // panel always answers "where am I?". (The sim only draws this row on
@@ -4239,19 +4505,27 @@ fn render_subtree(
                 spans.push(Span::styled(format!(" · {}", chip.device), ink));
             }
             spans.push(Span::styled(format!(" — {activity}"), ink));
-            // S4: right-aligned `elapsed · ↓ tokens` in the dim slot —
-            // live children tick on the shared anim clock's `clock_ms`,
-            // terminal children read a figure frozen from journal
-            // timestamps ([`crate::app::ChipModel::elapsed_ms`]); the
-            // token join is the chip's OWN truth chain
-            // ([`crate::app::chip_row_tokens`]).
-            let elapsed = chip.elapsed_ms(model.clock_ms).map(fmt_elapsed);
-            let tokens = crate::app::chip_row_tokens(&model.sessions, chip)
-                .map(|total| format!("↓ {} tokens", fmt_tok(total)));
+            // S4: right-aligned compact metrics in the dim slot. New daemons
+            // provide the agent-preserving snapshot; old daemons keep the
+            // exact elapsed/token truth chain as a compatibility fallback.
             let left = Line::from(spans.clone()).width();
             // ≥2-cell gap: the meta must never kiss the activity text.
             let budget = (area.width as usize).saturating_sub(left).saturating_sub(2);
-            if let Some(meta) = chip_row_meta(elapsed.as_deref(), tokens.as_deref(), budget) {
+            let meta = if let Some(metrics) = model.chip_metrics(chip) {
+                metrics_chip_row_meta(
+                    fmt_elapsed(crate::agent_metrics::elapsed_ms(metrics, model.clock_ms)),
+                    metrics.live,
+                    metrics.tool_attempts,
+                    metrics.usage.as_ref(),
+                    budget,
+                )
+            } else {
+                let elapsed = chip.elapsed_ms(model.clock_ms).map(fmt_elapsed);
+                let tokens = crate::app::chip_row_tokens(&model.sessions, chip)
+                    .map(|total| format!("↓ {} tokens", fmt_tok(total)));
+                legacy_chip_row_meta(elapsed.as_deref(), tokens.as_deref(), budget)
+            };
+            if let Some(meta) = meta {
                 let pad = (area.width as usize)
                     .saturating_sub(left)
                     .saturating_sub(meta.chars().count());
@@ -4529,6 +4803,12 @@ fn render_subagent(
 
     // ---- The chip's transcript (same Entry renderer) + tail lines ----
     let mut lines: Vec<Line<'_>> = Vec::new();
+    if let Some(metrics) = model.chip_metrics(chip) {
+        for line in crate::agent_metrics::detail_lines(metrics) {
+            lines.push(Line::styled(format!(" {line}"), theme.dim_style()));
+        }
+        lines.push(Line::default());
+    }
     for entry in chip.transcript.entries() {
         transcript_lines(
             &mut lines,

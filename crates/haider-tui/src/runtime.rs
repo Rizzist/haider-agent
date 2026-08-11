@@ -2541,12 +2541,14 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
     for payload in demo_script() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
-    crate::plain::render_plain_with_cache(
+    let mut output = crate::plain::render_plain_with_cache(
         &model.projection,
         model.identity.context_window,
         model.throughput_readout().as_ref(),
         &model.cache_usage,
-    )
+    );
+    output.push_str(&crate::plain::agent_metrics_plain(&model));
+    output
 }
 
 /// Sleep until `deadline`, or forever when there is none.

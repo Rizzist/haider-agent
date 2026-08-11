@@ -7,7 +7,10 @@
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 
 use haider_protocol::EventPayload;
-use haider_protocol::agent::{AgentMessageDelivery, AgentMessaged, ChipState};
+use haider_protocol::agent::{
+    AgentMessageDelivery, AgentMessaged, AgentMetricsSnapshot, AgentUsageBreakdown,
+    AgentUsageMetrics, ChipState,
+};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::hook::{
@@ -930,6 +933,7 @@ fn golden_usage_report_v1() {
                         reasoning_tokens: 2_000,
                         cached_tokens: 80_000,
                         est_cost_usd: None,
+                        api_equivalent_est_cost_usd: Some(0.42),
                         lines_added: 240,
                         lines_removed: 60,
                         cache: CacheUsageStatsV1::default(),
@@ -950,6 +954,7 @@ fn golden_usage_report_v1() {
                         reasoning_tokens: 0,
                         cached_tokens: 0,
                         est_cost_usd: Some(0.08),
+                        api_equivalent_est_cost_usd: Some(0.08),
                         lines_added: 12,
                         lines_removed: 4,
                         cache: CacheUsageStatsV1::default(),
@@ -1160,6 +1165,60 @@ fn golden_agent_messaged_fact() {
         .expect("serialize additive agent fact");
     assert!(serde_json::from_value::<EventPayload>(value.clone()).is_err());
     assert_eq!(AgentMessaged::from_payload_value(&value), Some(fact));
+}
+
+/// LAW (metrics wire): the compact snapshot is an additive raw agent fact,
+/// carries separate real/API-equivalent costs, and never enters the closed
+/// `EventPayload` union.
+#[test]
+fn golden_agent_metrics_snapshot_fact() {
+    let snapshot = AgentMetricsSnapshot {
+        agent: Some(AgentId::new("agent-child-7")),
+        session_id: SessionId::new("session-child-7"),
+        head_seq: 42,
+        started_at_ms: 1_000,
+        terminal_at_ms: None,
+        live: true,
+        tool_attempts: 2,
+        usage: Some(AgentUsageMetrics {
+            logical_input_tokens: 10_000,
+            billed_output_tokens: 500,
+            additional_reasoning_tokens: 25,
+            cache_read_tokens: 7_000,
+            cache_write_tokens: 1_000,
+            cache_hit_basis_points: Some(7_000),
+            metered_cost_microusd: None,
+            api_equivalent_cost_microusd: Some(27_000),
+            all_lanes_priced: true,
+            has_metered_lanes: false,
+            has_oauth_lanes: true,
+            breakdowns: vec![AgentUsageBreakdown {
+                provider: "openai".into(),
+                model: "gpt-5.6-terra".into(),
+                cache_epoch: "epoch-a".into(),
+                request_kind: haider_protocol::provider::UsageRequestKind::DelegatedAgent,
+                auth_method: Some(haider_protocol::credential::AuthMethod::OAuth),
+                logical_input_tokens: 10_000,
+                billed_output_tokens: 500,
+                additional_reasoning_tokens: 25,
+                cache_read_tokens: 7_000,
+                cache_write_tokens: 1_000,
+                metered_cost_microusd: None,
+                api_equivalent_cost_microusd: Some(27_000),
+                priced: true,
+            }],
+        }),
+    };
+    additive_golden(
+        "agent_metrics_snapshot",
+        &haider_protocol::agent::AgentEventPayload::AgentMetrics(snapshot.clone()),
+    );
+    let value = snapshot.to_payload_value().expect("serialize metrics fact");
+    assert!(serde_json::from_value::<EventPayload>(value.clone()).is_err());
+    assert_eq!(
+        AgentMetricsSnapshot::from_payload_value(&value),
+        Some(snapshot)
+    );
 }
 
 /// MUTATION CHECK: remove the serde default from `AgentManifest::task`.

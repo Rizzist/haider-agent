@@ -126,10 +126,10 @@ fn cm3a_tuning_is_gated_and_cm3e_confirmation_is_reversible() {
     // commits the requested setting; no setting/model is permanently pinned.
 }
 
-/// LAW (OAuth cost): subscription lanes retain tokens/equivalents but never
-/// expose an API-rate dollar estimate in a cache warning.
+/// LAW (OAuth cost): subscription lanes retain tokens/equivalents and expose
+/// only a clearly labeled hypothetical API-rate estimate.
 #[test]
-fn oauth_cache_warning_omits_dollars_but_keeps_rewarm_equivalents() {
+fn oauth_cache_warning_shows_labeled_api_rate_rewarm_equivalent() {
     let warning = assess_cache_change(
         &metadata(CachePolicyMode::Economy, 0),
         Some(&scope(1_000_000, "oauth_subscription")),
@@ -141,9 +141,10 @@ fn oauth_cache_warning_omits_dollars_but_keeps_rewarm_equivalents() {
     )
     .expect("oauth assessment");
     assert_eq!(warning.rewarm_cost_microusd, None);
+    assert!(warning.rewarm_api_equivalent_cost_microusd.is_some());
     assert_eq!(warning.rewarm_base_input_equivalent_tokens, Some(1_150_000));
-    assert!(!warning.message().contains('$'));
-    assert!(warning.message().contains("plan"));
+    assert!(warning.message().contains("≈$"));
+    assert!(warning.message().contains("API rate (plan)"));
 }
 
 /// Account selection is profile-global, so its preflight adds the impact of

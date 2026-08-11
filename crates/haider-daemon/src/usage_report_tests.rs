@@ -724,6 +724,362 @@ fn cm1_session_folder_uses_latest_full_cache_lane_snapshot() {
     }));
 }
 
+fn metrics_usage(logical: u64, output: u64, model: &str, request_kind: UsageRequestKind) -> Usage {
+    Usage {
+        input: logical,
+        output,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: Some(CredentialAlias::new("billing-key")),
+        accounts: Vec::new(),
+        normalized: Some(NormalizedUsage {
+            logical_input: logical,
+            uncached_input: logical,
+            billed_output: output,
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: logical,
+            ..NormalizedUsage::default()
+        }),
+        scope: Some(UsageScope {
+            provider: "openai".into(),
+            model: model.into(),
+            account_scope: Some(CredentialAlias::new("billing-key")),
+            auth_scope: "api_key".into(),
+            cache_epoch: "metrics-epoch".into(),
+            stable_prefix_tokens: 0,
+            cache_boundaries: None,
+            request_kind,
+            run: Some(RunId::new("metrics-run")),
+            agent: None,
+            prefix_digests: None,
+        }),
+        cache_cost: None,
+    }
+}
+
+/// LAW mv1 — Started+Completed for one durable ToolCall is one attempt;
+/// Delta and CommandExecution never count, while a Completed-only replay is
+/// the one allowed fallback.
+///
+/// MUTATION CHECK (executed): salt the uniqueness key with envelope sequence;
+/// Started+Completed for one item became two attempts (expected 2, got 3).
+#[test]
+fn mv1_tool_count_uniqueness_started_completed_delta_and_command() {
+    use haider_protocol::ids::ItemId;
+    use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+
+    let tool = |status| TurnItem::ToolCall {
+        call_id: "call-1".into(),
+        name: "fs_read".into(),
+        args: serde_json::json!({}),
+        status,
+    };
+    let command = TurnItem::CommandExecution {
+        call_id: "cmd-1".into(),
+        command: "pwd".into(),
+        status: ToolStatus::InProgress,
+        exit_code: None,
+    };
+    let events = [
+        ItemEvent::Started {
+            item_id: ItemId::new("tool-1"),
+            item: tool(ToolStatus::InProgress),
+        },
+        ItemEvent::Delta {
+            item_id: ItemId::new("tool-1"),
+            delta: ItemDelta::ToolArgs {
+                fragment: "{}".into(),
+            },
+        },
+        ItemEvent::Completed {
+            item_id: ItemId::new("tool-1"),
+            item: tool(ToolStatus::Completed),
+        },
+        ItemEvent::Started {
+            item_id: ItemId::new("cmd-1"),
+            item: command.clone(),
+        },
+        ItemEvent::Completed {
+            item_id: ItemId::new("cmd-1"),
+            item: command,
+        },
+        ItemEvent::Completed {
+            item_id: ItemId::new("tool-2"),
+            item: tool(ToolStatus::Failed),
+        },
+    ];
+    let mut folder = SessionFolder::new("gpt-5.2");
+    for (index, event) in events.into_iter().enumerate() {
+        folder.push(&envelope(
+            index as u64 + 1,
+            Some("metrics-run"),
+            Some("agent-a"),
+            index as u64 + 1,
+            serde_json::to_value(EventPayload::Item(event)).expect("item"),
+        ));
+    }
+    let snapshot = folder
+        .agent_snapshot(
+            &SessionId::new("s-usage"),
+            Some(&AgentId::new("agent-a")),
+            6,
+        )
+        .expect("snapshot");
+    assert_eq!(snapshot.tool_attempts, 2);
+}
+
+/// LAW mv2 — later cumulative usage replaces the same full lane key, while a
+/// distinct request lane remains additive.
+///
+/// MUTATION CHECK (executed): sum both same-key snapshots; 250 became 350.
+#[test]
+fn mv2_latest_snapshot_replaces_same_key_and_distinct_keys_sum() {
+    let mut folder = SessionFolder::new("gpt-5.2");
+    for (seq, logical, lane) in [
+        (1, 100, UsageRequestKind::MainTurn),
+        (2, 200, UsageRequestKind::MainTurn),
+        (3, 50, UsageRequestKind::Compaction),
+    ] {
+        folder.push(&envelope(
+            seq,
+            Some("metrics-run"),
+            Some("agent-a"),
+            seq,
+            usage_payload(metrics_usage(logical, 10, "gpt-5.2", lane)),
+        ));
+    }
+    let usage = folder
+        .agent_snapshot(
+            &SessionId::new("s-usage"),
+            Some(&AgentId::new("agent-a")),
+            3,
+        )
+        .and_then(|snapshot| snapshot.usage)
+        .expect("usage");
+    assert_eq!(usage.logical_input_tokens, 250);
+    assert_eq!(usage.billed_output_tokens, 20);
+    assert_eq!(usage.breakdowns.len(), 2);
+}
+
+/// LAW mv3 — agent identity remains queryable after the latest-snapshot fold,
+/// while the pre-existing account report still receives the exact combined
+/// totals.
+///
+/// MUTATION CHECK (executed): erase the agent key; one agent snapshot absorbed
+/// the other and this separate-query assertion failed.
+#[test]
+fn mv3_agent_dimension_preserved_and_account_report_unchanged() {
+    let mut folder = SessionFolder::new("gpt-5.2");
+    for (seq, agent, logical) in [(1, "agent-a", 100), (2, "agent-b", 200)] {
+        let mut usage = metrics_usage(logical, 10, "gpt-5.2", UsageRequestKind::MainTurn);
+        usage.cached = logical / 2;
+        let normalized = usage.normalized.as_mut().expect("normalized");
+        normalized.uncached_input = logical - usage.cached;
+        normalized.cache_read_input = usage.cached;
+        folder.push(&envelope(
+            seq,
+            Some("metrics-run"),
+            Some(agent),
+            seq,
+            usage_payload(usage),
+        ));
+    }
+    for (agent, expected) in [("agent-a", 100), ("agent-b", 200)] {
+        let usage = folder
+            .agent_snapshot(&SessionId::new("s-usage"), Some(&AgentId::new(agent)), 2)
+            .and_then(|snapshot| snapshot.usage)
+            .expect("agent usage");
+        assert_eq!(usage.logical_input_tokens, expected);
+    }
+    let stats = folder.finish();
+    assert_eq!(
+        stats.tokens[&CredentialAlias::new("billing-key")].input,
+        300,
+        "account aggregation remains the unchanged sum of both agents"
+    );
+    let account = &stats.tokens[&CredentialAlias::new("billing-key")];
+    assert_eq!(account.output, 20);
+    assert_eq!(account.cached, 150);
+    assert_eq!(account.cache.logical_input_tokens, 300);
+    assert_eq!(account.cache.uncached_input_tokens, 150);
+    assert_eq!(account.cache.cache_read_tokens, 150);
+    assert!(account.est_cost_usd.is_some_and(|cost| cost > 0.0));
+    assert_eq!(account.api_equivalent_est_cost_usd, account.est_cost_usd);
+
+    // A root session remains the `None` bucket after a child transcript
+    // projection arrives carrying the child's agent id on the parent run.
+    let mut root = SessionFolder::new("gpt-5.2");
+    root.push(&envelope(
+        1,
+        Some("root-run"),
+        None,
+        1,
+        usage_payload(metrics_usage(75, 5, "gpt-5.2", UsageRequestKind::MainTurn)),
+    ));
+    root.push(&envelope(
+        2,
+        Some("root-run"),
+        Some("agent-child"),
+        2,
+        serde_json::to_value(EventPayload::UserMessage {
+            text: "mirrored child prompt".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Steer,
+        })
+        .expect("prompt"),
+    ));
+    let root_snapshot = root
+        .primary_agent_snapshot(&SessionId::new("root-session"), 2)
+        .expect("root metrics");
+    assert_eq!(root_snapshot.agent, None);
+    assert_eq!(
+        root_snapshot
+            .usage
+            .expect("root usage")
+            .logical_input_tokens,
+        75
+    );
+
+    // Child sessions begin with an unscoped SessionCreated row; roster
+    // snapshots must still select the first actual delegated agent.
+    let mut child = SessionFolder::new("gpt-5.2");
+    child.push(&envelope(
+        1,
+        None,
+        None,
+        1,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Thinking,
+        ))
+        .expect("state"),
+    ));
+    child.push(&envelope(
+        2,
+        Some("metrics-run"),
+        Some("agent-a"),
+        2,
+        usage_payload(metrics_usage(
+            100,
+            10,
+            "gpt-5.2",
+            UsageRequestKind::DelegatedAgent,
+        )),
+    ));
+    assert_eq!(
+        child
+            .primary_agent_snapshot(&SessionId::new("child-session"), 2)
+            .and_then(|snapshot| snapshot.agent),
+        Some(AgentId::new("agent-a"))
+    );
+}
+
+/// LAW mv4 — no usage fact remains `None`; one unknown-priced lane poisons
+/// the complete aggregate instead of becoming a partial or `$0` estimate.
+///
+/// MUTATION CHECK (executed): omit the unpriced lane's
+/// `all_lanes_priced = false`; the aggregate exposed a known partial.
+#[test]
+fn mv4_no_usage_is_none_and_unknown_or_mixed_price_is_unpriced() {
+    let mut empty = SessionFolder::new("gpt-5.2");
+    empty.push(&envelope(
+        1,
+        Some("metrics-run"),
+        Some("agent-a"),
+        1,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Thinking,
+        ))
+        .expect("state"),
+    ));
+    assert!(
+        empty
+            .agent_snapshot(
+                &SessionId::new("s-usage"),
+                Some(&AgentId::new("agent-a")),
+                1,
+            )
+            .expect("snapshot")
+            .usage
+            .is_none()
+    );
+
+    let mut mixed = SessionFolder::new("gpt-5.2");
+    for (seq, model, lane) in [
+        (1, "gpt-5.2", UsageRequestKind::MainTurn),
+        (2, "unknown-model", UsageRequestKind::Compaction),
+    ] {
+        mixed.push(&envelope(
+            seq,
+            Some("metrics-run"),
+            Some("agent-a"),
+            seq,
+            usage_payload(metrics_usage(100, 10, model, lane)),
+        ));
+    }
+    let usage = mixed
+        .agent_snapshot(
+            &SessionId::new("s-usage"),
+            Some(&AgentId::new("agent-a")),
+            2,
+        )
+        .and_then(|snapshot| snapshot.usage)
+        .expect("usage");
+    assert!(!usage.all_lanes_priced);
+    assert_eq!(usage.metered_cost_microusd, None);
+    assert_eq!(usage.api_equivalent_cost_microusd, None);
+}
+
+/// LAW mv6 — a terminal committed state forces a settled snapshot through
+/// that exact sequence, while Error/Cancelled retain partial work.
+///
+/// MUTATION CHECK (executed): clear usage chunks on terminal; both terminal
+/// cases lost their 110 normalized tokens and the assertions failed.
+#[test]
+fn mv6_terminal_snapshot_drops_live_and_retains_error_cancel_partials() {
+    for terminal in [
+        haider_protocol::state::RunState::Errored,
+        haider_protocol::state::RunState::Cancelled,
+    ] {
+        let mut folder = SessionFolder::new("gpt-5.2");
+        folder.push(&envelope(
+            1,
+            Some("metrics-run"),
+            Some("agent-a"),
+            100,
+            usage_payload(metrics_usage(
+                100,
+                10,
+                "gpt-5.2",
+                UsageRequestKind::MainTurn,
+            )),
+        ));
+        folder.push(&envelope(
+            2,
+            Some("metrics-run"),
+            None,
+            700,
+            serde_json::to_value(EventPayload::RunState(terminal)).expect("terminal"),
+        ));
+        let snapshot = folder
+            .agent_snapshot(
+                &SessionId::new("s-usage"),
+                Some(&AgentId::new("agent-a")),
+                2,
+            )
+            .expect("snapshot");
+        assert!(!snapshot.live);
+        assert_eq!(snapshot.terminal_at_ms, Some(700));
+        let usage = snapshot.usage.expect("partials retained");
+        assert_eq!(
+            usage
+                .logical_input_tokens
+                .saturating_add(usage.billed_output_tokens),
+            110
+        );
+    }
+}
+
 /// LAW (meter_routing_is_flavor_and_provider_strict): only the three
 /// sanctioned OAuth subscriptions route to a meter; the SAME provider names
 /// under an API key, and any other provider under OAuth, are meterless.

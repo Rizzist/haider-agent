@@ -70,8 +70,14 @@ impl SessionUsageFold {
         let mut savings = 0.0;
         let mut metered_priced = true;
         let mut has_metered = false;
+        let mut api_input_with = 0.0;
+        let mut api_input_without = 0.0;
+        let mut api_savings = 0.0;
+        let mut api_priced = true;
+        let mut has_lane = false;
 
         for (key, usage) in &self.chunks {
+            has_lane = true;
             let normalized = usage.normalized.as_ref();
             let logical = normalized.map_or(usage.input, |usage| usage.logical_input);
             let uncached = normalized.map_or(usage.input, |usage| usage.uncached_input);
@@ -137,46 +143,85 @@ impl SessionUsageFold {
                 breakdown.cache_status = CacheStatAvailability::Unavailable;
             }
 
-            if metered && let Some(cost) = usage.cache_cost {
-                input_with += cost.input_with_cache_usd;
-                input_without += cost.input_without_cache_usd;
-                savings += cost.estimated_savings_usd;
-                merge_cost(
-                    &mut breakdown.input_with_cache_usd,
-                    Some(cost.input_with_cache_usd),
-                    breakdown_had_input,
-                );
-                merge_cost(
-                    &mut breakdown.input_without_cache_usd,
-                    Some(cost.input_without_cache_usd),
-                    breakdown_had_input,
-                );
-                merge_cost(
-                    &mut breakdown.estimated_savings_usd,
-                    Some(cost.estimated_savings_usd),
-                    breakdown_had_input,
-                );
-            } else if metered {
-                metered_priced = false;
-                merge_cost(
-                    &mut breakdown.input_with_cache_usd,
-                    None,
-                    breakdown_had_input,
-                );
-                merge_cost(
-                    &mut breakdown.input_without_cache_usd,
-                    None,
-                    breakdown_had_input,
-                );
-                merge_cost(
-                    &mut breakdown.estimated_savings_usd,
-                    None,
-                    breakdown_had_input,
-                );
+            if metered {
+                if let Some(cost) = usage.cache_cost {
+                    input_with += cost.input_with_cache_usd;
+                    input_without += cost.input_without_cache_usd;
+                    savings += cost.estimated_savings_usd;
+                    merge_cost(
+                        &mut breakdown.input_with_cache_usd,
+                        Some(cost.input_with_cache_usd),
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.input_without_cache_usd,
+                        Some(cost.input_without_cache_usd),
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.estimated_savings_usd,
+                        Some(cost.estimated_savings_usd),
+                        breakdown_had_input,
+                    );
+                } else {
+                    metered_priced = false;
+                    merge_cost(
+                        &mut breakdown.input_with_cache_usd,
+                        None,
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.input_without_cache_usd,
+                        None,
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.estimated_savings_usd,
+                        None,
+                        breakdown_had_input,
+                    );
+                }
+            }
+            if auth_method.is_some() {
+                if let Some(cost) = usage.cache_cost {
+                    api_input_with += cost.input_with_cache_usd;
+                    api_input_without += cost.input_without_cache_usd;
+                    api_savings += cost.estimated_savings_usd;
+                    merge_cost(
+                        &mut breakdown.api_equivalent_input_with_cache_usd,
+                        Some(cost.input_with_cache_usd),
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.api_equivalent_input_without_cache_usd,
+                        Some(cost.input_without_cache_usd),
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.api_equivalent_estimated_savings_usd,
+                        Some(cost.estimated_savings_usd),
+                        breakdown_had_input,
+                    );
+                } else {
+                    api_priced = false;
+                    merge_cost(
+                        &mut breakdown.api_equivalent_input_with_cache_usd,
+                        None,
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.api_equivalent_input_without_cache_usd,
+                        None,
+                        breakdown_had_input,
+                    );
+                    merge_cost(
+                        &mut breakdown.api_equivalent_estimated_savings_usd,
+                        None,
+                        breakdown_had_input,
+                    );
+                }
             } else {
-                breakdown.input_with_cache_usd = None;
-                breakdown.input_without_cache_usd = None;
-                breakdown.estimated_savings_usd = None;
+                api_priced = false;
             }
         }
 
@@ -199,6 +244,11 @@ impl SessionUsageFold {
             totals.input_with_cache_usd = Some(input_with);
             totals.input_without_cache_usd = Some(input_without);
             totals.estimated_savings_usd = Some(savings);
+        }
+        if has_lane && api_priced {
+            totals.api_equivalent_input_with_cache_usd = Some(api_input_with);
+            totals.api_equivalent_input_without_cache_usd = Some(api_input_without);
+            totals.api_equivalent_estimated_savings_usd = Some(api_savings);
         }
         totals.breakdowns = breakdowns;
         totals

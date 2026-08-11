@@ -184,13 +184,38 @@ fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> S
             out.push_str(&format!(
                 " · input ${with:.4} cached / ${without:.4} without · savings ${savings:.4}{qualifier}"
             ));
+            if stats.breakdowns.iter().any(|breakdown| {
+                breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
+            }) {
+                match (
+                    stats.api_equivalent_input_with_cache_usd,
+                    stats.api_equivalent_input_without_cache_usd,
+                    stats.api_equivalent_estimated_savings_usd,
+                ) {
+                    (Some(api_with), Some(api_without), Some(api_savings)) => {
+                        out.push_str(&format!(
+                            " · ≈${api_with:.4}/${api_without:.4} API rate (all lanes) · savings ≈${api_savings:.4}"
+                        ));
+                    }
+                    _ => out.push_str(" · $— API rate (all lanes)"),
+                }
+            }
         }
         _ if !stats.breakdowns.is_empty()
             && stats.breakdowns.iter().all(|breakdown| {
                 breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
             }) =>
         {
-            out.push_str(" · plan");
+            match (
+                stats.api_equivalent_input_with_cache_usd,
+                stats.api_equivalent_input_without_cache_usd,
+                stats.api_equivalent_estimated_savings_usd,
+            ) {
+                (Some(with), Some(without), Some(savings)) => out.push_str(&format!(
+                    " · plan · ≈${with:.4}/${without:.4} API rate · savings ≈${savings:.4}"
+                )),
+                _ => out.push_str(" · plan · $— API rate"),
+            }
         }
         _ => out.push_str(" · input cost n/a · savings n/a"),
     }
@@ -208,7 +233,16 @@ fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> S
                 format!(" · input ${with:.4}/${without:.4} · save ${savings:.4}")
             }
             _ if breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth) => {
-                " · plan".to_owned()
+                match (
+                    breakdown.api_equivalent_input_with_cache_usd,
+                    breakdown.api_equivalent_input_without_cache_usd,
+                    breakdown.api_equivalent_estimated_savings_usd,
+                ) {
+                    (Some(with), Some(without), Some(savings)) => format!(
+                        " · plan · ≈${with:.4}/${without:.4} API rate · save ≈${savings:.4}"
+                    ),
+                    _ => " · plan · input $— API rate".to_owned(),
+                }
             }
             _ => " · input $—".to_owned(),
         };
@@ -257,6 +291,91 @@ fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> S
             fmt_tok(breakdown.cache_write_tokens),
             fmt_tok(breakdown.cache_read_tokens),
         ));
+    }
+    out
+}
+
+/// Plain counterpart of the rich direct-agent block and selected-agent
+/// detail. Existing plain entry points stay stable; callers with an
+/// `AppModel` opt into this additive section.
+#[must_use]
+pub fn agent_metrics_plain(model: &crate::app::AppModel) -> String {
+    let main = model.main_agent_metrics();
+    let children = model
+        .chips
+        .iter()
+        .map(|chip| (chip, model.chip_metrics(chip)))
+        .collect::<Vec<_>>();
+    if main.is_none() && children.iter().all(|(_, metrics)| metrics.is_none()) {
+        return String::new();
+    }
+    let row = |label: &str, metrics: Option<&haider_protocol::agent::AgentMetricsSnapshot>| {
+        metrics.map_or_else(
+            || format!("{label} — metrics n/a"),
+            |metrics| {
+                let (tokens, cost) = metrics.usage.as_ref().map_or_else(
+                    || ("n/a tokens".to_owned(), "cost n/a".to_owned()),
+                    |usage| {
+                        (
+                            format!(
+                                "{} tokens",
+                                fmt_tok(crate::agent_metrics::normalized_tokens(usage))
+                            ),
+                            crate::agent_metrics::detailed_cost(usage),
+                        )
+                    },
+                );
+                format!(
+                    "{label} — {} tools · {tokens} · {cost}",
+                    metrics.tool_attempts
+                )
+            },
+        )
+    };
+    let mut out = "AGENTS — CURRENT SESSION\n".to_owned();
+    if main.is_some()
+        && children.iter().all(|(_, metrics)| metrics.is_some())
+        && let Some(total) = crate::agent_metrics::aggregate(
+            main.into_iter()
+                .chain(children.iter().filter_map(|(_, metrics)| *metrics)),
+        )
+    {
+        let (tokens, cost) = total.usage.as_ref().map_or_else(
+            || ("n/a tokens".to_owned(), "cost n/a".to_owned()),
+            |usage| {
+                (
+                    format!(
+                        "{} tokens",
+                        fmt_tok(crate::agent_metrics::normalized_tokens(usage))
+                    ),
+                    crate::agent_metrics::detailed_cost(usage),
+                )
+            },
+        );
+        out.push_str(&format!(
+            "session total — {} tools · {tokens} · {cost}\n",
+            total.tool_attempts
+        ));
+    }
+    out.push_str(&row("main", main));
+    out.push('\n');
+    for (chip, metrics) in children {
+        let label = if chip.callsign.is_empty() {
+            chip.agent.as_str()
+        } else {
+            chip.callsign.as_str()
+        };
+        out.push_str(&row(label, metrics));
+        out.push('\n');
+    }
+    if model.screen == crate::app::Screen::Subagent
+        && let Some(chip) = model.viewed_chip()
+        && let Some(metrics) = model.chip_metrics(chip)
+    {
+        for line in crate::agent_metrics::detail_lines(metrics) {
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
     out
 }
