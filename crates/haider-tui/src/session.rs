@@ -54,6 +54,9 @@ pub struct SessionState {
     /// Working dir (sim `s.dir`).
     pub dir: String,
     pub projection: SessionProjection,
+    /// Durable journal prompts for this session, newest first. This is
+    /// distinct from the composer's transient submitted-input ring.
+    pub prompt_history: std::collections::VecDeque<String>,
     pub cache_usage: crate::cache_usage::SessionUsageFold,
     pub chips: Vec<ChipModel>,
     /// This session's branch registry, active-branch selection, warm parked
@@ -133,6 +136,7 @@ impl SessionState {
             head_ros: None,
             dir: String::new(),
             projection: SessionProjection::new(),
+            prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
@@ -310,21 +314,28 @@ impl SessionState {
                         self.switch_branch(Some(&id));
                     }
                 }
-                if matches!(note, crate::branch::AdmittedNote::Content)
-                    && admission == Admission::Apply
-                {
+                if matches!(note, crate::branch::AdmittedNote::Content) {
                     match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                        Ok(payload) => self.route_admitted(
-                            &payload,
-                            envelope.branch_id.as_ref(),
-                            envelope.agent_id.as_ref(),
-                            envelope.committed_at_ms,
-                        ),
+                        Ok(payload) => {
+                            if envelope.agent_id.is_none()
+                                && let EventPayload::UserMessage { text, .. } = &payload
+                            {
+                                self.prompt_history.push_front(text.clone());
+                            }
+                            if admission == Admission::Apply {
+                                self.route_admitted(
+                                    &payload,
+                                    envelope.branch_id.as_ref(),
+                                    envelope.agent_id.as_ref(),
+                                    envelope.committed_at_ms,
+                                );
+                            }
+                        }
                         // S3/W-A: the additive agent- and task-event unions
                         // ride raw envelopes OUTSIDE `EventPayload` — try
                         // them before counting the payload unknown (both
                         // twins).
-                        Err(_) => {
+                        Err(_) if admission == Admission::Apply => {
                             if !route_agent_event(
                                 &mut self.branch_state,
                                 &mut self.projection,
@@ -339,6 +350,7 @@ impl SessionState {
                                 self.projection.count_unknown_payload();
                             }
                         }
+                        Err(_) => {}
                     }
                 }
                 RawOutcome::Applied

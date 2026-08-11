@@ -1770,16 +1770,10 @@ impl LiveDriver {
                 // discovered before the picker or the bootstrap can work.
                 self.provider_model_refreshes(model)
             }
-            LiveReply::DeviceCandidates {
-                discovery_disabled,
-                candidates,
-            } => {
-                // Metadata only, wholesale (D2): the section renders what
-                // the daemon reported and nothing else — an empty or
-                // switched-off report simply keeps the section absent.
-                model.device.apply(candidates, discovery_disabled);
-                model.dirty = true;
-                Vec::new()
+            LiveReply::DeviceCandidates { .. } => {
+                // The daemon has completed its auto-adoption pass. Candidate
+                // metadata has no TUI surface; re-read roster/provider truth.
+                vec![LiveCommand::AccountList, LiveCommand::ProviderList]
             }
             LiveReply::DeviceImported {
                 command_id,
@@ -1794,7 +1788,6 @@ impl LiveDriver {
                 {
                     self.pending_device_import = None;
                 }
-                model.device.pending_import = None;
                 // The receipt NAMES what the daemon committed; the rows
                 // themselves land via the chained refresh below — nothing
                 // is inserted here (D2's installs-nothing-locally law).
@@ -1811,7 +1804,7 @@ impl LiveDriver {
                 } else {
                     "imported"
                 };
-                model.device.message = Some(format!(
+                model.accounts.message = Some(format!(
                     "✓ {action} {} → {} · {}",
                     descriptor.provider,
                     descriptor.alias,
@@ -2309,10 +2302,8 @@ impl LiveDriver {
                     model.dirty = true;
                     return Vec::new();
                 }
-                // D2: a failed `account.import_device` releases the exact
-                // pending candidate and lands the daemon's honest typed
-                // reason inside the section (both screens render it).
-                // Nothing moved locally, so nothing rolls back.
+                // Compatibility path for an older queued manual device
+                // import: release it and surface the failure in Accounts.
                 if let Some(id) = &command_id
                     && self
                         .pending_device_import
@@ -2323,8 +2314,7 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.device.pending_import = None;
-                    model.device.message = Some(format!("✗ import failed — {message}"));
+                    model.accounts.message = Some(format!("✗ import failed — {message}"));
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -3097,14 +3087,6 @@ impl LiveDriver {
             // A read — never outboxed; the reducer already gated on the
             // feature bit and pushes it on screen entry only (D2).
             AppRequest::DeviceCandidatesRefresh => vec![LiveCommand::DeviceCandidates],
-            AppRequest::DeviceImport { candidate } => {
-                let command_id = self.mint();
-                self.pending_device_import = Some((command_id.clone(), candidate.clone()));
-                vec![self.enqueue(LiveCommand::DeviceImport {
-                    command_id,
-                    candidate,
-                })]
-            }
             AppRequest::ProvidersRefresh => vec![LiveCommand::ProviderList],
             AppRequest::OAuthAddStart {
                 provider,

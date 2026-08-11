@@ -3,7 +3,9 @@
 //! routing (tui.js:2516-2519).
 #![allow(clippy::expect_used)]
 
-use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
+use haider_protocol::credential::{
+    AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
+};
 use haider_protocol::ids::CredentialAlias;
 use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, PendingCacheChange, Screen};
 use haider_tui::mock::{SEED_ACCOUNT_PROVIDERS, SEED_ACCOUNTS, seed_account_rows};
@@ -344,6 +346,33 @@ fn expired_and_revoked_rows_refuse_selection_locally() {
     // the P1 default).
     let frame = draw(&model, 100, 32);
     assert!(frame.contains("○ billing-key [api key] · s******* · expired"));
+}
+
+#[test]
+fn keychain_attention_rows_render_typed_actionable_remedies() {
+    let mut model = accounts_model();
+    let cases = [
+        (
+            CredentialAttentionReason::KeychainDenied,
+            "needs attention — keychain access denied · re-link or re-allow",
+        ),
+        (
+            CredentialAttentionReason::KeychainLocked,
+            "needs attention — keychain locked · unlock login keychain (password may have changed)",
+        ),
+    ];
+    for (reason, expected) in cases {
+        let mut row = AccountRow::from_descriptor(&descriptor(
+            "claude-code",
+            "anthropic-oauth",
+            AuthMethod::OAuth,
+        ));
+        row.identity = "Claude Max subscription · Linked to Claude Code".to_owned();
+        row.status = CredentialStatus::NeedsAttention { reason };
+        model.accounts.apply_snapshot(vec![row], None);
+        let frame = draw(&model, 180, 32);
+        assert!(frame.contains(expected), "typed remedy missing:\n{frame}");
+    }
 }
 
 /// Esc routing (sim tui.js:2516-2519): no session → launcher; the sim's

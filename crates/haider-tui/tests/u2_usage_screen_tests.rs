@@ -280,7 +280,10 @@ fn identity_masking_keeps_first_chars_and_tld_only() {
 fn masked_runs_cap_at_eight_without_padding_short_runs() {
     assert_eq!(mask_identity(&format!("C{}", "x".repeat(40))), "C********");
     assert_eq!(mask_identity("Cxyz"), "C***");
-    assert_eq!(mask_identity("somethinglong@gmail.com"), "s********@g****.com");
+    assert_eq!(
+        mask_identity("somethinglong@gmail.com"),
+        "s********@g****.com"
+    );
 }
 
 // ---- per-state rendering ---------------------------------------------

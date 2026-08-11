@@ -1420,12 +1420,9 @@ impl DemoDriver {
             // W10b live-only mutations: the demo reducer removes locally.
             | AppRequest::AccountRemove { .. }
             | AppRequest::ProviderRemove { .. }
-            // D2 device discovery is LIVE-ONLY vocabulary, unreachable by
-            // the reducer's gate (`device_discovery_available` is false in
-            // demo — the sim has no device to probe, so the section is
-            // honestly absent and nothing can push these).
+            // Device auto-adoption refresh is live-only; demo has no host
+            // credential stores and the reducer gate never pushes it.
             | AppRequest::DeviceCandidatesRefresh
-            | AppRequest::DeviceImport { .. }
             // T2 live-only vocabulary: `/talk` refuses honestly upstream
             // in demo mode (the chip keeps the canned hold), so neither
             // the secret RPCs nor the stt-shell effects can be pushed.

@@ -68,6 +68,14 @@ const CODEX_IMPORT_FALLBACK_WINDOW: Duration = Duration::from_secs(15 * 60);
 #[cfg(not(test))]
 pub(crate) const CLAUDE_CODE_CREDENTIAL_SERVICE: &str = "Claude Code-credentials";
 pub(crate) const CLAUDE_DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub(crate) const CLAUDE_NATIVE_IDENTITY_LABEL: &str = "Linked to Claude Code";
+
+pub(crate) fn is_claude_native_owner_identity(identity: &str) -> bool {
+    identity
+        .rsplit(" · ")
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case(CLAUDE_NATIVE_IDENTITY_LABEL))
+}
 
 #[cfg(test)]
 static OAUTH_IMPORT_READ_COUNT: std::sync::atomic::AtomicUsize =
@@ -1040,13 +1048,15 @@ pub(crate) enum ClaudeNativeCredentialFailure {
     Unavailable,
 }
 
-/// A significant read is an explicit/startup account refresh. It may retry a
-/// previously failed no-UI probe; ordinary provider read-throughs honor the
-/// boot-scoped cooldown and reuse the last typed failure.
+/// Significant reads may retry a previously failed no-UI probe; ordinary
+/// provider read-throughs honor the boot-scoped cooldown and reuse the last
+/// typed failure. Auto-adopt discovery is distinguished only so its one
+/// successful read can be handed directly to the importer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeNativeReadEvent {
     Ordinary,
     Significant,
+    AutoAdoptDiscovery,
 }
 
 pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
@@ -1060,6 +1070,7 @@ pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
 /// and permits at most one interactive Keychain read for this object (one
 /// object is constructed per daemon boot).
 #[derive(Default)]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct PlatformClaudeNativeCredentialStore {
     interactive_attempted: AtomicBool,
     last_failure: Mutex<Option<ClaudeNativeCredentialFailure>>,
@@ -1080,14 +1091,25 @@ impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
 /// to the seam rather than dependent on actor scheduling.
 pub(crate) struct ClaudeNativeCredentialAccess {
     store: Arc<dyn ClaudeNativeCredentialStore>,
-    last_failure: Mutex<Option<ClaudeNativeCredentialFailure>>,
+    state: Mutex<ClaudeNativeCredentialAccessState>,
+}
+
+#[derive(Default)]
+struct ClaudeNativeCredentialAccessState {
+    last_failure: Option<ClaudeNativeCredentialFailure>,
+    /// A significant discovery read and its immediate auto-adopt are one
+    /// policy operation. Hand the already-authorized bytes to the importer
+    /// once so macOS "Allow Once" never requires a second Keychain query.
+    significant_handoff: Option<(Instant, ClaudeCredentialInput)>,
 }
 
 impl ClaudeNativeCredentialAccess {
+    const SIGNIFICANT_HANDOFF_TTL: Duration = Duration::from_secs(5);
+
     pub(crate) fn new(store: Arc<dyn ClaudeNativeCredentialStore>) -> Self {
         Self {
             store,
-            last_failure: Mutex::new(None),
+            state: Mutex::new(ClaudeNativeCredentialAccessState::default()),
         }
     }
 }
@@ -1097,22 +1119,30 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
         &self,
         event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
-        let mut failure = self
-            .last_failure
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if event == ClaudeNativeReadEvent::Ordinary
-            && let Some(cached) = *failure
-        {
-            return Err(cached);
+        if event == ClaudeNativeReadEvent::Ordinary {
+            if let Some((observed_at, input)) = state.significant_handoff.take()
+                && observed_at.elapsed() <= Self::SIGNIFICANT_HANDOFF_TTL
+            {
+                return Ok(input);
+            }
+            if let Some(cached) = state.last_failure {
+                return Err(cached);
+            }
         }
         match self.store.read(event) {
             Ok(input) => {
-                *failure = None;
+                state.last_failure = None;
+                state.significant_handoff = (event == ClaudeNativeReadEvent::AutoAdoptDiscovery)
+                    .then(|| (Instant::now(), input.clone()));
                 Ok(input)
             }
             Err(error) => {
-                *failure = Some(error);
+                state.significant_handoff = None;
+                state.last_failure = Some(error);
                 Err(error)
             }
         }
@@ -1175,7 +1205,7 @@ fn platform_claude_credential(
                     SearchResult::Data(bytes) => Some(bytes),
                     _ => None,
                 })
-                .ok_or_else(|| security_framework::Error::from_code(-25300))
+                .ok_or_else(|| security_framework::base::Error::from_code(-25300))
         });
     match result {
         Ok(bytes) => {
@@ -1258,9 +1288,8 @@ fn normalize_windows_credential(mut bytes: Zeroizing<Vec<u8>>) -> Option<Zeroizi
         .then_some(decoded)
 }
 
-/// Minimal WinCred adapter for Claude Code's generic credential. Errors such
-/// as absent, denied, or locked are deliberately collapsed to `None` by the
-/// caller-facing seam.
+/// Minimal WinCred adapter for Claude Code's generic credential. Platform
+/// failures stay typed at the injectable caller-facing seam.
 #[cfg(all(target_os = "windows", not(test)))]
 #[allow(unsafe_code)]
 mod windows_claude_store {
@@ -1285,7 +1314,7 @@ mod windows_claude_store {
 
     pub(super) fn read() -> Result<Zeroizing<Vec<u8>>, super::ClaudeNativeCredentialFailure> {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_LOGON_FAILURE, ERROR_NOT_FOUND, ERROR_NO_SUCH_LOGON_SESSION,
+            ERROR_ACCESS_DENIED, ERROR_LOGON_FAILURE, ERROR_NO_SUCH_LOGON_SESSION, ERROR_NOT_FOUND,
             GetLastError,
         };
 
@@ -1417,6 +1446,7 @@ pub(crate) fn load_oauth_import_material_with_native(
 /// Reads Claude Code's live owner store directly, ahead of any imported
 /// credential file. `None` is the sole signal that the independent grant
 /// fallback is eligible for a file-only credential.
+#[derive(Debug)]
 pub(crate) enum ClaudeNativeImportError {
     Access(ClaudeNativeCredentialFailure),
     Invalid(HaiderError),
@@ -1436,9 +1466,7 @@ pub(crate) fn load_claude_native_import_material(
         .map_err(ClaudeNativeImportError::Invalid)
 }
 
-pub(crate) fn claude_native_access_error(
-    failure: ClaudeNativeCredentialFailure,
-) -> HaiderError {
+pub(crate) fn claude_native_access_error(failure: ClaudeNativeCredentialFailure) -> HaiderError {
     let message = match failure {
         ClaudeNativeCredentialFailure::Denied => {
             "Claude Code credential access was denied; re-allow Keychain access or re-link"
@@ -1488,7 +1516,7 @@ fn load_oauth_import_material_from_input(
             .identity
             .display_identity
             .push_str(if claude_native_owner {
-                " · linked to Claude Code"
+                " · Linked to Claude Code"
             } else {
                 " · independently imported"
             }),
@@ -4960,11 +4988,12 @@ impl CredentialBroker {
                     .map_err(|error| imported_refresh_error(error, descriptor, &source));
                 }
                 crate::accounts::OAuthImportHealResult::LiveOwnerStore { source } => {
-                    // The external app owns this rotating credential. An
-                    // unchanged/unusable owner-store read is terminal for
-                    // this attempt; spending Haider's drifting snapshot here
-                    // would invalidate whichever app refreshed most recently.
-                    return Err(imported_credential_expired(descriptor, &source));
+                    // The external app owns this rotating credential. The
+                    // actor has either persisted the successfully re-read
+                    // snapshot or observed a newer durable generation. Re-read
+                    // Haider's vault; never spend its rotating refresh token.
+                    let _ = source;
+                    return Ok(RefreshFlightOutcome::Refreshed);
                 }
                 crate::accounts::OAuthImportHealResult::LiveOwnerUnavailable { failure } => {
                     return Err(claude_native_access_error(failure));

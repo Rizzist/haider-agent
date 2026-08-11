@@ -67,6 +67,92 @@ impl ClaudeNativeCredentialStore for OAuthTestClaudeNative {
     }
 }
 
+struct FailingClaudeNative {
+    failure: ClaudeNativeCredentialFailure,
+    reads: AtomicUsize,
+}
+
+impl ClaudeNativeCredentialStore for FailingClaudeNative {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Err(self.failure)
+    }
+}
+
+/// LAW D1: one ordinary read failure arms the boot-scoped cooldown. Provider
+/// read-throughs receive the same typed denial without calling the raw store
+/// again; an explicit/significant refresh gets exactly one new attempt.
+#[test]
+fn denied_native_read_is_cooled_down_until_a_significant_event() {
+    let raw = Arc::new(FailingClaudeNative {
+        failure: ClaudeNativeCredentialFailure::Denied,
+        reads: AtomicUsize::new(0),
+    });
+    let access = ClaudeNativeCredentialAccess::new(raw.clone());
+
+    assert!(matches!(
+        access.read(ClaudeNativeReadEvent::Ordinary),
+        Err(ClaudeNativeCredentialFailure::Denied)
+    ));
+    assert!(matches!(
+        access.read(ClaudeNativeReadEvent::Ordinary),
+        Err(ClaudeNativeCredentialFailure::Denied)
+    ));
+    assert_eq!(raw.reads.load(Ordering::SeqCst), 1);
+
+    assert!(matches!(
+        access.read(ClaudeNativeReadEvent::Significant),
+        Err(ClaudeNativeCredentialFailure::Denied)
+    ));
+    assert_eq!(raw.reads.load(Ordering::SeqCst), 2);
+}
+
+struct SuccessfulClaudeNative {
+    reads: AtomicUsize,
+}
+
+impl ClaudeNativeCredentialStore for SuccessfulClaudeNative {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(ClaudeCredentialInput {
+            location: PathBuf::from("mock-keychain"),
+            bytes: Zeroizing::new(br#"{"oauthAccessToken":"mock"}"#.to_vec()),
+            native_owner: true,
+        })
+    }
+}
+
+/// LAW A4/D1: the significant discovery read hands its authorized bytes to
+/// the immediate importer exactly once. This is the hermetic equivalent of a
+/// macOS "Allow Once" consent: auto-adopt does not issue a second store query,
+/// while later ordinary reads still reach the live owner.
+#[test]
+fn significant_native_read_is_handed_to_auto_adopt_without_a_second_store_call() {
+    let raw = Arc::new(SuccessfulClaudeNative {
+        reads: AtomicUsize::new(0),
+    });
+    let access = ClaudeNativeCredentialAccess::new(raw.clone());
+
+    access
+        .read(ClaudeNativeReadEvent::AutoAdoptDiscovery)
+        .expect("discovery reads the native owner");
+    access
+        .read(ClaudeNativeReadEvent::Ordinary)
+        .expect("auto-adopt receives the one-shot handoff");
+    assert_eq!(raw.reads.load(Ordering::SeqCst), 1);
+
+    access
+        .read(ClaudeNativeReadEvent::Ordinary)
+        .expect("later read-through returns to the live owner");
+    assert_eq!(raw.reads.load(Ordering::SeqCst), 2);
+}
+
 struct StubFixedResolver {
     address: SocketAddr,
     calls: AtomicUsize,
@@ -1509,12 +1595,9 @@ fn claude_file_and_native_secret_share_parser_and_fresh_bundle() {
 
     let native = OAuthTestClaudeNative::new(CLAUDE_SECURE_STORE_FIXTURE);
     let missing_path = fixture_dir.path().join("missing-credentials.json");
-    let secure = load_claude_credential_input(
-        &missing_path,
-        &native,
-        ClaudeNativeReadEvent::Significant,
-    )
-    .expect("secure-store input");
+    let secure =
+        load_claude_credential_input(&missing_path, &native, ClaudeNativeReadEvent::Significant)
+            .expect("secure-store input");
     assert_eq!(native.reads.load(Ordering::SeqCst), 1);
 
     let file_metadata =

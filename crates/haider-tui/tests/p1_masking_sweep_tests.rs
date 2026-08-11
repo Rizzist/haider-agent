@@ -10,11 +10,8 @@
 //! * `/accounts` rows render MASKED by default; `r` reveals for the
 //!   CURRENT visit only; esc-close AND ⌃C-out both restore the mask for
 //!   the next visit (the U2 Sub-Escape-Lane, baked in from the start);
-//! * the shared "found on this device" labels mask on BOTH host screens,
-//!   and each screen owns its OWN per-visit reveal pin — a reveal on
-//!   `/accounts` never leaks onto `/providers`;
-//! * receipts (device import, OAuth completion) carry the identity
-//!   MASKED-ALWAYS — transient chrome has no reveal loop of its own (the
+//! * OAuth completion receipts carry the identity MASKED-ALWAYS — transient
+//!   chrome has no reveal loop of its own (the
 //!   login card's Done stage is pinned in `w3c3_login_tests.rs`);
 //! * the launcher header's `account <label>` segment renders the ALIAS
 //!   (grammar `[a-z0-9][a-z0-9._-]{0,63}` — never an email), so it wears
@@ -23,9 +20,7 @@
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
-use haider_rpc::DeviceCredentialCandidateWire;
-use haider_tui::app::{AppModel, AppRequest, RuntimeMode, Screen};
-use haider_tui::live::{LiveDriver, LiveReply};
+use haider_tui::app::{AppModel, AppRequest, Screen};
 use haider_tui::mock::seed_account_rows;
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -62,38 +57,6 @@ fn accounts_model() -> AppModel {
     assert_eq!(model.screen, Screen::Accounts);
     model.requests.clear();
     model.accounts.apply_snapshot(seed_account_rows(), None);
-    model
-}
-
-/// A live model carrying one discovered candidate whose `account_label`
-/// is a real signed-in email — the D2 fixture shape, state-constructed.
-fn discovery_candidates() -> Vec<DeviceCredentialCandidateWire> {
-    vec![DeviceCredentialCandidateWire {
-        candidate: "dev-codex-1".to_owned(),
-        provider: "openai".to_owned(),
-        source_label: "Codex CLI".to_owned(),
-        account_label: Some("you@work.com".to_owned()),
-        freshness: "fresh".to_owned(),
-        expires_at_ms: Some(1_999_999),
-        path: "~/.codex/auth.json".to_owned(),
-        import_supported: true,
-        unsupported_reason: None,
-    }]
-}
-
-fn live_discovery_model() -> AppModel {
-    let mut model = launcher_model();
-    model.mode = RuntimeMode::Live;
-    model.daemon_features = [haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1]
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    model.daemon_version = Some("0.0.70".to_owned());
-    model.accounts.apply_snapshot(seed_account_rows(), Some(1));
-    run_slash(&mut model, "/accounts");
-    assert_eq!(model.screen, Screen::Accounts);
-    model.requests.clear();
-    model.device.apply(discovery_candidates(), false);
     model
 }
 
@@ -171,159 +134,13 @@ fn accounts_rows_mask_by_default_and_r_reveals_per_visit() {
     );
 }
 
-/// The shared device-section labels mask on BOTH host screens, and each
-/// screen owns its OWN per-visit reveal pin: a reveal on `/accounts`
-/// never travels to `/providers`, and `/providers`' own `r` reveal resets
-/// on its next visit.
-///
-/// MUTATION CHECK (executed): render `candidate.account_label` verbatim
-/// in `push_device_candidates_section` (ignore the pin) — the masked
-/// asserts on both screens fail.
-#[test]
-fn device_labels_mask_on_both_screens_with_per_screen_reveal_pins() {
-    let mut model = live_discovery_model();
-    let frame = draw(&model, 118, 40);
-    assert!(
-        frame.contains("[1] Codex CLI · openai · y**@w***.com · fresh")
-            && !frame.contains("you@work.com"),
-        "/accounts: the label opens masked:\n{frame}"
-    );
-
-    // Reveal on /accounts…
-    model.handle(key(KeyCode::Char('r')));
-    let frame = draw(&model, 118, 40);
-    assert!(
-        frame.contains("you@work.com"),
-        "/accounts: r reveals the label:\n{frame}"
-    );
-
-    // …then walk to /providers: the reveal is the ACCOUNTS visit's, not
-    // the section's — the providers screen opens masked.
-    model.handle(key(KeyCode::Esc));
-    run_slash(&mut model, "/providers");
-    assert_eq!(model.screen, Screen::Providers);
-    model.requests.clear();
-    let frame = draw(&model, 118, 44);
-    assert!(
-        frame.contains("y**@w***.com") && !frame.contains("you@work.com"),
-        "/providers: the shared section opens masked — per-surface pins:\n{frame}"
-    );
-    assert!(
-        frame.contains("r reveals"),
-        "/providers: the key map names the reveal while a label is on screen:\n{frame}"
-    );
-
-    // /providers' own r reveals; its next visit opens masked again.
-    model.handle(key(KeyCode::Char('r')));
-    let frame = draw(&model, 118, 44);
-    assert!(
-        frame.contains("you@work.com"),
-        "/providers: r reveals the label:\n{frame}"
-    );
-    model.handle(key(KeyCode::Esc));
-    run_slash(&mut model, "/providers");
-    let frame = draw(&model, 118, 44);
-    assert!(
-        !frame.contains("you@work.com"),
-        "/providers: a new visit opens masked:\n{frame}"
-    );
-}
-
-/// RV7 (review-of-record survivor, closed): the `r` toggle writes ONLY
-/// its own surface's pin — in STATE, not just at render. A cross-screen
-/// flag leak (`/accounts`' `r` arm also assigning `providers.revealed`)
-/// SURVIVED every render-level law in this file: the enter-door resets
-/// scrub the leaked flag before any walk can draw it, so a walk alone
-/// cannot distinguish true isolation from rescue-by-reset. This law
-/// binds the flags themselves, in both directions, and keeps a render
-/// walk as the behavior half.
-///
-/// MUTATION CHECK (executed, RV7): add
-/// `self.providers.revealed = self.accounts.revealed;` to the accounts
-/// `r` arm — the first state assert fails.
-#[test]
-fn reveal_pins_are_surface_isolated_in_state_not_just_at_render() {
-    let mut model = live_discovery_model();
-
-    // r on /accounts writes the ACCOUNTS pin only.
-    model.handle(key(KeyCode::Char('r')));
-    assert!(
-        model.accounts.revealed,
-        "precondition: r revealed /accounts"
-    );
-    assert!(
-        !model.providers.revealed,
-        "a reveal on /accounts must not touch the /providers pin (state isolation)"
-    );
-
-    // The behavior half: /providers still opens masked.
-    model.handle(key(KeyCode::Esc));
-    run_slash(&mut model, "/providers");
-    assert_eq!(model.screen, Screen::Providers);
-    model.requests.clear();
-    let frame = draw(&model, 118, 44);
-    assert!(
-        !frame.contains("you@work.com"),
-        "/providers opens masked after an /accounts reveal:\n{frame}"
-    );
-
-    // Mirror: r on /providers writes the PROVIDERS pin only.
-    model.handle(key(KeyCode::Char('r')));
-    assert!(
-        model.providers.revealed,
-        "precondition: r revealed /providers"
-    );
-    assert!(
-        !model.accounts.revealed,
-        "a reveal on /providers must not touch the /accounts pin (state isolation)"
-    );
-    model.handle(key(KeyCode::Esc));
-    run_slash(&mut model, "/accounts");
-    let frame = draw(&model, 118, 40);
-    assert!(
-        !frame.contains("you@work.com"),
-        "/accounts opens masked after a /providers reveal:\n{frame}"
-    );
-}
-
-/// Receipts carry the identity MASKED-ALWAYS: the device-import receipt
-/// and the OAuth completion receipt are transient chrome with no reveal
+/// OAuth completion receipts carry the identity MASKED-ALWAYS: transient
+/// chrome has no reveal
 /// loop of their own — the durable, revealable surface is the account
 /// row the chained refresh lands.
 ///
-/// MUTATION CHECK (executed): interpolate `descriptor.identity` raw in
-/// the live driver's `DeviceImported` arm — the import-receipt asserts
-/// fail.
 #[test]
-fn import_and_oauth_receipts_mask_the_identity_always() {
-    use haider_rpc::CommandId;
-
-    // The device-import receipt (live driver).
-    let mut model = live_discovery_model();
-    let mut driver = LiveDriver::new("test");
-    driver.apply(
-        &mut model,
-        LiveReply::DeviceImported {
-            command_id: CommandId::new("cmd-import-1"),
-            descriptor: CredentialDescriptor {
-                alias: CredentialAlias::new("codex-cli"),
-                provider: "openai".into(),
-                base_url: None,
-                auth_method: AuthMethod::OAuth,
-                identity: "you@work.com · ChatGPT".into(),
-                status: CredentialStatus::Ok,
-                active: false,
-            },
-            revision: 2,
-        },
-    );
-    let message = model.device.message.as_deref().expect("receipt named");
-    assert!(
-        message.contains("y**@w***.com · ChatGPT") && !message.contains("you@work.com"),
-        "the import receipt masks the identity: {message}"
-    );
-
-    // The OAuth completion receipt (card → accounts message).
+fn oauth_receipts_mask_the_identity_always() {
     let mut model = accounts_model();
     model.handle_hit(haider_tui::app::Hit::AccountAdd(
         haider_tui::app::AccountAddKind::OpenAiOAuth,

@@ -117,10 +117,8 @@ impl crate::oauth::ClaudeNativeCredentialStore for StubClaudeNative {
     fn read(
         &self,
         _event: crate::oauth::ClaudeNativeReadEvent,
-    ) -> Result<
-        crate::oauth::ClaudeCredentialInput,
-        crate::oauth::ClaudeNativeCredentialFailure,
-    > {
+    ) -> Result<crate::oauth::ClaudeCredentialInput, crate::oauth::ClaudeNativeCredentialFailure>
+    {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.bytes
             .as_ref()

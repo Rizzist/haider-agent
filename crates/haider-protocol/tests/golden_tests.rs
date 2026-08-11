@@ -836,6 +836,20 @@ fn golden_credentials() {
         },
     );
     golden(
+        "credential_descriptor_keychain_locked",
+        &CredentialDescriptor {
+            alias: CredentialAlias::new("claude-code"),
+            provider: "anthropic-oauth".into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "Claude Max subscription · Linked to Claude Code".into(),
+            status: CredentialStatus::NeedsAttention {
+                reason: CredentialAttentionReason::KeychainLocked,
+            },
+            active: true,
+        },
+    );
+    golden(
         "rotation_event",
         &RotationEvent {
             provider: "openai".into(),
