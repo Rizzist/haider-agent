@@ -37,5 +37,11 @@ haider-store = { path = "../haider-store" }
 http = "1"
 tempfile.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
 [lints]
 workspace = true

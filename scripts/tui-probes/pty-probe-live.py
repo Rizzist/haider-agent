@@ -113,6 +113,7 @@ SCRIPT = json.dumps(
 )
 
 profile = os.environ.get("LIVE_PROBE_PROFILE") or tempfile.mkdtemp(prefix="haider-live-probe-")
+profile = probelib.require_throwaway_profile(profile)
 os.makedirs(profile, exist_ok=True)
 store = os.path.join(profile, "profile")
 os.makedirs(store, exist_ok=True)

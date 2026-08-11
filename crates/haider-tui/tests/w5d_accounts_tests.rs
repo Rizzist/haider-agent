@@ -5,7 +5,7 @@
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Screen};
+use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, Screen};
 use haider_tui::mock::{SEED_ACCOUNT_PROVIDERS, SEED_ACCOUNTS, seed_account_rows};
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -78,6 +78,59 @@ fn seed_constants_match_the_seed_list() {
     let mut providers: Vec<&str> = rows.iter().map(|row| row.provider.as_str()).collect();
     providers.dedup();
     assert_eq!(providers.len(), SEED_ACCOUNT_PROVIDERS);
+}
+
+/// MUTATION CHECK: remove the probe-alias filter from `apply_snapshot`.
+/// Expected runtime failure: the two leaked fixtures remain in the roster and
+/// render beside the real Anthropic account.
+#[test]
+fn probe_accounts_are_absent_from_the_rendered_roster() {
+    let mut model = accounts_model();
+    let rows = ["probefix-api", "probe82251-api", "anthropic-oauth"]
+        .into_iter()
+        .map(|alias| {
+            AccountRow::from_descriptor(&descriptor(alias, "anthropic-oauth", AuthMethod::OAuth))
+        })
+        .collect();
+    assert!(model.accounts.apply_snapshot(rows, Some(2)));
+
+    assert_eq!(
+        model
+            .accounts
+            .rows
+            .iter()
+            .map(|row| row.alias.as_str())
+            .collect::<Vec<_>>(),
+        ["anthropic-oauth"]
+    );
+    let frame = draw(&model, 100, 24);
+    assert!(frame.contains("anthropic-oauth"));
+    assert!(!frame.contains("probefix-api"));
+    assert!(!frame.contains("probe82251-api"));
+}
+
+/// MUTATION CHECK: broaden the filter to `contains("probe")`.
+/// Expected runtime failure: these normal, non-fixture aliases disappear.
+#[test]
+fn normal_aliases_containing_probe_are_not_hidden() {
+    let mut model = accounts_model();
+    let aliases = ["customer-probe-work", "probe-team-api", "approbe82251-api"];
+    let rows = aliases
+        .into_iter()
+        .map(|alias| {
+            AccountRow::from_descriptor(&descriptor(alias, "anthropic", AuthMethod::ApiKey))
+        })
+        .collect();
+    assert!(model.accounts.apply_snapshot(rows, Some(2)));
+    assert_eq!(
+        model
+            .accounts
+            .rows
+            .iter()
+            .map(|row| row.alias.as_str())
+            .collect::<Vec<_>>(),
+        aliases
+    );
 }
 
 /// Sim hierarchy 1:1: head · provider groups (base URL on the group header,

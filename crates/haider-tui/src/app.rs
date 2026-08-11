@@ -266,6 +266,31 @@ impl AccountRow {
     }
 }
 
+/// Probe fixtures use only these whole-alias shapes: `probefix`,
+/// `probefix-api[-N]`, or `probe<PID>-api`. Keeping the match anchored avoids
+/// hiding legitimate aliases that merely contain the word `probe`.
+#[must_use]
+pub fn is_probe_account_alias(alias: &str) -> bool {
+    if matches!(alias, "probefix" | "probefix-api") {
+        return true;
+    }
+    if let Some(index) = alias.strip_prefix("probefix-api-") {
+        return canonical_positive_decimal(index) && index != "1";
+    }
+    alias
+        .strip_prefix("probe")
+        .and_then(|suffix| suffix.strip_suffix("-api"))
+        .is_some_and(canonical_positive_decimal)
+}
+
+fn canonical_positive_decimal(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|first| matches!(first, b'1'..=b'9'))
+        && value.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+}
+
 /// The `/accounts` screen state. OPTIMISTIC SELECTION IS FORBIDDEN (report
 /// §5.1): the dot moves only when a correlated daemon result or a
 /// newer-revision snapshot applies — never on click.
@@ -352,7 +377,10 @@ impl AccountsState {
         {
             return false;
         }
-        self.rows = rows;
+        self.rows = rows
+            .into_iter()
+            .filter(|row| !is_probe_account_alias(&row.alias))
+            .collect();
         if revision.is_some() {
             self.revision = revision;
         }

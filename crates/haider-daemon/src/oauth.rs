@@ -65,6 +65,9 @@ const KIMI_REFRESH_MAX_ATTEMPTS: usize = 3;
 // unparseable import is stamped this far ahead and marked inside its vault
 // bundle for one eager refresh on first resolution.
 const CODEX_IMPORT_FALLBACK_WINDOW: Duration = Duration::from_secs(15 * 60);
+#[cfg(not(test))]
+pub(crate) const CLAUDE_CODE_CREDENTIAL_SERVICE: &str = "Claude Code-credentials";
+pub(crate) const CLAUDE_DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 #[cfg(test)]
 static OAUTH_IMPORT_READ_COUNT: std::sync::atomic::AtomicUsize =
@@ -994,17 +997,208 @@ pub(crate) fn oauth_import_path(source: &str) -> Result<PathBuf, HaiderError> {
     if let Some(path) = std::env::var_os(spec.env_override).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
+    let Some(home) = oauth_home_dir() else {
         return Err(HaiderError::new(
             ErrorCode::CredentialMissing,
             format!(
-                "cannot locate OAuth import source `{}`: HOME and {} are unset",
+                "cannot locate OAuth import source `{}`: the home directory and {} are unset",
                 spec.source, spec.env_override
             ),
             false,
         ));
     };
     Ok(PathBuf::from(home).join(spec.home_relative_path))
+}
+
+pub(crate) fn oauth_home_dir() -> Option<std::ffi::OsString> {
+    #[cfg(target_os = "windows")]
+    let names = ["USERPROFILE", "HOME"];
+    #[cfg(not(target_os = "windows"))]
+    let names = ["HOME"];
+    names
+        .into_iter()
+        .find_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
+}
+
+pub(crate) struct ClaudeCredentialInput {
+    pub location: PathBuf,
+    pub bytes: Zeroizing<Vec<u8>>,
+}
+
+pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
+    fn read(&self) -> Option<ClaudeCredentialInput>;
+}
+
+pub(crate) struct PlatformClaudeNativeCredentialStore;
+
+impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
+    fn read(&self) -> Option<ClaudeCredentialInput> {
+        platform_claude_credential()
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn platform_claude_credential() -> Option<ClaudeCredentialInput> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    use security_framework::passwords::get_generic_password;
+
+    let mut accounts = [std::env::var("USER").ok(), std::env::var("LOGNAME").ok()]
+        .into_iter()
+        .flatten()
+        .filter(|account| !account.is_empty())
+        .collect::<Vec<_>>();
+    accounts.dedup();
+    for account in accounts {
+        if let Ok(bytes) = get_generic_password(CLAUDE_CODE_CREDENTIAL_SERVICE, &account) {
+            return native_claude_input("macOS Keychain", Zeroizing::new(bytes));
+        }
+    }
+
+    let item = ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
+        .load_data(true)
+        .search()
+        .ok()?
+        .into_iter()
+        .find_map(|item| match item {
+            SearchResult::Data(bytes) => Some(bytes),
+            _ => None,
+        })?;
+    native_claude_input("macOS Keychain", Zeroizing::new(item))
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+fn platform_claude_credential() -> Option<ClaudeCredentialInput> {
+    let bytes = windows_claude_store::read()?;
+    native_claude_input(
+        "Windows Credential Manager",
+        normalize_windows_credential(bytes)?,
+    )
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+fn normalize_windows_credential(mut bytes: Zeroizing<Vec<u8>>) -> Option<Zeroizing<Vec<u8>>> {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        bytes.drain(..3);
+    }
+    let utf8_end = bytes.iter().rposition(|byte| *byte != 0)? + 1;
+    if serde_json::from_slice::<serde_json::Value>(&bytes[..utf8_end]).is_ok() {
+        bytes.truncate(utf8_end);
+        return Some(bytes);
+    }
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let big_endian = bytes.starts_with(&[0xfe, 0xff]);
+    let little_endian = bytes.starts_with(&[0xff, 0xfe]);
+    let start = usize::from(big_endian || little_endian) * 2;
+    let mut units = bytes[start..]
+        .chunks_exact(2)
+        .map(|unit| {
+            if big_endian {
+                u16::from_be_bytes([unit[0], unit[1]])
+            } else {
+                u16::from_le_bytes([unit[0], unit[1]])
+            }
+        })
+        .collect::<Zeroizing<Vec<_>>>();
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    let mut decoded = Zeroizing::new(Vec::new());
+    for character in char::decode_utf16(units.iter().copied()) {
+        let character = character.ok()?;
+        let mut encoded = [0; 4];
+        decoded.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+    }
+    serde_json::from_slice::<serde_json::Value>(&decoded)
+        .is_ok()
+        .then_some(decoded)
+}
+
+/// Minimal WinCred adapter for Claude Code's generic credential. Errors such
+/// as absent, denied, or locked are deliberately collapsed to `None` by the
+/// caller-facing seam.
+#[cfg(all(target_os = "windows", not(test)))]
+#[allow(unsafe_code)]
+mod windows_claude_store {
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::slice;
+
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+    use zeroize::Zeroizing;
+
+    use super::CLAUDE_CODE_CREDENTIAL_SERVICE;
+
+    struct CredentialGuard(*mut CREDENTIALW);
+
+    impl Drop for CredentialGuard {
+        fn drop(&mut self) {
+            unsafe { CredFree(self.0.cast::<c_void>()) };
+        }
+    }
+
+    pub(super) fn read() -> Option<Zeroizing<Vec<u8>>> {
+        // Claude Code's generic-credential target is the same stable string as
+        // its macOS Keychain service name.
+        let target = CLAUDE_CODE_CREDENTIAL_SERVICE
+            .encode_utf16()
+            .chain([0])
+            .collect::<Vec<_>>();
+        let mut credential = ptr::null_mut::<CREDENTIALW>();
+        let found = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+        if found == 0 || credential.is_null() {
+            return None;
+        }
+        let guard = CredentialGuard(credential);
+        let size = unsafe { (*guard.0).CredentialBlobSize as usize };
+        let blob = unsafe { (*guard.0).CredentialBlob };
+        if size == 0 || blob.is_null() {
+            return None;
+        }
+        Some(Zeroizing::new(
+            unsafe { slice::from_raw_parts(blob, size) }.to_vec(),
+        ))
+    }
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
+fn platform_claude_credential() -> Option<ClaudeCredentialInput> {
+    None
+}
+
+#[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
+fn native_claude_input(store: &str, bytes: Zeroizing<Vec<u8>>) -> Option<ClaudeCredentialInput> {
+    (u64::try_from(bytes.len()).ok()? <= IMPORT_FILE_LIMIT).then(|| ClaudeCredentialInput {
+        location: PathBuf::from(format!("{store}: {CLAUDE_CODE_CREDENTIAL_SERVICE}")),
+        bytes,
+    })
+}
+
+pub(crate) fn load_claude_credential_input(
+    file_path: &Path,
+    native: &dyn ClaudeNativeCredentialStore,
+) -> Result<ClaudeCredentialInput, HaiderError> {
+    match std::fs::File::open(file_path) {
+        Ok(file) => read_oauth_import_reader(file_path, "claude-code", file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            native.read().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    format!(
+                        "cannot find Claude Code credentials at `{}` or in the native secure store",
+                        file_path.display()
+                    ),
+                    false,
+                )
+            })
+        }
+        Err(error) => Err(oauth_import_read_error(file_path, "claude-code", &error)),
+    }
 }
 
 pub(crate) struct OAuthImportMaterial {
@@ -1020,9 +1214,27 @@ pub(crate) fn load_oauth_import_material(
     source: &str,
     generation: u64,
 ) -> Result<OAuthImportMaterial, HaiderError> {
+    load_oauth_import_material_with_native(source, generation, &PlatformClaudeNativeCredentialStore)
+}
+
+pub(crate) fn load_oauth_import_material_with_native(
+    source: &str,
+    generation: u64,
+    native: &dyn ClaudeNativeCredentialStore,
+) -> Result<OAuthImportMaterial, HaiderError> {
     let spec = oauth_import_source_spec(source)?;
     let path = oauth_import_path(source)?;
-    let bytes = read_oauth_import_file(&path, spec.source)?;
+    let input = if spec.source == "claude-code" {
+        load_claude_credential_input(&path, native)?
+    } else {
+        let bytes = read_oauth_import_file(&path, spec.source)?;
+        ClaudeCredentialInput {
+            location: path,
+            bytes,
+        }
+    };
+    let path = input.location;
+    let bytes = input.bytes;
     let registration = OAuthProviderCatalog::default()
         .registration(spec.provider)
         .ok_or_else(|| {
@@ -1067,29 +1279,20 @@ pub(crate) fn load_oauth_import_material(
 fn read_oauth_import_file(path: &Path, source: &str) -> Result<Zeroizing<Vec<u8>>, HaiderError> {
     #[cfg(test)]
     OAUTH_IMPORT_READ_COUNT.fetch_add(1, Ordering::SeqCst);
-    let file = std::fs::File::open(path).map_err(|error| {
-        HaiderError::new(
-            ErrorCode::CredentialMissing,
-            format!(
-                "cannot read OAuth import source `{source}` at `{}`: {error}",
-                path.display()
-            ),
-            false,
-        )
-    })?;
+    let file =
+        std::fs::File::open(path).map_err(|error| oauth_import_read_error(path, source, &error))?;
+    read_oauth_import_reader(path, source, file).map(|input| input.bytes)
+}
+
+fn read_oauth_import_reader(
+    path: &Path,
+    source: &str,
+    file: std::fs::File,
+) -> Result<ClaudeCredentialInput, HaiderError> {
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(IMPORT_FILE_LIMIT.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| {
-            HaiderError::new(
-                ErrorCode::CredentialMissing,
-                format!(
-                    "cannot read OAuth import source `{source}` at `{}`: {error}",
-                    path.display()
-                ),
-                false,
-            )
-        })?;
+        .map_err(|error| oauth_import_read_error(path, source, &error))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > IMPORT_FILE_LIMIT {
         return Err(HaiderError::new(
             ErrorCode::InvalidArgument,
@@ -1100,7 +1303,21 @@ fn read_oauth_import_file(path: &Path, source: &str) -> Result<Zeroizing<Vec<u8>
             false,
         ));
     }
-    Ok(bytes)
+    Ok(ClaudeCredentialInput {
+        location: path.to_owned(),
+        bytes,
+    })
+}
+
+fn oauth_import_read_error(path: &Path, source: &str, error: &std::io::Error) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::CredentialMissing,
+        format!(
+            "cannot read OAuth import source `{source}` at `{}`: {error}",
+            path.display()
+        ),
+        false,
+    )
 }
 
 #[derive(Deserialize)]
@@ -1240,8 +1457,7 @@ fn claude_import_bundle(
     registration: &OAuthProviderRegistration,
     generation: u64,
 ) -> Result<OAuthTokenBundleV1, HaiderError> {
-    let credentials: ClaudeCredentialsFile = serde_json::from_slice(bytes)
-        .map_err(|error| malformed_import(path, "claude-code", &error))?;
+    let credentials = parse_claude_credentials(path, bytes)?;
     let source_access_fingerprint =
         *blake3::hash(credentials.oauth.access_token.0.as_slice()).as_bytes();
     if credentials.oauth.access_token.0.is_empty()
@@ -1296,6 +1512,45 @@ fn claude_import_bundle(
     )
     .map(|bundle| bundle.with_import_source_access_fingerprint(source_access_fingerprint))
     .map_err(|_| invalid_import(path, "claude-code"))
+}
+
+fn parse_claude_credentials(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<ClaudeCredentialsFile, HaiderError> {
+    serde_json::from_slice(bytes).map_err(|error| malformed_import(path, "claude-code", &error))
+}
+
+pub(crate) struct ClaudeCredentialMetadata {
+    pub expires_at_ms: u64,
+    pub has_inference_scope: bool,
+    pub custom_client: bool,
+}
+
+pub(crate) fn parse_claude_credential_metadata(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<ClaudeCredentialMetadata, HaiderError> {
+    let credentials = parse_claude_credentials(path, bytes)?;
+    if credentials.oauth.access_token.0.is_empty()
+        || credentials.oauth.refresh_token.0.is_empty()
+        || credentials.oauth.expires_at_unix_ms == 0
+    {
+        return Err(invalid_import(path, "claude-code"));
+    }
+    Ok(ClaudeCredentialMetadata {
+        expires_at_ms: credentials.oauth.expires_at_unix_ms,
+        has_inference_scope: credentials
+            .oauth
+            .scopes
+            .iter()
+            .any(|scope| scope == "user:inference"),
+        custom_client: credentials
+            .oauth
+            .client_id
+            .as_deref()
+            .is_some_and(|client_id| client_id != CLAUDE_DEFAULT_CLIENT_ID),
+    })
 }
 
 #[derive(Deserialize)]

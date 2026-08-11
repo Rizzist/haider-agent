@@ -4783,6 +4783,17 @@ async fn select_oauth_import_alias(
     if let Some(alias) = prior_aliases.into_iter().next() {
         return Ok(CredentialAlias::new(alias));
     }
+    let default = CredentialAlias::new(default_alias);
+    if accounts.get(&default).is_some_and(|descriptor| {
+        descriptor.provider == provider
+            && descriptor.auth_method == AuthMethod::OAuth
+            && descriptor.status == CredentialStatus::Expired
+    }) {
+        // A source-less, expired default OAuth slot is safe to repair in
+        // place. Healthy/manual incarnations retain the ownership protection
+        // below and force a suffixed import instead.
+        return Ok(default);
+    }
     let mut candidate = default_alias.to_owned();
     let mut suffix = 1_u32;
     while accounts

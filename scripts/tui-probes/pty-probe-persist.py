@@ -21,13 +21,12 @@ import probelib
 
 cols, rows = int(sys.argv[1]), int(sys.argv[2])
 binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
-# Both runs share ONE profile (probelib.spawn keeps a caller-pinned dir).
+# Both runs share ONE explicitly validated throwaway profile.
 profile = tempfile.mkdtemp(prefix="haider-persist-probe-")
-os.environ["HAIDER_PROFILE_DIR"] = profile
 
 
 def run(drive):
-    pid, fd = probelib.spawn(cols, rows, binary)
+    pid, fd = probelib.spawn(cols, rows, binary, profile_dir=profile)
     sink = [b""]
     pump = probelib.make_pump(fd, sink)
     try:

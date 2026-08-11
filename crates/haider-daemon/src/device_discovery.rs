@@ -16,11 +16,14 @@ use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
-use crate::oauth::{SecretJson, oauth_import_path};
+use crate::oauth::{
+    ClaudeNativeCredentialStore, PlatformClaudeNativeCredentialStore, SecretJson,
+    load_claude_credential_input, oauth_home_dir, oauth_import_path,
+    parse_claude_credential_metadata,
+};
 
 const DISCOVERY_FILE_LIMIT: u64 = 256 * 1024;
 const EXPIRING_WINDOW_MS: u64 = 5 * 60 * 1000;
-const CLAUDE_DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const GEMINI_UNSUPPORTED_REASON: &str = "Gemini CLI OAuth credentials cannot be imported: Google does not support third-party use of Gemini CLI OAuth; use a Gemini API or Vertex AI credential instead";
 const CLAUDE_CUSTOM_CLIENT_REASON: &str =
     "Claude Code credential uses a custom OAuth client that Haider cannot safely refresh";
@@ -35,6 +38,13 @@ pub(crate) struct DeviceCandidate {
 }
 
 pub(crate) fn discover_device_candidates(disabled: bool) -> Vec<DeviceCandidate> {
+    discover_device_candidates_with_native(disabled, &PlatformClaudeNativeCredentialStore)
+}
+
+pub(crate) fn discover_device_candidates_with_native(
+    disabled: bool,
+    native: &dyn ClaudeNativeCredentialStore,
+) -> Vec<DeviceCandidate> {
     if disabled || discovery_disabled_by_env() {
         return Vec::new();
     }
@@ -42,7 +52,7 @@ pub(crate) fn discover_device_candidates(disabled: bool) -> Vec<DeviceCandidate>
     if let Some(candidate) = discover_codex() {
         candidates.push(candidate);
     }
-    if let Some(candidate) = discover_claude() {
+    if let Some(candidate) = discover_claude(native) {
         candidates.push(candidate);
     }
     if let Some(candidate) = discover_claude_unverified_path() {
@@ -151,54 +161,31 @@ fn discover_codex() -> Option<DeviceCandidate> {
     ))
 }
 
-#[derive(Deserialize)]
-struct ClaudeFile {
-    #[serde(rename = "claudeAiOauth")]
-    oauth: ClaudeOauth,
-}
-
-#[derive(Deserialize)]
-struct ClaudeOauth {
-    #[serde(rename = "accessToken")]
-    access_token: SecretJson,
-    #[serde(rename = "refreshToken")]
-    refresh_token: SecretJson,
-    #[serde(rename = "expiresAt")]
-    expires_at_ms: u64,
-    scopes: Vec<String>,
-    #[serde(default, rename = "clientId")]
-    client_id: Option<String>,
-}
-
-fn discover_claude() -> Option<DeviceCandidate> {
+fn discover_claude(native: &dyn ClaudeNativeCredentialStore) -> Option<DeviceCandidate> {
     let path = oauth_import_path("claude-code").ok()?;
-    let bytes = read_bounded(&path)?;
-    let parsed: ClaudeFile = serde_json::from_slice(&bytes).ok()?;
-    if parsed.oauth.access_token.0.is_empty()
-        || parsed.oauth.refresh_token.0.is_empty()
-        || parsed.oauth.expires_at_ms == 0
-        || !parsed
-            .oauth
-            .scopes
-            .iter()
-            .any(|scope| scope == "user:inference")
-    {
+    discover_claude_at(&path, native)
+}
+
+pub(crate) fn discover_claude_at(
+    path: &Path,
+    native: &dyn ClaudeNativeCredentialStore,
+) -> Option<DeviceCandidate> {
+    let input = load_claude_credential_input(&path, native).ok()?;
+    let parsed = parse_claude_credential_metadata(&input.location, &input.bytes).ok()?;
+    if !parsed.has_inference_scope {
         return None;
     }
-    let custom_client = parsed
-        .oauth
-        .client_id
-        .as_deref()
-        .is_some_and(|client_id| client_id != CLAUDE_DEFAULT_CLIENT_ID);
     Some(candidate(
         "claude-code",
         "anthropic-oauth",
         "Claude Code",
         None,
-        Some(parsed.oauth.expires_at_ms),
-        path,
-        !custom_client,
-        custom_client.then(|| CLAUDE_CUSTOM_CLIENT_REASON.to_owned()),
+        Some(parsed.expires_at_ms),
+        input.location,
+        !parsed.custom_client,
+        parsed
+            .custom_client
+            .then(|| CLAUDE_CUSTOM_CLIENT_REASON.to_owned()),
     ))
 }
 
@@ -394,8 +381,7 @@ pub(crate) fn env_or_home(env_name: &str, relative: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(env_name).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
+    oauth_home_dir()
         .map(PathBuf::from)
         .map(|home| home.join(relative))
 }

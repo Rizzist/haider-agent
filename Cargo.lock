@@ -1050,6 +1050,7 @@ dependencies = [
  "jsonwebtoken",
  "reqwest",
  "rustix 1.1.4",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
@@ -1058,6 +1059,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

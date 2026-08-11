@@ -7,7 +7,8 @@
 //! arm of each test only builds fixtures and supervises the child.
 #![allow(clippy::expect_used)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -81,6 +82,140 @@ fn fake_jwt(payload: &serde_json::Value) -> String {
 }
 
 const KIMI_DEVICE_ID_FIXTURE: &str = "6f2a9c31-77d4-4b8e-9a10-3c5de88f01ab";
+const CLAUDE_NATIVE_FIXTURE: &[u8] = br#"{
+  "claudeAiOauth": {
+    "accessToken": "fake-claude-native-access-token",
+    "refreshToken": "fake-claude-native-refresh-token",
+    "expiresAt": 4102444800123,
+    "scopes": ["user:inference"],
+    "subscriptionType": "max"
+  }
+}"#;
+
+struct StubClaudeNative {
+    bytes: Option<Vec<u8>>,
+    reads: AtomicUsize,
+}
+
+impl StubClaudeNative {
+    fn with_bytes(bytes: &[u8]) -> Self {
+        Self {
+            bytes: Some(bytes.to_vec()),
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            bytes: None,
+            reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl crate::oauth::ClaudeNativeCredentialStore for StubClaudeNative {
+    fn read(&self) -> Option<crate::oauth::ClaudeCredentialInput> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.bytes
+            .as_ref()
+            .map(|bytes| crate::oauth::ClaudeCredentialInput {
+                location: PathBuf::from("mock native store: Claude Code-credentials"),
+                bytes: zeroize::Zeroizing::new(bytes.clone()),
+            })
+    }
+}
+
+fn assert_native_claude_discovered() {
+    let home = fixture_home();
+    let missing_file = home.path().join(".claude/.credentials.json");
+    let native = StubClaudeNative::with_bytes(CLAUDE_NATIVE_FIXTURE);
+    let candidate = discover_claude_at(&missing_file, &native).expect("native Claude candidate");
+    assert_eq!(native.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(candidate.wire.provider, "anthropic-oauth");
+    assert_eq!(candidate.wire.source_label, "Claude Code");
+    assert_eq!(candidate.wire.freshness, "fresh");
+    assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_123));
+    assert!(candidate.wire.import_supported);
+    assert_eq!(candidate.import_source, Some("claude-code"));
+}
+
+/// Platform-agnostic coverage for the seam shared by the cfg-gated macOS and
+/// Windows adapters. The platform-specific laws below pin adapter selection.
+#[test]
+fn native_secure_store_seam_discovers_claude_when_file_is_absent() {
+    assert_native_claude_discovered();
+}
+
+/// MUTATION CHECK: bypass the native seam after a file miss. Expected runtime
+/// failure: the macOS-only candidate disappears.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_keychain_seam_discovers_claude_when_file_is_absent() {
+    assert_native_claude_discovered();
+}
+
+/// MUTATION CHECK: bypass the native seam after a file miss. Expected runtime
+/// failure: the Windows-only candidate disappears.
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_credential_manager_seam_discovers_claude_when_file_is_absent() {
+    assert_native_claude_discovered();
+}
+
+/// MUTATION CHECK: query the native store before the file. Expected runtime
+/// failure: the read counter changes and the native expiry replaces the file.
+#[test]
+fn claude_file_short_circuits_the_native_store() {
+    let home = fixture_home();
+    let file = home.path().join(".claude/.credentials.json");
+    write_store(
+        home.path(),
+        ".claude/.credentials.json",
+        br#"{
+  "claudeAiOauth": {
+    "accessToken": "fake-claude-file-access-token",
+    "refreshToken": "fake-claude-file-refresh-token",
+    "expiresAt": 4102444800999,
+    "scopes": ["user:inference"]
+  }
+}"#,
+    );
+    let native = StubClaudeNative::with_bytes(CLAUDE_NATIVE_FIXTURE);
+    let candidate = discover_claude_at(&file, &native).expect("file Claude candidate");
+    assert_eq!(native.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_999));
+    assert_eq!(candidate.wire.path, file.to_string_lossy());
+}
+
+/// MUTATION CHECK: surface native absence/denial as a discovery error. Expected
+/// runtime failure: either call panics or returns a synthetic candidate.
+#[test]
+fn claude_native_absent_or_denied_degrades_to_clean_not_found() {
+    let home = fixture_home();
+    let file = home.path().join(".claude/.credentials.json");
+    let absent = StubClaudeNative::unavailable();
+    let denied = StubClaudeNative::unavailable();
+    let absent_error = match crate::oauth::load_claude_credential_input(&file, &absent) {
+        Err(error) => error,
+        Ok(_) => panic!("absent native store unexpectedly returned a credential"),
+    };
+    let denied_error = match crate::oauth::load_claude_credential_input(&file, &denied) {
+        Err(error) => error,
+        Ok(_) => panic!("denied native store unexpectedly returned a credential"),
+    };
+    assert_eq!(
+        absent_error.code,
+        haider_protocol::error::ErrorCode::CredentialMissing
+    );
+    assert_eq!(
+        denied_error.code,
+        haider_protocol::error::ErrorCode::CredentialMissing
+    );
+    assert!(discover_claude_at(&file, &absent).is_none());
+    assert!(discover_claude_at(&file, &denied).is_none());
+    assert_eq!(absent.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(denied.reads.load(Ordering::SeqCst), 2);
+}
 
 fn codex_access_jwt() -> String {
     fake_jwt(&serde_json::json!({

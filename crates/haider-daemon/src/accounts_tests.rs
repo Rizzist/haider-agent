@@ -5674,6 +5674,44 @@ async fn oauth_import_source_ownership_tracks_the_latest_alias_incarnation() {
     store.close().await.expect("close");
 }
 
+/// MUTATION CHECK: remove the expired-default repair branch in
+/// `select_oauth_import_alias`. Expected runtime failure: the discovered
+/// Claude credential is assigned `anthropic-oauth-2` instead of superseding
+/// the unusable `anthropic-oauth` slot.
+#[tokio::test]
+async fn oauth_import_repairs_an_expired_default_alias_in_place() {
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME);
+    let descriptor = CredentialDescriptor {
+        alias,
+        provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "expired Claude subscription".to_owned(),
+        status: CredentialStatus::Expired,
+        active: true,
+    };
+    accounts
+        .add(descriptor)
+        .expect("seed expired Claude account");
+
+    let selected = select_oauth_import_alias(
+        &store,
+        &accounts,
+        "repair-expired-claude",
+        "claude-code",
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+    )
+    .await
+    .expect("select expired default alias");
+    assert_eq!(selected.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
+
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK: stamp the Codex import with a non-sanctioned issuer or
 /// serialize a token into its receipt. Expected runtime failure: the bundle
 /// metadata or secret-free receipt assertions below fail after the command

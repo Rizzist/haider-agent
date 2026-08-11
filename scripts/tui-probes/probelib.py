@@ -6,9 +6,9 @@ ink assertions looked for). This module makes the ladder an enforceable,
 hermetic gate:
 
 - ``spawn`` scrubs the child environment: NO_COLOR/CLICOLOR*/FORCE_COLOR
-  unset, TERM pinned to xterm-256color, and a throwaway HAIDER_PROFILE_DIR
-  unless the caller pinned one — results depend on the binary, never the
-  invoking shell.
+  unset, TERM pinned to xterm-256color, and an explicitly assigned,
+  validated throwaway HAIDER_PROFILE_DIR — results depend on the binary,
+  never the invoking shell.
 - ``reap`` demands a CLEAN child exit after the probe requested quit: a
   process that has to be SIGKILLed, died on a signal, or exited nonzero is
   a probe FAILURE, never background noise.
@@ -63,8 +63,38 @@ def screen_rows(frame):
     return rows
 
 
-def spawn(cols, rows, binary):
+THROWAWAY_PROFILE_PREFIXES = (
+    "haider-probe-",
+    "haider-persist-probe-",
+    "haider-live-probe-",
+)
+
+
+def require_throwaway_profile(path):
+    """Return a canonical probe profile or reject it before any child runs."""
+    resolved = os.path.realpath(os.path.abspath(os.fspath(path)))
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    try:
+        inside_temp = os.path.commonpath((resolved, temp_root)) == temp_root
+    except ValueError:
+        inside_temp = False
+    relative_parts = os.path.relpath(resolved, temp_root).split(os.sep)
+    named_as_probe = any(
+        part.startswith(THROWAWAY_PROFILE_PREFIXES) for part in relative_parts
+    )
+    if not inside_temp or not named_as_probe:
+        raise RuntimeError(
+            "probe refused non-throwaway profile: "
+            f"{resolved} (expected a temp path named {THROWAWAY_PROFILE_PREFIXES})"
+        )
+    return resolved
+
+
+def spawn(cols, rows, binary, profile_dir=None):
     """Fork the TUI under a PTY with a hermetic environment."""
+    profile = require_throwaway_profile(
+        profile_dir or tempfile.mkdtemp(prefix="haider-probe-")
+    )
     pid, fd = pty.fork()
     if pid == 0:
         # Hermetic env: the gate's result must not depend on the host
@@ -74,12 +104,7 @@ def spawn(cols, rows, binary):
         for var in ("NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "COLORTERM"):
             os.environ.pop(var, None)
         os.environ["TERM"] = "xterm-256color"
-        # TUI4c-13b: the demo persists sessions under the profile dir.
-        # Isolate every probe run in a throwaway profile unless the caller
-        # pinned one — gates never read or pollute real demo state.
-        os.environ.setdefault(
-            "HAIDER_PROFILE_DIR", tempfile.mkdtemp(prefix="haider-probe-")
-        )
+        os.environ["HAIDER_PROFILE_DIR"] = profile
         os.execv(binary, [binary, "tui", "--demo"])
     set_size(fd, cols, rows)
     os.kill(pid, signal.SIGWINCH)

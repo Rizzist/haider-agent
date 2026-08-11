@@ -19,6 +19,40 @@ const RAW_BODY_SENTINEL: &str = "RAW_TOKEN_BODY_SENTINEL_a83c";
 const SCOPES: &str = "openid inference profile";
 const AUDIENCE: &str = "fake-resource";
 
+const CLAUDE_SECURE_STORE_FIXTURE: &[u8] = br#"{
+  "claudeAiOauth": {
+    "accessToken": "fake-claude-secure-store-access",
+    "refreshToken": "fake-claude-secure-store-refresh",
+    "expiresAt": 4102444800123,
+    "scopes": ["user:inference"],
+    "subscriptionType": "max"
+  }
+}"#;
+
+struct OAuthTestClaudeNative {
+    bytes: Vec<u8>,
+    reads: AtomicUsize,
+}
+
+impl OAuthTestClaudeNative {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ClaudeNativeCredentialStore for OAuthTestClaudeNative {
+    fn read(&self) -> Option<ClaudeCredentialInput> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Some(ClaudeCredentialInput {
+            location: PathBuf::from("mock secure store: Claude Code-credentials"),
+            bytes: Zeroizing::new(self.bytes.clone()),
+        })
+    }
+}
+
 struct StubFixedResolver {
     address: SocketAddr,
     calls: AtomicUsize,
@@ -1439,6 +1473,50 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
         bundle.identity.subject_hash,
         blake3::hash(b"fake-account-id-1").to_hex().to_string()
     );
+}
+
+/// MUTATION CHECK: give native-store bytes a separate parser or bypass the
+/// file-first resolver. Expected runtime failure: the two metadata records or
+/// complete Anthropic bundles no longer agree byte-for-byte on token fields
+/// and the exact source expiry.
+#[test]
+fn claude_file_and_native_secret_share_parser_and_fresh_bundle() {
+    let fixture_dir = tempfile::tempdir().expect("Claude import fixture directory");
+    let file_path = fixture_dir.path().join(".credentials.json");
+    std::fs::write(&file_path, CLAUDE_SECURE_STORE_FIXTURE).expect("write Claude fixture");
+    let unused_native = OAuthTestClaudeNative::new(b"not JSON and must not be read");
+    let file = load_claude_credential_input(&file_path, &unused_native).expect("file input");
+    assert_eq!(unused_native.reads.load(Ordering::SeqCst), 0);
+
+    let native = OAuthTestClaudeNative::new(CLAUDE_SECURE_STORE_FIXTURE);
+    let missing_path = fixture_dir.path().join("missing-credentials.json");
+    let secure = load_claude_credential_input(&missing_path, &native).expect("secure-store input");
+    assert_eq!(native.reads.load(Ordering::SeqCst), 1);
+
+    let file_metadata =
+        parse_claude_credential_metadata(&file.location, &file.bytes).expect("file metadata");
+    let secure_metadata = parse_claude_credential_metadata(&secure.location, &secure.bytes)
+        .expect("secure-store metadata");
+    assert_eq!(file_metadata.expires_at_ms, 4_102_444_800_123);
+    assert_eq!(secure_metadata.expires_at_ms, file_metadata.expires_at_ms);
+    assert!(file_metadata.has_inference_scope && secure_metadata.has_inference_scope);
+
+    let registration = OAuthProviderCatalog::default()
+        .registration(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)
+        .expect("Anthropic OAuth registration");
+    let file_bundle =
+        claude_import_bundle(&file.location, &file.bytes, &registration, 1).expect("file bundle");
+    let secure_bundle = claude_import_bundle(&secure.location, &secure.bytes, &registration, 1)
+        .expect("secure-store bundle");
+    assert_eq!(file_bundle.provider_id, "anthropic-oauth");
+    assert_eq!(secure_bundle.provider_id, file_bundle.provider_id);
+    assert_eq!(
+        secure_bundle.expires_at_unix_ms,
+        file_bundle.expires_at_unix_ms
+    );
+    assert_eq!(secure_bundle.access_token(), file_bundle.access_token());
+    assert_eq!(secure_bundle.refresh_token(), file_bundle.refresh_token());
+    assert!(secure_bundle.expires_at_unix_ms > now_ms().expect("clock"));
 }
 
 /// MUTATION CHECK: force either body builder to ignore the registration's
