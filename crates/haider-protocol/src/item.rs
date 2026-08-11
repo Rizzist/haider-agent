@@ -65,6 +65,11 @@ pub enum TurnItem {
         kind: String,
         data: serde_json::Value,
     },
+    /// A provider refusal is visible and durable, but remains semantically
+    /// distinct from assistant text and is never replayed as an answer.
+    Refusal {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +82,12 @@ pub enum ToolStatus {
     /// Turn was cancelled while the tool was open — an outcome, never a
     /// failure (frozen law; additive variant, ADR-2).
     Cancelled,
+    /// The call was understood but refused before an effect ran.
+    Rejected,
+    /// The call could not apply against the observed workspace state.
+    Conflict,
+    /// Dispatch crossed an ambiguity boundary and the outcome is not known.
+    Unknown,
 }
 
 /// The lifecycle events. Deltas are keyed by `item_id`; `Completed` carries

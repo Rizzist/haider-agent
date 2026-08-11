@@ -1362,7 +1362,7 @@ impl GeminiDecoder {
         };
         let mut items = self.accept_frames(frames);
         if !self.terminal {
-            items.push(Err(malformed(
+            items.push(Err(stream_interrupted(
                 "Gemini SSE stream ended before a terminal finish reason",
             )));
             self.terminal = true;
@@ -1799,7 +1799,10 @@ pub fn replay_gemini_http_error(
         let lower = message.to_ascii_lowercase();
         lower.contains("overload") || lower.contains("unavailable")
     });
+    let billing_exhausted =
+        wire_status == Some("RESOURCE_EXHAUSTED") && gemini_billing_exhausted(api_error, detail);
     let kind = match status {
+        _ if billing_exhausted => ProviderErrorKind::QuotaExhausted,
         401 => ProviderErrorKind::Authentication,
         403 => ProviderErrorKind::PermissionDenied,
         429 => ProviderErrorKind::RateLimited,
@@ -1828,11 +1831,37 @@ pub fn replay_gemini_http_error(
     } else {
         None
     };
-    ProviderError::new(
-        kind,
-        format!("Gemini HTTP {status} returned {}", provider_kind_name(kind)),
-    )
-    .with_retry_after_ms(retry_after_ms)
+    let message = if kind == ProviderErrorKind::QuotaExhausted {
+        "provider quota/credit exhausted — retrying will not help; check billing or switch account"
+            .to_owned()
+    } else {
+        format!("Gemini HTTP {status} returned {}", provider_kind_name(kind))
+    };
+    ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+}
+
+fn gemini_billing_exhausted(api_error: Option<&serde_json::Value>, detail: Option<&str>) -> bool {
+    let detail_is_billing = detail.is_some_and(|message| {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("billing") || lower.contains("credit") || lower.contains("payment")
+    });
+    detail_is_billing
+        || api_error
+            .and_then(|error| error.get("details"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|details| {
+                details.iter().any(|detail| {
+                    detail
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|reason| {
+                            let upper = reason.to_ascii_uppercase();
+                            upper.contains("BILLING")
+                                || upper.contains("CREDIT")
+                                || upper.contains("PAYMENT")
+                        })
+                })
+            })
 }
 
 fn is_context_prose(message: &str) -> bool {
@@ -1929,14 +1958,14 @@ fn provider_kind_name(kind: ProviderErrorKind) -> &'static str {
         ProviderErrorKind::MalformedFrame => "malformed frame",
         ProviderErrorKind::InvalidUtf8 => "invalid UTF-8",
         ProviderErrorKind::Internal => "internal failure",
+        ProviderErrorKind::QuotaExhausted => "quota/credit exhaustion",
+        ProviderErrorKind::StreamInterrupted => "stream interruption",
+        ProviderErrorKind::ConnectionConfiguration => "connection configuration failure",
     }
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
-    ProviderError::new(
-        ProviderErrorKind::Transport,
-        format!("Gemini HTTP transport failed: {error}"),
-    )
+    crate::reqwest_transport_error("Gemini", error)
 }
 
 fn response_open_timeout_error(timeout: Duration) -> ProviderError {
@@ -1965,6 +1994,10 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
 
 fn malformed(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+}
+
+fn stream_interrupted(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::StreamInterrupted, message)
 }
 
 fn internal(message: impl Into<String>) -> ProviderError {

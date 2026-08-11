@@ -394,6 +394,8 @@ pub enum EntryDto {
         #[serde(default)]
         output_decode_error: bool,
         #[serde(default)]
+        tool_reason: Option<String>,
+        #[serde(default)]
         spoken: bool,
     },
     Note {
@@ -575,6 +577,7 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             output_tail_b64: base64::engine::general_purpose::STANDARD.encode(&block.output_tail),
             output_truncated: block.output_truncated,
             output_decode_error: block.output_decode_error,
+            tool_reason: block.tool_reason.clone(),
             spoken: block.spoken,
         },
         TranscriptEntry::Note { text } => EntryDto::Note { text: text.clone() },
@@ -805,6 +808,7 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             output_tail_b64,
             output_truncated,
             output_decode_error,
+            tool_reason,
             spoken,
         } => {
             // A restored block is FINAL: no stream survives a restart, so
@@ -821,6 +825,7 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
                 output_tail,
                 output_truncated,
                 output_decode_error,
+                tool_reason,
                 spoken,
             })
         }

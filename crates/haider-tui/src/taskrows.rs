@@ -141,9 +141,20 @@ fn completed_note(fact: &TaskCompleted) -> String {
         .rev()
         .find(|line| !line.trim().is_empty())
         .map(excerpt);
+    let unavailable = if fact.full_output_unavailable {
+        " · full output unavailable"
+    } else {
+        ""
+    };
     match tail {
-        Some(tail) => format!("└ task {} — {disposition} · {elapsed} — {tail}", fact.name),
-        None => format!("└ task {} — {disposition} · {elapsed}", fact.name),
+        Some(tail) => format!(
+            "└ task {} — {disposition} · {elapsed}{unavailable} — {tail}",
+            fact.name
+        ),
+        None => format!(
+            "└ task {} — {disposition} · {elapsed}{unavailable}",
+            fact.name
+        ),
     }
 }
 

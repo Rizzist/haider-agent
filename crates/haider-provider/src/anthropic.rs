@@ -759,10 +759,7 @@ async fn send_items(
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
-    ProviderError::new(
-        ProviderErrorKind::Transport,
-        format!("Anthropic HTTP transport failed: {error}"),
-    )
+    crate::reqwest_transport_error("Anthropic", error)
 }
 
 fn stream_idle_error(timeout: Duration) -> ProviderError {
@@ -912,7 +909,11 @@ pub fn replay_anthropic_http_error(
     let context_exceeded = parsed.as_ref().is_some_and(|envelope| {
         is_anthropic_context_error(&envelope.error.kind, &envelope.error.message)
     });
+    let billing_exhausted = parsed.as_ref().is_some_and(|envelope| {
+        anthropic_billing_exhausted(&envelope.error.kind, &envelope.error.message)
+    });
     let kind = match status {
+        _ if billing_exhausted => ProviderErrorKind::QuotaExhausted,
         401 => ProviderErrorKind::Authentication,
         403 => ProviderErrorKind::PermissionDenied,
         429 => ProviderErrorKind::RateLimited,
@@ -928,10 +929,15 @@ pub fn replay_anthropic_http_error(
             _ => ProviderErrorKind::InvalidRequest,
         },
     };
-    let message = format!(
-        "Anthropic HTTP {status} returned {}",
-        provider_kind_name(kind)
-    );
+    let message = if kind == ProviderErrorKind::QuotaExhausted {
+        "provider quota/credit exhausted — retrying will not help; check billing or switch account"
+            .to_owned()
+    } else {
+        format!(
+            "Anthropic HTTP {status} returned {}",
+            provider_kind_name(kind)
+        )
+    };
     let retry_after_ms = matches!(
         kind,
         ProviderErrorKind::RateLimited
@@ -941,6 +947,16 @@ pub fn replay_anthropic_http_error(
     .then(|| parse_retry_after(retry_after))
     .flatten();
     ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+}
+
+pub(crate) fn anthropic_billing_exhausted(kind: &str, message: &str) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    kind.contains("billing")
+        || kind.contains("credit")
+        || message.contains("billing")
+        || message.contains("credit balance")
+        || message.contains("payment required")
 }
 
 #[derive(Debug, Deserialize)]

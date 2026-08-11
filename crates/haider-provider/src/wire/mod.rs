@@ -491,7 +491,7 @@ impl SseDecoder {
                 return items;
             }
         }
-        self.fail(malformed(
+        self.fail(stream_interrupted(
             "Anthropic SSE stream ended before a message_stop event",
         ))
     }
@@ -1335,7 +1335,9 @@ pub(crate) struct WireApiError {
 }
 
 pub(crate) fn api_error(error: WireApiError) -> ProviderError {
-    let kind = if is_anthropic_context_error(&error.kind, &error.message) {
+    let kind = if crate::anthropic::anthropic_billing_exhausted(&error.kind, &error.message) {
+        ProviderErrorKind::QuotaExhausted
+    } else if is_anthropic_context_error(&error.kind, &error.message) {
         ProviderErrorKind::ContextExceeded
     } else {
         match error.kind.as_str() {
@@ -1365,6 +1367,9 @@ pub(crate) const fn provider_kind_name(kind: ProviderErrorKind) -> &'static str 
         ProviderErrorKind::MalformedFrame => "a malformed-frame error",
         ProviderErrorKind::InvalidUtf8 => "an invalid-UTF-8 error",
         ProviderErrorKind::Internal => "an internal adapter error",
+        ProviderErrorKind::QuotaExhausted => "a quota/credit-exhaustion error",
+        ProviderErrorKind::StreamInterrupted => "a stream-interruption error",
+        ProviderErrorKind::ConnectionConfiguration => "a connection-configuration error",
     }
 }
 
@@ -1405,4 +1410,8 @@ pub(crate) fn is_anthropic_context_error(kind: &str, message: &str) -> bool {
 
 fn malformed(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+}
+
+fn stream_interrupted(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::StreamInterrupted, message)
 }

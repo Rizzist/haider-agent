@@ -399,6 +399,31 @@ fn http_errors_classify_typed_without_leaking_bodies() {
     assert_eq!(context.kind, ProviderErrorKind::ContextExceeded);
 }
 
+/// LAW E1c. MUTATION: delete the billing discriminator and this ordinary 429
+/// path wins as RateLimited.
+#[test]
+fn e1c_gemini_billing_resource_exhausted_is_non_retryable_quota() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": {
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "Billing account has insufficient credit; add payment"
+        }
+    }))
+    .expect("body");
+    let error = replay_gemini_http_error(429, Some("3"), &body);
+    assert_eq!(error.kind, ProviderErrorKind::QuotaExhausted);
+    assert!(!error.retryable);
+    assert_eq!(error.retry_after_ms, None);
+
+    let ordinary = replay_gemini_http_error(
+        429,
+        Some("99"),
+        include_bytes!("fixtures/gemini/rate_limit.http.json"),
+    );
+    assert_eq!(ordinary.kind, ProviderErrorKind::RateLimited);
+    assert!(ordinary.retryable);
+}
+
 #[tokio::test]
 async fn capability_backstop_is_native_where_the_api_is_native() {
     let current = provider("gemini-2.5-flash").capabilities().await;

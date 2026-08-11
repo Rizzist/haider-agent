@@ -3,6 +3,7 @@
 
 use crate::effect::EffectClass;
 use crate::ids::ArtifactRef;
+use crate::item::ToolStatus;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,6 +89,46 @@ pub struct BoundedResult {
     /// Opaque continuation for paging the full result on demand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Honest terminal disposition. Completed is omitted to preserve the
+    /// existing success wire shape; all failure values are additive.
+    #[serde(default, skip_serializing_if = "ToolResultStatus::is_completed")]
+    pub status: ToolResultStatus,
+    /// Bounded, sanitized human-readable reason for a non-success disposition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Terminal result status carried independently of the tool-call lifecycle.
+/// New values append only: durable encodings use names, never ordinals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultStatus {
+    #[default]
+    Completed,
+    Rejected,
+    Conflict,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+impl ToolResultStatus {
+    #[must_use]
+    pub const fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    #[must_use]
+    pub const fn item_status(self) -> ToolStatus {
+        match self {
+            Self::Completed => ToolStatus::Completed,
+            Self::Rejected => ToolStatus::Rejected,
+            Self::Conflict => ToolStatus::Conflict,
+            Self::Failed => ToolStatus::Failed,
+            Self::Cancelled => ToolStatus::Cancelled,
+            Self::Unknown => ToolStatus::Unknown,
+        }
+    }
 }
 
 /// Attachment blocks — composer paste tokens and skill inclusions (§10, §9.4).

@@ -298,6 +298,8 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
                     truncated: true,
                     artifact: None,
                     cursor: Some("cursor-7".into()),
+                    status: haider_protocol::tool::ToolResultStatus::Completed,
+                    reason: None,
                 },
             },
             PromptRender::Verbatim,
@@ -909,6 +911,8 @@ async fn tool_result_is_presented_after_its_completed_tool_call() {
                     truncated: false,
                     artifact: None,
                     cursor: None,
+                    status: haider_protocol::tool::ToolResultStatus::Completed,
+                    reason: None,
                 },
             },
             PromptRender::Verbatim,
@@ -1809,6 +1813,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         tail: "test result: ok\n".into(),
         artifact: Some(ArtifactRef::new("blake3:task-output")),
         truncated: true,
+        full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredQueued,
     });
     let steered = TaskEventPayload::TaskCompleted(TaskCompleted {
@@ -1820,6 +1825,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         tail: String::new(),
         artifact: None,
         truncated: false,
+        full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredSteer,
     });
     let mut events = vec![

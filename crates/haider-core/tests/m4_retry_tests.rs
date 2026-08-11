@@ -19,7 +19,7 @@
 use async_trait::async_trait;
 use haider_core::{
     HarnessActor, HarnessConfig, HarnessHandle, MemoryStore, RetrySleeper, SubmitTurn,
-    retry_backoff_ms,
+    retry_backoff_ms, retry_jittered_backoff_ms,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -117,19 +117,25 @@ async fn m4_retryable_failure_retries_then_completes_with_visible_counter() {
         2,
         "one retry re-issued the request"
     );
-    let retrying = retrying_states(&store.events(&SessionId::new(SESSION)).await);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let run_id = events
+        .iter()
+        .find_map(|event| event.run_id.clone())
+        .expect("run id");
+    let retrying = retrying_states(&events);
+    let expected_delay = retry_jittered_backoff_ms(&run_id, 1);
     assert_eq!(retrying.len(), 1, "exactly one visible retry beat");
     assert_eq!(
         retrying[0],
         RunState::Retrying {
             attempt: 2,
             max: 10,
-            delay_ms: 1_000,
+            delay_ms: expected_delay,
             reason: WaitReason::ProviderBackoff,
         },
-        "first failure shows the NEXT attempt (2/10) with the base backoff"
+        "first failure shows the NEXT attempt (2/10) with jittered backoff"
     );
-    assert_eq!(sleeper.recorded(), vec![1_000]);
+    assert_eq!(sleeper.recorded(), vec![expected_delay]);
 }
 
 /// A non-retryable error (400/401) surfaces immediately: no `Retrying`, no
@@ -244,6 +250,10 @@ async fn m4_exhausted_retries_latch_errored_once() {
         "MAX_API_RETRIES attempts total"
     );
     let events = store.events(&SessionId::new(SESSION)).await;
+    let run_id = events
+        .iter()
+        .find_map(|event| event.run_id.clone())
+        .expect("run id");
     assert_eq!(
         retrying_states(&events).len(),
         9,
@@ -252,13 +262,15 @@ async fn m4_exhausted_retries_latch_errored_once() {
     assert_eq!(terminal_count(&events), 1, "exactly one Errored terminal");
     assert_eq!(
         sleeper.recorded(),
-        (1..=9).map(retry_backoff_ms).collect::<Vec<_>>(),
-        "the exact pure backoff sequence was waited"
+        (1..=9)
+            .map(|attempt| retry_jittered_backoff_ms(&run_id, attempt))
+            .collect::<Vec<_>>(),
+        "the exact run-scoped jitter sequence was waited"
     );
 }
 
-/// The backoff is a PURE function of the attempt (no jitter, no run-id): the
-/// sequence is exactly `min(30_000, 1_000 * 2^(attempt-1))`.
+/// The base remains pure and capped; run-scoped jitter is stable and stays in
+/// the lower half of each window.
 #[test]
 fn m4_backoff_schedule_is_a_pure_function_of_attempt() {
     let sequence: Vec<u64> = (1..=8).map(retry_backoff_ms).collect();
@@ -271,6 +283,13 @@ fn m4_backoff_schedule_is_a_pure_function_of_attempt() {
     assert_eq!(retry_backoff_ms(3), retry_backoff_ms(3));
     // Attempt 0 saturates to the base instead of underflowing.
     assert_eq!(retry_backoff_ms(0), 1_000);
+    let run = haider_protocol::ids::RunId::new("m4-jitter");
+    for attempt in 1..=8 {
+        let base = retry_backoff_ms(attempt);
+        let jittered = retry_jittered_backoff_ms(&run, attempt);
+        assert!((base / 2..=base).contains(&jittered));
+        assert_eq!(jittered, retry_jittered_backoff_ms(&run, attempt));
+    }
 }
 
 /// A failure AFTER content was committed for the turn is NEVER auto-retried —

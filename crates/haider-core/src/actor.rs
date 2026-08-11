@@ -59,7 +59,7 @@ use haider_protocol::provider::{
     UsageScope, WEB_SOURCES_EXTENSION_KIND, WebSource,
 };
 use haider_protocol::state::{RunState, WaitReason};
-use haider_protocol::tool::BoundedResult;
+use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment,
@@ -80,8 +80,8 @@ const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
 /// the original try; up to nine more re-issues follow before the failure
 /// latches `Errored`, and the status line counts `attempt K/MAX_API_RETRIES`.
 const MAX_API_RETRIES: usize = 10;
-/// Deterministic (jitter-free) exponential backoff base — see
-/// [`retry_backoff_ms`]. One second reads cleanly as `Retrying in 1s`.
+/// Exponential backoff base before the run-scoped deterministic jitter is
+/// applied. One second reads cleanly as `Retrying in 1s`.
 const RETRY_BASE_MS: u64 = 1_000;
 /// Backoff cap: a single wait never exceeds ~30s of computed delay.
 const RETRY_CEILING_MS: u64 = 30_000;
@@ -399,7 +399,7 @@ impl RetrySleeper for RealRetrySleeper {
     }
 }
 
-/// Pure, jitter-free backoff schedule for the provider-retry seam (W-C M4):
+/// Pure exponential backoff schedule for the provider-retry seam (W-C M4):
 /// `min(RETRY_CEILING_MS, RETRY_BASE_MS * 2^(attempt-1))`. `attempt` is the
 /// 1-based number of the request that FAILED (attempt 1 = the original try),
 /// so a first failure waits `RETRY_BASE_MS`. A present `retry_after_ms`
@@ -411,6 +411,18 @@ pub fn retry_backoff_ms(attempt: usize) -> u64 {
     RETRY_BASE_MS
         .saturating_mul(2_u64.saturating_pow(exponent))
         .min(RETRY_CEILING_MS)
+}
+
+/// Stable per-run jitter in the lower half of the exponential window. This
+/// avoids a reconnecting herd while keeping replayable tests deterministic.
+#[must_use]
+pub fn retry_jittered_backoff_ms(run_id: &RunId, attempt: usize) -> u64 {
+    let base = retry_backoff_ms(attempt);
+    let floor = base / 2;
+    let digest =
+        blake3::hash(format!("haider/provider-retry-jitter/{run_id}/{attempt}").as_bytes());
+    let sample = u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes"));
+    floor + sample % (base.saturating_sub(floor).saturating_add(1))
 }
 
 /// Two-phase compaction port. `plan` is journaled before `compact` performs
@@ -1363,6 +1375,7 @@ impl HarnessActor {
             let mut assistant_blocks = Vec::new();
             let mut tool_results = Vec::new();
             let mut provider_content_seen = false;
+            let mut refusal_reason = String::new();
             loop {
                 let next = tokio::select! {
                     // Cancellation owns ties. Provider progress is polled
@@ -1423,19 +1436,11 @@ impl HarnessActor {
                         )
                         .await;
                 }
-                let Some(next) = next else {
-                    let error =
-                        provider_protocol_error("provider stream closed before a finish event");
-                    return self
-                        .provider_failure_outcome_with_items(
-                            &run_id,
-                            &mut message,
-                            &mut reasoning,
-                            &mut tools,
-                            error,
-                        )
-                        .await;
-                };
+                let next = next.unwrap_or_else(|| {
+                    Err(provider_stream_interrupted(
+                        "provider stream closed before a finish event",
+                    ))
+                });
                 let event = match next {
                     Ok(event) => {
                         if !matches!(event, StreamEvent::UsageUpdate(_)) {
@@ -1566,10 +1571,11 @@ impl HarnessActor {
                             .await
                             .map(|()| None)
                     }
-                    StreamEvent::RefusalDelta { .. } => {
+                    StreamEvent::RefusalDelta { text } => {
                         // Refusal content has its own provider channel. The
                         // terminal Refusal outcome survives, but this content
                         // must never become assistant text or prompt history.
+                        append_bounded_refusal(&mut refusal_reason, &text);
                         Ok(None)
                     }
                     StreamEvent::ProviderOpaque { provider, data } => {
@@ -1708,6 +1714,13 @@ impl HarnessActor {
                                         truncated: false,
                                         artifact: None,
                                         cursor: None,
+                                        status: if is_error {
+                                            ToolResultStatus::Failed
+                                        } else {
+                                            ToolResultStatus::Completed
+                                        },
+                                        reason: is_error
+                                            .then(|| "server tool reported an error".into()),
                                     },
                                 },
                                 prompt_omit_render(),
@@ -1860,6 +1873,23 @@ impl HarnessActor {
                                     &mut tools,
                                 )
                                 .await;
+                        }
+                        if reason == FinishReason::Refusal {
+                            let reason = normalized_refusal_reason(&refusal_reason);
+                            if let Err(error) = self
+                                .commit_closed_item_omitted(&run_id, TurnItem::Refusal { reason })
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
                         }
                         if !assistant_blocks.is_empty() {
                             messages
@@ -2404,7 +2434,7 @@ impl HarnessActor {
     /// visible `attempt K/max` counter), waits through the injected sleeper,
     /// then commits `Thinking` — the R6 backoff between provider attempts.
     ///
-    /// The delay is the PURE [`retry_backoff_ms`] schedule UNLESS the provider
+    /// The delay is the run-scoped [`retry_jittered_backoff_ms`] schedule UNLESS the provider
     /// sent a `retry_after_ms`, which OVERRIDES it exactly through the
     /// one-minute respect cap. Instructions beyond the respect cap are
     /// terminalized as retryable exhaustion instead of silently shortened.
@@ -2438,10 +2468,10 @@ impl HarnessActor {
             WaitReason::ProviderBackoff
         };
         // `retry_after_ms` (429/529 Retry-After) OVERRIDES the computed
-        // backoff; otherwise use the pure exponential schedule.
+        // backoff; otherwise use the jittered exponential schedule.
         let delay_ms = error
             .retry_after_ms
-            .unwrap_or_else(|| retry_backoff_ms(failed_attempt));
+            .unwrap_or_else(|| retry_jittered_backoff_ms(run_id, failed_attempt));
         self.commit_state(
             run_id,
             RunState::Retrying {
@@ -2602,6 +2632,51 @@ impl HarnessActor {
                 "provider ended unknown tool call `{call_id}`",
             ))));
         };
+        // A delegated child may only invoke declarations present in its
+        // resolved grant-filtered pack. This actor-side fence covers the two
+        // actor-owned tools before the daemon dispatcher is reached.
+        if self.config.agent_id.is_some()
+            && !self
+                .config
+                .tools
+                .iter()
+                .any(|definition| definition.name == tools[index].name)
+        {
+            let reason = format!(
+                "grant ceiling violation: child is not allowed to use `{}`",
+                tools[index].name
+            );
+            let result = BoundedResult {
+                preview: serde_json::json!({
+                    "status": "rejected",
+                    "error": {
+                        "kind": "grant_ceiling_violation",
+                        "message": reason,
+                    }
+                })
+                .to_string(),
+                truncated: false,
+                artifact: None,
+                cursor: None,
+                status: ToolResultStatus::Rejected,
+                reason: Some(reason),
+            };
+            let call_id = tools[index].call_id.clone();
+            self.commit_payload(
+                run_id,
+                EventPayload::ToolResult {
+                    call_id: call_id.clone(),
+                    result: result.clone(),
+                },
+                prompt_verbatim_render(),
+            )
+            .await
+            .map_err(DriveError::Store)?;
+            self.commit_tool_completed(run_id, &tools[index], ToolStatus::Rejected)
+                .await?;
+            tools.remove(index);
+            return Ok(Some(Message::tool_result(call_id, result.preview, false)));
+        }
         if tools[index].name == "request_input" {
             return self
                 .complete_request_input(run_id, tools, index, cancel)
@@ -2674,7 +2749,7 @@ impl HarnessActor {
             )
             .await
             .map_err(DriveError::Store)?;
-            self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+            self.commit_tool_completed(run_id, &tools[index], result.status.item_status())
                 .await?;
             tools.remove(index);
             self.commit_state(run_id, RunState::Streaming)
@@ -2891,6 +2966,8 @@ impl HarnessActor {
                     truncated: false,
                     artifact: None,
                     cursor: None,
+                    status: ToolResultStatus::Completed,
+                    reason: None,
                 }
             }
             Err(error @ haider_tools::ToolError::InvalidArgument { .. }) => BoundedResult {
@@ -2905,6 +2982,8 @@ impl HarnessActor {
                 truncated: false,
                 artifact: None,
                 cursor: None,
+                status: ToolResultStatus::Rejected,
+                reason: Some(sanitized_failure_message(&error.to_string())),
             },
             Err(error) => return Err(tool_error_to_drive(error)),
         };
@@ -2919,7 +2998,7 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+        self.commit_tool_completed(run_id, &tools[index], result.status.item_status())
             .await?;
         tools.remove(index);
         Ok(Message::tool_result(
@@ -3086,7 +3165,7 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+        self.commit_tool_completed(run_id, &tools[index], result.status.item_status())
             .await?;
         tools.remove(index);
         self.commit_state(run_id, RunState::Streaming)
@@ -3270,6 +3349,8 @@ impl HarnessActor {
                             truncated: false,
                             artifact: None,
                             cursor: None,
+                            status: ToolResultStatus::Completed,
+                            reason: None,
                         },
                     },
                     prompt_verbatim_render(),
@@ -3362,6 +3443,13 @@ impl HarnessActor {
                 truncated: completion.truncated,
                 artifact: None,
                 cursor: None,
+                status: if completion.chip == ChipState::Error {
+                    ToolResultStatus::Failed
+                } else {
+                    ToolResultStatus::Completed
+                },
+                reason: (completion.chip == ChipState::Error)
+                    .then(|| sanitized_failure_message(&completion.report.summary)),
             };
             if !pending.report_emitted {
                 self.commit_payload(
@@ -3417,7 +3505,7 @@ impl HarnessActor {
                     ))
                 })?;
             if !pending.item_completed {
-                self.commit_tool_completed(run_id, &tools[tool_index], ToolStatus::Completed)
+                self.commit_tool_completed(run_id, &tools[tool_index], result.status.item_status())
                     .await?;
                 pending.item_completed = true;
             }
@@ -3456,6 +3544,41 @@ impl HarnessActor {
                 run_id,
                 EventPayload::Item(ItemEvent::Completed { item_id, item }),
                 prompt_verbatim_render(),
+            )
+            .map_err(DriveError::Store)?,
+        ];
+        self.store
+            .append(&mut envelopes)
+            .await
+            .map_err(DriveError::Store)?;
+        for envelope in envelopes {
+            let _ = self.events.send(envelope);
+        }
+        Ok(())
+    }
+
+    /// Persists a visible transcript item that must not be replayed to a
+    /// provider. Model refusal text is durable UI history, not assistant text.
+    async fn commit_closed_item_omitted(
+        &mut self,
+        run_id: &RunId,
+        item: TurnItem,
+    ) -> Result<(), DriveError> {
+        let item_id = self.next_item_id();
+        let mut envelopes = [
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+                prompt_omit_render(),
+            )
+            .map_err(DriveError::Store)?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+                prompt_omit_render(),
             )
             .map_err(DriveError::Store)?,
         ];
@@ -4300,6 +4423,43 @@ fn provider_protocol_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
 }
 
+fn provider_stream_interrupted(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::StreamInterrupted, message)
+}
+
+const REFUSAL_REASON_CAP: usize = 512;
+
+fn append_bounded_refusal(reason: &mut String, delta: &str) {
+    if reason.len() >= REFUSAL_REASON_CAP {
+        return;
+    }
+    let normalized: String = delta
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let remaining = REFUSAL_REASON_CAP.saturating_sub(reason.len());
+    let boundary = normalized
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= remaining)
+        .last()
+        .unwrap_or(0);
+    if normalized.len() <= remaining {
+        reason.push_str(&normalized);
+    } else {
+        reason.push_str(&normalized[..boundary]);
+    }
+}
+
+fn normalized_refusal_reason(reason: &str) -> String {
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if reason.is_empty() {
+        "The model declined to answer this request.".into()
+    } else {
+        reason
+    }
+}
+
 fn repeated_context_overflow_after_compaction() -> DriveError {
     DriveError::Provider(ProviderError::new(
         ProviderErrorKind::ContextExceeded,
@@ -4363,6 +4523,7 @@ fn provider_error_allows_retry(error: &ProviderError) -> bool {
         && matches!(
             error.kind,
             ProviderErrorKind::Transport
+                | ProviderErrorKind::StreamInterrupted
                 | ProviderErrorKind::RateLimited
                 | ProviderErrorKind::Overloaded
         )
@@ -4381,7 +4542,10 @@ fn provider_error_allows_rotation(error: &ProviderError) -> bool {
         | ProviderErrorKind::Transport
         | ProviderErrorKind::MalformedFrame
         | ProviderErrorKind::InvalidUtf8
-        | ProviderErrorKind::Internal => false,
+        | ProviderErrorKind::Internal
+        | ProviderErrorKind::QuotaExhausted
+        | ProviderErrorKind::StreamInterrupted
+        | ProviderErrorKind::ConnectionConfiguration => false,
     }
 }
 

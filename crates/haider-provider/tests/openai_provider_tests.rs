@@ -144,13 +144,13 @@ fn lk4_chat_stream_missing_done_sentinel_completes_on_eof() {
         ]
     );
 
-    // A stream truncated BEFORE any finish_reason is still an error — the
-    // tolerance is for the absent sentinel, not for a torn turn.
+    // A stream truncated BEFORE any finish_reason is a retryable stream
+    // interruption. Core only retries it when no content was committed.
     let torn = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
     let items = replay_openai_chat_sse(torn.as_bytes());
     assert!(
-        matches!(items.last(), Some(Err(error)) if error.kind == ProviderErrorKind::MalformedFrame),
-        "EOF before finish_reason stays a malformed stream"
+        matches!(items.last(), Some(Err(error)) if error.kind == ProviderErrorKind::StreamInterrupted && error.retryable),
+        "EOF before finish_reason is a retryable interrupted stream"
     );
 }
 
@@ -668,6 +668,28 @@ data: {"type":"response.failed","response":{"id":"resp_failed","status":"failed"
     assert_eq!(stream_error.kind, ProviderErrorKind::Transport);
     assert!(stream_error.retryable);
     assert!(!stream_error.message.contains("private failure detail"));
+}
+
+/// LAW E1c. MUTATION: let HTTP 429 win before the billing-code classifier;
+/// this becomes RateLimited and the assertion fails.
+#[test]
+fn e1c_openai_insufficient_quota_is_non_retryable_quota_exhausted() {
+    let body = br#"{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"private billing detail"}}"#;
+    let error = replay_openai_http_error(429, Some("1"), body);
+    assert_eq!(error.kind, ProviderErrorKind::QuotaExhausted);
+    assert!(!error.retryable);
+    assert_eq!(error.retry_after_ms, None);
+    assert!(error.message.contains("retrying will not help"));
+    assert!(!error.message.contains("private billing detail"));
+}
+
+#[test]
+fn e1e_openai_empty_stream_is_retryable_stream_interruption() {
+    let items = replay_openai_responses_sse(b"");
+    assert!(matches!(
+        items.as_slice(),
+        [Err(error)] if error.kind == ProviderErrorKind::StreamInterrupted && error.retryable
+    ));
 }
 
 /// MUTATION CHECK: remove the `overloaded_error` stream mapping.

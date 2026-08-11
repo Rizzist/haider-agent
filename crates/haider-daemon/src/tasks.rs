@@ -28,7 +28,7 @@ use haider_protocol::task::{
     TASK_CONCURRENCY_CAP, TASK_OUTPUT_RETAIN_BYTES, TASK_TAIL_BYTES, TaskCompleted,
     TaskCompletionDelivery, TaskEventPayload, TaskStarted, TaskTerminalState,
 };
-use haider_protocol::tool::BoundedResult;
+use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_tools::{
     BACKGROUND_KILL_GRACE, BackgroundExec, BackgroundExitStatus, EffectBroker, EffectOperation,
     PermissionPolicy, PidLiveness, ProcessExec, SharedTaskOutput, TaskKillHandle, ToolError,
@@ -334,6 +334,7 @@ impl TaskFacade {
                 tail: String::new(),
                 artifact: None,
                 truncated: false,
+                full_output_unavailable: false,
                 delivery: TaskCompletionDelivery::DeliveredQueued,
             };
             let mut envelopes = [self.task_fact_envelope(
@@ -399,6 +400,8 @@ impl TaskFacade {
                 truncated: false,
                 artifact: None,
                 cursor: None,
+                status: ToolResultStatus::Rejected,
+                reason: Some("background task concurrency cap reached".into()),
             });
         }
         let name = name.unwrap_or_else(|| default_task_name(&command));
@@ -487,6 +490,8 @@ impl TaskFacade {
             truncated: false,
             artifact: None,
             cursor: None,
+            status: ToolResultStatus::Completed,
+            reason: None,
         })
     }
 
@@ -508,16 +513,29 @@ impl TaskFacade {
         };
         let state = if status.killed {
             TaskTerminalState::Killed
-        } else if let Some(exit_code) = status.exit_code {
-            TaskTerminalState::Completed {
-                exit_code: Some(exit_code),
-            }
         } else if let Some(fault) = status.fault.clone() {
             TaskTerminalState::Failed {
                 reason: bounded_chars(&fault, TASK_FAILURE_REASON_CHARS),
             }
+        } else if status.exit_code == Some(0) {
+            TaskTerminalState::Completed { exit_code: Some(0) }
+        } else if let Some(exit_code) = status.exit_code {
+            TaskTerminalState::Failed {
+                reason: format!("process exited with code {exit_code}"),
+            }
+        } else if let Some(signal) = status.signal {
+            TaskTerminalState::Failed {
+                reason: if signal == 9 {
+                    "process ended by signal 9 (SIGKILL); out-of-memory termination is possible"
+                        .into()
+                } else {
+                    format!("process ended by signal {signal}")
+                },
+            }
         } else {
-            TaskTerminalState::Completed { exit_code: None }
+            TaskTerminalState::Failed {
+                reason: "process ended without an exit status".into(),
+            }
         };
         let (output_bytes, truncated, tail, retained) = {
             let buffer = lock_task_output(&entry.output);
@@ -528,14 +546,14 @@ impl TaskFacade {
                 buffer.retained().to_vec(),
             )
         };
-        let artifact = if retained.is_empty() {
-            None
+        let (artifact, full_output_unavailable) = if retained.is_empty() {
+            (None, false)
         } else {
             match self.hub.put_internal_artifact(retained).await {
-                Ok(artifact) => Some(artifact),
+                Ok(artifact) => (Some(artifact), false),
                 Err(error) => {
                     tracing::warn!(%session_id, task = %task, ?error, "task output artifact was not stored");
-                    None
+                    (None, true)
                 }
             }
         };
@@ -548,6 +566,7 @@ impl TaskFacade {
             tail,
             artifact,
             truncated,
+            full_output_unavailable,
             delivery: TaskCompletionDelivery::DeliveredQueued,
         };
         let notice =
@@ -657,6 +676,8 @@ impl TaskFacade {
             truncated: buffer.truncated(),
             artifact,
             cursor: result_cursor,
+            status: ToolResultStatus::Completed,
+            reason: None,
         })
     }
 
@@ -688,6 +709,8 @@ impl TaskFacade {
                 truncated: false,
                 artifact: None,
                 cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
             });
         }
         let operation = TaskKillEffect {
@@ -708,6 +731,8 @@ impl TaskFacade {
             truncated: false,
             artifact: None,
             cursor: None,
+            status: ToolResultStatus::Completed,
+            reason: None,
         })
     }
 
@@ -1074,6 +1099,8 @@ fn unknown_task_result(task_id: &str) -> BoundedResult {
         truncated: false,
         artifact: None,
         cursor: None,
+        status: ToolResultStatus::Unknown,
+        reason: Some("no background task with this id exists in this session".into()),
     }
 }
 

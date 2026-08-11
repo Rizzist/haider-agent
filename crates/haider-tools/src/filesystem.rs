@@ -1583,6 +1583,8 @@ fn apply_write_at(
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         },
         path: operation.path.clone(),
         bytes_hash,
@@ -1736,6 +1738,8 @@ fn apply_edit_at(
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         },
         path: operation.path.clone(),
         bytes_hash,
@@ -1854,6 +1858,8 @@ fn apply_patch_at_with_commit_hooks(
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         },
         path: operation.path.clone(),
         bytes_hash,
@@ -2526,6 +2532,8 @@ where
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         });
     }
 
@@ -2539,6 +2547,8 @@ where
         truncated: true,
         artifact: Some(artifact),
         cursor: None,
+        status: haider_protocol::tool::ToolResultStatus::Completed,
+        reason: None,
     })
 }
 
@@ -2558,6 +2568,8 @@ where
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         });
     }
     let artifact = cas.put_file(output.complete.path()).await?;
@@ -2566,6 +2578,8 @@ where
         truncated: true,
         artifact: Some(artifact),
         cursor: None,
+        status: haider_protocol::tool::ToolResultStatus::Completed,
+        reason: None,
     })
 }
 
@@ -2591,6 +2605,8 @@ where
         truncated: true,
         artifact,
         cursor: None,
+        status: haider_protocol::tool::ToolResultStatus::Completed,
+        reason: None,
     })
 }
 

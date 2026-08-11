@@ -44,6 +44,7 @@ use haider_core::{
     context_soft_threshold_tokens, estimate_provider_request_input_tokens,
     sanitized_failure_message,
 };
+use haider_protocol::agent::Grant;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
@@ -67,7 +68,7 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{
     BoundedResult, DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
-    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault, ToolResultStatus,
 };
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
@@ -510,6 +511,8 @@ pub struct WorkerToolContext {
     pub(crate) delegation: DelegationHandle,
     pub(crate) tasks: crate::tasks::TaskFacade,
     pub agent_id: Option<AgentId>,
+    /// Durable child capability ceiling; root sessions have no ceiling here.
+    pub grant: Option<Grant>,
     /// W-B: the client web_search executor for this turn (None = typed
     /// unavailable result).
     pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
@@ -2910,8 +2913,27 @@ async fn perform_manual_compaction(
             false,
         )
     })?;
-    let agent_id = delegation.agent_for_session(lease.session_id()).await?;
-    let web_degrade = lease.hub().web_degrade(lease.session_id());
+    let delegation_record = delegation.record_for_session(lease.session_id()).await?;
+    let agent_id = delegation_record
+        .as_ref()
+        .map(|record| record.agent_id.clone());
+    let grant = delegation_record
+        .as_ref()
+        .map(|record| &record.manifest.grant);
+    if let Some(grant) = grant {
+        validate_grant(grant)?;
+    }
+    let mut web_degrade = lease.hub().web_degrade(lease.session_id());
+    if grant.is_some_and(|grant| {
+        !effect_within_grant(
+            grant,
+            &EffectClass::Network {
+                host: String::new(),
+            },
+        )
+    }) {
+        web_degrade.anthropic_web_tools = true;
+    }
     let resolved = dependencies
         .provider_factory
         .resolve_for_turn_with_web(metadata, web_degrade)
@@ -2941,7 +2963,7 @@ async fn perform_manual_compaction(
     );
     let post_compaction_tools = advertised_tool_definitions(
         &dependencies.tool_factory,
-        agent_id.is_some(),
+        grant,
         &resolved.provider_name,
         web_degrade,
     );
@@ -3469,7 +3491,32 @@ async fn start_turn(
     // W-B (decision 8): the session's web-capability degrades ride into
     // pair resolution (native declarations) AND the tool pack below — ONE
     // per-turn derivation from the resolved pair.
-    let web_degrade = lease.hub().web_degrade(lease.session_id());
+    let mut web_degrade = lease.hub().web_degrade(lease.session_id());
+    let delegation = dependencies.delegation.clone().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "worker delegation coordinator is not installed",
+            false,
+        )
+    })?;
+    let delegation_record = delegation.record_for_session(lease.session_id()).await?;
+    let agent_id = delegation_record
+        .as_ref()
+        .map(|record| record.agent_id.clone());
+    let grant = delegation_record
+        .as_ref()
+        .map(|record| record.manifest.grant.clone());
+    if let Some(grant) = grant.as_ref() {
+        validate_grant(grant)?;
+        if !effect_within_grant(
+            grant,
+            &EffectClass::Network {
+                host: String::new(),
+            },
+        ) {
+            web_degrade.anthropic_web_tools = true;
+        }
+    }
     let resolved = dependencies
         .provider_factory
         .resolve_for_turn_with_web(metadata, web_degrade)
@@ -3490,17 +3537,8 @@ async fn start_turn(
         .provider_factory
         .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
         .await;
-    let delegation = dependencies.delegation.clone().ok_or_else(|| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            "worker delegation coordinator is not installed",
-            false,
-        )
-    })?;
-    let agent_id = delegation.agent_for_session(lease.session_id()).await?;
     // G1 (L5): a delegation-owned session is a child — its tool pack below
     // excludes the root-only planning surface.
-    let delegated_child = agent_id.is_some();
     let handoff_dir = delegation
         .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
         .await?;
@@ -3577,6 +3615,7 @@ async fn start_turn(
             delegation,
             tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
             agent_id: agent_id.clone(),
+            grant: grant.clone(),
             web_search: dependencies.web_search.clone(),
         })
         .await?;
@@ -3617,7 +3656,7 @@ async fn start_turn(
     ));
     config.tools = advertised_tool_definitions(
         &dependencies.tool_factory,
-        delegated_child,
+        grant.as_ref(),
         &resolved.provider_name,
         web_degrade,
     );
@@ -4613,6 +4652,106 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
     ]
 }
 
+/// The broad child request before the durable parent ceiling is applied.
+/// `todo_write` remains root-only; every other registered declaration is
+/// included and then intersected with the parent grant.
+pub(crate) fn default_child_grant() -> Grant {
+    let entries = registered_tools();
+    Grant {
+        tools: entries
+            .iter()
+            .filter(|entry| entry.route != RegisteredToolRoute::TodoWrite)
+            .map(|entry| entry.manifest.name.clone())
+            .collect(),
+        effect_ceiling: entries
+            .iter()
+            .filter(|entry| entry.route != RegisteredToolRoute::TodoWrite)
+            .flat_map(|entry| entry.manifest.effects.iter().cloned())
+            .fold(Vec::new(), |mut effects, effect| {
+                if !effects.contains(&effect) {
+                    effects.push(effect);
+                }
+                effects
+            }),
+    }
+}
+
+pub(crate) fn effect_within_grant(grant: &Grant, requested: &EffectClass) -> bool {
+    grant
+        .effect_ceiling
+        .iter()
+        .any(|ceiling| match (ceiling, requested) {
+            (
+                EffectClass::Network { host: ceiling_host },
+                EffectClass::Network {
+                    host: requested_host,
+                },
+            ) => ceiling_host.is_empty() || ceiling_host == requested_host,
+            _ => ceiling == requested,
+        })
+}
+
+pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
+    let registry = registered_tools();
+    Grant {
+        tools: requested
+            .tools
+            .into_iter()
+            .filter(|name| ceiling.tools.contains(name))
+            .filter(|name| {
+                registry
+                    .iter()
+                    .find(|entry| entry.manifest.name == *name)
+                    .is_some_and(|entry| {
+                        entry
+                            .manifest
+                            .effects
+                            .iter()
+                            .all(|effect| effect_within_grant(ceiling, effect))
+                    })
+            })
+            .collect(),
+        effect_ceiling: requested
+            .effect_ceiling
+            .into_iter()
+            .filter(|effect| effect_within_grant(ceiling, effect))
+            .collect(),
+    }
+}
+
+pub(crate) fn validate_grant(grant: &Grant) -> Result<(), HaiderError> {
+    let registry = registered_tools();
+    for name in &grant.tools {
+        let Some(entry) = registry.iter().find(|entry| entry.manifest.name == *name) else {
+            return Err(grant_corrupt(format!(
+                "delegated manifest grants unknown tool `{name}`"
+            )));
+        };
+        if !entry
+            .manifest
+            .effects
+            .iter()
+            .all(|effect| effect_within_grant(grant, effect))
+        {
+            return Err(grant_corrupt(format!(
+                "delegated manifest grants tool `{name}` above its effect ceiling"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn grant_corrupt(message: impl Into<String>) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::StoreCorrupt,
+        format!(
+            "{}; repair or recreate the delegated session before retrying",
+            message.into()
+        ),
+        false,
+    )
+}
+
 pub(crate) fn registered_tool_route(name: &str) -> Option<RegisteredToolRoute> {
     if name == "exec" {
         return Some(RegisteredToolRoute::ProcessExec);
@@ -4658,13 +4797,26 @@ fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
 /// derivation — this is the single advertisement seam.
 pub(crate) fn advertised_tool_definitions(
     tool_factory: &Arc<dyn TurnToolFactory>,
-    delegated_child: bool,
+    grant: Option<&Grant>,
     provider_name: &str,
     web_degrade: WebCapabilityDegrade,
 ) -> Vec<ToolDefinition> {
     let mut definitions = tool_factory.definitions();
-    if delegated_child {
-        definitions.retain(|definition| definition.name != "todo_write");
+    if let Some(grant) = grant {
+        let registry = registered_tools();
+        definitions.retain(|definition| {
+            grant.tools.contains(&definition.name)
+                && registry
+                    .iter()
+                    .find(|entry| entry.manifest.name == definition.name)
+                    .is_some_and(|entry| {
+                        entry
+                            .manifest
+                            .effects
+                            .iter()
+                            .all(|effect| effect_within_grant(grant, effect))
+                    })
+        });
     }
     // First-party Anthropic pairs carry the SERVER `web_fetch` tool, so the
     // local client tool is withheld — UNLESS the session's server tools
@@ -4748,6 +4900,7 @@ impl TurnToolFactory for BrokerToolFactory {
             parent_agent_id: context.agent_id,
             delegation: context.delegation,
             tasks: context.tasks,
+            grant: context.grant,
             deferred: Mutex::new(HashMap::new()),
         })))
     }
@@ -4794,6 +4947,7 @@ struct BrokerToolDispatcher {
     parent_agent_id: Option<AgentId>,
     delegation: DelegationHandle,
     tasks: crate::tasks::TaskFacade,
+    grant: Option<Grant>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
 }
 
@@ -4814,6 +4968,22 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 "tool dispatch was cancelled before start",
                 false,
             ));
+        }
+        if let Some(grant) = &self.grant {
+            let allowed = grant.tools.iter().any(|allowed| allowed == name)
+                && registered_tools()
+                    .into_iter()
+                    .find(|entry| entry.manifest.name == name)
+                    .is_some_and(|entry| {
+                        entry
+                            .manifest
+                            .effects
+                            .iter()
+                            .all(|effect| effect_within_grant(grant, effect))
+                    });
+            if !allowed {
+                return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
+            }
         }
         let mut broker_guard = self.broker.lock().await;
         let broker = broker_guard.as_mut().ok_or_else(|| {
@@ -4955,6 +5125,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         truncated: false,
                         artifact: None,
                         cursor: None,
+                        status: ToolResultStatus::Rejected,
+                        reason: Some(error.message.clone()),
                     }));
                 }
                 Err(error) => return Err(error),
@@ -4971,6 +5143,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 truncated: false,
                 artifact: None,
                 cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
             }));
         }
         let result = match route {
@@ -5154,6 +5328,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     truncated: outcome.truncated,
                                     artifact: None,
                                     cursor: None,
+                                    status: ToolResultStatus::Completed,
+                                    reason: None,
                                 })
                             }
                             Err(error) => {
@@ -5172,6 +5348,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     truncated: false,
                                     artifact: None,
                                     cursor: None,
+                                    status: ToolResultStatus::Failed,
+                                    reason: Some(crate::worker::bounded_failure_reason(&message)),
                                 })
                             }
                         }
@@ -5243,6 +5421,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         truncated: false,
                         artifact: None,
                         cursor: None,
+                        status: ToolResultStatus::Failed,
+                        reason: Some("web_search is unavailable in this session".into()),
                     }),
                     Some(executor) => {
                         match executor
@@ -5256,6 +5436,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     truncated,
                                     artifact: None,
                                     cursor: None,
+                                    status: ToolResultStatus::Completed,
+                                    reason: None,
                                 })
                             }
                             Err(failure) => {
@@ -5270,6 +5452,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     truncated: false,
                                     artifact: None,
                                     cursor: None,
+                                    status: ToolResultStatus::Failed,
+                                    reason: Some(bounded_failure_reason(&failure.message)),
                                 })
                             }
                         }
@@ -5537,8 +5721,17 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
         haider_tools::ToolError::UnreadFile { .. } => ("rejected", "unread_file"),
         haider_tools::ToolError::Conflict(_) => ("conflict", "patch_conflict"),
+        haider_tools::ToolError::EditAnchor(_) => ("conflict", "edit_anchor_count"),
         haider_tools::ToolError::InvalidArgument { .. } => ("rejected", "invalid_argument"),
-        _ => return None,
+        haider_tools::ToolError::InvalidMenuAnswer { .. } => ("rejected", "invalid_menu_answer"),
+        haider_tools::ToolError::Io { .. } => ("failed", "io"),
+        haider_tools::ToolError::Cas { .. } => ("failed", "output_store"),
+        haider_tools::ToolError::Runtime { .. } => ("failed", "runtime"),
+        haider_tools::ToolError::StaleRead { .. } => ("conflict", "stale_read"),
+        haider_tools::ToolError::AuthorizationRequired { .. }
+        | haider_tools::ToolError::Journal { .. }
+        | haider_tools::ToolError::Ledger { .. }
+        | haider_tools::ToolError::Lifecycle { .. } => return None,
     };
     Some(typed_error_result(
         status,
@@ -5569,6 +5762,12 @@ fn typed_error_result(
         truncated: false,
         artifact: None,
         cursor: None,
+        status: match status {
+            "denied" | "rejected" => ToolResultStatus::Rejected,
+            "conflict" => ToolResultStatus::Conflict,
+            _ => ToolResultStatus::Failed,
+        },
+        reason: Some(bounded_failure_reason(&error.to_string())),
     }
 }
 
@@ -5589,6 +5788,8 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
         truncated: false,
         artifact: None,
         cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(bounded_failure_reason(&refusal.message())),
     }
 }
 
@@ -5606,6 +5807,30 @@ fn recursion_limit_result() -> BoundedResult {
         truncated: false,
         artifact: None,
         cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(crate::delegation::RECURSION_LIMIT_MESSAGE.into()),
+    }
+}
+
+fn grant_ceiling_result(name: &str) -> BoundedResult {
+    let reason = bounded_failure_reason(&format!(
+        "grant ceiling violation: child is not allowed to use `{name}`"
+    ));
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "rejected",
+            "error": {
+                "kind": "grant_ceiling_violation",
+                "message": reason,
+                "details": { "tool": name },
+            }
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(reason),
     }
 }
 
@@ -5887,13 +6112,15 @@ fn optional_u64(args: &serde_json::Value, field: &str) -> Result<Option<u64>, Ha
     })
 }
 
-fn process_result(result: ProcessResult) -> BoundedResult {
+pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
     let artifact = result.artifact.clone();
     let truncated = artifact.is_some() || result.limit_reached.is_some();
+    let reason = process_failure_reason(&result);
     BoundedResult {
         preview: serde_json::json!({
             "status": result.status,
             "exit_code": result.exit_code,
+            "signal": result.signal,
             "output_bytes": result.output_bytes,
             "inline_output": result.inline_output,
             "artifact": artifact,
@@ -5908,7 +6135,47 @@ fn process_result(result: ProcessResult) -> BoundedResult {
         truncated,
         artifact,
         cursor: None,
+        status: match result.status {
+            haider_protocol::item::ToolStatus::Completed => ToolResultStatus::Completed,
+            haider_protocol::item::ToolStatus::Rejected => ToolResultStatus::Rejected,
+            haider_protocol::item::ToolStatus::Conflict => ToolResultStatus::Conflict,
+            haider_protocol::item::ToolStatus::Failed => ToolResultStatus::Failed,
+            haider_protocol::item::ToolStatus::Cancelled => ToolResultStatus::Cancelled,
+            haider_protocol::item::ToolStatus::Unknown
+            | haider_protocol::item::ToolStatus::Pending
+            | haider_protocol::item::ToolStatus::InProgress => ToolResultStatus::Unknown,
+        },
+        reason,
     }
+}
+
+fn process_failure_reason(result: &ProcessResult) -> Option<String> {
+    match result.status {
+        haider_protocol::item::ToolStatus::Completed => None,
+        haider_protocol::item::ToolStatus::Cancelled => Some("process cancelled".into()),
+        _ if result.limit_reached.is_some() => Some(format!(
+            "process exceeded {:?}",
+            result.limit_reached.expect("checked")
+        )),
+        _ if result.exit_code.is_some() => Some(format!(
+            "process exited with code {}",
+            result.exit_code.expect("checked")
+        )),
+        _ if result.signal.is_some() => Some(format!(
+            "process ended by signal {}",
+            result.signal.expect("checked")
+        )),
+        _ => result
+            .escalation_note
+            .as_deref()
+            .map(bounded_failure_reason)
+            .or_else(|| Some("process failed".into())),
+    }
+}
+
+fn bounded_failure_reason(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.chars().take(240).collect()
 }
 
 #[derive(Clone)]

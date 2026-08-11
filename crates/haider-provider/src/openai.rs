@@ -1311,7 +1311,7 @@ impl ResponsesDecoder {
             items
         } else {
             let mut items = items;
-            items.push(Err(malformed(
+            items.push(Err(stream_interrupted(
                 "OpenAI Responses SSE ended before a terminal response event",
             )));
             self.terminal = true;
@@ -1823,7 +1823,7 @@ impl ChatDecoder {
             self.terminal = true;
             items
         } else {
-            items.push(Err(malformed(
+            items.push(Err(stream_interrupted(
                 "OpenAI-compatible Chat SSE ended before [DONE] or finish_reason",
             )));
             self.terminal = true;
@@ -2178,7 +2178,12 @@ pub fn replay_openai_http_error(
                 | "input_too_large"
         )
     );
+    let quota_exhausted = matches!(
+        error_code.or(error_type),
+        Some("insufficient_quota" | "billing_hard_limit_reached" | "credit_balance_too_low")
+    );
     let kind = match status {
+        _ if quota_exhausted => ProviderErrorKind::QuotaExhausted,
         401 => ProviderErrorKind::Authentication,
         403 => ProviderErrorKind::PermissionDenied,
         429 => ProviderErrorKind::RateLimited,
@@ -2187,7 +2192,7 @@ pub fn replay_openai_http_error(
         _ if context_exceeded => ProviderErrorKind::ContextExceeded,
         _ => match error_code.or(error_type) {
             Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
-            Some("insufficient_quota" | "permission_denied") => ProviderErrorKind::PermissionDenied,
+            Some("permission_denied") => ProviderErrorKind::PermissionDenied,
             Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
             Some("server_error" | "timeout") => ProviderErrorKind::Transport,
             _ if parsed
@@ -2217,11 +2222,13 @@ pub fn replay_openai_http_error(
         let bounded: String = detail.chars().take(200).collect();
         eprintln!("openai http {status} error detail (log-only): {bounded}");
     }
-    ProviderError::new(
-        kind,
-        format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind)),
-    )
-    .with_retry_after_ms(retry_after_ms)
+    let message = if kind == ProviderErrorKind::QuotaExhausted {
+        "provider quota/credit exhausted — retrying will not help; check billing or switch account"
+            .to_owned()
+    } else {
+        format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind))
+    };
+    ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2255,7 +2262,10 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
         .or_else(|| error.get("type").and_then(serde_json::Value::as_str));
     let provider_kind = match kind {
         Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
-        Some("permission_denied" | "insufficient_quota") => ProviderErrorKind::PermissionDenied,
+        Some("permission_denied") => ProviderErrorKind::PermissionDenied,
+        Some("insufficient_quota" | "billing_hard_limit_reached" | "credit_balance_too_low") => {
+            ProviderErrorKind::QuotaExhausted
+        }
         Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
         Some("overloaded_error") => ProviderErrorKind::Overloaded,
         Some(
@@ -3666,10 +3676,7 @@ fn parse_retry_after(value: Option<&str>) -> Option<u64> {
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
-    ProviderError::new(
-        ProviderErrorKind::Transport,
-        format!("OpenAI HTTP transport failed: {error}"),
-    )
+    crate::reqwest_transport_error("OpenAI", error)
 }
 
 fn response_open_timeout_error(timeout: Duration) -> ProviderError {
@@ -3698,6 +3705,10 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
 
 fn malformed(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+}
+
+fn stream_interrupted(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::StreamInterrupted, message)
 }
 
 fn internal(message: impl Into<String>) -> ProviderError {

@@ -6904,7 +6904,10 @@ fn item_lines<'a>(
                 Span::styled(
                     format!("{} ", status_glyph(*status)),
                     match status {
-                        haider_protocol::item::ToolStatus::Failed => theme.err_style(),
+                        haider_protocol::item::ToolStatus::Rejected
+                        | haider_protocol::item::ToolStatus::Conflict
+                        | haider_protocol::item::ToolStatus::Failed
+                        | haider_protocol::item::ToolStatus::Unknown => theme.err_style(),
                         haider_protocol::item::ToolStatus::Cancelled => theme.dim_style(),
                         // Sim ToolRow `.glyph` while running: warn ink,
                         // PULSING (tui.js:4524-4530, 1.1s).
@@ -6934,6 +6937,16 @@ fn item_lines<'a>(
             }
             if !meta.is_empty() {
                 spans.push(Span::styled(format!("  {meta}"), theme.faint_style()));
+            }
+            if let Some(reason) = &block.tool_reason {
+                let used = Line::from(spans.clone()).width();
+                let budget = (width as usize).saturating_sub(used + 3);
+                if budget > 0 {
+                    spans.push(Span::styled(
+                        format!(" · {}", ellipsize(reason, budget)),
+                        theme.err_style(),
+                    ));
+                }
             }
             lines.push(Line::from(spans));
             // W8b (research risk 10): a process tool's streamed output was
@@ -7071,6 +7084,12 @@ fn item_lines<'a>(
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(text, theme.gold_style()),
+            ]));
+        }
+        TurnItem::Refusal { reason } => {
+            lines.push(Line::from(vec![
+                Span::styled("  ✗ model refused — ", theme.err_style()),
+                Span::styled(reason.as_str(), theme.text_style()),
             ]));
         }
         TurnItem::Extension { kind, .. } => {

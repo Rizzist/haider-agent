@@ -6271,7 +6271,10 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             | ProviderErrorKind::Transport
             | ProviderErrorKind::MalformedFrame
             | ProviderErrorKind::InvalidUtf8
-            | ProviderErrorKind::Internal => {
+            | ProviderErrorKind::Internal
+            | ProviderErrorKind::QuotaExhausted
+            | ProviderErrorKind::StreamInterrupted
+            | ProviderErrorKind::ConnectionConfiguration => {
                 return Ok(haider_core::ProviderAttemptDecision::Wait);
             }
         };

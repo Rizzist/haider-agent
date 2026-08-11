@@ -2044,3 +2044,20 @@ fn m5_classifier_blocks_added_special_use_ranges_both_directions() {
         "ordinary public v6 must stay allowed"
     );
 }
+/// LAW E1e: invalid endpoint/configuration failures bypass connection retry.
+/// MUTATION: route every reqwest error through Transport and this fails.
+#[tokio::test]
+async fn e1e_invalid_endpoint_is_permanent_connection_configuration() {
+    let reqwest_error = reqwest::Client::new()
+        .get("://invalid endpoint")
+        .send()
+        .await
+        .expect_err("invalid URL");
+    let error = super::transport_error(reqwest_error);
+    assert_eq!(
+        error.kind,
+        crate::ProviderErrorKind::ConnectionConfiguration
+    );
+    assert!(!error.retryable);
+    assert!(error.message.contains("connection configuration failed"));
+}

@@ -15,8 +15,11 @@ pub const fn status_glyph(status: ToolStatus) -> &'static str {
         ToolStatus::Pending => "…",
         ToolStatus::InProgress => "◐",
         ToolStatus::Completed => "✓",
+        ToolStatus::Rejected => "✗",
+        ToolStatus::Conflict => "✗",
         ToolStatus::Failed => "✗",
         ToolStatus::Cancelled => "⊘",
+        ToolStatus::Unknown => "?",
     }
 }
 
@@ -277,7 +280,11 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             out.push('\n');
         }
         TurnItem::ToolCall { name, status, .. } => {
-            out.push_str(&format!("⚒ {name} {}\n", status_glyph(*status)));
+            out.push_str(&format!("⚒ {name} {}", status_glyph(*status)));
+            if let Some(reason) = &block.tool_reason {
+                out.push_str(&format!(" · {reason}"));
+            }
+            out.push('\n');
         }
         TurnItem::CommandExecution {
             command,
@@ -335,6 +342,7 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             )),
             _ => out.push_str("⊟ context compacted\n"),
         },
+        TurnItem::Refusal { reason } => out.push_str(&format!("✗ model refused — {reason}\n")),
         TurnItem::Extension { kind, .. } => out.push_str(&format!("⋯ {kind}\n")),
     }
 }

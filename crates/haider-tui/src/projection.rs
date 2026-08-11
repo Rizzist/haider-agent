@@ -81,6 +81,8 @@ pub struct ItemBlock {
     pub output_truncated: bool,
     /// True if any output chunk failed base64 decoding (chunk skipped).
     pub output_decode_error: bool,
+    /// Bounded terminal reason joined from the matching `ToolResult` fact.
+    pub tool_reason: Option<String>,
     /// The block was produced during a voice turn — the agent header tags
     /// ` · ♪ speaking` (sim tui.js:3895-3897; demo-local voice surface).
     pub spoken: bool,
@@ -96,6 +98,7 @@ impl ItemBlock {
             output_tail: Vec::new(),
             output_truncated: false,
             output_decode_error: false,
+            tool_reason: None,
             spoken: false,
         }
     }
@@ -200,6 +203,8 @@ pub struct SessionProjection {
     /// stale `Started`) for one of these is idempotently ignored (replace
     /// semantics: one item, one block, ever).
     finished_items: std::collections::HashSet<ItemId>,
+    /// Results may precede or follow their completed item during attach.
+    pending_tool_results: std::collections::HashMap<String, haider_protocol::tool::BoundedResult>,
     menu: Option<Menu>,
     /// Menu-id → opening scope (report R11 cut 2). Stream-scoped: hydration
     /// starts it empty, and a menu with no recorded opening falls back to
@@ -419,6 +424,7 @@ impl SessionProjection {
                 from_main: false,
             }),
             EventPayload::Item(event) => self.apply_item(event),
+            EventPayload::ToolResult { call_id, result } => self.apply_tool_result(call_id, result),
             EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
             // The failed run's PUBLIC reason joins the transcript (W5g-6):
             // the envelope always carried it; only the badge ever showed.
@@ -512,10 +518,32 @@ impl SessionProjection {
             // Consumed by later waves (effects timeline, subagent tree,
             // accounts). The projection stays tolerant of them now.
             EventPayload::Effect(_)
-            | EventPayload::ToolResult { .. }
             | EventPayload::AgentSpawned(_)
             | EventPayload::AgentReport(_)
             | EventPayload::AgentChipState { .. } => {}
+        }
+    }
+
+    fn apply_tool_result(&mut self, call_id: &str, result: &haider_protocol::tool::BoundedResult) {
+        let reason = bounded_tool_reason(result);
+        if let Some(block) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            TranscriptEntry::Item(block) => match &mut block.item {
+                TurnItem::ToolCall {
+                    call_id: known,
+                    status,
+                    ..
+                } if known == call_id => {
+                    *status = result.status.item_status();
+                    Some(block)
+                }
+                _ => None,
+            },
+            _ => None,
+        }) {
+            block.tool_reason = reason;
+        } else {
+            self.pending_tool_results
+                .insert(call_id.to_owned(), result.clone());
         }
     }
 
@@ -671,6 +699,11 @@ impl SessionProjection {
                                 self.voice_live,
                             )));
                     }
+                }
+                if let TurnItem::ToolCall { call_id, .. } = item
+                    && let Some(result) = self.pending_tool_results.remove(call_id)
+                {
+                    self.apply_tool_result(call_id, &result);
                 }
             }
         }
@@ -1106,6 +1139,15 @@ impl SessionProjection {
     pub fn duplicate_items(&self) -> u64 {
         self.duplicate_items
     }
+}
+
+fn bounded_tool_reason(result: &haider_protocol::tool::BoundedResult) -> Option<String> {
+    if result.status.is_completed() {
+        return None;
+    }
+    let reason = result.reason.as_deref().unwrap_or("tool did not complete");
+    let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(normalized.chars().take(240).collect())
 }
 
 /// The sim's badge PULSE set, verbatim (tui.js:5558-5563:

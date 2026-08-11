@@ -1141,6 +1141,8 @@ impl ToolDispatcher for CompletingDispatcher {
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         }))
     }
 }
@@ -1165,6 +1167,8 @@ impl ToolDispatcher for LargeResultDispatcher {
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         }))
     }
 }
@@ -2350,6 +2354,8 @@ impl ToolDispatcher for BoundaryRecordingDispatcher {
             truncated: false,
             artifact: None,
             cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
         }))
     }
 }
