@@ -58,6 +58,7 @@ fn haider_command(store: &Path) -> Command {
     let mut command = Command::new(haider_binary());
     command
         .env("HAIDER_PROFILE_DIR", store)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

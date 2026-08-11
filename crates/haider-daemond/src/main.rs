@@ -159,7 +159,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    match (profile, store_dir, runtime_dir) {
+    let mut config = match (profile, store_dir, runtime_dir) {
         (Some(profile), Some(store_dir), Some(runtime_dir)) => {
             let env = haider_client::ProfileEnv::capture();
             // The identity flags are explicit, but the release-owned default
@@ -169,7 +169,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
                 .map_err(|error| format!("cannot resolve default model: {error}"))?;
             let mut config = DaemonConfig::new(profile, store_dir, runtime_dir);
             config.default_model = default_model;
-            Ok(config)
+            config
         }
         (None, None, None) => {
             let env = haider_client::ProfileEnv::capture();
@@ -181,12 +181,22 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
                 resolved.runtime_dir,
             );
             config.default_model = resolved.default_model;
-            Ok(config)
+            config
         }
-        _ => Err(
-            "--profile, --store-dir, and --runtime-dir must be given together (or all omitted \
-             to resolve the shared default profile)"
-                .into(),
-        ),
+        _ => {
+            return Err(
+                "--profile, --store-dir, and --runtime-dir must be given together (or all \
+                 omitted to resolve the shared default profile)"
+                    .into(),
+            );
+        }
+    };
+    // `HAIDER_DISCOVERY_DISABLED` (any value but `0`): never probe first-party
+    // device credential stores. Tests and CI set this so startup
+    // auto-adoption cannot read the HOST machine's real codex/Claude/kimi
+    // credentials into a throwaway profile.
+    if std::env::var_os("HAIDER_DISCOVERY_DISABLED").is_some_and(|value| value != "0") {
+        config.discovery_disabled = true;
     }
+    Ok(config)
 }

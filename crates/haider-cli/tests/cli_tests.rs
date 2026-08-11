@@ -72,6 +72,10 @@ fn haider() -> HaiderCommand {
     command
         .current_dir(&workspace)
         .env("HAIDER_PROFILE_DIR", &profile)
+        // Hermetic accounts: startup auto-adoption (A2) would otherwise read
+        // the HOST machine's real codex/Claude credentials into this
+        // throwaway profile — "no active account" tests stop being true.
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
         .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT);
     HaiderCommand {
         command,
@@ -392,6 +396,7 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
         Command::new(env!("CARGO_BIN_EXE_haider"))
             .args(["run", "--provider", "fake", "--jsonl", prompt])
             .env("HAIDER_PROFILE_DIR", &profile)
+            .env("HAIDER_DISCOVERY_DISABLED", "1")
             .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
             .output()
             .expect("binary runs")

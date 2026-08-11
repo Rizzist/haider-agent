@@ -251,6 +251,7 @@ fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
         let output = Command::new(env!("CARGO_BIN_EXE_haider"))
             .args(command)
             .env("HAIDER_PROFILE_DIR", &profile_dir)
+            .env("HAIDER_DISCOVERY_DISABLED", "1")
             .env_remove("XDG_RUNTIME_DIR")
             .output()
             .expect("run no-spawn observe command");
