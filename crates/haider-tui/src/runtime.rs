@@ -2268,6 +2268,9 @@ impl Player {
                 source: UsageSource::Estimated,
                 account: None,
                 accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
             }))
         };
         for beat in beats {
@@ -2538,10 +2541,11 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
     for payload in demo_script() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
-    crate::plain::render_plain(
+    crate::plain::render_plain_with_cache(
         &model.projection,
         model.identity.context_window,
         model.throughput_readout().as_ref(),
+        &model.cache_usage,
     )
 }
 

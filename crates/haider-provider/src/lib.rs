@@ -74,13 +74,17 @@ pub use openai::{
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
     OpenAiTransportConfig, azure_openai_origin, codex_alpha_search_request_body,
-    codex_alpha_search_response_text, codex_alpha_search_url, replay_deepseek_models_response,
-    replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
-    replay_openai_models_response, replay_openai_responses_sse,
-    validate_openai_compatible_endpoint,
+    codex_alpha_search_response_text, codex_alpha_search_url, replay_deepseek_chat_sse,
+    replay_deepseek_models_response, replay_kimi_chat_sse, replay_kimi_models_response,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_responses_sse, validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
-pub use pricing::{MODEL_RATES, ModelRate, estimate_chunk_cost_usd, model_rate};
+pub use pricing::{
+    CACHE_PRICING_POLICIES, CachePricingPolicy, CacheReadSemantics, MODEL_RATES, ModelRate,
+    cache_pricing_policy, estimate_cache_input_costs, estimate_chunk_cost_usd,
+    estimate_normalized_usage_cost_usd, model_rate,
+};
 pub use usage::{
     ANTHROPIC_OAUTH_USAGE_URL, ANTHROPIC_OAUTH_USAGE_USER_AGENT, KIMI_OAUTH_USAGE_URL,
     MeterReading, MeterUnavailable, OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint,

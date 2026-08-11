@@ -70,6 +70,7 @@ fn stats(sessions: u64, est_cost_usd: Option<f64>) -> LocalUsageStatsV1 {
         est_cost_usd,
         lines_added: 1240,
         lines_removed: 380,
+        cache: haider_protocol::usage::CacheUsageStatsV1::default(),
     }
 }
 

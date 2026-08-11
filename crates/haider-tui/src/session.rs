@@ -54,6 +54,7 @@ pub struct SessionState {
     /// Working dir (sim `s.dir`).
     pub dir: String,
     pub projection: SessionProjection,
+    pub cache_usage: crate::cache_usage::SessionUsageFold,
     pub chips: Vec<ChipModel>,
     /// This session's branch registry, active-branch selection, warm parked
     /// views and fork-coordinate tracker (B2b m1). The `projection`/`chips`
@@ -131,6 +132,7 @@ impl SessionState {
             head_ros: None,
             dir: String::new(),
             projection: SessionProjection::new(),
+            cache_usage: crate::cache_usage::SessionUsageFold::default(),
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
@@ -354,6 +356,9 @@ impl SessionState {
         at_ms: u64,
     ) {
         use crate::branch::BranchScope;
+        if let EventPayload::Usage(usage) = payload {
+            self.cache_usage.note(usage);
+        }
         match self.branch_state.scope_of(payload, branch) {
             BranchScope::Aggregate => {
                 self.branch_state.apply_aggregate_to_parked(payload);
@@ -420,6 +425,9 @@ impl SessionState {
     /// demo driver's background arm calls this directly with its scripted
     /// payloads (which carry no envelope, so no scope and no cursor).
     pub fn absorb_envelope(&mut self, payload: &EventPayload) {
+        if let EventPayload::Usage(usage) = payload {
+            self.cache_usage.note(usage);
+        }
         if let EventPayload::UserMessage { .. } = payload {
             self.turn_active = true;
         }

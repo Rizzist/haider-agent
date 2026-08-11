@@ -912,6 +912,7 @@ fn golden_usage_report_v1() {
                         est_cost_usd: None,
                         lines_added: 240,
                         lines_removed: 60,
+                        cache: CacheUsageStatsV1::default(),
                     },
                 },
                 AccountUsageReportV1 {
@@ -931,6 +932,7 @@ fn golden_usage_report_v1() {
                         est_cost_usd: Some(0.08),
                         lines_added: 12,
                         lines_removed: 4,
+                        cache: CacheUsageStatsV1::default(),
                     },
                 },
             ],
@@ -996,8 +998,66 @@ fn golden_usage_account_tagged() {
             source: UsageSource::ProviderReported,
             account: Some(CredentialAlias::new("personal-max")),
             accounts: Vec::new(),
+            normalized: Some(NormalizedUsage {
+                logical_input: 1_800,
+                uncached_input: 1_000,
+                cache_read_input: 800,
+                cache_write_input: 200,
+                cache_write_5m_input: 200,
+                cache_write_1h_input: 0,
+                billed_output: 200,
+                reasoning_detail: 50,
+                reasoning_accounting: ReasoningAccounting::SubsetOfOutput,
+                cache_status: CacheStatAvailability::Present,
+                cache_write_status: CacheStatAvailability::Present,
+                cache_write_ttl_status: CacheStatAvailability::Present,
+                cache_telemetry_input: 1_800,
+                explicit_cache_storage_token_hours: None,
+            }),
+            scope: Some(UsageScope {
+                provider: "anthropic-oauth".into(),
+                model: "claude-sonnet-5".into(),
+                account_scope: Some(CredentialAlias::new("personal-max")),
+                auth_scope: "oauth_subscription".into(),
+                cache_epoch: "epoch-7".into(),
+                request_kind: UsageRequestKind::MainTurn,
+                run: Some(RunId::new("run-7")),
+                agent: None,
+                prefix_digests: Some(PrefixDigests {
+                    system: "system-digest".into(),
+                    tools: "tools-digest".into(),
+                    immutable_history: "history-digest".into(),
+                    model: "model-digest".into(),
+                    auth_mode: "auth-digest".into(),
+                    reasoning_settings: "reasoning-digest".into(),
+                }),
+            }),
+            cache_cost: Some(CacheCostEstimate {
+                input_with_cache_usd: 0.001,
+                input_without_cache_usd: 0.0054,
+                estimated_savings_usd: 0.0044,
+                explicit_storage_usd: 0.0,
+            }),
         },
     );
+}
+
+/// CM1 protocol extension law: every normalized/cache-domain field is
+/// additive, so a pre-CM1 usage payload still decodes with no invented cache
+/// telemetry or cost.
+#[test]
+fn cm1_normalized_usage_fields_are_additive() {
+    use haider_protocol::provider::{Usage, UsageSource};
+
+    let usage: Usage = serde_json::from_str(
+        r#"{"input":42,"output":7,"reasoning":3,"cached":0,"source":"provider_reported"}"#,
+    )
+    .expect("pre-CM1 usage decodes");
+    assert_eq!(usage.input, 42);
+    assert_eq!(usage.source, UsageSource::ProviderReported);
+    assert_eq!(usage.normalized, None);
+    assert_eq!(usage.scope, None);
+    assert_eq!(usage.cache_cost, None);
 }
 
 /// MUTATION CHECK: relabel an estimated footprint as exact, omit a token

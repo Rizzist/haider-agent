@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use haider_protocol::ids::CredentialAlias;
-use haider_protocol::provider::{Block, FinishReason, StreamEvent, Usage, UsageSource, WebSource};
+use haider_protocol::provider::{
+    Block, CacheStatAvailability, FinishReason, NormalizedUsage, ReasoningAccounting, StreamEvent,
+    Usage, UsageSource, WebSource,
+};
 use haider_protocol::tool::AttachmentBlock;
 use serde::Deserialize;
 
@@ -868,16 +871,21 @@ impl StreamState {
                 let input = self
                     .input
                     .input_tokens
-                    .checked_add(self.input.cache_creation_input_tokens)
+                    .unwrap_or(0)
+                    .checked_add(self.input.cache_creation_input_tokens.unwrap_or(0))
                     .ok_or_else(|| malformed("Anthropic input usage counter overflowed u64"))?;
+                let normalized = self.input.normalized(usage.output_tokens.unwrap_or(0))?;
                 Ok(vec![StreamEvent::UsageUpdate(Usage {
                     input,
                     output: usage.output_tokens.unwrap_or(0),
                     reasoning: 0,
-                    cached: self.input.cache_read_input_tokens,
+                    cached: normalized.cache_read_input,
                     source: UsageSource::ProviderReported,
                     account: self.account.clone(),
                     accounts: Vec::new(),
+                    normalized: Some(normalized),
+                    scope: None,
+                    cache_cost: None,
                 })])
             }
             WireEvent::MessageStop => {
@@ -920,26 +928,96 @@ impl StreamState {
 
 #[derive(Debug, Default)]
 struct InputUsage {
-    input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    cache_read_input_tokens: u64,
+    input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_write_5m_input_tokens: Option<u64>,
+    cache_write_1h_input_tokens: Option<u64>,
 }
 
 impl InputUsage {
     fn update(&mut self, usage: &WireUsage) -> Result<(), ProviderError> {
         if let Some(value) = usage.input_tokens {
-            self.input_tokens = value;
+            self.input_tokens = Some(value);
         }
         if let Some(value) = usage.cache_creation_input_tokens {
-            self.cache_creation_input_tokens = value;
+            self.cache_creation_input_tokens = Some(value);
         }
         if let Some(value) = usage.cache_read_input_tokens {
-            self.cache_read_input_tokens = value;
+            self.cache_read_input_tokens = Some(value);
+        }
+        if let Some(cache_creation) = &usage.cache_creation {
+            if let Some(value) = cache_creation.ephemeral_5m_input_tokens {
+                self.cache_write_5m_input_tokens = Some(value);
+            }
+            if let Some(value) = cache_creation.ephemeral_1h_input_tokens {
+                self.cache_write_1h_input_tokens = Some(value);
+            }
         }
         self.input_tokens
-            .checked_add(self.cache_creation_input_tokens)
+            .unwrap_or(0)
+            .checked_add(self.cache_creation_input_tokens.unwrap_or(0))
             .ok_or_else(|| malformed("Anthropic input usage counter overflowed u64"))?;
         Ok(())
+    }
+
+    fn normalized(&self, billed_output: u64) -> Result<NormalizedUsage, ProviderError> {
+        let input = self.input_tokens.unwrap_or(0);
+        let write = self.cache_creation_input_tokens.unwrap_or(0);
+        let read = self.cache_read_input_tokens.unwrap_or(0);
+        let uncached = input
+            .checked_add(write)
+            .ok_or_else(|| malformed("Anthropic uncached usage counter overflowed u64"))?;
+        let logical = uncached
+            .checked_add(read)
+            .ok_or_else(|| malformed("Anthropic logical usage counter overflowed u64"))?;
+        let cache_status = if self.input_tokens.is_some()
+            && self.cache_creation_input_tokens.is_some()
+            && self.cache_read_input_tokens.is_some()
+        {
+            CacheStatAvailability::Present
+        } else {
+            CacheStatAvailability::Unavailable
+        };
+        let ttl_sum = self
+            .cache_write_5m_input_tokens
+            .zip(self.cache_write_1h_input_tokens)
+            .and_then(|(five, one)| five.checked_add(one));
+        let ttl_present = ttl_sum == self.cache_creation_input_tokens;
+        Ok(if cache_status == CacheStatAvailability::Present {
+            NormalizedUsage {
+                logical_input: logical,
+                uncached_input: uncached,
+                cache_read_input: read,
+                cache_write_input: write,
+                cache_write_5m_input: self.cache_write_5m_input_tokens.unwrap_or(0),
+                cache_write_1h_input: self.cache_write_1h_input_tokens.unwrap_or(0),
+                billed_output,
+                reasoning_accounting: ReasoningAccounting::Unavailable,
+                cache_status,
+                cache_write_status: CacheStatAvailability::Present,
+                cache_write_ttl_status: if ttl_present {
+                    CacheStatAvailability::Present
+                } else {
+                    CacheStatAvailability::Unavailable
+                },
+                cache_telemetry_input: logical,
+                ..NormalizedUsage::default()
+            }
+        } else {
+            NormalizedUsage {
+                logical_input: logical,
+                uncached_input: logical,
+                billed_output,
+                cache_write_input: write,
+                cache_write_status: if self.cache_creation_input_tokens.is_some() {
+                    CacheStatAvailability::Present
+                } else {
+                    CacheStatAvailability::Unavailable
+                },
+                ..NormalizedUsage::default()
+            }
+        })
     }
 }
 
@@ -1083,6 +1161,16 @@ struct WireUsage {
     cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation: Option<WireCacheCreation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

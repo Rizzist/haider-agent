@@ -8,6 +8,7 @@
 
 use crate::credential::AuthMethod;
 use crate::ids::CredentialAlias;
+use crate::provider::{CacheStatAvailability, UsageRequestKind};
 use serde::{Deserialize, Serialize};
 
 /// One `usage.report` snapshot: every known account with its meter state and
@@ -96,4 +97,74 @@ pub struct LocalUsageStatsV1 {
     pub lines_added: u64,
     #[serde(default)]
     pub lines_removed: u64,
+    /// Additive cache/pricing detail for the journal-derived counters.
+    #[serde(default, skip_serializing_if = "CacheUsageStatsV1::is_empty")]
+    pub cache: CacheUsageStatsV1,
+}
+
+/// Cache-aware local totals. Costs are input-only because output cost is
+/// unchanged by prompt caching.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheUsageStatsV1 {
+    pub logical_input_tokens: u64,
+    pub uncached_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_5m_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub billed_output_tokens: u64,
+    /// Logical input backed by a provider-reported cache split.
+    pub telemetry_covered_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_with_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_without_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_savings_usd: Option<f64>,
+    #[serde(default)]
+    pub breakdowns: Vec<CacheUsageBreakdownV1>,
+}
+
+impl CacheUsageStatsV1 {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.logical_input_tokens == 0
+            && self.uncached_input_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+            && self.cache_write_5m_tokens == 0
+            && self.cache_write_1h_tokens == 0
+            && self.billed_output_tokens == 0
+            && self.telemetry_covered_input_tokens == 0
+            && self.input_with_cache_usd.is_none()
+            && self.input_without_cache_usd.is_none()
+            && self.estimated_savings_usd.is_none()
+            && self.breakdowns.is_empty()
+    }
+}
+
+/// Provider/model/cache-epoch/request-lane breakdown for `/usage`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheUsageBreakdownV1 {
+    pub provider: String,
+    pub model: String,
+    pub cache_epoch: String,
+    #[serde(default)]
+    pub request_kind: UsageRequestKind,
+    pub logical_input_tokens: u64,
+    pub uncached_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_5m_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub billed_output_tokens: u64,
+    pub telemetry_covered_input_tokens: u64,
+    #[serde(default)]
+    pub cache_status: CacheStatAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_with_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_without_cache_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_savings_usd: Option<f64>,
 }

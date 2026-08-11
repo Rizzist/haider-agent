@@ -59,7 +59,10 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
-use haider_protocol::provider::{FeatureResolve, FinishReason, StreamEvent};
+use haider_protocol::provider::{
+    AccountUsage, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
+    UsageRequestKind, UsageScope,
+};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{
@@ -68,7 +71,7 @@ use haider_protocol::tool::{
 };
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
-    OPENAI_OAUTH_PROVIDER_NAME, ResolvedAttachment,
+    OPENAI_OAUTH_PROVIDER_NAME, ProviderCredentialSurface, ResolvedAttachment,
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
@@ -195,6 +198,8 @@ struct DaemonContextCompactor {
     event_ids: Arc<EventIdGenerator>,
     agent_id: Option<AgentId>,
     branch_id: Option<BranchId>,
+    usage_scope: UsageScope,
+    usage_account: Option<haider_protocol::ids::CredentialAlias>,
 }
 
 impl std::fmt::Debug for DaemonContextCompactor {
@@ -242,6 +247,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 )
             });
         }
+        let immutable_history_digest = digest_json(&covered_messages);
         covered_messages.push(Message::user_text(
             "Summarize the preceding conversation for lossless continuation. Preserve decisions, constraints, exact identifiers, unresolved work, and tool outcomes. Return only the summary.",
         ));
@@ -262,6 +268,7 @@ impl ContextCompactor for DaemonContextCompactor {
         })?;
         let mut summary = String::new();
         let mut finished = false;
+        let mut reported_usage: Option<Usage> = None;
         while let Some(item) = stream.recv().await {
             match item.map_err(|error| {
                 HaiderError::new(
@@ -271,7 +278,45 @@ impl ContextCompactor for DaemonContextCompactor {
                 )
             })? {
                 StreamEvent::TextDelta { text } => summary.push_str(&text),
-                StreamEvent::ReasoningDelta { .. } | StreamEvent::UsageUpdate(_) => {}
+                StreamEvent::ReasoningDelta { .. } => {}
+                StreamEvent::UsageUpdate(mut usage) => {
+                    let mut scope = self.usage_scope.clone();
+                    scope.request_kind = UsageRequestKind::Compaction;
+                    scope.run = Some(run_id.clone());
+                    scope.agent = self.agent_id.clone();
+                    scope.prefix_digests = Some(PrefixDigests {
+                        system: digest_json(&Option::<String>::None),
+                        tools: digest_json(&Vec::<ToolDefinition>::new()),
+                        immutable_history: immutable_history_digest.clone(),
+                        model: digest_json(&self.model),
+                        auth_mode: digest_json(&scope.auth_scope),
+                        reasoning_settings: digest_json(&"compaction-default"),
+                    });
+                    if let Some(account) = &self.usage_account {
+                        usage.account = Some(account.clone());
+                        scope.account_scope = Some(account.clone());
+                    }
+                    usage.scope = Some(scope.clone());
+                    usage.cache_cost = usage.normalized.as_ref().and_then(|normalized| {
+                        haider_provider::estimate_cache_input_costs(&self.model, normalized)
+                    });
+                    if let Some(account) = &self.usage_account {
+                        usage.accounts = vec![AccountUsage {
+                            account: account.clone(),
+                            input: usage.input,
+                            output: usage.output,
+                            reasoning: usage.reasoning,
+                            cached: usage.cached,
+                            source: usage.source,
+                            normalized: usage.normalized.clone(),
+                            scope: Some(scope),
+                            cache_cost: usage.cache_cost,
+                        }];
+                    }
+                    // Provider streaming usage is cumulative within this
+                    // request; the latest snapshot replaces earlier ones.
+                    reported_usage = Some(usage);
+                }
                 StreamEvent::Finish {
                     reason: FinishReason::EndTurn,
                 } => {
@@ -362,6 +407,9 @@ impl ContextCompactor for DaemonContextCompactor {
             EventPayload::Item(ItemEvent::Completed { item_id, item }),
             EventPayload::NodeCommitted(node),
         ];
+        if let Some(usage) = reported_usage {
+            payloads.push(EventPayload::Usage(usage));
+        }
         if intent.resume_cause == CompactionResume::ManualIdle {
             let post_compaction_messages = [Message::user_text(summary.clone())];
             let post_compaction_input = estimate_provider_request_input_tokens(
@@ -2843,6 +2891,25 @@ async fn perform_manual_compaction(
         &resolved.provider_name,
         web_degrade,
     );
+    let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
+    let usage_account = resolved
+        .account_alias
+        .as_deref()
+        .map(haider_protocol::ids::CredentialAlias::new);
+    let reasoning_settings = serde_json::to_string(&serde_json::json!({
+        "effort": metadata.effort,
+        "fast": metadata.fast,
+    }))
+    .unwrap_or_default();
+    let usage_scope = usage_scope_for(
+        &resolved.provider_name,
+        &resolved.model,
+        usage_account.clone(),
+        &auth_scope,
+        &reasoning_settings,
+        &Some(post_compaction_system_prompt.clone()),
+        &post_compaction_tools,
+    );
     let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
         lease,
         lease,
@@ -2926,6 +2993,8 @@ async fn perform_manual_compaction(
         event_ids: Arc::clone(&event_ids),
         agent_id,
         branch_id: branch_id.clone(),
+        usage_scope,
+        usage_account,
     };
     if let Err(error) = compactor.compact(&run_id, &intent, messages).await {
         append_failure(
@@ -3448,6 +3517,26 @@ async fn start_turn(
         &resolved.provider_name,
         web_degrade,
     );
+    let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
+    let account_scope = resolved
+        .account_alias
+        .as_deref()
+        .map(haider_protocol::ids::CredentialAlias::new);
+    config.reasoning_settings = serde_json::to_string(&serde_json::json!({
+        "effort": metadata.effort,
+        "fast": metadata.fast,
+    }))
+    .unwrap_or_default();
+    config.usage_scope = usage_scope_for(
+        &resolved.provider_name,
+        &config.model,
+        account_scope.clone(),
+        &auth_scope,
+        &config.reasoning_settings,
+        &config.system_prompt,
+        &config.tools,
+    );
+    config.usage_account = account_scope;
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
     // result at the cap; hiding the tool would turn that recoverable model
@@ -3467,10 +3556,9 @@ async fn start_turn(
         event_ids: Arc::clone(&event_ids),
         agent_id: config.agent_id.clone(),
         branch_id: accepted.branch_id.clone(),
+        usage_scope: config.usage_scope.clone(),
+        usage_account: config.usage_account.clone(),
     }));
-    config.usage_account = resolved
-        .account_alias
-        .map(haider_protocol::ids::CredentialAlias::new);
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;
     config.provider_attempt_resolver = resolved.attempt_resolver;
@@ -3580,6 +3668,53 @@ fn cached_input_is_subset_for_provider(provider: &str) -> bool {
         provider,
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME | DEEPSEEK_PROVIDER_NAME
     )
+}
+
+fn credential_surface_name(surface: ProviderCredentialSurface) -> &'static str {
+    match surface {
+        ProviderCredentialSurface::Opaque => "opaque",
+        ProviderCredentialSurface::ApiKey => "api_key",
+        ProviderCredentialSurface::OAuthSubscriptionBearer => "oauth_subscription",
+        ProviderCredentialSurface::CloudBearer => "cloud_bearer",
+    }
+}
+
+fn digest_json(value: &impl serde::Serialize) -> String {
+    serde_json::to_vec(value).map_or_else(
+        |_| blake3::hash(b"serialization-error").to_hex().to_string(),
+        |bytes| blake3::hash(&bytes).to_hex().to_string(),
+    )
+}
+
+fn usage_scope_for(
+    provider: &str,
+    model: &str,
+    account_scope: Option<haider_protocol::ids::CredentialAlias>,
+    auth_scope: &str,
+    reasoning_settings: &str,
+    system_prompt: &Option<String>,
+    tools: &[ToolDefinition],
+) -> UsageScope {
+    let cache_epoch = digest_json(&serde_json::json!({
+        "provider": provider,
+        "model": model,
+        "account": account_scope.as_ref(),
+        "auth": auth_scope,
+        "reasoning": reasoning_settings,
+        "system": digest_json(system_prompt),
+        "tools": digest_json(&tools),
+    }));
+    UsageScope {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        account_scope,
+        auth_scope: auth_scope.to_owned(),
+        cache_epoch,
+        request_kind: UsageRequestKind::MainTurn,
+        run: None,
+        agent: None,
+        prefix_digests: None,
+    }
 }
 
 async fn find_committed_menu_answer(

@@ -1140,6 +1140,9 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         source: UsageSource::ProviderReported,
         account: None,
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     };
     let fake = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
@@ -4147,6 +4150,9 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         source: UsageSource::ProviderReported,
         account: None,
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     };
     let second_usage = Usage {
         input: 6,
@@ -4156,6 +4162,9 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         source: UsageSource::ProviderReported,
         account: None,
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     };
     let expected_cumulative = Usage {
         input: 16,
@@ -4165,6 +4174,9 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         source: UsageSource::ProviderReported,
         account: None,
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     };
     let (dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitReasoning {

@@ -16,13 +16,13 @@
   {
     "result": "ok",
     "value": {
-      "event": "provider_opaque",
-      "provider": "anthropic",
       "data": {
-        "type": "thinking",
+        "signature": "signature_sanitized",
         "thinking": "Compare the evidence. Then answer.",
-        "signature": "signature_sanitized"
-      }
+        "type": "thinking"
+      },
+      "event": "provider_opaque",
+      "provider": "anthropic"
     }
   },
   {
@@ -35,11 +35,26 @@
   {
     "result": "ok",
     "value": {
+      "cached": 900,
       "event": "usage_update",
       "input": 1500,
+      "normalized": {
+        "billed_output": 501,
+        "cache_read_input": 900,
+        "cache_status": "present",
+        "cache_telemetry_input": 2400,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 300,
+        "cache_write_status": "present",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 2400,
+        "reasoning_accounting": "unavailable",
+        "reasoning_detail": 0,
+        "uncached_input": 1500
+      },
       "output": 501,
       "reasoning": 0,
-      "cached": 900,
       "source": "provider_reported"
     }
   },

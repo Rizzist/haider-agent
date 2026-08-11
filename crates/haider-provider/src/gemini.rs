@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use haider_accounts::SecretHandle;
 use haider_protocol::ids::{ArtifactRef, CredentialAlias};
 use haider_protocol::provider::{
-    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource, WebSource,
+    Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
+    ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
 };
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -1316,14 +1317,54 @@ fn gemini_usage(
                 .ok_or_else(|| malformed(format!("Gemini usage field `{field}` is not an integer")))
         })
     };
+    let optional = |field: &str| -> Result<Option<u64>, ProviderError> {
+        value.get(field).map_or(Ok(None), |value| {
+            value
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| malformed(format!("Gemini usage field `{field}` is not an integer")))
+        })
+    };
+    let logical_input = read("promptTokenCount")?;
+    let output = read("candidatesTokenCount")?;
+    let reasoning = optional("thoughtsTokenCount")?;
+    let cached = optional("cachedContentTokenCount")?;
+    let normalized = match cached.filter(|cached| *cached <= logical_input) {
+        Some(cached) => NormalizedUsage {
+            logical_input,
+            uncached_input: logical_input - cached,
+            cache_read_input: cached,
+            billed_output: output,
+            reasoning_detail: reasoning.unwrap_or(0),
+            reasoning_accounting: reasoning.map_or(ReasoningAccounting::Unavailable, |_| {
+                ReasoningAccounting::AdditionalToOutput
+            }),
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: logical_input,
+            ..NormalizedUsage::default()
+        },
+        None => NormalizedUsage {
+            logical_input,
+            uncached_input: logical_input,
+            billed_output: output,
+            reasoning_detail: reasoning.unwrap_or(0),
+            reasoning_accounting: reasoning.map_or(ReasoningAccounting::Unavailable, |_| {
+                ReasoningAccounting::AdditionalToOutput
+            }),
+            ..NormalizedUsage::default()
+        },
+    };
     Ok(Usage {
-        input: read("promptTokenCount")?,
-        output: read("candidatesTokenCount")?,
-        reasoning: read("thoughtsTokenCount")?,
-        cached: read("cachedContentTokenCount")?,
+        input: logical_input,
+        output,
+        reasoning: reasoning.unwrap_or(0),
+        cached: normalized.cache_read_input,
         source: UsageSource::ProviderReported,
         account,
         accounts: Vec::new(),
+        normalized: Some(normalized),
+        scope: None,
+        cache_cost: None,
     })
 }
 

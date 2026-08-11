@@ -1,53 +1,80 @@
 [
   {
     "result": "ok",
-    "value": {"event": "text_delta", "text": "Checking "}
-  },
-  {
-    "result": "ok",
-    "value": {"event": "reasoning_delta", "text": "I should use the weather tool."}
+    "value": {
+      "event": "text_delta",
+      "text": "Checking "
+    }
   },
   {
     "result": "ok",
     "value": {
-      "event": "tool_call_start",
+      "event": "reasoning_delta",
+      "text": "I should use the weather tool."
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
       "call_id": "call_sanitized",
+      "event": "tool_call_start",
       "name": "get_weather"
     }
   },
   {
     "result": "ok",
     "value": {
-      "event": "tool_call_args_delta",
+      "args_fragment": "{\"city\":",
       "call_id": "call_sanitized",
-      "args_fragment": "{\"city\":"
+      "event": "tool_call_args_delta"
     }
   },
   {
     "result": "ok",
     "value": {
-      "event": "tool_call_args_delta",
+      "args_fragment": "\"Tehran\"}",
       "call_id": "call_sanitized",
-      "args_fragment": "\"Tehran\"}"
+      "event": "tool_call_args_delta"
     }
   },
   {
     "result": "ok",
-    "value": {"event": "tool_call_end", "call_id": "call_sanitized"}
+    "value": {
+      "call_id": "call_sanitized",
+      "event": "tool_call_end"
+    }
   },
   {
     "result": "ok",
     "value": {
+      "cached": 11,
       "event": "usage_update",
       "input": 41,
+      "normalized": {
+        "billed_output": 17,
+        "cache_read_input": 11,
+        "cache_status": "present",
+        "cache_telemetry_input": 41,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "unavailable",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 41,
+        "reasoning_accounting": "subset_of_output",
+        "reasoning_detail": 9,
+        "uncached_input": 30
+      },
       "output": 17,
       "reasoning": 9,
-      "cached": 11,
       "source": "provider_reported"
     }
   },
   {
     "result": "ok",
-    "value": {"event": "finish", "reason": "tool_use"}
+    "value": {
+      "event": "finish",
+      "reason": "tool_use"
+    }
   }
 ]

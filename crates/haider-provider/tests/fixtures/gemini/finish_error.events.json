@@ -1,3 +1,9 @@
 [
-  {"result":"ok","value":{"event":"finish","reason":"error"}}
+  {
+    "result": "ok",
+    "value": {
+      "event": "finish",
+      "reason": "error"
+    }
+  }
 ]

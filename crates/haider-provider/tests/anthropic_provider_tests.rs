@@ -51,6 +51,24 @@ impl ExpectedItem {
     }
 }
 
+fn reanchor_events(path: &Path, actual: &[ProviderStreamItem]) {
+    if std::env::var_os("UPDATE_FIXTURES").is_none() {
+        return;
+    }
+    let tagged = actual
+        .iter()
+        .map(|item| match item {
+            Ok(event) => serde_json::json!({"result": "ok", "value": event}),
+            Err(error) => serde_json::json!({"result": "err", "value": error}),
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&tagged).expect("serialize event golden"),
+    )
+    .expect("write event golden");
+}
+
 #[test]
 fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
     let directory = fixture_directory();
@@ -79,17 +97,14 @@ fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
         let wire = fs::read(directory.join(&fixture.wire)).expect("fixture wire bytes");
         match fixture.transport.as_str() {
             "sse" => {
+                let actual = replay_anthropic_sse(&wire);
+                reanchor_events(&directory.join(&fixture.golden), &actual);
                 let expected: Vec<ExpectedItem> = read_json(&directory.join(&fixture.golden));
                 let expected = expected
                     .into_iter()
                     .map(ExpectedItem::into_result)
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    replay_anthropic_sse(&wire),
-                    expected,
-                    "fixture `{}`",
-                    fixture.name
-                );
+                assert_eq!(actual, expected, "fixture `{}`", fixture.name);
             }
             "http" => {
                 let expected: ProviderError = read_json(&directory.join(&fixture.golden));

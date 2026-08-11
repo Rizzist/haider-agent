@@ -1,53 +1,80 @@
 [
   {
     "result": "ok",
-    "value": {"event": "text_delta", "text": "Checking "}
-  },
-  {
-    "result": "ok",
-    "value": {"event": "reasoning_delta", "text": "Need a tool."}
+    "value": {
+      "event": "text_delta",
+      "text": "Checking "
+    }
   },
   {
     "result": "ok",
     "value": {
-      "event": "tool_call_start",
+      "event": "reasoning_delta",
+      "text": "Need a tool."
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
       "call_id": "call_compat",
+      "event": "tool_call_start",
       "name": "get_weather"
     }
   },
   {
     "result": "ok",
     "value": {
-      "event": "tool_call_args_delta",
+      "args_fragment": "{\"city\":",
       "call_id": "call_compat",
-      "args_fragment": "{\"city\":"
+      "event": "tool_call_args_delta"
     }
   },
   {
     "result": "ok",
     "value": {
-      "event": "tool_call_args_delta",
+      "args_fragment": "\"Tehran\"}",
       "call_id": "call_compat",
-      "args_fragment": "\"Tehran\"}"
+      "event": "tool_call_args_delta"
     }
   },
   {
     "result": "ok",
-    "value": {"event": "tool_call_end", "call_id": "call_compat"}
+    "value": {
+      "call_id": "call_compat",
+      "event": "tool_call_end"
+    }
   },
   {
     "result": "ok",
     "value": {
+      "cached": 5,
       "event": "usage_update",
       "input": 33,
+      "normalized": {
+        "billed_output": 12,
+        "cache_read_input": 5,
+        "cache_status": "present",
+        "cache_telemetry_input": 33,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "unavailable",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 33,
+        "reasoning_accounting": "subset_of_output",
+        "reasoning_detail": 7,
+        "uncached_input": 28
+      },
       "output": 12,
       "reasoning": 7,
-      "cached": 5,
       "source": "provider_reported"
     }
   },
   {
     "result": "ok",
-    "value": {"event": "finish", "reason": "tool_use"}
+    "value": {
+      "event": "finish",
+      "reason": "tool_use"
+    }
   }
 ]

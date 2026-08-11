@@ -18,7 +18,10 @@ use haider_protocol::history::{
 };
 use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::provider::{Block, FinishReason};
+use haider_protocol::provider::{
+    Block, CacheStatAvailability, FinishReason, NormalizedUsage, Usage, UsageRequestKind,
+    UsageSource,
+};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider};
@@ -690,7 +693,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
 /// latest footprint is not after the compaction node or does not exceed the
 /// node's summary-only token count with compiled request overhead included.
 #[tokio::test]
-async fn manual_compaction_command_replay_compacts_exactly_once() {
+async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let session_id = SessionId::new("manual-compaction-replay");
@@ -714,6 +717,28 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
         },
         FakeStep::EmitText {
             text: "summary of durable history".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 100,
+                output: 10,
+                reasoning: 0,
+                cached: 75,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+                normalized: Some(NormalizedUsage {
+                    logical_input: 100,
+                    uncached_input: 25,
+                    cache_read_input: 75,
+                    billed_output: 10,
+                    cache_status: CacheStatAvailability::Present,
+                    cache_telemetry_input: 100,
+                    ..NormalizedUsage::default()
+                }),
+                scope: None,
+                cache_cost: None,
+            },
         },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
@@ -871,6 +896,33 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             ))
             .count(),
         1
+    );
+    let compaction_usage = payloads
+        .iter()
+        .filter_map(|(_, payload)| match payload {
+            EventPayload::Usage(usage)
+                if usage
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.request_kind == UsageRequestKind::Compaction) =>
+            {
+                Some(usage)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compaction_usage.len(),
+        1,
+        "MUTATION CHECK: discard UsageUpdate in the compactor and this lane disappears"
+    );
+    assert_eq!(
+        compaction_usage[0]
+            .normalized
+            .as_ref()
+            .expect("normalized compaction usage")
+            .cache_read_input,
+        75
     );
     assert_eq!(
         payloads

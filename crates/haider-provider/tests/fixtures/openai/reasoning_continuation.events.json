@@ -2,30 +2,53 @@
   {
     "result": "ok",
     "value": {
-      "event": "provider_opaque",
-      "provider": "openai",
       "data": {
-        "id": "rs_sanitized",
-        "type": "reasoning",
-        "summary": [{"type": "summary_text", "text": "Synthetic summary."}],
         "encrypted_content": "encrypted-synthetic-continuation",
-        "status": "completed"
-      }
+        "id": "rs_sanitized",
+        "status": "completed",
+        "summary": [
+          {
+            "text": "Synthetic summary.",
+            "type": "summary_text"
+          }
+        ],
+        "type": "reasoning"
+      },
+      "event": "provider_opaque",
+      "provider": "openai"
     }
   },
   {
     "result": "ok",
     "value": {
+      "cached": 0,
       "event": "usage_update",
       "input": 4,
+      "normalized": {
+        "billed_output": 3,
+        "cache_read_input": 0,
+        "cache_status": "present",
+        "cache_telemetry_input": 4,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "unavailable",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 4,
+        "reasoning_accounting": "subset_of_output",
+        "reasoning_detail": 3,
+        "uncached_input": 4
+      },
       "output": 3,
       "reasoning": 3,
-      "cached": 0,
       "source": "provider_reported"
     }
   },
   {
     "result": "ok",
-    "value": {"event": "finish", "reason": "end_turn"}
+    "value": {
+      "event": "finish",
+      "reason": "end_turn"
+    }
   }
 ]

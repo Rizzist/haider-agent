@@ -1,21 +1,42 @@
 [
   {
     "result": "ok",
-    "value": {"event": "refusal_delta", "text": "I cannot help with that."}
+    "value": {
+      "event": "refusal_delta",
+      "text": "I cannot help with that."
+    }
   },
   {
     "result": "ok",
     "value": {
+      "cached": 0,
       "event": "usage_update",
       "input": 8,
+      "normalized": {
+        "billed_output": 6,
+        "cache_read_input": 0,
+        "cache_status": "present",
+        "cache_telemetry_input": 8,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "unavailable",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 8,
+        "reasoning_accounting": "subset_of_output",
+        "reasoning_detail": 0,
+        "uncached_input": 8
+      },
       "output": 6,
       "reasoning": 0,
-      "cached": 0,
       "source": "provider_reported"
     }
   },
   {
     "result": "ok",
-    "value": {"event": "finish", "reason": "refusal"}
+    "value": {
+      "event": "finish",
+      "reason": "refusal"
+    }
   }
 ]

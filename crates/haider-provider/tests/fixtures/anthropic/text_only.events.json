@@ -1,25 +1,49 @@
 [
   {
     "result": "ok",
-    "value": {"event": "text_delta", "text": "Hello "}
-  },
-  {
-    "result": "ok",
-    "value": {"event": "text_delta", "text": "🌍"}
+    "value": {
+      "event": "text_delta",
+      "text": "Hello "
+    }
   },
   {
     "result": "ok",
     "value": {
+      "event": "text_delta",
+      "text": "🌍"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "cached": 0,
       "event": "usage_update",
       "input": 25,
+      "normalized": {
+        "billed_output": 15,
+        "cache_read_input": 0,
+        "cache_status": "present",
+        "cache_telemetry_input": 25,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "present",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 25,
+        "reasoning_accounting": "unavailable",
+        "reasoning_detail": 0,
+        "uncached_input": 25
+      },
       "output": 15,
       "reasoning": 0,
-      "cached": 0,
       "source": "provider_reported"
     }
   },
   {
     "result": "ok",
-    "value": {"event": "finish", "reason": "end_turn"}
+    "value": {
+      "event": "finish",
+      "reason": "end_turn"
+    }
   }
 ]

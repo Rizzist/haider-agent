@@ -9,11 +9,26 @@
   {
     "result": "ok",
     "value": {
+      "cached": 71,
       "event": "usage_update",
       "input": 23,
+      "normalized": {
+        "billed_output": 13,
+        "cache_read_input": 71,
+        "cache_status": "present",
+        "cache_telemetry_input": 94,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "unavailable",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 94,
+        "reasoning_accounting": "unavailable",
+        "reasoning_detail": 0,
+        "uncached_input": 23
+      },
       "output": 13,
       "reasoning": 0,
-      "cached": 71,
       "source": "provider_reported"
     }
   },

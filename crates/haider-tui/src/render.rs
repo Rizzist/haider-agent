@@ -1972,6 +1972,7 @@ fn render_usage(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
+    use crate::cache_usage::CacheUsageStatsExt as _;
     use haider_protocol::usage::AccountMeterStateV1;
 
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -2012,6 +2013,128 @@ fn render_usage(
         lines.push(Line::styled("  fetching usage…", theme.dim_style()));
     }
     lines.push(Line::raw(""));
+
+    if !model.cache_usage.is_empty() {
+        let cache = model.cache_usage.totals();
+        let hit = cache
+            .complete_hit_rate()
+            .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.2}%", rate * 100.0));
+        let coverage = cache
+            .telemetry_coverage()
+            .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.0}%", rate * 100.0));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "CURRENT SESSION",
+                theme
+                    .bright_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(
+                " — latest cumulative snapshot per cache lane",
+                theme.dim_style(),
+            ),
+        ]));
+        lines.push(Line::styled(
+            format!(
+                "    input — logical {} · uncached {} · cache read {} · {hit} hit · coverage {coverage}",
+                fmt_tok(cache.logical_input_tokens),
+                fmt_tok(cache.uncached_input_tokens),
+                fmt_tok(cache.cache_read_tokens),
+            ),
+            theme.dim_style(),
+        ));
+        lines.push(Line::styled(
+            format!(
+                "    cache write — total {} · 5m {} · 1h {} · billed output {}",
+                fmt_tok(cache.cache_write_tokens),
+                fmt_tok(cache.cache_write_5m_tokens),
+                fmt_tok(cache.cache_write_1h_tokens),
+                fmt_tok(cache.billed_output_tokens),
+            ),
+            theme.dim_style(),
+        ));
+        match (
+            cache.input_with_cache_usd,
+            cache.input_without_cache_usd,
+            cache.estimated_savings_usd,
+        ) {
+            (Some(with), Some(without), Some(savings)) => lines.push(Line::styled(
+                format!(
+                    "    input cost — ${with:.4} with caching · ${without:.4} without · ${savings:.4} estimated savings"
+                ),
+                theme.dim_style(),
+            )),
+            _ => lines.push(Line::styled(
+                "    input cost — n/a · without caching n/a · savings n/a",
+                theme.dim_style(),
+            )),
+        }
+        for breakdown in &cache.breakdowns {
+            let epoch = breakdown
+                .cache_epoch
+                .get(..8)
+                .unwrap_or(&breakdown.cache_epoch);
+            let lane = match breakdown.request_kind {
+                haider_protocol::provider::UsageRequestKind::MainTurn => "main",
+                haider_protocol::provider::UsageRequestKind::Compaction => "compaction",
+                haider_protocol::provider::UsageRequestKind::DelegatedAgent => "delegated",
+            };
+            let provider = if breakdown.provider.is_empty() {
+                "unknown"
+            } else {
+                &breakdown.provider
+            };
+            let model_name = if breakdown.model.is_empty() {
+                "unknown"
+            } else {
+                &breakdown.model
+            };
+            let epoch = if epoch.is_empty() { "unknown" } else { epoch };
+            let part_hit = if breakdown.telemetry_covered_input_tokens
+                == breakdown.logical_input_tokens
+                && breakdown.logical_input_tokens > 0
+            {
+                let denominator = breakdown
+                    .cache_read_tokens
+                    .saturating_add(breakdown.uncached_input_tokens);
+                if denominator == 0 {
+                    "0.00%".to_owned()
+                } else {
+                    #[allow(clippy::cast_precision_loss)]
+                    let rate = breakdown.cache_read_tokens as f64 / denominator as f64;
+                    format!("{:.2}%", rate * 100.0)
+                }
+            } else {
+                "n/a".to_owned()
+            };
+            let part_cost = match (
+                breakdown.input_with_cache_usd,
+                breakdown.input_without_cache_usd,
+                breakdown.estimated_savings_usd,
+            ) {
+                (Some(with), Some(without), Some(savings)) => {
+                    format!(" · input ${with:.4}/${without:.4} · save ${savings:.4}")
+                }
+                _ => " · input $ n/a".to_owned(),
+            };
+            lines.push(Line::styled(
+                format!(
+                    "      {provider} · {model_name} · epoch {epoch} · {lane} — uncached {} · write {} · read {} · {part_hit} hit{part_cost}",
+                    fmt_tok(breakdown.uncached_input_tokens),
+                    fmt_tok(breakdown.cache_write_tokens),
+                    fmt_tok(breakdown.cache_read_tokens),
+                ),
+                if breakdown.request_kind
+                    == haider_protocol::provider::UsageRequestKind::Compaction
+                {
+                    theme.gold_style()
+                } else {
+                    theme.dim_style()
+                },
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
 
     let groups = model.usage.groups();
     if let Some(report) = &model.usage.report {
@@ -2198,6 +2321,43 @@ fn render_usage(
                 ),
                 theme.dim_style(),
             ));
+            if local.cache.logical_input_tokens > 0 {
+                let hit = local
+                    .cache
+                    .complete_hit_rate()
+                    .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.2}%", rate * 100.0));
+                let coverage = local
+                    .cache
+                    .telemetry_coverage()
+                    .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.0}%", rate * 100.0));
+                lines.push(Line::styled(
+                    format!(
+                        "    cache — uncached {} · write {} (5m {} · 1h {}) · read {} · {hit} hit · coverage {coverage}",
+                        fmt_tok(local.cache.uncached_input_tokens),
+                        fmt_tok(local.cache.cache_write_tokens),
+                        fmt_tok(local.cache.cache_write_5m_tokens),
+                        fmt_tok(local.cache.cache_write_1h_tokens),
+                        fmt_tok(local.cache.cache_read_tokens),
+                    ),
+                    theme.dim_style(),
+                ));
+                match (
+                    local.cache.input_with_cache_usd,
+                    local.cache.input_without_cache_usd,
+                    local.cache.estimated_savings_usd,
+                ) {
+                    (Some(with), Some(without), Some(savings)) => lines.push(Line::styled(
+                        format!(
+                            "    input $ — ${with:.4} cached · ${without:.4} without · ${savings:.4} savings"
+                        ),
+                        theme.dim_style(),
+                    )),
+                    _ => lines.push(Line::styled(
+                        "    input $ — caching n/a · without n/a · savings n/a",
+                        theme.dim_style(),
+                    )),
+                }
+            }
             lines.push(Line::raw(""));
         }
 
@@ -6229,8 +6389,26 @@ fn render_status_bar(
     // beside the badge (the badge always survives, never clipped chrome).
     let badge_cells = 1 + badge.chars().count() + 4;
     left.extend(chip_two_tone(badge, badge_chrome, badge_ink));
-    if badge_cells + 2 + meter.chars().count() <= area.width as usize {
+    let meter_shown = badge_cells + 2 + meter.chars().count() <= area.width as usize;
+    if meter_shown {
         left.push(Span::styled(format!("  {meter}  "), theme.dim_style()));
+    }
+    if meter_shown && !model.cache_usage.is_empty() {
+        let totals = model.cache_usage.totals();
+        let wide = crate::cache_usage::wide_status(&totals);
+        let medium = crate::cache_usage::medium_status(&totals);
+        let branch_reserve = if model.screen == Screen::Session {
+            model.active_branch_name().chars().count() + 4
+        } else {
+            0
+        };
+        let used = badge_cells + 2 + meter.chars().count();
+        let available = (area.width as usize).saturating_sub(used + branch_reserve);
+        if wide.chars().count() + 2 <= available {
+            left.push(Span::styled(format!("{wide}  "), theme.dim_style()));
+        } else if medium.chars().count() + 2 <= available {
+            left.push(Span::styled(format!("{medium}  "), theme.dim_style()));
+        }
     }
     // The branch name inside a session, plus ` · q:turn` while queue mode
     // holds (tui.js:2840-2842). B2b: the ACTIVE branch's name — "main" on

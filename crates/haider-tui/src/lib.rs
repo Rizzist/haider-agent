@@ -9,6 +9,7 @@ pub mod app;
 pub mod boot;
 pub mod branch;
 pub mod browser;
+pub mod cache_usage;
 pub mod clipboard;
 pub mod commands;
 pub mod composer;

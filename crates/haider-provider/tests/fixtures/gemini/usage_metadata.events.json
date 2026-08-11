@@ -1,5 +1,42 @@
 [
-  {"result":"ok","value":{"event":"text_delta","text":"done"}},
-  {"result":"ok","value":{"event":"usage_update","input":8,"output":2,"reasoning":0,"cached":0,"source":"provider_reported"}},
-  {"result":"ok","value":{"event":"finish","reason":"end_turn"}}
+  {
+    "result": "ok",
+    "value": {
+      "event": "text_delta",
+      "text": "done"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "cached": 0,
+      "event": "usage_update",
+      "input": 8,
+      "normalized": {
+        "billed_output": 2,
+        "cache_read_input": 0,
+        "cache_status": "unavailable",
+        "cache_telemetry_input": 0,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "unavailable",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 8,
+        "reasoning_accounting": "unavailable",
+        "reasoning_detail": 0,
+        "uncached_input": 8
+      },
+      "output": 2,
+      "reasoning": 0,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "finish",
+      "reason": "end_turn"
+    }
+  }
 ]

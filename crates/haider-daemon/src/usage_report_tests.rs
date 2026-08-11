@@ -14,7 +14,10 @@ use haider_protocol::EventPayload;
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::ids::{AgentId, CredentialAlias, DeviceId, EventId, RunId, SessionId};
-use haider_protocol::provider::{AccountUsage, Usage, UsageSource};
+use haider_protocol::provider::{
+    AccountUsage, CacheCostEstimate, CacheStatAvailability, NormalizedUsage, Usage,
+    UsageRequestKind, UsageScope, UsageSource,
+};
 use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::AccountMeterStateV1;
 use haider_provider::MeterUnavailable;
@@ -384,6 +387,9 @@ fn plain_usage(input: u64, output: u64, account: &str) -> Usage {
         source: UsageSource::ProviderReported,
         account: Some(CredentialAlias::new(account)),
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     }
 }
 
@@ -508,6 +514,9 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
                     reasoning: 0,
                     cached: 0,
                     source: UsageSource::ProviderReported,
+                    normalized: None,
+                    scope: None,
+                    cache_cost: None,
                 },
                 AccountUsage {
                     account: CredentialAlias::new("billing-key"),
@@ -516,8 +525,14 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
                     reasoning: 0,
                     cached: 0,
                     source: UsageSource::ProviderReported,
+                    normalized: None,
+                    scope: None,
+                    cache_cost: None,
                 },
             ],
+            normalized: None,
+            scope: None,
+            cache_cost: None,
         }),
     ));
     // Unattributed usage: no account, no subtotals — skipped, not invented.
@@ -534,6 +549,9 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
             source: UsageSource::Estimated,
             account: None,
             accounts: Vec::new(),
+            normalized: None,
+            scope: None,
+            cache_cost: None,
         }),
     ));
 
@@ -542,7 +560,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
     assert_eq!(stats.lines_added, 5, "3 patched + 2 written");
     assert_eq!(stats.lines_removed, 1, "failed receipts never count");
 
-    let max = stats.tokens[&CredentialAlias::new("personal-max")];
+    let max = &stats.tokens[&CredentialAlias::new("personal-max")];
     // Head lane last snapshot (1M/100k) + subagent lane (200k/10k) +
     // rotation subtotal (1M/100k).
     assert_eq!(max.input, 2_200_000);
@@ -556,7 +574,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
         (max_cost - expected_max_cost).abs() < 1e-9,
         "cost {max_cost} != {expected_max_cost}"
     );
-    let billing = stats.tokens[&CredentialAlias::new("billing-key")];
+    let billing = &stats.tokens[&CredentialAlias::new("billing-key")];
     assert_eq!(billing.input, 2_000_000);
     let billing_cost = billing.est_cost_usd.expect("priced");
     assert!(((2.5 + 2.0) - billing_cost).abs() < 1e-9);
@@ -577,6 +595,110 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
     assert_eq!(billing_totals.sessions, 0);
     assert_eq!(billing_totals.total_duration_ms, 0);
     assert_eq!(billing_totals.lines_added, 0);
+}
+
+/// CM1 session fold law: changing account/auth attribution during rotation
+/// does not fork a cumulative request lane, while compaction is a distinct
+/// additive lane under the exact cache-domain key.
+#[test]
+fn cm1_session_folder_uses_latest_full_cache_lane_snapshot() {
+    let account = CredentialAlias::new("billing-key");
+    let usage = |logical: u64,
+                 uncached: u64,
+                 read: u64,
+                 request_kind: UsageRequestKind,
+                 scope_account: &str,
+                 auth: &str| Usage {
+        input: logical,
+        output: 10,
+        reasoning: 0,
+        cached: read,
+        source: UsageSource::ProviderReported,
+        account: Some(account.clone()),
+        accounts: Vec::new(),
+        normalized: Some(NormalizedUsage {
+            logical_input: logical,
+            uncached_input: uncached,
+            cache_read_input: read,
+            billed_output: 10,
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: logical,
+            ..NormalizedUsage::default()
+        }),
+        scope: Some(UsageScope {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            account_scope: Some(CredentialAlias::new(scope_account)),
+            auth_scope: auth.into(),
+            cache_epoch: "epoch-a".into(),
+            request_kind,
+            run: Some(RunId::new("run-cache")),
+            agent: None,
+            prefix_digests: None,
+        }),
+        cache_cost: Some(CacheCostEstimate {
+            input_with_cache_usd: logical as f64 / 1_000_000.0,
+            input_without_cache_usd: logical as f64 / 500_000.0,
+            estimated_savings_usd: logical as f64 / 1_000_000.0,
+            explicit_storage_usd: 0.0,
+        }),
+    };
+
+    let mut folder = SessionFolder::new("gpt-5");
+    folder.push(&envelope(
+        1,
+        Some("run-cache"),
+        None,
+        1,
+        usage_payload(usage(
+            500,
+            100,
+            400,
+            UsageRequestKind::MainTurn,
+            "first",
+            "api_key",
+        )),
+    ));
+    folder.push(&envelope(
+        2,
+        Some("run-cache"),
+        None,
+        2,
+        usage_payload(usage(
+            1_000,
+            200,
+            800,
+            UsageRequestKind::MainTurn,
+            "rotated",
+            "oauth",
+        )),
+    ));
+    folder.push(&envelope(
+        3,
+        Some("run-cache"),
+        None,
+        3,
+        usage_payload(usage(
+            100,
+            100,
+            0,
+            UsageRequestKind::Compaction,
+            "rotated",
+            "oauth",
+        )),
+    ));
+
+    let stats = folder.finish();
+    let totals = &stats.tokens[&account];
+    assert_eq!(totals.input, 1_100, "first main snapshot was replaced");
+    assert_eq!(totals.cache.logical_input_tokens, 1_100);
+    assert_eq!(totals.cache.uncached_input_tokens, 300);
+    assert_eq!(totals.cache.cache_read_tokens, 800);
+    assert_eq!(totals.cache.breakdowns.len(), 2);
+    assert!(totals.cache.breakdowns.iter().any(|breakdown| {
+        breakdown.request_kind == UsageRequestKind::Compaction
+            && breakdown.logical_input_tokens == 100
+    }));
 }
 
 /// LAW (meter_routing_is_flavor_and_provider_strict): only the three
