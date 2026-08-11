@@ -1286,7 +1286,13 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         payload,
         EventPayload::Item(haider_protocol::item::ItemEvent::Completed { .. })
     )));
-    assert!(payloads.contains(&&EventPayload::Usage(usage)));
+    // CM1 enriches the journaled Usage with a measurement `scope` (provider/
+    // model/cache-epoch/prefix-digests) the fake provider does not emit; this
+    // test pins billing durability, so compare with scope normalized out.
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::Usage(actual) if { let mut a = actual.clone(); a.scope = None; a == usage }
+    )));
     assert!(payloads.contains(&&EventPayload::RunState(RunState::Done)));
     assert!(!run_id.as_str().is_empty());
     assert!(
@@ -4239,7 +4245,16 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(usages.last().copied(), Some(&expected_cumulative));
+    // CM1 enriches the journaled Usage with a measurement `scope`; pin the
+    // cumulative billing totals with scope normalized out.
+    assert_eq!(
+        usages.last().map(|u| {
+            let mut u = (*u).clone();
+            u.scope = None;
+            u
+        }),
+        Some(expected_cumulative.clone())
+    );
     let failures = events
         .iter()
         .filter_map(|(_, payload)| match payload {
