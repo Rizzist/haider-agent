@@ -231,6 +231,7 @@ fn legacy_session_create_defaults_permission_overrides_to_none() {
                 model: "fake-model".into(),
                 max_tokens: 4096,
                 permission_overrides: None,
+                cache_policy: None,
             },
         }
     );
@@ -1557,6 +1558,7 @@ fn session_select_model_absent_provider_keeps_legacy_bytes() {
             worker_generation: 7,
             model: "model-next".into(),
             provider: None,
+            confirm_new_epoch: false,
         },
     };
     let encoded = serde_json::to_string(&frame).expect("encode model-only selection");
@@ -1581,6 +1583,7 @@ fn session_select_model_pair_request_and_response_are_golden() {
             worker_generation: 7,
             model: "fable-5".into(),
             provider: Some("anthropic-oauth".into()),
+            confirm_new_epoch: false,
         },
     };
     let encoded = serde_json::to_string(&request).expect("encode pair selection");
@@ -2054,6 +2057,7 @@ fn session_tuning_pairs_are_golden_and_revert_omits_the_effort_key() {
             session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
             worker_generation: 7,
             effort: Some("xhigh".into()),
+            confirm_new_epoch: false,
         },
     };
     assert_eq!(
@@ -2070,6 +2074,7 @@ fn session_tuning_pairs_are_golden_and_revert_omits_the_effort_key() {
             session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
             worker_generation: 7,
             effort: None,
+            confirm_new_epoch: false,
         },
     };
     let encoded = serde_json::to_string(&revert).expect("encode revert");
@@ -2103,6 +2108,7 @@ fn session_tuning_pairs_are_golden_and_revert_omits_the_effort_key() {
             session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
             worker_generation: 7,
             enabled: true,
+            confirm_new_epoch: false,
         },
     };
     assert_eq!(

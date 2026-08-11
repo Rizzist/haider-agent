@@ -388,8 +388,35 @@ fn plain_usage(input: u64, output: u64, account: &str) -> Usage {
         account: Some(CredentialAlias::new(account)),
         accounts: Vec::new(),
         normalized: None,
-        scope: None,
+        scope: Some(account_scope(account)),
         cache_cost: None,
+    }
+}
+
+fn account_scope(account: &str) -> UsageScope {
+    let metered = account == "billing-key";
+    UsageScope {
+        provider: if metered { "openai" } else { "anthropic-oauth" }.into(),
+        model: if metered {
+            "gpt-5.2"
+        } else {
+            "claude-sonnet-4-5"
+        }
+        .into(),
+        account_scope: Some(CredentialAlias::new(account)),
+        auth_scope: if metered {
+            "api_key"
+        } else {
+            "oauth_subscription"
+        }
+        .into(),
+        cache_epoch: "usage-report-fixture".into(),
+        stable_prefix_tokens: 0,
+        cache_boundaries: None,
+        request_kind: UsageRequestKind::MainTurn,
+        run: None,
+        agent: None,
+        prefix_digests: None,
     }
 }
 
@@ -515,7 +542,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
                     cached: 0,
                     source: UsageSource::ProviderReported,
                     normalized: None,
-                    scope: None,
+                    scope: Some(account_scope("personal-max")),
                     cache_cost: None,
                 },
                 AccountUsage {
@@ -526,7 +553,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
                     cached: 0,
                     source: UsageSource::ProviderReported,
                     normalized: None,
-                    scope: None,
+                    scope: Some(account_scope("billing-key")),
                     cache_cost: None,
                 },
             ],
@@ -565,15 +592,9 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
     // rotation subtotal (1M/100k).
     assert_eq!(max.input, 2_200_000);
     assert_eq!(max.output, 210_000);
-    // Cost: sonnet chunks (1M in @ $3 + 100k out @ $15 = 4.5) + subagent
-    // (200k @ 3 = 0.6 + 10k @ 15 = 0.15) + gpt-5.2 subtotal
-    // (1M @ 1.25 + 100k @ 10 = 2.25).
-    let expected_max_cost = 3.0 + 1.5 + 0.6 + 0.15 + 1.25 + 1.0;
-    let max_cost = max.est_cost_usd.expect("priced");
-    assert!(
-        (max_cost - expected_max_cost).abs() < 1e-9,
-        "cost {max_cost} != {expected_max_cost}"
-    );
+    // Subscription usage is intentionally token-only: API-list pricing is
+    // not presented as a charge against a flat plan.
+    assert_eq!(max.est_cost_usd, None);
     let billing = &stats.tokens[&CredentialAlias::new("billing-key")];
     assert_eq!(billing.input, 2_000_000);
     let billing_cost = billing.est_cost_usd.expect("priced");
@@ -631,6 +652,8 @@ fn cm1_session_folder_uses_latest_full_cache_lane_snapshot() {
             account_scope: Some(CredentialAlias::new(scope_account)),
             auth_scope: auth.into(),
             cache_epoch: "epoch-a".into(),
+            stable_prefix_tokens: 0,
+            cache_boundaries: None,
             request_kind,
             run: Some(RunId::new("run-cache")),
             agent: None,

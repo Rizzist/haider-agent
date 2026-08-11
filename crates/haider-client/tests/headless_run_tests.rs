@@ -197,6 +197,7 @@ async fn respond_create_and_attach(
                 title: None,
                 effort: None,
                 fast: false,
+                cache_policy: Default::default(),
                 created_at_ms: 1,
             },
         },

@@ -286,6 +286,7 @@ pub enum LiveCommand {
     AccountSetActive {
         command_id: CommandId,
         alias: String,
+        confirm_new_epoch: bool,
     },
     /// `provider.list` for the `/providers` screen (W5d). A read.
     ProviderList,
@@ -339,6 +340,7 @@ pub enum LiveCommand {
         worker_generation: u64,
         model: String,
         provider: String,
+        confirm_new_epoch: bool,
     },
     /// `session.rename` (G2): receipted live-session rename. DURABLE — a
     /// reconnect resends under the same command id and the daemon replays
@@ -358,6 +360,7 @@ pub enum LiveCommand {
         session: SessionId,
         worker_generation: u64,
         effort: Option<String>,
+        confirm_new_epoch: bool,
     },
     /// `session.select_fast` (G3): the receipted fast-mode toggle. DURABLE.
     SelectFast {
@@ -365,6 +368,7 @@ pub enum LiveCommand {
         session: SessionId,
         worker_generation: u64,
         enabled: bool,
+        confirm_new_epoch: bool,
     },
     /// `provider.configure` for a custom OpenAI-compatible provider
     /// (W5g-4) or a G4b enterprise builtin. Identity fields are fixed by
@@ -953,14 +957,14 @@ pub struct LiveDriver {
     pending_default_model: Option<(CommandId, String)>,
     /// In-flight `session.select_model` (F2a): the REQUESTED pair, so a
     /// typed refusal can land on the exact selection that asked.
-    pending_model_select: Option<(CommandId, String, String)>,
+    pending_model_select: Option<(CommandId, SessionId, String, String)>,
     /// In-flight `session.rename` (G2): (command, session), so a typed
     /// refusal lands on the exact session that asked.
     pending_rename: Option<(CommandId, SessionId)>,
     /// In-flight `session.select_effort` (G3): failure correlation.
-    pending_effort_select: Option<CommandId>,
+    pending_effort_select: Option<(CommandId, SessionId, Option<String>)>,
     /// In-flight `session.select_fast` (G3): failure correlation.
-    pending_fast_select: Option<CommandId>,
+    pending_fast_select: Option<(CommandId, SessionId, bool)>,
     /// W10b in-flight removals: (command, alias/provider) — failures
     /// surface on the owning screen; successes come as typed replies.
     pending_account_remove: Option<(CommandId, String)>,
@@ -1872,7 +1876,7 @@ impl LiveDriver {
                 if self
                     .pending_model_select
                     .as_ref()
-                    .is_some_and(|(id, _, _)| *id == command_id)
+                    .is_some_and(|(id, _, _, _)| *id == command_id)
                 {
                     self.pending_model_select = None;
                 }
@@ -1908,7 +1912,7 @@ impl LiveDriver {
                 if self
                     .pending_effort_select
                     .as_ref()
-                    .is_some_and(|id| *id == command_id)
+                    .is_some_and(|(id, _, _)| *id == command_id)
                 {
                     self.pending_effort_select = None;
                 }
@@ -1926,7 +1930,7 @@ impl LiveDriver {
                 if self
                     .pending_fast_select
                     .as_ref()
-                    .is_some_and(|id| *id == command_id)
+                    .is_some_and(|(id, _, _)| *id == command_id)
                 {
                     self.pending_fast_select = None;
                 }
@@ -2346,13 +2350,25 @@ impl LiveDriver {
                     && self
                         .pending_model_select
                         .as_ref()
-                        .is_some_and(|(pending, _, _)| pending == id)
-                    && let Some((_, provider, model_name)) = self.pending_model_select.take()
+                        .is_some_and(|(pending, _, _, _)| pending == id)
+                    && let Some((_, session, provider, model_name)) =
+                        self.pending_model_select.take()
                 {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.model_select_failed(&provider, &model_name, &code, &message);
+                    if code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED {
+                        model.cache_epoch_confirmation_required(
+                            crate::app::PendingCacheChange::Model {
+                                session,
+                                provider,
+                                model: model_name,
+                            },
+                            &message,
+                        );
+                    } else {
+                        model.model_select_failed(&provider, &model_name, &code, &message);
+                    }
                     return Vec::new();
                 }
                 // A failed `session.rename` (G2): the typed public reason
@@ -2378,13 +2394,20 @@ impl LiveDriver {
                     && self
                         .pending_effort_select
                         .as_ref()
-                        .is_some_and(|pending| pending == id)
-                    && self.pending_effort_select.take().is_some()
+                        .is_some_and(|(pending, _, _)| pending == id)
+                    && let Some((_, session, effort)) = self.pending_effort_select.take()
                 {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.effort_select_failed(&code, &message);
+                    if code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED {
+                        model.cache_epoch_confirmation_required(
+                            crate::app::PendingCacheChange::Effort { session, effort },
+                            &message,
+                        );
+                    } else {
+                        model.effort_select_failed(&code, &message);
+                    }
                     return Vec::new();
                 }
                 // A failed `session.select_fast` (G3).
@@ -2392,13 +2415,20 @@ impl LiveDriver {
                     && self
                         .pending_fast_select
                         .as_ref()
-                        .is_some_and(|pending| pending == id)
-                    && self.pending_fast_select.take().is_some()
+                        .is_some_and(|(pending, _, _)| pending == id)
+                    && let Some((_, session, enabled)) = self.pending_fast_select.take()
                 {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.fast_select_failed(&code, &message);
+                    if code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED {
+                        model.cache_epoch_confirmation_required(
+                            crate::app::PendingCacheChange::Fast { session, enabled },
+                            &message,
+                        );
+                    } else {
+                        model.fast_select_failed(&code, &message);
+                    }
                     return Vec::new();
                 }
                 // A failed `account.set_default_model` releases its gate;
@@ -2468,7 +2498,14 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.account_select_failed(&alias, &message);
+                    if code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED {
+                        model.cache_epoch_confirmation_required(
+                            crate::app::PendingCacheChange::Account { alias },
+                            &message,
+                        );
+                    } else {
+                        model.account_select_failed(&alias, &message);
+                    }
                     return Vec::new();
                 }
                 // A rejected TURN must release the optimistic mid-turn UI,
@@ -3129,17 +3166,23 @@ impl LiveDriver {
                 session,
                 model: model_name,
                 provider,
+                confirm_new_epoch,
             } => {
                 let command_id = self.mint();
                 let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
-                self.pending_model_select =
-                    Some((command_id.clone(), provider.clone(), model_name.clone()));
+                self.pending_model_select = Some((
+                    command_id.clone(),
+                    session.clone(),
+                    provider.clone(),
+                    model_name.clone(),
+                ));
                 vec![self.enqueue(LiveCommand::SelectModel {
                     command_id,
                     session,
                     worker_generation,
                     model: model_name,
                     provider,
+                    confirm_new_epoch,
                 })]
             }
             AppRequest::Rename { session, title } => {
@@ -3153,26 +3196,37 @@ impl LiveDriver {
                     title,
                 })]
             }
-            AppRequest::SelectEffort { session, effort } => {
+            AppRequest::SelectEffort {
+                session,
+                effort,
+                confirm_new_epoch,
+            } => {
                 let command_id = self.mint();
                 let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
-                self.pending_effort_select = Some(command_id.clone());
+                self.pending_effort_select =
+                    Some((command_id.clone(), session.clone(), effort.clone()));
                 vec![self.enqueue(LiveCommand::SelectEffort {
                     command_id,
                     session,
                     worker_generation,
                     effort,
+                    confirm_new_epoch,
                 })]
             }
-            AppRequest::SelectFast { session, enabled } => {
+            AppRequest::SelectFast {
+                session,
+                enabled,
+                confirm_new_epoch,
+            } => {
                 let command_id = self.mint();
                 let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
-                self.pending_fast_select = Some(command_id.clone());
+                self.pending_fast_select = Some((command_id.clone(), session.clone(), enabled));
                 vec![self.enqueue(LiveCommand::SelectFast {
                     command_id,
                     session,
                     worker_generation,
                     enabled,
+                    confirm_new_epoch,
                 })]
             }
             AppRequest::ProviderConfigure {
@@ -3206,10 +3260,17 @@ impl LiveDriver {
                 self.models_requested.insert(provider.clone());
                 vec![LiveCommand::RefreshProviderModels { provider }]
             }
-            AppRequest::AccountSetActive { alias } => {
+            AppRequest::AccountSetActive {
+                alias,
+                confirm_new_epoch,
+            } => {
                 let command_id = self.mint();
                 self.pending_account_select = Some((command_id.clone(), alias.clone()));
-                vec![self.enqueue(LiveCommand::AccountSetActive { command_id, alias })]
+                vec![self.enqueue(LiveCommand::AccountSetActive {
+                    command_id,
+                    alias,
+                    confirm_new_epoch,
+                })]
             }
             // The request's `after_seq` is the reducer's own last fully
             // applied sequence — the same value [`cursor_of`] reads, from

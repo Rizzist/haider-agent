@@ -114,6 +114,8 @@ pub struct SessionCreateCommand {
     pub effort: Option<String>,
     /// Creation-time fast-mode flag (G3); same inheritance seam as `effort`.
     pub fast: bool,
+    /// Creation-time cache warning policy (CM3).
+    pub cache_policy: haider_protocol::cache::CachePolicySettingsV1,
     pub system_prompt_version: String,
     pub event_id: EventId,
     pub device_id: DeviceId,
@@ -1442,6 +1444,7 @@ impl Store {
             // inherit effort/fast through the metadata clone (LE6).
             effort: command.effort.clone(),
             fast: command.fast,
+            cache_policy: command.cache_policy,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {

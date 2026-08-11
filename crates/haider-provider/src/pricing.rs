@@ -46,6 +46,10 @@ pub enum CacheReadSemantics {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CachePricingPolicy {
     pub prefix: &'static str,
+    /// Provider-name prefixes allowed to use this row. This prevents a
+    /// compatible/custom endpoint from inheriting another vendor's cache
+    /// economics merely by serving a coincidentally named model.
+    pub provider_prefixes: &'static [&'static str],
     pub read_semantics: CacheReadSemantics,
     pub input_per_mtok: Option<f64>,
     pub cached_input_per_mtok: Option<f64>,
@@ -62,6 +66,7 @@ pub struct CachePricingPolicy {
 pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     CachePricingPolicy {
         prefix: "claude-",
+        provider_prefixes: &["anthropic", "anthropic-oauth"],
         read_semantics: CacheReadSemantics::SeparateFromInput,
         input_per_mtok: None,
         cached_input_per_mtok: None,
@@ -73,6 +78,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gpt-5.6-sol",
+        provider_prefixes: &["openai", "openai-oauth"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: None,
@@ -84,6 +90,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gpt-5.6-terra",
+        provider_prefixes: &["openai", "openai-oauth"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: None,
@@ -95,6 +102,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gpt-5.6-luna",
+        provider_prefixes: &["openai", "openai-oauth"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: None,
@@ -106,6 +114,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gpt-",
+        provider_prefixes: &["openai", "openai-oauth"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: None,
@@ -117,6 +126,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gemini-2.5-pro",
+        provider_prefixes: &["gemini"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: Some(0.125),
@@ -128,6 +138,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gemini-2.5-flash",
+        provider_prefixes: &["gemini"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: Some(0.03),
@@ -139,6 +150,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gemini-3.1-pro",
+        provider_prefixes: &["gemini"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: Some(0.2),
@@ -150,6 +162,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "gemini-3.5-flash",
+        provider_prefixes: &["gemini"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: None,
         cached_input_per_mtok: Some(0.075),
@@ -161,6 +174,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "kimi-k3",
+        provider_prefixes: &["kimi", "kimi-oauth"],
         read_semantics: CacheReadSemantics::SubsetOfInput,
         input_per_mtok: Some(3.0),
         cached_input_per_mtok: Some(0.3),
@@ -172,6 +186,7 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
     },
     CachePricingPolicy {
         prefix: "deepseek-v4-flash",
+        provider_prefixes: &["deepseek"],
         read_semantics: CacheReadSemantics::SeparateFromInput,
         input_per_mtok: Some(0.14),
         cached_input_per_mtok: Some(0.0028),
@@ -360,6 +375,82 @@ pub fn cache_pricing_policy(model: &str) -> Option<&'static CachePricingPolicy> 
         .iter()
         .filter(|policy| normalized.starts_with(policy.prefix))
         .max_by_key(|policy| policy.prefix.len())
+}
+
+/// Provider-qualified cache policy lookup for decisions that can change a
+/// live cache domain. Cost display retains the legacy model-only lookup for
+/// old journal entries which did not carry an authoritative provider.
+pub fn cache_pricing_policy_for(
+    provider: &str,
+    model: &str,
+) -> Option<&'static CachePricingPolicy> {
+    let provider = provider.trim().to_ascii_lowercase();
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.strip_prefix("models/").unwrap_or(&normalized);
+    CACHE_PRICING_POLICIES
+        .iter()
+        .filter(|policy| {
+            normalized.starts_with(policy.prefix)
+                && policy
+                    .provider_prefixes
+                    .iter()
+                    .any(|allowed| provider == *allowed)
+        })
+        .max_by_key(|policy| policy.prefix.len())
+}
+
+/// Cache-write class used by the next-turn cold-versus-warm estimator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheWriteTtl {
+    /// Provider/model default (5-minute for Anthropic).
+    #[default]
+    Default,
+    FiveMinutes,
+    OneHour,
+}
+
+/// Input-only cost of rebuilding a stable prefix once instead of reading it
+/// warm. `base_input_equivalent_tokens` makes the registry multiplier
+/// inspectable without duplicating provider constants in callers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheRewarmEstimate {
+    pub stable_prefix_tokens: u64,
+    pub base_input_equivalent_tokens: f64,
+    pub extra_input_cost_usd: f64,
+}
+
+/// Estimates the one-turn cold-minus-warm input cost for an existing stable
+/// prefix. Every multiplier is derived from the provider/model policy row:
+/// selected write rate minus cached-read rate. Unknown or mismatched
+/// provider/model coordinates remain unavailable.
+pub fn estimate_cache_rewarm_cost_usd(
+    provider: &str,
+    model: &str,
+    stable_prefix_tokens: u64,
+    ttl: CacheWriteTtl,
+) -> Option<CacheRewarmEstimate> {
+    let policy = cache_pricing_policy_for(provider, model)?;
+    let base = model_rate(model);
+    let input_rate = policy
+        .input_per_mtok
+        .or_else(|| base.map(|rate| rate.input_per_mtok))?;
+    let cached_rate = policy
+        .cached_input_per_mtok
+        .or_else(|| base.and_then(|rate| rate.cached_input_per_mtok))
+        .unwrap_or(input_rate);
+    let write_multiplier = match ttl {
+        CacheWriteTtl::Default => policy.default_write_multiplier,
+        CacheWriteTtl::FiveMinutes => policy.write_5m_multiplier,
+        CacheWriteTtl::OneHour => policy.write_1h_multiplier,
+    };
+    let warm_multiplier = cached_rate / input_rate;
+    let extra_multiplier = (write_multiplier - warm_multiplier).max(0.0);
+    let base_input_equivalent_tokens = stable_prefix_tokens as f64 * extra_multiplier;
+    Some(CacheRewarmEstimate {
+        stable_prefix_tokens,
+        base_input_equivalent_tokens,
+        extra_input_cost_usd: base_input_equivalent_tokens * input_rate / 1_000_000.0,
+    })
 }
 
 /// Estimates USD cost for one model's token chunk.

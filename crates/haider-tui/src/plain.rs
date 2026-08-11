@@ -177,9 +177,21 @@ fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> S
         stats.input_without_cache_usd,
         stats.estimated_savings_usd,
     ) {
-        (Some(with), Some(without), Some(savings)) => out.push_str(&format!(
-            " · input ${with:.4} cached / ${without:.4} without · savings ${savings:.4}"
-        )),
+        (Some(with), Some(without), Some(savings)) => {
+            let qualifier = (stats.metered_input_tokens < stats.logical_input_tokens)
+                .then_some(" (metered lanes)")
+                .unwrap_or("");
+            out.push_str(&format!(
+                " · input ${with:.4} cached / ${without:.4} without · savings ${savings:.4}{qualifier}"
+            ));
+        }
+        _ if !stats.breakdowns.is_empty()
+            && stats.breakdowns.iter().all(|breakdown| {
+                breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
+            }) =>
+        {
+            out.push_str(" · plan");
+        }
         _ => out.push_str(" · input cost n/a · savings n/a"),
     }
     for breakdown in &stats.breakdowns {
@@ -195,7 +207,10 @@ fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> S
             (Some(with), Some(without), Some(savings)) => {
                 format!(" · input ${with:.4}/${without:.4} · save ${savings:.4}")
             }
-            _ => " · input $ n/a".to_owned(),
+            _ if breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth) => {
+                " · plan".to_owned()
+            }
+            _ => " · input $—".to_owned(),
         };
         let complete = breakdown.logical_input_tokens > 0
             && breakdown.telemetry_covered_input_tokens == breakdown.logical_input_tokens;
@@ -343,6 +358,15 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             _ => out.push_str("⊟ context compacted\n"),
         },
         TurnItem::Refusal { reason } => out.push_str(&format!("✗ model refused — {reason}\n")),
-        TurnItem::Extension { kind, .. } => out.push_str(&format!("⋯ {kind}\n")),
+        TurnItem::Extension { kind, .. } => {
+            if let Some(transition) =
+                haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(&block.item)
+            {
+                out.push_str(&transition.display_label());
+                out.push('\n');
+            } else {
+                out.push_str(&format!("⋯ {kind}\n"));
+            }
+        }
     }
 }

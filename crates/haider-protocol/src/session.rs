@@ -71,6 +71,13 @@ pub struct SessionMetadataV1 {
     /// rows stay byte-identical.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fast: bool,
+    /// Cache-destruction warning policy (CM3). Absent legacy metadata uses
+    /// the balanced default and its configurable cold-cost threshold.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::cache::CachePolicySettingsV1::is_default"
+    )]
+    pub cache_policy: crate::cache::CachePolicySettingsV1,
     /// Durable creation time in Unix milliseconds.
     pub created_at_ms: u64,
 }

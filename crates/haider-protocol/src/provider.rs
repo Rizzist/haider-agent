@@ -268,6 +268,13 @@ pub struct UsageScope {
     pub account_scope: Option<CredentialAlias>,
     pub auth_scope: String,
     pub cache_epoch: String,
+    /// Exact compiler estimate for the stable prefix behind this epoch.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stable_prefix_tokens: u64,
+    /// Daemon-owned component identities used to name otherwise mysterious
+    /// cold boundaries on a later turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_boundaries: Option<CacheBoundaryIdentity>,
     #[serde(default)]
     pub request_kind: UsageRequestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,6 +283,19 @@ pub struct UsageScope {
     pub agent: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_digests: Option<PrefixDigests>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheBoundaryIdentity {
+    pub instructions: String,
+    pub tool_pack: String,
+    pub system_version: String,
+    pub web_tools: String,
+    pub reasoning_settings: String,
 }
 
 /// Input-only model-registry estimate used by `/usage`. Output is excluded

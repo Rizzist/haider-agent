@@ -5,7 +5,7 @@
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
-use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, Screen};
+use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, PendingCacheChange, Screen};
 use haider_tui::mock::{SEED_ACCOUNT_PROVIDERS, SEED_ACCOUNTS, seed_account_rows};
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -192,7 +192,7 @@ fn selection_moves_only_on_the_correlated_reply_never_on_click() {
     );
     assert!(model.requests.iter().any(|request| matches!(
         request,
-        AppRequest::AccountSetActive { alias } if alias == "billing-key"
+        AppRequest::AccountSetActive { alias, .. } if alias == "billing-key"
     )));
     // …and the DOT DID NOT MOVE.
     let openai_selected: Vec<&str> = model
@@ -237,6 +237,38 @@ fn selection_moves_only_on_the_correlated_reply_never_on_click() {
             .iter()
             .any(|row| row.alias == "personal-max" && row.selected)
     );
+}
+
+/// CM3 account switches use the same exact-repeat confirmation as model and
+/// tuning changes; the warning releases the pending row without moving it.
+#[test]
+fn cm3_account_switch_repeats_with_new_epoch_confirmation() {
+    let mut model = accounts_model();
+    model.select_account("billing-key");
+    assert!(matches!(
+        model.requests.last(),
+        Some(AppRequest::AccountSetActive {
+            alias,
+            confirm_new_epoch: false,
+        }) if alias == "billing-key"
+    ));
+
+    model.requests.clear();
+    model.cache_epoch_confirmation_required(
+        PendingCacheChange::Account {
+            alias: "billing-key".into(),
+        },
+        "account/auth; 1000 stable-prefix tokens invalidated; plan",
+    );
+    assert!(model.accounts.pending_select.is_none());
+    model.select_account("billing-key");
+    assert!(matches!(
+        model.requests.last(),
+        Some(AppRequest::AccountSetActive {
+            alias,
+            confirm_new_epoch: true,
+        }) if alias == "billing-key"
+    ));
 }
 
 /// LAW — the revision gate: a LATE result (older revision) may clear its

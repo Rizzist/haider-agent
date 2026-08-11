@@ -1033,7 +1033,9 @@ impl SessionProjection {
         };
         let footprint = haider_protocol::context::ContextFootprint::from_extension_item(item);
         let intent = kind == haider_protocol::history::COMPACTION_INTENT_EXTENSION_KIND;
-        if footprint.is_none() && !intent {
+        let cache_transition =
+            haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(item);
+        if footprint.is_none() && !intent && cache_transition.is_none() {
             return false;
         }
         if !completed {
@@ -1049,6 +1051,10 @@ impl SessionProjection {
             self.latest_footprint = Some(footprint);
             return true;
         }
+        if let Some(transition) = cache_transition {
+            self.push_note(transition.display_label());
+            return true;
+        }
         // Pre-announce (research §Q2: the sim's `· context at 85% —
         // compacting` line): percent from the latest snapshot when the
         // window is known; the honest count-free line otherwise.
@@ -1059,13 +1065,13 @@ impl SessionProjection {
                 let window = footprint.context_window?;
                 (window > 0).then(|| {
                     format!(
-                        "· context at {}% — compacting (summary retained · originals stay in /tree)",
+                        "· context at {}% — compacting · planned cache epoch transition; next turn history cold (summary retained · originals stay in /tree)",
                         footprint.used_tokens.saturating_mul(100) / window
                     )
                 })
             })
             .unwrap_or_else(|| {
-                "· compacting — summary retained · originals stay in /tree".to_owned()
+                "· compacting · planned cache epoch transition; next turn history cold — summary retained · originals stay in /tree".to_owned()
             });
         self.push_note(note);
         true

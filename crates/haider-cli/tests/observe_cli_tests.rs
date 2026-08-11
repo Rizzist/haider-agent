@@ -67,6 +67,7 @@ fn digest(
             title: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             created_at_ms: 1_800_000_000_000,
         }),
         title: "Inspect durable automation truth".into(),

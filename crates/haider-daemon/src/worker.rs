@@ -45,6 +45,7 @@ use haider_core::{
     sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
+use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
@@ -61,8 +62,8 @@ use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{
-    AccountUsage, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
-    UsageRequestKind, UsageScope,
+    AccountUsage, CacheBoundaryIdentity, FeatureResolve, FinishReason, PrefixDigests, StreamEvent,
+    Usage, UsageRequestKind, UsageScope,
 };
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -3679,6 +3680,31 @@ async fn start_turn(
         &config.system_prompt,
         &config.tools,
     );
+    config.usage_scope.cache_boundaries = Some(CacheBoundaryIdentity {
+        instructions: digest_json(
+            &instructions
+                .as_ref()
+                .map(LoadedProjectInstructions::fact)
+                .unwrap_or_default(),
+        ),
+        tool_pack: canonical_tool_definitions_digest(&config.tools),
+        system_version: SystemPromptBuilder::VERSION.to_owned(),
+        web_tools: format!(
+            "anthropic_web_tools={} openai_alpha_search={}",
+            web_degrade.anthropic_web_tools, web_degrade.openai_alpha_search
+        ),
+        reasoning_settings: config.reasoning_settings.clone(),
+    });
+    surface_request_cache_transitions(
+        lease,
+        device_id,
+        &accepted.run_id,
+        accepted.branch_id.as_ref(),
+        &event_ids,
+        metadata,
+        &config.usage_scope,
+    )
+    .await?;
     config.cache_reuse_gap_ms =
         prior_cache_domain_gap_ms(lease, &accepted.run_id, &config.usage_scope).await?;
     config.cache_stable_history_end = Some(compiled_stable_history_end);
@@ -3862,6 +3888,8 @@ fn usage_scope_for(
         account_scope,
         auth_scope: auth_scope.to_owned(),
         cache_epoch,
+        stable_prefix_tokens: 0,
+        cache_boundaries: None,
         request_kind: UsageRequestKind::MainTurn,
         run: None,
         agent: None,
@@ -4283,6 +4311,66 @@ async fn journal_project_instructions_if_changed(
         payload,
     }];
     StoreHandle::append(store, &mut envelope).await?;
+    if previous.is_some() {
+        let previous_scope = latest_main_usage_scope(store).await?;
+        let stable = previous_scope
+            .as_ref()
+            .map_or(0, |scope| scope.stable_prefix_tokens);
+        let estimate = previous_scope.as_ref().and_then(|scope| {
+            haider_provider::estimate_cache_rewarm_cost_usd(
+                &scope.provider,
+                &scope.model,
+                stable,
+                haider_provider::CacheWriteTtl::Default,
+            )
+        });
+        let rewarm_cost_usd = previous_scope
+            .as_ref()
+            .is_some_and(|scope| scope.auth_scope == "api_key")
+            .then(|| estimate.map(|estimate| estimate.extra_input_cost_usd))
+            .flatten();
+        let transition = CacheEpochTransitionV1 {
+            reason: CacheEpochTransitionReason::InstructionsChanged,
+            planned: false,
+            changed_fields: vec!["instructions".into()],
+            invalidated_stable_tokens: stable,
+            rewarm_cost_usd,
+            rewarm_base_input_equivalent_tokens: estimate
+                .map(|estimate| estimate.base_input_equivalent_tokens),
+            transition_id: digest_json(&current),
+            from_cache_epoch: previous_scope.map(|scope| scope.cache_epoch),
+            to_cache_epoch: None,
+        };
+        let item = transition.extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot serialize instruction cache transition: {error}"),
+                false,
+            )
+        })?;
+        let item_id = ItemId::new(format!(
+            "cache-instructions-{}",
+            transition
+                .transition_id
+                .get(..12)
+                .unwrap_or(&transition.transition_id)
+        ));
+        append_payloads(
+            store,
+            device_id,
+            run_id,
+            branch_id,
+            event_ids,
+            vec![
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            ],
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -4321,6 +4409,249 @@ async fn project_instruction_fact_history(
         }
     }
     Ok((latest, same_run))
+}
+
+async fn latest_main_usage_scope(
+    store: &HubStoreHandle,
+) -> Result<Option<UsageScope>, HaiderError> {
+    let mut latest = None;
+    let mut cursor = 0;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            let Ok(EventPayload::Usage(usage)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            let Some(scope) = usage.scope else {
+                continue;
+            };
+            if scope.request_kind == UsageRequestKind::MainTurn && scope.agent.is_none() {
+                latest = Some(scope);
+            }
+        }
+    }
+    Ok(latest)
+}
+
+async fn cache_transition_was_emitted(
+    store: &HubStoreHandle,
+    transition: &CacheEpochTransitionV1,
+) -> Result<bool, HaiderError> {
+    let mut cursor = 0;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            return Ok(false);
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        let found = page.into_iter().any(|envelope| {
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                return false;
+            };
+            CacheEpochTransitionV1::from_extension_item(&item).is_some_and(|existing| {
+                existing.reason == transition.reason
+                    && existing.transition_id == transition.transition_id
+            })
+        });
+        if found {
+            return Ok(true);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn journal_cache_transition_if_new(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_ids: &EventIdGenerator,
+    transition: CacheEpochTransitionV1,
+) -> Result<(), HaiderError> {
+    if cache_transition_was_emitted(store, &transition).await? {
+        return Ok(());
+    }
+    let item = transition.extension_item().map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("cannot serialize cache epoch transition: {error}"),
+            false,
+        )
+    })?;
+    let item_id = ItemId::new(format!(
+        "cache-transition-{}",
+        transition
+            .transition_id
+            .get(..16)
+            .unwrap_or(&transition.transition_id)
+    ));
+    append_payloads(
+        store,
+        device_id,
+        run_id,
+        branch_id,
+        event_ids,
+        vec![
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: item.clone(),
+            }),
+            EventPayload::Item(ItemEvent::Completed { item_id, item }),
+        ],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn surface_request_cache_transitions(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_ids: &EventIdGenerator,
+    metadata: &SessionMetadataV1,
+    current: &UsageScope,
+) -> Result<(), HaiderError> {
+    let previous = latest_main_usage_scope(store).await?;
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let stable = previous.stable_prefix_tokens;
+    let estimate = haider_provider::estimate_cache_rewarm_cost_usd(
+        &current.provider,
+        &current.model,
+        stable,
+        haider_provider::CacheWriteTtl::Default,
+    );
+    let cost = (current.auth_scope == "api_key")
+        .then(|| estimate.map(|estimate| estimate.extra_input_cost_usd))
+        .flatten();
+    let equivalents = estimate.map(|estimate| estimate.base_input_equivalent_tokens);
+    let transition =
+        |reason, fields: Vec<String>, identity: serde_json::Value| CacheEpochTransitionV1 {
+            reason,
+            planned: false,
+            changed_fields: fields,
+            invalidated_stable_tokens: stable,
+            rewarm_cost_usd: cost,
+            rewarm_base_input_equivalent_tokens: equivalents,
+            transition_id: digest_json(&serde_json::json!({
+                "reason": reason,
+                "from": previous.cache_epoch,
+                "to": identity,
+            })),
+            from_cache_epoch: Some(previous.cache_epoch.clone()),
+            to_cache_epoch: Some(current.cache_epoch.clone()),
+        };
+
+    let mut config_fields = Vec::new();
+    if previous.provider != current.provider {
+        config_fields.push("provider".into());
+    }
+    if previous.model != current.model {
+        config_fields.push("model".into());
+    }
+    if previous.auth_scope != current.auth_scope {
+        config_fields.push("auth".into());
+    }
+    if previous.account_scope != current.account_scope {
+        config_fields.push("account".into());
+    }
+    let prior_reasoning = previous
+        .cache_boundaries
+        .as_ref()
+        .map(|boundaries| boundaries.reasoning_settings.as_str());
+    let current_reasoning = current
+        .cache_boundaries
+        .as_ref()
+        .map(|boundaries| boundaries.reasoning_settings.as_str());
+    if prior_reasoning != current_reasoning {
+        config_fields.push("effort/thinking/fast".into());
+    }
+    if !config_fields.is_empty() {
+        journal_cache_transition_if_new(
+            store,
+            device_id,
+            run_id,
+            branch_id,
+            event_ids,
+            transition(
+                CacheEpochTransitionReason::ConfigurationChanged,
+                config_fields,
+                serde_json::json!({
+                    "provider": current.provider,
+                    "model": current.model,
+                    "auth": current.auth_scope,
+                    "account": current.account_scope,
+                    "reasoning": current_reasoning,
+                }),
+            ),
+        )
+        .await?;
+    }
+
+    let previous_boundaries = previous.cache_boundaries.as_ref();
+    let current_boundaries = current.cache_boundaries.as_ref();
+    let system_version_changed = match (previous_boundaries, current_boundaries) {
+        (Some(previous), Some(current)) => previous.system_version != current.system_version,
+        _ => metadata.system_prompt_version.as_deref() != Some(SystemPromptBuilder::VERSION),
+    };
+    if system_version_changed {
+        journal_cache_transition_if_new(
+            store,
+            device_id,
+            run_id,
+            branch_id,
+            event_ids,
+            transition(
+                CacheEpochTransitionReason::SystemVersionChanged,
+                vec!["system_version".into()],
+                serde_json::json!(SystemPromptBuilder::VERSION),
+            ),
+        )
+        .await?;
+    }
+    if let (Some(previous), Some(current)) = (previous_boundaries, current_boundaries) {
+        if previous.tool_pack != current.tool_pack {
+            journal_cache_transition_if_new(
+                store,
+                device_id,
+                run_id,
+                branch_id,
+                event_ids,
+                transition(
+                    CacheEpochTransitionReason::ToolPackChanged,
+                    vec!["tools".into()],
+                    serde_json::json!(&current.tool_pack),
+                ),
+            )
+            .await?;
+        }
+        if previous.web_tools != current.web_tools && current.web_tools.contains("=true") {
+            journal_cache_transition_if_new(
+                store,
+                device_id,
+                run_id,
+                branch_id,
+                event_ids,
+                transition(
+                    CacheEpochTransitionReason::WebToolDegradation,
+                    vec!["web_tools".into()],
+                    serde_json::json!(&current.web_tools),
+                ),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 fn supervisor_envelope(

@@ -311,9 +311,14 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     let decoded: SessionMetadataV1 = serde_json::from_str(legacy).expect("legacy metadata decodes");
     assert_eq!(decoded.effort, None);
     assert!(!decoded.fast);
+    assert_eq!(
+        decoded.cache_policy,
+        haider_protocol::cache::CachePolicySettingsV1::default()
+    );
     let encoded = serde_json::to_string(&decoded).expect("re-encode");
     assert!(!encoded.contains("effort"));
     assert!(!encoded.contains("fast"));
+    assert!(!encoded.contains("cache_policy"));
 
     let tuned = SessionMetadataV1 {
         effort: Some("max".into()),
@@ -323,6 +328,20 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     let encoded = serde_json::to_value(&tuned).expect("tuned encode");
     assert_eq!(encoded["effort"], "max");
     assert_eq!(encoded["fast"], true);
+
+    let mobile = SessionMetadataV1 {
+        cache_policy: haider_protocol::cache::CachePolicySettingsV1 {
+            mode: haider_protocol::cache::CachePolicyMode::Mobility,
+            cold_cost_threshold_microusd: 9_000,
+        },
+        ..tuned
+    };
+    let encoded = serde_json::to_value(&mobile).expect("policy encode");
+    assert_eq!(encoded["cache_policy"]["mode"], "mobility");
+    assert_eq!(
+        encoded["cache_policy"]["cold_cost_threshold_microusd"],
+        9_000
+    );
 }
 
 /// MUTATION CHECK: remove, rename, or reorder any project-instruction audit
@@ -1021,6 +1040,8 @@ fn golden_usage_account_tagged() {
                 account_scope: Some(CredentialAlias::new("personal-max")),
                 auth_scope: "oauth_subscription".into(),
                 cache_epoch: "epoch-7".into(),
+                stable_prefix_tokens: 1_700,
+                cache_boundaries: None,
                 request_kind: UsageRequestKind::MainTurn,
                 run: Some(RunId::new("run-7")),
                 agent: None,

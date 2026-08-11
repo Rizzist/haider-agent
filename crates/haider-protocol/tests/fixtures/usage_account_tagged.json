@@ -26,6 +26,7 @@
     "account_scope": "personal-max",
     "auth_scope": "oauth_subscription",
     "cache_epoch": "epoch-7",
+    "stable_prefix_tokens": 1700,
     "request_kind": "main_turn",
     "run": "run-7",
     "prefix_digests": {

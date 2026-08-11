@@ -1751,6 +1751,7 @@ impl HarnessActor {
                             &run_id,
                             prefix_digests.clone(),
                             &cache_metadata.cache_epoch,
+                            cache_metadata.stable_prefix_tokens,
                             &mut usage,
                         );
                         if let Some(account) = &usage_account {
@@ -4627,10 +4628,12 @@ fn attach_usage_scope_and_cost(
     run_id: &RunId,
     prefix_digests: PrefixDigests,
     cache_epoch: &str,
+    stable_prefix_tokens: u64,
     usage: &mut Usage,
 ) {
     let mut scope = config.usage_scope.clone();
     scope.cache_epoch = cache_epoch.to_owned();
+    scope.stable_prefix_tokens = stable_prefix_tokens;
     scope.run = Some(run_id.clone());
     scope.agent = config.agent_id.clone();
     if scope.agent.is_some() && scope.request_kind == UsageRequestKind::MainTurn {

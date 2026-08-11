@@ -195,6 +195,7 @@ fn select_body(
         worker_generation: generation,
         model: model.into(),
         provider: provider.map(str::to_owned),
+        confirm_new_epoch: false,
     }
 }
 

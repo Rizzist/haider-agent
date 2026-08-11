@@ -28,6 +28,8 @@ fn usage(run: &str, provider: &str, kind: UsageRequestKind, normalized: Normaliz
             account_scope: None,
             auth_scope: "api_key".into(),
             cache_epoch: "epoch-fixture".into(),
+            stable_prefix_tokens: 0,
+            cache_boundaries: None,
             request_kind: kind,
             run: Some(RunId::new(run)),
             agent: None,
@@ -92,7 +94,7 @@ fn cm1g_session_fold_and_responsive_cache_readout_laws() {
     );
     let scope = latest.scope.as_mut().expect("fixture scope");
     scope.account_scope = Some(haider_protocol::ids::CredentialAlias::new("rotated"));
-    scope.auth_scope = "rotated_oauth".into();
+    scope.auth_scope = "api_key".into();
     fold.note(&latest);
     let totals = fold.totals();
     assert_eq!(totals.uncached_input_tokens, 450_000);
@@ -115,7 +117,7 @@ fn cm1g_session_fold_and_responsive_cache_readout_laws() {
     let plain = render_plain_with_cache(&SessionProjection::new(), 200_000, None, &fold);
     assert!(plain.contains("cache usage — logical"));
     assert!(plain.contains("/ Compaction —"));
-    assert!(plain.contains("input $ n/a"));
+    assert!(plain.contains("input $—"));
 
     fold.note(&usage(
         "unsupported",
@@ -180,4 +182,69 @@ fn cm1c_reported_zero_and_missing_render_differently() {
         },
     ));
     assert_eq!(wide_status(&missing.totals()), "⚡n/a · hit n/a");
+}
+
+#[test]
+fn part_a_unknown_auth_is_unknown_price_not_a_subscription_plan() {
+    let mut fold = SessionUsageFold::default();
+    let mut unknown = usage(
+        "unknown-auth",
+        "compatible",
+        UsageRequestKind::MainTurn,
+        present(1_000, 0, 1),
+    );
+    unknown.scope.as_mut().expect("scope").auth_scope = "opaque".into();
+    fold.note(&unknown);
+    let plain = render_plain_with_cache(&SessionProjection::new(), 200_000, None, &fold);
+    assert!(plain.contains("input $—"), "{plain}");
+    assert!(!plain.contains(" · plan"), "{plain}");
+}
+
+/// LAW (Part A): OAuth lanes retain tokens/cache/hit-rate but contribute no
+/// dollar estimate. A mixed session renders only the API-key subtotal and
+/// labels it as the metered portion.
+///
+/// MUTATION CHECK (executed): classify `oauth_subscription` as API-key in
+/// `scope_auth_method`; the exact subtotal and no-dollar plan lane fail.
+#[test]
+fn part_a_mixed_session_displays_only_metered_lane_cost() {
+    let priced = |run: &str, epoch: &str, auth: &str, cost: f64| {
+        let mut value = usage(
+            run,
+            "openai",
+            UsageRequestKind::MainTurn,
+            present(200, 800, 10),
+        );
+        let scope = value.scope.as_mut().expect("scope");
+        scope.cache_epoch = epoch.into();
+        scope.auth_scope = auth.into();
+        value.cache_cost = Some(haider_protocol::provider::CacheCostEstimate {
+            input_with_cache_usd: cost,
+            input_without_cache_usd: cost * 2.0,
+            estimated_savings_usd: cost,
+            explicit_storage_usd: 0.0,
+        });
+        value
+    };
+    let mut fold = SessionUsageFold::default();
+    fold.note(&priced("api", "api-epoch", "api_key", 0.25));
+    fold.note(&priced("oauth", "oauth-epoch", "oauth_subscription", 9.99));
+    let totals = fold.totals();
+    assert_eq!(totals.logical_input_tokens, 2_000);
+    assert_eq!(totals.cache_read_tokens, 1_600);
+    assert_eq!(totals.complete_hit_rate(), Some(0.8));
+    assert_eq!(totals.metered_input_tokens, 1_000);
+    assert_eq!(totals.input_with_cache_usd, Some(0.25));
+    let oauth = totals
+        .breakdowns
+        .iter()
+        .find(|lane| lane.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth))
+        .expect("OAuth lane");
+    assert_eq!(oauth.input_with_cache_usd, None);
+
+    let plain = render_plain_with_cache(&SessionProjection::new(), 200_000, None, &fold);
+    assert!(plain.contains("$0.2500"), "{plain}");
+    assert!(plain.contains("metered lanes"), "{plain}");
+    assert!(plain.contains("plan"), "{plain}");
+    assert!(!plain.contains("$9.9900"), "{plain}");
 }

@@ -115,6 +115,11 @@ pub struct CacheUsageStatsV1 {
     pub billed_output_tokens: u64,
     /// Logical input backed by a provider-reported cache split.
     pub telemetry_covered_input_tokens: u64,
+    /// Logical input attributed to API-key (pay-as-you-go) lanes. Dollar
+    /// estimates cover only these tokens; OAuth/subscription lanes are plan
+    /// covered and intentionally never receive API-equivalent dollar values.
+    #[serde(default)]
+    pub metered_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_with_cache_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +141,7 @@ impl CacheUsageStatsV1 {
             && self.cache_write_1h_tokens == 0
             && self.billed_output_tokens == 0
             && self.telemetry_covered_input_tokens == 0
+            && self.metered_input_tokens == 0
             && self.input_with_cache_usd.is_none()
             && self.input_without_cache_usd.is_none()
             && self.estimated_savings_usd.is_none()
@@ -151,6 +157,10 @@ pub struct CacheUsageBreakdownV1 {
     pub cache_epoch: String,
     #[serde(default)]
     pub request_kind: UsageRequestKind,
+    /// Credential flavor for this lane. Absent is legacy/unknown and is
+    /// conservatively treated as not eligible for dollar rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<AuthMethod>,
     pub logical_input_tokens: u64,
     pub uncached_input_tokens: u64,
     pub cache_read_tokens: u64,

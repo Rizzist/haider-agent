@@ -2198,7 +2198,10 @@ pub enum AppRequest {
     /// `account.set_active` for the clicked/entered row. The model already
     /// holds `pending_select` — the dot moves only when the driver's reply
     /// applies (optimism forbidden, report §5.1).
-    AccountSetActive { alias: String },
+    AccountSetActive {
+        alias: String,
+        confirm_new_epoch: bool,
+    },
     /// Fetch/refresh the `/providers` summaries (`provider.list`).
     ProvidersRefresh,
     /// Fetch/refresh the `/usage` snapshot (U1's `usage.report`). A READ —
@@ -2220,6 +2223,7 @@ pub enum AppRequest {
         session: SessionId,
         model: String,
         provider: String,
+        confirm_new_epoch: bool,
     },
     /// G2: receipted live-session rename (`session.rename`) — `/rename`
     /// on an attached session. The daemon normalizes the title; the name
@@ -2232,9 +2236,14 @@ pub enum AppRequest {
     SelectEffort {
         session: SessionId,
         effort: Option<String>,
+        confirm_new_epoch: bool,
     },
     /// G3: the receipted fast-mode toggle (`session.select_fast`).
-    SelectFast { session: SessionId, enabled: bool },
+    SelectFast {
+        session: SessionId,
+        enabled: bool,
+        confirm_new_epoch: bool,
+    },
     /// Start an OAuth add flow (`account.oauth_start`) for the card.
     OAuthAddStart {
         provider: String,
@@ -2747,6 +2756,29 @@ pub struct ModelPickerRow {
     pub selectable: bool,
 }
 
+/// Exact cache-sensitive change awaiting a deliberate repeat. The first
+/// request is daemon-preflight only; repeating the same selection sends the
+/// explicit new-epoch confirmation, while a different selection replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingCacheChange {
+    Model {
+        session: SessionId,
+        provider: String,
+        model: String,
+    },
+    Effort {
+        session: SessionId,
+        effort: Option<String>,
+    },
+    Fast {
+        session: SessionId,
+        enabled: bool,
+    },
+    Account {
+        alias: String,
+    },
+}
+
 /// Identity shown in the status bar and launcher info line. Real values come
 /// from config/accounts in later waves; the demo pins sim-parity defaults.
 #[derive(Debug, Clone)]
@@ -2828,6 +2860,9 @@ pub struct AppModel {
     /// Session-wide latest-snapshot usage fold. Kept outside branch/chip
     /// projections so every billed lane survives view switches.
     pub cache_usage: crate::cache_usage::SessionUsageFold,
+    /// Daemon-issued cache impact warning. Repeating exactly this selection
+    /// is the explicit confirmation that opens a new epoch.
+    pub pending_cache_change: Option<PendingCacheChange>,
     pub identity: IdentityLine,
     /// The user EXPLICITLY chose a provider/model/account this run
     /// (`/model`, `/provider`, or clicking an account). Once pinned, the
@@ -3186,6 +3221,7 @@ impl Default for AppModel {
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
+            pending_cache_change: None,
             identity: IdentityLine::default(),
             identity_pinned: false,
             composer: crate::composer::Composer::new(),
@@ -6391,10 +6427,15 @@ impl AppModel {
             haider_protocol::credential::CredentialStatus::Ok
             | haider_protocol::credential::CredentialStatus::Limited { .. } => {}
         }
+        let change = PendingCacheChange::Account {
+            alias: alias.to_owned(),
+        };
+        let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
         self.accounts.pending_select = Some(alias.to_owned());
         self.accounts.message = None;
         self.requests.push(AppRequest::AccountSetActive {
             alias: alias.to_owned(),
+            confirm_new_epoch,
         });
         self.dirty = true;
     }
@@ -6414,6 +6455,13 @@ impl AppModel {
             .is_some_and(|pending| pending == descriptor.alias.as_str())
         {
             self.accounts.pending_select = None;
+        }
+        if self.pending_cache_change.as_ref()
+            == Some(&PendingCacheChange::Account {
+                alias: descriptor.alias.as_str().to_owned(),
+            })
+        {
+            self.pending_cache_change = None;
         }
         if let Some(current) = self.accounts.revision
             && revision < current
@@ -8837,10 +8885,17 @@ impl AppModel {
                 if !self.daemon_serves(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1) {
                     return format!("· /{} — model override needs a newer daemon", command.name);
                 }
+                let change = PendingCacheChange::Model {
+                    session: session.clone(),
+                    provider: provider.clone(),
+                    model: resolved_model.clone(),
+                };
+                let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
                 self.requests.push(AppRequest::SelectModel {
                     session,
                     model: resolved_model.clone(),
                     provider: provider.clone(),
+                    confirm_new_epoch,
                 });
                 format!(
                     "· /{} — model → {resolved_model} · {provider}",
@@ -10943,10 +10998,17 @@ impl AppModel {
             picker.pending = Some((row.provider.clone(), row.model.clone()));
             picker.error = None;
         }
+        let change = PendingCacheChange::Model {
+            session: session.clone(),
+            provider: row.provider.clone(),
+            model: row.model.clone(),
+        };
+        let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
         self.requests.push(AppRequest::SelectModel {
             session,
             model: row.model.clone(),
             provider: row.provider.clone(),
+            confirm_new_epoch,
         });
     }
 
@@ -10958,6 +11020,7 @@ impl AppModel {
         self.identity_pinned = true;
         self.refresh_context_window();
         self.model_picker = None;
+        self.pending_cache_change = None;
         self.flash = Some(format!("· model → {model} · {provider}"));
         self.dirty = true;
     }
@@ -11059,8 +11122,16 @@ impl AppModel {
             self.flash = Some(self.stale_daemon_note("fast-mode selection"));
             return;
         }
-        self.requests
-            .push(AppRequest::SelectFast { session, enabled });
+        let change = PendingCacheChange::Fast {
+            session: session.clone(),
+            enabled,
+        };
+        let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
+        self.requests.push(AppRequest::SelectFast {
+            session,
+            enabled,
+            confirm_new_epoch,
+        });
     }
 
     /// Whether the CURRENT pair's daemon detail declares the `fast` speed.
@@ -11170,8 +11241,16 @@ impl AppModel {
             picker.pending = Some(effort.clone());
             picker.error = None;
         }
-        self.requests
-            .push(AppRequest::SelectEffort { session, effort });
+        let change = PendingCacheChange::Effort {
+            session: session.clone(),
+            effort: effort.clone(),
+        };
+        let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
+        self.requests.push(AppRequest::SelectEffort {
+            session,
+            effort,
+            confirm_new_epoch,
+        });
     }
 
     /// The RESOLVED effort committed (G3/R2): render daemon truth. On
@@ -11180,6 +11259,7 @@ impl AppModel {
     pub fn apply_effort_selected(&mut self, effort: Option<&str>) {
         self.identity.reasoning = effort.map(str::to_owned);
         self.effort_picker = None;
+        self.pending_cache_change = None;
         let label = effort.unwrap_or("default");
         self.flash = Some(if self.identity.provider.starts_with("anthropic") {
             format!("· effort → {label} · cache re-warm")
@@ -11192,6 +11272,7 @@ impl AppModel {
     /// The committed fast toggle (G3/R2): render daemon truth.
     pub fn apply_fast_selected(&mut self, enabled: bool) {
         self.identity.fast = enabled;
+        self.pending_cache_change = None;
         let state = if enabled { "on" } else { "off" };
         self.flash = Some(if self.identity.provider.starts_with("anthropic") {
             format!("· fast → {state} · cache re-warm")
@@ -11221,6 +11302,35 @@ impl AppModel {
         self.projection
             .record_local_error(format!("fast-mode selection failed — {code}: {message}"));
         self.flash = Some(format!("· fast-mode selection failed — {code}"));
+        self.dirty = true;
+    }
+
+    /// The daemon preflighted a warmed cache epoch. Nothing changed; the
+    /// exact selection is retained so repeating it is an explicit confirm.
+    pub fn cache_epoch_confirmation_required(&mut self, change: PendingCacheChange, message: &str) {
+        self.pending_cache_change = Some(change);
+        let notice = format!("{message} · repeat this selection to create the new epoch");
+        match &mut self.pending_cache_change {
+            Some(PendingCacheChange::Model { .. }) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.pending = None;
+                    picker.error = Some(notice.clone());
+                }
+            }
+            Some(PendingCacheChange::Effort { .. }) => {
+                if let Some(picker) = self.effort_picker.as_mut() {
+                    picker.pending = None;
+                    picker.error = Some(notice.clone());
+                }
+            }
+            Some(PendingCacheChange::Account { .. }) => {
+                self.accounts.pending_select = None;
+                self.accounts.message = Some(notice.clone());
+            }
+            Some(PendingCacheChange::Fast { .. }) | None => {}
+        }
+        self.projection.push_note(format!("· {notice}"));
+        self.flash = Some("· cache epoch change needs confirmation".to_owned());
         self.dirty = true;
     }
 

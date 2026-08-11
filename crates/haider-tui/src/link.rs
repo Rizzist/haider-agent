@@ -570,6 +570,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
                     allow_exec: true,
                 },
             ),
+            cache_policy: None,
         },
         // B2b encode-selection law: a captured branch rides the
         // branch-capable decode form; `None` keeps the LEGACY variant so
@@ -764,9 +765,15 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             command_id,
             candidate,
         },
-        LiveCommand::AccountSetActive { command_id, alias } => {
-            RequestBody::AccountSetActive { command_id, alias }
-        }
+        LiveCommand::AccountSetActive {
+            command_id,
+            alias,
+            confirm_new_epoch,
+        } => RequestBody::AccountSetActive {
+            command_id,
+            alias,
+            confirm_new_epoch,
+        },
         LiveCommand::ProviderList => RequestBody::ProviderList { provider: None },
         LiveCommand::RefreshProviderModels { provider } => {
             RequestBody::ProviderModelsRefresh { provider }
@@ -791,12 +798,14 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             worker_generation,
             model,
             provider,
+            confirm_new_epoch,
         } => RequestBody::SessionSelectModel {
             command_id,
             session_id: session,
             worker_generation,
             model,
             provider: Some(provider),
+            confirm_new_epoch,
         },
         // G2: the /rename command's receipted title. Always `Some` — bare
         // clearing is deliberately not offered by this client.
@@ -817,22 +826,26 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             session,
             worker_generation,
             effort,
+            confirm_new_epoch,
         } => RequestBody::SessionSelectEffort {
             command_id,
             session_id: session,
             worker_generation,
             effort,
+            confirm_new_epoch,
         },
         LiveCommand::SelectFast {
             command_id,
             session,
             worker_generation,
             enabled,
+            confirm_new_epoch,
         } => RequestBody::SessionSelectFast {
             command_id,
             session_id: session,
             worker_generation,
             enabled,
+            confirm_new_epoch,
         },
         // W5g-4: the card CREATES — identity fields are fixed here, never
         // typed. The origin string is data on the wire only; it is never

@@ -427,6 +427,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
             permission_overrides: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: "test-v1".into(),
             event_id: EventId::new("created-compacted-session"),
             device_id: DeviceId::new("compaction-restart-test"),

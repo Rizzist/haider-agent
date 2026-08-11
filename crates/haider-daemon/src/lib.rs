@@ -49,6 +49,9 @@
 //! documented on [`DaemonState`] and enforced by the state publisher.
 
 mod accounts;
+mod cache_policy;
+#[cfg(test)]
+mod cache_policy_tests;
 mod config;
 mod connection;
 #[cfg(test)]

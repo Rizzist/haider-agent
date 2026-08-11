@@ -544,6 +544,7 @@ impl HubConnection {
                 model,
                 max_tokens,
                 permission_overrides,
+                cache_policy,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -562,6 +563,7 @@ impl HubConnection {
                     model,
                     max_tokens,
                     permission_overrides,
+                    cache_policy.unwrap_or_default(),
                 )
                 .await
             }
@@ -582,7 +584,14 @@ impl HubConnection {
                     );
                 }
                 self.session_create(
-                    request_id, command_id, cwd, provider, model, max_tokens, None,
+                    request_id,
+                    command_id,
+                    cwd,
+                    provider,
+                    model,
+                    max_tokens,
+                    None,
+                    Default::default(),
                 )
                 .await
             }
@@ -1010,6 +1019,7 @@ impl HubConnection {
                 worker_generation,
                 model,
                 provider,
+                confirm_new_epoch,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -1039,6 +1049,7 @@ impl HubConnection {
                     worker_generation,
                     model,
                     provider,
+                    confirm_new_epoch,
                 )
                 .await
             }
@@ -1077,6 +1088,7 @@ impl HubConnection {
                 session_id,
                 worker_generation,
                 effort,
+                confirm_new_epoch,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -1105,6 +1117,7 @@ impl HubConnection {
                     session_id,
                     worker_generation,
                     effort,
+                    confirm_new_epoch,
                 )
                 .await
             }
@@ -1113,6 +1126,7 @@ impl HubConnection {
                 session_id,
                 worker_generation,
                 enabled,
+                confirm_new_epoch,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -1141,6 +1155,7 @@ impl HubConnection {
                     session_id,
                     worker_generation,
                     enabled,
+                    confirm_new_epoch,
                 )
                 .await
             }
@@ -1373,7 +1388,11 @@ impl HubConnection {
                     oauth_reference,
                 )
             }
-            RequestBody::AccountSetActive { command_id, alias } => {
+            RequestBody::AccountSetActive {
+                command_id,
+                alias,
+                confirm_new_epoch,
+            } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
                         request_id,
@@ -1383,7 +1402,8 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.account_set_active(request_id, command_id, alias)
+                self.account_set_active(request_id, command_id, alias, confirm_new_epoch)
+                    .await
             }
             RequestBody::AccountRemove {
                 command_id,
@@ -2254,11 +2274,12 @@ impl HubConnection {
         }
     }
 
-    fn account_set_active(
+    async fn account_set_active(
         &self,
         request_id: RequestId,
         command_id: CommandId,
         alias: String,
+        confirm_new_epoch: bool,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().trim().is_empty() || alias.trim().is_empty() {
             return self.respond_error(
@@ -2268,6 +2289,64 @@ impl HubConnection {
                 false,
                 None,
             );
+        }
+        let descriptor = self
+            .hub
+            .accounts()?
+            .and_then(|facade| facade.management.read())
+            .and_then(|view| {
+                view.descriptors
+                    .into_iter()
+                    .find(|descriptor| descriptor.alias.as_str() == alias)
+            });
+        if let Some(descriptor) = descriptor {
+            let target_auth_scope = match descriptor.auth_method {
+                haider_protocol::credential::AuthMethod::ApiKey => "api_key",
+                haider_protocol::credential::AuthMethod::OAuth => "oauth_subscription",
+            };
+            let mut warnings = Vec::new();
+            for session_id in self.hub.inner.store.session_ids().await? {
+                let Some(metadata) = self.hub.inner.store.session_metadata(&session_id).await?
+                else {
+                    continue;
+                };
+                if metadata.provider != descriptor.provider {
+                    continue;
+                }
+                let scope = crate::cache_policy::latest_main_cache_scope(
+                    &self.hub.inner.store,
+                    &session_id,
+                )
+                .await?;
+                let Some(scope) = scope else {
+                    continue;
+                };
+                let mut changed_fields = Vec::new();
+                if scope.account_scope.as_ref().map(|value| value.as_str())
+                    != Some(descriptor.alias.as_str())
+                {
+                    changed_fields.push("account".to_owned());
+                }
+                if scope.auth_scope != target_auth_scope {
+                    changed_fields.push("auth".to_owned());
+                }
+                if let Some(warning) = crate::cache_policy::assess_cache_change(
+                    &metadata,
+                    Some(&scope),
+                    &metadata.provider,
+                    &metadata.model,
+                    Some(target_auth_scope),
+                    changed_fields,
+                    false,
+                ) {
+                    warnings.push(warning);
+                }
+            }
+            if let Some(warning) = crate::cache_policy::combine_cache_change_warnings(warnings)
+                && crate::cache_policy::blocks_change(&warning, confirm_new_epoch)
+            {
+                return self.respond_cache_confirmation_required(request_id, &warning);
+            }
         }
         self.send_management_command(
             request_id.clone(),
@@ -2698,6 +2777,7 @@ impl HubConnection {
         worker_generation: u64,
         model: String,
         provider: Option<String>,
+        confirm_new_epoch: bool,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().trim().is_empty() || model.trim().is_empty() {
             return self.respond_error(
@@ -2713,6 +2793,7 @@ impl HubConnection {
             "worker_generation": worker_generation,
             "model": &model,
             "provider": &provider,
+            "confirm_new_epoch": confirm_new_epoch,
         }))
         .map_err(|error| {
             SessionHubError::Task(format!(
@@ -2748,12 +2829,14 @@ impl HubConnection {
                 None,
             );
         };
-        let summaries = self
+        let (summaries, descriptors) = self
             .hub
             .accounts()?
             .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
-            .unwrap_or_default();
+            .map_or_else(
+                || (Vec::new(), Vec::new()),
+                |view| (view.providers, view.descriptors),
+            );
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             summaries,
@@ -2763,6 +2846,52 @@ impl HubConnection {
                 Ok(pair) => pair,
                 Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
             };
+        let target_descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.provider == resolved_provider && descriptor.active)
+            .cloned();
+        let mut changed_fields = Vec::new();
+        if current.provider != resolved_provider {
+            changed_fields.push("provider".to_owned());
+        }
+        if current.model != resolved_model {
+            changed_fields.push("model".to_owned());
+        }
+        let current_scope =
+            crate::cache_policy::latest_main_cache_scope(&self.hub.inner.store, &session_id)
+                .await?;
+        let target_auth_scope =
+            target_descriptor
+                .as_ref()
+                .map(|descriptor| match descriptor.auth_method {
+                    haider_protocol::credential::AuthMethod::ApiKey => "api_key",
+                    haider_protocol::credential::AuthMethod::OAuth => "oauth_subscription",
+                });
+        if let Some(scope) = current_scope.as_ref() {
+            if let Some(target_auth_scope) = target_auth_scope
+                && scope.auth_scope != target_auth_scope
+            {
+                changed_fields.push("auth".to_owned());
+            }
+            let target_account = target_descriptor
+                .as_ref()
+                .map(|descriptor| &descriptor.alias);
+            if target_descriptor.is_some() && scope.account_scope.as_ref() != target_account {
+                changed_fields.push("account".to_owned());
+            }
+        }
+        if let Some(warning) = crate::cache_policy::assess_cache_change(
+            &current,
+            current_scope.as_ref(),
+            &resolved_provider,
+            &resolved_model,
+            target_auth_scope,
+            changed_fields,
+            false,
+        ) && crate::cache_policy::blocks_change(&warning, confirm_new_epoch)
+        {
+            return self.respond_cache_confirmation_required(request_id, &warning);
+        }
 
         let command = SessionSelectModelCommand {
             command_id: command_id.0,
@@ -2974,6 +3103,7 @@ impl HubConnection {
         session_id: SessionId,
         worker_generation: u64,
         effort: Option<String>,
+        confirm_new_epoch: bool,
     ) -> Result<(), SessionHubError> {
         let effort = effort
             .map(|effort| effort.trim().to_owned())
@@ -2991,6 +3121,7 @@ impl HubConnection {
             "session_id": &session_id,
             "worker_generation": worker_generation,
             "effort": &effort,
+            "confirm_new_epoch": confirm_new_epoch,
         }))
         .map_err(|error| {
             SessionHubError::Task(format!(
@@ -3032,6 +3163,26 @@ impl HubConnection {
         {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
+        let changed_fields = (current.effort != effort)
+            .then(|| vec!["effort/thinking".to_owned()])
+            .unwrap_or_default();
+        let current_scope =
+            crate::cache_policy::latest_main_cache_scope(&self.hub.inner.store, &session_id)
+                .await?;
+        if let Some(warning) = crate::cache_policy::assess_cache_change(
+            &current,
+            current_scope.as_ref(),
+            &current.provider,
+            &current.model,
+            current_scope
+                .as_ref()
+                .map(|scope| scope.auth_scope.as_str()),
+            changed_fields,
+            true,
+        ) && crate::cache_policy::blocks_change(&warning, confirm_new_epoch)
+        {
+            return self.respond_cache_confirmation_required(request_id, &warning);
+        }
 
         let command = haider_core::SessionSelectEffortCommand {
             command_id: command_id.0,
@@ -3063,6 +3214,7 @@ impl HubConnection {
         session_id: SessionId,
         worker_generation: u64,
         enabled: bool,
+        confirm_new_epoch: bool,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().trim().is_empty() {
             return self.respond_error(
@@ -3077,6 +3229,7 @@ impl HubConnection {
             "session_id": &session_id,
             "worker_generation": worker_generation,
             "enabled": enabled,
+            "confirm_new_epoch": confirm_new_epoch,
         }))
         .map_err(|error| {
             SessionHubError::Task(format!(
@@ -3113,6 +3266,26 @@ impl HubConnection {
         let authority = self.tuning_authority()?;
         if let Err(refusal) = authority.validate_fast(&current.provider, &current.model, enabled) {
             return self.respond_tuning_refusal(request_id, &refusal);
+        }
+        let changed_fields = (current.fast != enabled)
+            .then(|| vec!["fast/speed".to_owned()])
+            .unwrap_or_default();
+        let current_scope =
+            crate::cache_policy::latest_main_cache_scope(&self.hub.inner.store, &session_id)
+                .await?;
+        if let Some(warning) = crate::cache_policy::assess_cache_change(
+            &current,
+            current_scope.as_ref(),
+            &current.provider,
+            &current.model,
+            current_scope
+                .as_ref()
+                .map(|scope| scope.auth_scope.as_str()),
+            changed_fields,
+            true,
+        ) && crate::cache_policy::blocks_change(&warning, confirm_new_epoch)
+        {
+            return self.respond_cache_confirmation_required(request_id, &warning);
         }
 
         let command = haider_core::SessionSelectFastCommand {
@@ -3183,6 +3356,31 @@ impl HubConnection {
             ),
         };
         self.respond_error(request_id, code, &refusal.message(), false, data)
+    }
+
+    fn respond_cache_confirmation_required(
+        &self,
+        request_id: RequestId,
+        warning: &crate::cache_policy::CacheChangeWarning,
+    ) -> Result<(), SessionHubError> {
+        let policy = match warning.policy {
+            haider_protocol::cache::CachePolicyMode::Economy => "economy",
+            haider_protocol::cache::CachePolicyMode::Balanced => "balanced",
+            haider_protocol::cache::CachePolicyMode::Mobility => "mobility",
+        };
+        self.respond_error(
+            request_id,
+            haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED,
+            &warning.message(),
+            false,
+            Some(ErrorData::CacheEpochConfirmationRequired {
+                changed_fields: warning.changed_fields.clone(),
+                invalidated_stable_tokens: warning.invalidated_stable_tokens,
+                rewarm_cost_microusd: warning.rewarm_cost_microusd,
+                rewarm_base_input_equivalent_tokens: warning.rewarm_base_input_equivalent_tokens,
+                policy: policy.to_owned(),
+            }),
+        )
     }
 
     fn respond_effort_selected(
@@ -3810,6 +4008,7 @@ impl HubConnection {
         model: String,
         max_tokens: u64,
         permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
+        cache_policy: haider_protocol::cache::CachePolicySettingsV1,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() {
             return self.respond_error(
@@ -3832,6 +4031,12 @@ impl HubConnection {
                     SessionHubError::Task(format!(
                         "cannot encode session permission overrides: {error}"
                     ))
+                })?;
+        }
+        if !cache_policy.is_default() {
+            request_coordinates["cache_policy"] =
+                serde_json::to_value(cache_policy).map_err(|error| {
+                    SessionHubError::Task(format!("cannot encode session cache policy: {error}"))
                 })?;
         }
         let request_json = serde_json::to_string(&request_coordinates).map_err(|error| {
@@ -3929,6 +4134,7 @@ impl HubConnection {
             permission_overrides,
             effort: None,
             fast: false,
+            cache_policy,
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(random_id("session-created")?),
             device_id: self.hub.inner.device_id.clone(),

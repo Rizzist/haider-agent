@@ -1525,7 +1525,7 @@ impl DemoDriver {
                 model.flash = Some(format!("· browser (demo): {url}"));
                 model.dirty = true;
             }
-            AppRequest::AccountSetActive { alias } => {
+            AppRequest::AccountSetActive { alias, .. } => {
                 let Some(row) = model
                     .accounts
                     .rows
