@@ -1721,7 +1721,10 @@ impl StubAccountClaudeNative {
 }
 
 impl ClaudeNativeCredentialStore for StubAccountClaudeNative {
-    fn read(&self) -> Option<crate::oauth::ClaudeCredentialInput> {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<crate::oauth::ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.bytes
             .lock()
@@ -1732,6 +1735,7 @@ impl ClaudeNativeCredentialStore for StubAccountClaudeNative {
                 bytes: Zeroizing::new(bytes),
                 native_owner: true,
             })
+            .ok_or(ClaudeNativeCredentialFailure::Missing)
     }
 }
 
@@ -2011,7 +2015,7 @@ fn start_oauth_import_heal_test_actor(
         store,
         vault,
         catalog,
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
         None,
     )
 }
@@ -4788,7 +4792,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         },
         discoverer_trait,
         Arc::new(UnreachableGcloud),
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
     )
     .expect("custom refresh actor");
 
@@ -5024,7 +5028,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         },
         discoverer_trait,
         Arc::new(UnreachableGcloud),
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
     )
     .expect("actor with broker");
 
@@ -5628,7 +5632,11 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
     let native = Arc::new(StubAccountClaudeNative::unavailable());
     let exchange = Arc::new(CountingAnthropicRefreshExchange::new());
     assert!(
-        load_claude_native_import_material(2, native.as_ref())
+        load_claude_native_import_material(
+            2,
+            native.as_ref(),
+            ClaudeNativeReadEvent::Significant,
+        )
             .expect("native absence probe")
             .is_none()
     );
@@ -8413,7 +8421,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
         job("gcloud-import-1", "req-1"),
     )
     .await;
@@ -8462,7 +8470,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
         job("gcloud-import-2", "req-2"),
     )
     .await;

@@ -17,8 +17,8 @@ use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
 use crate::oauth::{
-    ClaudeNativeCredentialStore, PlatformClaudeNativeCredentialStore, SecretJson,
-    load_claude_credential_input, oauth_home_dir, oauth_import_path,
+    ClaudeNativeCredentialStore, ClaudeNativeReadEvent, PlatformClaudeNativeCredentialStore,
+    SecretJson, load_claude_credential_input, oauth_home_dir, oauth_import_path,
     parse_claude_credential_metadata,
 };
 
@@ -39,7 +39,10 @@ pub(crate) struct DeviceCandidate {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn discover_device_candidates(disabled: bool) -> Vec<DeviceCandidate> {
-    discover_device_candidates_with_native(disabled, &PlatformClaudeNativeCredentialStore)
+    discover_device_candidates_with_native(
+        disabled,
+        &PlatformClaudeNativeCredentialStore::default(),
+    )
 }
 
 pub(crate) fn discover_device_candidates_with_native(
@@ -77,7 +80,11 @@ pub(crate) fn discovery_is_disabled(profile_disabled: bool) -> bool {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn candidate_by_id(disabled: bool, id: &str) -> Option<DeviceCandidate> {
-    candidate_by_id_with_native(disabled, id, &PlatformClaudeNativeCredentialStore)
+    candidate_by_id_with_native(
+        disabled,
+        id,
+        &PlatformClaudeNativeCredentialStore::default(),
+    )
 }
 
 pub(crate) fn candidate_by_id_with_native(
@@ -180,7 +187,8 @@ pub(crate) fn discover_claude_at(
     path: &Path,
     native: &dyn ClaudeNativeCredentialStore,
 ) -> Option<DeviceCandidate> {
-    let input = load_claude_credential_input(&path, native).ok()?;
+    let input =
+        load_claude_credential_input(&path, native, ClaudeNativeReadEvent::Ordinary).ok()?;
     let source_label = if input.native_owner {
         "Linked to Claude Code"
     } else {

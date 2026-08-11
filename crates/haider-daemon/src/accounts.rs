@@ -40,7 +40,8 @@ use haider_core::{
     LoginReceiptResponse, ManagementClaim, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD,
 };
 use haider_protocol::credential::{
-    AuthMethod, CredentialDescriptor, CredentialStatus, RotationCause, RotationEvent,
+    AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus, RotationCause,
+    RotationEvent,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
@@ -66,10 +67,11 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::oauth::{
-    ClaudeNativeCredentialStore, CredentialBroker, KIMI_DEVICE_ALIAS, OAuthCoordinator,
-    OAuthCoordinatorConfig, OAuthImportMaterial, OAuthInferenceAuthMode, OAuthInferenceHeaderSet,
-    OAuthProviderCatalog, OAuthReadyClaim, PlatformClaudeNativeCredentialStore,
-    RefreshFenceRegistry, load_claude_native_import_material,
+    ClaudeNativeCredentialAccess, ClaudeNativeCredentialFailure, ClaudeNativeCredentialStore,
+    ClaudeNativeImportError, ClaudeNativeReadEvent, CredentialBroker, KIMI_DEVICE_ALIAS,
+    OAuthCoordinator, OAuthCoordinatorConfig, OAuthImportMaterial, OAuthInferenceAuthMode,
+    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim,
+    PlatformClaudeNativeCredentialStore, RefreshFenceRegistry, load_claude_native_import_material,
     load_oauth_import_material_with_native, oauth_import_source_spec, sanctioned_inference,
 };
 use crate::provider_registry::{
@@ -894,6 +896,9 @@ pub(crate) enum OAuthImportHealResult {
     LiveOwnerStore {
         source: String,
     },
+    LiveOwnerUnavailable {
+        failure: ClaudeNativeCredentialFailure,
+    },
     Committed {
         expected: OAuthRefreshFence,
     },
@@ -1074,7 +1079,7 @@ pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHan
         None,
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(crate::gcloud::GcloudCli),
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
     )
 }
 
@@ -1114,6 +1119,8 @@ fn spawn_account_actor(
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) -> AccountActorHandle {
+    let claude_native: Arc<dyn ClaudeNativeCredentialStore> =
+        Arc::new(ClaudeNativeCredentialAccess::new(claude_native));
     let task = tokio::spawn(run_account_actor(
         config,
         commands.clone(),
@@ -1885,7 +1892,9 @@ impl AutomaticAlternate<'_> {
                 && match descriptor.status {
                     CredentialStatus::Ok => true,
                     CredentialStatus::Limited { until_ms } => now_ms >= until_ms,
-                    CredentialStatus::Expired | CredentialStatus::Revoked => false,
+                    CredentialStatus::Expired
+                    | CredentialStatus::Revoked
+                    | CredentialStatus::NeedsAttention { .. } => false,
                 }
         }) {
             RotationDecision::RotateTo(alternate.alias.clone())
@@ -1973,7 +1982,9 @@ async fn resolve_account(
             })?;
         let trigger = match active.status {
             CredentialStatus::Limited { until_ms } => Some(RotationTrigger::RateLimit { until_ms }),
-            CredentialStatus::Expired => Some(RotationTrigger::AuthExpired),
+            CredentialStatus::Expired | CredentialStatus::NeedsAttention { .. } => {
+                Some(RotationTrigger::AuthExpired)
+            }
             CredentialStatus::Ok | CredentialStatus::Revoked => None,
         };
         let policy = AutomaticAlternate {
@@ -2077,8 +2088,16 @@ async fn apply_oauth_refresh(
     }
     if accounts
         .get(&alias)
-        .is_some_and(|current| matches!(&current.status, CredentialStatus::Expired))
-        && !matches!(&descriptor.status, CredentialStatus::Expired)
+        .is_some_and(|current| {
+            matches!(
+                &current.status,
+                CredentialStatus::Expired | CredentialStatus::NeedsAttention { .. }
+            )
+        })
+        && !matches!(
+            &descriptor.status,
+            CredentialStatus::Expired | CredentialStatus::NeedsAttention { .. }
+        )
     {
         if accounts
             .set_status(&alias, descriptor.status.clone())
@@ -4358,7 +4377,11 @@ async fn handle_oauth_import_heal(
         let live_owner =
             if source == "claude-code" && descriptor.provider == ANTHROPIC_OAUTH_PROVIDER_NAME {
                 let native_for_read = Arc::clone(&claude_native);
-                tokio::task::spawn_blocking(move || native_for_read.read().is_some())
+                tokio::task::spawn_blocking(move || {
+                    native_for_read
+                        .read(ClaudeNativeReadEvent::Ordinary)
+                        .is_ok()
+                })
                     .await
                     .map_err(|_| {
                         HaiderError::new(
@@ -4383,20 +4406,28 @@ async fn handle_oauth_import_heal(
             false,
         ));
     };
+    let linked_native_owner = current
+        .identity
+        .display_identity
+        .ends_with("linked to Claude Code");
     let source_for_read = source.clone();
     let native_for_read = Arc::clone(&claude_native);
     let imported =
         if source == "claude-code" && descriptor.provider == ANTHROPIC_OAUTH_PROVIDER_NAME {
             match tokio::task::spawn_blocking(move || {
-                load_claude_native_import_material(generation, native_for_read.as_ref())
+                load_claude_native_import_material(
+                    generation,
+                    native_for_read.as_ref(),
+                    ClaudeNativeReadEvent::Ordinary,
+                )
             })
             .await
             {
-                Ok(Ok(Some(imported))) => imported,
+                Ok(Ok(imported)) => imported,
                 // A present but malformed/invalid owner store is still owner
                 // controlled. Returning the parse error is fail-closed: the
                 // snapshotted rotating refresh token remains untouched.
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(ClaudeNativeImportError::Invalid(error))) => return Err(error),
                 Err(_) => {
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
@@ -4404,13 +4435,28 @@ async fn handle_oauth_import_heal(
                         true,
                     ));
                 }
-                Ok(Ok(None)) => {
+                Ok(Err(ClaudeNativeImportError::Access(failure))) if linked_native_owner => {
+                    if unix_ms_after(Duration::ZERO) >= current.expires_at_unix_ms {
+                        persist_native_store_attention(
+                            store,
+                            accounts,
+                            snapshot,
+                            management,
+                            &descriptor.alias,
+                            failure,
+                        )
+                        .await?;
+                    }
+                    return Ok(OAuthImportHealResult::LiveOwnerUnavailable { failure });
+                }
+                Ok(Err(ClaudeNativeImportError::Access(_))) => {
                     let native_for_fallback = Arc::clone(&claude_native);
                     match tokio::task::spawn_blocking(move || {
                         load_oauth_import_material_with_native(
                             &source_for_read,
                             generation,
                             native_for_fallback.as_ref(),
+                            ClaudeNativeReadEvent::Ordinary,
                         )
                     })
                     .await
@@ -4428,6 +4474,7 @@ async fn handle_oauth_import_heal(
                     &source_for_read,
                     generation,
                     native_for_read.as_ref(),
+                    ClaudeNativeReadEvent::Ordinary,
                 )
             })
             .await
@@ -4439,7 +4486,28 @@ async fn handle_oauth_import_heal(
             }
         };
     let live_owner = imported.claude_native_owner;
-    if bool::from(current.access_token().ct_eq(imported.bundle.access_token())) {
+    if same_oauth_import(&current, &imported.bundle)
+        && !matches!(descriptor.status, CredentialStatus::NeedsAttention { .. })
+    {
+        if live_owner {
+            // A successful owner read always refreshes Haider's degraded-path
+            // snapshot, even when token bytes are unchanged. Keep the current
+            // generation because no descriptor/revision mutation occurred.
+            let mut bundle = imported.bundle;
+            bundle.generation = current.generation;
+            let encoded = bundle.encode()?;
+            let vault_for_put = Arc::clone(&vault);
+            let alias_for_put = descriptor.alias.clone();
+            tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded))
+                .await
+                .map_err(|_| {
+                    HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "Claude snapshot persistence worker failed",
+                        true,
+                    )
+                })??;
+        }
         return Ok(if live_owner {
             OAuthImportHealResult::LiveOwnerStore { source }
         } else {
@@ -4512,6 +4580,43 @@ async fn handle_oauth_import_heal(
     Ok(OAuthImportHealResult::Committed {
         expected: committed,
     })
+}
+
+fn native_attention_reason(
+    failure: ClaudeNativeCredentialFailure,
+) -> CredentialAttentionReason {
+    match failure {
+        ClaudeNativeCredentialFailure::Denied => CredentialAttentionReason::KeychainDenied,
+        ClaudeNativeCredentialFailure::Locked => CredentialAttentionReason::KeychainLocked,
+        ClaudeNativeCredentialFailure::Missing => CredentialAttentionReason::KeychainMissing,
+        ClaudeNativeCredentialFailure::Unavailable => {
+            CredentialAttentionReason::KeychainUnavailable
+        }
+    }
+}
+
+async fn persist_native_store_attention(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    alias: &CredentialAlias,
+    failure: ClaudeNativeCredentialFailure,
+) -> Result<(), HaiderError> {
+    let status = CredentialStatus::NeedsAttention {
+        reason: native_attention_reason(failure),
+    };
+    if accounts
+        .get(alias)
+        .is_some_and(|descriptor| descriptor.status == status)
+    {
+        return Ok(());
+    }
+    accounts.set_status(alias, status)?;
+    refresh_resolver_snapshot(snapshot, accounts);
+    publish_next_management_revision(store, snapshot, management, accounts)
+        .await
+        .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4748,7 +4853,12 @@ async fn handle_oauth_import(
         None => {
             let claude_native = Arc::clone(&claude_native);
             match tokio::task::spawn_blocking(move || {
-                load_oauth_import_material_with_native(&source, generation, claude_native.as_ref())
+                load_oauth_import_material_with_native(
+                    &source,
+                    generation,
+                    claude_native.as_ref(),
+                    ClaudeNativeReadEvent::Significant,
+                )
             })
             .await
             {
@@ -4892,7 +5002,10 @@ async fn select_oauth_import_alias(
     if accounts.get(&default).is_some_and(|descriptor| {
         descriptor.provider == provider
             && descriptor.auth_method == AuthMethod::OAuth
-            && descriptor.status == CredentialStatus::Expired
+            && matches!(
+                descriptor.status,
+                CredentialStatus::Expired | CredentialStatus::NeedsAttention { .. }
+            )
     }) {
         // A source-less, expired default OAuth slot is safe to repair in
         // place. Healthy/manual incarnations retain the ownership protection
@@ -6178,9 +6291,10 @@ impl AccountsProviderFactory {
             to: descriptor.alias.clone(),
             cause: match active.status {
                 CredentialStatus::Limited { .. } => RotationCause::RateLimit,
-                CredentialStatus::Expired | CredentialStatus::Revoked | CredentialStatus::Ok => {
-                    RotationCause::Error
-                }
+                CredentialStatus::Expired
+                | CredentialStatus::Revoked
+                | CredentialStatus::Ok
+                | CredentialStatus::NeedsAttention { .. } => RotationCause::Error,
             },
         });
         Ok(ResolvedAccount {
@@ -7232,7 +7346,7 @@ impl AccountsRuntime {
                     },
                     Arc::new(ProductionProviderModelDiscoverer),
                     Arc::clone(&gcloud),
-                    Arc::new(PlatformClaudeNativeCredentialStore),
+                    Arc::new(PlatformClaudeNativeCredentialStore::default()),
                 )?;
                 let commands = actor.commands();
                 Ok(Self {

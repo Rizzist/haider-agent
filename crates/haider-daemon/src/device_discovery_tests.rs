@@ -114,7 +114,13 @@ impl StubClaudeNative {
 }
 
 impl crate::oauth::ClaudeNativeCredentialStore for StubClaudeNative {
-    fn read(&self) -> Option<crate::oauth::ClaudeCredentialInput> {
+    fn read(
+        &self,
+        _event: crate::oauth::ClaudeNativeReadEvent,
+    ) -> Result<
+        crate::oauth::ClaudeCredentialInput,
+        crate::oauth::ClaudeNativeCredentialFailure,
+    > {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.bytes
             .as_ref()
@@ -123,6 +129,7 @@ impl crate::oauth::ClaudeNativeCredentialStore for StubClaudeNative {
                 bytes: zeroize::Zeroizing::new(bytes.clone()),
                 native_owner: true,
             })
+            .ok_or(crate::oauth::ClaudeNativeCredentialFailure::Missing)
     }
 }
 
@@ -200,11 +207,19 @@ fn claude_native_absent_or_denied_degrades_to_clean_not_found() {
     let file = home.path().join(".claude/.credentials.json");
     let absent = StubClaudeNative::unavailable();
     let denied = StubClaudeNative::unavailable();
-    let absent_error = match crate::oauth::load_claude_credential_input(&file, &absent) {
+    let absent_error = match crate::oauth::load_claude_credential_input(
+        &file,
+        &absent,
+        crate::oauth::ClaudeNativeReadEvent::Significant,
+    ) {
         Err(error) => error,
         Ok(_) => panic!("absent native store unexpectedly returned a credential"),
     };
-    let denied_error = match crate::oauth::load_claude_credential_input(&file, &denied) {
+    let denied_error = match crate::oauth::load_claude_credential_input(
+        &file,
+        &denied,
+        crate::oauth::ClaudeNativeReadEvent::Significant,
+    ) {
         Err(error) => error,
         Ok(_) => panic!("denied native store unexpectedly returned a credential"),
     };

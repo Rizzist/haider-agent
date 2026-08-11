@@ -83,8 +83,8 @@ pub fn notification_line(attention: Attention, session_title: Option<&str>) -> S
 }
 
 /// Mask identity- AND secret-like tokens inside free text, delegating the
-/// length-preserving mask to the ONE masking authority (`format::mask_identity`)
-/// so no second dialect exists. Ordinary prose words pass through unchanged.
+/// capped-run mask to the ONE masking authority (`format::mask_identity`) so
+/// no second dialect exists. Ordinary prose words pass through unchanged.
 ///
 /// H3: a notification line goes into OSC 9 *and* the OS notification history,
 /// so it must not carry a leaked credential. An earlier pass masked ONLY

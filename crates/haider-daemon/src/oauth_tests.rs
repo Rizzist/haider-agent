@@ -51,13 +51,19 @@ impl OAuthTestClaudeNative {
 }
 
 impl ClaudeNativeCredentialStore for OAuthTestClaudeNative {
-    fn read(&self) -> Option<ClaudeCredentialInput> {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        self.bytes.as_ref().map(|bytes| ClaudeCredentialInput {
-            location: PathBuf::from("mock secure store: Claude Code-credentials"),
-            bytes: Zeroizing::new(bytes.clone()),
-            native_owner: true,
-        })
+        self.bytes
+            .as_ref()
+            .map(|bytes| ClaudeCredentialInput {
+                location: PathBuf::from("mock secure store: Claude Code-credentials"),
+                bytes: Zeroizing::new(bytes.clone()),
+                native_owner: true,
+            })
+            .ok_or(ClaudeNativeCredentialFailure::Missing)
     }
 }
 
@@ -1493,12 +1499,22 @@ fn claude_file_and_native_secret_share_parser_and_fresh_bundle() {
     let file_path = fixture_dir.path().join(".credentials.json");
     std::fs::write(&file_path, CLAUDE_SECURE_STORE_FIXTURE).expect("write Claude fixture");
     let absent_native = OAuthTestClaudeNative::unavailable();
-    let file = load_claude_credential_input(&file_path, &absent_native).expect("file input");
+    let file = load_claude_credential_input(
+        &file_path,
+        &absent_native,
+        ClaudeNativeReadEvent::Significant,
+    )
+    .expect("file input");
     assert_eq!(absent_native.reads.load(Ordering::SeqCst), 1);
 
     let native = OAuthTestClaudeNative::new(CLAUDE_SECURE_STORE_FIXTURE);
     let missing_path = fixture_dir.path().join("missing-credentials.json");
-    let secure = load_claude_credential_input(&missing_path, &native).expect("secure-store input");
+    let secure = load_claude_credential_input(
+        &missing_path,
+        &native,
+        ClaudeNativeReadEvent::Significant,
+    )
+    .expect("secure-store input");
     assert_eq!(native.reads.load(Ordering::SeqCst), 1);
 
     let file_metadata =
