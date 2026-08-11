@@ -16,6 +16,11 @@
 # exercised. Any nonzero probe exit fails the ladder.
 set -uo pipefail
 
+# Hermetic: the live rows' REAL daemon must never run startup auto-adoption
+# (A2) against the host's credential stores — adopted real accounts widen the
+# status bar and shed the /voice flash at 90 cols (ladder caught it 1/16).
+export HAIDER_DISCOVERY_DISABLED=1
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 bin="${1:-$root/target/release/haider}"
