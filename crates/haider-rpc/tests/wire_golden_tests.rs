@@ -524,6 +524,7 @@ fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
     assert_eq!(sessions[0].turn_count, None);
     assert_eq!(sessions[0].footprint_tokens, None);
     assert_eq!(sessions[0].footprint_truth, None);
+    assert_eq!(sessions[0].agent_metrics, None);
 
     let newer_daemon = r#"{
         "method":"session.list",
@@ -534,6 +535,26 @@ fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
             "turn_count":4,
             "footprint_tokens":33500,
             "footprint_truth":"exact",
+            "agent_metrics":{
+                "session_id":"session-1",
+                "head_seq":9,
+                "started_at_ms":100,
+                "live":true,
+                "tool_attempts":2,
+                "usage":{
+                    "logical_input_tokens":1000,
+                    "billed_output_tokens":50,
+                    "additional_reasoning_tokens":0,
+                    "cache_read_tokens":800,
+                    "cache_write_tokens":0,
+                    "metered_cost_microusd":123000,
+                    "api_equivalent_cost_microusd":123000,
+                    "all_lanes_priced":true,
+                    "has_metered_lanes":true,
+                    "has_oauth_lanes":false,
+                    "breakdowns":[]
+                }
+            },
             "future_roster_field":true
         }]
     }"#;
@@ -546,6 +567,17 @@ fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
     assert_eq!(
         sessions[0].footprint_truth,
         Some(haider_protocol::context::ContextFootprintTruth::Exact)
+    );
+    let metrics = sessions[0].agent_metrics.as_ref().expect("agent metrics");
+    assert_eq!(metrics.head_seq, 9);
+    assert_eq!(metrics.tool_attempts, 2);
+    assert!(metrics.live);
+    assert_eq!(
+        metrics
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.metered_cost_microusd),
+        Some(123_000)
     );
 }
 
@@ -1784,6 +1816,7 @@ fn session_rename_frames_are_additive_and_golden() {
         footprint_tokens: None,
         footprint_truth: None,
         title: None,
+        agent_metrics: None,
     })
     .expect("encode bare summary");
     assert!(

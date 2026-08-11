@@ -197,6 +197,33 @@ fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
         Ok(EventPayload::AgentChipState { agent, chip: ChipState::Done })
             if agent == agent_id
     ));
+    let snapshot = haider_protocol::agent::AgentMetricsSnapshot {
+        agent: Some(agent_id.clone()),
+        session_id: record.child_session_id.clone(),
+        head_seq: 12,
+        started_at_ms: 100,
+        terminal_at_ms: None,
+        live: true,
+        tool_attempts: 2,
+        usage: None,
+    };
+    let envelope = crate::delegation::metrics_projection_envelope(
+        &record,
+        "branch-metrics-event",
+        EventId::new("child-metrics-cause"),
+        snapshot.clone(),
+        DeviceId::new("branch-metrics-device"),
+        7,
+    )
+    .expect("metrics projection envelope");
+    assert_eq!(envelope.branch_id, Some(branch_id.clone()));
+    assert_eq!(envelope.run_id, Some(record.parent_run_id.clone()));
+    assert_eq!(envelope.render.prompt, PromptRender::Omit);
+    assert!(envelope.render.ui && envelope.render.durable);
+    assert_eq!(
+        haider_protocol::agent::AgentMetricsSnapshot::from_payload_value(&envelope.payload),
+        Some(snapshot)
+    );
     let message = format!("{}suffix", "é".repeat(205));
     let envelope = crate::delegation::agent_messaged_envelope(
         &record,
@@ -2461,6 +2488,76 @@ async fn parent_cancel_sweeps_its_outstanding_child() {
         *state == RunState::Cancelled
     })
     .await;
+    let child_head = timeout(Duration::from_secs(5), async {
+        loop {
+            let events = store
+                .read(&child.child_session_id, 0, 1024)
+                .await
+                .expect("child terminal journal");
+            let cancelled = events
+                .iter()
+                .filter_map(|event| {
+                    serde_json::from_value::<EventPayload>(event.payload.clone())
+                        .is_ok_and(|payload| {
+                            matches!(
+                                payload,
+                                EventPayload::RunState(RunState::Cancelled)
+                            )
+                        })
+                        .then_some(event.seq)
+                })
+                .max();
+            let idle = events
+                .iter()
+                .filter_map(|event| {
+                    serde_json::from_value::<EventPayload>(event.payload.clone())
+                        .is_ok_and(|payload| {
+                            matches!(
+                                payload,
+                                EventPayload::SessionState(
+                                    haider_protocol::state::SessionState::Idle { .. }
+                                )
+                            )
+                        })
+                        .then_some(event.seq)
+                })
+                .max();
+            if let Some(head) = cancelled
+                .zip(idle)
+                .and_then(|(cancelled, idle)| (idle > cancelled).then_some(idle))
+            {
+                break head;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child reaches durable idle fence");
+    let terminal_metrics = timeout(Duration::from_secs(5), async {
+        loop {
+            let events = store
+                .read(&parent_session, 0, 1024)
+                .await
+                .expect("parent metrics journal");
+            if let Some(snapshot) = events
+                .iter()
+                .filter_map(|event| {
+                    haider_protocol::agent::AgentMetricsSnapshot::from_payload_value(&event.payload)
+                })
+                .filter(|snapshot| snapshot.agent.as_ref() == Some(&child.agent_id))
+                .max_by_key(|snapshot| snapshot.head_seq)
+                .filter(|snapshot| snapshot.head_seq == child_head)
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal child metrics mirrored to parent");
+    assert_eq!(terminal_metrics.head_seq, child_head);
+    assert!(!terminal_metrics.live);
+    assert!(terminal_metrics.terminal_at_ms.is_some());
 
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");

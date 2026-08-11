@@ -328,7 +328,7 @@ impl SessionState {
                             if !route_agent_event(
                                 &mut self.branch_state,
                                 &mut self.projection,
-                                &self.chips,
+                                &mut self.chips,
                                 envelope,
                             ) && !route_task_event(
                                 &mut self.tasks,
@@ -613,10 +613,38 @@ pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, at_ms: u64) {
 pub fn route_agent_event(
     branch_state: &mut crate::branch::BranchState,
     projection: &mut SessionProjection,
-    chips: &[ChipModel],
+    chips: &mut [ChipModel],
     envelope: &RawEnvelope,
 ) -> bool {
     use crate::branch::BranchScope;
+    if let Some(metrics) =
+        haider_protocol::agent::AgentMetricsSnapshot::from_payload_value(&envelope.payload)
+    {
+        let Some(agent) = metrics.agent.clone() else {
+            return true;
+        };
+        let apply = |chips: &mut [ChipModel], metrics| {
+            if let Some(chip) = crate::app::find_chip_mut(chips, agent.as_str()) {
+                chip.note_metrics(metrics);
+            }
+        };
+        match branch_state.content_scope(envelope.branch_id.as_ref()) {
+            BranchScope::Active => apply(chips, metrics),
+            BranchScope::ParkedMain => {
+                if let Some(view) = branch_state.parked_main_mut() {
+                    apply(&mut view.chips, metrics);
+                }
+            }
+            BranchScope::ParkedNamed(id) => {
+                if let Some(view) = branch_state.view_mut(&id) {
+                    apply(&mut view.chips, metrics);
+                }
+            }
+            BranchScope::Orphan => branch_state.count_orphan(),
+            BranchScope::Aggregate => {}
+        }
+        return true;
+    }
     let Some(fact) = haider_protocol::agent::AgentMessaged::from_payload_value(&envelope.payload)
     else {
         return false;

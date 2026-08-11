@@ -1,0 +1,37 @@
+{
+  "type": "agent_metrics",
+  "agent": "agent-child-7",
+  "session_id": "session-child-7",
+  "head_seq": 42,
+  "started_at_ms": 1000,
+  "live": true,
+  "tool_attempts": 2,
+  "usage": {
+    "logical_input_tokens": 10000,
+    "billed_output_tokens": 500,
+    "additional_reasoning_tokens": 25,
+    "cache_read_tokens": 7000,
+    "cache_write_tokens": 1000,
+    "cache_hit_basis_points": 7000,
+    "api_equivalent_cost_microusd": 27000,
+    "all_lanes_priced": true,
+    "has_metered_lanes": false,
+    "has_oauth_lanes": true,
+    "breakdowns": [
+      {
+        "provider": "openai",
+        "model": "gpt-5.6-terra",
+        "cache_epoch": "epoch-a",
+        "request_kind": "delegated_agent",
+        "auth_method": "oauth",
+        "logical_input_tokens": 10000,
+        "billed_output_tokens": 500,
+        "additional_reasoning_tokens": 25,
+        "cache_read_tokens": 7000,
+        "cache_write_tokens": 1000,
+        "api_equivalent_cost_microusd": 27000,
+        "priced": true
+      }
+    ]
+  }
+}

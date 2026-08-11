@@ -837,6 +837,9 @@ pub struct ChipModel {
     /// transition, so `last − spawned` IS the frozen final duration (the
     /// S4 live-tick vs frozen-final law).
     pub last_event_at_ms: Option<u64>,
+    /// Daemon-derived direct metrics, replaced only by a strictly newer
+    /// child-session head. `None` preserves the legacy elapsed/token row.
+    pub metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
     pub question: Option<ChipQuestion>,
     pub closed: bool,
     pub removing: bool,
@@ -900,6 +903,7 @@ impl ChipModel {
             child_session: None,
             spawned_at_ms: None,
             last_event_at_ms: None,
+            metrics: None,
             question: None,
             closed: false,
             removing: false,
@@ -951,6 +955,7 @@ impl ChipModel {
                 .map(str::to_owned),
             spawned_at_ms: None,
             last_event_at_ms: None,
+            metrics: None,
             question: None,
             closed: false,
             removing: false,
@@ -1015,6 +1020,19 @@ impl ChipModel {
     pub fn set_state_at(&mut self, state: ChipDisplayState, at_ms: u64) {
         self.note_event_at(at_ms);
         self.state = state;
+    }
+
+    /// Replace-by-source-head freshness. Equal delivery is an idempotent
+    /// replay; a stale snapshot can never rewind live/settled state or totals.
+    pub fn note_metrics(&mut self, metrics: haider_protocol::agent::AgentMetricsSnapshot) {
+        if self
+            .metrics
+            .as_ref()
+            .is_some_and(|held| held.head_seq >= metrics.head_seq)
+        {
+            return;
+        }
+        self.metrics = Some(metrics);
     }
 
     /// The S4 row's elapsed figure, in ms:
@@ -2986,6 +3004,11 @@ pub struct AppModel {
     /// seeds. The ATTACHED session's state is checked OUT of its slot into
     /// this model's live fields (see `crate::session`).
     pub sessions: Vec<crate::session::SessionState>,
+    /// Cold/reconnect direct snapshots from additive `SessionSummary`
+    /// fields, keyed by their exact session id. Active-session state does not
+    /// swap this registry, so `/usage` can refresh it in place.
+    pub session_metrics:
+        std::collections::HashMap<SessionId, haider_protocol::agent::AgentMetricsSnapshot>,
     /// Which runtime drives this model (W3c3 M2). Demo by default.
     pub mode: RuntimeMode,
     /// The masked `/login … api` card, while it is open (W3c3 M3).
@@ -3260,6 +3283,7 @@ impl Default for AppModel {
             // fresh process's seeds are 1-3 exactly as before and
             // `next_ui_generation` continues at 4.
             sessions: seed_session_states(UiGeneration::FIRST.get()),
+            session_metrics: std::collections::HashMap::new(),
             active_session: None,
             custom_commands: Vec::new(),
             custom_command_warnings: Vec::new(),
@@ -9220,7 +9244,7 @@ impl AppModel {
                             if !crate::session::route_agent_event(
                                 &mut self.branch_state,
                                 &mut self.projection,
-                                &self.chips,
+                                &mut self.chips,
                                 envelope,
                             ) && !crate::session::route_task_event(
                                 &mut self.tasks,
@@ -10131,6 +10155,17 @@ impl AppModel {
                 self.dirty = true;
             }
         }
+        if let Some(metrics) = &summary.agent_metrics {
+            let replace = self
+                .session_metrics
+                .get(&summary.session_id)
+                .is_none_or(|held| held.head_seq < metrics.head_seq);
+            if replace {
+                self.session_metrics
+                    .insert(summary.session_id.clone(), metrics.clone());
+                self.dirty = true;
+            }
+        }
         if summary.turn_count.is_none() && summary.footprint_tokens.is_none() {
             return;
         }
@@ -10155,6 +10190,31 @@ impl AppModel {
             footprint_truth: summary.footprint_truth,
         });
         self.dirty = true;
+    }
+
+    /// Freshest direct metrics for one chip: the live parent-journal mirror
+    /// wins, with the child `SessionSummary` as cold/older-daemon fallback.
+    #[must_use]
+    pub fn chip_metrics<'a>(
+        &'a self,
+        chip: &'a ChipModel,
+    ) -> Option<&'a haider_protocol::agent::AgentMetricsSnapshot> {
+        let summary = chip
+            .child_session
+            .as_deref()
+            .and_then(|session| self.session_metrics.get(&SessionId::new(session)));
+        match (chip.metrics.as_ref(), summary) {
+            (Some(live), Some(cold)) if cold.head_seq > live.head_seq => Some(cold),
+            (Some(live), _) => Some(live),
+            (None, summary) => summary,
+        }
+    }
+
+    #[must_use]
+    pub fn main_agent_metrics(&self) -> Option<&haider_protocol::agent::AgentMetricsSnapshot> {
+        self.active_session
+            .as_ref()
+            .and_then(|session| self.session_metrics.get(session))
     }
 
     /// Seed a session's cursor with the sequence its attach asked FROM, so

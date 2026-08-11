@@ -1,5 +1,5 @@
-//! S4 — subagent rows wear a RIGHT-ALIGNED `elapsed · ↓ tokens` meta
-//! (owner directive, Claude Code screenshot as the model).
+//! S4 — subagent rows wear a right-aligned direct-metrics summary, with the
+//! pre-metrics `elapsed · ↓ tokens` shape retained for old daemons.
 //!
 //! Laws under test:
 //!
@@ -12,16 +12,21 @@
 //!   exact-match — a wrong child never wears another child's tokens;
 //! * unknown is never rendered as zero — a missing source DROPS its
 //!   segment;
-//! * width degradation drops WHOLE segments, tokens first, then elapsed
-//!   (the F2c pattern) — never a mid-segment truncation.
+//! * metrics width degradation drops WHOLE segments in the pinned order
+//!   live → elapsed → cost → tools → tokens.
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::agent::{AgentManifest, AgentRole, ChipState, Grant, Placement};
+use haider_protocol::agent::{
+    AgentManifest, AgentMetricsSnapshot, AgentRole, AgentUsageBreakdown, AgentUsageMetrics,
+    ChipState, Grant, Placement,
+};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+use haider_protocol::credential::AuthMethod;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::ids::{AgentId, DeviceId, EventId, ItemId, LeaseId, SessionId};
 use haider_protocol::item::ItemEvent;
+use haider_protocol::provider::UsageRequestKind;
 use haider_tui::app::{AppModel, ChipModel, RuntimeMode, Screen, chip_row_tokens};
 use haider_tui::format::fmt_elapsed;
 use haider_tui::render::render;
@@ -97,6 +102,76 @@ fn raw(seq: u64, agent: Option<&str>, at_ms: u64, payload: &EventPayload) -> Raw
         },
         payload: serde_json::to_value(payload).expect("payload serializes"),
     }
+}
+
+fn raw_metrics(seq: u64, at_ms: u64, snapshot: &AgentMetricsSnapshot) -> RawEnvelope {
+    let mut envelope = raw(
+        seq,
+        None,
+        at_ms,
+        &EventPayload::RunState(haider_protocol::state::RunState::Thinking),
+    );
+    envelope.payload = snapshot.to_payload_value().expect("metrics payload");
+    envelope
+}
+
+fn usage(auth: AuthMethod, cost_microusd: u64) -> AgentUsageMetrics {
+    let (metered, oauth) = match auth {
+        AuthMethod::ApiKey => (Some(cost_microusd), false),
+        AuthMethod::OAuth => (None, true),
+    };
+    AgentUsageMetrics {
+        logical_input_tokens: 1_200,
+        billed_output_tokens: 300,
+        cache_read_tokens: 800,
+        cache_write_tokens: 25,
+        cache_hit_basis_points: Some(8_000),
+        metered_cost_microusd: metered,
+        api_equivalent_cost_microusd: Some(cost_microusd),
+        all_lanes_priced: true,
+        has_metered_lanes: auth == AuthMethod::ApiKey,
+        has_oauth_lanes: oauth,
+        breakdowns: vec![AgentUsageBreakdown {
+            provider: "openai".into(),
+            model: "gpt-5.2".into(),
+            cache_epoch: "epoch-s4".into(),
+            request_kind: UsageRequestKind::DelegatedAgent,
+            auth_method: Some(auth),
+            logical_input_tokens: 1_200,
+            billed_output_tokens: 300,
+            cache_read_tokens: 800,
+            cache_write_tokens: 25,
+            metered_cost_microusd: metered,
+            api_equivalent_cost_microusd: Some(cost_microusd),
+            priced: true,
+            ..AgentUsageBreakdown::default()
+        }],
+        ..AgentUsageMetrics::default()
+    }
+}
+
+fn snapshot(
+    agent: Option<&str>,
+    session: &str,
+    head_seq: u64,
+    live: bool,
+    auth: AuthMethod,
+    cost_microusd: u64,
+) -> AgentMetricsSnapshot {
+    AgentMetricsSnapshot {
+        agent: agent.map(AgentId::new),
+        session_id: SessionId::new(session),
+        head_seq,
+        started_at_ms: SPAWN_MS,
+        terminal_at_ms: (!live).then_some(SPAWN_MS + RUN_MS),
+        live,
+        tool_attempts: 3,
+        usage: Some(usage(auth, cost_microusd)),
+    }
+}
+
+fn note_child_metrics(model: &mut AppModel, metrics: &AgentMetricsSnapshot) {
+    model.route_raw(&raw_metrics(2, SPAWN_MS + 1, metrics));
 }
 
 /// A live session with one child spawned at [`SPAWN_MS`], per the journal.
@@ -350,6 +425,7 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         footprint_tokens: Some(tokens),
         footprint_truth: Some(ContextFootprintTruth::Exact),
         title: None,
+        agent_metrics: None,
     }
 }
 
@@ -468,12 +544,10 @@ fn chip_row_tokens_is_truth_ordered() {
 
 // -------------------------------------------------- width degradation ----
 
-/// MUTATION CHECK (S4, F2c law): truncate the meta to the budget instead
-/// of dropping whole segments. Expected runtime failure: a narrow frame
-/// below carries a cut fragment (`↓ 26`) instead of elapsed-only, and
-/// the narrowest carries a cut elapsed instead of nothing.
+/// Old-daemon compatibility keeps the pre-snapshot shedding behavior. The
+/// new snapshot path has its own mv7 law below.
 #[test]
-fn width_degradation_drops_tokens_first_then_elapsed_whole() {
+fn legacy_width_degradation_drops_tokens_then_elapsed_whole() {
     let mut model = live_session_with_chip();
     model.upsert_live_session(&SessionId::new(CHILD_A_SESSION));
     model.note_summary_counts(&summary(CHILD_A_SESSION, 9, 265_900));
@@ -500,6 +574,290 @@ fn width_degradation_drops_tokens_first_then_elapsed_whole() {
         !row.contains("25m") && !row.contains("18s") && !row.contains('↓'),
         "both segments gone whole below budget: {row:?}"
     );
+}
+
+/// LAW mv5 — OAuth is always approximate/plan-labeled, API-key spend stays
+/// real, and a mixed aggregate exposes the two ledgers separately.
+///
+/// MUTATION CHECK (executed): merge the OAuth equivalent into metered cost;
+/// the mixed `$0.27 metered · ≈$0.54` assertions fail.
+#[test]
+fn mv5_oauth_api_and_mixed_costs_remain_separate_and_labeled() {
+    let api = snapshot(
+        Some(CHILD_A),
+        CHILD_A_SESSION,
+        4,
+        false,
+        AuthMethod::ApiKey,
+        270_000,
+    );
+    let oauth = snapshot(
+        Some(CHILD_B),
+        CHILD_B_SESSION,
+        4,
+        false,
+        AuthMethod::OAuth,
+        270_000,
+    );
+    assert_eq!(
+        haider_tui::agent_metrics::compact_cost(api.usage.as_ref().expect("api usage")),
+        "$0.27"
+    );
+    assert_eq!(
+        haider_tui::agent_metrics::compact_cost(oauth.usage.as_ref().expect("oauth usage")),
+        "≈$0.27"
+    );
+    assert_eq!(
+        haider_tui::agent_metrics::detailed_cost(oauth.usage.as_ref().expect("oauth usage")),
+        "≈$0.27 API rate · plan"
+    );
+    let aggregate = haider_tui::agent_metrics::aggregate([&api, &oauth])
+        .and_then(|total| total.usage)
+        .expect("mixed usage");
+    assert_eq!(
+        haider_tui::agent_metrics::compact_cost(&aggregate),
+        "$0.27 + ≈$0.54"
+    );
+    assert_eq!(
+        haider_tui::agent_metrics::detailed_cost(&aggregate),
+        "$0.27 metered · ≈$0.54 API rate (all lanes)"
+    );
+}
+
+#[test]
+fn normalized_tokens_exclude_reasoning_and_missing_detail_stays_explicitly_na() {
+    let mut metrics = snapshot(
+        Some(CHILD_A),
+        CHILD_A_SESSION,
+        4,
+        false,
+        AuthMethod::OAuth,
+        270_000,
+    );
+    let usage = metrics.usage.as_mut().expect("usage");
+    usage.additional_reasoning_tokens = 700;
+    usage.breakdowns[0].additional_reasoning_tokens = 700;
+    assert_eq!(haider_tui::agent_metrics::normalized_tokens(usage), 1_500);
+    let detail = haider_tui::agent_metrics::detail_lines(&metrics);
+    assert!(detail[0].contains("1.5k tokens"), "{detail:?}");
+    assert!(detail[1].contains("reasoning +700"), "{detail:?}");
+    assert!(detail[3].contains("1.5k tokens"), "{detail:?}");
+
+    metrics.usage = None;
+    assert_eq!(
+        haider_tui::agent_metrics::detail_lines(&metrics),
+        vec![
+            "own — 3 tools · tokens n/a · cost n/a",
+            "tokens — in n/a · out n/a · cached n/a · cache write n/a",
+            "cache — hit n/a",
+        ]
+    );
+}
+
+/// LAW mv4 display seam — an unpriced lane is `$—`, never `$0`, while a
+/// snapshot with no usage truth invents no token or cost segment.
+#[test]
+fn mv4_unpriced_and_missing_usage_never_render_zero_truth() {
+    let mut unpriced = snapshot(
+        Some(CHILD_A),
+        CHILD_A_SESSION,
+        9,
+        true,
+        AuthMethod::OAuth,
+        270_000,
+    );
+    let usage = unpriced.usage.as_mut().expect("usage");
+    usage.all_lanes_priced = false;
+    usage.api_equivalent_cost_microusd = None;
+    assert_eq!(haider_tui::agent_metrics::compact_cost(usage), "$—");
+    let mut model = live_session_with_chip();
+    note_child_metrics(&mut model, &unpriced);
+    let row = chip_row(&draw_rows(&model, 150, 36));
+    assert!(row.contains("$—"), "{row:?}");
+    assert!(!row.contains("$0"), "{row:?}");
+
+    unpriced.head_seq = 10;
+    unpriced.usage = None;
+    note_child_metrics(&mut model, &unpriced);
+    let row = chip_row(&draw_rows(&model, 150, 36));
+    assert!(row.contains("3 tools"), "{row:?}");
+    assert!(!row.contains("tokens") && !row.contains('$'), "{row:?}");
+}
+
+/// LAW mv7 — explicit frame widths pin whole-segment shedding to
+/// live → elapsed → cost → tools, with tokens last.
+///
+/// MUTATION CHECK (executed): restore S4's old tokens-first order; the
+/// explicit-width assertions fail in sequence.
+#[test]
+fn mv7_metrics_shedding_order_is_live_elapsed_cost_tools_tokens_last() {
+    let mut model = live_session_with_chip();
+    let metrics = snapshot(
+        Some(CHILD_A),
+        CHILD_A_SESSION,
+        9,
+        true,
+        AuthMethod::OAuth,
+        270_000,
+    );
+    note_child_metrics(&mut model, &metrics);
+    model.clock_ms = SPAWN_MS + RUN_MS;
+
+    let wide = chip_row(&draw_rows(&model, 150, 36));
+    assert!(
+        wide.contains("25m 18s · live · 3 tools · 1.5k tokens · ≈$0.27"),
+        "wide row has every segment: {wide:?}"
+    );
+    // Exact regression pins: each next rung loses one complete segment and
+    // keeps the remaining segments in canonical order.
+    let no_live = chip_row(&draw_rows(&model, 105, 36));
+    assert!(!no_live.contains("live"), "{no_live:?}");
+    assert!(
+        no_live.contains("25m 18s") && no_live.contains("≈$0.27"),
+        "{no_live:?}"
+    );
+    let no_elapsed = chip_row(&draw_rows(&model, 95, 36));
+    assert!(!no_elapsed.contains("25m 18s"), "{no_elapsed:?}");
+    assert!(
+        no_elapsed.contains("≈$0.27") && no_elapsed.contains("3 tools"),
+        "{no_elapsed:?}"
+    );
+    let no_cost = chip_row(&draw_rows(&model, 85, 36));
+    assert!(!no_cost.contains("≈$0.27"), "{no_cost:?}");
+    assert!(
+        no_cost.contains("3 tools") && no_cost.contains("1.5k tokens"),
+        "{no_cost:?}"
+    );
+    let tokens_only = chip_row(&draw_rows(&model, 75, 36));
+    assert!(!tokens_only.contains("3 tools"), "{tokens_only:?}");
+    assert!(tokens_only.contains("1.5k tokens"), "{tokens_only:?}");
+}
+
+/// LAW mv8 — a v0.0.901 daemon has no metrics field, so the exact old
+/// elapsed/token row remains available rather than going blank.
+///
+/// MUTATION CHECK (executed): remove the legacy fallback after a missing
+/// snapshot; both old segments disappear and this assertion fails.
+#[test]
+fn mv8_old_daemon_without_metrics_renders_legacy_elapsed_tokens_row() {
+    let mut model = live_session_with_chip();
+    model.upsert_live_session(&SessionId::new(CHILD_A_SESSION));
+    model.note_summary_counts(&summary(CHILD_A_SESSION, 9, 265_900));
+    model.clock_ms = SPAWN_MS + RUN_MS;
+    let row = chip_row(&draw_rows(&model, 118, 36));
+    assert!(row.contains("25m 18s · ↓ 266k tokens"), "{row:?}");
+}
+
+#[test]
+fn metrics_snapshot_replaces_only_at_a_newer_child_head_seq() {
+    let mut model = live_session_with_chip();
+    let first = snapshot(
+        Some(CHILD_A),
+        CHILD_A_SESSION,
+        9,
+        true,
+        AuthMethod::OAuth,
+        270_000,
+    );
+    model.route_raw(&raw_metrics(2, SPAWN_MS + 1, &first));
+    let mut stale = first.clone();
+    stale.head_seq = 8;
+    stale.live = false;
+    stale.tool_attempts = 99;
+    model.route_raw(&raw_metrics(3, SPAWN_MS + 2, &stale));
+    let held = model.chips[0].metrics.as_ref().expect("held snapshot");
+    assert_eq!(held.head_seq, 9);
+    assert!(held.live);
+    assert_eq!(held.tool_attempts, 3);
+
+    let mut settled = first;
+    settled.head_seq = 10;
+    settled.live = false;
+    settled.terminal_at_ms = Some(SPAWN_MS + RUN_MS);
+    model.route_raw(&raw_metrics(4, SPAWN_MS + 3, &settled));
+    let held = model.chips[0].metrics.as_ref().expect("newer snapshot");
+    assert_eq!(held.head_seq, 10);
+    assert!(!held.live);
+    assert_eq!(held.terminal_at_ms, Some(SPAWN_MS + RUN_MS));
+}
+
+#[test]
+fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
+    let mut model = live_session_with_chip();
+    let child = snapshot(
+        Some(CHILD_A),
+        CHILD_A_SESSION,
+        9,
+        false,
+        AuthMethod::OAuth,
+        270_000,
+    );
+    note_child_metrics(&mut model, &child);
+    let main = snapshot(None, sid().as_str(), 11, false, AuthMethod::ApiKey, 130_000);
+    model.note_summary_counts(&haider_rpc::SessionSummary {
+        session_id: sid(),
+        head_seq: 11,
+        worker_generation: 7,
+        metadata: None,
+        turn_count: Some(1),
+        footprint_tokens: None,
+        footprint_truth: None,
+        title: None,
+        agent_metrics: Some(main),
+    });
+
+    let text = draw_rows(&model, 150, 40).join("\n");
+    assert!(
+        text.contains("subagents total — 3 tools · 1.5k tokens · ≈$0.27"),
+        "{text}"
+    );
+
+    model.screen = Screen::Subagent;
+    model.view_path = vec![CHILD_A.to_owned()];
+    let detail = draw_rows(&model, 150, 40).join("\n");
+    assert!(
+        detail.contains("own — 3 tools · 1.5k tokens · ≈$0.27 API rate · plan"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("tokens — in 1.2k · out 300 · cached 800 · cache write 25"),
+        "{detail}"
+    );
+    assert!(detail.contains("cache — 80.00% hit"), "{detail}");
+    assert!(detail.contains("openai/gpt-5.2 · delegated"), "{detail}");
+    assert!(
+        !detail.contains("subtree —"),
+        "slice 4 is deliberately absent: {detail}"
+    );
+
+    model.screen = Screen::Usage;
+    let usage_screen = draw_rows(&model, 150, 44).join("\n");
+    assert!(
+        usage_screen.contains("AGENTS — CURRENT SESSION"),
+        "{usage_screen}"
+    );
+    assert!(
+        usage_screen.contains(
+            "session total — 6 tools · 3.0k tokens · $0.13 metered · ≈$0.40 API rate (all lanes)"
+        ),
+        "{usage_screen}"
+    );
+    assert!(
+        usage_screen.contains("main — 3 tools · 1.5k tokens · $0.13"),
+        "{usage_screen}"
+    );
+    assert!(
+        usage_screen.contains("Ammar — 3 tools · 1.5k tokens · ≈$0.27 API rate · plan"),
+        "{usage_screen}"
+    );
+
+    let plain = haider_tui::plain::agent_metrics_plain(&model);
+    assert!(plain.contains("AGENTS — CURRENT SESSION"), "{plain}");
+    assert!(
+        plain.contains("session total — 6 tools · 3.0k tokens"),
+        "{plain}"
+    );
+    assert!(plain.contains("≈$0.27 API rate · plan"), "{plain}");
 }
 
 // ------------------------------------------------------------- style ----

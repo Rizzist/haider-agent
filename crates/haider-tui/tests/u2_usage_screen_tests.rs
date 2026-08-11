@@ -68,6 +68,7 @@ fn stats(sessions: u64, est_cost_usd: Option<f64>) -> LocalUsageStatsV1 {
         reasoning_tokens: 12_000,
         cached_tokens: 800_000,
         est_cost_usd,
+        api_equivalent_est_cost_usd: est_cost_usd,
         lines_added: 1240,
         lines_removed: 380,
         cache: haider_protocol::usage::CacheUsageStatsV1::default(),
@@ -76,14 +77,20 @@ fn stats(sessions: u64, est_cost_usd: Option<f64>) -> LocalUsageStatsV1 {
 
 fn oauth_stats() -> LocalUsageStatsV1 {
     let mut local = stats(12, Some(4.12));
+    local.est_cost_usd = None;
+    local.api_equivalent_est_cost_usd = Some(4.12);
     local.cache.logical_input_tokens = 1_000_000;
     local.cache.uncached_input_tokens = 200_000;
     local.cache.cache_read_tokens = 800_000;
     local.cache.telemetry_covered_input_tokens = 1_000_000;
-    local.cache.input_with_cache_usd = Some(0.12);
-    local.cache.input_without_cache_usd = Some(1.20);
-    local.cache.estimated_savings_usd = Some(1.08);
+    local.cache.api_equivalent_input_with_cache_usd = Some(0.12);
+    local.cache.api_equivalent_input_without_cache_usd = Some(1.20);
+    local.cache.api_equivalent_estimated_savings_usd = Some(1.08);
     local
+}
+
+fn idle_oauth_stats() -> LocalUsageStatsV1 {
+    LocalUsageStatsV1::default()
 }
 
 /// The U1 wire shapes CONSUMED verbatim: a two-account OAuth provider
@@ -125,7 +132,7 @@ fn report() -> UsageReportV1 {
                 meter: AccountMeterStateV1::Unavailable {
                     reason: "http 401 — token expired".to_owned(),
                 },
-                local: stats(1, None),
+                local: idle_oauth_stats(),
             },
             AccountUsageReportV1 {
                 provider: "openai".to_owned(),
@@ -343,9 +350,9 @@ fn api_key_accounts_render_tokens_and_cost_never_a_meter() {
     );
 }
 
-/// OAuth is not an unknown price: it renders `plan`, never a dollar or dash.
+/// OAuth is not an unknown price: it renders a labeled API-rate equivalent.
 #[test]
-fn part_a_oauth_usage_omits_dollars_but_keeps_tokens_cache_and_hit_rate() {
+fn part_a_oauth_usage_shows_labeled_api_rate_with_tokens_cache_and_hit_rate() {
     let mut model = usage_model();
     model.usage.filter = Some("anthropic-oauth".to_owned());
     let (rows, _) = draw(&model, 110, 30);
@@ -361,19 +368,24 @@ fn part_a_oauth_usage_omits_dollars_but_keeps_tokens_cache_and_hit_rate() {
     );
     assert!(text.contains("plan"), "OAuth is plan-covered: {text}");
     assert!(
-        !text.contains('$'),
-        "OAuth must never render dollars: {text}"
+        text.contains("≈$4.12 API rate"),
+        "OAuth shows the plan's API-rate equivalent: {text}"
+    );
+    assert!(
+        !text.contains("est $4.12"),
+        "OAuth is not real spend: {text}"
     );
 }
 
-/// Mixed device totals price only API-key lanes and label the subtotal.
+/// Mixed device totals keep real spend and all-lane API equivalent separate.
 #[test]
-fn part_a_mixed_device_total_labels_only_metered_lanes() {
+fn part_a_mixed_device_total_separates_metered_and_all_lane_api_rate() {
     let model = usage_model();
     let (rows, _) = draw(&model, 120, 40);
     let text = body_text(&rows);
     assert!(text.contains("est $0.57 (metered lanes)"), "{text}");
-    assert!(!text.contains("$4.12") && !text.contains("$4.69"), "{text}");
+    assert!(text.contains("≈$4.69 API rate (all lanes)"), "{text}");
+    assert!(!text.contains("est $4.69"), "{text}");
 }
 
 // ---- masking ----------------------------------------------------------

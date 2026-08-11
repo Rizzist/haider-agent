@@ -23,16 +23,19 @@
 //! the duration of one request; reasons, reports, and cache entries carry
 //! no token or response bytes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::SecretHandle;
+use haider_protocol::EventPayload;
+use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageBreakdown, AgentUsageMetrics};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::CredentialAlias;
+use haider_protocol::ids::{AgentId, CredentialAlias, SessionId};
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::{
     CacheCostEstimate, CacheStatAvailability, NormalizedUsage, UsageRequestKind, UsageScope,
 };
@@ -422,8 +425,12 @@ pub(crate) struct TokenTotals {
     pub reasoning: u64,
     pub cached: u64,
     pub est_cost_usd: Option<f64>,
+    pub api_equivalent_est_cost_usd: Option<f64>,
     pub cache: CacheUsageStatsV1,
-    cache_cost_missing: bool,
+    metered_cache_cost_missing: bool,
+    api_equivalent_cache_cost_missing: bool,
+    metered_cost_missing: bool,
+    api_equivalent_cost_missing: bool,
 }
 
 impl TokenTotals {
@@ -443,18 +450,27 @@ impl TokenTotals {
         self.output = self.output.saturating_add(output);
         self.reasoning = self.reasoning.saturating_add(reasoning);
         self.cached = self.cached.saturating_add(cached);
-        let metered = scope.is_some_and(|scope| scope.auth_scope == "api_key");
+        let auth_method = scope.and_then(scope_auth_method);
+        let metered = auth_method == Some(AuthMethod::ApiKey);
+        let known_auth = auth_method.is_some();
         if metered && let Some(cost) = cost {
             *self.est_cost_usd.get_or_insert(0.0) += cost;
         }
-        add_cache_stats(
-            &mut self.cache,
-            normalized,
-            scope,
-            metered.then_some(cache_cost).flatten(),
-        );
+        if known_auth && let Some(cost) = cost {
+            *self.api_equivalent_est_cost_usd.get_or_insert(0.0) += cost;
+        }
+        if metered && cost.is_none() {
+            self.metered_cost_missing = true;
+        }
+        if !known_auth || cost.is_none() {
+            self.api_equivalent_cost_missing = true;
+        }
+        add_cache_stats(&mut self.cache, normalized, scope, cache_cost);
         if metered && normalized.is_some() && cache_cost.is_none() {
-            self.cache_cost_missing = true;
+            self.metered_cache_cost_missing = true;
+        }
+        if (!known_auth || cache_cost.is_none()) && normalized.is_some() {
+            self.api_equivalent_cache_cost_missing = true;
         }
     }
 
@@ -517,6 +533,7 @@ fn add_cache_stats(
         return;
     };
     let totals_had_input = totals.logical_input_tokens > 0;
+    let totals_had_metered_input = totals.metered_input_tokens > 0;
     totals.logical_input_tokens = totals
         .logical_input_tokens
         .saturating_add(usage.logical_input);
@@ -541,29 +558,43 @@ fn add_cache_stats(
     totals.telemetry_covered_input_tokens = totals
         .telemetry_covered_input_tokens
         .saturating_add(usage.cache_telemetry_input);
-    let auth_method = scope.and_then(|scope| match scope.auth_scope.as_str() {
-        "api_key" => Some(haider_protocol::credential::AuthMethod::ApiKey),
-        "oauth" | "oauth_subscription" => Some(haider_protocol::credential::AuthMethod::OAuth),
-        _ => None,
-    });
+    let auth_method = scope.and_then(scope_auth_method);
     if auth_method == Some(haider_protocol::credential::AuthMethod::ApiKey) {
         totals.metered_input_tokens = totals
             .metered_input_tokens
             .saturating_add(usage.logical_input);
     }
+    if auth_method == Some(AuthMethod::ApiKey) {
+        merge_optional_cost(
+            &mut totals.input_with_cache_usd,
+            cost.map(|cost| cost.input_with_cache_usd),
+            totals_had_metered_input,
+        );
+        merge_optional_cost(
+            &mut totals.input_without_cache_usd,
+            cost.map(|cost| cost.input_without_cache_usd),
+            totals_had_metered_input,
+        );
+        merge_optional_cost(
+            &mut totals.estimated_savings_usd,
+            cost.map(|cost| cost.estimated_savings_usd),
+            totals_had_metered_input,
+        );
+    }
+    let api_cost = auth_method.is_some().then_some(cost).flatten();
     merge_optional_cost(
-        &mut totals.input_with_cache_usd,
-        cost.map(|cost| cost.input_with_cache_usd),
+        &mut totals.api_equivalent_input_with_cache_usd,
+        api_cost.map(|cost| cost.input_with_cache_usd),
         totals_had_input,
     );
     merge_optional_cost(
-        &mut totals.input_without_cache_usd,
-        cost.map(|cost| cost.input_without_cache_usd),
+        &mut totals.api_equivalent_input_without_cache_usd,
+        api_cost.map(|cost| cost.input_without_cache_usd),
         totals_had_input,
     );
     merge_optional_cost(
-        &mut totals.estimated_savings_usd,
-        cost.map(|cost| cost.estimated_savings_usd),
+        &mut totals.api_equivalent_estimated_savings_usd,
+        api_cost.map(|cost| cost.estimated_savings_usd),
         totals_had_input,
     );
 
@@ -633,21 +664,46 @@ fn add_cache_stats(
     if usage.cache_status != CacheStatAvailability::Present {
         breakdown.cache_status = CacheStatAvailability::Unavailable;
     }
+    if auth_method == Some(AuthMethod::ApiKey) {
+        merge_optional_cost(
+            &mut breakdown.input_with_cache_usd,
+            cost.map(|cost| cost.input_with_cache_usd),
+            breakdown_had_input,
+        );
+        merge_optional_cost(
+            &mut breakdown.input_without_cache_usd,
+            cost.map(|cost| cost.input_without_cache_usd),
+            breakdown_had_input,
+        );
+        merge_optional_cost(
+            &mut breakdown.estimated_savings_usd,
+            cost.map(|cost| cost.estimated_savings_usd),
+            breakdown_had_input,
+        );
+    }
     merge_optional_cost(
-        &mut breakdown.input_with_cache_usd,
-        cost.map(|cost| cost.input_with_cache_usd),
+        &mut breakdown.api_equivalent_input_with_cache_usd,
+        api_cost.map(|cost| cost.input_with_cache_usd),
         breakdown_had_input,
     );
     merge_optional_cost(
-        &mut breakdown.input_without_cache_usd,
-        cost.map(|cost| cost.input_without_cache_usd),
+        &mut breakdown.api_equivalent_input_without_cache_usd,
+        api_cost.map(|cost| cost.input_without_cache_usd),
         breakdown_had_input,
     );
     merge_optional_cost(
-        &mut breakdown.estimated_savings_usd,
-        cost.map(|cost| cost.estimated_savings_usd),
+        &mut breakdown.api_equivalent_estimated_savings_usd,
+        api_cost.map(|cost| cost.estimated_savings_usd),
         breakdown_had_input,
     );
+}
+
+fn scope_auth_method(scope: &UsageScope) -> Option<AuthMethod> {
+    match scope.auth_scope.as_str() {
+        "api_key" => Some(AuthMethod::ApiKey),
+        "oauth" | "oauth_subscription" => Some(AuthMethod::OAuth),
+        _ => None,
+    }
 }
 
 const FS_TOOL_NAMES: [&str; 3] = ["fs_write", "fs_patch", "fs_edit"];
@@ -693,12 +749,191 @@ fn fs_receipt_lines(name: &str, args: &serde_json::Value) -> (u64, u64) {
 ///   snapshot wins (summing them would double-count);
 /// - unattributed usage (no account, no subtotals) is skipped, never
 ///   invented onto an account.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UsageChunkKey {
+    run: String,
+    agent: String,
+    provider: String,
+    model: String,
+    cache_epoch: String,
+    request_kind: UsageRequestKind,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentTiming {
+    started_at_ms: u64,
+    terminal_at_ms: Option<u64>,
+    live: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentBreakdownKey {
+    provider: String,
+    model: String,
+    cache_epoch: String,
+    request_kind: UsageRequestKind,
+    auth_method: Option<AuthMethod>,
+}
+
+#[derive(Default)]
+struct AgentBreakdownAccumulator {
+    logical_input_tokens: u64,
+    billed_output_tokens: u64,
+    additional_reasoning_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    metered_cost_usd: f64,
+    api_equivalent_cost_usd: f64,
+    priced: bool,
+    saw_component: bool,
+}
+
+#[derive(Default)]
+struct AgentUsageAccumulator {
+    logical_input_tokens: u64,
+    uncached_input_tokens: u64,
+    billed_output_tokens: u64,
+    additional_reasoning_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    telemetry_covered_input_tokens: u64,
+    metered_cost_usd: f64,
+    api_equivalent_cost_usd: f64,
+    metered_lanes_priced: bool,
+    all_lanes_priced: bool,
+    has_metered_lanes: bool,
+    has_oauth_lanes: bool,
+    saw_component: bool,
+    breakdowns: HashMap<AgentBreakdownKey, AgentBreakdownAccumulator>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_agent_usage_component(
+    accumulator: &mut AgentUsageAccumulator,
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cached: u64,
+    normalized: Option<&NormalizedUsage>,
+    scope: Option<&UsageScope>,
+    fallback_model: &str,
+) {
+    use haider_protocol::provider::ReasoningAccounting;
+
+    let logical = normalized.map_or(input, |usage| usage.logical_input);
+    let uncached = normalized.map_or(input, |usage| usage.uncached_input);
+    let read = normalized.map_or(cached, |usage| usage.cache_read_input);
+    let write = normalized.map_or(0, |usage| usage.cache_write_input);
+    let billed_output = normalized.map_or(output, |usage| usage.billed_output);
+    let additional_reasoning = normalized.map_or(0, |usage| {
+        (usage.reasoning_accounting == ReasoningAccounting::AdditionalToOutput)
+            .then_some(usage.reasoning_detail)
+            .unwrap_or(0)
+    });
+    let covered = normalized.map_or(0, |usage| usage.cache_telemetry_input);
+    let model = scope
+        .map(|scope| scope.model.as_str())
+        .filter(|model| !model.is_empty())
+        .unwrap_or(fallback_model);
+    let cost = normalized.map_or_else(
+        || haider_provider::estimate_chunk_cost_usd(model, input, output, reasoning, cached),
+        |usage| haider_provider::estimate_normalized_usage_cost_usd(model, usage),
+    );
+    let auth_method = scope.and_then(scope_auth_method);
+    let metered = auth_method == Some(AuthMethod::ApiKey);
+
+    accumulator.saw_component = true;
+    if !accumulator.metered_lanes_priced && !accumulator.has_metered_lanes {
+        accumulator.metered_lanes_priced = true;
+    }
+    if !accumulator.all_lanes_priced
+        && !accumulator.has_metered_lanes
+        && !accumulator.has_oauth_lanes
+        && accumulator.breakdowns.is_empty()
+    {
+        accumulator.all_lanes_priced = true;
+    }
+    accumulator.logical_input_tokens = accumulator.logical_input_tokens.saturating_add(logical);
+    accumulator.uncached_input_tokens = accumulator.uncached_input_tokens.saturating_add(uncached);
+    accumulator.billed_output_tokens = accumulator
+        .billed_output_tokens
+        .saturating_add(billed_output);
+    accumulator.additional_reasoning_tokens = accumulator
+        .additional_reasoning_tokens
+        .saturating_add(additional_reasoning);
+    accumulator.cache_read_tokens = accumulator.cache_read_tokens.saturating_add(read);
+    accumulator.cache_write_tokens = accumulator.cache_write_tokens.saturating_add(write);
+    accumulator.telemetry_covered_input_tokens = accumulator
+        .telemetry_covered_input_tokens
+        .saturating_add(covered);
+    match auth_method {
+        Some(AuthMethod::ApiKey) => {
+            accumulator.has_metered_lanes = true;
+            if let Some(cost) = cost {
+                accumulator.metered_cost_usd += cost;
+                accumulator.api_equivalent_cost_usd += cost;
+            } else {
+                accumulator.metered_lanes_priced = false;
+                accumulator.all_lanes_priced = false;
+            }
+        }
+        Some(AuthMethod::OAuth) => {
+            accumulator.has_oauth_lanes = true;
+            if let Some(cost) = cost {
+                accumulator.api_equivalent_cost_usd += cost;
+            } else {
+                accumulator.all_lanes_priced = false;
+            }
+        }
+        None => accumulator.all_lanes_priced = false,
+    }
+
+    let key = AgentBreakdownKey {
+        provider: scope.map_or_else(String::new, |scope| scope.provider.clone()),
+        model: model.to_owned(),
+        cache_epoch: scope.map_or_else(String::new, |scope| scope.cache_epoch.clone()),
+        request_kind: scope.map_or(UsageRequestKind::MainTurn, |scope| scope.request_kind),
+        auth_method,
+    };
+    let breakdown = accumulator.breakdowns.entry(key).or_default();
+    if !breakdown.saw_component {
+        breakdown.priced = true;
+        breakdown.saw_component = true;
+    }
+    breakdown.logical_input_tokens = breakdown.logical_input_tokens.saturating_add(logical);
+    breakdown.billed_output_tokens = breakdown.billed_output_tokens.saturating_add(billed_output);
+    breakdown.additional_reasoning_tokens = breakdown
+        .additional_reasoning_tokens
+        .saturating_add(additional_reasoning);
+    breakdown.cache_read_tokens = breakdown.cache_read_tokens.saturating_add(read);
+    breakdown.cache_write_tokens = breakdown.cache_write_tokens.saturating_add(write);
+    if auth_method.is_none() || cost.is_none() {
+        breakdown.priced = false;
+    } else if let Some(cost) = cost {
+        breakdown.api_equivalent_cost_usd += cost;
+        if metered {
+            breakdown.metered_cost_usd += cost;
+        }
+    }
+}
+
+fn usd_to_microusd(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    ((value * 1_000_000.0).round() as u64).max(1)
+}
+
 #[derive(Default)]
 pub(crate) struct SessionFolder {
     stats: SessionLocalStats,
     current_model: String,
-    chunks:
-        HashMap<(String, String, String, String, String, UsageRequestKind), (UsagePayload, String)>,
+    chunks: HashMap<UsageChunkKey, (UsagePayload, String)>,
+    tool_attempts: HashMap<String, HashSet<String>>,
+    timings: HashMap<String, AgentTiming>,
+    run_agents: HashMap<String, Option<String>>,
+    root_run_seen: bool,
+    primary_agent: Option<AgentId>,
 }
 
 impl SessionFolder {
@@ -707,10 +942,60 @@ impl SessionFolder {
             stats: SessionLocalStats::default(),
             current_model: initial_model.to_owned(),
             chunks: HashMap::new(),
+            tool_attempts: HashMap::new(),
+            timings: HashMap::new(),
+            run_agents: HashMap::new(),
+            root_run_seen: false,
+            primary_agent: None,
         }
     }
 
     pub(crate) fn push(&mut self, envelope: &RawEnvelope) {
+        // Delegated sessions begin with an unscoped SessionCreated fact, then
+        // name their durable agent on the accepted turn. Remember that first
+        // actual agent, while `root_run_seen` below keeps root sessions in the
+        // `None` bucket even after child-scoped mirror events arrive.
+        if self.primary_agent.is_none()
+            && let Some(agent) = &envelope.agent_id
+        {
+            self.primary_agent = Some(agent.clone());
+        }
+        if let Some(run) = &envelope.run_id {
+            let owner = self
+                .run_agents
+                .entry(run.as_str().to_owned())
+                .or_insert_with(|| {
+                    envelope
+                        .agent_id
+                        .as_ref()
+                        .map(|agent| agent.as_str().to_owned())
+                });
+            self.root_run_seen |= owner.is_none();
+        }
+        // Cancellation terminalization can emit an unscoped run-state
+        // envelope. Recover its already-established agent from the durable
+        // run instead of accidentally settling the root/empty bucket.
+        let envelope_agent = envelope.agent_id.as_ref().map_or_else(
+            || {
+                envelope
+                    .run_id
+                    .as_ref()
+                    .and_then(|run| self.run_agents.get(run.as_str()))
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_default()
+            },
+            |agent| agent.as_str().to_owned(),
+        );
+        // SessionCreated/config facts are not agent work. The first
+        // run-scoped durable fact establishes the elapsed basis.
+        if envelope.run_id.is_some() {
+            let timing = self.timings.entry(envelope_agent.clone()).or_default();
+            if timing.started_at_ms == 0 {
+                timing.started_at_ms = envelope.committed_at_ms;
+                timing.live = true;
+            }
+        }
         self.stats.last_committed_at_ms = self
             .stats
             .last_committed_at_ms
@@ -735,24 +1020,43 @@ impl SessionFolder {
                     .filter(|model| !model.is_empty())
                     .unwrap_or(&self.current_model)
                     .to_owned();
-                let key = (
-                    scope
+                let key = UsageChunkKey {
+                    run: scope
                         .and_then(|scope| scope.run.as_ref())
                         .or(envelope.run_id.as_ref())
                         .map_or_else(String::new, |run| run.as_str().to_owned()),
-                    scope
+                    agent: scope
                         .and_then(|scope| scope.agent.as_ref())
                         .or(envelope.agent_id.as_ref())
                         .map_or_else(String::new, |agent| agent.as_str().to_owned()),
-                    scope.map_or_else(String::new, |scope| scope.provider.clone()),
-                    model.clone(),
-                    scope.map_or_else(String::new, |scope| scope.cache_epoch.clone()),
-                    scope.map_or(UsageRequestKind::MainTurn, |scope| scope.request_kind),
-                );
+                    provider: scope.map_or_else(String::new, |scope| scope.provider.clone()),
+                    model: model.clone(),
+                    cache_epoch: scope.map_or_else(String::new, |scope| scope.cache_epoch.clone()),
+                    request_kind: scope
+                        .map_or(UsageRequestKind::MainTurn, |scope| scope.request_kind),
+                };
                 self.chunks.insert(key, (usage, model));
             }
             "item" => {
                 let payload = &envelope.payload;
+                if let Ok(EventPayload::Item(event)) =
+                    serde_json::from_value::<EventPayload>(payload.clone())
+                {
+                    match event {
+                        ItemEvent::Started { item_id, item }
+                        | ItemEvent::Completed { item_id, item }
+                            if matches!(item, TurnItem::ToolCall { .. }) =>
+                        {
+                            self.tool_attempts
+                                .entry(envelope_agent.clone())
+                                .or_default()
+                                .insert(item_id.as_str().to_owned());
+                        }
+                        ItemEvent::Started { .. }
+                        | ItemEvent::Delta { .. }
+                        | ItemEvent::Completed { .. } => {}
+                    }
+                }
                 if payload.get("event").and_then(|event| event.as_str()) != Some("completed") {
                     return;
                 }
@@ -776,8 +1080,167 @@ impl SessionFolder {
                 self.stats.lines_added = self.stats.lines_added.saturating_add(added);
                 self.stats.lines_removed = self.stats.lines_removed.saturating_add(removed);
             }
+            "run_state" => {
+                if let Ok(EventPayload::RunState(state)) =
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                {
+                    let timing = self.timings.entry(envelope_agent).or_default();
+                    if state.is_terminal() {
+                        timing.live = false;
+                        timing.terminal_at_ms = Some(envelope.committed_at_ms);
+                    } else {
+                        timing.live = true;
+                        timing.terminal_at_ms = None;
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Direct metrics for the session's owning agent at `head_seq`. The
+    /// borrowing form lets the delegation mirror publish as each child page
+    /// advances without consuming the account-report fold.
+    pub(crate) fn primary_agent_snapshot(
+        &self,
+        session_id: &SessionId,
+        head_seq: u64,
+    ) -> Option<AgentMetricsSnapshot> {
+        let agent = (!self.root_run_seen)
+            .then_some(self.primary_agent.as_ref())
+            .flatten();
+        self.agent_snapshot(session_id, agent, head_seq)
+    }
+
+    pub(crate) fn agent_snapshot(
+        &self,
+        session_id: &SessionId,
+        agent: Option<&AgentId>,
+        head_seq: u64,
+    ) -> Option<AgentMetricsSnapshot> {
+        let agent_key = agent.map_or("", AgentId::as_str);
+        let timing = self.timings.get(agent_key)?;
+        let mut accumulator = AgentUsageAccumulator::default();
+        for (key, (usage, fallback_model)) in &self.chunks {
+            if key.agent != agent_key {
+                continue;
+            }
+            if usage.accounts.is_empty() {
+                add_agent_usage_component(
+                    &mut accumulator,
+                    usage.input,
+                    usage.output,
+                    usage.reasoning,
+                    usage.cached,
+                    usage.normalized.as_ref(),
+                    usage.scope.as_ref(),
+                    fallback_model,
+                );
+            } else {
+                for subtotal in &usage.accounts {
+                    add_agent_usage_component(
+                        &mut accumulator,
+                        subtotal.input,
+                        subtotal.output,
+                        subtotal.reasoning,
+                        subtotal.cached,
+                        subtotal.normalized.as_ref(),
+                        subtotal.scope.as_ref().or(usage.scope.as_ref()),
+                        fallback_model,
+                    );
+                }
+            }
+        }
+        let usage = accumulator.saw_component.then(|| {
+            let cache_hit_basis_points = (accumulator.logical_input_tokens > 0
+                && accumulator.telemetry_covered_input_tokens == accumulator.logical_input_tokens)
+                .then(|| {
+                    let denominator = accumulator
+                        .cache_read_tokens
+                        .saturating_add(accumulator.uncached_input_tokens);
+                    if denominator == 0 {
+                        0
+                    } else {
+                        let points =
+                            accumulator.cache_read_tokens.saturating_mul(10_000) / denominator;
+                        u32::try_from(points).unwrap_or(10_000).min(10_000)
+                    }
+                });
+            let metered_cost_microusd = accumulator
+                .has_metered_lanes
+                .then_some(accumulator.metered_lanes_priced)
+                .filter(|priced| *priced)
+                .map(|_| usd_to_microusd(accumulator.metered_cost_usd));
+            let api_equivalent_cost_microusd = accumulator
+                .all_lanes_priced
+                .then(|| usd_to_microusd(accumulator.api_equivalent_cost_usd));
+            let mut breakdowns = accumulator
+                .breakdowns
+                .into_iter()
+                .map(|(key, value)| AgentUsageBreakdown {
+                    provider: key.provider,
+                    model: key.model,
+                    cache_epoch: key.cache_epoch,
+                    request_kind: key.request_kind,
+                    auth_method: key.auth_method,
+                    logical_input_tokens: value.logical_input_tokens,
+                    billed_output_tokens: value.billed_output_tokens,
+                    additional_reasoning_tokens: value.additional_reasoning_tokens,
+                    cache_read_tokens: value.cache_read_tokens,
+                    cache_write_tokens: value.cache_write_tokens,
+                    metered_cost_microusd: (key.auth_method == Some(AuthMethod::ApiKey)
+                        && value.priced)
+                        .then(|| usd_to_microusd(value.metered_cost_usd)),
+                    api_equivalent_cost_microusd: value
+                        .priced
+                        .then(|| usd_to_microusd(value.api_equivalent_cost_usd)),
+                    priced: value.priced,
+                })
+                .collect::<Vec<_>>();
+            breakdowns.sort_by(|left, right| {
+                (
+                    left.provider.as_str(),
+                    left.model.as_str(),
+                    left.cache_epoch.as_str(),
+                    request_kind_rank(left.request_kind),
+                )
+                    .cmp(&(
+                        right.provider.as_str(),
+                        right.model.as_str(),
+                        right.cache_epoch.as_str(),
+                        request_kind_rank(right.request_kind),
+                    ))
+            });
+            AgentUsageMetrics {
+                logical_input_tokens: accumulator.logical_input_tokens,
+                billed_output_tokens: accumulator.billed_output_tokens,
+                additional_reasoning_tokens: accumulator.additional_reasoning_tokens,
+                cache_read_tokens: accumulator.cache_read_tokens,
+                cache_write_tokens: accumulator.cache_write_tokens,
+                cache_hit_basis_points,
+                metered_cost_microusd,
+                api_equivalent_cost_microusd,
+                all_lanes_priced: accumulator.all_lanes_priced,
+                has_metered_lanes: accumulator.has_metered_lanes,
+                has_oauth_lanes: accumulator.has_oauth_lanes,
+                breakdowns,
+            }
+        });
+        Some(AgentMetricsSnapshot {
+            agent: agent.cloned(),
+            session_id: session_id.clone(),
+            head_seq,
+            started_at_ms: timing.started_at_ms,
+            terminal_at_ms: timing.terminal_at_ms,
+            live: timing.live,
+            tool_attempts: self
+                .tool_attempts
+                .get(agent_key)
+                .map_or(0, HashSet::len)
+                .try_into()
+                .unwrap_or(u64::MAX),
+            usage,
+        })
     }
 
     pub(crate) fn finish(self) -> SessionLocalStats {
@@ -858,13 +1321,32 @@ impl SessionFolder {
             }
         }
         for totals in stats.tokens.values_mut() {
-            if totals.cache_cost_missing {
+            if totals.metered_cost_missing {
+                totals.est_cost_usd = None;
+            }
+            if totals.api_equivalent_cost_missing {
+                totals.api_equivalent_est_cost_usd = None;
+            }
+            if totals.metered_cache_cost_missing {
                 totals.cache.input_with_cache_usd = None;
                 totals.cache.input_without_cache_usd = None;
                 totals.cache.estimated_savings_usd = None;
             }
+            if totals.api_equivalent_cache_cost_missing {
+                totals.cache.api_equivalent_input_with_cache_usd = None;
+                totals.cache.api_equivalent_input_without_cache_usd = None;
+                totals.cache.api_equivalent_estimated_savings_usd = None;
+            }
         }
         stats
+    }
+}
+
+const fn request_kind_rank(kind: UsageRequestKind) -> u8 {
+    match kind {
+        UsageRequestKind::MainTurn => 0,
+        UsageRequestKind::Compaction => 1,
+        UsageRequestKind::DelegatedAgent => 2,
     }
 }
 
@@ -886,6 +1368,9 @@ pub(crate) fn attribute_session(
         merge_cache_stats(&mut entry.cache, &tokens.cache);
         if let Some(cost) = tokens.est_cost_usd {
             *entry.est_cost_usd.get_or_insert(0.0) += cost;
+        }
+        if let Some(cost) = tokens.api_equivalent_est_cost_usd {
+            *entry.api_equivalent_est_cost_usd.get_or_insert(0.0) += cost;
         }
         let beats = dominant.as_ref().is_none_or(|(_, best)| magnitude > *best);
         if beats {
@@ -914,6 +1399,7 @@ fn merge_optional_cost(target: &mut Option<f64>, source: Option<f64>, target_had
 
 fn merge_cache_stats(target: &mut CacheUsageStatsV1, source: &CacheUsageStatsV1) {
     let target_had_input = target.logical_input_tokens > 0;
+    let target_had_metered_input = target.metered_input_tokens > 0;
     target.logical_input_tokens = target
         .logical_input_tokens
         .saturating_add(source.logical_input_tokens);
@@ -941,19 +1427,36 @@ fn merge_cache_stats(target: &mut CacheUsageStatsV1, source: &CacheUsageStatsV1)
     target.metered_input_tokens = target
         .metered_input_tokens
         .saturating_add(source.metered_input_tokens);
+    if source.metered_input_tokens > 0 {
+        merge_optional_cost(
+            &mut target.input_with_cache_usd,
+            source.input_with_cache_usd,
+            target_had_metered_input,
+        );
+        merge_optional_cost(
+            &mut target.input_without_cache_usd,
+            source.input_without_cache_usd,
+            target_had_metered_input,
+        );
+        merge_optional_cost(
+            &mut target.estimated_savings_usd,
+            source.estimated_savings_usd,
+            target_had_metered_input,
+        );
+    }
     merge_optional_cost(
-        &mut target.input_with_cache_usd,
-        source.input_with_cache_usd,
+        &mut target.api_equivalent_input_with_cache_usd,
+        source.api_equivalent_input_with_cache_usd,
         target_had_input,
     );
     merge_optional_cost(
-        &mut target.input_without_cache_usd,
-        source.input_without_cache_usd,
+        &mut target.api_equivalent_input_without_cache_usd,
+        source.api_equivalent_input_without_cache_usd,
         target_had_input,
     );
     merge_optional_cost(
-        &mut target.estimated_savings_usd,
-        source.estimated_savings_usd,
+        &mut target.api_equivalent_estimated_savings_usd,
+        source.api_equivalent_estimated_savings_usd,
         target_had_input,
     );
     for source_breakdown in &source.breakdowns {
@@ -1010,6 +1513,21 @@ fn merge_cache_stats(target: &mut CacheUsageStatsV1, source: &CacheUsageStatsV1)
         merge_optional_cost(
             &mut entry.estimated_savings_usd,
             source_breakdown.estimated_savings_usd,
+            entry_had_input,
+        );
+        merge_optional_cost(
+            &mut entry.api_equivalent_input_with_cache_usd,
+            source_breakdown.api_equivalent_input_with_cache_usd,
+            entry_had_input,
+        );
+        merge_optional_cost(
+            &mut entry.api_equivalent_input_without_cache_usd,
+            source_breakdown.api_equivalent_input_without_cache_usd,
+            entry_had_input,
+        );
+        merge_optional_cost(
+            &mut entry.api_equivalent_estimated_savings_usd,
+            source_breakdown.api_equivalent_estimated_savings_usd,
             entry_had_input,
         );
     }

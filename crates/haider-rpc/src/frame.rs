@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
-use haider_protocol::agent::AgentMessageReceipt;
+use haider_protocol::agent::{AgentMessageReceipt, AgentMetricsSnapshot};
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
@@ -843,6 +843,11 @@ pub struct SessionSummary {
     /// from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Additive direct-agent metrics reduced through this committed head.
+    /// Absent means an older daemon (or no reducible agent truth), never a
+    /// zero-valued snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_metrics: Option<AgentMetricsSnapshot>,
 }
 
 /// Result of a non-subscribing session read.
@@ -1834,6 +1839,8 @@ pub enum ErrorData {
         invalidated_stable_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rewarm_cost_microusd: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewarm_api_equivalent_cost_microusd: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rewarm_base_input_equivalent_tokens: Option<u64>,
         policy: String,
