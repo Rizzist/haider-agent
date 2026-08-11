@@ -177,6 +177,12 @@ fn child_command(config: &DaemonConfig) -> Command {
         .arg(&config.store_dir)
         .arg("--runtime-dir")
         .arg(&config.runtime_dir)
+        // Hermetic: the REAL child binary parses CLI args, so the in-process
+        // `test_config` flag never reaches it — without this env it runs
+        // startup auto-adoption (A2) against the HOST's credential stores.
+        // Under gate load that wedged shutdown (gate116/117: the two
+        // child-process lifecycle tests were the only flakes).
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
