@@ -1722,6 +1722,7 @@ pub enum SubmitDisposition {
     Started,
     Queued,
     SteerPending,
+    SubturnPending,
     #[serde(other)]
     Unknown,
 }

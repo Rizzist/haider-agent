@@ -788,9 +788,10 @@ fn live_mid_turn_input_reaches_the_daemon_instead_of_a_local_queue() {
     // MUTATION CHECK: delete the `RuntimeMode::Live` branch from
     // `submit_composer`'s mid-turn arm and both assertions below fail — the
     // request never appears and the local row does.
-    for (queue_mode, expected) in [
-        (false, haider_protocol::DeliveryMode::Steer),
-        (true, haider_protocol::DeliveryMode::Queue),
+    for (queue_mode, subturn_mode, expected) in [
+        (false, false, haider_protocol::DeliveryMode::Steer),
+        (true, false, haider_protocol::DeliveryMode::Queue),
+        (false, true, haider_protocol::DeliveryMode::Subturn),
     ] {
         let mut model = live_model();
         let mut driver = LiveDriver::new("test");
@@ -799,6 +800,7 @@ fn live_mid_turn_input_reaches_the_daemon_instead_of_a_local_queue() {
         model.screen = Screen::Session;
         model.turn_active = true;
         model.queue_mode = queue_mode;
+        model.subturn_mode = subturn_mode;
         let rows_before = model.projection.entries().len();
 
         for c in "one more thing".chars() {

@@ -2294,6 +2294,245 @@ async fn daemon_nudge_reaches_the_next_safe_provider_boundary_in_the_same_turn()
     }));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedDispatch {
+    call_id: String,
+    provider_requests_seen: usize,
+    subturn_seen: bool,
+}
+
+struct BoundaryRecordingDispatcher {
+    provider: Arc<FakeProvider>,
+    records: Mutex<Vec<RecordedDispatch>>,
+    subturn_text: String,
+}
+
+#[async_trait]
+impl ToolDispatcher for BoundaryRecordingDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        let requests = self.provider.requests();
+        let subturn_seen = requests.last().is_some_and(|request| {
+            request.messages.iter().any(|message| {
+                message.blocks.iter().any(
+                    |block| matches!(block, Block::Text { text } if text == &self.subturn_text),
+                )
+            })
+        });
+        self.records
+            .lock()
+            .expect("dispatch records lock")
+            .push(RecordedDispatch {
+                call_id: call_id.to_owned(),
+                provider_requests_seen: requests.len(),
+                subturn_seen,
+            });
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: "done".into(),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+        }))
+    }
+}
+
+/// ST2/ST3 LAW. MUTATION CHECK: call `complete_tool` before consuming
+/// `pending_subturns`, or omit the user-message append. Expected runtime
+/// failure: `pending-before-subturn` reaches the dispatcher, the dispatcher
+/// sees only one provider request, or request two lacks the injected text.
+#[tokio::test]
+async fn subturn_holds_the_pending_tool_and_reprompts_before_dispatch() {
+    let subturn_text = "use the narrow fixture before you inspect";
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "I will inspect the broad fixture first.".into(),
+        },
+        FakeStep::Delay { ms: 80 },
+        FakeStep::EmitToolCall {
+            call_id: "pending-before-subturn".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path":"broad.rs"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "revised-after-subturn".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path":"narrow.rs"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "revised-after-subturn".into(),
+        },
+        FakeStep::EmitText {
+            text: "The narrow fixture is correct.".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let dispatcher = Arc::new(BoundaryRecordingDispatcher {
+        provider: provider.clone(),
+        records: Mutex::new(Vec::new()),
+        subturn_text: subturn_text.into(),
+    });
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let mut subscriber = handle.subscribe();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("inspect the fixture"))
+        .await
+        .expect("turn accepted");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = subscriber.recv().await.expect("text event");
+            if matches!(
+                typed(&event),
+                EventPayload::Item(ItemEvent::Delta {
+                    delta: haider_protocol::item::ItemDelta::Text { ref text },
+                    ..
+                }) if text == "I will inspect the broad fixture first."
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("current response text arrives first");
+    handle
+        .subturn(subturn_text)
+        .expect("subturn accepted without blocking");
+
+    let outcome = timeout(Duration::from_secs(2), turn.wait())
+        .await
+        .expect("subturn turn completes")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let records = dispatcher.records.lock().expect("dispatch records").clone();
+    assert_eq!(
+        records,
+        vec![RecordedDispatch {
+            call_id: "revised-after-subturn".into(),
+            provider_requests_seen: 2,
+            subturn_seen: true,
+        }],
+        "the original call must be held and only the post-subturn call may dispatch"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let second = &requests[1].messages;
+    let current_text_index = second
+        .iter()
+        .position(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(block, Block::Text { text } if text == "I will inspect the broad fixture first.")
+            })
+        })
+        .expect("current response text is retained");
+    let subturn_index = second
+        .iter()
+        .position(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == subturn_text))
+        })
+        .expect("subturn text is injected");
+    assert!(
+        current_text_index < subturn_index,
+        "the subturn must not overtake current response text"
+    );
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert!(events.iter().any(|event| {
+        matches!(
+            typed(event),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::ToolCall { call_id, status: ToolStatus::Pending, .. },
+                ..
+            }) if call_id == "pending-before-subturn"
+        )
+    }));
+
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
+}
+
+/// ST4 LAW. MUTATION CHECK: clear `pending_subturns` at a pure-text Finish.
+/// Expected runtime failure: there is only one provider request or the second
+/// request does not contain the held input.
+#[tokio::test]
+async fn subturn_without_a_tool_degrades_to_turn_end_delivery() {
+    let subturn_text = "add the restart caveat";
+    let (handle, _store, provider) = runtime(vec![
+        FakeStep::EmitText {
+            text: "Here is the initial answer.".into(),
+        },
+        FakeStep::Delay { ms: 80 },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "The restart caveat is included.".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let mut subscriber = handle.subscribe();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("answer directly"))
+        .await
+        .expect("turn accepted");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = subscriber.recv().await.expect("text event");
+            if matches!(
+                typed(&event),
+                EventPayload::Item(ItemEvent::Delta {
+                    delta: haider_protocol::item::ItemDelta::Text { ref text },
+                    ..
+                }) if text == "Here is the initial answer."
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("initial text arrives");
+    handle.subturn(subturn_text).expect("subturn accepted");
+    let outcome = timeout(Duration::from_secs(2), turn.wait())
+        .await
+        .expect("degraded subturn completes")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text == subturn_text))
+    }));
+}
+
 #[tokio::test]
 async fn submit_flood_is_bounded_and_cannot_starve_provider_progress() {
     let provider = Arc::new(FairnessProvider::new());

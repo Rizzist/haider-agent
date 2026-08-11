@@ -3340,10 +3340,25 @@ impl HubConnection {
                     self.maybe_auto_title(&session_id, auto_title_slug(&text))
                         .await;
                 }
-                if accepted.worker_generation == self.hub.inner.store.worker_generation()
-                    && let Err(error) = self.hub.worker_manager()?.submit(accepted.clone()).await
-                {
-                    return self.respond_turn_error(request_id, error);
+                if accepted.worker_generation == self.hub.inner.store.worker_generation() {
+                    let handoff = match accepted.disposition {
+                        TurnAdmissionDisposition::SteerPending => {
+                            self.hub
+                                .submit_internal_nudge(accepted.clone(), text.clone())
+                                .await
+                        }
+                        TurnAdmissionDisposition::SubturnPending => {
+                            self.hub
+                                .submit_internal_subturn(accepted.clone(), text.clone())
+                                .await
+                        }
+                        TurnAdmissionDisposition::Started | TurnAdmissionDisposition::Queued => {
+                            self.hub.worker_manager()?.submit(accepted.clone()).await
+                        }
+                    };
+                    if let Err(error) = handoff {
+                        return self.respond_turn_error(request_id, error);
+                    }
                 }
                 return self.respond_turn_accepted(request_id, accepted);
             }
@@ -3368,6 +3383,7 @@ impl HubConnection {
         // Captured before `text` moves into the acceptance command; only a
         // committed FIRST accept consumes it (G2 auto-title).
         let first_turn_slug = auto_title_slug(&text);
+        let delivery_text = text.clone();
         let command = TurnAcceptCommand {
             command_id: command_id.0,
             request_digest,
@@ -3402,7 +3418,22 @@ impl HubConnection {
         }
         // Durable-before-provider: the manager sees this only after the actor
         // committed and synchronously published the acceptance transaction.
-        if let Err(error) = self.hub.worker_manager()?.submit(accepted.clone()).await {
+        let handoff = match accepted.disposition {
+            TurnAdmissionDisposition::SteerPending => {
+                self.hub
+                    .submit_internal_nudge(accepted.clone(), delivery_text)
+                    .await
+            }
+            TurnAdmissionDisposition::SubturnPending => {
+                self.hub
+                    .submit_internal_subturn(accepted.clone(), delivery_text)
+                    .await
+            }
+            TurnAdmissionDisposition::Started | TurnAdmissionDisposition::Queued => {
+                self.hub.worker_manager()?.submit(accepted.clone()).await
+            }
+        };
+        if let Err(error) = handoff {
             return self.respond_turn_error(request_id, error);
         }
         self.respond_turn_accepted(request_id, accepted)
@@ -3699,6 +3730,7 @@ impl HubConnection {
             TurnAdmissionDisposition::Started => SubmitDisposition::Started,
             TurnAdmissionDisposition::Queued => SubmitDisposition::Queued,
             TurnAdmissionDisposition::SteerPending => SubmitDisposition::SteerPending,
+            TurnAdmissionDisposition::SubturnPending => SubmitDisposition::SubturnPending,
         };
         let body = if let Some(branch_id) = accepted.branch_id {
             ResponseBody::TurnSubmitOnBranch {

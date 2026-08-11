@@ -43,7 +43,6 @@ use haider_core::{
     ToolDispatchResult, ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
     estimate_provider_request_input_tokens, sanitized_failure_message,
 };
-use haider_protocol::EventPayload;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
@@ -69,6 +68,7 @@ use haider_protocol::tool::{
     BoundedResult, DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
     ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
 };
+use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
     OPENAI_OAUTH_PROVIDER_NAME, ProviderCredentialSurface, ResolvedAttachment,
@@ -715,6 +715,7 @@ enum ManagerCommand {
         run_id: RunId,
         accepted_seq: u64,
         text: String,
+        mode: DeliveryMode,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
     Compact {
@@ -739,6 +740,7 @@ enum SupervisorCommand {
         run_id: RunId,
         accepted_seq: u64,
         text: String,
+        mode: DeliveryMode,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
     Compact {
@@ -921,6 +923,35 @@ impl WorkerManagerHandle {
         accepted_seq: u64,
         text: String,
     ) -> Result<(), HaiderError> {
+        self.deliver_mid_turn(session_id, run_id, accepted_seq, text, DeliveryMode::Steer)
+            .await
+    }
+
+    pub(crate) async fn subturn(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        text: String,
+    ) -> Result<(), HaiderError> {
+        self.deliver_mid_turn(
+            session_id,
+            run_id,
+            accepted_seq,
+            text,
+            DeliveryMode::Subturn,
+        )
+        .await
+    }
+
+    async fn deliver_mid_turn(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        text: String,
+        mode: DeliveryMode,
+    ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
         self.commands
             .try_send(ManagerCommand::Nudge {
@@ -928,6 +959,7 @@ impl WorkerManagerHandle {
                 run_id,
                 accepted_seq,
                 text,
+                mode,
                 completed,
             })
             .map_err(manager_try_send)?;
@@ -1136,6 +1168,7 @@ async fn run_manager(
                 run_id,
                 accepted_seq,
                 text,
+                mode,
                 completed,
             } => {
                 let supervisor = match supervisor_for(
@@ -1160,6 +1193,7 @@ async fn run_manager(
                     run_id,
                     accepted_seq,
                     text,
+                    mode,
                     completed,
                 }) {
                     let (completed, error) = match error {
@@ -1863,11 +1897,20 @@ async fn run_supervisor(
                             run_id,
                             accepted_seq,
                             text,
+                            mode,
                             completed,
                         }) => {
                             let result = if run_id == active_run {
                                 if delivered_nudges.insert(accepted_seq) {
-                                    turn.harness.nudge(text)
+                                    match mode {
+                                        DeliveryMode::Steer => turn.harness.nudge(text),
+                                        DeliveryMode::Subturn => turn.harness.subturn(text),
+                                        DeliveryMode::Queue => Err(HaiderError::new(
+                                            ErrorCode::InvalidArgument,
+                                            "queue-mode input cannot target an active harness",
+                                            false,
+                                        )),
+                                    }
                                 } else {
                                     Ok(())
                                 }

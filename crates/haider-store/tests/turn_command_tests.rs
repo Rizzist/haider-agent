@@ -155,6 +155,86 @@ fn same_run_steer_commits_one_message_without_minting_a_new_turn() {
     ));
 }
 
+/// ST1 daemon-admission law. MUTATION CHECK: treat Subturn as Queue, fail to
+/// bind the daemon-minted candidate to the active run, or reuse SteerPending.
+/// Expected runtime failure: a Queued prefix appears or the disposition/run
+/// id differs.
+#[test]
+fn subturn_binds_to_the_active_run_with_a_distinct_durable_disposition() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("session-subturn");
+    create(&store, &session_id);
+    store
+        .accept_turn(&submit(
+            &store,
+            "submit-subturn-base",
+            &session_id,
+            "run-subturn-active",
+        ))
+        .expect("base turn");
+    let mut streaming = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("subturn-streaming"),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(RunId::new("run-subturn-active")),
+        agent_id: None,
+        device_id: DeviceId::new("test-daemon"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(haider_protocol::EventPayload::RunState(RunState::Streaming))
+            .expect("streaming payload"),
+    }];
+    store.append(&mut streaming).expect("streaming append");
+
+    let command = TurnAcceptCommand {
+        command_id: "submit-subturn-input".into(),
+        request_digest: "submit-subturn-input-digest".into(),
+        request_json: r#"{"mode":"subturn","text":"use narrow args"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: RunId::new("daemon-minted-subturn-candidate"),
+        agent_id: None,
+        branch_id: None,
+        text: "use narrow args".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Subturn,
+        queued_event_id: EventId::new("unused-subturn-queued"),
+        user_event_id: EventId::new("subturn-user"),
+        active_event_id: EventId::new("unused-subturn-active"),
+        device_id: DeviceId::new("test-daemon"),
+    };
+    let TurnAcceptOutcome::Committed {
+        accepted,
+        envelopes,
+    } = store.accept_turn(&command).expect("subturn accepts")
+    else {
+        panic!("first subturn commits");
+    };
+    assert_eq!(accepted.run_id, RunId::new("run-subturn-active"));
+    assert_eq!(
+        accepted.disposition,
+        TurnAdmissionDisposition::SubturnPending
+    );
+    assert_eq!(envelopes.len(), 2, "same-run delivery has no Queued prefix");
+    assert!(matches!(
+        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[0].payload.clone())
+            .expect("subturn payload"),
+        haider_protocol::EventPayload::UserMessage { text, mode, .. }
+            if text == "use narrow args" && mode == DeliveryMode::Subturn
+    ));
+}
+
 #[test]
 fn legacy_session_without_typed_metadata_is_rejected_before_acceptance() {
     let root = tempfile::tempdir().expect("tempdir");

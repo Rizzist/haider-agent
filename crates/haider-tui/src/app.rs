@@ -1289,6 +1289,7 @@ pub fn messaged_note(chips: &[ChipModel], fact: &haider_protocol::agent::AgentMe
     let delivery = match fact.delivery {
         haider_protocol::agent::AgentMessageDelivery::DeliveredSteer => "steer",
         haider_protocol::agent::AgentMessageDelivery::DeliveredQueued => "queued",
+        haider_protocol::agent::AgentMessageDelivery::DeliveredSubturn => "subturn",
     };
     // The preview is a bounded single fact — one timeline row, so its
     // newlines flatten (the daemon's 200-char bound already applied).
@@ -2831,6 +2832,8 @@ pub struct AppModel {
     pub msg_queue: Vec<String>,
     /// `/queue turn` — mid-turn input queues instead of steering.
     pub queue_mode: bool,
+    /// `/queue subturn` — hold for the next tool boundary and re-prompt.
+    pub subturn_mode: bool,
     /// ⌃G / `/tokens` context panel (sim tui.js:2946-2977) — session
     /// surfaces only; esc closes.
     pub token_panel: bool,
@@ -3167,6 +3170,7 @@ impl Default for AppModel {
             session_head: ("Hasan".to_owned(), "(a)".to_owned()),
             msg_queue: Vec::new(),
             queue_mode: false,
+            subturn_mode: false,
             voice: VoiceState::default(),
             listening: false,
             talk: crate::talk::TalkState::default(),
@@ -5038,15 +5042,21 @@ impl AppModel {
             if self.queue_mode {
                 self.msg_queue.push(text);
             } else {
+                let mode = if self.subturn_mode {
+                    DeliveryMode::Subturn
+                } else {
+                    DeliveryMode::Steer
+                };
                 self.projection.apply(&EventPayload::UserMessage {
                     text,
                     attachments: vec![],
-                    mode: DeliveryMode::Steer,
+                    mode,
                 });
-                self.projection.push_note(
-                    "· steered — delivered at the next safe boundary of the current turn"
-                        .to_owned(),
-                );
+                self.projection.push_note(if self.subturn_mode {
+                    "· subturn — lands at the next tool call before it executes".to_owned()
+                } else {
+                    "· steered — delivered at the next safe boundary of the current turn".to_owned()
+                });
             }
             return;
         }
@@ -8513,6 +8523,7 @@ impl AppModel {
                     match arg.as_deref() {
                         Some("steer") => {
                             self.queue_mode = false;
+                            self.subturn_mode = false;
                             self.projection.push_note(
                                 "· mid-turn input → STEER — delivered at the next safe boundary"
                                     .to_owned(),
@@ -8520,19 +8531,30 @@ impl AppModel {
                         }
                         Some("turn" | "queue") => {
                             self.queue_mode = true;
+                            self.subturn_mode = false;
                             self.projection.push_note(
                                 "· mid-turn input → QUEUE — held until the turn ends, then consumed without idling"
+                                    .to_owned(),
+                            );
+                        }
+                        Some("subturn") => {
+                            self.queue_mode = false;
+                            self.subturn_mode = true;
+                            self.projection.push_note(
+                                "· mid-turn input → SUBTURN — held for the next tool call, then injected before execution"
                                     .to_owned(),
                             );
                         }
                         _ => {
                             let mode = if self.queue_mode {
                                 "queue (after turn)"
+                            } else if self.subturn_mode {
+                                "subturn (next tool call)"
                             } else {
                                 "steer (safe boundary)"
                             };
                             self.projection.push_note(format!(
-                                "· mid-turn input mode is {mode} — /queue steer|turn"
+                                "· mid-turn input mode is {mode} — /queue steer|subturn|turn"
                             ));
                         }
                     }
@@ -9627,6 +9649,7 @@ impl AppModel {
         self.turn_active = false;
         self.msg_queue.clear();
         self.queue_mode = false;
+        self.subturn_mode = false;
         self.voice = VoiceState::default();
         self.listening = false;
         self.session_dir = self.launcher_dir.clone();
@@ -9823,6 +9846,7 @@ impl AppModel {
         self.tasks = std::mem::take(&mut slot.tasks);
         self.msg_queue = std::mem::take(&mut slot.msg_queue);
         self.queue_mode = slot.queue_mode;
+        self.subturn_mode = slot.subturn_mode;
         self.turn_active = slot.turn_active;
         self.auto_resuming = slot.auto_resuming;
         self.subtree_collapsed = slot.subtree_collapsed;
@@ -9872,6 +9896,7 @@ impl AppModel {
             slot.tasks = std::mem::take(&mut self.tasks);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);
+            slot.subturn_mode = std::mem::take(&mut self.subturn_mode);
             slot.turn_active = std::mem::take(&mut self.turn_active);
             slot.auto_resuming = std::mem::take(&mut self.auto_resuming);
             slot.subtree_collapsed = std::mem::take(&mut self.subtree_collapsed);
@@ -9887,6 +9912,7 @@ impl AppModel {
         self.last_detached = Some(active);
         self.msg_queue.clear();
         self.queue_mode = false;
+        self.subturn_mode = false;
         self.view_path.clear();
         self.menu_selection = 0;
         self.scroll_back.set(0);

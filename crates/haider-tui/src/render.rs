@@ -6414,7 +6414,13 @@ fn render_status_bar(
     // holds (tui.js:2840-2842). B2b: the ACTIVE branch's name — "main" on
     // the main branch, the daemon-named fork otherwise.
     if model.screen == Screen::Session {
-        let queue_tag = if model.queue_mode { " · q:turn" } else { "" };
+        let queue_tag = if model.queue_mode {
+            " · q:turn"
+        } else if model.subturn_mode {
+            " · q:subturn"
+        } else {
+            ""
+        };
         left.push(Span::styled(
             format!("· {}{queue_tag}  ", model.active_branch_name()),
             theme.text_style(),

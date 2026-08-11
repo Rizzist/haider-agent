@@ -1627,6 +1627,9 @@ impl LiveDriver {
                     haider_protocol::agent::AgentMessageDelivery::DeliveredQueued => {
                         format!("· messaged {who} — queued as a fresh child turn")
                     }
+                    haider_protocol::agent::AgentMessageDelivery::DeliveredSubturn => {
+                        format!("· messaged {who} — subturn lands at the next tool call")
+                    }
                 });
                 model.dirty = true;
                 Vec::new()
@@ -3400,6 +3403,8 @@ impl LiveDriver {
         // every submit — the daemon, not the client, decides when.
         let mode = if model.queue_mode {
             DeliveryMode::Queue
+        } else if model.subturn_mode {
+            DeliveryMode::Subturn
         } else {
             DeliveryMode::Steer
         };

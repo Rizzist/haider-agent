@@ -1303,6 +1303,25 @@ fn golden_user_message_queue_mode() {
     );
 }
 
+/// ST1 LAW. MUTATION CHECK: remove/rename `Subturn`, reorder the default to
+/// it, or serialize it as either legacy mode. Expected runtime failure: the
+/// additive bytes or the default assertion differ.
+#[test]
+fn delivery_mode_subturn_round_trips_and_preserves_steer_default() {
+    assert_eq!(
+        haider_protocol::DeliveryMode::default(),
+        haider_protocol::DeliveryMode::Steer
+    );
+    additive_golden(
+        "user_message_subturn",
+        &EventPayload::UserMessage {
+            text: "revise before the next tool".into(),
+            attachments: vec![],
+            mode: haider_protocol::DeliveryMode::Subturn,
+        },
+    );
+}
+
 /// MUTATION CHECK: expose a surface tag/resolved attachment bytes, rename a
 /// coordinate, or omit the count/truncation contract. Expected RUNTIME failure:
 /// the additive hook-input golden differs byte-for-byte.

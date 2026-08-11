@@ -70,6 +70,7 @@ pub struct SessionState {
     pub tasks: crate::taskrows::TaskPanel,
     pub msg_queue: Vec<String>,
     pub queue_mode: bool,
+    pub subturn_mode: bool,
     /// This session's turn engine is mid-turn (the per-session slice of
     /// the sim's `runStates` that the projection's badge does not carry).
     pub turn_active: bool,
@@ -139,6 +140,7 @@ impl SessionState {
             tasks: crate::taskrows::TaskPanel::default(),
             msg_queue: Vec::new(),
             queue_mode: false,
+            subturn_mode: false,
             turn_active: false,
             auto_resuming: false,
             subtree_collapsed: false,

@@ -602,6 +602,11 @@ impl DelegationHandle {
                     .submit_internal_nudge(accepted.clone(), request.message)
                     .await?;
             }
+            AgentMessageDelivery::DeliveredSubturn => {
+                self.hub
+                    .submit_internal_subturn(accepted.clone(), request.message)
+                    .await?;
+            }
             AgentMessageDelivery::DeliveredQueued => {
                 self.hub.submit_internal_turn(accepted.clone()).await?;
             }
@@ -800,6 +805,9 @@ impl DelegationHandle {
                     AgentMessageDelivery::DeliveredSteer => {
                         haider_core::TurnAdmissionDisposition::SteerPending
                     }
+                    AgentMessageDelivery::DeliveredSubturn => {
+                        haider_core::TurnAdmissionDisposition::SubturnPending
+                    }
                     AgentMessageDelivery::DeliveredQueued => {
                         haider_core::TurnAdmissionDisposition::Started
                     }
@@ -809,6 +817,11 @@ impl DelegationHandle {
                 AgentMessageDelivery::DeliveredSteer => {
                     self.hub
                         .submit_internal_nudge(accepted, message.text.clone())
+                        .await?;
+                }
+                AgentMessageDelivery::DeliveredSubturn => {
+                    self.hub
+                        .submit_internal_subturn(accepted, message.text.clone())
                         .await?;
                 }
                 AgentMessageDelivery::DeliveredQueued => {

@@ -104,6 +104,33 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     }
 }
 
+/// ST1 submit-wire law. MUTATION CHECK: omit the mode, map Subturn to Steer,
+/// or reject the additive string while normalizing the legacy submit shape.
+/// Expected runtime failure: the encoded mode or decoded variant differs.
+#[test]
+fn turn_submit_round_trips_subturn_mode() {
+    let submit = RequestBody::TurnSubmit {
+        command_id: haider_rpc::CommandId::new("subturn-submit"),
+        session_id: haider_protocol::ids::SessionId::new("subturn-session"),
+        worker_generation: 7,
+        text: "revise the pending call".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Subturn,
+    };
+    let value = serde_json::to_value(&submit).expect("encode subturn submit");
+    assert_eq!(value["method"], "turn.submit");
+    assert_eq!(value["mode"], "subturn");
+    let decoded: RequestBody = serde_json::from_value(value).expect("decode subturn submit");
+    assert!(matches!(
+        decoded,
+        RequestBody::TurnSubmitWithBranch {
+            mode: haider_protocol::DeliveryMode::Subturn,
+            branch_id: None,
+            ..
+        }
+    ));
+}
+
 /// MUTATION CHECK: charge a 5 MiB image as if the default frame carried raw
 /// bytes, or shrink the documented bound below the padded base64 envelope.
 /// Expected RUNTIME failure: encoding returns `FrameTooLarge` instead of a

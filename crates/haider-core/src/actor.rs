@@ -599,12 +599,23 @@ impl HarnessHandle {
     /// the next provider-request boundary, while a provider/tool that never
     /// reaches such a boundary remains cancellable by its supervisor.
     pub fn nudge(&self, text: impl Into<String>) -> Result<(), HaiderError> {
+        self.deliver_mid_turn(text.into(), DeliveryMode::Steer)
+    }
+
+    /// Queues user input for the next resolved tool-call boundary. The
+    /// pending call is held before dispatch and the provider is re-prompted
+    /// with this input so it can revise or confirm the call first.
+    pub fn subturn(&self, text: impl Into<String>) -> Result<(), HaiderError> {
+        self.deliver_mid_turn(text.into(), DeliveryMode::Subturn)
+    }
+
+    fn deliver_mid_turn(&self, text: String, mode: DeliveryMode) -> Result<(), HaiderError> {
         self.commands
-            .try_send(ActorCommand::Nudge { text: text.into() })
+            .try_send(ActorCommand::Nudge { text, mode })
             .map_err(|error| {
                 HaiderError::new(
                     ErrorCode::Busy,
-                    format!("session actor could not accept nudge: {error}"),
+                    format!("session actor could not accept mid-turn input: {error}"),
                     true,
                 )
             })
@@ -715,6 +726,7 @@ enum ActorCommand {
     },
     Nudge {
         text: String,
+        mode: DeliveryMode,
     },
     Stop {
         completed: oneshot::Sender<()>,
@@ -754,6 +766,7 @@ pub struct HarnessActor {
     tree_head: Option<NodeId>,
     deferred_commands: VecDeque<ActorCommand>,
     pending_nudges: Vec<String>,
+    pending_subturns: Vec<String>,
     /// G1: the OPEN `todo_write` plan lifecycle. One `TurnItem::Plan` item id
     /// per lifecycle: the first write of a run Starts it, later writes emit
     /// Completed (replace semantics) under the same id, and completion or an
@@ -821,6 +834,7 @@ impl HarnessActor {
                 tree_head: None,
                 deferred_commands: VecDeque::new(),
                 pending_nudges: Vec::new(),
+                pending_subturns: Vec::new(),
                 plan: None,
             },
             handle,
@@ -881,6 +895,10 @@ impl HarnessActor {
     /// Runs one turn to a terminal state. Every return path commits that
     /// terminal `RunState` (best effort) before reporting the outcome.
     async fn drive_turn(&mut self, submit: TurnSubmission, cancel: CancelToken) -> TurnOutcome {
+        // A subturn belongs only to the active logical turn. Cancellation or
+        // failure may end that turn before a boundary; never leak its input
+        // into a later queued turn.
+        self.pending_subturns.clear();
         let (run_id, mut messages, checkpoint, child_wait) = match submit {
             TurnSubmission::Local(submit) => {
                 let run_id = self.next_run_id();
@@ -1452,6 +1470,34 @@ impl HarnessActor {
                     }
                 };
 
+                // `stream.recv()` is intentionally biased ahead of command
+                // service, so drain already-arrived input once more at the
+                // exact pre-dispatch boundary. Otherwise a ready ToolCallEnd
+                // could win the tie and execute before a Subturn command that
+                // was already accepted into the actor queue.
+                if matches!(&event, StreamEvent::ToolCallEnd { .. }) {
+                    loop {
+                        match self.commands.try_recv() {
+                            Ok(ActorCommand::Stop { completed }) => {
+                                cancel.cancel();
+                                let outcome = self
+                                    .cancelled_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                    )
+                                    .await;
+                                let _ = completed.send(());
+                                return outcome;
+                            }
+                            Ok(command) => self.service_command_without_menu(command),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                }
+
                 let event_result: Result<Option<Message>, DriveError> = match event {
                     StreamEvent::TextDelta { text } => {
                         assistant_blocks.push(Block::Text { text: text.clone() });
@@ -1503,6 +1549,61 @@ impl HarnessActor {
                         match provider_tool_block(&tools, &call_id) {
                             Ok(block) => {
                                 assistant_blocks.push(block);
+                                if !self.pending_subturns.is_empty() {
+                                    if let Err(error) =
+                                        self.complete_tools_for_subturn(&run_id, &mut tools).await
+                                    {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                    if !assistant_blocks.is_empty() {
+                                        messages.push(Message::assistant(std::mem::take(
+                                            &mut assistant_blocks,
+                                        )));
+                                    }
+                                    // Close the provider protocol's pending
+                                    // tool-use pair without claiming it ran.
+                                    // The following user messages then form
+                                    // the actual subturn request.
+                                    messages.push(Message::tool_result(
+                                        call_id,
+                                        "held before execution for a user subturn; revise or confirm the tool call",
+                                        false,
+                                    ));
+                                    messages.extend(
+                                        std::mem::take(&mut self.pending_subturns)
+                                            .into_iter()
+                                            .map(Message::user_text),
+                                    );
+                                    if let Err(error) = finalize_request_usage(
+                                        &mut completed_usage,
+                                        &mut request_usage,
+                                    ) {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                    provider_attempt = 0;
+                                    if let Err(error) =
+                                        self.commit_state(&run_id, RunState::Thinking).await
+                                    {
+                                        return self.errored_state_outcome(&run_id, error).await;
+                                    }
+                                    continue 'requests;
+                                }
                                 self.complete_tool(
                                     &run_id,
                                     &mut tools,
@@ -1844,6 +1945,36 @@ impl HarnessActor {
                                     "Continue exactly where you stopped. Do not repeat completed content.",
                                 ));
                             }
+                            provider_attempt = 0;
+                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            continue 'requests;
+                        }
+                        // No tool-call boundary appeared in this response.
+                        // Deliver Subturn input at the completed-response
+                        // boundary, matching Queue's end-of-turn timing while
+                        // retaining the active run's durable receipt.
+                        if !self.pending_subturns.is_empty() {
+                            if let Err(error) =
+                                finalize_request_usage(&mut completed_usage, &mut request_usage)
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                            messages.extend(
+                                std::mem::take(&mut self.pending_subturns)
+                                    .into_iter()
+                                    .map(Message::user_text),
+                            );
                             provider_attempt = 0;
                             if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
                             {
@@ -3303,6 +3434,37 @@ impl HarnessActor {
         Ok(())
     }
 
+    /// Settles every call opened by the interrupted provider response as a
+    /// non-executed proposal before a Subturn request begins. Parallel calls
+    /// may still have partial arguments when the first resolved call reaches
+    /// the boundary, so this path preserves raw fragments instead of turning
+    /// the user-requested hold into a provider-protocol failure.
+    async fn complete_tools_for_subturn(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+    ) -> Result<(), DriveError> {
+        while !tools.is_empty() {
+            let tool = &tools[0];
+            self.commit_item(
+                run_id,
+                ItemEvent::Completed {
+                    item_id: tool.item_id.clone(),
+                    item: TurnItem::ToolCall {
+                        call_id: tool.call_id.clone(),
+                        name: tool.name.clone(),
+                        args: tool_args_or_raw(tool),
+                        status: ToolStatus::Pending,
+                    },
+                },
+            )
+            .await
+            .map_err(DriveError::Store)?;
+            tools.remove(0);
+        }
+        Ok(())
+    }
+
     /// Closes every tool still open, in start order.
     async fn complete_all_tools(
         &mut self,
@@ -3934,7 +4096,20 @@ impl HarnessActor {
     fn service_command_without_menu(&mut self, command: ActorCommand) {
         match command {
             command @ ActorCommand::Submit { .. } => self.defer_submit_or_reject(command),
-            ActorCommand::Nudge { text } => self.pending_nudges.push(text),
+            ActorCommand::Nudge {
+                text,
+                mode: DeliveryMode::Steer,
+            } => self.pending_nudges.push(text),
+            ActorCommand::Nudge {
+                text,
+                mode: DeliveryMode::Subturn,
+            } => self.pending_subturns.push(text),
+            ActorCommand::Nudge {
+                mode: DeliveryMode::Queue,
+                ..
+            } => {
+                unreachable!("queue-mode input is admitted as a later logical turn")
+            }
             ActorCommand::AnswerMenu { completed, .. } => {
                 let _ = completed.send(Err(HaiderError::new(
                     ErrorCode::MenuNotFound,

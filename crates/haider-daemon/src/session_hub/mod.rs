@@ -1212,6 +1212,22 @@ impl SessionHub {
             .await
     }
 
+    pub(crate) async fn submit_internal_subturn(
+        &self,
+        accepted: AcceptedTurn,
+        text: String,
+    ) -> Result<(), HaiderError> {
+        self.worker_manager()
+            .map_err(hub_error_as_store)?
+            .subturn(
+                accepted.session_id,
+                accepted.run_id,
+                accepted.accepted_seq,
+                text,
+            )
+            .await
+    }
+
     /// Receipt-backed daemon-internal cancellation used by delegation
     /// supervision and subtree sweeps.
     pub(crate) async fn cancel_internal_turn(

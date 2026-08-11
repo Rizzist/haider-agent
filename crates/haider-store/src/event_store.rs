@@ -436,6 +436,7 @@ pub enum TurnAdmissionDisposition {
     Started,
     Queued,
     SteerPending,
+    SubturnPending,
 }
 
 /// Durable response coordinates stored in a committed `turn.submit` receipt.
@@ -2538,6 +2539,7 @@ impl Store {
     /// composition — unfenced replay, then fenced acceptance — reproduces
     /// the menu CAS's replay-before-fence semantics end to end.
     pub fn accept_turn(&self, command: &TurnAcceptCommand) -> StoreResult<TurnAcceptOutcome> {
+        let mut command = command.clone();
         validate_command_identity(
             &command.command_id,
             &command.request_digest,
@@ -2584,18 +2586,43 @@ impl Store {
             })
             .transpose()?;
         let states = latest_run_states(&transaction, &command.session_id)?;
-        let same_run_steer = states
+        // RPC submit does not carry a run id. For Subturn only, bind the
+        // daemon-minted candidate to the newest actually-running response on
+        // the requested branch inside this serialized transaction. Queue
+        // remains a fresh run, and Steer's established explicit-run behavior
+        // is unchanged.
+        if command.mode == DeliveryMode::Subturn && !states.contains_key(&command.run_id) {
+            let active = states
+                .iter()
+                .filter(|(_, (state, _, branch_id))| {
+                    branch_id == &command.branch_id
+                        && !state.is_terminal()
+                        && !matches!(
+                            state,
+                            RunState::Queued
+                                | RunState::Compacting
+                                | RunState::Cancelling
+                                | RunState::EffectOutcomeUnknown
+                        )
+                })
+                .max_by_key(|(_, (_, seq, _))| *seq)
+                .map(|(run_id, _)| run_id.clone());
+            if let Some(active) = active {
+                command.run_id = active;
+            }
+        }
+        let same_run_delivery = states
             .get(&command.run_id)
             .is_some_and(|(state, _, branch_id)| {
-                command.mode == DeliveryMode::Steer
+                matches!(command.mode, DeliveryMode::Steer | DeliveryMode::Subturn)
                     && !state.is_terminal()
                     && *state != RunState::Cancelling
                     && branch_id == &command.branch_id
             });
-        if states.contains_key(&command.run_id) && !same_run_steer {
+        if states.contains_key(&command.run_id) && !same_run_delivery {
             return Err(corrupt("daemon-minted turn run id already exists"));
         }
-        if !same_run_steer
+        if !same_run_delivery
             && command.branch_id.as_ref().is_some_and(|requested_branch| {
                 states.values().any(|(state, _, branch_id)| {
                     !state.is_terminal() && branch_id.as_ref() == Some(requested_branch)
@@ -2620,11 +2647,12 @@ impl Store {
             ));
         }
         let has_active = states.values().any(|(state, _, _)| !state.is_terminal());
-        let disposition = if same_run_steer {
-            // W6c activates the reserved same-run steer shape: the durable
-            // user message commits here, then the manager delivers it to the
-            // active harness at its next provider-request boundary.
-            TurnAdmissionDisposition::SteerPending
+        let disposition = if same_run_delivery {
+            match command.mode {
+                DeliveryMode::Steer => TurnAdmissionDisposition::SteerPending,
+                DeliveryMode::Subturn => TurnAdmissionDisposition::SubturnPending,
+                DeliveryMode::Queue => unreachable!("queue cannot be a same-run delivery"),
+            }
         } else if has_active {
             // A newly minted run remains an explicitly queued turn. Only a
             // same-run daemon steer may use `SteerPending`.
@@ -2666,7 +2694,7 @@ impl Store {
         // and a subagent turn always have ancestry).
         let first_user_turn = command.agent_id.is_none()
             && command.branch_id.is_none()
-            && !same_run_steer
+            && !same_run_delivery
             && parent.is_none();
         let user_node = TreeNode {
             node: NodeId::new(format!("node-{}", command.user_event_id)),
@@ -2676,7 +2704,7 @@ impl Store {
                 attachments: command.attachments.clone(),
             },
         };
-        let mut envelopes = if same_run_steer {
+        let mut envelopes = if same_run_delivery {
             vec![
                 unstamped_command_envelope(
                     command.user_event_id.clone(),
@@ -2785,7 +2813,7 @@ impl Store {
             envelope.agent_id = command.agent_id.clone();
         }
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
-        let accepted_seq = if same_run_steer {
+        let accepted_seq = if same_run_delivery {
             envelopes[0].seq
         } else {
             envelopes[1].seq

@@ -223,10 +223,19 @@ fn queue_command_switches_modes_with_the_sim_notes() {
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
         TranscriptEntry::Note { text }
-            if text == "· mid-turn input mode is steer (safe boundary) — /queue steer|turn"
+            if text == "· mid-turn input mode is steer (safe boundary) — /queue steer|subturn|turn"
+    )));
+    submit(&mut model, "/queue subturn");
+    assert!(!model.queue_mode);
+    assert!(model.subturn_mode);
+    assert!(model.projection.entries().iter().any(|entry| matches!(
+        entry,
+        TranscriptEntry::Note { text }
+            if text == "· mid-turn input → SUBTURN — held for the next tool call, then injected before execution"
     )));
     submit(&mut model, "/queue turn");
     assert!(model.queue_mode);
+    assert!(!model.subturn_mode);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
         TranscriptEntry::Note { text }
@@ -234,6 +243,7 @@ fn queue_command_switches_modes_with_the_sim_notes() {
     )));
     submit(&mut model, "/queue steer");
     assert!(!model.queue_mode);
+    assert!(!model.subturn_mode);
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,
         TranscriptEntry::Note { text }
@@ -595,6 +605,10 @@ fn status_bar_shows_q_turn_while_queue_mode_holds() {
     // F2c: the identity block moved to the composer rule; the bar keeps
     // state · tokens · branch, and the queue tag rides the branch.
     assert!(rows.iter().any(|row| row.contains("· main · q:turn")));
+    model.queue_mode = false;
+    model.subturn_mode = true;
+    let rows = draw(&model, 118, 34);
+    assert!(rows.iter().any(|row| row.contains("· main · q:subturn")));
 }
 
 /// MUTATION CHECK: drop the zero-option ask interception from the

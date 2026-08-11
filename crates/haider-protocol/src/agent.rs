@@ -105,6 +105,7 @@ pub enum ReportVerification {
 pub enum AgentMessageDelivery {
     DeliveredSteer,
     DeliveredQueued,
+    DeliveredSubturn,
 }
 
 /// Receipt returned by both the model tool and the chip-composer wire.

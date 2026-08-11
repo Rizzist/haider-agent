@@ -458,7 +458,10 @@ fn stub_commands_flash_honestly_and_help_opens() {
     model.handle(key(KeyCode::Enter));
     assert!(model.help_open);
     let (text, _) = draw(&model, 100, 34);
-    assert!(text.contains("/queue <steer|turn>"), "help panel body");
+    assert!(
+        text.contains("/queue <steer|subturn|turn>"),
+        "help panel body"
+    );
     model.handle(key(KeyCode::Esc));
     assert!(!model.help_open);
 }
