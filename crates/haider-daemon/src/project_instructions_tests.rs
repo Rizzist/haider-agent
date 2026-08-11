@@ -114,6 +114,7 @@ impl TestWorker {
             }),
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(format!("created-instructions-{session_suffix}")),
             device_id: device_id.clone(),
@@ -222,6 +223,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     }
 }
@@ -667,6 +669,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
             permission_overrides: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new("created-instructions-recovery"),
             device_id: device_id.clone(),

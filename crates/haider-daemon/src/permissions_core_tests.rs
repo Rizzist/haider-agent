@@ -110,6 +110,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     };
     let decision = |metadata: &SessionMetadataV1, class: EffectClass| {
@@ -443,6 +444,7 @@ fn create_durable_session(store: &Store, session_id: &SessionId) {
             permission_overrides: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: "test-v1".into(),
             event_id: EventId::new(format!("created-{session_id}")),
             device_id: DeviceId::new("recovery-test"),

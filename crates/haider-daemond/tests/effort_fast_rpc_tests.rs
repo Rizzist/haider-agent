@@ -147,6 +147,7 @@ fn effort_body(
         session_id: session_id.clone(),
         worker_generation: generation,
         effort: effort.map(str::to_owned),
+        confirm_new_epoch: false,
     }
 }
 
@@ -161,6 +162,7 @@ fn fast_body(
         session_id: session_id.clone(),
         worker_generation: generation,
         enabled,
+        confirm_new_epoch: false,
     }
 }
 
@@ -408,6 +410,7 @@ async fn select_fast_gates_statically_and_empty_ladders_refuse() {
             worker_generation: generation,
             model: "claude-sonnet-5".into(),
             provider: None,
+            confirm_new_epoch: false,
         },
     )
     .await;

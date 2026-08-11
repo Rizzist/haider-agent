@@ -198,6 +198,7 @@ impl WebWorld {
             }),
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(format!("created-{prefix}")),
             device_id: device_id.clone(),

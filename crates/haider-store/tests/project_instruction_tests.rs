@@ -26,6 +26,7 @@ fn accepted_store() -> (tempfile::TempDir, Store, SessionId, RunId) {
             permission_overrides: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: "haider-system-v2".into(),
             event_id: EventId::new("created-project-instruction-store"),
             device_id: DeviceId::new("project-instruction-store-device"),

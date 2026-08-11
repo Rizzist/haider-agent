@@ -872,6 +872,7 @@ async fn run_headless_inner(
         max_tokens: request.max_tokens,
         permission_overrides: (!request.permission_overrides.is_empty())
             .then_some(request.permission_overrides),
+        cache_policy: None,
     };
 
     let (session_id, created_generation) =

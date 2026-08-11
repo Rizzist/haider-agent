@@ -21,9 +21,10 @@
 
 use haider_protocol::provider::{CacheStatAvailability, NormalizedUsage, ReasoningAccounting};
 use haider_provider::{
-    ANTHROPIC_OAUTH_USAGE_URL, KIMI_OAUTH_USAGE_URL, MeterUnavailable, OPENAI_OAUTH_USAGE_URL,
-    UsageMeterEndpoint, estimate_cache_input_costs, estimate_chunk_cost_usd, model_rate,
-    normalize_utilization, parse_rfc3339_to_unix_ms,
+    ANTHROPIC_OAUTH_USAGE_URL, CacheWriteTtl, KIMI_OAUTH_USAGE_URL, MeterUnavailable,
+    OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint, estimate_cache_input_costs,
+    estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd, model_rate, normalize_utilization,
+    parse_rfc3339_to_unix_ms,
 };
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -399,6 +400,86 @@ fn cm1_model_registry_prices_gpt56_kimi_deepseek_and_explicit_storage() {
     .expect("Gemini explicit storage");
     assert!((gemini.input_with_cache_usd - 7.7).abs() < 1e-12);
     assert!((gemini.explicit_storage_usd - 2.0).abs() < 1e-12);
+}
+
+/// LAW (CM3b): cold-minus-warm estimates come from the qualified cache-price
+/// registry. The 1M-token equivalent multipliers are 1.15/1.90 for
+/// Anthropic 5m/1h, 1.15 for GPT-5.6, model-specific 0.5–0.9 for older
+/// OpenAI, 0.9 for Gemini/Kimi K3, and 0.98 for DeepSeek V4 Flash.
+///
+/// MUTATION CHECK (executed): replace the registry delta with a global 0.9,
+/// or ignore the TTL selector; the exact equivalent-token/cost rows fail.
+#[test]
+fn cm3b_registry_estimates_invalidated_prefix_rewarm_cost() {
+    let cases = [
+        (
+            "anthropic",
+            "claude-sonnet-5",
+            CacheWriteTtl::FiveMinutes,
+            1_150_000.0,
+            3.45,
+        ),
+        (
+            "anthropic-oauth",
+            "claude-sonnet-5",
+            CacheWriteTtl::OneHour,
+            1_900_000.0,
+            5.70,
+        ),
+        (
+            "openai",
+            "gpt-5.6-terra",
+            CacheWriteTtl::Default,
+            1_150_000.0,
+            2.30,
+        ),
+        ("openai", "gpt-4o", CacheWriteTtl::Default, 500_000.0, 1.25),
+        ("openai", "gpt-5", CacheWriteTtl::Default, 900_000.0, 1.125),
+        (
+            "gemini",
+            "gemini-2.5-flash",
+            CacheWriteTtl::Default,
+            900_000.0,
+            0.27,
+        ),
+        (
+            "kimi-oauth",
+            "kimi-k3",
+            CacheWriteTtl::Default,
+            900_000.0,
+            2.70,
+        ),
+        (
+            "deepseek",
+            "deepseek-v4-flash",
+            CacheWriteTtl::Default,
+            980_000.0,
+            0.1372,
+        ),
+    ];
+    for (provider, model, ttl, equivalents, usd) in cases {
+        let estimate = estimate_cache_rewarm_cost_usd(provider, model, 1_000_000, ttl)
+            .unwrap_or_else(|| panic!("missing {provider}/{model}"));
+        assert_eq!(estimate.stable_prefix_tokens, 1_000_000);
+        assert!(
+            (estimate.base_input_equivalent_tokens - equivalents).abs() < 1e-9,
+            "{provider}/{model}: {estimate:?}"
+        );
+        assert!(
+            (estimate.extra_input_cost_usd - usd).abs() < 1e-9,
+            "{provider}/{model}: {estimate:?}"
+        );
+    }
+    assert!(
+        estimate_cache_rewarm_cost_usd(
+            "openai-compatible",
+            "gpt-5",
+            1_000_000,
+            CacheWriteTtl::Default
+        )
+        .is_none(),
+        "a compatible endpoint cannot inherit OpenAI economics by model name"
+    );
 }
 
 /// LAW (review-of-record RV4): the anthropic-oauth meter request's REQUIRED

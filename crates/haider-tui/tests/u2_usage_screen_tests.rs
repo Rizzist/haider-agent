@@ -74,6 +74,18 @@ fn stats(sessions: u64, est_cost_usd: Option<f64>) -> LocalUsageStatsV1 {
     }
 }
 
+fn oauth_stats() -> LocalUsageStatsV1 {
+    let mut local = stats(12, Some(4.12));
+    local.cache.logical_input_tokens = 1_000_000;
+    local.cache.uncached_input_tokens = 200_000;
+    local.cache.cache_read_tokens = 800_000;
+    local.cache.telemetry_covered_input_tokens = 1_000_000;
+    local.cache.input_with_cache_usd = Some(0.12);
+    local.cache.input_without_cache_usd = Some(1.20);
+    local.cache.estimated_savings_usd = Some(1.08);
+    local
+}
+
 /// The U1 wire shapes CONSUMED verbatim: a two-account OAuth provider
 /// (metered + unavailable), an API-key local-only provider.
 fn report() -> UsageReportV1 {
@@ -102,7 +114,7 @@ fn report() -> UsageReportV1 {
                         },
                     ],
                 },
-                local: stats(12, Some(4.12)),
+                local: oauth_stats(),
             },
             AccountUsageReportV1 {
                 provider: "anthropic-oauth".to_owned(),
@@ -281,10 +293,7 @@ fn metered_accounts_render_bars_percent_and_resets() {
         "the plan renders (unmasked — not sensitive)"
     );
     assert!(text.contains("oauth"), "the auth flavor renders");
-    assert!(
-        text.contains("est $4.12"),
-        "the local stats carry the cost estimate"
-    );
+    assert!(text.contains("plan"), "subscription usage is plan-covered");
     assert!(text.contains("3h 42m"), "the local duration renders");
     assert!(text.contains("+1240 −380 lines"), "LOC renders");
     assert!(text.contains("in 1.2M"), "token splits render");
@@ -334,17 +343,37 @@ fn api_key_accounts_render_tokens_and_cost_never_a_meter() {
     );
 }
 
-/// Absent cost estimates render an honest `est —`, never $0.00.
+/// OAuth is not an unknown price: it renders `plan`, never a dollar or dash.
 #[test]
-fn missing_cost_estimates_render_a_dash_never_zero() {
+fn part_a_oauth_usage_omits_dollars_but_keeps_tokens_cache_and_hit_rate() {
     let mut model = usage_model();
-    model.handle(key(KeyCode::Right));
+    model.usage.filter = Some("anthropic-oauth".to_owned());
     let (rows, _) = draw(&model, 110, 30);
-    let text = rows.join("\n");
+    let text = body_text(&rows);
+    assert!(text.contains("in 1.2M"), "tokens remain visible: {text}");
     assert!(
-        text.contains("est —"),
-        "the unpriced account's stats say est — honestly"
+        text.contains("read 800k"),
+        "cache reads remain visible: {text}"
     );
+    assert!(
+        text.contains("80.00% hit"),
+        "hit rate remains visible: {text}"
+    );
+    assert!(text.contains("plan"), "OAuth is plan-covered: {text}");
+    assert!(
+        !text.contains('$'),
+        "OAuth must never render dollars: {text}"
+    );
+}
+
+/// Mixed device totals price only API-key lanes and label the subtotal.
+#[test]
+fn part_a_mixed_device_total_labels_only_metered_lanes() {
+    let model = usage_model();
+    let (rows, _) = draw(&model, 120, 40);
+    let text = body_text(&rows);
+    assert!(text.contains("est $0.57 (metered lanes)"), "{text}");
+    assert!(!text.contains("$4.12") && !text.contains("$4.69"), "{text}");
 }
 
 // ---- masking ----------------------------------------------------------

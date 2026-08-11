@@ -25,6 +25,7 @@ fn create(store: &Store, session_id: &SessionId) {
             permission_overrides: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: "test-system-v1".into(),
             event_id: EventId::new(format!("created-{session_id}")),
             device_id: DeviceId::new("test-daemon"),

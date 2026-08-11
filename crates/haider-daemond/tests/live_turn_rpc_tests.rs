@@ -4581,6 +4581,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         model: "fake-v1".into(),
         max_tokens: 4096,
         permission_overrides: overrides,
+        cache_policy: None,
     };
 
     send_request(

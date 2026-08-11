@@ -57,6 +57,7 @@ fn task_metadata(cwd: &str) -> SessionMetadataV1 {
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     }
 }
@@ -75,6 +76,7 @@ async fn create_task_session(hub: &SessionHub, name: &str, cwd: &str) -> Session
         permission_overrides: overrides(),
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
         event_id: EventId::new(format!("created-{name}")),
         device_id: DeviceId::new(format!("{name}-device")),

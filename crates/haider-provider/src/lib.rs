@@ -147,8 +147,9 @@ pub use openai::{
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{
-    CACHE_PRICING_POLICIES, CachePricingPolicy, CacheReadSemantics, MODEL_RATES, ModelRate,
-    cache_pricing_policy, estimate_cache_input_costs, estimate_chunk_cost_usd,
+    CACHE_PRICING_POLICIES, CachePricingPolicy, CacheReadSemantics, CacheRewarmEstimate,
+    CacheWriteTtl, MODEL_RATES, ModelRate, cache_pricing_policy, cache_pricing_policy_for,
+    estimate_cache_input_costs, estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd,
     estimate_normalized_usage_cost_usd, model_rate,
 };
 pub use usage::{

@@ -4,6 +4,7 @@
 //! latest snapshot for a full cache-domain/request-lane key replaces the
 //! earlier one; totals sum only those latest snapshots.
 
+use haider_protocol::credential::AuthMethod;
 use haider_protocol::provider::{CacheStatAvailability, Usage, UsageRequestKind};
 use haider_protocol::usage::{CacheUsageBreakdownV1, CacheUsageStatsV1};
 use std::collections::HashMap;
@@ -16,6 +17,14 @@ struct UsageFoldKey {
     model: String,
     epoch: String,
     request_kind: UsageRequestKind,
+}
+
+fn scope_auth_method(auth_scope: &str) -> Option<AuthMethod> {
+    match auth_scope {
+        "api_key" => Some(AuthMethod::ApiKey),
+        "oauth" | "oauth_subscription" => Some(AuthMethod::OAuth),
+        _ => None,
+    }
 }
 
 /// Latest-snapshot session fold used by the status bar, `/usage`, and plain
@@ -53,13 +62,14 @@ impl SessionUsageFold {
     pub fn totals(&self) -> CacheUsageStatsV1 {
         let mut totals = CacheUsageStatsV1::default();
         let mut breakdowns: HashMap<
-            (String, String, String, UsageRequestKind),
+            (String, String, String, UsageRequestKind, Option<AuthMethod>),
             CacheUsageBreakdownV1,
         > = HashMap::new();
         let mut input_with = 0.0;
         let mut input_without = 0.0;
         let mut savings = 0.0;
-        let mut priced = !self.chunks.is_empty();
+        let mut metered_priced = true;
+        let mut has_metered = false;
 
         for (key, usage) in &self.chunks {
             let normalized = usage.normalized.as_ref();
@@ -82,6 +92,15 @@ impl SessionUsageFold {
             totals.telemetry_covered_input_tokens = totals
                 .telemetry_covered_input_tokens
                 .saturating_add(covered);
+            let auth_method = usage
+                .scope
+                .as_ref()
+                .and_then(|scope| scope_auth_method(&scope.auth_scope));
+            let metered = auth_method == Some(AuthMethod::ApiKey);
+            if metered {
+                has_metered = true;
+                totals.metered_input_tokens = totals.metered_input_tokens.saturating_add(logical);
+            }
 
             let breakdown = breakdowns
                 .entry((
@@ -89,12 +108,14 @@ impl SessionUsageFold {
                     key.model.clone(),
                     key.epoch.clone(),
                     key.request_kind,
+                    auth_method,
                 ))
                 .or_insert_with(|| CacheUsageBreakdownV1 {
                     provider: key.provider.clone(),
                     model: key.model.clone(),
                     cache_epoch: key.epoch.clone(),
                     request_kind: key.request_kind,
+                    auth_method,
                     cache_status: CacheStatAvailability::Present,
                     ..CacheUsageBreakdownV1::default()
                 });
@@ -116,7 +137,7 @@ impl SessionUsageFold {
                 breakdown.cache_status = CacheStatAvailability::Unavailable;
             }
 
-            if let Some(cost) = usage.cache_cost {
+            if metered && let Some(cost) = usage.cache_cost {
                 input_with += cost.input_with_cache_usd;
                 input_without += cost.input_without_cache_usd;
                 savings += cost.estimated_savings_usd;
@@ -135,8 +156,8 @@ impl SessionUsageFold {
                     Some(cost.estimated_savings_usd),
                     breakdown_had_input,
                 );
-            } else {
-                priced = false;
+            } else if metered {
+                metered_priced = false;
                 merge_cost(
                     &mut breakdown.input_with_cache_usd,
                     None,
@@ -152,6 +173,10 @@ impl SessionUsageFold {
                     None,
                     breakdown_had_input,
                 );
+            } else {
+                breakdown.input_with_cache_usd = None;
+                breakdown.input_without_cache_usd = None;
+                breakdown.estimated_savings_usd = None;
             }
         }
 
@@ -170,7 +195,7 @@ impl SessionUsageFold {
                     request_kind_rank(right.request_kind),
                 ))
         });
-        if priced {
+        if has_metered && metered_priced {
             totals.input_with_cache_usd = Some(input_with);
             totals.input_without_cache_usd = Some(input_without);
             totals.estimated_savings_usd = Some(savings);

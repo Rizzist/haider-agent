@@ -443,11 +443,17 @@ impl TokenTotals {
         self.output = self.output.saturating_add(output);
         self.reasoning = self.reasoning.saturating_add(reasoning);
         self.cached = self.cached.saturating_add(cached);
-        if let Some(cost) = cost {
+        let metered = scope.is_some_and(|scope| scope.auth_scope == "api_key");
+        if metered && let Some(cost) = cost {
             *self.est_cost_usd.get_or_insert(0.0) += cost;
         }
-        add_cache_stats(&mut self.cache, normalized, scope, cache_cost);
-        if normalized.is_some() && cache_cost.is_none() {
+        add_cache_stats(
+            &mut self.cache,
+            normalized,
+            scope,
+            metered.then_some(cache_cost).flatten(),
+        );
+        if metered && normalized.is_some() && cache_cost.is_none() {
             self.cache_cost_missing = true;
         }
     }
@@ -535,6 +541,16 @@ fn add_cache_stats(
     totals.telemetry_covered_input_tokens = totals
         .telemetry_covered_input_tokens
         .saturating_add(usage.cache_telemetry_input);
+    let auth_method = scope.and_then(|scope| match scope.auth_scope.as_str() {
+        "api_key" => Some(haider_protocol::credential::AuthMethod::ApiKey),
+        "oauth" | "oauth_subscription" => Some(haider_protocol::credential::AuthMethod::OAuth),
+        _ => None,
+    });
+    if auth_method == Some(haider_protocol::credential::AuthMethod::ApiKey) {
+        totals.metered_input_tokens = totals
+            .metered_input_tokens
+            .saturating_add(usage.logical_input);
+    }
     merge_optional_cost(
         &mut totals.input_with_cache_usd,
         cost.map(|cost| cost.input_with_cache_usd),
@@ -574,6 +590,7 @@ fn add_cache_stats(
             && entry.model == model
             && entry.cache_epoch == epoch
             && entry.request_kind == request_kind
+            && entry.auth_method == auth_method
     });
     let position = position.unwrap_or_else(|| {
         totals.breakdowns.push(CacheUsageBreakdownV1 {
@@ -581,6 +598,7 @@ fn add_cache_stats(
             model: model.clone(),
             cache_epoch: epoch.clone(),
             request_kind,
+            auth_method,
             cache_status: CacheStatAvailability::Present,
             ..CacheUsageBreakdownV1::default()
         });
@@ -920,6 +938,9 @@ fn merge_cache_stats(target: &mut CacheUsageStatsV1, source: &CacheUsageStatsV1)
     target.telemetry_covered_input_tokens = target
         .telemetry_covered_input_tokens
         .saturating_add(source.telemetry_covered_input_tokens);
+    target.metered_input_tokens = target
+        .metered_input_tokens
+        .saturating_add(source.metered_input_tokens);
     merge_optional_cost(
         &mut target.input_with_cache_usd,
         source.input_with_cache_usd,
@@ -941,6 +962,7 @@ fn merge_cache_stats(target: &mut CacheUsageStatsV1, source: &CacheUsageStatsV1)
                 && entry.model == source_breakdown.model
                 && entry.cache_epoch == source_breakdown.cache_epoch
                 && entry.request_kind == source_breakdown.request_kind
+                && entry.auth_method == source_breakdown.auth_method
         });
         let Some(position) = position else {
             target.breakdowns.push(source_breakdown.clone());

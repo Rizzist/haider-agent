@@ -227,6 +227,7 @@ impl DelegationHandle {
             // different tuning is a different command.
             "effort": coordinates.metadata.effort,
             "fast": coordinates.metadata.fast,
+            "cache_policy": coordinates.metadata.cache_policy,
         }))
         .map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
@@ -243,6 +244,7 @@ impl DelegationHandle {
                 permission_overrides: child_overrides,
                 effort: coordinates.metadata.effort.clone(),
                 fast: coordinates.metadata.fast,
+                cache_policy: coordinates.metadata.cache_policy,
                 system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
                 event_id: EventId::new(format!("delegation-created-{identity}")),
                 device_id: self.hub.device_id(),

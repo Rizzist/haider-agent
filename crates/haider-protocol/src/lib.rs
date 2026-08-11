@@ -12,6 +12,7 @@
 
 pub mod agent;
 pub mod branch;
+pub mod cache;
 pub mod context;
 pub mod credential;
 pub mod effect;

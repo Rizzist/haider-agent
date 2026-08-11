@@ -2066,14 +2066,26 @@ fn render_usage(
             cache.input_without_cache_usd,
             cache.estimated_savings_usd,
         ) {
-            (Some(with), Some(without), Some(savings)) => lines.push(Line::styled(
-                format!(
-                    "    input cost — ${with:.4} with caching · ${without:.4} without · ${savings:.4} estimated savings"
-                ),
-                theme.dim_style(),
-            )),
+            (Some(with), Some(without), Some(savings)) => {
+                let qualifier = (cache.metered_input_tokens < cache.logical_input_tokens)
+                    .then_some(" · metered lanes only")
+                    .unwrap_or("");
+                lines.push(Line::styled(
+                    format!(
+                        "    input cost — ${with:.4} with caching · ${without:.4} without · ${savings:.4} estimated savings{qualifier}"
+                    ),
+                    theme.dim_style(),
+                ));
+            }
+            _ if !cache.breakdowns.is_empty()
+                && cache.breakdowns.iter().all(|breakdown| {
+                    breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
+                }) =>
+            {
+                lines.push(Line::styled("    input cost — plan", theme.dim_style()));
+            }
             _ => lines.push(Line::styled(
-                "    input cost — n/a · without caching n/a · savings n/a",
+                "    input cost — $— · without caching $— · savings $—",
                 theme.dim_style(),
             )),
         }
@@ -2123,7 +2135,12 @@ fn render_usage(
                 (Some(with), Some(without), Some(savings)) => {
                     format!(" · input ${with:.4}/${without:.4} · save ${savings:.4}")
                 }
-                _ => " · input $ n/a".to_owned(),
+                _ if breakdown.auth_method
+                    == Some(haider_protocol::credential::AuthMethod::OAuth) =>
+                {
+                    " · plan".to_owned()
+                }
+                _ => " · input $—".to_owned(),
             };
             lines.push(Line::styled(
                 format!(
@@ -2305,9 +2322,13 @@ fn render_usage(
 
             // Local journal stats: duration/cost/LOC, then token splits.
             let local = &account.local;
-            let cost = local
-                .est_cost_usd
-                .map_or_else(|| "est —".to_owned(), |usd| format!("est ${usd:.2}"));
+            let cost = if account.auth_method == haider_protocol::credential::AuthMethod::ApiKey {
+                local
+                    .est_cost_usd
+                    .map_or_else(|| "est $—".to_owned(), |usd| format!("est ${usd:.2}"))
+            } else {
+                "plan".to_owned()
+            };
             lines.push(Line::styled(
                 format!(
                     "    local — {} session{} · {} · {cost} · +{} −{} lines",
@@ -2354,14 +2375,21 @@ fn render_usage(
                     local.cache.input_without_cache_usd,
                     local.cache.estimated_savings_usd,
                 ) {
-                    (Some(with), Some(without), Some(savings)) => lines.push(Line::styled(
+                    (Some(with), Some(without), Some(savings))
+                        if account.auth_method
+                            == haider_protocol::credential::AuthMethod::ApiKey => lines.push(Line::styled(
                         format!(
                             "    input $ — ${with:.4} cached · ${without:.4} without · ${savings:.4} savings"
                         ),
                         theme.dim_style(),
                     )),
+                    _ if account.auth_method
+                        == haider_protocol::credential::AuthMethod::OAuth => lines.push(Line::styled(
+                        "    input cost — plan",
+                        theme.dim_style(),
+                    )),
                     _ => lines.push(Line::styled(
-                        "    input $ — caching n/a · without n/a · savings n/a",
+                        "    input $ — caching $— · without $— · savings $—",
                         theme.dim_style(),
                     )),
                 }
@@ -2390,12 +2418,23 @@ fn render_usage(
                 .sum();
             let costs: Vec<f64> = shown
                 .iter()
+                .filter(|account| {
+                    account.auth_method == haider_protocol::credential::AuthMethod::ApiKey
+                })
                 .filter_map(|account| account.local.est_cost_usd)
                 .collect();
-            let cost = if costs.is_empty() {
-                "est —".to_owned()
+            let metered_accounts = shown
+                .iter()
+                .filter(|account| {
+                    account.auth_method == haider_protocol::credential::AuthMethod::ApiKey
+                })
+                .count();
+            let cost = if metered_accounts == 0 {
+                "plan".to_owned()
+            } else if costs.len() != metered_accounts {
+                "est $— (metered lanes)".to_owned()
             } else {
-                format!("est ${:.2}", costs.iter().sum::<f64>())
+                format!("est ${:.2} (metered lanes)", costs.iter().sum::<f64>())
             };
             lines.push(Line::from(vec![
                 Span::styled(
@@ -7101,7 +7140,16 @@ fn item_lines<'a>(
             ]));
         }
         TurnItem::Extension { kind, .. } => {
-            lines.push(Line::styled(format!("  ⋯ {kind}"), theme.faint_style()));
+            if let Some(transition) =
+                haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(&block.item)
+            {
+                lines.push(Line::styled(
+                    format!("  {}", transition.display_label()),
+                    theme.gold_style(),
+                ));
+            } else {
+                lines.push(Line::styled(format!("  ⋯ {kind}"), theme.faint_style()));
+            }
         }
     }
 }

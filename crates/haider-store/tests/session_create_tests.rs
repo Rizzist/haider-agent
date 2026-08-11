@@ -23,6 +23,7 @@ fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateC
         permission_overrides: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         system_prompt_version: "test-system-v1".into(),
         event_id: EventId::new(event_id),
         device_id: DeviceId::new("daemon-test"),

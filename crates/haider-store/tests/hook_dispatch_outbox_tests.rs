@@ -65,6 +65,7 @@ fn hook_dispatch_outbox_is_atomic_persistent_and_idempotently_acknowledged() {
             permission_overrides: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             system_prompt_version: "hook-outbox-v1".into(),
             event_id: EventId::new("hook-outbox-created"),
             device_id: DeviceId::new("hook-outbox-device"),

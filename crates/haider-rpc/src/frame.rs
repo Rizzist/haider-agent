@@ -15,6 +15,11 @@ use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The logical wire protocol encoded by this crate.
 ///
 /// Decoding is deliberately strict about the top-level `"v"` field: any other
@@ -185,6 +190,9 @@ pub const ERROR_CODE_EFFORT_UNSUPPORTED: &str = "effort_unsupported";
 /// A `session.select_fast` refusal (G3): the CURRENT pair is not in the
 /// static fast-mode gate. Turning fast OFF is always accepted.
 pub const ERROR_CODE_FAST_UNSUPPORTED: &str = "fast_unsupported";
+/// A cache-sensitive live-session change needs an explicit second-step
+/// confirmation to create a fresh epoch.
+pub const ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED: &str = "cache_epoch_confirmation_required";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -967,6 +975,8 @@ pub enum RequestBody {
         max_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_overrides: Option<SessionPermissionOverridesV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_policy: Option<haider_protocol::cache::CachePolicySettingsV1>,
     },
     /// Atomically creates typed session configuration, a `Created` event, and
     /// the durable command receipt that makes response-loss retries safe.
@@ -1141,6 +1151,8 @@ pub enum RequestBody {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
     },
     /// Receipted live-session rename (G2). `title` is normalized by the
     /// daemon (trimmed, control characters stripped, ≤ 80 chars; empty
@@ -1167,6 +1179,8 @@ pub enum RequestBody {
         worker_generation: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
     },
     /// Receipted live-session fast-mode toggle (G3), same law set as
     /// `session.select_effort`. Enabling requires the CURRENT pair to be in
@@ -1177,6 +1191,8 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
         enabled: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
     },
     /// Executes exact user-supplied shell program bytes on the session daemon.
     /// The command creates no user message and no provider request. `cwd`, when
@@ -1283,6 +1299,8 @@ pub enum RequestBody {
     AccountSetActive {
         command_id: CommandId,
         alias: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
     },
     /// Durably removes one globally named account.
     #[serde(rename = "account.remove")]
@@ -1810,6 +1828,16 @@ pub enum ErrorData {
     /// A fast-mode enable named a pair outside the static fast gate
     /// ([`ERROR_CODE_FAST_UNSUPPORTED`]) (G3).
     FastUnsupported { provider: String, model: String },
+    /// Cache-impact preflight for a live configuration change (CM3).
+    CacheEpochConfirmationRequired {
+        changed_fields: Vec<String>,
+        invalidated_stable_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewarm_cost_microusd: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewarm_base_input_equivalent_tokens: Option<u64>,
+        policy: String,
+    },
     /// A custom-provider removal was refused. Blocking credential aliases are
     /// carried as typed data so clients never need to parse the message.
     ProviderRemoveRefused {

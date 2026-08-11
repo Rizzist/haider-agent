@@ -250,6 +250,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     };
 
@@ -465,6 +466,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             title: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             created_at_ms: 1,
         })
         .await
@@ -533,6 +535,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     };
 
@@ -625,6 +628,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
                 title: None,
                 effort: None,
                 fast: false,
+                cache_policy: Default::default(),
                 created_at_ms: 1,
             })
             .await
@@ -1089,6 +1093,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             title: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             created_at_ms: 1,
         },
         ProviderTuning::default(),
@@ -1219,6 +1224,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             title: None,
             effort: None,
             fast: false,
+            cache_policy: Default::default(),
             created_at_ms: 1,
         })
         .await
@@ -1423,6 +1429,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     };
     let (_, _, openai_access_fingerprint) = factory
@@ -7690,6 +7697,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
         title: None,
         effort: Some("xhigh".into()),
         fast: true,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     };
     let tuning = ProviderTuning::from_metadata(&metadata);
@@ -7882,6 +7890,7 @@ fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session:
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     }
 }
@@ -8594,6 +8603,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         title: None,
         effort: None,
         fast: false,
+        cache_policy: Default::default(),
         created_at_ms: 1,
     };
     let clean = crate::worker::WebCapabilityDegrade::default();

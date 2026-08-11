@@ -293,6 +293,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: None,
+                cache_policy: None,
             },
         },
         WireFrame::Response {
@@ -311,6 +312,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     title: None,
                     effort: None,
                     fast: false,
+                    cache_policy: Default::default(),
                     created_at_ms: 1_753_500_040_000,
                 },
             },
@@ -587,6 +589,7 @@ pub fn transcript() -> Vec<WireFrame> {
             body: RequestBody::AccountSetActive {
                 command_id: CommandId::new("command-set-active"),
                 alias: "work".into(),
+                confirm_new_epoch: false,
             },
         },
         WireFrame::Response {
@@ -861,6 +864,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     allow_writes: true,
                     allow_exec: true,
                 }),
+                cache_policy: None,
             },
         },
         // B2a append-only branch shapes. Every earlier frame stays byte-for-
@@ -1354,6 +1358,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 session_id: SessionId::new("session-1"),
                 worker_generation: 7,
                 effort: Some("xhigh".into()),
+                confirm_new_epoch: false,
             },
         },
         WireFrame::Response {
@@ -1372,6 +1377,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 session_id: SessionId::new("session-1"),
                 worker_generation: 7,
                 enabled: true,
+                confirm_new_epoch: false,
             },
         },
         WireFrame::Response {
