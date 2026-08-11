@@ -17,7 +17,7 @@
     },
     {
       "name": "deepseek_reasoning_usage",
-      "family": "chat_completions",
+      "family": "deepseek_chat_completions",
       "wire": "deepseek_reasoning_usage.sse",
       "golden": "deepseek_reasoning_usage.events.json"
     },

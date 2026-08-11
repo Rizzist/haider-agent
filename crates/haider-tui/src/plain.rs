@@ -31,6 +31,26 @@ pub fn render_plain(
     window: u64,
     throughput: Option<&crate::throughput::ThroughputReadout>,
 ) -> String {
+    render_plain_impl(projection, window, throughput, None)
+}
+
+/// Live/plain parity with the styled status and `/usage` cache semantics.
+#[must_use]
+pub fn render_plain_with_cache(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    cache_usage: &crate::cache_usage::SessionUsageFold,
+) -> String {
+    render_plain_impl(projection, window, throughput, Some(cache_usage))
+}
+
+fn render_plain_impl(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    cache_usage: Option<&crate::cache_usage::SessionUsageFold>,
+) -> String {
     let mut out = String::new();
     for entry in projection.entries() {
         match entry {
@@ -116,8 +136,110 @@ pub fn render_plain(
         out.push_str(&readout.plain_text());
         out.push('\n');
     }
+    let cache_totals = cache_usage
+        .filter(|usage| !usage.is_empty())
+        .map(crate::cache_usage::SessionUsageFold::totals);
+    if let Some(totals) = &cache_totals {
+        out.push_str(&cache_breakdown_plain(totals));
+        out.push('\n');
+    }
     out.push_str(&status_line(projection, window));
+    if let Some(totals) = &cache_totals {
+        out.push_str(" · ");
+        out.push_str(&crate::cache_usage::wide_status(totals));
+    }
     out.push('\n');
+    out
+}
+
+fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> String {
+    use crate::cache_usage::CacheUsageStatsExt as _;
+    let hit = stats
+        .complete_hit_rate()
+        .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.2}%", rate * 100.0));
+    let coverage = stats
+        .telemetry_coverage()
+        .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.0}%", rate * 100.0));
+    let mut out = format!(
+        "cache usage — logical {} · uncached {} · write {} (5m {} · 1h {}) · read {} · hit {hit} · coverage {coverage}",
+        fmt_tok(stats.logical_input_tokens),
+        fmt_tok(stats.uncached_input_tokens),
+        fmt_tok(stats.cache_write_tokens),
+        fmt_tok(stats.cache_write_5m_tokens),
+        fmt_tok(stats.cache_write_1h_tokens),
+        fmt_tok(stats.cache_read_tokens),
+    );
+    match (
+        stats.input_with_cache_usd,
+        stats.input_without_cache_usd,
+        stats.estimated_savings_usd,
+    ) {
+        (Some(with), Some(without), Some(savings)) => out.push_str(&format!(
+            " · input ${with:.4} cached / ${without:.4} without · savings ${savings:.4}"
+        )),
+        _ => out.push_str(" · input cost n/a · savings n/a"),
+    }
+    for breakdown in &stats.breakdowns {
+        let epoch = breakdown
+            .cache_epoch
+            .get(..8)
+            .unwrap_or(&breakdown.cache_epoch);
+        let cost = match (
+            breakdown.input_with_cache_usd,
+            breakdown.input_without_cache_usd,
+            breakdown.estimated_savings_usd,
+        ) {
+            (Some(with), Some(without), Some(savings)) => {
+                format!(" · input ${with:.4}/${without:.4} · save ${savings:.4}")
+            }
+            _ => " · input $ n/a".to_owned(),
+        };
+        let complete = breakdown.logical_input_tokens > 0
+            && breakdown.telemetry_covered_input_tokens == breakdown.logical_input_tokens;
+        let denominator = breakdown
+            .cache_read_tokens
+            .saturating_add(breakdown.uncached_input_tokens);
+        let part_hit = if complete {
+            #[allow(clippy::cast_precision_loss)]
+            let rate = if denominator == 0 {
+                0.0
+            } else {
+                breakdown.cache_read_tokens as f64 / denominator as f64
+            };
+            format!("{:.2}%", rate * 100.0)
+        } else {
+            "n/a".to_owned()
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let part_coverage = if breakdown.logical_input_tokens == 0 {
+            "n/a".to_owned()
+        } else {
+            format!(
+                "{:.0}%",
+                breakdown.telemetry_covered_input_tokens as f64
+                    / breakdown.logical_input_tokens as f64
+                    * 100.0
+            )
+        };
+        out.push_str(&format!(
+            "\n  {} / {} / {} / {:?} — uncached {} · write {} · read {} · hit {part_hit} · coverage {part_coverage}{cost}",
+            if breakdown.provider.is_empty() {
+                "unknown"
+            } else {
+                &breakdown.provider
+            },
+            if breakdown.model.is_empty() {
+                "unknown"
+            } else {
+                &breakdown.model
+            },
+            if epoch.is_empty() { "unknown" } else { epoch },
+            breakdown.request_kind,
+            fmt_tok(breakdown.uncached_input_tokens),
+            fmt_tok(breakdown.cache_write_tokens),
+            fmt_tok(breakdown.cache_read_tokens),
+        ));
+    }
     out
 }
 

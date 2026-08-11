@@ -447,6 +447,9 @@ fn usage_drives_the_context_meter() {
         source: UsageSource::ProviderReported,
         account: None,
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     }));
     assert_eq!(projection.context_tokens(), 1550);
 }
@@ -631,6 +634,9 @@ fn context_tokens_saturate_on_adversarial_usage() {
         source: UsageSource::ProviderReported,
         account: None,
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     }));
     assert_eq!(projection.context_tokens(), u64::MAX);
 }

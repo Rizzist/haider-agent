@@ -86,6 +86,15 @@ fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
             payload["parent"] = serde_json::Value::String("<node>".into());
         }
     }
+    if payload["type"] == "usage" {
+        // Cache-domain instrumentation includes run-scoped digests. This
+        // sequence law compares the stable event contract; CM1h covers the
+        // digest values themselves.
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("scope");
+            object.remove("cache_cost");
+        }
+    }
     payload
 }
 
@@ -122,6 +131,9 @@ async fn full_turn_commits_exact_projected_sequence() {
         source: UsageSource::ProviderReported,
         account: None,
         accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
     };
     let (handle, store, provider) = runtime(vec![
         FakeStep::EmitText {
@@ -709,6 +721,9 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
                 source: UsageSource::ProviderReported,
                 account: None,
                 accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
             },
         },
         FakeStep::Finish {
@@ -756,6 +771,9 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
                 source: UsageSource::Estimated,
                 account: None,
                 accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
             },
         },
         FakeStep::Finish {
@@ -1744,6 +1762,9 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
                 source: UsageSource::ProviderReported,
                 account: None,
                 accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
             },
         },
         FakeStep::EmitToolCall {
@@ -1773,6 +1794,9 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
                 source: UsageSource::ProviderReported,
                 account: None,
                 accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
             },
         },
         FakeStep::Finish {

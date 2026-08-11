@@ -1,10 +1,16 @@
 [
   {
     "result": "ok",
-    "value": {"event": "refusal_delta", "text": "I cannot help with that."}
+    "value": {
+      "event": "refusal_delta",
+      "text": "I cannot help with that."
+    }
   },
   {
     "result": "ok",
-    "value": {"event": "finish", "reason": "refusal"}
+    "value": {
+      "event": "finish",
+      "reason": "refusal"
+    }
   }
 ]

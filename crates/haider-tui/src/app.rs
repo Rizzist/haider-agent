@@ -2796,6 +2796,9 @@ pub struct AppModel {
     pub theme_commits: u64,
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
+    /// Session-wide latest-snapshot usage fold. Kept outside branch/chip
+    /// projections so every billed lane survives view switches.
+    pub cache_usage: crate::cache_usage::SessionUsageFold,
     pub identity: IdentityLine,
     /// The user EXPLICITLY chose a provider/model/account this run
     /// (`/model`, `/provider`, or clicking an account). Once pinned, the
@@ -3151,6 +3154,7 @@ impl Default for AppModel {
             theme_commits: 0,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
+            cache_usage: crate::cache_usage::SessionUsageFold::default(),
             identity: IdentityLine::default(),
             identity_pinned: false,
             composer: crate::composer::Composer::new(),
@@ -9142,6 +9146,9 @@ impl AppModel {
         at_ms: u64,
     ) {
         use crate::branch::BranchScope;
+        if let EventPayload::Usage(usage) = payload {
+            self.cache_usage.note(usage);
+        }
         match self.branch_state.scope_of(payload, branch) {
             BranchScope::Aggregate => {
                 self.branch_state.apply_aggregate_to_parked(payload);
@@ -9484,6 +9491,9 @@ impl AppModel {
     }
 
     fn handle_envelope(&mut self, payload: &EventPayload) {
+        if let EventPayload::Usage(usage) = payload {
+            self.cache_usage.note(usage);
+        }
         // Screen auto-transitions (sim: boot → launcher when startup
         // completes; the first user message attaches the session view).
         if matches!(payload, EventPayload::HarnessStatus(HarnessStatus::Ready))
@@ -9801,6 +9811,7 @@ impl AppModel {
         );
         crate::session::sweep_closed_chips(&mut slot.chips);
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
+        self.cache_usage = std::mem::take(&mut slot.cache_usage);
         self.chips = std::mem::take(&mut slot.chips);
         // B2b: the branch registry/active/parked views travel as ONE unit
         // with the session — the A→B→A checkout law.
@@ -9854,6 +9865,7 @@ impl AppModel {
             // (identity is the protocol id; the row's generation stays put)
             let slot = &mut self.sessions[index];
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
+            slot.cache_usage = std::mem::take(&mut self.cache_usage);
             slot.chips = std::mem::take(&mut self.chips);
             slot.branch_state = std::mem::take(&mut self.branch_state);
             slot.hook_facts = std::mem::take(&mut self.hook_facts);

@@ -1275,6 +1275,7 @@ pub fn transcript() -> Vec<WireFrame> {
                                 est_cost_usd: None,
                                 lines_added: 120,
                                 lines_removed: 30,
+                                cache: haider_protocol::usage::CacheUsageStatsV1::default(),
                             },
                         },
                         AccountUsageReportV1 {
@@ -1305,6 +1306,7 @@ pub fn transcript() -> Vec<WireFrame> {
                                 est_cost_usd: Some(0.08),
                                 lines_added: 12,
                                 lines_removed: 4,
+                                cache: haider_protocol::usage::CacheUsageStatsV1::default(),
                             },
                         },
                     ],

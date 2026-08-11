@@ -54,8 +54,9 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason};
 use haider_protocol::provider::{
-    AccountUsage, Block, FinishReason, PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent, Usage,
-    WEB_SOURCES_EXTENSION_KIND, WebSource,
+    AccountUsage, Block, CacheCostEstimate, CacheStatAvailability, FinishReason, NormalizedUsage,
+    PROVIDER_OPAQUE_EXTENSION_KIND, PrefixDigests, StreamEvent, Usage, UsageRequestKind,
+    UsageScope, WEB_SOURCES_EXTENSION_KIND, WebSource,
 };
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::BoundedResult;
@@ -122,6 +123,12 @@ pub struct HarnessConfig {
     pub attachments: Vec<ResolvedAttachment>,
     /// Account pinned by the turn-scoped provider resolver.
     pub usage_account: Option<CredentialAlias>,
+    /// Non-secret provider/model/auth/cache-domain coordinates attached to
+    /// usage telemetry after the provider response is decoded.
+    pub usage_scope: UsageScope,
+    /// Canonical provider-visible reasoning/fast settings used only for the
+    /// prefix digest. It never enters a request body from this field.
+    pub reasoning_settings: String,
     /// A factory-time alternate that must be committed before provider work.
     pub initial_rotation: Option<RotationEvent>,
     /// Logical-turn-wide one-hop allowance. This is distinct from provider
@@ -177,6 +184,8 @@ impl HarnessConfig {
             tools: Vec::new(),
             attachments: Vec::new(),
             usage_account: None,
+            usage_scope: UsageScope::default(),
+            reasoning_settings: String::new(),
             initial_rotation: None,
             rotation_budget_consumed: false,
             provider_attempt_resolver: None,
@@ -922,6 +931,7 @@ impl HarnessActor {
         // Everything before it is the only prefix eligible for mid-turn
         // forced compaction; current-run content remains a verbatim suffix.
         let current_turn_start = messages.len().saturating_sub(1);
+        let mut stable_history_end = current_turn_start;
 
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
@@ -1110,6 +1120,12 @@ impl HarnessActor {
                         .await;
                 }
             };
+            if request_projection_compacted {
+                // Compaction replaces the covered prefix with exactly one
+                // immutable summary message; the current-turn suffix stays
+                // verbatim after it.
+                stable_history_end = usize::from(!messages.is_empty());
+            }
             if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
             }
@@ -1136,6 +1152,10 @@ impl HarnessActor {
                 tools: self.config.tools.clone(),
                 attachments: self.config.attachments.clone(),
             };
+            let prefix_digests = usage_prefix_digests(
+                &self.config,
+                &messages[..stable_history_end.min(messages.len())],
+            );
             let mut request_usage: Option<Usage> = None;
             let attempt_provider = Arc::clone(&provider);
             let mut opening = Box::pin(attempt_provider.stream_turn(provider_request));
@@ -1558,8 +1578,17 @@ impl HarnessActor {
                         Ok(None)
                     }
                     StreamEvent::UsageUpdate(mut usage) => {
+                        attach_usage_scope_and_cost(
+                            &self.config,
+                            &run_id,
+                            prefix_digests.clone(),
+                            &mut usage,
+                        );
                         if let Some(account) = &usage_account {
                             usage.account = Some(account.clone());
+                            if let Some(scope) = &mut usage.scope {
+                                scope.account_scope = Some(account.clone());
+                            }
                             usage.accounts = vec![AccountUsage {
                                 account: account.clone(),
                                 input: usage.input,
@@ -1567,6 +1596,9 @@ impl HarnessActor {
                                 reasoning: usage.reasoning,
                                 cached: usage.cached,
                                 source: usage.source,
+                                normalized: usage.normalized.clone(),
+                                scope: usage.scope.clone(),
+                                cache_cost: usage.cache_cost,
                             }];
                         }
                         let footprint =
@@ -4123,6 +4155,118 @@ fn provider_error_allows_rotation(error: &ProviderError) -> bool {
     }
 }
 
+fn digest_json(value: &impl serde::Serialize) -> String {
+    serde_json::to_vec(value).map_or_else(
+        |_| blake3::hash(b"serialization-error").to_hex().to_string(),
+        |bytes| blake3::hash(&bytes).to_hex().to_string(),
+    )
+}
+
+fn usage_prefix_digests(config: &HarnessConfig, immutable_history: &[Message]) -> PrefixDigests {
+    PrefixDigests {
+        system: digest_json(&config.system_prompt),
+        tools: digest_json(&config.tools),
+        immutable_history: digest_json(&immutable_history),
+        model: digest_json(&config.model),
+        auth_mode: digest_json(&config.usage_scope.auth_scope),
+        reasoning_settings: digest_json(&config.reasoning_settings),
+    }
+}
+
+fn attach_usage_scope_and_cost(
+    config: &HarnessConfig,
+    run_id: &RunId,
+    prefix_digests: PrefixDigests,
+    usage: &mut Usage,
+) {
+    let mut scope = config.usage_scope.clone();
+    scope.run = Some(run_id.clone());
+    scope.agent = config.agent_id.clone();
+    if scope.agent.is_some() && scope.request_kind == UsageRequestKind::MainTurn {
+        scope.request_kind = UsageRequestKind::DelegatedAgent;
+    }
+    scope.prefix_digests = Some(prefix_digests);
+    usage.cache_cost = usage.normalized.as_ref().and_then(|normalized| {
+        haider_provider::estimate_cache_input_costs(&config.model, normalized)
+    });
+    usage.scope = Some(scope);
+}
+
+fn cumulative_normalized(
+    completed: &NormalizedUsage,
+    current: &NormalizedUsage,
+) -> NormalizedUsage {
+    let combine_status = |left, right| {
+        if left == CacheStatAvailability::Present && right == CacheStatAvailability::Present {
+            CacheStatAvailability::Present
+        } else {
+            CacheStatAvailability::Unavailable
+        }
+    };
+    let reasoning_accounting = if completed.reasoning_accounting == current.reasoning_accounting {
+        current.reasoning_accounting
+    } else {
+        haider_protocol::provider::ReasoningAccounting::Unavailable
+    };
+    NormalizedUsage {
+        logical_input: completed
+            .logical_input
+            .saturating_add(current.logical_input),
+        uncached_input: completed
+            .uncached_input
+            .saturating_add(current.uncached_input),
+        cache_read_input: completed
+            .cache_read_input
+            .saturating_add(current.cache_read_input),
+        cache_write_input: completed
+            .cache_write_input
+            .saturating_add(current.cache_write_input),
+        cache_write_5m_input: completed
+            .cache_write_5m_input
+            .saturating_add(current.cache_write_5m_input),
+        cache_write_1h_input: completed
+            .cache_write_1h_input
+            .saturating_add(current.cache_write_1h_input),
+        billed_output: completed
+            .billed_output
+            .saturating_add(current.billed_output),
+        reasoning_detail: completed
+            .reasoning_detail
+            .saturating_add(current.reasoning_detail),
+        reasoning_accounting,
+        cache_status: combine_status(completed.cache_status, current.cache_status),
+        cache_write_status: combine_status(
+            completed.cache_write_status,
+            current.cache_write_status,
+        ),
+        cache_write_ttl_status: combine_status(
+            completed.cache_write_ttl_status,
+            current.cache_write_ttl_status,
+        ),
+        cache_telemetry_input: completed
+            .cache_telemetry_input
+            .saturating_add(current.cache_telemetry_input),
+        explicit_cache_storage_token_hours: completed
+            .explicit_cache_storage_token_hours
+            .zip(current.explicit_cache_storage_token_hours)
+            .map(|(left, right)| left + right),
+    }
+}
+
+fn cumulative_cache_cost(
+    completed: Option<CacheCostEstimate>,
+    current: Option<CacheCostEstimate>,
+) -> Option<CacheCostEstimate> {
+    completed
+        .zip(current)
+        .map(|(left, right)| CacheCostEstimate {
+            input_with_cache_usd: left.input_with_cache_usd + right.input_with_cache_usd,
+            input_without_cache_usd: left.input_without_cache_usd + right.input_without_cache_usd,
+            estimated_savings_usd: left.estimated_savings_usd + right.estimated_savings_usd,
+            explicit_storage_usd: left.explicit_storage_usd + right.explicit_storage_usd,
+        })
+}
+
 fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage, DriveError> {
     let Some(completed) = completed else {
         return Ok(current.clone());
@@ -4138,6 +4282,13 @@ fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage,
             total.reasoning = total.reasoning.saturating_add(current_account.reasoning);
             total.cached = total.cached.saturating_add(current_account.cached);
             total.source = current_account.source;
+            total.normalized = total
+                .normalized
+                .as_ref()
+                .zip(current_account.normalized.as_ref())
+                .map(|(left, right)| cumulative_normalized(left, right));
+            total.cache_cost = cumulative_cache_cost(total.cache_cost, current_account.cache_cost);
+            total.scope = current_account.scope.clone();
         } else {
             accounts.push(current_account.clone());
         }
@@ -4158,6 +4309,13 @@ fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage,
         source: current.source,
         account,
         accounts,
+        normalized: completed
+            .normalized
+            .as_ref()
+            .zip(current.normalized.as_ref())
+            .map(|(left, right)| cumulative_normalized(left, right)),
+        scope: current.scope.clone(),
+        cache_cost: cumulative_cache_cost(completed.cache_cost, current.cache_cost),
     })
 }
 
@@ -4198,6 +4356,15 @@ fn context_footprint_from_usage(
 ) -> ContextFootprint {
     if usage.source != haider_protocol::provider::UsageSource::ProviderReported {
         return estimated_context_footprint(config, messages);
+    }
+    if let Some(normalized) = &usage.normalized {
+        return context_footprint(
+            config,
+            normalized.uncached_input,
+            normalized.billed_output,
+            normalized.cache_read_input,
+            ContextFootprintTruth::Exact,
+        );
     }
     let input_tokens = if config.cached_input_is_subset {
         let Some(uncached) = usage.input.checked_sub(usage.cached) else {
@@ -4313,6 +4480,9 @@ mod usage_tests {
             source: UsageSource::ProviderReported,
             account: None,
             accounts: Vec::new(),
+            normalized: None,
+            scope: None,
+            cache_cost: None,
         };
         let current = Usage {
             input: 1,
@@ -4322,12 +4492,55 @@ mod usage_tests {
             source: UsageSource::ProviderReported,
             account: None,
             accounts: Vec::new(),
+            normalized: None,
+            scope: None,
+            cache_cost: None,
         };
         let cumulative = cumulative_usage(Some(&completed), &current).expect("same account");
         assert_eq!(cumulative.input, u64::MAX);
         assert_eq!(cumulative.output, u64::MAX);
         assert_eq!(cumulative.reasoning, u64::MAX);
         assert_eq!(cumulative.cached, u64::MAX);
+    }
+
+    /// CM1h — no-op session configuration keeps system/tool/model/auth/
+    /// reasoning digests stable while immutable history grows append-only.
+    ///
+    /// MUTATION CHECK (executed): salt the tool digest per request or hash
+    /// history into it; the successive equality assertion fails.
+    #[test]
+    fn cm1h_prefix_digest_baseline_is_stable_across_append_only_history() {
+        let mut config = HarnessConfig::for_session(
+            SessionId::new("digest-session"),
+            DeviceId::new("digest-device"),
+            0,
+            0,
+        );
+        config.model = "gpt-5.6-terra".into();
+        config.system_prompt = Some("stable system".into());
+        config.tools = vec![ToolDefinition {
+            name: "read".into(),
+            description: "stable tool".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        config.usage_scope.auth_scope = "api_key".into();
+        config.reasoning_settings = r#"{"effort":"high","fast":false}"#.into();
+        let first_history = vec![Message::user_text("first")];
+        let mut second_history = first_history.clone();
+        second_history.push(Message::assistant(vec![Block::Text {
+            text: "answer".into(),
+        }]));
+        let first = usage_prefix_digests(&config, &first_history);
+        let second = usage_prefix_digests(&config, &second_history);
+        assert_eq!(first.system, second.system);
+        assert_eq!(first.tools, second.tools);
+        assert_eq!(first.model, second.model);
+        assert_eq!(first.auth_mode, second.auth_mode);
+        assert_eq!(first.reasoning_settings, second.reasoning_settings);
+        assert_ne!(
+            first.immutable_history, second.immutable_history,
+            "append-only history has its own diagnostic digest"
+        );
     }
 }
 

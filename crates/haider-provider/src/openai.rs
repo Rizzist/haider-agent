@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use haider_accounts::SecretHandle;
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
-    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource, WebSource,
+    Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
+    ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
 };
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -881,7 +882,12 @@ impl Provider for OpenAiCompatibleProvider {
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         let response = self.send_request(&request).await?;
-        checked_stream(response, self.http.account.clone(), DecoderKind::Chat).await
+        checked_stream(
+            response,
+            self.http.account.clone(),
+            DecoderKind::Chat(self.dialect),
+        )
+        .await
     }
 }
 
@@ -1015,7 +1021,7 @@ fn body_too_large(context: &str, limit: usize) -> ProviderError {
 #[derive(Debug, Clone, Copy)]
 enum DecoderKind {
     Responses,
-    Chat,
+    Chat(CompatibleDialect),
 }
 
 async fn stream_response(
@@ -1051,7 +1057,7 @@ async fn stream_sse_source<S: SseChunkSource>(
 ) {
     let mut decoder = match kind {
         DecoderKind::Responses => OpenAiDecoder::Responses(ResponsesDecoder::new(account)),
-        DecoderKind::Chat => OpenAiDecoder::Chat(ChatDecoder::new(account)),
+        DecoderKind::Chat(dialect) => OpenAiDecoder::Chat(ChatDecoder::new(account, dialect)),
     };
     loop {
         let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
@@ -1711,6 +1717,7 @@ pub fn codex_alpha_search_response_text(body: &[u8]) -> String {
 struct ChatDecoder {
     framer: SseFramer,
     account: Option<CredentialAlias>,
+    dialect: CompatibleDialect,
     open_calls: BTreeMap<usize, ChatFunctionCall>,
     pending_tool_events: Vec<StreamEvent>,
     finish_reason: Option<FinishReason>,
@@ -1730,10 +1737,11 @@ struct ChatFunctionCall {
 }
 
 impl ChatDecoder {
-    fn new(account: Option<CredentialAlias>) -> Self {
+    fn new(account: Option<CredentialAlias>, dialect: CompatibleDialect) -> Self {
         Self {
             framer: SseFramer::default(),
             account,
+            dialect,
             open_calls: BTreeMap::new(),
             pending_tool_events: Vec::new(),
             finish_reason: None,
@@ -1813,6 +1821,7 @@ impl ChatDecoder {
             events.push(StreamEvent::UsageUpdate(chat_usage(
                 usage,
                 self.account.clone(),
+                self.dialect,
             )?));
         }
         let choices = value
@@ -2000,7 +2009,11 @@ pub fn replay_openai_responses_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
 /// Replays compatible Chat Completions SSE bytes through the live decoder.
 #[must_use]
 pub fn replay_openai_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
-    let mut decoder = ChatDecoder::new(None);
+    replay_chat_sse(bytes, CompatibleDialect::Generic)
+}
+
+fn replay_chat_sse(bytes: &[u8], dialect: CompatibleDialect) -> Vec<ProviderStreamItem> {
+    let mut decoder = ChatDecoder::new(None, dialect);
     let mut items = Vec::new();
     for chunk in bytes.chunks(7) {
         items.extend(decoder.push(chunk));
@@ -2010,6 +2023,16 @@ pub fn replay_openai_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
     }
     items.extend(decoder.finish());
     items
+}
+
+#[must_use]
+pub fn replay_kimi_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    replay_chat_sse(bytes, CompatibleDialect::KimiOAuth)
+}
+
+#[must_use]
+pub fn replay_deepseek_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    replay_chat_sse(bytes, CompatibleDialect::DeepSeekApi)
 }
 
 /// Replays a fake/captured `GET /v1/models` body through the live capability
@@ -3193,60 +3216,207 @@ fn openai_usage(
     value: &serde_json::Value,
     account: Option<CredentialAlias>,
 ) -> Result<Usage, ProviderError> {
+    let input = required_u64(value, "input_tokens", "OpenAI usage")?;
+    let output = required_u64(value, "output_tokens", "OpenAI usage")?;
+    let reasoning = value
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let details = value.get("input_tokens_details");
+    let cached = details
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let cache_write = details
+        .and_then(|details| {
+            details
+                .get("cache_write_tokens")
+                .or_else(|| details.get("created_cache_tokens"))
+        })
+        .and_then(serde_json::Value::as_u64);
+    let normalized = subset_cache_usage(input, cached, cache_write, output, reasoning);
     Ok(Usage {
-        input: required_u64(value, "input_tokens", "OpenAI usage")?,
-        output: required_u64(value, "output_tokens", "OpenAI usage")?,
-        reasoning: value
-            .get("output_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        cached: value
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
+        input,
+        output,
+        reasoning: reasoning.unwrap_or(0),
+        cached: normalized.cache_read_input,
         source: UsageSource::ProviderReported,
         account,
         accounts: Vec::new(),
+        normalized: Some(normalized),
+        scope: None,
+        cache_cost: None,
     })
 }
 
 fn chat_usage(
     value: &serde_json::Value,
     account: Option<CredentialAlias>,
+    dialect: CompatibleDialect,
 ) -> Result<Usage, ProviderError> {
     let prompt_tokens = required_u64(value, "prompt_tokens", "Chat usage")?;
-    // DeepSeek reports cache accounting as two top-level counters. Its
-    // `prompt_tokens` is their sum, while Haider's `input` is the uncached
-    // portion whenever a provider exposes that split.
-    let input = value
-        .get("prompt_cache_miss_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(prompt_tokens);
-    let cached = value
-        .get("prompt_cache_hit_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
+    let output = required_u64(value, "completion_tokens", "Chat usage")?;
+    let reasoning = value
+        .get("completion_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    // DeepSeek reports disjoint top-level hit/miss counters. The pair is
+    // authoritative only when BOTH are present and reconcile to the prompt
+    // total; a partial or malformed pair is unavailable, never saturated.
+    let deepseek_miss = (dialect == CompatibleDialect::DeepSeekApi)
+        .then(|| {
             value
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
+                .get("prompt_cache_miss_tokens")
                 .and_then(serde_json::Value::as_u64)
         })
-        .unwrap_or(0);
+        .flatten();
+    let deepseek_hit = (dialect == CompatibleDialect::DeepSeekApi)
+        .then(|| {
+            value
+                .get("prompt_cache_hit_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .flatten();
+    let (input, normalized) = if dialect == CompatibleDialect::DeepSeekApi {
+        match (deepseek_miss, deepseek_hit) {
+            (Some(miss), Some(hit)) if miss.checked_add(hit) == Some(prompt_tokens) => (
+                miss,
+                normalized_cache_usage(
+                    prompt_tokens,
+                    miss,
+                    hit,
+                    None,
+                    output,
+                    reasoning,
+                    CacheStatAvailability::Present,
+                ),
+            ),
+            _ => (
+                prompt_tokens,
+                unavailable_cache_usage(prompt_tokens, output, reasoning),
+            ),
+        }
+    } else {
+        let details = value.get("prompt_tokens_details");
+        let cached = if dialect == CompatibleDialect::KimiOAuth {
+            value
+                .get("cached_tokens")
+                .and_then(serde_json::Value::as_u64)
+        } else {
+            // Generic OpenAI-compatible endpoints are capability-probed only
+            // through the recognized vLLM/OpenAI nested detail shape. An
+            // arbitrary top-level `cached_tokens` is not authoritative.
+            details
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let cache_write = if dialect == CompatibleDialect::KimiOAuth {
+            None
+        } else {
+            value
+                .get("cache_write_tokens")
+                .or_else(|| value.get("created_cache_tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    details
+                        .and_then(|details| {
+                            details
+                                .get("cache_write_tokens")
+                                .or_else(|| details.get("created_cache_tokens"))
+                        })
+                        .and_then(serde_json::Value::as_u64)
+                })
+        };
+        (
+            prompt_tokens,
+            subset_cache_usage(prompt_tokens, cached, cache_write, output, reasoning),
+        )
+    };
     Ok(Usage {
         input,
-        output: required_u64(value, "completion_tokens", "Chat usage")?,
-        reasoning: value
-            .get("completion_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        cached,
+        output,
+        reasoning: reasoning.unwrap_or(0),
+        cached: normalized.cache_read_input,
         source: UsageSource::ProviderReported,
         account,
         accounts: Vec::new(),
+        normalized: Some(normalized),
+        scope: None,
+        cache_cost: None,
     })
+}
+
+fn unavailable_cache_usage(
+    logical_input: u64,
+    billed_output: u64,
+    reasoning: Option<u64>,
+) -> NormalizedUsage {
+    NormalizedUsage {
+        logical_input,
+        uncached_input: logical_input,
+        billed_output,
+        reasoning_detail: reasoning.unwrap_or(0),
+        reasoning_accounting: reasoning.map_or(ReasoningAccounting::Unavailable, |_| {
+            ReasoningAccounting::SubsetOfOutput
+        }),
+        ..NormalizedUsage::default()
+    }
+}
+
+fn subset_cache_usage(
+    logical_input: u64,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+    billed_output: u64,
+    reasoning: Option<u64>,
+) -> NormalizedUsage {
+    let Some(cache_read) = cache_read.filter(|cached| *cached <= logical_input) else {
+        return unavailable_cache_usage(logical_input, billed_output, reasoning);
+    };
+    let uncached = logical_input - cache_read;
+    normalized_cache_usage(
+        logical_input,
+        uncached,
+        cache_read,
+        cache_write,
+        billed_output,
+        reasoning,
+        CacheStatAvailability::Present,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalized_cache_usage(
+    logical_input: u64,
+    uncached_input: u64,
+    cache_read_input: u64,
+    cache_write: Option<u64>,
+    billed_output: u64,
+    reasoning: Option<u64>,
+    cache_status: CacheStatAvailability,
+) -> NormalizedUsage {
+    let (cache_write_input, cache_write_status) = match cache_write {
+        Some(write) if write <= uncached_input => (write, CacheStatAvailability::Present),
+        _ => (0, CacheStatAvailability::Unavailable),
+    };
+    NormalizedUsage {
+        logical_input,
+        uncached_input,
+        cache_read_input,
+        cache_write_input,
+        billed_output,
+        reasoning_detail: reasoning.unwrap_or(0),
+        reasoning_accounting: reasoning.map_or(ReasoningAccounting::Unavailable, |_| {
+            ReasoningAccounting::SubsetOfOutput
+        }),
+        cache_status,
+        cache_write_status,
+        cache_telemetry_input: if cache_status == CacheStatAvailability::Present {
+            logical_input
+        } else {
+            0
+        },
+        ..NormalizedUsage::default()
+    }
 }
 
 fn required_string(

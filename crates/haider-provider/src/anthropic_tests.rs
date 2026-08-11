@@ -16,7 +16,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use crate::anthropic::{
     ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
     ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicProvider, SseChunkSource,
-    stream_sse_source,
+    replay_anthropic_sse, stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
 use crate::{
@@ -616,6 +616,39 @@ fn one_line_turn(model: &str) -> TurnRequest {
         tools: Vec::new(),
         attachments: Vec::new(),
     }
+}
+
+/// CM1a — captured Anthropic usage keeps its separate read/write semantics,
+/// including the provider's 5m/1h creation detail.
+///
+/// MUTATION CHECK (executed): map cache creation into reads, or omit the 1h
+/// split; the unequal 100/70/30/10/20 assertions fail.
+#[test]
+fn cm1a_anthropic_separate_read_write_decode() {
+    use haider_protocol::provider::{CacheStatAvailability, StreamEvent};
+
+    let events = replay_anthropic_sse(include_bytes!(
+        "../tests/fixtures/anthropic/cache_usage_split.sse"
+    ));
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+            _ => None,
+        })
+        .expect("captured usage update");
+    let normalized = usage.normalized.as_ref().expect("normalized usage");
+    assert_eq!(normalized.logical_input, 200);
+    assert_eq!(normalized.uncached_input, 130);
+    assert_eq!(normalized.cache_read_input, 70);
+    assert_eq!(normalized.cache_write_input, 30);
+    assert_eq!(normalized.cache_write_5m_input, 10);
+    assert_eq!(normalized.cache_write_1h_input, 20);
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+    assert_eq!(
+        normalized.cache_write_ttl_status,
+        CacheStatAvailability::Present
+    );
 }
 
 /// LAW (LB1 — the mantle golden): the Bedrock adapter POSTs

@@ -1224,7 +1224,7 @@ async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
 /// `prompt_tokens`; the unequal 23/71/94 assertions kill the mutation.
 #[test]
 fn wh4_deepseek_cache_usage_maps_hit_and_miss_tokens() {
-    let items = replay_openai_chat_sse(include_bytes!(
+    let items = replay_deepseek_chat_sse(include_bytes!(
         "../tests/fixtures/openai/deepseek_reasoning_usage.sse"
     ));
     let usage = items
@@ -1238,13 +1238,118 @@ fn wh4_deepseek_cache_usage_maps_hit_and_miss_tokens() {
     assert_eq!(usage.cached, 71, "cache hit is cache-read input");
     assert_eq!(usage.input + usage.cached, 94, "matches prompt total");
     assert_eq!(usage.output, 13);
+    let normalized = usage
+        .normalized
+        .as_ref()
+        .expect("normalized DeepSeek usage");
+    assert_eq!(normalized.logical_input, 94);
+    assert_eq!(normalized.uncached_input, 23);
+    assert_eq!(normalized.cache_read_input, 71);
+}
+
+/// CM1b/CM1c/CM1d — captured Responses usage proves subset subtraction,
+/// reported-zero versus omitted telemetry, GPT-5.6 write decoding, and the
+/// malformed cached>total fence.
+///
+/// MUTATION CHECK (executed): replace `total - cached` with `total + cached`,
+/// treat absent cached tokens as zero, or saturate malformed subtraction;
+/// the 30/70, Present/Unavailable, and malformed assertions fail.
+#[test]
+fn cm1b_cm1c_cm1d_openai_subset_availability_and_malformed_laws() {
+    use haider_protocol::provider::{CacheStatAvailability, StreamEvent};
+
+    let decode = |bytes: &[u8]| {
+        replay_openai_responses_sse(bytes)
+            .into_iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+                _ => None,
+            })
+            .expect("captured usage")
+    };
+    let present = decode(include_bytes!(
+        "../tests/fixtures/openai/cache_write_usage.sse"
+    ));
+    let normalized = present.normalized.as_ref().expect("normalized usage");
+    assert_eq!(normalized.logical_input, 100);
+    assert_eq!(normalized.uncached_input, 30);
+    assert_eq!(normalized.cache_read_input, 70);
+    assert_eq!(normalized.cache_write_input, 20);
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+
+    let zero = decode(include_bytes!(
+        "../tests/fixtures/openai/reasoning_continuation.sse"
+    ));
+    assert_eq!(
+        zero.normalized
+            .as_ref()
+            .expect("zero normalized")
+            .cache_status,
+        CacheStatAvailability::Present,
+        "reported zero is present"
+    );
+    let missing = decode(include_bytes!(
+        "../tests/fixtures/openai/missing_cache_usage.sse"
+    ));
+    assert_eq!(
+        missing
+            .normalized
+            .as_ref()
+            .expect("missing normalized")
+            .cache_status,
+        CacheStatAvailability::Unavailable,
+        "omitted cache telemetry is n/a"
+    );
+    let malformed = decode(include_bytes!(
+        "../tests/fixtures/openai/malformed_cache_usage.sse"
+    ));
+    let malformed = malformed.normalized.as_ref().expect("malformed normalized");
+    assert_eq!(malformed.cache_status, CacheStatAvailability::Unavailable);
+    assert_eq!(malformed.cache_read_input, 0);
+    assert_eq!(malformed.uncached_input, 100);
+}
+
+/// Kimi's recognized top-level cache counter is a subset of prompt_tokens;
+/// generic compatible payloads without a recognized counter stay n/a.
+#[test]
+fn cm1b_kimi_top_level_cached_tokens_are_subset() {
+    use haider_protocol::provider::{CacheStatAvailability, StreamEvent};
+
+    let usage = replay_kimi_chat_sse(include_bytes!(
+        "../tests/fixtures/openai/kimi_cache_usage.sse"
+    ))
+    .into_iter()
+    .find_map(|event| match event {
+        Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+        _ => None,
+    })
+    .expect("Kimi usage");
+    let normalized = usage.normalized.expect("normalized Kimi usage");
+    assert_eq!(normalized.uncached_input, 25);
+    assert_eq!(normalized.cache_read_input, 75);
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+
+    let generic = replay_openai_chat_sse(include_bytes!(
+        "../tests/fixtures/openai/kimi_cache_usage.sse"
+    ))
+    .into_iter()
+    .find_map(|event| match event {
+        Ok(StreamEvent::UsageUpdate(usage)) => usage.normalized,
+        _ => None,
+    })
+    .expect("generic normalized usage");
+    assert_eq!(
+        generic.cache_status,
+        CacheStatAvailability::Unavailable,
+        "unknown compatible top-level fields are not cache telemetry"
+    );
 }
 
 /// WH5 — DeepSeek reasoner streams non-namespaced `reasoning_content`; it
 /// must surface as normalized reasoning rather than disappearing.
 #[test]
 fn wh5_deepseek_reasoning_content_surfaces_as_reasoning() {
-    let items = replay_openai_chat_sse(include_bytes!(
+    let items = replay_deepseek_chat_sse(include_bytes!(
         "../tests/fixtures/openai/deepseek_reasoning_usage.sse"
     ));
     assert!(items.iter().any(|item| matches!(

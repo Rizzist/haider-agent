@@ -969,6 +969,9 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
                 source: haider_protocol::provider::UsageSource::ProviderReported,
                 account: None,
                 accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
             },
         },
         FakeStep::Finish {

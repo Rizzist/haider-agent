@@ -2,7 +2,7 @@
 //! Normalize semantics, not quirks; preserve provider-native state as opaque
 //! envelopes; capability documents make degradation explicit, never silent.
 
-use crate::ids::CredentialAlias;
+use crate::ids::{AgentId, CredentialAlias, RunId};
 use crate::tool::AttachmentBlock;
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +142,20 @@ pub struct Usage {
     /// when exactly one account contributed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accounts: Vec<AccountUsage>,
+    /// Provider-neutral accounting. This is additive: the legacy
+    /// `input`/`cached` counters above retain their existing wire meaning so
+    /// older readers and journal entries continue to decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized: Option<NormalizedUsage>,
+    /// Non-secret cache-domain coordinates attached by the turn engine.
+    /// Adapters intentionally leave this absent because they do not own the
+    /// session/run/cache-epoch identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<UsageScope>,
+    /// Model-registry estimate for input caching. Absent when the model,
+    /// cache split, or required write telemetry is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_cost: Option<CacheCostEstimate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,6 +168,125 @@ pub struct AccountUsage {
     #[serde(default)]
     pub cached: u64,
     pub source: UsageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized: Option<NormalizedUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<UsageScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_cost: Option<CacheCostEstimate>,
+}
+
+/// Honest availability for a provider-reported cache counter. A reported
+/// numeric zero is [`Self::Present`]; an omitted, malformed, or unsupported
+/// counter is [`Self::Unavailable`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheStatAvailability {
+    Present,
+    #[default]
+    Unavailable,
+}
+
+/// How a provider's reasoning-token detail relates to billed output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningAccounting {
+    /// The detail is already included in `billed_output` (OpenAI-style).
+    SubsetOfOutput,
+    /// The detail is billed in addition to `billed_output`.
+    AdditionalToOutput,
+    #[default]
+    Unavailable,
+}
+
+/// Provider-neutral token accounting for one cumulative usage snapshot.
+///
+/// `uncached_input` includes cache writes exactly once. Pricing derives
+/// fresh non-write input as `uncached_input - cache_write_input`, then uses
+/// the model registry's write and read rates.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedUsage {
+    pub logical_input: u64,
+    pub uncached_input: u64,
+    pub cache_read_input: u64,
+    pub cache_write_input: u64,
+    #[serde(default)]
+    pub cache_write_5m_input: u64,
+    #[serde(default)]
+    pub cache_write_1h_input: u64,
+    pub billed_output: u64,
+    #[serde(default)]
+    pub reasoning_detail: u64,
+    #[serde(default)]
+    pub reasoning_accounting: ReasoningAccounting,
+    #[serde(default)]
+    pub cache_status: CacheStatAvailability,
+    #[serde(default)]
+    pub cache_write_status: CacheStatAvailability,
+    #[serde(default)]
+    pub cache_write_ttl_status: CacheStatAvailability,
+    /// Logical input for which the read/uncached split is authoritative.
+    /// This equals `logical_input` for a fully covered provider snapshot and
+    /// zero for an unavailable one; cumulative folds sum it for coverage.
+    #[serde(default)]
+    pub cache_telemetry_input: u64,
+    /// Reserved for explicit-cache resources whose providers bill storage.
+    /// Current request adapters do not synthesize this from latency or
+    /// resource metadata, so it remains absent until exact telemetry exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_cache_storage_token_hours: Option<f64>,
+}
+
+/// Request lane for cache/cost aggregation. Variants are append-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageRequestKind {
+    #[default]
+    MainTurn,
+    Compaction,
+    DelegatedAgent,
+}
+
+/// Non-secret hashes of provider-visible prefix components. These are
+/// instrumentation only and never enter provider request payloads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixDigests {
+    pub system: String,
+    pub tools: String,
+    pub immutable_history: String,
+    pub model: String,
+    pub auth_mode: String,
+    pub reasoning_settings: String,
+}
+
+/// Coordinates of one usage snapshot's cache domain and cumulative lane.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageScope {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_scope: Option<CredentialAlias>,
+    pub auth_scope: String,
+    pub cache_epoch: String,
+    #[serde(default)]
+    pub request_kind: UsageRequestKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_digests: Option<PrefixDigests>,
+}
+
+/// Input-only model-registry estimate used by `/usage`. Output is excluded
+/// because caching changes only input cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheCostEstimate {
+    pub input_with_cache_usd: f64,
+    pub input_without_cache_usd: f64,
+    pub estimated_savings_usd: f64,
+    #[serde(default)]
+    pub explicit_storage_usd: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

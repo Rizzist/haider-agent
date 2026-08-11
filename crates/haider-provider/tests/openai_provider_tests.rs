@@ -9,8 +9,8 @@ use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent
 use haider_provider::{
     Message, MessageRole, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, Provider,
     ProviderError, ProviderErrorKind, ProviderStreamItem, ToolDefinition, TurnRequest,
-    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
-    replay_openai_responses_sse,
+    replay_deepseek_chat_sse, replay_openai_chat_sse, replay_openai_http_error,
+    replay_openai_models_response, replay_openai_responses_sse,
 };
 use serde::Deserialize;
 
@@ -46,6 +46,24 @@ impl ExpectedItem {
             Self::Err(error) => Err(error),
         }
     }
+}
+
+fn reanchor_events(path: &Path, actual: &[ProviderStreamItem]) {
+    if std::env::var_os("UPDATE_FIXTURES").is_none() {
+        return;
+    }
+    let tagged = actual
+        .iter()
+        .map(|item| match item {
+            Ok(event) => serde_json::json!({"result": "ok", "value": event}),
+            Err(error) => serde_json::json!({"result": "err", "value": error}),
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&tagged).expect("serialize event golden"),
+    )
+    .expect("write event golden");
 }
 
 #[test]
@@ -87,16 +105,18 @@ fn manifest_replays_every_declared_openai_fixture_with_provenance() {
 
     for fixture in manifest.fixtures {
         let wire = fs::read(directory.join(&fixture.wire)).expect("fixture wire");
+        let actual = match fixture.family.as_str() {
+            "responses" => replay_openai_responses_sse(&wire),
+            "chat_completions" => replay_openai_chat_sse(&wire),
+            "deepseek_chat_completions" => replay_deepseek_chat_sse(&wire),
+            other => panic!("unknown OpenAI fixture family `{other}`"),
+        };
+        reanchor_events(&directory.join(&fixture.golden), &actual);
         let expected: Vec<ExpectedItem> = read_json(&directory.join(&fixture.golden));
         let expected = expected
             .into_iter()
             .map(ExpectedItem::into_result)
             .collect::<Vec<_>>();
-        let actual = match fixture.family.as_str() {
-            "responses" => replay_openai_responses_sse(&wire),
-            "chat_completions" => replay_openai_chat_sse(&wire),
-            other => panic!("unknown OpenAI fixture family `{other}`"),
-        };
         assert_eq!(actual, expected, "fixture `{}`", fixture.name);
     }
 }

@@ -14,7 +14,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::gemini::{
     GeminiDecoder, GeminiProvider, GeminiRetryPolicy, GeminiSseChunkSource,
-    parse_protobuf_duration_ms, stream_sse_source,
+    parse_protobuf_duration_ms, replay_gemini_sse, stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
 use crate::{ProviderError, ProviderErrorKind};
@@ -235,4 +235,40 @@ async fn hanging_mid_turn_fixture_times_out_only_the_idle_chunk_await() {
     assert!(error.message.contains("90 seconds"));
     assert!(receiver.recv().await.is_none());
     stream_task.await.expect("stream task exits");
+}
+
+/// CM1b/CM1c — Gemini cachedContentTokenCount is a subset of prompt input,
+/// while an omitted field is unavailable rather than a reported zero.
+///
+/// MUTATION CHECK (executed): keep promptTokenCount as uncached input or
+/// default the missing counter to zero; the 28/3 and availability assertions
+/// fail on the two captured responses.
+#[test]
+fn cm1b_cm1c_gemini_subset_and_missing_cache_telemetry() {
+    use haider_protocol::provider::CacheStatAvailability;
+
+    let usage_from = |bytes: &[u8]| {
+        replay_gemini_sse(bytes)
+            .into_iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+                _ => None,
+            })
+            .expect("Gemini usage")
+    };
+    let present = usage_from(include_bytes!("../tests/fixtures/gemini/combined.sse"));
+    let present = present.normalized.expect("normalized present usage");
+    assert_eq!(present.logical_input, 31);
+    assert_eq!(present.uncached_input, 28);
+    assert_eq!(present.cache_read_input, 3);
+    assert_eq!(present.cache_status, CacheStatAvailability::Present);
+
+    let missing = usage_from(include_bytes!(
+        "../tests/fixtures/gemini/usage_metadata.sse"
+    ));
+    let missing = missing.normalized.expect("normalized missing usage");
+    assert_eq!(missing.logical_input, 8);
+    assert_eq!(missing.uncached_input, 8);
+    assert_eq!(missing.cache_read_input, 0);
+    assert_eq!(missing.cache_status, CacheStatAvailability::Unavailable);
 }

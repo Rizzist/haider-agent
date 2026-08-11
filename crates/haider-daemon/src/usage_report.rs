@@ -33,9 +33,13 @@ use haider_accounts::SecretHandle;
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::CredentialAlias;
+use haider_protocol::provider::{
+    CacheCostEstimate, CacheStatAvailability, NormalizedUsage, UsageRequestKind, UsageScope,
+};
 use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
-    AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1,
+    AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageStatsV1,
+    LocalUsageStatsV1, UsageReportV1,
 };
 use haider_provider::{MeterReading, MeterUnavailable, UsageMeterEndpoint};
 use serde::Deserialize;
@@ -411,23 +415,40 @@ pub(crate) struct SessionLocalStats {
     pub lines_removed: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct TokenTotals {
     pub input: u64,
     pub output: u64,
     pub reasoning: u64,
     pub cached: u64,
     pub est_cost_usd: Option<f64>,
+    pub cache: CacheUsageStatsV1,
+    cache_cost_missing: bool,
 }
 
 impl TokenTotals {
-    fn add(&mut self, input: u64, output: u64, reasoning: u64, cached: u64, cost: Option<f64>) {
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        cached: u64,
+        cost: Option<f64>,
+        normalized: Option<&NormalizedUsage>,
+        scope: Option<&UsageScope>,
+        cache_cost: Option<CacheCostEstimate>,
+    ) {
         self.input = self.input.saturating_add(input);
         self.output = self.output.saturating_add(output);
         self.reasoning = self.reasoning.saturating_add(reasoning);
         self.cached = self.cached.saturating_add(cached);
         if let Some(cost) = cost {
             *self.est_cost_usd.get_or_insert(0.0) += cost;
+        }
+        add_cache_stats(&mut self.cache, normalized, scope, cache_cost);
+        if normalized.is_some() && cache_cost.is_none() {
+            self.cache_cost_missing = true;
         }
     }
 
@@ -453,6 +474,12 @@ struct UsagePayload {
     account: Option<CredentialAlias>,
     #[serde(default)]
     accounts: Vec<UsageAccountPayload>,
+    #[serde(default)]
+    normalized: Option<NormalizedUsage>,
+    #[serde(default)]
+    scope: Option<UsageScope>,
+    #[serde(default)]
+    cache_cost: Option<CacheCostEstimate>,
 }
 
 #[derive(Deserialize)]
@@ -466,6 +493,143 @@ struct UsageAccountPayload {
     reasoning: u64,
     #[serde(default)]
     cached: u64,
+    #[serde(default)]
+    normalized: Option<NormalizedUsage>,
+    #[serde(default)]
+    scope: Option<UsageScope>,
+    #[serde(default)]
+    cache_cost: Option<CacheCostEstimate>,
+}
+
+fn add_cache_stats(
+    totals: &mut CacheUsageStatsV1,
+    normalized: Option<&NormalizedUsage>,
+    scope: Option<&UsageScope>,
+    cost: Option<CacheCostEstimate>,
+) {
+    let Some(usage) = normalized else {
+        return;
+    };
+    let totals_had_input = totals.logical_input_tokens > 0;
+    totals.logical_input_tokens = totals
+        .logical_input_tokens
+        .saturating_add(usage.logical_input);
+    totals.uncached_input_tokens = totals
+        .uncached_input_tokens
+        .saturating_add(usage.uncached_input);
+    totals.cache_read_tokens = totals
+        .cache_read_tokens
+        .saturating_add(usage.cache_read_input);
+    totals.cache_write_tokens = totals
+        .cache_write_tokens
+        .saturating_add(usage.cache_write_input);
+    totals.cache_write_5m_tokens = totals
+        .cache_write_5m_tokens
+        .saturating_add(usage.cache_write_5m_input);
+    totals.cache_write_1h_tokens = totals
+        .cache_write_1h_tokens
+        .saturating_add(usage.cache_write_1h_input);
+    totals.billed_output_tokens = totals
+        .billed_output_tokens
+        .saturating_add(usage.billed_output);
+    totals.telemetry_covered_input_tokens = totals
+        .telemetry_covered_input_tokens
+        .saturating_add(usage.cache_telemetry_input);
+    merge_optional_cost(
+        &mut totals.input_with_cache_usd,
+        cost.map(|cost| cost.input_with_cache_usd),
+        totals_had_input,
+    );
+    merge_optional_cost(
+        &mut totals.input_without_cache_usd,
+        cost.map(|cost| cost.input_without_cache_usd),
+        totals_had_input,
+    );
+    merge_optional_cost(
+        &mut totals.estimated_savings_usd,
+        cost.map(|cost| cost.estimated_savings_usd),
+        totals_had_input,
+    );
+
+    let (provider, model, epoch, request_kind) = scope.map_or_else(
+        || {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                UsageRequestKind::MainTurn,
+            )
+        },
+        |scope| {
+            (
+                scope.provider.clone(),
+                scope.model.clone(),
+                scope.cache_epoch.clone(),
+                scope.request_kind,
+            )
+        },
+    );
+    let position = totals.breakdowns.iter().position(|entry| {
+        entry.provider == provider
+            && entry.model == model
+            && entry.cache_epoch == epoch
+            && entry.request_kind == request_kind
+    });
+    let position = position.unwrap_or_else(|| {
+        totals.breakdowns.push(CacheUsageBreakdownV1 {
+            provider: provider.clone(),
+            model: model.clone(),
+            cache_epoch: epoch.clone(),
+            request_kind,
+            cache_status: CacheStatAvailability::Present,
+            ..CacheUsageBreakdownV1::default()
+        });
+        totals.breakdowns.len() - 1
+    });
+    let breakdown = &mut totals.breakdowns[position];
+    let breakdown_had_input = breakdown.logical_input_tokens > 0;
+    breakdown.logical_input_tokens = breakdown
+        .logical_input_tokens
+        .saturating_add(usage.logical_input);
+    breakdown.uncached_input_tokens = breakdown
+        .uncached_input_tokens
+        .saturating_add(usage.uncached_input);
+    breakdown.cache_read_tokens = breakdown
+        .cache_read_tokens
+        .saturating_add(usage.cache_read_input);
+    breakdown.cache_write_tokens = breakdown
+        .cache_write_tokens
+        .saturating_add(usage.cache_write_input);
+    breakdown.cache_write_5m_tokens = breakdown
+        .cache_write_5m_tokens
+        .saturating_add(usage.cache_write_5m_input);
+    breakdown.cache_write_1h_tokens = breakdown
+        .cache_write_1h_tokens
+        .saturating_add(usage.cache_write_1h_input);
+    breakdown.billed_output_tokens = breakdown
+        .billed_output_tokens
+        .saturating_add(usage.billed_output);
+    breakdown.telemetry_covered_input_tokens = breakdown
+        .telemetry_covered_input_tokens
+        .saturating_add(usage.cache_telemetry_input);
+    if usage.cache_status != CacheStatAvailability::Present {
+        breakdown.cache_status = CacheStatAvailability::Unavailable;
+    }
+    merge_optional_cost(
+        &mut breakdown.input_with_cache_usd,
+        cost.map(|cost| cost.input_with_cache_usd),
+        breakdown_had_input,
+    );
+    merge_optional_cost(
+        &mut breakdown.input_without_cache_usd,
+        cost.map(|cost| cost.input_without_cache_usd),
+        breakdown_had_input,
+    );
+    merge_optional_cost(
+        &mut breakdown.estimated_savings_usd,
+        cost.map(|cost| cost.estimated_savings_usd),
+        breakdown_had_input,
+    );
 }
 
 const FS_TOOL_NAMES: [&str; 3] = ["fs_write", "fs_patch", "fs_edit"];
@@ -502,19 +666,21 @@ fn fs_receipt_lines(name: &str, args: &serde_json::Value) -> (u64, u64) {
 
 /// Incremental fold of one session's committed envelopes (in seq order)
 /// into local stats. Exact across page boundaries: the folder holds the
-/// last cumulative usage snapshot per `(run, agent)` and the model active
-/// at each snapshot, and only reduces on [`SessionFolder::finish`].
+/// last cumulative usage snapshot per
+/// `(run, agent, provider, model, cache epoch, request kind)` and only
+/// reduces on [`SessionFolder::finish`].
 ///
 /// - `model_selected` facts switch the pricing model for LATER usage;
-/// - usage snapshots are cumulative per `(run, agent)` — the last snapshot
-///   wins (summing them would double-count);
+/// - usage snapshots are cumulative per cache/request lane — the last
+///   snapshot wins (summing them would double-count);
 /// - unattributed usage (no account, no subtotals) is skipped, never
 ///   invented onto an account.
 #[derive(Default)]
 pub(crate) struct SessionFolder {
     stats: SessionLocalStats,
     current_model: String,
-    chunks: HashMap<(String, String), (UsagePayload, String)>,
+    chunks:
+        HashMap<(String, String, String, String, String, UsageRequestKind), (UsagePayload, String)>,
 }
 
 impl SessionFolder {
@@ -545,19 +711,27 @@ impl SessionFolder {
                 else {
                     return;
                 };
+                let scope = usage.scope.as_ref();
+                let model = scope
+                    .map(|scope| scope.model.as_str())
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or(&self.current_model)
+                    .to_owned();
                 let key = (
-                    envelope
-                        .run_id
-                        .as_ref()
-                        .map(|run| run.as_str().to_owned())
-                        .unwrap_or_default(),
-                    envelope
-                        .agent_id
-                        .as_ref()
-                        .map(|agent| agent.as_str().to_owned())
-                        .unwrap_or_default(),
+                    scope
+                        .and_then(|scope| scope.run.as_ref())
+                        .or(envelope.run_id.as_ref())
+                        .map_or_else(String::new, |run| run.as_str().to_owned()),
+                    scope
+                        .and_then(|scope| scope.agent.as_ref())
+                        .or(envelope.agent_id.as_ref())
+                        .map_or_else(String::new, |agent| agent.as_str().to_owned()),
+                    scope.map_or_else(String::new, |scope| scope.provider.clone()),
+                    model.clone(),
+                    scope.map_or_else(String::new, |scope| scope.cache_epoch.clone()),
+                    scope.map_or(UsageRequestKind::MainTurn, |scope| scope.request_kind),
                 );
-                self.chunks.insert(key, (usage, self.current_model.clone()));
+                self.chunks.insert(key, (usage, model));
             }
             "item" => {
                 let payload = &envelope.payload;
@@ -594,28 +768,64 @@ impl SessionFolder {
             let model = model.as_str();
             if !usage.accounts.is_empty() {
                 for subtotal in usage.accounts {
-                    let cost = haider_provider::estimate_chunk_cost_usd(
-                        model,
-                        subtotal.input,
-                        subtotal.output,
-                        subtotal.reasoning,
-                        subtotal.cached,
+                    let subtotal_model = subtotal
+                        .scope
+                        .as_ref()
+                        .map(|scope| scope.model.as_str())
+                        .filter(|model| !model.is_empty())
+                        .unwrap_or(model);
+                    let cost = subtotal.normalized.as_ref().map_or_else(
+                        || {
+                            haider_provider::estimate_chunk_cost_usd(
+                                subtotal_model,
+                                subtotal.input,
+                                subtotal.output,
+                                subtotal.reasoning,
+                                subtotal.cached,
+                            )
+                        },
+                        |normalized| {
+                            haider_provider::estimate_normalized_usage_cost_usd(
+                                subtotal_model,
+                                normalized,
+                            )
+                        },
                     );
+                    let cache_cost = subtotal.cache_cost.or_else(|| {
+                        subtotal.normalized.as_ref().and_then(|normalized| {
+                            haider_provider::estimate_cache_input_costs(subtotal_model, normalized)
+                        })
+                    });
                     stats.tokens.entry(subtotal.account).or_default().add(
                         subtotal.input,
                         subtotal.output,
                         subtotal.reasoning,
                         subtotal.cached,
                         cost,
+                        subtotal.normalized.as_ref(),
+                        subtotal.scope.as_ref(),
+                        cache_cost,
                     );
                 }
             } else if let Some(account) = usage.account {
-                let cost = haider_provider::estimate_chunk_cost_usd(
-                    model,
-                    usage.input,
-                    usage.output,
-                    usage.reasoning,
-                    usage.cached,
+                let cache_cost = usage.cache_cost.or_else(|| {
+                    usage.normalized.as_ref().and_then(|normalized| {
+                        haider_provider::estimate_cache_input_costs(model, normalized)
+                    })
+                });
+                let cost = usage.normalized.as_ref().map_or_else(
+                    || {
+                        haider_provider::estimate_chunk_cost_usd(
+                            model,
+                            usage.input,
+                            usage.output,
+                            usage.reasoning,
+                            usage.cached,
+                        )
+                    },
+                    |normalized| {
+                        haider_provider::estimate_normalized_usage_cost_usd(model, normalized)
+                    },
                 );
                 stats.tokens.entry(account).or_default().add(
                     usage.input,
@@ -623,7 +833,17 @@ impl SessionFolder {
                     usage.reasoning,
                     usage.cached,
                     cost,
+                    usage.normalized.as_ref(),
+                    usage.scope.as_ref(),
+                    cache_cost,
                 );
+            }
+        }
+        for totals in stats.tokens.values_mut() {
+            if totals.cache_cost_missing {
+                totals.cache.input_with_cache_usd = None;
+                totals.cache.input_without_cache_usd = None;
+                totals.cache.estimated_savings_usd = None;
             }
         }
         stats
@@ -645,6 +865,7 @@ pub(crate) fn attribute_session(
         entry.output_tokens = entry.output_tokens.saturating_add(tokens.output);
         entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(tokens.reasoning);
         entry.cached_tokens = entry.cached_tokens.saturating_add(tokens.cached);
+        merge_cache_stats(&mut entry.cache, &tokens.cache);
         if let Some(cost) = tokens.est_cost_usd {
             *entry.est_cost_usd.get_or_insert(0.0) += cost;
         }
@@ -661,6 +882,114 @@ pub(crate) fn attribute_session(
             .saturating_add(stats.last_committed_at_ms.saturating_sub(created_at_ms));
         entry.lines_added = entry.lines_added.saturating_add(stats.lines_added);
         entry.lines_removed = entry.lines_removed.saturating_add(stats.lines_removed);
+    }
+}
+
+fn merge_optional_cost(target: &mut Option<f64>, source: Option<f64>, target_had_input: bool) {
+    *target = match (*target, source, target_had_input) {
+        (_, None, _) => None,
+        (Some(left), Some(right), true) => Some(left + right),
+        (_, Some(right), false) => Some(right),
+        (None, Some(_), true) => None,
+    };
+}
+
+fn merge_cache_stats(target: &mut CacheUsageStatsV1, source: &CacheUsageStatsV1) {
+    let target_had_input = target.logical_input_tokens > 0;
+    target.logical_input_tokens = target
+        .logical_input_tokens
+        .saturating_add(source.logical_input_tokens);
+    target.uncached_input_tokens = target
+        .uncached_input_tokens
+        .saturating_add(source.uncached_input_tokens);
+    target.cache_read_tokens = target
+        .cache_read_tokens
+        .saturating_add(source.cache_read_tokens);
+    target.cache_write_tokens = target
+        .cache_write_tokens
+        .saturating_add(source.cache_write_tokens);
+    target.cache_write_5m_tokens = target
+        .cache_write_5m_tokens
+        .saturating_add(source.cache_write_5m_tokens);
+    target.cache_write_1h_tokens = target
+        .cache_write_1h_tokens
+        .saturating_add(source.cache_write_1h_tokens);
+    target.billed_output_tokens = target
+        .billed_output_tokens
+        .saturating_add(source.billed_output_tokens);
+    target.telemetry_covered_input_tokens = target
+        .telemetry_covered_input_tokens
+        .saturating_add(source.telemetry_covered_input_tokens);
+    merge_optional_cost(
+        &mut target.input_with_cache_usd,
+        source.input_with_cache_usd,
+        target_had_input,
+    );
+    merge_optional_cost(
+        &mut target.input_without_cache_usd,
+        source.input_without_cache_usd,
+        target_had_input,
+    );
+    merge_optional_cost(
+        &mut target.estimated_savings_usd,
+        source.estimated_savings_usd,
+        target_had_input,
+    );
+    for source_breakdown in &source.breakdowns {
+        let position = target.breakdowns.iter().position(|entry| {
+            entry.provider == source_breakdown.provider
+                && entry.model == source_breakdown.model
+                && entry.cache_epoch == source_breakdown.cache_epoch
+                && entry.request_kind == source_breakdown.request_kind
+        });
+        let Some(position) = position else {
+            target.breakdowns.push(source_breakdown.clone());
+            continue;
+        };
+        let entry = &mut target.breakdowns[position];
+        let entry_had_input = entry.logical_input_tokens > 0;
+        entry.logical_input_tokens = entry
+            .logical_input_tokens
+            .saturating_add(source_breakdown.logical_input_tokens);
+        entry.uncached_input_tokens = entry
+            .uncached_input_tokens
+            .saturating_add(source_breakdown.uncached_input_tokens);
+        entry.cache_read_tokens = entry
+            .cache_read_tokens
+            .saturating_add(source_breakdown.cache_read_tokens);
+        entry.cache_write_tokens = entry
+            .cache_write_tokens
+            .saturating_add(source_breakdown.cache_write_tokens);
+        entry.cache_write_5m_tokens = entry
+            .cache_write_5m_tokens
+            .saturating_add(source_breakdown.cache_write_5m_tokens);
+        entry.cache_write_1h_tokens = entry
+            .cache_write_1h_tokens
+            .saturating_add(source_breakdown.cache_write_1h_tokens);
+        entry.billed_output_tokens = entry
+            .billed_output_tokens
+            .saturating_add(source_breakdown.billed_output_tokens);
+        entry.telemetry_covered_input_tokens = entry
+            .telemetry_covered_input_tokens
+            .saturating_add(source_breakdown.telemetry_covered_input_tokens);
+        if source_breakdown.cache_status != CacheStatAvailability::Present {
+            entry.cache_status = CacheStatAvailability::Unavailable;
+        }
+        merge_optional_cost(
+            &mut entry.input_with_cache_usd,
+            source_breakdown.input_with_cache_usd,
+            entry_had_input,
+        );
+        merge_optional_cost(
+            &mut entry.input_without_cache_usd,
+            source_breakdown.input_without_cache_usd,
+            entry_had_input,
+        );
+        merge_optional_cost(
+            &mut entry.estimated_savings_usd,
+            source_breakdown.estimated_savings_usd,
+            entry_had_input,
+        );
     }
 }
 

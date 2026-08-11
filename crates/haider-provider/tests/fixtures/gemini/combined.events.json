@@ -1,11 +1,107 @@
 [
-  {"result":"ok","value":{"event":"text_delta","text":"Answer: "}},
-  {"result":"ok","value":{"event":"provider_opaque","provider":"gemini","data":{"kind":"signed_part","part":{"text":"checking","thought":true,"thoughtSignature":"thought-signature-synthetic"}}}},
-  {"result":"ok","value":{"event":"reasoning_delta","text":"checking"}},
-  {"result":"ok","value":{"event":"provider_opaque","provider":"gemini","data":{"kind":"signed_part","call_id":"gemini-call-0000000000000000","part":{"functionCall":{"name":"get_weather","args":{"city":"Tehran"}},"thoughtSignature":"call-signature-synthetic"}}}},
-  {"result":"ok","value":{"event":"tool_call_start","call_id":"gemini-call-0000000000000000","name":"get_weather"}},
-  {"result":"ok","value":{"event":"tool_call_args_delta","call_id":"gemini-call-0000000000000000","args_fragment":"{\"city\":\"Tehran\"}"}},
-  {"result":"ok","value":{"event":"tool_call_end","call_id":"gemini-call-0000000000000000"}},
-  {"result":"ok","value":{"event":"usage_update","input":31,"output":9,"reasoning":4,"cached":3,"source":"provider_reported"}},
-  {"result":"ok","value":{"event":"finish","reason":"tool_use"}}
+  {
+    "result": "ok",
+    "value": {
+      "event": "text_delta",
+      "text": "Answer: "
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "data": {
+        "kind": "signed_part",
+        "part": {
+          "text": "checking",
+          "thought": true,
+          "thoughtSignature": "thought-signature-synthetic"
+        }
+      },
+      "event": "provider_opaque",
+      "provider": "gemini"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "reasoning_delta",
+      "text": "checking"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "data": {
+        "call_id": "gemini-call-0000000000000000",
+        "kind": "signed_part",
+        "part": {
+          "functionCall": {
+            "args": {
+              "city": "Tehran"
+            },
+            "name": "get_weather"
+          },
+          "thoughtSignature": "call-signature-synthetic"
+        }
+      },
+      "event": "provider_opaque",
+      "provider": "gemini"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "call_id": "gemini-call-0000000000000000",
+      "event": "tool_call_start",
+      "name": "get_weather"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "args_fragment": "{\"city\":\"Tehran\"}",
+      "call_id": "gemini-call-0000000000000000",
+      "event": "tool_call_args_delta"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "call_id": "gemini-call-0000000000000000",
+      "event": "tool_call_end"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "cached": 3,
+      "event": "usage_update",
+      "input": 31,
+      "normalized": {
+        "billed_output": 9,
+        "cache_read_input": 3,
+        "cache_status": "present",
+        "cache_telemetry_input": 31,
+        "cache_write_1h_input": 0,
+        "cache_write_5m_input": 0,
+        "cache_write_input": 0,
+        "cache_write_status": "unavailable",
+        "cache_write_ttl_status": "unavailable",
+        "logical_input": 31,
+        "reasoning_accounting": "additional_to_output",
+        "reasoning_detail": 4,
+        "uncached_input": 28
+      },
+      "output": 9,
+      "reasoning": 4,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "finish",
+      "reason": "tool_use"
+    }
+  }
 ]

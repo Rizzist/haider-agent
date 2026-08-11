@@ -4,5 +4,43 @@
   "reasoning": 50,
   "cached": 800,
   "source": "provider_reported",
-  "account": "personal-max"
+  "account": "personal-max",
+  "normalized": {
+    "logical_input": 1800,
+    "uncached_input": 1000,
+    "cache_read_input": 800,
+    "cache_write_input": 200,
+    "cache_write_5m_input": 200,
+    "cache_write_1h_input": 0,
+    "billed_output": 200,
+    "reasoning_detail": 50,
+    "reasoning_accounting": "subset_of_output",
+    "cache_status": "present",
+    "cache_write_status": "present",
+    "cache_write_ttl_status": "present",
+    "cache_telemetry_input": 1800
+  },
+  "scope": {
+    "provider": "anthropic-oauth",
+    "model": "claude-sonnet-5",
+    "account_scope": "personal-max",
+    "auth_scope": "oauth_subscription",
+    "cache_epoch": "epoch-7",
+    "request_kind": "main_turn",
+    "run": "run-7",
+    "prefix_digests": {
+      "system": "system-digest",
+      "tools": "tools-digest",
+      "immutable_history": "history-digest",
+      "model": "model-digest",
+      "auth_mode": "auth-digest",
+      "reasoning_settings": "reasoning-digest"
+    }
+  },
+  "cache_cost": {
+    "input_with_cache_usd": 0.001,
+    "input_without_cache_usd": 0.0054,
+    "estimated_savings_usd": 0.0044,
+    "explicit_storage_usd": 0.0
+  }
 }

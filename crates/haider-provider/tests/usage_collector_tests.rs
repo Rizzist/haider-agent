@@ -19,10 +19,11 @@
 //!   / luisleineweber/usagebar `docs/providers/kimi.md` (string counters).
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 
+use haider_protocol::provider::{CacheStatAvailability, NormalizedUsage, ReasoningAccounting};
 use haider_provider::{
     ANTHROPIC_OAUTH_USAGE_URL, KIMI_OAUTH_USAGE_URL, MeterUnavailable, OPENAI_OAUTH_USAGE_URL,
-    UsageMeterEndpoint, estimate_chunk_cost_usd, model_rate, normalize_utilization,
-    parse_rfc3339_to_unix_ms,
+    UsageMeterEndpoint, estimate_cache_input_costs, estimate_chunk_cost_usd, model_rate,
+    normalize_utilization, parse_rfc3339_to_unix_ms,
 };
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -310,6 +311,94 @@ fn pricing_estimates_known_families_and_refuses_unknown_models() {
         estimate_chunk_cost_usd("claude-haiku-4-5", 0, 0, 0, 0),
         Some(0.0)
     );
+}
+
+/// CM1b — the compatibility pricing fold subtracts cache reads from
+/// subset-style total input instead of charging them twice.
+///
+/// MUTATION CHECK (executed): restore `input*R + cached*C`; the OpenAI cost
+/// becomes 1.35 instead of 0.35 and the Gemini cost becomes 0.327 instead of
+/// 0.057.
+#[test]
+fn cm1b_subset_pricing_does_not_double_count_openai_or_gemini_reads() {
+    let openai = estimate_chunk_cost_usd("gpt-5", 1_000_000, 0, 0, 800_000).expect("OpenAI price");
+    assert!((openai - 0.35).abs() < 1e-12, "OpenAI cost: {openai}");
+    let gemini = estimate_chunk_cost_usd("gemini-2.5-flash", 1_000_000, 0, 0, 900_000)
+        .expect("Gemini price");
+    assert!((gemini - 0.057).abs() < 1e-12, "Gemini cost: {gemini}");
+}
+
+/// CM1e — an Anthropic 1h creation is billed at the registry's 2x write
+/// rate.
+///
+/// MUTATION CHECK (executed): set the 1h multiplier to 1.0; the with-cache
+/// input cost falls from $6 to $3 and this law fails.
+#[test]
+fn cm1e_anthropic_one_hour_write_premium_is_priced() {
+    let usage = NormalizedUsage {
+        logical_input: 1_000_000,
+        uncached_input: 1_000_000,
+        cache_read_input: 0,
+        cache_write_input: 1_000_000,
+        cache_write_5m_input: 0,
+        cache_write_1h_input: 1_000_000,
+        billed_output: 10,
+        reasoning_detail: 10,
+        reasoning_accounting: ReasoningAccounting::SubsetOfOutput,
+        cache_status: CacheStatAvailability::Present,
+        cache_write_status: CacheStatAvailability::Present,
+        cache_write_ttl_status: CacheStatAvailability::Present,
+        cache_telemetry_input: 1_000_000,
+        explicit_cache_storage_token_hours: None,
+    };
+    let cost = estimate_cache_input_costs("claude-sonnet-5", &usage).expect("priced");
+    assert!((cost.input_with_cache_usd - 6.0).abs() < 1e-12);
+    assert!((cost.input_without_cache_usd - 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn cm1_model_registry_prices_gpt56_kimi_deepseek_and_explicit_storage() {
+    let normalized = |uncached: u64, read: u64| NormalizedUsage {
+        logical_input: uncached + read,
+        uncached_input: uncached,
+        cache_read_input: read,
+        billed_output: 0,
+        reasoning_accounting: ReasoningAccounting::SubsetOfOutput,
+        cache_status: CacheStatAvailability::Present,
+        cache_telemetry_input: uncached + read,
+        ..NormalizedUsage::default()
+    };
+
+    let kimi = estimate_cache_input_costs("kimi-k3", &normalized(10_000_000, 90_000_000))
+        .expect("Kimi cache rate");
+    assert!((kimi.input_with_cache_usd - 57.0).abs() < 1e-12);
+
+    let deepseek =
+        estimate_cache_input_costs("deepseek-v4-flash", &normalized(10_000_000, 90_000_000))
+            .expect("DeepSeek cache rate");
+    assert!((deepseek.input_with_cache_usd - 1.652).abs() < 1e-12);
+
+    let terra = estimate_cache_input_costs(
+        "gpt-5.6-terra",
+        &NormalizedUsage {
+            cache_write_input: 2_000_000,
+            cache_write_status: CacheStatAvailability::Present,
+            ..normalized(10_000_000, 90_000_000)
+        },
+    )
+    .expect("GPT-5.6 write surcharge");
+    assert!((terra.input_with_cache_usd - 39.0).abs() < 1e-12);
+
+    let gemini = estimate_cache_input_costs(
+        "gemini-2.5-flash",
+        &NormalizedUsage {
+            explicit_cache_storage_token_hours: Some(2_000_000.0),
+            ..normalized(10_000_000, 90_000_000)
+        },
+    )
+    .expect("Gemini explicit storage");
+    assert!((gemini.input_with_cache_usd - 7.7).abs() < 1e-12);
+    assert!((gemini.explicit_storage_usd - 2.0).abs() < 1e-12);
 }
 
 /// LAW (review-of-record RV4): the anthropic-oauth meter request's REQUIRED
