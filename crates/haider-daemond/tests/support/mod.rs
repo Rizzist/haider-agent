@@ -42,8 +42,19 @@ pub fn test_root(prefix: &str) -> tempfile::TempDir {
         .expect("short temporary root")
 }
 
+/// Hermeticity law for every black-box daemon: integration tests must NEVER
+/// probe the developer machine's real credential stores (codex auth.json,
+/// Claude Keychain, kimi files). Startup auto-adoption (A2) runs whenever
+/// discovery is enabled, so the harness forces it off — a suite that ever
+/// needs live discovery must spawn directly and inject mock stores.
+fn hermetic(config: &DaemonConfig) -> DaemonConfig {
+    let mut config = config.clone();
+    config.discovery_disabled = true;
+    config
+}
+
 pub async fn ready(config: &DaemonConfig) -> DaemonTask {
-    let task = spawn(config.clone());
+    let task = spawn(hermetic(config));
     await_ready(task).await
 }
 
@@ -51,7 +62,7 @@ pub async fn ready_with_dependencies(
     config: &DaemonConfig,
     dependencies: DaemonDependencies,
 ) -> DaemonTask {
-    let task = spawn_with_dependencies(config.clone(), dependencies);
+    let task = spawn_with_dependencies(hermetic(config), dependencies);
     await_ready(task).await
 }
 

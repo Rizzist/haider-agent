@@ -746,7 +746,8 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     .expect("install tracing capture");
     let root = test_root("haoW");
     let store_dir = root.path().join("store");
-    let config = DaemonConfig::new("oauth-wire", store_dir.clone(), root.path());
+    let mut config = DaemonConfig::new("oauth-wire", store_dir.clone(), root.path());
+    config.discovery_disabled = true; // hermetic: direct spawns bypass support::ready
     let server = FakeServer::start().await;
     let vault = Arc::new(MemoryVault::new());
     let deps = dependencies(&server, Arc::clone(&vault));
@@ -1099,6 +1100,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let mut config = DaemonConfig::new("oauth-barrier", root.path().join("store"), root.path());
+    config.discovery_disabled = true; // hermetic: direct spawns bypass support::ready
     config.drain_timeout = Duration::from_millis(100);
     config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
     let server = FakeServer::start().await;
