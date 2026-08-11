@@ -2395,6 +2395,7 @@ async fn validate_kimi_oauth_bundle(bundle: &OAuthTokenBundleV1) -> Result<(), O
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let mut stream = adapter
         .stream_turn(request)

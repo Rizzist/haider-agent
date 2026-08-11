@@ -109,6 +109,34 @@ impl FixedOriginGuard {
         self.validated_addresses().await.map(|_| ())
     }
 
+    /// Validates a caller-constructed endpoint on this pinned origin after
+    /// the caller has independently constrained its dynamic path. This is
+    /// intentionally crate-private and used only for provider resource names
+    /// whose syntax is validated before URL construction.
+    pub(crate) async fn validate_trusted_origin_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> Result<(), ProviderError> {
+        let requested = reqwest::Url::parse(endpoint)
+            .map_err(|_| invalid_origin("fixed provider endpoint is not a valid URL"))?;
+        let Some(allowed) = self.endpoints.first() else {
+            return Err(invalid_origin("fixed provider endpoint set is empty"));
+        };
+        if requested.scheme() != allowed.scheme()
+            || requested.host_str() != allowed.host_str()
+            || requested.port_or_known_default() != allowed.port_or_known_default()
+            || !requested.username().is_empty()
+            || requested.password().is_some()
+            || requested.query().is_some()
+            || requested.fragment().is_some()
+        {
+            return Err(invalid_origin(
+                "credential-bearing provider resource left its pinned origin",
+            ));
+        }
+        self.validated_addresses().await.map(|_| ())
+    }
+
     async fn validated_addresses(&self) -> Result<Arc<[SocketAddr]>, ProviderError> {
         self.validated
             .get_or_init(|| async {

@@ -26,7 +26,7 @@ use haider_protocol::session::{
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
 
 /// Routes each turn to the fake registered for `metadata.provider` — the
@@ -34,6 +34,7 @@ use tokio::time::{Duration, timeout};
 /// (`provider_name` mirrors the session metadata).
 struct RoutingProviderFactory {
     providers: HashMap<String, Arc<FakeProvider>>,
+    cache_reconciliations: Arc<Mutex<Vec<(SessionId, String)>>>,
 }
 
 #[async_trait::async_trait]
@@ -60,6 +61,13 @@ impl ProviderFactory for RoutingProviderFactory {
             attempt_resolver: None,
         })
     }
+
+    async fn reconcile_cache_scope(&self, session_id: &SessionId, provider: &str) {
+        self.cache_reconciliations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((session_id.clone(), provider.to_owned()));
+    }
 }
 
 struct PairSwitchWorld {
@@ -68,6 +76,7 @@ struct PairSwitchWorld {
     manager: WorkerManager,
     session_id: SessionId,
     device_id: DeviceId,
+    cache_reconciliations: Arc<Mutex<Vec<(SessionId, String)>>>,
 }
 
 impl PairSwitchWorld {
@@ -82,6 +91,7 @@ impl PairSwitchWorld {
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
         hub.install_creatable_providers(BTreeSet::from(["fake-a".to_owned(), "fake-b".to_owned()]))
             .expect("install creatable providers");
+        let cache_reconciliations = Arc::new(Mutex::new(Vec::new()));
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
@@ -90,6 +100,7 @@ impl PairSwitchWorld {
                         ("fake-a".to_owned(), fake_a),
                         ("fake-b".to_owned(), fake_b),
                     ]),
+                    cache_reconciliations: Arc::clone(&cache_reconciliations),
                 }),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,
@@ -129,6 +140,7 @@ impl PairSwitchWorld {
             manager,
             session_id,
             device_id,
+            cache_reconciliations,
         }
     }
 
@@ -451,6 +463,17 @@ async fn pair_switch_is_receipted_and_next_turn_resolves_the_new_provider() {
     assert_eq!(fake_b.requests().len(), 1, "turn 2 lands on provider B");
     assert_eq!(fake_b.requests()[0].model, "model-b");
     assert_eq!(fake_a.requests().len(), 1, "provider A saw only turn 1");
+    assert_eq!(
+        *world
+            .cache_reconciliations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![
+            (world.session_id.clone(), "fake-a".to_owned()),
+            (world.session_id.clone(), "fake-b".to_owned()),
+        ],
+        "each ordinary turn reconciles session-owned explicit cache resources after pair resolution"
+    );
 
     world.shutdown().await;
 }
@@ -1484,6 +1507,45 @@ fn opaque_tag_table_and_strip_are_exact() {
         ],
         "same-family facts and text pass through verbatim"
     );
+}
+
+/// Cache boundaries are coordinates in the post-strip provider projection.
+/// Removing a foreign-opaque-only message remaps every later boundary while
+/// leaving the surviving signed/native blocks byte-exact.
+#[test]
+fn cache_boundaries_remap_across_foreign_opaque_removal() {
+    use crate::worker::strip_foreign_provider_opaque_projection;
+    use haider_core::CompiledPromptProjection;
+
+    let kept = Block::ProviderOpaque {
+        provider: "anthropic".into(),
+        data: serde_json::json!({"type": "thinking", "signature": "exact"}),
+    };
+    let mut projection = CompiledPromptProjection {
+        messages: vec![
+            haider_provider::Message::user_text("summary"),
+            haider_provider::Message::assistant(vec![Block::ProviderOpaque {
+                provider: "openai".into(),
+                data: serde_json::json!({"type": "reasoning", "encrypted": "exact"}),
+            }]),
+            haider_provider::Message::assistant(vec![
+                kept.clone(),
+                Block::Text {
+                    text: "stable answer".into(),
+                },
+            ]),
+            haider_provider::Message::user_text("current"),
+        ],
+        stable_history_end: 3,
+        current_user_start: 3,
+        latest_compaction_summary_end: Some(1),
+    };
+    strip_foreign_provider_opaque_projection(&mut projection, "anthropic-oauth");
+    assert_eq!(projection.stable_history_end, 2);
+    assert_eq!(projection.current_user_start, 2);
+    assert_eq!(projection.latest_compaction_summary_end, Some(1));
+    assert_eq!(projection.messages.len(), 3);
+    assert_eq!(projection.messages[1].blocks[0], kept);
 }
 
 /// WH4 daemon half — DeepSeek's adapter already splits prompt misses and

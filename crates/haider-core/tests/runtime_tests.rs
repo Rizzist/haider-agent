@@ -1521,6 +1521,7 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
         store: Arc::clone(&durable_store),
         requests: AtomicUsize::new(0),
         saw_rotation_before_request: AtomicBool::new(false),
+        cache_account: Mutex::new(None),
     });
     let forbidden_second = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
         reason: FinishReason::EndTurn,
@@ -1534,6 +1535,7 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
     });
     let mut durable_config = config();
     durable_config.usage_account = Some(CredentialAlias::new("account-a"));
+    durable_config.cache_reuse_gap_ms = Some(999_999);
     durable_config.provider_attempt_resolver = Some(resolver.clone());
     let durable_handle =
         HarnessActor::spawn(durable_config, primary.clone(), durable_store.clone());
@@ -1549,6 +1551,15 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
     assert_eq!(primary.requests.load(Ordering::SeqCst), 1);
     assert_eq!(alternate.requests.load(Ordering::SeqCst), 1);
     assert!(alternate.saw_rotation_before_request.load(Ordering::SeqCst));
+    assert_eq!(
+        alternate
+            .cache_account
+            .lock()
+            .expect("cache account lock")
+            .clone(),
+        Some(("account-b".to_owned(), None)),
+        "the rotated attempt must leave the old account cache domain and its measured gap"
+    );
     assert!(forbidden_second.requests().is_empty());
     assert_eq!(
         durable_store
@@ -2892,6 +2903,7 @@ struct RotationAwareFinishProvider {
     store: Arc<MemoryStore>,
     requests: AtomicUsize,
     saw_rotation_before_request: AtomicBool,
+    cache_account: Mutex<Option<(String, Option<u64>)>>,
 }
 
 struct ScriptedRotationResolver {
@@ -3034,8 +3046,14 @@ impl Provider for RotationAwareFinishProvider {
         FakeProvider::new(Vec::new()).capabilities().await
     }
 
-    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         self.requests.fetch_add(1, Ordering::SeqCst);
+        *self.cache_account.lock().expect("cache account lock") =
+            request.cache_metadata.and_then(|metadata| {
+                metadata
+                    .account_scope
+                    .map(|account| (account, metadata.reuse_gap_ms))
+            });
         let saw_rotation = self
             .store
             .events(&SessionId::new(SESSION))

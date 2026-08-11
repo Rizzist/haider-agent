@@ -47,9 +47,10 @@ pub(crate) fn request_json(
     effort: Option<&str>,
     fast: bool,
     web_tools: bool,
+    cache_ttl: Option<crate::AnthropicCacheTtl>,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
-    let messages = request
+    let mut messages = request
         .messages
         .iter()
         .map(|message| {
@@ -95,6 +96,27 @@ pub(crate) fn request_json(
             "max_uses": 10,
         }));
     }
+    if let Some(ttl) = cache_ttl {
+        if let Some(tool) = tools.last_mut().and_then(serde_json::Value::as_object_mut) {
+            tool.insert("cache_control".into(), anthropic_cache_control(ttl));
+        }
+        if let Some(metadata) = &request.cache_metadata {
+            if let Some(boundary) = metadata.latest_compaction_summary_end {
+                annotate_anthropic_message_boundary(
+                    &mut messages,
+                    &request.messages,
+                    boundary,
+                    ttl,
+                );
+            }
+            annotate_anthropic_message_boundary(
+                &mut messages,
+                &request.messages,
+                metadata.stable_history_end,
+                ttl,
+            );
+        }
+    }
     let mut payload = serde_json::json!({
         "model": request.model,
         "max_tokens": request.max_tokens,
@@ -110,7 +132,18 @@ pub(crate) fn request_json(
     match system_shape {
         AnthropicSystemShape::ApiKey => {
             if let Some(system) = &request.system_prompt {
-                object.insert("system".into(), serde_json::Value::String(system.clone()));
+                if let Some(ttl) = cache_ttl {
+                    object.insert(
+                        "system".into(),
+                        serde_json::json!([{
+                            "type": "text",
+                            "text": system,
+                            "cache_control": anthropic_cache_control(ttl),
+                        }]),
+                    );
+                } else {
+                    object.insert("system".into(), serde_json::Value::String(system.clone()));
+                }
             }
         }
         AnthropicSystemShape::OAuthClaudeCode => {
@@ -119,7 +152,13 @@ pub(crate) fn request_json(
                 "text": ANTHROPIC_OAUTH_SYSTEM_IDENTITY,
             })];
             if let Some(system) = &request.system_prompt {
-                blocks.push(serde_json::json!({"type": "text", "text": system}));
+                let mut block = serde_json::json!({"type": "text", "text": system});
+                if let Some(ttl) = cache_ttl
+                    && let Some(object) = block.as_object_mut()
+                {
+                    object.insert("cache_control".into(), anthropic_cache_control(ttl));
+                }
+                blocks.push(block);
             }
             object.insert("system".into(), serde_json::Value::Array(blocks));
         }
@@ -142,6 +181,43 @@ pub(crate) fn request_json(
         object.insert("speed".into(), serde_json::json!("fast"));
     }
     Ok(payload)
+}
+
+fn anthropic_cache_control(ttl: crate::AnthropicCacheTtl) -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral", "ttl": ttl.wire()})
+}
+
+fn annotate_anthropic_message_boundary(
+    wire_messages: &mut [serde_json::Value],
+    source_messages: &[crate::Message],
+    boundary: usize,
+    ttl: crate::AnthropicCacheTtl,
+) {
+    if boundary == 0 || boundary > wire_messages.len() || boundary > source_messages.len() {
+        return;
+    }
+    // Provider-opaque blocks may carry signatures over their exact object.
+    // If one terminates the requested boundary, omit this breakpoint instead
+    // of mutating or traversing that provider-owned value.
+    if source_messages[boundary - 1]
+        .blocks
+        .last()
+        .is_none_or(|block| matches!(block, Block::ProviderOpaque { .. }))
+    {
+        return;
+    }
+    let Some(content) = wire_messages[boundary - 1]
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    if let Some(object) = content
+        .last_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        object.insert("cache_control".into(), anthropic_cache_control(ttl));
+    }
 }
 
 /// Shapes one custom tool `input_schema` for Anthropic's Messages API, which

@@ -62,8 +62,8 @@ use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::BoundedResult;
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
-    Message, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition,
-    TurnRequest,
+    Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment,
+    ToolDefinition, TurnRequest, canonical_tool_definitions_digest,
 };
 use haider_tools::{RequestInput, TodoWrite};
 use std::collections::{HashMap, VecDeque};
@@ -126,6 +126,17 @@ pub struct HarnessConfig {
     /// Non-secret provider/model/auth/cache-domain coordinates attached to
     /// usage telemetry after the provider response is decoded.
     pub usage_scope: UsageScope,
+    /// Compiler-provided exclusive end of immutable history. `None` keeps
+    /// standalone callers on the structural current-user boundary.
+    pub cache_stable_history_end: Option<usize>,
+    /// Compiler-provided current-user start for adapter cache metadata.
+    pub cache_current_user_start: Option<usize>,
+    /// Exclusive end of the latest active compaction-summary message.
+    pub cache_compaction_summary_end: Option<usize>,
+    /// Conservative future-read expectation for explicit cache resources.
+    pub cache_expected_later_reads: u32,
+    /// Observed gap in the current ephemeral cache domain.
+    pub cache_reuse_gap_ms: Option<u64>,
     /// Canonical provider-visible reasoning/fast settings used only for the
     /// prefix digest. It never enters a request body from this field.
     pub reasoning_settings: String,
@@ -185,6 +196,11 @@ impl HarnessConfig {
             attachments: Vec::new(),
             usage_account: None,
             usage_scope: UsageScope::default(),
+            cache_stable_history_end: None,
+            cache_current_user_start: None,
+            cache_compaction_summary_end: None,
+            cache_expected_later_reads: 0,
+            cache_reuse_gap_ms: None,
             reasoning_settings: String::new(),
             initial_rotation: None,
             rotation_budget_consumed: false,
@@ -948,8 +964,21 @@ impl HarnessActor {
         // The compiler always places the accepted current user message last.
         // Everything before it is the only prefix eligible for mid-turn
         // forced compaction; current-run content remains a verbatim suffix.
-        let current_turn_start = messages.len().saturating_sub(1);
-        let mut stable_history_end = current_turn_start;
+        let structural_current_turn_start = messages.len().saturating_sub(1);
+        let mut current_turn_start = self
+            .config
+            .cache_current_user_start
+            .filter(|boundary| *boundary <= structural_current_turn_start)
+            .unwrap_or(structural_current_turn_start);
+        let mut stable_history_end = self
+            .config
+            .cache_stable_history_end
+            .filter(|boundary| *boundary <= current_turn_start)
+            .unwrap_or(current_turn_start);
+        let mut latest_compaction_summary_end = self
+            .config
+            .cache_compaction_summary_end
+            .filter(|boundary| *boundary <= stable_history_end);
 
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
@@ -1143,6 +1172,8 @@ impl HarnessActor {
                 // immutable summary message; the current-turn suffix stays
                 // verbatim after it.
                 stable_history_end = usize::from(!messages.is_empty());
+                current_turn_start = stable_history_end;
+                latest_compaction_summary_end = Some(stable_history_end);
             }
             if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
@@ -1162,18 +1193,41 @@ impl HarnessActor {
                     .await;
             }
             provider_attempt = provider_attempt.saturating_add(1);
-            let provider_request = TurnRequest {
+            let mut prefix_digests = usage_prefix_digests(
+                &self.config,
+                &messages[..stable_history_end.min(messages.len())],
+            );
+            let mut cache_metadata = prompt_cache_metadata(
+                &self.config,
+                &messages,
+                stable_history_end,
+                current_turn_start,
+                latest_compaction_summary_end,
+                prefix_digests.clone(),
+                usage_account.as_ref(),
+            );
+            let mut provider_request = TurnRequest {
                 messages: messages.clone(),
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
                 system_prompt: self.config.system_prompt.clone(),
                 tools: self.config.tools.clone(),
                 attachments: self.config.attachments.clone(),
+                cache_metadata: Some(cache_metadata.clone()),
             };
-            let prefix_digests = usage_prefix_digests(
-                &self.config,
-                &messages[..stable_history_end.min(messages.len())],
-            );
+            if let Some(rendered) = provider.rendered_cache_prefix_digests(&provider_request) {
+                prefix_digests = rendered;
+                cache_metadata = prompt_cache_metadata(
+                    &self.config,
+                    &messages,
+                    stable_history_end,
+                    current_turn_start,
+                    latest_compaction_summary_end,
+                    prefix_digests.clone(),
+                    usage_account.as_ref(),
+                );
+                provider_request.cache_metadata = Some(cache_metadata.clone());
+            }
             let mut request_usage: Option<Usage> = None;
             let attempt_provider = Arc::clone(&provider);
             let mut opening = Box::pin(attempt_provider.stream_turn(provider_request));
@@ -1683,6 +1737,7 @@ impl HarnessActor {
                             &self.config,
                             &run_id,
                             prefix_digests.clone(),
+                            &cache_metadata.cache_epoch,
                             &mut usage,
                         );
                         if let Some(account) = &usage_account {
@@ -4340,7 +4395,7 @@ fn digest_json(value: &impl serde::Serialize) -> String {
 fn usage_prefix_digests(config: &HarnessConfig, immutable_history: &[Message]) -> PrefixDigests {
     PrefixDigests {
         system: digest_json(&config.system_prompt),
-        tools: digest_json(&config.tools),
+        tools: canonical_tool_definitions_digest(&config.tools),
         immutable_history: digest_json(&immutable_history),
         model: digest_json(&config.model),
         auth_mode: digest_json(&config.usage_scope.auth_scope),
@@ -4348,13 +4403,70 @@ fn usage_prefix_digests(config: &HarnessConfig, immutable_history: &[Message]) -
     }
 }
 
+fn prompt_cache_metadata(
+    config: &HarnessConfig,
+    messages: &[Message],
+    stable_history_end: usize,
+    current_user_start: usize,
+    latest_compaction_summary_end: Option<usize>,
+    prefix_digests: PrefixDigests,
+    account_scope: Option<&CredentialAlias>,
+) -> PromptCacheMetadata {
+    let stable_history_end = stable_history_end.min(messages.len());
+    let current_user_start = current_user_start.min(messages.len());
+    let latest_compaction_summary_end = latest_compaction_summary_end
+        .filter(|boundary| *boundary > 0 && *boundary <= stable_history_end);
+    let compaction_epoch = latest_compaction_summary_end.map_or_else(
+        || digest_json(&"root-compaction-epoch"),
+        |boundary| digest_json(&messages[boundary - 1]),
+    );
+    let cache_epoch = digest_json(&serde_json::json!({
+        "provider": config.usage_scope.provider,
+        "model": config.model,
+        "account_scope": account_scope,
+        "system_digest": prefix_digests.system,
+        "tool_digest": prefix_digests.tools,
+        "auth_digest": prefix_digests.auth_mode,
+        "reasoning_digest": prefix_digests.reasoning_settings,
+        "compaction_epoch": compaction_epoch,
+    }));
+    let stable_prefix_tokens = estimate_provider_request_input_tokens(
+        &messages[..stable_history_end],
+        &config.system_prompt,
+        &config.tools,
+        &[],
+    );
+    PromptCacheMetadata {
+        stable_history_end,
+        current_user_start,
+        latest_compaction_summary_end,
+        prefix_digests,
+        cache_epoch,
+        compaction_epoch,
+        provider: config.usage_scope.provider.clone(),
+        session_scope: config.session_id.as_str().to_owned(),
+        account_scope: account_scope.map(|scope| scope.as_str().to_owned()),
+        stable_prefix_tokens,
+        expected_later_reads: config.cache_expected_later_reads,
+        // The daemon measured this gap for the initially resolved account.
+        // A pre-first-event account rotation creates a different cache
+        // domain, so retain the conservative unknown-gap/5m fallback until a
+        // later turn can measure that account from durable usage telemetry.
+        reuse_gap_ms: (account_scope == config.usage_account.as_ref())
+            .then_some(config.cache_reuse_gap_ms)
+            .flatten(),
+    }
+}
+
 fn attach_usage_scope_and_cost(
     config: &HarnessConfig,
     run_id: &RunId,
     prefix_digests: PrefixDigests,
+    cache_epoch: &str,
     usage: &mut Usage,
 ) {
     let mut scope = config.usage_scope.clone();
+    scope.cache_epoch = cache_epoch.to_owned();
     scope.run = Some(run_id.clone());
     scope.agent = config.agent_id.clone();
     if scope.agent.is_some() && scope.request_kind == UsageRequestKind::MainTurn {
@@ -4678,13 +4790,13 @@ mod usage_tests {
         assert_eq!(cumulative.cached, u64::MAX);
     }
 
-    /// CM1h — no-op session configuration keeps system/tool/model/auth/
+    /// CM2a — no-op session configuration keeps system/tool/model/auth/
     /// reasoning digests stable while immutable history grows append-only.
     ///
     /// MUTATION CHECK (executed): salt the tool digest per request or hash
     /// history into it; the successive equality assertion fails.
     #[test]
-    fn cm1h_prefix_digest_baseline_is_stable_across_append_only_history() {
+    fn cm2a_system_and_tool_digests_are_stable_across_append_only_history() {
         let mut config = HarnessConfig::for_session(
             SessionId::new("digest-session"),
             DeviceId::new("digest-device"),
@@ -4715,6 +4827,43 @@ mod usage_tests {
         assert_ne!(
             first.immutable_history, second.immutable_history,
             "append-only history has its own diagnostic digest"
+        );
+
+        // Executed mutation: perturb each owned digest input independently.
+        // Omitting either input from the implementation kills these checks.
+        let mut changed_system = config.clone();
+        changed_system.system_prompt = Some("mutated system".into());
+        assert_ne!(
+            first.system,
+            usage_prefix_digests(&changed_system, &first_history).system
+        );
+        let mut changed_tools = config;
+        changed_tools.tools[0].description.push_str(" mutated");
+        assert_ne!(
+            first.tools,
+            usage_prefix_digests(&changed_tools, &first_history).tools
+        );
+
+        // Haider owns tool schemas, so key insertion order is canonicalized
+        // for the diagnostic/cache-domain digest without changing wire bytes.
+        let mut left_schema = serde_json::Map::new();
+        left_schema.insert("zeta".into(), serde_json::json!({"type": "string"}));
+        left_schema.insert("alpha".into(), serde_json::json!({"type": "number"}));
+        let mut right_schema = serde_json::Map::new();
+        right_schema.insert("alpha".into(), serde_json::json!({"type": "number"}));
+        right_schema.insert("zeta".into(), serde_json::json!({"type": "string"}));
+        let schema_tool = |input_schema| ToolDefinition {
+            name: "canonical".into(),
+            description: "canonical".into(),
+            input_schema,
+        };
+        assert_eq!(
+            canonical_tool_definitions_digest(&[schema_tool(serde_json::Value::Object(
+                left_schema
+            ))]),
+            canonical_tool_definitions_digest(&[schema_tool(serde_json::Value::Object(
+                right_schema
+            ))])
         );
     }
 }

@@ -187,6 +187,7 @@ fn two_turn_tool_roundtrip_continuation_payload_is_stable() {
         system_prompt: None,
         tools: vec![weather_tool()],
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let actual = provider
         .request_payload(&request)
@@ -238,6 +239,7 @@ fn gemini_opaque_roundtrips_and_foreign_provider_opaque_is_rejected() {
         system_prompt: None,
         tools: vec![weather_tool()],
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let payload = provider("gemini-2.5-flash")
         .request_payload(&request)
@@ -268,6 +270,7 @@ fn missing_or_ambiguous_call_id_to_name_mapping_is_rejected_locally() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let error = provider("gemini-2.5-flash")
         .request_payload(&missing)
@@ -329,6 +332,7 @@ fn request_payload_maps_system_tools_results_and_inline_images() {
             artifact: image,
             data_base64: "iVBORw0KGgo=".into(),
         }],
+        cache_metadata: None,
     };
     let payload = provider("gemini-2.5-flash")
         .request_payload(&request)
@@ -502,6 +506,7 @@ fn sparse_history_call_index_continues_past_the_greatest_not_the_count() {
         system_prompt: None,
         tools: vec![weather_tool()],
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let items = haider_provider::replay_gemini_sse_for_request(&request, &bytes)
         .expect("request-aware replay");
@@ -533,6 +538,7 @@ fn effort_injects_thinking_level_for_3x_models_only() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
 
     let payload = provider("gemini-3-flash")
@@ -594,6 +600,7 @@ fn web_builtins_declare_on_3x_beside_function_declarations_and_never_on_25() {
         system_prompt: None,
         tools: vec![weather_tool()],
         attachments: Vec::new(),
+        cache_metadata: None,
     };
 
     let payload = provider("gemini-3-flash")

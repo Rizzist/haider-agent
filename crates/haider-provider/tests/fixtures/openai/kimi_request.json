@@ -12,6 +12,7 @@
     }
   ],
   "max_completion_tokens": 1,
+  "prompt_cache_key": "8940b263eab54a9c365e416ec4ea7c3e7c39564f6793a9731dbfc30215bafc55",
   "stream": true,
   "stream_options": {
     "include_usage": true

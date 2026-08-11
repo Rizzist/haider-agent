@@ -318,6 +318,7 @@ fn wh1_deepseek_factory_builds_api_key_adapter() {
         "deepseek-reasoner",
         &alias,
         &ProviderTuning::default(),
+        None,
     )
     .expect("build DeepSeek adapter");
     assert_eq!(
@@ -334,6 +335,7 @@ fn wh1_deepseek_factory_builds_api_key_adapter() {
         "deepseek-reasoner",
         &alias,
         &ProviderTuning::default(),
+        None,
     );
     let Err(oauth) = oauth else {
         panic!("DeepSeek OAuth must not cross-wire");
@@ -1482,6 +1484,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         "gpt-oauth",
         &wrong_alias,
         &crate::accounts::ProviderTuning::default(),
+        None,
     );
     let Err(error) = result else {
         panic!("OAuth provider ID must reject API-key mode");

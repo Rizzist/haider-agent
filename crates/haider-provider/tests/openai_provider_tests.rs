@@ -431,6 +431,7 @@ fn responses_payload_uses_native_input_tools_and_reasoning_summary() {
             }),
         }],
         attachments: Vec::new(),
+        cache_metadata: None,
     };
 
     let payload = provider
@@ -458,6 +459,7 @@ fn compatible_payload_uses_chat_completions_lingua_franca() {
         system_prompt: Some("Brief.".into()),
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
 
     let payload = provider.request_payload(&request).expect("Chat payload");
@@ -618,6 +620,7 @@ fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
 
     let payload = provider

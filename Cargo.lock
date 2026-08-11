@@ -1103,6 +1103,7 @@ name = "haider-provider"
 version = "0.0.86"
 dependencies = [
  "async-trait",
+ "blake3",
  "haider-accounts",
  "haider-protocol",
  "httpdate",

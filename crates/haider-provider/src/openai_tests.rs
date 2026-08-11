@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::{Message, PromptCacheMetadata, ToolDefinition};
 use haider_accounts::{MemoryVault, Vault};
+use haider_protocol::provider::PrefixDigests;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -923,7 +925,255 @@ fn probe_request(model: &str) -> TurnRequest {
         system_prompt: Some("Be terse.".to_owned()),
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     }
+}
+
+fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetadata {
+    PromptCacheMetadata {
+        stable_history_end,
+        current_user_start: stable_history_end,
+        latest_compaction_summary_end: Some(1),
+        prefix_digests: PrefixDigests {
+            system: "system-a".into(),
+            tools: "tools-a".into(),
+            immutable_history: "history-a".into(),
+            model: "model-a".into(),
+            auth_mode: "auth-a".into(),
+            reasoning_settings: "reasoning-a".into(),
+        },
+        cache_epoch: "epoch-a".into(),
+        compaction_epoch: "compaction-a".into(),
+        provider: provider.into(),
+        session_scope: "session-a".into(),
+        account_scope: Some("account-a".into()),
+        stable_prefix_tokens: 8_192,
+        expected_later_reads: 2,
+        reuse_gap_ms: Some(10_000),
+    }
+}
+
+fn remove_openai_cache_metadata(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            values.iter_mut().for_each(remove_openai_cache_metadata);
+        }
+        serde_json::Value::Object(values) => {
+            values.remove("prompt_cache_key");
+            values.remove("prompt_cache_options");
+            values.remove("prompt_cache_breakpoint");
+            values.values_mut().for_each(remove_openai_cache_metadata);
+        }
+        _ => {}
+    }
+}
+
+/// CM2d — the routing key is a cache-domain key, not a turn/run key. It is
+/// stable under append-only history and changes for every required domain
+/// component.
+///
+/// MUTATION CHECK (executed): add message count to the domain, or omit the
+/// system/tool/compaction component; one of these assertions fails.
+#[test]
+fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
+    let mut request = probe_request("gpt-5.6");
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let metadata = request.cache_metadata.as_ref().expect("metadata");
+    let first = derive_prompt_cache_key(&request, metadata);
+    request.messages.push(Message::assistant(vec![Block::Text {
+        text: "append-only answer".into(),
+    }]));
+    let second =
+        derive_prompt_cache_key(&request, request.cache_metadata.as_ref().expect("metadata"));
+    assert_eq!(first, second, "history growth is outside the cache domain");
+
+    for mutate in ["account", "system", "tools", "compaction"] {
+        let mut changed = request.cache_metadata.clone().expect("metadata");
+        match mutate {
+            "account" => changed.account_scope = Some("account-b".into()),
+            "system" => changed.prefix_digests.system.push_str("-changed"),
+            "tools" => changed.prefix_digests.tools.push_str("-changed"),
+            "compaction" => changed.compaction_epoch.push_str("-changed"),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            first,
+            derive_prompt_cache_key(&request, &changed),
+            "{mutate}"
+        );
+    }
+}
+
+/// GPT-5.6 gets explicit breakpoints plus the stable cache key. The volatile
+/// current-user suffix is deliberately beyond the final marker.
+#[test]
+fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
+    let mut request = TurnRequest {
+        messages: vec![
+            Message::user_text("summary"),
+            Message::user_text("stable history"),
+            Message::user_text("volatile current turn"),
+        ],
+        model: "gpt-5.6".into(),
+        max_tokens: 256,
+        system_prompt: Some("stable system".into()),
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        cache_metadata: Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 2)),
+    };
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("metadata")
+        .current_user_start = 2;
+    let payload = responses_request_json(&request, false, None, false).expect("GPT-5.6 wire");
+    assert!(payload.get("prompt_cache_key").is_some());
+    assert_eq!(
+        payload["prompt_cache_options"],
+        serde_json::json!({"mode": "explicit", "ttl": "30m"})
+    );
+    assert_eq!(
+        payload["input"][0]["content"][0]["prompt_cache_breakpoint"],
+        serde_json::json!({"mode": "explicit"})
+    );
+    assert_eq!(
+        payload["input"][1]["content"][0]["prompt_cache_breakpoint"],
+        serde_json::json!({"mode": "explicit"})
+    );
+    assert!(
+        payload["input"][2]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none(),
+        "volatile suffix must not be explicitly written: {payload}"
+    );
+}
+
+/// CM2f — Codex subscription/lite caching is unverified and therefore keeps
+/// its exact CM1 full-history request even when compiler metadata is present.
+#[test]
+fn cm2f_openai_lite_is_byte_exact_without_cache_annotations() {
+    let mut request = probe_request("gpt-5.6-sol");
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let with_metadata = responses_request_json(&request, true, None, false).expect("fallback");
+    request.cache_metadata = None;
+    let baseline = responses_request_json(&request, true, None, false).expect("CM1 wire");
+    assert_eq!(with_metadata, baseline);
+    assert!(!with_metadata.to_string().contains("prompt_cache"));
+}
+
+/// CM2g — strip only the new cache keys and the GPT-5.6 request becomes the
+/// byte-equivalent unannotated request, including provider-opaque reasoning
+/// and provider-produced tool arguments in their original order.
+///
+/// MUTATION CHECK (executed): normalize/reorder the opaque object or tool
+/// arguments, or omit a message while adding markers; equality fails.
+#[test]
+fn cm2g_openai_cache_keys_do_not_change_model_visible_content() {
+    let opaque = serde_json::json!({
+        "type": "reasoning",
+        "id": "reasoning-1",
+        "encrypted_content": "signed-provider-bytes"
+    });
+    let args = serde_json::json!({"z": 1, "a": {"second": 2, "first": 1}});
+    let mut request = TurnRequest {
+        messages: vec![
+            Message::user_text("summary"),
+            Message::assistant(vec![
+                Block::ProviderOpaque {
+                    provider: OPENAI_PROVIDER_NAME.into(),
+                    data: opaque,
+                },
+                Block::ToolCall {
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    args,
+                },
+            ]),
+            Message::user_text("current"),
+        ],
+        model: "gpt-5.6".into(),
+        max_tokens: 256,
+        system_prompt: Some("system".into()),
+        tools: vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "lookup".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }],
+        attachments: Vec::new(),
+        cache_metadata: Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 2)),
+    };
+    let mut annotated =
+        responses_request_json(&request, false, None, false).expect("annotated wire");
+    remove_openai_cache_metadata(&mut annotated);
+    request.cache_metadata = None;
+    let baseline = responses_request_json(&request, false, None, false).expect("baseline wire");
+    assert_eq!(annotated, baseline);
+}
+
+#[test]
+fn cm2g_kimi_cache_key_preserves_thinking_tools_and_arguments() {
+    let mut request = TurnRequest {
+        messages: vec![
+            Message::user_text("stable"),
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "call-kimi".into(),
+                name: "lookup".into(),
+                args: serde_json::json!({"z": 1, "a": {"second": 2, "first": 1}}),
+            }]),
+            Message::tool_result("call-kimi", "exact result", false),
+        ],
+        model: "kimi-coding-a".into(),
+        max_tokens: 256,
+        system_prompt: Some("stable system".into()),
+        tools: vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "exact tool".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"z": {"type": "number"}, "a": {"type": "object"}}
+            }),
+        }],
+        attachments: Vec::new(),
+        cache_metadata: Some(cm2_cache_metadata(KIMI_OAUTH_PROVIDER_NAME, 2)),
+    };
+    let thinking = KimiThinkingConfig {
+        thinking_type: KimiThinkingType::Enabled,
+        effort: Some("high".into()),
+        keep: Some("all".into()),
+    };
+    let mut annotated = chat_request_json(
+        &request,
+        CompatibleDialect::KimiOAuth,
+        Some(&thinking),
+        Some("high"),
+    )
+    .expect("annotated Kimi wire");
+    annotated
+        .as_object_mut()
+        .expect("Kimi object")
+        .remove("prompt_cache_key");
+    request.cache_metadata = None;
+    let baseline = chat_request_json(
+        &request,
+        CompatibleDialect::KimiOAuth,
+        Some(&thinking),
+        Some("high"),
+    )
+    .expect("baseline Kimi wire");
+    assert_eq!(annotated, baseline);
+}
+
+#[test]
+fn cm2f_unknown_compatible_endpoint_is_byte_exact_without_annotations() {
+    let mut request = probe_request("unknown-local-model");
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_COMPATIBLE_PROVIDER_NAME, 1));
+    let with_metadata = chat_request_json(&request, CompatibleDialect::Generic, None, None)
+        .expect("unknown compatible fallback");
+    request.cache_metadata = None;
+    let baseline = chat_request_json(&request, CompatibleDialect::Generic, None, None)
+        .expect("CM1 compatible wire");
+    assert_eq!(with_metadata, baseline);
+    assert!(!with_metadata.to_string().contains("prompt_cache"));
 }
 
 /// MUTATION CHECK (W5f-2d): in `responses_request_json`, keep inserting
@@ -1121,6 +1371,7 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: Some(cm2_cache_metadata(KIMI_OAUTH_PROVIDER_NAME, 1)),
     };
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/openai/kimi_request.json"))
@@ -1138,6 +1389,38 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
         b"Bearer KIMI_ACCESS_SENTINEL_2d47"
     );
     assert!(authorization.is_sensitive());
+
+    let first_key = payload["prompt_cache_key"]
+        .as_str()
+        .expect("Kimi session cache key");
+    let mut next_turn = request.clone();
+    next_turn
+        .messages
+        .push(Message::assistant(vec![Block::Text {
+            text: "append-only history".into(),
+        }]));
+    let next_key = provider
+        .request_payload(&next_turn)
+        .expect("next Kimi turn")["prompt_cache_key"]
+        .as_str()
+        .expect("next Kimi cache key")
+        .to_owned();
+    assert_eq!(
+        first_key, next_key,
+        "append-only turns share the session key"
+    );
+    next_turn
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .session_scope = "session-b".into();
+    let other_session_key = provider
+        .request_payload(&next_turn)
+        .expect("other Kimi session")["prompt_cache_key"]
+        .as_str()
+        .expect("other Kimi cache key")
+        .to_owned();
+    assert_ne!(first_key, other_session_key, "Kimi keys are session-scoped");
 
     let thinking = provider
         .with_kimi_thinking(KimiThinkingConfig {
@@ -1157,9 +1440,11 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
 /// WH2 — a named DeepSeek turn is rooted at `/chat/completions`, carries a
 /// sensitive Bearer key, and sends the selected DeepSeek slug in `model`.
 ///
+/// CM2f also rides rich cache metadata through this unsupported endpoint and
+/// proves the existing golden remains byte-exact with no annotation.
 /// MUTATION CHECK: route through generic compatible endpoint expansion,
-/// remove Bearer, or substitute the configured model. The exact URL/header
-/// and request golden below all fail independently.
+/// remove Bearer, substitute the configured model, or annotate the unknown
+/// dialect. The exact URL/header and request golden all fail independently.
 #[tokio::test]
 async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
     let vault = MemoryVault::new();
@@ -1185,6 +1470,7 @@ async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: Some(cm2_cache_metadata(DEEPSEEK_PROVIDER_NAME, 1)),
     };
     let payload = provider
         .request_payload(&request)
@@ -1382,6 +1668,7 @@ fn kimi_reasoning_effort_is_top_level_and_kimi_only() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let payload = provider.request_payload(&request).expect("Kimi payload");
     assert_eq!(payload["reasoning_effort"], "max");
@@ -1519,6 +1806,7 @@ fn assistant_history_replays_as_output_text() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     for lite in [true, false] {
         let payload = responses_request_json(&request, lite, None, false).expect("payload");
@@ -1589,6 +1877,7 @@ async fn lz1_azure_request_rides_api_key_header_and_deployment_model() {
             system_prompt: None,
             tools: Vec::new(),
             attachments: Vec::new(),
+            cache_metadata: None,
         })
         .expect("azure chat payload");
     assert_eq!(

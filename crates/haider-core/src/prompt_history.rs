@@ -31,6 +31,38 @@ pub trait ArtifactReader: Send + Sync {
 /// Branch/agent-scoped committed-history compiler.
 pub struct PromptHistoryCompiler;
 
+/// Provider-facing prompt projection plus ephemeral cache boundaries.
+///
+/// The message vector is byte-for-byte the same projection returned by the
+/// legacy compiler entry points. Boundary metadata is deliberately separate
+/// from the journal so request adapters can annotate cacheable prefixes
+/// without changing replay or compaction semantics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledPromptProjection {
+    pub messages: Vec<Message>,
+    /// Exclusive end of immutable completed history.
+    pub stable_history_end: usize,
+    /// Index of the accepted current-user message, or `messages.len()` for an
+    /// idle projection.
+    pub current_user_start: usize,
+    /// Exclusive end of the latest active compaction-summary message.
+    pub latest_compaction_summary_end: Option<usize>,
+}
+
+impl CompiledPromptProjection {
+    fn from_rendered(rendered: RenderedJournal) -> Self {
+        let current_user_start = rendered
+            .current_user_start
+            .unwrap_or(rendered.messages.len());
+        Self {
+            stable_history_end: current_user_start,
+            current_user_start,
+            latest_compaction_summary_end: None,
+            messages: rendered.messages,
+        }
+    }
+}
+
 impl PromptHistoryCompiler {
     /// Compiles the active durable tree. This entry point is sufficient for an
     /// uncompacted tree; encountering a committed compaction without a CAS
@@ -42,6 +74,21 @@ impl PromptHistoryCompiler {
         agent_id: Option<&AgentId>,
         current_run: &RunId,
     ) -> Result<Vec<Message>, HaiderError> {
+        Self::compile_provider_projection(store, session_id, branch_id, agent_id, current_run)
+            .await
+            .map(|projection| projection.messages)
+    }
+
+    /// Compiles the active durable tree with provider-neutral cache boundary
+    /// metadata. This is additive; [`Self::compile`] retains its exact return
+    /// type and message bytes for existing consumers.
+    pub async fn compile_provider_projection(
+        store: &dyn StoreHandle,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+        current_run: &RunId,
+    ) -> Result<CompiledPromptProjection, HaiderError> {
         Self::compile_projection(store, None, session_id, branch_id, agent_id, current_run).await
     }
 
@@ -55,6 +102,28 @@ impl PromptHistoryCompiler {
         agent_id: Option<&AgentId>,
         current_run: &RunId,
     ) -> Result<Vec<Message>, HaiderError> {
+        Self::compile_provider_projection_with_artifacts(
+            store,
+            artifacts,
+            session_id,
+            branch_id,
+            agent_id,
+            current_run,
+        )
+        .await
+        .map(|projection| projection.messages)
+    }
+
+    /// Artifact-resolving compiler entry point with ephemeral cache boundary
+    /// metadata for the live provider projection.
+    pub async fn compile_provider_projection_with_artifacts(
+        store: &dyn StoreHandle,
+        artifacts: &dyn ArtifactReader,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+        current_run: &RunId,
+    ) -> Result<CompiledPromptProjection, HaiderError> {
         Self::compile_projection(
             store,
             Some(artifacts),
@@ -95,7 +164,7 @@ impl PromptHistoryCompiler {
         branch_id: Option<&BranchId>,
         agent_id: Option<&AgentId>,
         current_run: &RunId,
-    ) -> Result<Vec<Message>, HaiderError> {
+    ) -> Result<CompiledPromptProjection, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
         if legacy_journal_only(&envelopes, branch_id, agent_id) {
             return render_journal(
@@ -106,7 +175,7 @@ impl PromptHistoryCompiler {
                 Some(current_run),
                 true,
             )
-            .map(|rendered| rendered.messages);
+            .map(CompiledPromptProjection::from_rendered);
         }
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
         let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
@@ -121,7 +190,7 @@ impl PromptHistoryCompiler {
                 Some(current_run),
                 true,
             )
-            .map(|rendered| rendered.messages);
+            .map(CompiledPromptProjection::from_rendered);
         };
         compile_ancestry(
             &envelopes,
@@ -154,7 +223,9 @@ impl PromptHistoryCompiler {
                     false,
                 )
             })?;
-        compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None).await
+        compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None)
+            .await
+            .map(|projection| projection.messages)
     }
 
     /// Returns the latest committed tree head in one branch/agent scope.
@@ -567,6 +638,7 @@ impl ProjectionPlan {
 struct RenderedJournal {
     messages: Vec<Message>,
     current_user_seen: bool,
+    current_user_start: Option<usize>,
 }
 
 async fn compile_ancestry(
@@ -575,10 +647,12 @@ async fn compile_ancestry(
     artifacts: Option<&dyn ArtifactReader>,
     agent_id: Option<&AgentId>,
     current_run: Option<&RunId>,
-) -> Result<Vec<Message>, HaiderError> {
+) -> Result<CompiledPromptProjection, HaiderError> {
     let plan = ProjectionPlan::build(ancestry)?;
     let mut messages = Vec::new();
     let mut current_user_seen = false;
+    let mut current_user_start = None;
+    let mut latest_compaction_summary_end = None;
     let mut verbatim = Vec::new();
     let mut verbatim_owner = None::<Option<BranchId>>;
 
@@ -592,6 +666,7 @@ async fn compile_ancestry(
                     agent_id,
                     current_run,
                     &mut current_user_seen,
+                    &mut current_user_start,
                     &mut messages,
                 )?;
             }
@@ -617,6 +692,7 @@ async fn compile_ancestry(
                 ))
             })?;
             messages.push(Message::user_text(summary));
+            latest_compaction_summary_end = Some(messages.len());
         }
 
         if plan.covered.contains(&index) || matches!(entry.node.kind, NodeKind::Compaction { .. }) {
@@ -631,6 +707,7 @@ async fn compile_ancestry(
                     agent_id,
                     current_run,
                     &mut current_user_seen,
+                    &mut current_user_start,
                     &mut messages,
                 )?;
             }
@@ -655,6 +732,7 @@ async fn compile_ancestry(
             agent_id,
             current_run,
             &mut current_user_seen,
+            &mut current_user_start,
             &mut messages,
         )?;
     }
@@ -665,7 +743,13 @@ async fn compile_ancestry(
             "accepted run {current_run} has no tree-selected committed user message"
         )));
     }
-    Ok(messages)
+    let current_user_start = current_user_start.unwrap_or(messages.len());
+    Ok(CompiledPromptProjection {
+        stable_history_end: current_user_start,
+        current_user_start,
+        latest_compaction_summary_end,
+        messages,
+    })
 }
 
 fn flush_verbatim(
@@ -675,6 +759,7 @@ fn flush_verbatim(
     agent_id: Option<&AgentId>,
     current_run: Option<&RunId>,
     current_user_seen: &mut bool,
+    current_user_start: &mut Option<usize>,
     messages: &mut Vec<Message>,
 ) -> Result<(), HaiderError> {
     if verbatim.is_empty() {
@@ -688,6 +773,11 @@ fn flush_verbatim(
         current_run,
         false,
     )?;
+    if current_user_start.is_none()
+        && let Some(relative) = rendered.current_user_start
+    {
+        *current_user_start = Some(messages.len().saturating_add(relative));
+    }
     *current_user_seen |= rendered.current_user_seen;
     messages.extend(rendered.messages);
     verbatim.clear();
@@ -720,6 +810,7 @@ fn render_journal(
     let mut messages = Vec::new();
     let mut pending_tool_results = HashMap::<String, BoundedResult>::new();
     let mut current_user_seen = false;
+    let mut current_user_start = None;
     for envelope in selected {
         if !scoped(envelope, branch_id, agent_id) {
             continue;
@@ -765,6 +856,7 @@ fn render_journal(
                 });
                 if is_current {
                     current_user_seen = true;
+                    current_user_start.get_or_insert(messages.len().saturating_sub(1));
                 }
             }
             EventPayload::Item(ItemEvent::Completed { item, .. }) if !is_current => match item {
@@ -812,6 +904,7 @@ fn render_journal(
     Ok(RenderedJournal {
         messages,
         current_user_seen,
+        current_user_start,
     })
 }
 

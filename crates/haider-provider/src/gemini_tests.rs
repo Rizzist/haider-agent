@@ -4,20 +4,26 @@ use std::future;
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
-use haider_protocol::provider::{FinishReason, StreamEvent};
+use haider_protocol::provider::{Block, FinishReason, PrefixDigests, StreamEvent};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::gemini::{
-    GeminiDecoder, GeminiProvider, GeminiRetryPolicy, GeminiSseChunkSource,
-    parse_protobuf_duration_ms, replay_gemini_sse, stream_sse_source,
+    GeminiCacheBackend, GeminiCacheRegistry, GeminiDecoder, GeminiProvider, GeminiRetryPolicy,
+    GeminiSseChunkSource, gemini_request_json, parse_protobuf_duration_ms, replay_gemini_sse,
+    stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
-use crate::{ProviderError, ProviderErrorKind};
+use crate::{
+    GEMINI_PROVIDER_NAME, Message, PromptCacheMetadata, ProviderError, ProviderErrorKind,
+    ToolDefinition, TurnRequest,
+};
 
 struct StubFixedResolver {
     address: SocketAddr,
@@ -271,4 +277,271 @@ fn cm1b_cm1c_gemini_subset_and_missing_cache_telemetry() {
     assert_eq!(missing.uncached_input, 8);
     assert_eq!(missing.cache_read_input, 0);
     assert_eq!(missing.cache_status, CacheStatAvailability::Unavailable);
+}
+
+#[derive(Debug, Default)]
+struct RecordingCacheBackend {
+    sequence: AtomicUsize,
+    operations: StdMutex<Vec<String>>,
+    create_payloads: StdMutex<Vec<serde_json::Value>>,
+}
+
+#[async_trait]
+impl GeminiCacheBackend for RecordingCacheBackend {
+    async fn create_cached_content(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<String, ProviderError> {
+        let next = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        self.operations
+            .lock()
+            .expect("operations lock")
+            .push(format!("create:{next}"));
+        self.create_payloads
+            .lock()
+            .expect("payloads lock")
+            .push(payload.clone());
+        Ok(format!("cachedContents/mock-{next}"))
+    }
+
+    async fn delete_cached_content(&self, name: &str) -> Result<(), ProviderError> {
+        self.operations
+            .lock()
+            .expect("operations lock")
+            .push(format!("delete:{name}"));
+        Ok(())
+    }
+}
+
+fn gemini_cache_request(model: &str) -> TurnRequest {
+    TurnRequest {
+        messages: vec![
+            Message::user_text("stable question"),
+            Message::assistant(vec![Block::Text {
+                text: "stable answer".into(),
+            }]),
+            Message::user_text("volatile question"),
+        ],
+        model: model.into(),
+        max_tokens: 256,
+        system_prompt: Some("stable system".into()),
+        tools: vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "Look something up".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}}
+            }),
+        }],
+        attachments: Vec::new(),
+        cache_metadata: Some(PromptCacheMetadata {
+            stable_history_end: 2,
+            current_user_start: 2,
+            latest_compaction_summary_end: None,
+            prefix_digests: PrefixDigests {
+                system: "system-a".into(),
+                tools: "tools-a".into(),
+                immutable_history: "history-a".into(),
+                model: "model-a".into(),
+                auth_mode: "auth-a".into(),
+                reasoning_settings: "reasoning-a".into(),
+            },
+            cache_epoch: "epoch-a".into(),
+            compaction_epoch: "compaction-a".into(),
+            provider: GEMINI_PROVIDER_NAME.into(),
+            session_scope: "session-a".into(),
+            account_scope: Some("account-a".into()),
+            stable_prefix_tokens: 2_048,
+            expected_later_reads: 2,
+            reuse_gap_ms: None,
+        }),
+    }
+}
+
+/// CM2e — an eligible epoch creates once, reuses the returned resource name,
+/// and synchronously deletes the superseded resource before creating its
+/// replacement.
+///
+/// MUTATION CHECK (executed): skip the delete or key the registry by turn;
+/// the exact operation sequence and reused-name assertions fail.
+#[tokio::test]
+async fn cm2e_gemini_cached_content_create_reuse_and_delete_superseded() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let backend_trait: Arc<dyn GeminiCacheBackend> = backend.clone();
+    let request = gemini_cache_request("gemini-2.5-flash");
+    let full = gemini_request_json(&request, None, false).expect("full payload");
+
+    let first = registry
+        .prepare_generate_payload(&request, full.clone(), backend_trait.clone(), None, false)
+        .await;
+    assert_eq!(first["cachedContent"], "cachedContents/mock-1");
+
+    let reused = registry
+        .prepare_generate_payload(&request, full.clone(), backend_trait.clone(), None, false)
+        .await;
+    assert_eq!(reused["cachedContent"], "cachedContents/mock-1");
+
+    let mut transitioned = request;
+    let metadata = transitioned.cache_metadata.as_mut().expect("metadata");
+    metadata.cache_epoch = "epoch-b".into();
+    metadata.compaction_epoch = "compaction-b".into();
+    let transitioned_full =
+        gemini_request_json(&transitioned, None, false).expect("transitioned full payload");
+    let replaced = registry
+        .prepare_generate_payload(&transitioned, transitioned_full, backend_trait, None, false)
+        .await;
+    assert_eq!(replaced["cachedContent"], "cachedContents/mock-2");
+    assert_eq!(
+        *backend.operations.lock().expect("operations lock"),
+        ["create:1", "delete:cachedContents/mock-1", "create:2"]
+    );
+}
+
+/// Expiry is another supersession boundary: a dead resource name is deleted
+/// and recreated instead of being sent forever after its one-hour TTL.
+#[tokio::test(start_paused = true)]
+async fn cm2e_gemini_expired_resource_is_deleted_and_recreated() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let request = gemini_cache_request("gemini-2.5-flash");
+    let full = gemini_request_json(&request, None, false).expect("full payload");
+    let first = registry
+        .prepare_generate_payload(&request, full.clone(), backend.clone(), None, false)
+        .await;
+    assert_eq!(first["cachedContent"], "cachedContents/mock-1");
+
+    tokio::time::advance(Duration::from_secs(3_601)).await;
+    let recreated = registry
+        .prepare_generate_payload(&request, full, backend.clone(), None, false)
+        .await;
+    assert_eq!(recreated["cachedContent"], "cachedContents/mock-2");
+    assert_eq!(
+        *backend.operations.lock().expect("operations lock"),
+        ["create:1", "delete:cachedContents/mock-1", "create:2"]
+    );
+}
+
+#[tokio::test]
+async fn cm2e_gemini_switch_away_deletes_session_resource() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let request = gemini_cache_request("gemini-2.5-flash");
+    let full = gemini_request_json(&request, None, false).expect("full payload");
+    let _ = registry
+        .prepare_generate_payload(&request, full, backend.clone(), None, false)
+        .await;
+    registry
+        .delete_scope("session-a")
+        .await
+        .expect("switch-away delete");
+    assert_eq!(
+        *backend.operations.lock().expect("operations lock"),
+        ["create:1", "delete:cachedContents/mock-1"]
+    );
+}
+
+/// CM2g — the model-visible Gemini input is exactly the original full body
+/// when the cached resource prefix and generate-call suffix are recombined.
+#[tokio::test]
+async fn cm2g_gemini_cached_prefix_plus_suffix_equals_full_model_input() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let request = gemini_cache_request("gemini-2.5-flash");
+    let full = gemini_request_json(&request, None, false).expect("full payload");
+    let generated = registry
+        .prepare_generate_payload(&request, full.clone(), backend.clone(), None, false)
+        .await;
+    let created = backend.create_payloads.lock().expect("payloads lock")[0].clone();
+
+    assert_eq!(created["systemInstruction"], full["system_instruction"]);
+    assert_eq!(created["tools"], full["tools"]);
+    let mut effective_contents = created["contents"]
+        .as_array()
+        .expect("cached contents")
+        .clone();
+    effective_contents.extend(
+        generated["contents"]
+            .as_array()
+            .expect("volatile suffix")
+            .iter()
+            .cloned(),
+    );
+    assert_eq!(
+        serde_json::Value::Array(effective_contents),
+        full["contents"]
+    );
+    assert!(generated.get("system_instruction").is_none());
+    assert!(generated.get("tools").is_none());
+}
+
+#[tokio::test]
+async fn cm2g_gemini_cached_prefix_preserves_signed_parts_byte_exact() {
+    let signed = serde_json::json!({
+        "kind": "signed_part",
+        "call_id": "gemini-call-0000000000000000",
+        "part": {
+            "functionCall": {"name": "lookup", "args": {"z": 1, "a": 2}},
+            "thoughtSignature": "signed-provider-bytes"
+        }
+    });
+    let mut request = gemini_cache_request("gemini-2.5-flash");
+    request.messages = vec![
+        Message::assistant(vec![
+            Block::ProviderOpaque {
+                provider: GEMINI_PROVIDER_NAME.into(),
+                data: signed.clone(),
+            },
+            Block::ToolCall {
+                call_id: "gemini-call-0000000000000000".into(),
+                name: "lookup".into(),
+                args: serde_json::json!({"z": 1, "a": 2}),
+            },
+        ]),
+        Message::tool_result("gemini-call-0000000000000000", "result", false),
+    ];
+    let metadata = request.cache_metadata.as_mut().expect("metadata");
+    metadata.stable_history_end = 1;
+    metadata.current_user_start = 1;
+    let full = gemini_request_json(&request, None, false).expect("signed full payload");
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let generated = registry
+        .prepare_generate_payload(&request, full.clone(), backend.clone(), None, false)
+        .await;
+    let created = backend.create_payloads.lock().expect("payloads lock")[0].clone();
+    assert_eq!(created["contents"][0]["parts"][0], signed["part"]);
+    let mut recombined = created["contents"]
+        .as_array()
+        .expect("cached contents")
+        .clone();
+    recombined.extend(
+        generated["contents"]
+            .as_array()
+            .expect("suffix")
+            .iter()
+            .cloned(),
+    );
+    assert_eq!(serde_json::Value::Array(recombined), full["contents"]);
+}
+
+/// CM2f — unknown Gemini models stay on implicit caching with the exact full
+/// request and no resource lifecycle calls.
+#[tokio::test]
+async fn cm2f_unknown_gemini_model_is_byte_exact_implicit_cache_fallback() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let request = gemini_cache_request("gemini-3.6-pro");
+    let full = gemini_request_json(&request, None, false).expect("full payload");
+    let fallback = registry
+        .prepare_generate_payload(&request, full.clone(), backend.clone(), None, false)
+        .await;
+    assert_eq!(fallback, full);
+    assert!(
+        backend
+            .operations
+            .lock()
+            .expect("operations lock")
+            .is_empty()
+    );
 }

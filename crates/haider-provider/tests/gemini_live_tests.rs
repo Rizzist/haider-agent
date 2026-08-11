@@ -128,6 +128,7 @@ fn text_request(model: &str, prompt: &str) -> TurnRequest {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     }
 }
 
@@ -149,6 +150,7 @@ fn tool_request(model: &str) -> TurnRequest {
             }),
         }],
         attachments: Vec::new(),
+        cache_metadata: None,
     }
 }
 

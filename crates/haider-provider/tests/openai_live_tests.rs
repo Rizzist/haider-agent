@@ -32,6 +32,7 @@ async fn live_openai_responses_text_smoke_is_explicitly_gated() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let mut stream = provider
         .stream_turn(request)

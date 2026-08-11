@@ -302,6 +302,7 @@ async fn validate_provider_api_key(
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let mut stream = adapter
         .stream_turn(request)
@@ -405,6 +406,7 @@ async fn validate_openai_compatible_key(
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     };
     let mut stream = adapter
         .stream_turn(request)
@@ -5262,6 +5264,21 @@ pub trait AccountProviderBuilder: Send + Sync {
         let _ = tuning;
         self.build_profile_descriptor(profile, descriptor, credential, model)
     }
+
+    /// CM2 Gemini resource ownership. Injected builders remain source
+    /// compatible and ignore the registry through this default.
+    fn build_tuned_with_cache(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+        tuning: &ProviderTuning,
+        gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        let _ = gemini_cache_registry;
+        self.build_tuned(profile, descriptor, credential, model, tuning)
+    }
 }
 
 /// Production builder for every account-backed adapter shipped in this lane.
@@ -5291,6 +5308,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             model,
             alias,
             &ProviderTuning::default(),
+            None,
         )
     }
 
@@ -5309,6 +5327,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             model,
             &descriptor.alias,
             &ProviderTuning::default(),
+            None,
         )
     }
 
@@ -5328,6 +5347,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             model,
             &descriptor.alias,
             &ProviderTuning::default(),
+            None,
         )
     }
 
@@ -5348,6 +5368,29 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             model,
             &descriptor.alias,
             tuning,
+            None,
+        )
+    }
+
+    fn build_tuned_with_cache(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+        tuning: &ProviderTuning,
+        gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        build_account_provider(
+            &descriptor.provider,
+            profile,
+            descriptor.base_url.as_deref(),
+            descriptor.auth_method,
+            credential,
+            model,
+            &descriptor.alias,
+            tuning,
+            Some(gemini_cache_registry),
         )
     }
 }
@@ -5362,6 +5405,7 @@ fn build_account_provider(
     model: &str,
     alias: &CredentialAlias,
     tuning: &ProviderTuning,
+    gemini_cache_registry: Option<Arc<haider_provider::GeminiCacheRegistry>>,
 ) -> Result<Arc<dyn Provider>, HaiderError> {
     let compatible_base_url = account_openai_compatible_base_url(provider, profile, base_url);
     let anthropic_fast = anthropic_fast_for(provider, tuning, model);
@@ -5434,7 +5478,8 @@ fn build_account_provider(
                 .with_effort(tuning.effort.clone())
                 // W-B: google_search + url_context built-ins, name-gated to
                 // 3.x models inside the request builder.
-                .with_web_builtins(tuning.web_tools),
+                .with_web_builtins(tuning.web_tools)
+                .with_cache_registry(gemini_cache_registry.unwrap_or_default()),
         ),
         (DEEPSEEK_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiCompatibleProvider::new_deepseek_api(credential, model, DEEPSEEK_BASE_URL)
@@ -5796,6 +5841,7 @@ pub(crate) struct AccountsProviderFactory {
     vault: VaultProvision,
     builder: Arc<dyn AccountProviderBuilder>,
     broker: Option<CredentialBroker>,
+    gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
 }
 
 struct ReadOnlySnapshotStore(Vec<CredentialDescriptor>);
@@ -5826,6 +5872,7 @@ impl AccountsProviderFactory {
             vault,
             builder,
             broker: None,
+            gemini_cache_registry: Arc::default(),
         }
     }
 
@@ -5841,6 +5888,7 @@ impl AccountsProviderFactory {
             vault,
             builder,
             broker: Some(broker),
+            gemini_cache_registry: Arc::default(),
         }
     }
 
@@ -5856,6 +5904,7 @@ impl AccountsProviderFactory {
             vault,
             builder,
             broker: None,
+            gemini_cache_registry: Arc::default(),
         }
     }
 
@@ -5872,6 +5921,7 @@ impl AccountsProviderFactory {
             vault,
             builder,
             broker: Some(broker),
+            gemini_cache_registry: Arc::default(),
         }
     }
 
@@ -5904,12 +5954,13 @@ impl AccountsProviderFactory {
         tuning: &ProviderTuning,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         let profile = self.provider_profile(&descriptor.provider);
-        self.builder.build_tuned(
+        self.builder.build_tuned_with_cache(
             profile.as_ref(),
             descriptor,
             credential,
             &metadata.model,
             tuning,
+            Arc::clone(&self.gemini_cache_registry),
         )
     }
 
@@ -6327,6 +6378,19 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
             tuning.web_tools = false;
         }
         self.resolve_turn_tuned(metadata, tuning).await
+    }
+
+    async fn reconcile_cache_scope(
+        &self,
+        session_id: &haider_protocol::ids::SessionId,
+        provider: &str,
+    ) {
+        if provider != haider_provider::GEMINI_PROVIDER_NAME {
+            let _ = self
+                .gemini_cache_registry
+                .delete_scope(session_id.as_str())
+                .await;
+        }
     }
 }
 

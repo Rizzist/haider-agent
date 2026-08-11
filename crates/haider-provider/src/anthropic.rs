@@ -117,6 +117,38 @@ pub struct AnthropicProvider {
     /// resolved pair — first-party `anthropic`/`anthropic-oauth` only, never
     /// Bedrock/Vertex, and dropped after a session-scoped degrade.
     web_tools: bool,
+    /// Explicit prompt caching is enabled only after this exact
+    /// provider/model/auth surface is verified. Consumer OAuth and enterprise
+    /// endpoints default false and retain the byte-exact legacy request.
+    prompt_caching_verified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicCacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl AnthropicCacheTtl {
+    pub(crate) const fn wire(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+}
+
+/// Selects the explicit-cache TTL without guessing future reuse. Unknown or
+/// short gaps stay on the lower-cost five-minute write policy.
+pub const fn select_anthropic_cache_ttl(
+    reuse_gap_ms: Option<u64>,
+    expected_later_reads: u32,
+) -> AnthropicCacheTtl {
+    if matches!(reuse_gap_ms, Some(gap) if gap > 5 * 60 * 1_000) && expected_later_reads >= 2 {
+        AnthropicCacheTtl::OneHour
+    } else {
+        AnthropicCacheTtl::FiveMinutes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +182,9 @@ pub struct AnthropicCapture {
 
 impl AnthropicProvider {
     pub fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
-        Self::new_with_auth(credential, model, AnthropicAuthMode::ApiKey, None)
+        let mut provider = Self::new_with_auth(credential, model, AnthropicAuthMode::ApiKey, None)?;
+        provider.prompt_caching_verified = true;
+        Ok(provider)
     }
 
     pub fn new_subscription(
@@ -259,6 +293,7 @@ impl AnthropicProvider {
             effort: None,
             fast: false,
             web_tools: false,
+            prompt_caching_verified: false,
         })
     }
 
@@ -296,6 +331,14 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_web_tools(mut self, web_tools: bool) -> Self {
         self.web_tools = web_tools;
+        self
+    }
+
+    /// Installs the result of an auth/model cache capability probe. Production
+    /// consumer OAuth leaves this false until the private surface is verified.
+    #[must_use]
+    pub fn with_prompt_caching_verified(mut self, verified: bool) -> Self {
+        self.prompt_caching_verified = verified;
         self
     }
 
@@ -359,6 +402,26 @@ impl AnthropicProvider {
             self.effort.as_deref(),
             self.fast,
             self.web_tools,
+            self.prompt_caching_verified
+                .then(|| request.cache_metadata.as_ref())
+                .flatten()
+                .filter(|metadata| {
+                    metadata.boundaries_valid(request.messages.len())
+                        && metadata.account_scope.is_some()
+                        && match self.auth_mode {
+                            AnthropicAuthMode::ApiKey => {
+                                metadata.provider == ANTHROPIC_PROVIDER_NAME
+                            }
+                            AnthropicAuthMode::OAuthBearer => {
+                                metadata.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
+                            }
+                            AnthropicAuthMode::CloudBearer => false,
+                        }
+                        && known_anthropic_cache_model(&request.model)
+                })
+                .map(|metadata| {
+                    select_anthropic_cache_ttl(metadata.reuse_gap_ms, metadata.expected_later_reads)
+                }),
         )?;
         // G4b Vertex wire deltas (LV1): the model is URL-addressed, so the
         // body DROPS `model` and carries `anthropic_version` in its place —
@@ -509,6 +572,18 @@ impl AnthropicProvider {
     }
 }
 
+fn known_anthropic_cache_model(model: &str) -> bool {
+    let model = crate::effort::base_model(model);
+    model.starts_with("claude-opus-5")
+        || model.starts_with("claude-sonnet-5")
+        || model == "claude-fable-5"
+        || model.starts_with("claude-opus-4")
+        || model.starts_with("claude-sonnet-4")
+        || model.starts_with("claude-haiku-4")
+        || model.starts_with("claude-3-")
+        || cfg!(test) && model == "claude-audit"
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
@@ -519,6 +594,29 @@ impl Provider for AnthropicProvider {
             }
             AnthropicAuthMode::CloudBearer => crate::ProviderCredentialSurface::CloudBearer,
         }
+    }
+
+    fn rendered_cache_prefix_digests(
+        &self,
+        request: &TurnRequest,
+    ) -> Option<haider_protocol::provider::PrefixDigests> {
+        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let full_payload = self.request_payload(request).ok()?;
+        let mut stable_request = request.clone();
+        stable_request.messages.truncate(boundary);
+        if let Some(metadata) = &mut stable_request.cache_metadata {
+            metadata.stable_history_end = boundary;
+            metadata.current_user_start = boundary;
+        }
+        let stable_payload = self.request_payload(&stable_request).ok()?;
+        crate::rendered_prefix_digests(
+            request,
+            &full_payload,
+            &stable_payload,
+            "system",
+            "tools",
+            "messages",
+        )
     }
 
     async fn capabilities(&self) -> CapabilityDoc {

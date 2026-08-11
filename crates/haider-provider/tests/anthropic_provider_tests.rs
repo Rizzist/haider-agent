@@ -187,6 +187,7 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
             artifact: image.clone(),
             data_base64: "iVBORw0KGgo=".into(),
         }],
+        cache_metadata: None,
         messages: vec![
             Message {
                 role: MessageRole::User,
@@ -255,6 +256,7 @@ fn missing_image_data_is_a_typed_invalid_request() {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
         messages: vec![Message {
             role: MessageRole::User,
             blocks: vec![Block::Attachment(AttachmentBlock::Image {
@@ -570,6 +572,7 @@ fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_reject
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
         messages: vec![
             Message::user_text("read the file"),
             Message {
@@ -640,6 +643,7 @@ fn web_tools_declaration_is_exact_and_absent_without_the_flag() {
             input_schema: serde_json::json!({"type": "object"}),
         }],
         attachments: Vec::new(),
+        cache_metadata: None,
         messages: vec![Message::user_text("search the web")],
     };
 
@@ -857,6 +861,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
         messages: vec![
             Message::user_text("search the web"),
             Message {
@@ -905,6 +910,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
         messages: vec![
             Message::user_text("search the web"),
             Message::assistant(vec![opaque(&signed_text)]),
@@ -930,6 +936,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
         messages: vec![
             Message::user_text("search the web"),
             Message::assistant(vec![

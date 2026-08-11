@@ -1,0 +1,58 @@
+{
+  "model": "claude-audit",
+  "max_tokens": 128,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Compacted history summary",
+          "cache_control": {"type": "ephemeral", "ttl": "5m"}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [{"type": "text", "text": "prior question"}]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "prior answer",
+          "cache_control": {"type": "ephemeral", "ttl": "5m"}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [{"type": "text", "text": "current question"}]
+    }
+  ],
+  "stream": true,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude."
+    },
+    {
+      "type": "text",
+      "text": "Haider system",
+      "cache_control": {"type": "ephemeral", "ttl": "5m"}
+    }
+  ],
+  "tools": [
+    {
+      "name": "fs_read",
+      "description": "Read a file",
+      "input_schema": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
+      },
+      "cache_control": {"type": "ephemeral", "ttl": "5m"}
+    }
+  ]
+}

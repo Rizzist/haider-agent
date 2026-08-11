@@ -581,7 +581,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     StoreHandle::append(&store, &mut events)
         .await
         .expect("append compacted history");
-    let first_compile = PromptHistoryCompiler::compile_with_artifacts(
+    let first_projection = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
         &store,
         &store,
         &session_id,
@@ -595,7 +595,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let restarted = SqliteStoreHandle::open(root.path())
         .await
         .expect("reopen store");
-    let restarted_compile = PromptHistoryCompiler::compile_with_artifacts(
+    let restarted_projection = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
         &restarted,
         &restarted,
         &session_id,
@@ -605,7 +605,8 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     )
     .await
     .expect("compile after restart-equivalent replay");
-    let text = first_compile
+    let text = first_projection
+        .messages
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
@@ -618,14 +619,18 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
         text,
         ["durable summary", "suffix user", "suffix answer", "current"]
     );
-    assert!(first_compile.iter().any(|message| {
+    assert!(first_projection.messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(block, Block::Attachment(attachment) if attachment == &surviving_image)
         })
     }));
+    assert_eq!(first_projection.latest_compaction_summary_end, Some(1));
+    assert_eq!(first_projection.stable_history_end, 3);
+    assert_eq!(first_projection.current_user_start, 3);
+    assert_eq!(first_projection, restarted_projection);
     assert_eq!(
-        serde_json::to_vec(&first_compile).expect("serialize first compile"),
-        serde_json::to_vec(&restarted_compile).expect("serialize restarted compile")
+        serde_json::to_vec(&first_projection.messages).expect("serialize first compile"),
+        serde_json::to_vec(&restarted_projection.messages).expect("serialize restarted compile")
     );
     restarted.close().await.expect("close restarted store");
 }

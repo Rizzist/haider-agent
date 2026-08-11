@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
-use haider_protocol::provider::StreamEvent;
+use haider_protocol::provider::{Block, PrefixDigests, StreamEvent};
 use reqwest::header::AUTHORIZATION;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -20,7 +20,8 @@ use crate::anthropic::{
 };
 use crate::origin::FixedDnsResolver;
 use crate::{
-    Message, Provider as _, ProviderError, ProviderErrorKind, ToolDefinition, TurnRequest,
+    AnthropicCacheTtl, Message, PromptCacheMetadata, Provider as _, ProviderError,
+    ProviderErrorKind, ToolDefinition, TurnRequest, select_anthropic_cache_ttl,
 };
 
 struct HangingFixture {
@@ -270,7 +271,254 @@ fn payload_request(system_prompt: Option<&str>) -> TurnRequest {
             },
         ],
         attachments: Vec::new(),
+        cache_metadata: None,
     }
+}
+
+fn cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetadata {
+    PromptCacheMetadata {
+        stable_history_end,
+        current_user_start: stable_history_end,
+        latest_compaction_summary_end: Some(1),
+        prefix_digests: PrefixDigests {
+            system: "system-digest".into(),
+            tools: "tool-digest".into(),
+            immutable_history: "history-digest".into(),
+            model: "model-digest".into(),
+            auth_mode: "auth-digest".into(),
+            reasoning_settings: "reasoning-digest".into(),
+        },
+        cache_epoch: "epoch-a".into(),
+        compaction_epoch: "compaction-a".into(),
+        provider: provider.into(),
+        session_scope: "session-a".into(),
+        account_scope: Some("account-a".into()),
+        stable_prefix_tokens: 8_192,
+        expected_later_reads: 2,
+        reuse_gap_ms: Some(30_000),
+    }
+}
+
+fn cache_control_request() -> TurnRequest {
+    TurnRequest {
+        messages: vec![
+            Message::user_text("Compacted history summary"),
+            Message::user_text("prior question"),
+            Message::assistant(vec![Block::Text {
+                text: "prior answer".into(),
+            }]),
+            Message::user_text("current question"),
+        ],
+        model: "claude-audit".into(),
+        max_tokens: 128,
+        system_prompt: Some("Haider system".into()),
+        tools: vec![ToolDefinition {
+            name: "fs_read".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        }],
+        attachments: Vec::new(),
+        cache_metadata: Some(cache_metadata("anthropic-oauth", 3)),
+    }
+}
+
+fn strip_cache_control(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => values.iter_mut().for_each(strip_cache_control),
+        serde_json::Value::Object(values) => {
+            values.remove("cache_control");
+            values.values_mut().for_each(strip_cache_control);
+        }
+        _ => {}
+    }
+}
+
+/// CM2b — all four explicit Anthropic anchors are placed without moving or
+/// decorating the OAuth identity block. The checked-in fixture is the exact
+/// request body that crosses the adapter boundary.
+///
+/// MUTATION CHECK (executed): move any anchor by one message, annotate the
+/// identity block, or drop tool/system/summary/history caching; the golden and
+/// the explicit four-count assertion fail.
+#[test]
+fn cm2b_anthropic_four_breakpoints_oauth_identity_first_golden() {
+    let payload = payload_provider(true)
+        .with_prompt_caching_verified(true)
+        .request_payload(&cache_control_request())
+        .expect("cache-controlled OAuth payload");
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/anthropic/cache_control_request.json"
+    ))
+    .expect("Anthropic cache-control golden");
+    assert_eq!(payload, expected);
+    assert_eq!(
+        payload["system"][0],
+        serde_json::json!({"type": "text", "text": ANTHROPIC_OAUTH_SYSTEM_IDENTITY})
+    );
+    let cache_controls = payload.to_string().match_indices("cache_control").count();
+    assert_eq!(
+        cache_controls, 4,
+        "exactly four explicit anchors: {payload}"
+    );
+}
+
+/// CM2c — the longer TTL requires both a gap beyond five minutes and at
+/// least two later reads; every uncertain/short/single-read case stays 5m.
+///
+/// MUTATION CHECK (executed): change `>` to `>=` or remove the read-count
+/// conjunct; the boundary and one-read assertions fail.
+#[test]
+fn cm2c_anthropic_cache_ttl_requires_long_gap_and_two_reads() {
+    assert_eq!(
+        select_anthropic_cache_ttl(Some(300_001), 2),
+        AnthropicCacheTtl::OneHour
+    );
+    for (gap, reads) in [
+        (None, 2),
+        (Some(300_000), 2),
+        (Some(300_001), 1),
+        (Some(10_000), 99),
+    ] {
+        assert_eq!(
+            select_anthropic_cache_ttl(gap, reads),
+            AnthropicCacheTtl::FiveMinutes
+        );
+    }
+}
+
+/// CM2f — consumer OAuth is deliberately unverified in production. Merely
+/// attaching provider-neutral metadata must keep its CM1 full-history bytes.
+#[test]
+fn cm2f_unverified_anthropic_oauth_is_byte_exact_full_history() {
+    let request = cache_control_request();
+    let mut baseline = request.clone();
+    baseline.cache_metadata = None;
+    let provider = payload_provider(true);
+    assert_eq!(
+        provider
+            .request_payload(&request)
+            .expect("fallback payload"),
+        provider.request_payload(&baseline).expect("CM1 payload")
+    );
+
+    let verified = payload_provider(true).with_prompt_caching_verified(true);
+    let mut mismatched = request.clone();
+    mismatched
+        .cache_metadata
+        .as_mut()
+        .expect("metadata")
+        .provider = "anthropic".into();
+    assert_eq!(
+        verified
+            .request_payload(&mismatched)
+            .expect("mismatch fallback"),
+        verified.request_payload(&baseline).expect("CM1 payload")
+    );
+
+    let mut malformed = request;
+    let metadata = malformed.cache_metadata.as_mut().expect("metadata");
+    metadata.stable_history_end = 3;
+    metadata.current_user_start = 2;
+    assert_eq!(
+        verified
+            .request_payload(&malformed)
+            .expect("boundary fallback"),
+        verified.request_payload(&baseline).expect("CM1 payload")
+    );
+}
+
+/// CM2g — cache metadata changes annotations only. After deleting those
+/// ephemeral keys, the exact system, tools, message roles, text, and ordering
+/// are identical to the unannotated request.
+///
+/// MUTATION CHECK (executed): truncate/reorder the stable messages while
+/// annotating; stripping cache keys no longer recovers the baseline.
+#[test]
+fn cm2g_anthropic_annotations_do_not_change_model_visible_content() {
+    let request = cache_control_request();
+    let mut annotated = payload_provider(true)
+        .with_prompt_caching_verified(true)
+        .request_payload(&request)
+        .expect("annotated payload");
+    strip_cache_control(&mut annotated);
+    let baseline = payload_provider(true)
+        .request_payload(&request)
+        .expect("unannotated payload");
+    assert_eq!(annotated, baseline);
+}
+
+#[test]
+fn cm2g_anthropic_api_key_system_text_and_signed_opaque_are_unchanged() {
+    let provider = payload_provider(false);
+    let mut request = cache_control_request();
+    request.cache_metadata.as_mut().expect("metadata").provider = "anthropic".into();
+    let signed = serde_json::json!({
+        "type": "thinking",
+        "thinking": "provider reasoning",
+        "signature": "signed-provider-bytes"
+    });
+    request.messages[2].blocks.push(Block::ProviderOpaque {
+        provider: "anthropic".into(),
+        data: signed.clone(),
+    });
+    let annotated = provider
+        .request_payload(&request)
+        .expect("annotated API-key payload");
+    let mut baseline_request = request;
+    baseline_request.cache_metadata = None;
+    let baseline = provider
+        .request_payload(&baseline_request)
+        .expect("baseline API-key payload");
+
+    assert_eq!(annotated["system"][0]["text"], baseline["system"]);
+    let mut stripped = annotated.clone();
+    strip_cache_control(&mut stripped);
+    assert_eq!(stripped["messages"], baseline["messages"]);
+    assert_eq!(annotated["messages"][2]["content"][1], signed);
+    assert!(
+        annotated["messages"][2]["content"][1]
+            .get("cache_control")
+            .is_none(),
+        "signed terminal blocks are never decorated"
+    );
+}
+
+/// CM2a (final wire) — append-only history does not perturb Haider-owned
+/// system/tool bytes or their canonical digests. A real owned-input mutation
+/// changes the corresponding digest.
+#[test]
+fn cm2a_anthropic_final_wire_system_and_tool_digests_are_stable() {
+    let provider = payload_provider(true).with_prompt_caching_verified(true);
+    let first = cache_control_request();
+    let first_digests = provider
+        .rendered_cache_prefix_digests(&first)
+        .expect("first rendered digests");
+    let mut second = first.clone();
+    second.messages.push(Message::assistant(vec![Block::Text {
+        text: "current answer".into(),
+    }]));
+    second.messages.push(Message::user_text("next question"));
+    let metadata = second.cache_metadata.as_mut().expect("cache metadata");
+    metadata.stable_history_end = 5;
+    metadata.current_user_start = 5;
+    let second_digests = provider
+        .rendered_cache_prefix_digests(&second)
+        .expect("second rendered digests");
+    assert_eq!(first_digests.system, second_digests.system);
+    assert_eq!(first_digests.tools, second_digests.tools);
+
+    let mut mutated = second;
+    mutated.tools[0].description.push_str(" mutated");
+    mutated.system_prompt = Some("mutated system".into());
+    let mutated_digests = provider
+        .rendered_cache_prefix_digests(&mutated)
+        .expect("mutated rendered digests");
+    assert_ne!(first_digests.system, mutated_digests.system);
+    assert_ne!(first_digests.tools, mutated_digests.tools);
 }
 
 /// MUTATION CHECK: change or drop the identity text, merge it into the turn's
@@ -615,6 +863,7 @@ fn one_line_turn(model: &str) -> TurnRequest {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     }
 }
 

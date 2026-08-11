@@ -21,6 +21,7 @@ fn request() -> TurnRequest {
         system_prompt: None,
         tools: Vec::new(),
         attachments: Vec::new(),
+        cache_metadata: None,
     }
 }
 

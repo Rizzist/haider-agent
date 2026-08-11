@@ -34,7 +34,7 @@ mod wire;
 use async_trait::async_trait;
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::provider::{
-    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage,
+    Block, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -42,13 +42,77 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
+/// Digests Haider-owned tool definitions after recursively sorting object
+/// keys in their schemas.
+///
+/// The typed input deliberately prevents provider-produced tool arguments or
+/// provider-opaque/signed blocks from crossing this canonicalization seam.
+#[must_use]
+pub fn canonical_tool_definitions_digest(tools: &[ToolDefinition]) -> String {
+    fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(canonicalize).collect())
+            }
+            serde_json::Value::Object(values) => {
+                let sorted = values
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize(value)))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            scalar => scalar,
+        }
+    }
+
+    serde_json::to_value(tools)
+        .map(canonicalize)
+        .and_then(|value| serde_json::to_vec(&value))
+        .map_or_else(
+            |_| blake3::hash(b"haider-owned-json-serialization-error"),
+            |bytes| blake3::hash(&bytes),
+        )
+        .to_hex()
+        .to_string()
+}
+
+fn exact_optional_wire_digest(value: Option<&serde_json::Value>) -> String {
+    serde_json::to_vec(&value)
+        .map_or_else(
+            |_| blake3::hash(b"haider-final-wire-serialization-error"),
+            |bytes| blake3::hash(&bytes),
+        )
+        .to_hex()
+        .to_string()
+}
+
+/// Replaces the normalized component hashes with exact rendered-wire hashes.
+/// Adapters call this only on Haider-rendered top-level system/tools/history
+/// values; provider-opaque children remain byte-for-byte in the value and are
+/// never canonicalized.
+pub(crate) fn rendered_prefix_digests(
+    request: &TurnRequest,
+    full_payload: &serde_json::Value,
+    stable_payload: &serde_json::Value,
+    system_key: &str,
+    tools_key: &str,
+    history_key: &str,
+) -> Option<PrefixDigests> {
+    let mut digests = request.cache_metadata.as_ref()?.prefix_digests.clone();
+    digests.system = exact_optional_wire_digest(full_payload.get(system_key));
+    digests.tools = exact_optional_wire_digest(full_payload.get(tools_key));
+    digests.immutable_history = exact_optional_wire_digest(stable_payload.get(history_key));
+    Some(digests)
+}
+
 pub use anthropic::{
     ANTHROPIC_API_URL, ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL,
     ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME,
-    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider,
-    AnthropicRetryPolicy, AnthropicTransportConfig, BEDROCK_MANTLE_DEFAULT_BASE_URL,
-    BEDROCK_PROVIDER_NAME, BEDROCK_SEED_MODELS, VERTEX_ANTHROPIC_VERSION, VERTEX_PROVIDER_NAME,
-    VERTEX_SEED_MODELS, bedrock_mantle_base_url, replay_anthropic_http_error, replay_anthropic_sse,
+    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, ANTHROPIC_PROVIDER_NAME, AnthropicCacheTtl, AnthropicCapture,
+    AnthropicProvider, AnthropicRetryPolicy, AnthropicTransportConfig,
+    BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME, BEDROCK_SEED_MODELS,
+    VERTEX_ANTHROPIC_VERSION, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS, bedrock_mantle_base_url,
+    replay_anthropic_http_error, replay_anthropic_sse, select_anthropic_cache_ttl,
     validate_bedrock_mantle_base_url, validate_vertex_models_base_url, vertex_models_base_url,
 };
 pub use catalog::{
@@ -62,8 +126,9 @@ pub use effort::{
     gemini_web_builtins_supported,
 };
 pub use gemini::{
-    GEMINI_API_BASE_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME, GeminiCapture, GeminiProvider,
-    GeminiRetryPolicy, GeminiTransportConfig, replay_gemini_http_error, replay_gemini_sse,
+    GEMINI_API_BASE_URL, GEMINI_CACHED_CONTENTS_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME,
+    GeminiCacheBackend, GeminiCacheRegistry, GeminiCapture, GeminiProvider, GeminiRetryPolicy,
+    GeminiTransportConfig, replay_gemini_http_error, replay_gemini_sse,
     replay_gemini_sse_for_request,
 };
 pub use openai::{
@@ -212,6 +277,58 @@ pub struct ResolvedAttachment {
     pub data_base64: String,
 }
 
+/// Ephemeral, provider-neutral coordinates for prompt-cache adapters.
+///
+/// This metadata describes boundaries in [`TurnRequest::messages`]; it never
+/// enters the durable journal and adapters must not use it to rewrite message
+/// content. Indexes are exclusive message boundaries in the normalized
+/// request projection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheMetadata {
+    /// End of immutable completed history and start of the volatile tail.
+    pub stable_history_end: usize,
+    /// Start of the accepted current user turn.
+    pub current_user_start: usize,
+    /// End of the latest active compaction-summary message, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_compaction_summary_end: Option<usize>,
+    /// CM1's non-secret provider-visible component digests, reused by CM2.
+    pub prefix_digests: PrefixDigests,
+    /// Stable until system/tools/reasoning/provider/account/compaction change.
+    pub cache_epoch: String,
+    /// Stable identifier for the active compaction summary, or the root epoch.
+    pub compaction_epoch: String,
+    /// Provider name selected for this request.
+    pub provider: String,
+    /// Session scope used only for ownership of ephemeral provider resources.
+    pub session_scope: String,
+    /// Non-secret account/cache routing scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_scope: Option<String>,
+    /// Conservative stable-prefix size estimate used by explicit-cache gates.
+    #[serde(default)]
+    pub stable_prefix_tokens: u64,
+    /// Expected future reads in this immutable epoch. Zero is the safe default.
+    #[serde(default)]
+    pub expected_later_reads: u32,
+    /// Observed gap since the preceding request in this cache domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_gap_ms: Option<u64>,
+}
+
+impl PromptCacheMetadata {
+    /// Fail-closed validation for ephemeral coordinates after every compiler
+    /// and provider-family projection step.
+    #[must_use]
+    pub fn boundaries_valid(&self, message_count: usize) -> bool {
+        self.stable_history_end <= self.current_user_start
+            && self.current_user_start <= message_count
+            && self
+                .latest_compaction_summary_end
+                .is_none_or(|boundary| boundary > 0 && boundary <= self.stable_history_end)
+    }
+}
+
 /// Normalized request accepted by every provider adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRequest {
@@ -224,6 +341,9 @@ pub struct TurnRequest {
     pub tools: Vec<ToolDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ResolvedAttachment>,
+    /// Ephemeral cache-boundary metadata. Absent preserves the exact CM1 wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metadata: Option<PromptCacheMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +455,13 @@ pub trait Provider: Send + Sync {
     /// Describes how this adapter authenticates its outbound request.
     fn credential_surface(&self) -> ProviderCredentialSurface {
         ProviderCredentialSurface::Opaque
+    }
+
+    /// Returns non-secret hashes of the exact adapter-rendered stable
+    /// components. `None` retains the normalized CM1 hashes for injected or
+    /// unknown providers.
+    fn rendered_cache_prefix_digests(&self, _request: &TurnRequest) -> Option<PrefixDigests> {
+        None
     }
 
     async fn capabilities(&self) -> CapabilityDoc;

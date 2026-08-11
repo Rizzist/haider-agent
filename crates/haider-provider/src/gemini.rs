@@ -13,7 +13,7 @@ use haider_protocol::provider::{
 };
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use crate::{
@@ -24,6 +24,8 @@ use crate::{
 pub const GEMINI_PROVIDER_NAME: &str = "gemini";
 pub const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const GEMINI_MODELS_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+pub const GEMINI_CACHED_CONTENTS_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/cachedContents";
 const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
 const STREAM_CAPACITY: usize = 32;
 const ERROR_BODY_LIMIT: usize = 64 * 1024;
@@ -61,7 +63,7 @@ pub struct GeminiCapture {
 #[derive(Debug)]
 pub struct GeminiProvider {
     client: reqwest::Client,
-    credential: SecretHandle,
+    credential: Arc<SecretHandle>,
     account: Option<CredentialAlias>,
     model: String,
     api_url: String,
@@ -75,6 +77,38 @@ pub struct GeminiProvider {
     /// request builder name-gates this to 3.x models (the G3 pattern) —
     /// 2.5-era models cannot combine built-ins with function declarations.
     web_builtins: bool,
+    cache_registry: Option<Arc<GeminiCacheRegistry>>,
+    cache_backend: Arc<dyn GeminiCacheBackend>,
+}
+
+#[async_trait]
+pub trait GeminiCacheBackend: std::fmt::Debug + Send + Sync {
+    async fn create_cached_content(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<String, ProviderError>;
+    async fn delete_cached_content(&self, name: &str) -> Result<(), ProviderError>;
+}
+
+#[derive(Debug, Default)]
+pub struct GeminiCacheRegistry {
+    resources: Mutex<HashMap<String, GeminiCachedResource>>,
+}
+
+#[derive(Debug)]
+struct GeminiCachedResource {
+    epoch: String,
+    name: String,
+    contents: Vec<serde_json::Value>,
+    expires_at: tokio::time::Instant,
+    backend: Arc<dyn GeminiCacheBackend>,
+}
+
+#[derive(Debug)]
+struct GeminiHttpCacheBackend {
+    client: reqwest::Client,
+    credential: Arc<SecretHandle>,
+    fixed_origin_guard: Arc<FixedOriginGuard>,
 }
 
 impl GeminiProvider {
@@ -89,8 +123,11 @@ impl GeminiProvider {
     ) -> Result<Self, ProviderError> {
         let model = model.into();
         let api_url = gemini_stream_endpoint(&model)?;
-        let fixed_origin_guard =
-            Arc::new(FixedOriginGuard::new(&api_url, GEMINI_API_HOST, resolver)?);
+        let fixed_origin_guard = Arc::new(FixedOriginGuard::new_allowing(
+            &[&api_url, GEMINI_CACHED_CONTENTS_URL],
+            GEMINI_API_HOST,
+            resolver,
+        )?);
         let transport = Self::transport_config();
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -107,6 +144,12 @@ impl GeminiProvider {
                     format!("could not construct Gemini HTTP client: {error}"),
                 )
             })?;
+        let credential = Arc::new(credential);
+        let cache_backend = Arc::new(GeminiHttpCacheBackend {
+            client: client.clone(),
+            credential: Arc::clone(&credential),
+            fixed_origin_guard: Arc::clone(&fixed_origin_guard),
+        });
         Ok(Self {
             client,
             credential,
@@ -116,6 +159,8 @@ impl GeminiProvider {
             fixed_origin_guard,
             effort: None,
             web_builtins: false,
+            cache_registry: None,
+            cache_backend,
         })
     }
 
@@ -142,6 +187,14 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_web_builtins(mut self, web_builtins: bool) -> Self {
         self.web_builtins = web_builtins;
+        self
+    }
+
+    /// Installs the daemon-owned ephemeral resource registry shared by all
+    /// Gemini provider instances in one runtime.
+    #[must_use]
+    pub fn with_cache_registry(mut self, registry: Arc<GeminiCacheRegistry>) -> Self {
+        self.cache_registry = Some(registry);
         self
     }
 
@@ -242,7 +295,21 @@ impl GeminiProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let payload = self.request_payload(request)?;
+        let full_payload = self.request_payload(request)?;
+        let payload = if let Some(registry) = &self.cache_registry {
+            registry
+                .prepare_generate_payload(
+                    request,
+                    full_payload,
+                    Arc::clone(&self.cache_backend),
+                    self.effort.as_deref(),
+                    self.web_builtins
+                        && crate::effort::gemini_web_builtins_supported(&request.model),
+                )
+                .await
+        } else {
+            full_payload
+        };
         let request = self.request(&payload).await?;
         tokio::time::timeout(
             Self::transport_config().response_open_timeout,
@@ -258,6 +325,29 @@ impl GeminiProvider {
 impl Provider for GeminiProvider {
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         crate::ProviderCredentialSurface::ApiKey
+    }
+
+    fn rendered_cache_prefix_digests(
+        &self,
+        request: &TurnRequest,
+    ) -> Option<haider_protocol::provider::PrefixDigests> {
+        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let full_payload = self.request_payload(request).ok()?;
+        let mut stable_request = request.clone();
+        stable_request.messages.truncate(boundary);
+        if let Some(metadata) = &mut stable_request.cache_metadata {
+            metadata.stable_history_end = boundary;
+            metadata.current_user_start = boundary;
+        }
+        let stable_payload = self.request_payload(&stable_request).ok()?;
+        crate::rendered_prefix_digests(
+            request,
+            &full_payload,
+            &stable_payload,
+            "system_instruction",
+            "tools",
+            "contents",
+        )
     }
 
     async fn capabilities(&self) -> CapabilityDoc {
@@ -313,6 +403,287 @@ impl Provider for GeminiProvider {
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
+}
+
+#[async_trait]
+impl GeminiCacheBackend for GeminiHttpCacheBackend {
+    async fn create_cached_content(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<String, ProviderError> {
+        self.fixed_origin_guard
+            .validate_endpoint(GEMINI_CACHED_CONTENTS_URL)
+            .await?;
+        let mut api_key =
+            HeaderValue::from_bytes(self.credential.expose_secret()).map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "resolved Gemini credential is not a valid HTTP header value",
+                )
+            })?;
+        api_key.set_sensitive(true);
+        let request = self
+            .client
+            .post(GEMINI_CACHED_CONTENTS_URL)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-goog-api-key", api_key)
+            .json(payload)
+            .build()
+            .map_err(transport_error)?;
+        let response = tokio::time::timeout(
+            GeminiProvider::transport_config().response_open_timeout,
+            self.client.execute(request),
+        )
+        .await
+        .map_err(|_| {
+            response_open_timeout_error(GeminiProvider::transport_config().response_open_timeout)
+        })?
+        .map_err(transport_error)?;
+        if !response.status().is_success() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!(
+                    "Gemini CachedContent create returned HTTP {}",
+                    response.status().as_u16()
+                ),
+            ));
+        }
+        let body = response.bytes().await.map_err(transport_error)?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| malformed("Gemini CachedContent create returned malformed JSON"))?;
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| valid_gemini_cache_name(name))
+            .ok_or_else(|| malformed("Gemini CachedContent create returned an invalid name"))?;
+        Ok(name.to_owned())
+    }
+
+    async fn delete_cached_content(&self, name: &str) -> Result<(), ProviderError> {
+        if !valid_gemini_cache_name(name) {
+            return Err(invalid_request("Gemini CachedContent name is invalid"));
+        }
+        let endpoint = format!("{GEMINI_API_BASE_URL}/{name}");
+        self.fixed_origin_guard
+            .validate_trusted_origin_endpoint(&endpoint)
+            .await?;
+        let mut api_key =
+            HeaderValue::from_bytes(self.credential.expose_secret()).map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "resolved Gemini credential is not a valid HTTP header value",
+                )
+            })?;
+        api_key.set_sensitive(true);
+        let request = self
+            .client
+            .delete(endpoint)
+            .header("x-goog-api-key", api_key)
+            .build()
+            .map_err(transport_error)?;
+        let response = tokio::time::timeout(
+            GeminiProvider::transport_config().response_open_timeout,
+            self.client.execute(request),
+        )
+        .await
+        .map_err(|_| {
+            response_open_timeout_error(GeminiProvider::transport_config().response_open_timeout)
+        })?
+        .map_err(transport_error)?;
+        if response.status().is_success() || response.status().as_u16() == 404 {
+            Ok(())
+        } else {
+            Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!(
+                    "Gemini CachedContent delete returned HTTP {}",
+                    response.status().as_u16()
+                ),
+            ))
+        }
+    }
+}
+
+impl GeminiCacheRegistry {
+    /// Deletes the resource owned by one session scope. A failed delete is
+    /// retained so a later switch-away/transition can retry it.
+    pub async fn delete_scope(&self, scope: &str) -> Result<(), ProviderError> {
+        let existing = { self.resources.lock().await.remove(scope) };
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        if let Err(error) = existing.backend.delete_cached_content(&existing.name).await {
+            self.resources
+                .lock()
+                .await
+                .insert(scope.to_owned(), existing);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn prepare_generate_payload(
+        &self,
+        request: &TurnRequest,
+        full_payload: serde_json::Value,
+        backend: Arc<dyn GeminiCacheBackend>,
+        effort: Option<&str>,
+        web_builtins: bool,
+    ) -> serde_json::Value {
+        let Some(metadata) = request.cache_metadata.as_ref().filter(|metadata| {
+            metadata.boundaries_valid(request.messages.len())
+                && metadata.provider == GEMINI_PROVIDER_NAME
+                && metadata.account_scope.is_some()
+        }) else {
+            return full_payload;
+        };
+        let scope = metadata.session_scope.clone();
+        let existing = { self.resources.lock().await.remove(&scope) };
+        if let Some(existing) = existing {
+            let expired = existing.expires_at <= tokio::time::Instant::now();
+            if existing.epoch == metadata.cache_epoch
+                && !expired
+                && payload_contents(&full_payload)
+                    .is_some_and(|contents| contents.starts_with(&existing.contents))
+            {
+                let payload = gemini_cached_generate_payload(
+                    full_payload,
+                    &existing.name,
+                    existing.contents.len(),
+                );
+                self.resources.lock().await.insert(scope, existing);
+                return payload;
+            }
+            if existing
+                .backend
+                .delete_cached_content(&existing.name)
+                .await
+                .is_err()
+            {
+                // Never create a second paid resource while the superseded
+                // one could not be deleted. Retain it for a later retry and
+                // send the exact implicit full-history request now.
+                // An entry beyond Haider's own matching TTL is already dead
+                // provider-side; discard that local handle so an unavailable
+                // DELETE endpoint cannot permanently disable explicit reuse.
+                if !expired {
+                    self.resources.lock().await.insert(scope, existing);
+                }
+                return full_payload;
+            }
+        }
+
+        let Some(minimum) = gemini_explicit_cache_minimum(&request.model) else {
+            return full_payload;
+        };
+        if metadata.stable_prefix_tokens < minimum
+            || metadata.expected_later_reads < 2
+            || web_builtins
+            || metadata.stable_history_end == 0
+            || metadata.stable_history_end > request.messages.len()
+        {
+            return full_payload;
+        }
+
+        let mut stable_request = request.clone();
+        stable_request
+            .messages
+            .truncate(metadata.stable_history_end);
+        stable_request.cache_metadata = None;
+        let Ok(stable_payload) = gemini_request_json(&stable_request, effort, web_builtins) else {
+            return full_payload;
+        };
+        let Some(stable_contents) = payload_contents(&stable_payload).map(<[_]>::to_vec) else {
+            return full_payload;
+        };
+        if stable_contents.is_empty()
+            || !payload_contents(&full_payload)
+                .is_some_and(|contents| contents.starts_with(&stable_contents))
+        {
+            // Adjacent equal Gemini roles can coalesce across a split. Such a
+            // boundary is not byte-stable and stays on implicit caching.
+            return full_payload;
+        }
+        let create_payload = gemini_cached_content_create_payload(request, &stable_payload);
+        let Ok(name) = backend.create_cached_content(&create_payload).await else {
+            return full_payload;
+        };
+        let payload = gemini_cached_generate_payload(full_payload, &name, stable_contents.len());
+        self.resources.lock().await.insert(
+            scope,
+            GeminiCachedResource {
+                epoch: metadata.cache_epoch.clone(),
+                name,
+                contents: stable_contents,
+                expires_at: tokio::time::Instant::now() + Duration::from_secs(3_600),
+                backend,
+            },
+        );
+        payload
+    }
+}
+
+fn gemini_explicit_cache_minimum(model: &str) -> Option<u64> {
+    if model.starts_with("gemini-2.5-flash") || model.starts_with("gemini-2.5-pro") {
+        Some(2_048)
+    } else if model.starts_with("gemini-3.1-pro-preview") || model.starts_with("gemini-3.5-flash") {
+        Some(4_096)
+    } else {
+        None
+    }
+}
+
+fn payload_contents(payload: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    payload.get("contents")?.as_array().map(Vec::as_slice)
+}
+
+fn gemini_cached_content_create_payload(
+    request: &TurnRequest,
+    stable_payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "model": format!("models/{}", request.model),
+        "contents": stable_payload.get("contents").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "ttl": "3600s",
+    });
+    let object = payload.as_object_mut().expect("literal JSON object");
+    if let Some(system) = stable_payload.get("system_instruction") {
+        object.insert("systemInstruction".into(), system.clone());
+    }
+    if let Some(tools) = stable_payload.get("tools") {
+        object.insert("tools".into(), tools.clone());
+    }
+    payload
+}
+
+fn gemini_cached_generate_payload(
+    mut full_payload: serde_json::Value,
+    name: &str,
+    covered_contents: usize,
+) -> serde_json::Value {
+    let Some(object) = full_payload.as_object_mut() else {
+        return full_payload;
+    };
+    object.remove("system_instruction");
+    object.remove("tools");
+    if let Some(contents) = object
+        .get_mut("contents")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        contents.drain(..covered_contents.min(contents.len()));
+    }
+    object.insert("cachedContent".into(), serde_json::json!(name));
+    full_payload
+}
+
+fn valid_gemini_cache_name(name: &str) -> bool {
+    let Some(identifier) = name.strip_prefix("cachedContents/") else {
+        return false;
+    };
+    !identifier.is_empty()
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn gemini_stream_endpoint(model: &str) -> Result<String, ProviderError> {
@@ -387,7 +758,7 @@ type CallNameIndex = HashMap<String, String>;
 type OpaqueCallIndex = HashMap<String, FunctionIdentity>;
 type ToolCallIndex = (CallNameIndex, OpaqueCallIndex);
 
-fn gemini_request_json(
+pub(crate) fn gemini_request_json(
     request: &TurnRequest,
     effort: Option<&str>,
     web_builtins: bool,

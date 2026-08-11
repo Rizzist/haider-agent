@@ -487,6 +487,29 @@ impl Provider for OpenAiProvider {
         }
     }
 
+    fn rendered_cache_prefix_digests(
+        &self,
+        request: &TurnRequest,
+    ) -> Option<haider_protocol::provider::PrefixDigests> {
+        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let full_payload = self.request_payload(request).ok()?;
+        let mut stable_request = request.clone();
+        stable_request.messages.truncate(boundary);
+        if let Some(metadata) = &mut stable_request.cache_metadata {
+            metadata.stable_history_end = boundary;
+            metadata.current_user_start = boundary;
+        }
+        let stable_payload = self.request_payload(&stable_request).ok()?;
+        crate::rendered_prefix_digests(
+            request,
+            &full_payload,
+            &stable_payload,
+            "instructions",
+            "tools",
+            "input",
+        )
+    }
+
     async fn capabilities(&self) -> CapabilityDoc {
         native_capabilities(&self.http.model)
     }
@@ -867,6 +890,29 @@ impl Provider for OpenAiCompatibleProvider {
                 crate::ProviderCredentialSurface::OAuthSubscriptionBearer
             }
         }
+    }
+
+    fn rendered_cache_prefix_digests(
+        &self,
+        request: &TurnRequest,
+    ) -> Option<haider_protocol::provider::PrefixDigests> {
+        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let full_payload = self.request_payload(request).ok()?;
+        let mut stable_request = request.clone();
+        stable_request.messages.truncate(boundary);
+        if let Some(metadata) = &mut stable_request.cache_metadata {
+            metadata.stable_history_end = boundary;
+            metadata.current_user_start = boundary;
+        }
+        let stable_payload = self.request_payload(&stable_request).ok()?;
+        crate::rendered_prefix_digests(
+            request,
+            &full_payload,
+            &stable_payload,
+            "system",
+            "tools",
+            "messages",
+        )
     }
 
     async fn capabilities(&self) -> CapabilityDoc {
@@ -2264,7 +2310,7 @@ fn responses_request_json(
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let mut input = Vec::new();
-    for message in &request.messages {
+    for (message_index, message) in request.messages.iter().enumerate() {
         let mut content = Vec::new();
         for block in &message.blocks {
             match block {
@@ -2379,6 +2425,14 @@ fn responses_request_json(
             }
         }
         flush_response_message(&mut input, message.role, &mut content);
+        if openai_explicit_cache_enabled(request, codex_responses_lite)
+            && request.cache_metadata.as_ref().is_some_and(|metadata| {
+                metadata.latest_compaction_summary_end == Some(message_index.saturating_add(1))
+                    || metadata.stable_history_end == message_index.saturating_add(1)
+            })
+        {
+            mark_latest_openai_cacheable_block(&mut input);
+        }
     }
     let mut tools = request
         .tools
@@ -2436,6 +2490,15 @@ fn responses_request_json(
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
+    if let Some(key) = openai_prompt_cache_key(request, codex_responses_lite) {
+        object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
+        if openai_explicit_cache_enabled(request, codex_responses_lite) {
+            object.insert(
+                "prompt_cache_options".into(),
+                serde_json::json!({"mode": "explicit", "ttl": "30m"}),
+            );
+        }
+    }
     // Reasoning object: `summary: auto` + encrypted-content include for
     // reasoning models; lite ADDS the required `context: all_turns` and
     // ensures the object exists even for a non-reasoning model.
@@ -2463,6 +2526,88 @@ fn responses_request_json(
         }
     }
     Ok(payload)
+}
+
+fn openai_explicit_cache_enabled(request: &TurnRequest, codex_responses_lite: bool) -> bool {
+    !codex_responses_lite
+        && request.cache_metadata.as_ref().is_some_and(|metadata| {
+            metadata.boundaries_valid(request.messages.len())
+                && metadata.provider == OPENAI_PROVIDER_NAME
+                && metadata.account_scope.is_some()
+                && (request.model == "gpt-5.6" || request.model.starts_with("gpt-5.6-"))
+        })
+}
+
+fn openai_automatic_cache_key_supported(model: &str) -> bool {
+    let model_or_variant = |base: &str| model == base || model.starts_with(&format!("{base}-"));
+    model_or_variant("gpt-4o")
+        || model_or_variant("gpt-4.1")
+        || model_or_variant("gpt-5")
+        || [
+            "gpt-5.1", "gpt-5.2", "gpt-5.3", "gpt-5.4", "gpt-5.5", "gpt-5.6",
+        ]
+        .iter()
+        .any(|base| model_or_variant(base))
+        || model_or_variant("o1")
+        || model_or_variant("o3")
+        || model_or_variant("o4")
+}
+
+fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) -> Option<String> {
+    if codex_responses_lite || !openai_automatic_cache_key_supported(&request.model) {
+        return None;
+    }
+    let metadata = request.cache_metadata.as_ref()?;
+    (metadata.boundaries_valid(request.messages.len())
+        && metadata.provider == OPENAI_PROVIDER_NAME
+        && metadata.account_scope.is_some())
+    .then(|| derive_prompt_cache_key(request, metadata))
+}
+
+fn derive_prompt_cache_key(request: &TurnRequest, metadata: &crate::PromptCacheMetadata) -> String {
+    let domain = serde_json::json!({
+        "schema": "haider.prompt-cache-key.v1",
+        "provider": metadata.provider,
+        "model": request.model,
+        "account_scope": metadata.account_scope,
+        "system_digest": metadata.prefix_digests.system,
+        "tool_digest": metadata.prefix_digests.tools,
+        "compaction_epoch": metadata.compaction_epoch,
+    });
+    serde_json::to_vec(&domain).map_or_else(
+        |_| {
+            blake3::hash(b"haider-prompt-cache-key-serialization-error")
+                .to_hex()
+                .to_string()
+        },
+        |bytes| blake3::hash(&bytes).to_hex().to_string(),
+    )
+}
+
+fn mark_latest_openai_cacheable_block(input: &mut [serde_json::Value]) {
+    for item in input.iter_mut().rev() {
+        let Some(content) = item
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for block in content.iter_mut().rev() {
+            let supported = block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| matches!(kind, "input_text" | "input_image" | "input_file"));
+            if supported {
+                if let Some(object) = block.as_object_mut() {
+                    object.insert(
+                        "prompt_cache_breakpoint".into(),
+                        serde_json::json!({"mode": "explicit"}),
+                    );
+                }
+                return;
+            }
+        }
+    }
 }
 
 fn flush_response_message(
@@ -2660,12 +2805,48 @@ fn chat_request_json(
                 // top-level knob; catalog gating happens at the factory.
                 object.insert("reasoning_effort".into(), serde_json::json!(effort));
             }
+            if let Some(metadata) = request.cache_metadata.as_ref().filter(|metadata| {
+                metadata.boundaries_valid(request.messages.len())
+                    && metadata.provider == KIMI_OAUTH_PROVIDER_NAME
+                    && metadata.account_scope.is_some()
+            }) {
+                object.insert(
+                    "prompt_cache_key".into(),
+                    serde_json::Value::String(derive_kimi_session_prompt_cache_key(
+                        request, metadata,
+                    )),
+                );
+            }
         }
     }
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
     Ok(payload)
+}
+
+fn derive_kimi_session_prompt_cache_key(
+    request: &TurnRequest,
+    metadata: &crate::PromptCacheMetadata,
+) -> String {
+    let domain = serde_json::json!({
+        "schema": "haider.kimi-prompt-cache-key.v1",
+        "provider": metadata.provider,
+        "model": request.model,
+        "session_scope": metadata.session_scope,
+        "account_scope": metadata.account_scope,
+        "system_digest": metadata.prefix_digests.system,
+        "tool_digest": metadata.prefix_digests.tools,
+        "compaction_epoch": metadata.compaction_epoch,
+    });
+    serde_json::to_vec(&domain).map_or_else(
+        |_| {
+            blake3::hash(b"haider-kimi-prompt-cache-key-serialization-error")
+                .to_hex()
+                .to_string()
+        },
+        |bytes| blake3::hash(&bytes).to_hex().to_string(),
+    )
 }
 
 fn attachment_index(request: &TurnRequest) -> Result<HashMap<&str, &str>, ProviderError> {

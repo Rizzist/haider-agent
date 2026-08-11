@@ -36,12 +36,13 @@ use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payl
 use async_trait::async_trait;
 use base64::Engine;
 use haider_core::{
-    AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, ContextCompactionClaim,
-    ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket, DeferredToolResult,
-    EventIdGenerator, HarnessActor, HarnessConfig, PromptHistoryCompiler, RequestInputCheckpoint,
-    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
-    estimate_provider_request_input_tokens, sanitized_failure_message,
+    AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, CompiledPromptProjection,
+    ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
+    DeferredToolResult, EventIdGenerator, HarnessActor, HarnessConfig, PromptHistoryCompiler,
+    RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn,
+    SubmitCommittedTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
+    sanitized_failure_message,
 };
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
@@ -72,6 +73,7 @@ use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
     OPENAI_OAUTH_PROVIDER_NAME, ProviderCredentialSurface, ResolvedAttachment,
+    canonical_tool_definitions_digest,
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
@@ -85,7 +87,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -150,6 +152,10 @@ pub trait ProviderFactory: Send + Sync {
         let _ = degrade;
         self.resolve_for_turn(metadata).await
     }
+
+    /// Gives production factories a chance to delete provider-owned
+    /// ephemeral cache resources when a session switches wire families.
+    async fn reconcile_cache_scope(&self, _session_id: &SessionId, _provider: &str) {}
 }
 
 /// W-B: session-scoped web-capability degrades (hub-owned, in-memory).
@@ -258,6 +264,7 @@ impl ContextCompactor for DaemonContextCompactor {
             system_prompt: None,
             tools: Vec::new(),
             attachments: Vec::new(),
+            cache_metadata: None,
         };
         let mut stream = self.provider.stream_turn(request).await.map_err(|error| {
             HaiderError::new(
@@ -286,7 +293,7 @@ impl ContextCompactor for DaemonContextCompactor {
                     scope.agent = self.agent_id.clone();
                     scope.prefix_digests = Some(PrefixDigests {
                         system: digest_json(&Option::<String>::None),
-                        tools: digest_json(&Vec::<ToolDefinition>::new()),
+                        tools: canonical_tool_definitions_digest(&[]),
                         immutable_history: immutable_history_digest.clone(),
                         model: digest_json(&self.model),
                         auth_mode: digest_json(&scope.auth_scope),
@@ -2916,6 +2923,10 @@ async fn perform_manual_compaction(
             false,
         ));
     }
+    dependencies
+        .provider_factory
+        .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
+        .await;
     let instructions = project_instructions::load(&metadata.cwd).await;
     let instruction_entries = instructions
         .as_ref()
@@ -3370,6 +3381,43 @@ fn strip_foreign_provider_opaque(messages: &mut Vec<Message>, provider_name: &st
     messages.retain(|message| !message.blocks.is_empty());
 }
 
+/// Applies the provider-family opaque strip while remapping every compiler
+/// boundary through messages that became empty. The strip remains a pure
+/// removal; signed/native blocks that survive are never rewritten.
+fn strip_foreign_provider_opaque_projection(
+    projection: &mut CompiledPromptProjection,
+    provider_name: &str,
+) {
+    let stable_before = projection.stable_history_end;
+    let current_before = projection.current_user_start;
+    let summary_before = projection.latest_compaction_summary_end;
+    let accepted = accepted_opaque_provider(provider_name);
+    let mut boundary_map = Vec::with_capacity(projection.messages.len().saturating_add(1));
+    boundary_map.push(0usize);
+    let mut retained = 0usize;
+    for message in &projection.messages {
+        let survives = message.blocks.iter().any(|block| {
+            !matches!(
+                block,
+                haider_protocol::provider::Block::ProviderOpaque { provider, .. }
+                    if provider != accepted
+            )
+        });
+        retained = retained.saturating_add(usize::from(survives));
+        boundary_map.push(retained);
+    }
+    strip_foreign_provider_opaque(&mut projection.messages, provider_name);
+    let remap = |boundary: usize| {
+        boundary_map
+            .get(boundary.min(boundary_map.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(projection.messages.len())
+    };
+    projection.stable_history_end = remap(stable_before);
+    projection.current_user_start = remap(current_before);
+    projection.latest_compaction_summary_end = summary_before.map(remap);
+}
+
 /// Re-reads THIS session's metadata for one logical turn (F1). The store is
 /// the one truth for the current model selection: a committed
 /// `session.select_model` between turns is picked up here, which is what
@@ -3433,6 +3481,15 @@ async fn start_turn(
             false,
         ));
     }
+    // Explicit Gemini resources are session-owned rather than provider-
+    // instance-owned. Reconcile on every ordinary turn after resolving the
+    // selected pair so switching away deletes the old paid resource before
+    // any request is sent on the new provider. Implementations for providers
+    // without explicit resources retain the additive no-op default.
+    dependencies
+        .provider_factory
+        .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
+        .await;
     let delegation = dependencies.delegation.clone().ok_or_else(|| {
         HaiderError::new(
             ErrorCode::Internal,
@@ -3459,7 +3516,7 @@ async fn start_turn(
     )
     .await?;
     let prompt_compile_started = Instant::now();
-    let mut messages = PromptHistoryCompiler::compile_with_artifacts(
+    let mut compiled = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
         lease,
         lease,
         lease.session_id(),
@@ -3474,7 +3531,11 @@ async fn start_turn(
     // the old family's facts (openai encrypted reasoning, gemini signed
     // parts, anthropic thinking blocks), so they are stripped here, before
     // the request, instead of failing every turn on the new pair.
-    strip_foreign_provider_opaque(&mut messages, &resolved.provider_name);
+    strip_foreign_provider_opaque_projection(&mut compiled, &resolved.provider_name);
+    let compiled_stable_history_end = compiled.stable_history_end;
+    let compiled_current_user_start = compiled.current_user_start;
+    let compiled_compaction_summary_end = compiled.latest_compaction_summary_end;
+    let mut messages = compiled.messages;
     if messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(
@@ -3579,6 +3640,15 @@ async fn start_turn(
         &config.system_prompt,
         &config.tools,
     );
+    config.cache_reuse_gap_ms =
+        prior_cache_domain_gap_ms(lease, &accepted.run_id, &config.usage_scope).await?;
+    config.cache_stable_history_end = Some(compiled_stable_history_end);
+    config.cache_current_user_start = Some(compiled_current_user_start);
+    config.cache_compaction_summary_end = compiled_compaction_summary_end;
+    // A coding turn with an advertised tool pack is expected to reuse a
+    // sufficiently large immutable prefix for at least a tool loop and a
+    // later turn. Toolless lanes retain the zero-reuse safe fallback.
+    config.cache_expected_later_reads = u32::from(!config.tools.is_empty()) * 2;
     config.usage_account = account_scope;
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
@@ -3745,7 +3815,7 @@ fn usage_scope_for(
         "auth": auth_scope,
         "reasoning": reasoning_settings,
         "system": digest_json(system_prompt),
-        "tools": digest_json(&tools),
+        "tools": canonical_tool_definitions_digest(tools),
     }));
     UsageScope {
         provider: provider.to_owned(),
@@ -3758,6 +3828,60 @@ fn usage_scope_for(
         agent: None,
         prefix_digests: None,
     }
+}
+
+/// Returns the observed wall-clock gap since the latest completed request in
+/// the same provider/model/account/auth domain. This reads existing usage
+/// telemetry only; it adds no journal facts and unknown clocks/history retain
+/// the conservative short-TTL fallback.
+async fn prior_cache_domain_gap_ms(
+    store: &HubStoreHandle,
+    current_run: &RunId,
+    scope: &UsageScope,
+) -> Result<Option<u64>, HaiderError> {
+    let mut cursor = 0_u64;
+    let mut latest = None::<u64>;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() == Some(current_run) {
+                continue;
+            }
+            let Ok(EventPayload::Usage(usage)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            let Some(previous) = usage.scope else {
+                continue;
+            };
+            if previous.request_kind == UsageRequestKind::MainTurn
+                && previous.provider == scope.provider
+                && previous.model == scope.model
+                && previous.account_scope == scope.account_scope
+                && previous.auth_scope == scope.auth_scope
+            {
+                latest = Some(latest.map_or(envelope.committed_at_ms, |timestamp| {
+                    timestamp.max(envelope.committed_at_ms)
+                }));
+            }
+        }
+    }
+    let Some(latest) = latest.filter(|timestamp| *timestamp > 0) else {
+        return Ok(None);
+    };
+    let Some(now) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(now.saturating_sub(latest)))
 }
 
 async fn find_committed_menu_answer(
