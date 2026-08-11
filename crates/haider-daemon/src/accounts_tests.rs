@@ -1690,28 +1690,34 @@ const CLAUDE_READ_THROUGH_FIXTURE: &[u8] = br#"{
 }"#;
 
 struct StubAccountClaudeNative {
-    bytes: StdMutex<Option<Vec<u8>>>,
+    state: StdMutex<Result<Vec<u8>, ClaudeNativeCredentialFailure>>,
     reads: std::sync::atomic::AtomicUsize,
 }
 
 impl StubAccountClaudeNative {
     fn with_bytes(bytes: &[u8]) -> Self {
         Self {
-            bytes: StdMutex::new(Some(bytes.to_vec())),
+            state: StdMutex::new(Ok(bytes.to_vec())),
             reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn unavailable() -> Self {
         Self {
-            bytes: StdMutex::new(None),
+            state: StdMutex::new(Err(ClaudeNativeCredentialFailure::Missing)),
             reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn replace(&self, bytes: &[u8]) {
-        if let Ok(mut current) = self.bytes.lock() {
-            *current = Some(bytes.to_vec());
+        if let Ok(mut current) = self.state.lock() {
+            *current = Ok(bytes.to_vec());
+        }
+    }
+
+    fn fail(&self, failure: ClaudeNativeCredentialFailure) {
+        if let Ok(mut current) = self.state.lock() {
+            *current = Err(failure);
         }
     }
 
@@ -1721,12 +1727,15 @@ impl StubAccountClaudeNative {
 }
 
 impl ClaudeNativeCredentialStore for StubAccountClaudeNative {
-    fn read(&self) -> Option<crate::oauth::ClaudeCredentialInput> {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<crate::oauth::ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.bytes
+        self.state
             .lock()
-            .ok()
-            .and_then(|bytes| bytes.clone())
+            .map_err(|_| ClaudeNativeCredentialFailure::Unavailable)?
+            .clone()
             .map(|bytes| crate::oauth::ClaudeCredentialInput {
                 location: std::path::PathBuf::from("mock native store: Claude Code-credentials"),
                 bytes: Zeroizing::new(bytes),
@@ -2011,7 +2020,7 @@ fn start_oauth_import_heal_test_actor(
         store,
         vault,
         catalog,
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
         None,
     )
 }
@@ -2067,6 +2076,7 @@ fn start_oauth_import_heal_test_actor_with_native(
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(UnreachableGcloud),
         claude_native,
+        None,
     )
     .expect("OAuth import heal actor");
     (actor, broker, snapshot, refresh_fences)
@@ -4788,7 +4798,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         },
         discoverer_trait,
         Arc::new(UnreachableGcloud),
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+        None,
     )
     .expect("custom refresh actor");
 
@@ -5024,7 +5035,8 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         },
         discoverer_trait,
         Arc::new(UnreachableGcloud),
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+        None,
     )
     .expect("actor with broker");
 
@@ -5400,6 +5412,14 @@ async fn import_claude_for_heal(actor: &AccountActorHandle) -> CredentialDescrip
 /// record an UNCERTAIN refresh, and under it the rotating token is never
 /// replayed).
 fn age_import_bundle(vault: &MemoryVault, descriptor: &CredentialDescriptor) {
+    set_import_bundle_expiry(vault, descriptor, 1_600_000_000_000);
+}
+
+fn set_import_bundle_expiry(
+    vault: &MemoryVault,
+    descriptor: &CredentialDescriptor,
+    expires_at_unix_ms: u64,
+) {
     let stored = vault.resolve(&descriptor.alias).expect("imported bundle");
     let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
         .expect("decode imported bundle");
@@ -5413,7 +5433,7 @@ fn age_import_bundle(vault: &MemoryVault, descriptor: &CredentialDescriptor) {
         bundle
             .refresh_token()
             .map(|token| zeroize::Zeroizing::new(token.to_vec())),
-        1_600_000_000_000, // 2020 — thoroughly expired
+        expires_at_unix_ms,
         bundle.refresh_expires_at_unix_ms,
         bundle.granted_scopes.clone(),
         bundle.identity.clone(),
@@ -5578,7 +5598,7 @@ async fn expired_claude_snapshot_reads_through_live_owner_without_refresh_grant(
             Some(exchange_service),
         );
     let descriptor = import_claude_for_heal(&actor).await;
-    assert!(descriptor.identity.ends_with("linked to Claude Code"));
+    assert!(descriptor.identity.ends_with("Linked to Claude Code"));
     native.replace(CLAUDE_READ_THROUGH_FIXTURE);
     age_import_bundle(vault.as_ref(), &descriptor);
 
@@ -5616,6 +5636,256 @@ async fn expired_claude_snapshot_reads_through_live_owner_without_refresh_grant(
     store.close().await.expect("close");
 }
 
+/// LAW D2/D3: an unreachable owner store does not poison a still-valid
+/// snapshot. Once the same cached token truly expires, the row receives the
+/// typed locked remedy. An explicit refresh after the store recovers retries
+/// the seam, auto-re-adopts, and returns the row to active/Ok without a
+/// manual import action.
+#[tokio::test(flavor = "current_thread")]
+async fn locked_store_waits_for_cached_expiry_then_significant_refresh_self_heals() {
+    let fixture_home = test_store_dir();
+    let missing_file = fixture_home.path().join("missing-claude-credentials.json");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::locked_store_waits_for_cached_expiry_then_significant_refresh_self_heals",
+        &[
+            ("HOME", fixture_home.path()),
+            ("HAIDER_CLAUDE_CREDS_PATH", &missing_file),
+        ],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let native = Arc::new(StubAccountClaudeNative::with_bytes(CLAUDE_IMPORT_FIXTURE));
+    let native_service: Arc<dyn ClaudeNativeCredentialStore> = native.clone();
+    let (mut actor, broker, snapshot, _refresh_fences) =
+        start_oauth_import_heal_test_actor_with_native(
+            &store,
+            Arc::clone(&vault),
+            anthropic_import_refresh_catalog("http://127.0.0.1:1/token"),
+            native_service,
+            None,
+        );
+    let descriptor = import_claude_for_heal(&actor).await;
+
+    set_import_bundle_expiry(
+        vault.as_ref(),
+        &descriptor,
+        unix_ms_after(Duration::from_secs(5)),
+    );
+    native.fail(ClaudeNativeCredentialFailure::Locked);
+    let cached = broker
+        .resolve(&descriptor)
+        .await
+        .expect("valid cached token survives the locked owner store");
+    assert_eq!(cached.expose_secret(), b"fake-claude-access-token-1");
+    assert_eq!(
+        snapshot.lock().expect("valid snapshot")[0].status,
+        CredentialStatus::Ok,
+        "store failures are not surfaced while cached access is usable"
+    );
+    let reads_after_failure = native.reads();
+
+    age_import_bundle(vault.as_ref(), &descriptor);
+    let error = broker
+        .resolve(&descriptor)
+        .await
+        .expect_err("expired cache cannot hide a locked owner store");
+    assert_eq!(error.code, ErrorCode::CredentialMissing);
+    assert_eq!(
+        native.reads(),
+        reads_after_failure,
+        "the expired resolution is served by the boot cooldown"
+    );
+    let retry = broker
+        .resolve(&descriptor)
+        .await
+        .expect_err("cooldown keeps a repeated expired resolution graceful");
+    assert_eq!(retry.code, ErrorCode::CredentialMissing);
+    assert_eq!(
+        native.reads(),
+        reads_after_failure,
+        "ordinary retry is served by the boot cooldown"
+    );
+    assert_eq!(
+        snapshot.lock().expect("attention snapshot")[0].status,
+        CredentialStatus::NeedsAttention {
+            reason: CredentialAttentionReason::KeychainLocked,
+        }
+    );
+
+    native.replace(CLAUDE_READ_THROUGH_FIXTURE);
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::DeviceCandidates {
+            discovery_disabled: false,
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-after-unlock"),
+                sink,
+            },
+        })
+        .await
+        .expect("explicit discovery refresh");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("refresh deadline")
+            .expect("refresh response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountDeviceCandidates { .. },
+            ..
+        }
+    ));
+    let current = snapshot.lock().expect("self-healed snapshot")[0].clone();
+    assert_eq!(current.status, CredentialStatus::Ok);
+    assert!(current.active);
+    let stored = vault
+        .resolve(&descriptor.alias)
+        .and_then(|secret| haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret()))
+        .expect("self-healed snapshot persisted");
+    assert_eq!(stored.access_token(), b"fake-claude-live-access-token-2");
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// LAW D4: denial is actionable rather than terminal. Once a significant
+/// refresh can read the owner again, automatic re-adoption clears the typed
+/// status and restores the account without a manual import.
+#[tokio::test(flavor = "current_thread")]
+async fn success_after_denied_auto_adopt_self_heals_to_active() {
+    let fixture_home = test_store_dir();
+    let missing_file = fixture_home.path().join("missing-claude-credentials.json");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::success_after_denied_auto_adopt_self_heals_to_active",
+        &[
+            ("HOME", fixture_home.path()),
+            ("HAIDER_CLAUDE_CREDS_PATH", &missing_file),
+        ],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let native = Arc::new(StubAccountClaudeNative::with_bytes(CLAUDE_IMPORT_FIXTURE));
+    let native_service: Arc<dyn ClaudeNativeCredentialStore> = native.clone();
+    let (mut actor, broker, snapshot, _refresh_fences) =
+        start_oauth_import_heal_test_actor_with_native(
+            &store,
+            Arc::clone(&vault),
+            anthropic_import_refresh_catalog("http://127.0.0.1:1/token"),
+            native_service,
+            None,
+        );
+    let descriptor = import_claude_for_heal(&actor).await;
+    age_import_bundle(vault.as_ref(), &descriptor);
+    native.fail(ClaudeNativeCredentialFailure::Denied);
+
+    let error = broker
+        .resolve(&descriptor)
+        .await
+        .expect_err("denied live owner cannot replace an expired snapshot");
+    assert_eq!(error.code, ErrorCode::CredentialMissing);
+    assert_eq!(
+        snapshot.lock().expect("denied snapshot")[0].status,
+        CredentialStatus::NeedsAttention {
+            reason: CredentialAttentionReason::KeychainDenied,
+        }
+    );
+
+    let reads_before_recovery = native.reads();
+    native.replace(CLAUDE_READ_THROUGH_FIXTURE);
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::DeviceCandidates {
+            discovery_disabled: false,
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-after-reallow"),
+                sink,
+            },
+        })
+        .await
+        .expect("explicit discovery refresh");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("refresh deadline")
+            .expect("refresh response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountDeviceCandidates { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        native.reads(),
+        reads_before_recovery + 1,
+        "the successful discovery bytes are handed to auto-adopt"
+    );
+    let current = snapshot.lock().expect("self-healed snapshot")[0].clone();
+    assert_eq!(current.status, CredentialStatus::Ok);
+    assert!(current.active);
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// LAW D5: even if the live owner returns the same token bytes, a successful
+/// read-through rewrites Haider's FileVault snapshot with the owner's fresh
+/// expiry. The degraded path therefore always holds the newest complete copy.
+#[tokio::test(flavor = "current_thread")]
+async fn successful_unchanged_owner_read_persists_fresh_snapshot() {
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let native = Arc::new(StubAccountClaudeNative::with_bytes(CLAUDE_IMPORT_FIXTURE));
+    let native_service: Arc<dyn ClaudeNativeCredentialStore> = native;
+    let (mut actor, broker, snapshot, _refresh_fences) =
+        start_oauth_import_heal_test_actor_with_native(
+            &store,
+            Arc::clone(&vault),
+            anthropic_import_refresh_catalog("http://127.0.0.1:1/token"),
+            native_service,
+            None,
+        );
+    let descriptor = import_claude_for_heal(&actor).await;
+    set_import_bundle_expiry(
+        vault.as_ref(),
+        &descriptor,
+        unix_ms_after(Duration::from_secs(5)),
+    );
+
+    let access = broker
+        .resolve(&descriptor)
+        .await
+        .expect("unchanged live owner remains usable");
+    assert_eq!(access.expose_secret(), b"fake-claude-access-token-1");
+    let stored = vault
+        .resolve(&descriptor.alias)
+        .and_then(|secret| haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret()))
+        .expect("fresh owner snapshot persisted");
+    assert_eq!(stored.expires_at_unix_ms, 4_102_444_800_123);
+    assert_eq!(
+        stored.generation, 1,
+        "unchanged bytes do not mint a revision"
+    );
+    assert_eq!(
+        snapshot.lock().expect("snapshot")[0].status,
+        CredentialStatus::Ok
+    );
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 /// LAW (d): without a live native owner store, a file-only Claude credential
 /// remains independently refreshable and persists the rotated grant.
 ///
@@ -5627,11 +5897,12 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
     let vault = Arc::new(MemoryVault::new());
     let native = Arc::new(StubAccountClaudeNative::unavailable());
     let exchange = Arc::new(CountingAnthropicRefreshExchange::new());
-    assert!(
-        load_claude_native_import_material(2, native.as_ref())
-            .expect("native absence probe")
-            .is_none()
-    );
+    assert!(matches!(
+        load_claude_native_import_material(2, native.as_ref(), ClaudeNativeReadEvent::Significant,),
+        Err(ClaudeNativeImportError::Access(
+            ClaudeNativeCredentialFailure::Missing
+        ))
+    ));
     let descriptor = CredentialDescriptor {
         alias: CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME),
         provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
@@ -6054,6 +6325,61 @@ async fn oauth_import_source_ownership_tracks_the_latest_alias_incarnation() {
     store.close().await.expect("close");
 }
 
+/// LAW A3: probe aliases are never considered source-owned adoption targets.
+/// A discovery refresh may create the ordinary default row, but it can never
+/// replace a `probeN-api` credential or inherit its receipt provenance.
+#[tokio::test]
+async fn auto_adopt_alias_selection_never_reuses_probe_accounts() {
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let mut accounts = memory_accounts();
+    let probe_alias = CredentialAlias::new("probe7-api");
+    let probe = oauth_descriptor_for(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        &probe_alias,
+        &openai_import_test_bundle(b"probe-access", b"probe-refresh", 1),
+        true,
+    );
+    accounts.add(probe.clone()).expect("seed probe account");
+    let identity = OAuthImportIdentity {
+        source: "codex".to_owned(),
+        alias: probe_alias.as_str().to_owned(),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        candidate: None,
+    };
+    let request_json = identity.canonical_json().expect("probe coordinates");
+    let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        store
+            .account_add_claim_receipt("probe-import".to_owned(), digest, request_json)
+            .await
+            .expect("claim probe receipt"),
+        AccountAddClaim::Fresh
+    );
+    store
+        .finalize_account_add_receipt(
+            "probe-import".to_owned(),
+            AccountAddReceiptResponse { descriptor: probe },
+        )
+        .await
+        .expect("commit probe receipt");
+
+    let selected = select_oauth_import_alias(
+        &store,
+        &accounts,
+        "automatic-import",
+        "codex",
+        OPENAI_OAUTH_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
+    )
+    .await
+    .expect("select non-probe alias");
+    assert_eq!(selected.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
+    assert!(!is_probe_account_alias(selected.as_str()));
+
+    store.close().await.expect("close");
+}
+
 /// LAW (c): a live Claude owner credential remains discoverable beside an
 /// existing same-provider account, and the device action re-adopts the
 /// expired default alias in place as active/Ok.
@@ -6141,7 +6467,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     assert_eq!(descriptor.alias.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
     assert_eq!(descriptor.status, CredentialStatus::Ok);
     assert!(descriptor.active);
-    assert!(descriptor.identity.ends_with("linked to Claude Code"));
+    assert!(descriptor.identity.ends_with("Linked to Claude Code"));
     assert_eq!(accounts.list().len(), 1);
     assert_eq!(snapshot.lock().expect("snapshot")[0], descriptor);
 
@@ -6233,7 +6559,7 @@ async fn codex_import_commits_refreshable_bundle_and_secret_free_receipt() {
     };
     assert_eq!(descriptor.alias.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
     assert_eq!(descriptor.provider, OPENAI_OAUTH_PROVIDER_NAME);
-    assert_eq!(descriptor.identity, "fake-account-1");
+    assert_eq!(descriptor.identity, "fake-account-1 · Codex");
     assert!(descriptor.active);
     {
         let current = snapshot.lock().expect("snapshot");
@@ -7322,6 +7648,124 @@ const GEMINI_DISCOVERY_FIXTURE: &[u8] = br#"{
   "expiry_date": 4102444800123
 }"#;
 
+/// LAW A1/A2: production actor startup performs the discovery policy before
+/// servicing commands. The discovered Codex credential becomes roster truth
+/// without a TUI import action, and later discovery-cadence refreshes are
+/// revision/alias/receipt idempotent.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
+    let fixture_dir = test_store_dir();
+    let codex_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&codex_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture");
+    let empty_home = fixture_dir.path().join("empty-home");
+    std::fs::create_dir_all(&empty_home).expect("mkdir empty home");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::startup_auto_adopts_codex_once_and_refresh_is_idempotent",
+        &[
+            ("HAIDER_CODEX_AUTH_PATH", &codex_path),
+            ("HOME", &empty_home),
+        ],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let refresh_fences = RefreshFenceRegistry::default();
+    let broker_vault = Arc::clone(&vault) as Arc<dyn Vault>;
+    let broker_snapshot = Arc::clone(&snapshot);
+    let broker_fences = refresh_fences.clone();
+    let (mut actor, broker) = start_account_actor_with_services(
+        AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: Arc::clone(&vault) as Arc<dyn Vault>,
+            validator: Arc::new(ProviderCredentialValidator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management.clone()),
+            profile_id: "auto-adopt-test".to_owned(),
+            default_model: "unused".to_owned(),
+            providers,
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            reserved_aliases: HashSet::new(),
+            refresh_fences,
+        },
+        |commands| {
+            CredentialBroker::new_with_fences(
+                broker_vault,
+                import_refresh_catalog("http://127.0.0.1:1/token"),
+                broker_snapshot,
+                commands,
+                broker_fences,
+            )
+        },
+        Arc::new(ProductionProviderModelDiscoverer),
+        Arc::new(UnreachableGcloud),
+        Arc::new(StubAccountClaudeNative::unavailable()),
+        Some(false),
+    )
+    .expect("auto-adopt actor");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if management.read().is_some_and(|view| view.revision == 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup auto-adopt deadline");
+    let initial = management.read().expect("startup roster");
+    assert_eq!(initial.descriptors.len(), 1);
+    assert_eq!(
+        initial.descriptors[0].alias.as_str(),
+        OPENAI_OAUTH_PROVIDER_NAME
+    );
+    assert!(initial.descriptors[0].identity.ends_with(" · Codex"));
+
+    for ordinal in 1..=2 {
+        let (sink, mut frames) = channel_sink();
+        actor
+            .commands()
+            .send(AccountCommand::DeviceCandidates {
+                discovery_disabled: false,
+                completed: LoginRoute {
+                    request_id: RequestId::new(format!("auto-refresh-{ordinal}")),
+                    sink,
+                },
+            })
+            .await
+            .expect("refresh cadence command");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), frames.recv())
+                .await
+                .expect("refresh response deadline")
+                .expect("refresh response"),
+            WireFrame::Response {
+                body: ResponseBody::AccountDeviceCandidates { .. },
+                ..
+            }
+        ));
+    }
+    let after = management.read().expect("idempotent roster");
+    assert_eq!(after.revision, 1);
+    assert_eq!(after.descriptors, initial.descriptors);
+    assert_eq!(
+        store.account_add_receipts().await.expect("receipts").len(),
+        1
+    );
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 async fn send_import_device(
     commands: &mpsc::Sender<AccountCommand>,
     sink: Arc<dyn FrameSink>,
@@ -7448,7 +7892,7 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
     };
     assert_eq!(codex_descriptor.alias.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
     assert_eq!(codex_descriptor.provider, OPENAI_OAUTH_PROVIDER_NAME);
-    assert_eq!(codex_descriptor.identity, "fake-account-1");
+    assert_eq!(codex_descriptor.identity, "fake-account-1 · Codex");
     assert!(codex_descriptor.active);
     let stored = vault
         .resolve(&CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME))
@@ -7487,7 +7931,10 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
     };
     assert_eq!(kimi_descriptor.alias.as_str(), KIMI_OAUTH_PROVIDER_NAME);
     assert_eq!(kimi_descriptor.provider, KIMI_OAUTH_PROVIDER_NAME);
-    assert_eq!(kimi_descriptor.identity, "Kimi Code subscription");
+    assert_eq!(
+        kimi_descriptor.identity,
+        "Kimi Code subscription · Kimi Code"
+    );
     assert!(kimi_descriptor.active);
     let stored = vault
         .resolve(&CredentialAlias::new(KIMI_OAUTH_PROVIDER_NAME))
@@ -8413,7 +8860,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
         job("gcloud-import-1", "req-1"),
     )
     .await;
@@ -8462,7 +8909,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
-        Arc::new(PlatformClaudeNativeCredentialStore),
+        Arc::new(PlatformClaudeNativeCredentialStore::default()),
         job("gcloud-import-2", "req-2"),
     )
     .await;

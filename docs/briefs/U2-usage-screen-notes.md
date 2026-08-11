@@ -36,7 +36,8 @@ cross-provider; plus the owner addendum (identity masking, below).
     U1 attributes sessions/duration/LOC to exactly one dominant account.
 - **Identity masking (owner addendum)** — `mask_identity` (`format.rs`):
   first char of local part + first char of domain survive, `*` for the
-  rest (length-preserving), final `.tld` readable
+  rest, capped at eight stars per run so long identities do not reveal
+  their exact length; final `.tld` readable
   (`support@diffforge.ai` → `s******@d********.ai`); non-emails mask as
   one part. MASKED BY DEFAULT on every open (`enter_usage` resets the
   flag — a reveal can never survive into a later visit whichever way the

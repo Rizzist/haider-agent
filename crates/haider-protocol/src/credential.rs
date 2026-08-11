@@ -40,6 +40,24 @@ pub enum CredentialStatus {
     },
     Expired,
     Revoked,
+    /// The cached credential remains durable, but its external owner store
+    /// cannot currently be read. The daemon keeps using an unexpired cached
+    /// access token and surfaces this state only once that token expires.
+    NeedsAttention {
+        reason: CredentialAttentionReason,
+    },
+}
+
+/// Actionable external-owner failures carried by an account row. This is
+/// deliberately credential-store vocabulary rather than a free-form error so
+/// every client can render an honest recovery action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialAttentionReason {
+    KeychainDenied,
+    KeychainLocked,
+    KeychainMissing,
+    KeychainUnavailable,
 }
 
 /// Surfaced like a model change in the transcript (§4.4 rotation).

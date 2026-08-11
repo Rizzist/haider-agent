@@ -162,12 +162,13 @@ pub enum UsageTone {
 /// Streamer-friendly identity masking (U2 owner addendum; P1 extended it
 /// to every surface that renders an account identity). THE ONE AUTHORITY
 /// — no second mask dialect exists: `/usage` identity lines, `/accounts`
-/// rows, the shared device-discovery labels, the import/OAuth receipts,
-/// and the login card's committed identity all pass through here.
+/// rows, import/OAuth receipts, and the login card's committed identity
+/// all pass through here.
 ///
 /// MASK LAW: emails keep the first character of the local part and the
-/// first character of the domain, `*` for every other character
-/// (length-preserving), with the final `.tld` left readable —
+/// first character of the domain, up to eight `*` for the remaining
+/// characters (so the secret's exact length is not disclosed), with the
+/// final `.tld` left readable —
 /// `support@diffforge.ai` → `s******@d********.ai`. Non-email identities
 /// mask the same way as one part. The masked form never contains the
 /// full local part.
@@ -180,10 +181,12 @@ pub enum UsageTone {
 /// would be a second dialect, not more safety).
 #[must_use]
 pub fn mask_identity(identity: &str) -> String {
+    const MAX_MASKED_RUN: usize = 8;
+
     fn mask_part(part: &str) -> String {
         let mut chars = part.chars();
         chars.next().map_or_else(String::new, |first| {
-            let rest = chars.count();
+            let rest = chars.count().min(MAX_MASKED_RUN);
             let mut out = String::with_capacity(part.len());
             out.push(first);
             out.push_str(&"*".repeat(rest));

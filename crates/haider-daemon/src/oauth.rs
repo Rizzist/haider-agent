@@ -68,6 +68,14 @@ const CODEX_IMPORT_FALLBACK_WINDOW: Duration = Duration::from_secs(15 * 60);
 #[cfg(not(test))]
 pub(crate) const CLAUDE_CODE_CREDENTIAL_SERVICE: &str = "Claude Code-credentials";
 pub(crate) const CLAUDE_DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub(crate) const CLAUDE_NATIVE_IDENTITY_LABEL: &str = "Linked to Claude Code";
+
+pub(crate) fn is_claude_native_owner_identity(identity: &str) -> bool {
+    identity
+        .rsplit(" · ")
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case(CLAUDE_NATIVE_IDENTITY_LABEL))
+}
 
 #[cfg(test)]
 static OAUTH_IMPORT_READ_COUNT: std::sync::atomic::AtomicUsize =
@@ -1020,6 +1028,7 @@ pub(crate) fn oauth_home_dir() -> Option<std::ffi::OsString> {
         .find_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
 }
 
+#[derive(Clone)]
 pub(crate) struct ClaudeCredentialInput {
     pub location: PathBuf,
     pub bytes: Zeroizing<Vec<u8>>,
@@ -1028,55 +1037,214 @@ pub(crate) struct ClaudeCredentialInput {
     pub native_owner: bool,
 }
 
-pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
-    fn read(&self) -> Option<ClaudeCredentialInput>;
+/// Typed failures from Claude Code's native credential owner. These stay at
+/// the injectable seam so daemon policy can distinguish an absent item from
+/// a denied or locked Keychain without tests ever touching the real store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeNativeCredentialFailure {
+    Denied,
+    Locked,
+    Missing,
+    Unavailable,
 }
 
-pub(crate) struct PlatformClaudeNativeCredentialStore;
+/// Significant reads may retry a previously failed no-UI probe; ordinary
+/// provider read-throughs honor the boot-scoped cooldown and reuse the last
+/// typed failure. Auto-adopt discovery is distinguished only so its one
+/// successful read can be handed directly to the importer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeNativeReadEvent {
+    Ordinary,
+    Significant,
+    AutoAdoptDiscovery,
+}
+
+pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
+    fn read(
+        &self,
+        event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure>;
+}
+
+/// Raw platform store. The macOS implementation performs a no-UI query first
+/// and permits at most one interactive Keychain read for this object (one
+/// object is constructed per daemon boot).
+#[derive(Default)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct PlatformClaudeNativeCredentialStore {
+    interactive_attempted: AtomicBool,
+    last_failure: Mutex<Option<ClaudeNativeCredentialFailure>>,
+}
 
 impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
-    fn read(&self) -> Option<ClaudeCredentialInput> {
-        platform_claude_credential()
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        platform_claude_credential(self)
+    }
+}
+
+/// Boot-scoped single-flight/cooldown wrapper over the injected raw seam.
+/// The account actor serializes callers, while this mutex also protects the
+/// old discovery RPC's blocking worker and makes the no-second-call law local
+/// to the seam rather than dependent on actor scheduling.
+pub(crate) struct ClaudeNativeCredentialAccess {
+    store: Arc<dyn ClaudeNativeCredentialStore>,
+    state: Mutex<ClaudeNativeCredentialAccessState>,
+}
+
+#[derive(Default)]
+struct ClaudeNativeCredentialAccessState {
+    last_failure: Option<ClaudeNativeCredentialFailure>,
+    /// A significant discovery read and its immediate auto-adopt are one
+    /// policy operation. Hand the already-authorized bytes to the importer
+    /// once so macOS "Allow Once" never requires a second Keychain query.
+    significant_handoff: Option<(Instant, ClaudeCredentialInput)>,
+}
+
+impl ClaudeNativeCredentialAccess {
+    const SIGNIFICANT_HANDOFF_TTL: Duration = Duration::from_secs(5);
+
+    pub(crate) fn new(store: Arc<dyn ClaudeNativeCredentialStore>) -> Self {
+        Self {
+            store,
+            state: Mutex::new(ClaudeNativeCredentialAccessState::default()),
+        }
+    }
+}
+
+impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
+    fn read(
+        &self,
+        event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if event == ClaudeNativeReadEvent::Ordinary {
+            if let Some((observed_at, input)) = state.significant_handoff.take()
+                && observed_at.elapsed() <= Self::SIGNIFICANT_HANDOFF_TTL
+            {
+                return Ok(input);
+            }
+            if let Some(cached) = state.last_failure {
+                return Err(cached);
+            }
+        }
+        match self.store.read(event) {
+            Ok(input) => {
+                state.last_failure = None;
+                state.significant_handoff = (event == ClaudeNativeReadEvent::AutoAdoptDiscovery)
+                    .then(|| (Instant::now(), input.clone()));
+                Ok(input)
+            }
+            Err(error) => {
+                state.significant_handoff = None;
+                state.last_failure = Some(error);
+                Err(error)
+            }
+        }
     }
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
-fn platform_claude_credential() -> Option<ClaudeCredentialInput> {
+fn platform_claude_credential(
+    store: &PlatformClaudeNativeCredentialStore,
+) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
-    use security_framework::passwords::get_generic_password;
 
-    let mut accounts = [std::env::var("USER").ok(), std::env::var("LOGNAME").ok()]
-        .into_iter()
-        .flatten()
-        .filter(|account| !account.is_empty())
-        .collect::<Vec<_>>();
-    accounts.dedup();
-    for account in accounts {
-        if let Ok(bytes) = get_generic_password(CLAUDE_CODE_CREDENTIAL_SERVICE, &account) {
-            return native_claude_input("macOS Keychain", Zeroizing::new(bytes));
-        }
+    // Attributes establish whether the service item exists without asking
+    // for secret data. This distinguishes a genuinely missing item from a
+    // protected item silently skipped by kSecUseAuthenticationUISkip.
+    ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
+        .load_attributes(true)
+        .search()
+        .map_err(|error| classify_macos_keychain_status(error.code()))?;
+
+    let no_ui = ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
+        .load_data(true)
+        .skip_authenticated_items(true)
+        .search();
+    if let Ok(results) = no_ui
+        && let Some(bytes) = results.into_iter().find_map(|item| match item {
+            SearchResult::Data(bytes) => Some(bytes),
+            _ => None,
+        })
+    {
+        *store
+            .last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        return native_claude_input("macOS Keychain", Zeroizing::new(bytes));
     }
 
-    let item = ItemSearchOptions::new()
+    // Protected data needs UI. Only the first attempt in this daemon boot is
+    // allowed to ask; later probes return the recorded typed outcome.
+    if store.interactive_attempted.swap(true, Ordering::AcqRel) {
+        return Err(store
+            .last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(ClaudeNativeCredentialFailure::Denied));
+    }
+    let result = ItemSearchOptions::new()
         .class(ItemClass::generic_password())
         .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
         .load_data(true)
         .search()
-        .ok()?
-        .into_iter()
-        .find_map(|item| match item {
-            SearchResult::Data(bytes) => Some(bytes),
-            _ => None,
-        })?;
-    native_claude_input("macOS Keychain", Zeroizing::new(item))
+        .and_then(|items| {
+            items
+                .into_iter()
+                .find_map(|item| match item {
+                    SearchResult::Data(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .ok_or_else(|| security_framework::base::Error::from_code(-25300))
+        });
+    match result {
+        Ok(bytes) => {
+            *store
+                .last_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            native_claude_input("macOS Keychain", Zeroizing::new(bytes))
+        }
+        Err(error) => {
+            let failure = classify_macos_keychain_status(error.code());
+            *store
+                .last_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
+            Err(failure)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn classify_macos_keychain_status(status: i32) -> ClaudeNativeCredentialFailure {
+    match status {
+        -128 | -25243 => ClaudeNativeCredentialFailure::Denied,
+        -25293 => ClaudeNativeCredentialFailure::Locked,
+        -25300 => ClaudeNativeCredentialFailure::Missing,
+        -25291 | -25308 | -25315 => ClaudeNativeCredentialFailure::Unavailable,
+        _ => ClaudeNativeCredentialFailure::Unavailable,
+    }
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
-fn platform_claude_credential() -> Option<ClaudeCredentialInput> {
+fn platform_claude_credential(
+    _store: &PlatformClaudeNativeCredentialStore,
+) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
     let bytes = windows_claude_store::read()?;
     native_claude_input(
         "Windows Credential Manager",
-        normalize_windows_credential(bytes)?,
+        normalize_windows_credential(bytes).ok_or(ClaudeNativeCredentialFailure::Unavailable)?,
     )
 }
 
@@ -1120,9 +1288,8 @@ fn normalize_windows_credential(mut bytes: Zeroizing<Vec<u8>>) -> Option<Zeroizi
         .then_some(decoded)
 }
 
-/// Minimal WinCred adapter for Claude Code's generic credential. Errors such
-/// as absent, denied, or locked are deliberately collapsed to `None` by the
-/// caller-facing seam.
+/// Minimal WinCred adapter for Claude Code's generic credential. Platform
+/// failures stay typed at the injectable caller-facing seam.
 #[cfg(all(target_os = "windows", not(test)))]
 #[allow(unsafe_code)]
 mod windows_claude_store {
@@ -1145,7 +1312,12 @@ mod windows_claude_store {
         }
     }
 
-    pub(super) fn read() -> Option<Zeroizing<Vec<u8>>> {
+    pub(super) fn read() -> Result<Zeroizing<Vec<u8>>, super::ClaudeNativeCredentialFailure> {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_LOGON_FAILURE, ERROR_NO_SUCH_LOGON_SESSION, ERROR_NOT_FOUND,
+            GetLastError,
+        };
+
         // Claude Code's generic-credential target is the same stable string as
         // its macOS Keychain service name.
         let target = CLAUDE_CODE_CREDENTIAL_SERVICE
@@ -1155,28 +1327,43 @@ mod windows_claude_store {
         let mut credential = ptr::null_mut::<CREDENTIALW>();
         let found = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
         if found == 0 || credential.is_null() {
-            return None;
+            return Err(match unsafe { GetLastError() } {
+                ERROR_NOT_FOUND => super::ClaudeNativeCredentialFailure::Missing,
+                ERROR_ACCESS_DENIED => super::ClaudeNativeCredentialFailure::Denied,
+                ERROR_LOGON_FAILURE | ERROR_NO_SUCH_LOGON_SESSION => {
+                    super::ClaudeNativeCredentialFailure::Locked
+                }
+                _ => super::ClaudeNativeCredentialFailure::Unavailable,
+            });
         }
         let guard = CredentialGuard(credential);
         let size = unsafe { (*guard.0).CredentialBlobSize as usize };
         let blob = unsafe { (*guard.0).CredentialBlob };
         if size == 0 || blob.is_null() {
-            return None;
+            return Err(super::ClaudeNativeCredentialFailure::Unavailable);
         }
-        Some(Zeroizing::new(
+        Ok(Zeroizing::new(
             unsafe { slice::from_raw_parts(blob, size) }.to_vec(),
         ))
     }
 }
 
 #[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
-fn platform_claude_credential() -> Option<ClaudeCredentialInput> {
-    None
+fn platform_claude_credential(
+    _store: &PlatformClaudeNativeCredentialStore,
+) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+    Err(ClaudeNativeCredentialFailure::Missing)
 }
 
 #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
-fn native_claude_input(store: &str, bytes: Zeroizing<Vec<u8>>) -> Option<ClaudeCredentialInput> {
-    (u64::try_from(bytes.len()).ok()? <= IMPORT_FILE_LIMIT).then(|| ClaudeCredentialInput {
+fn native_claude_input(
+    store: &str,
+    bytes: Zeroizing<Vec<u8>>,
+) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > IMPORT_FILE_LIMIT {
+        return Err(ClaudeNativeCredentialFailure::Unavailable);
+    }
+    Ok(ClaudeCredentialInput {
         location: PathBuf::from(format!("{store}: {CLAUDE_CODE_CREDENTIAL_SERVICE}")),
         bytes,
         native_owner: true,
@@ -1186,10 +1373,15 @@ fn native_claude_input(store: &str, bytes: Zeroizing<Vec<u8>>) -> Option<ClaudeC
 pub(crate) fn load_claude_credential_input(
     file_path: &Path,
     native: &dyn ClaudeNativeCredentialStore,
+    event: ClaudeNativeReadEvent,
 ) -> Result<ClaudeCredentialInput, HaiderError> {
-    if let Some(mut input) = native.read() {
-        input.native_owner = true;
-        return Ok(input);
+    match native.read(event) {
+        Ok(mut input) => {
+            input.native_owner = true;
+            return Ok(input);
+        }
+        Err(ClaudeNativeCredentialFailure::Missing) => {}
+        Err(failure) => return Err(claude_native_access_error(failure)),
     }
     match std::fs::File::open(file_path) {
         Ok(file) => read_oauth_import_reader(file_path, "claude-code", file),
@@ -1222,18 +1414,24 @@ pub(crate) fn load_oauth_import_material(
     source: &str,
     generation: u64,
 ) -> Result<OAuthImportMaterial, HaiderError> {
-    load_oauth_import_material_with_native(source, generation, &PlatformClaudeNativeCredentialStore)
+    load_oauth_import_material_with_native(
+        source,
+        generation,
+        &PlatformClaudeNativeCredentialStore::default(),
+        ClaudeNativeReadEvent::Significant,
+    )
 }
 
 pub(crate) fn load_oauth_import_material_with_native(
     source: &str,
     generation: u64,
     native: &dyn ClaudeNativeCredentialStore,
+    event: ClaudeNativeReadEvent,
 ) -> Result<OAuthImportMaterial, HaiderError> {
     let spec = oauth_import_source_spec(source)?;
     let path = oauth_import_path(source)?;
     let input = if spec.source == "claude-code" {
-        load_claude_credential_input(&path, native)?
+        load_claude_credential_input(&path, native, event)?
     } else {
         let bytes = read_oauth_import_file(&path, spec.source)?;
         ClaudeCredentialInput {
@@ -1248,16 +1446,42 @@ pub(crate) fn load_oauth_import_material_with_native(
 /// Reads Claude Code's live owner store directly, ahead of any imported
 /// credential file. `None` is the sole signal that the independent grant
 /// fallback is eligible for a file-only credential.
+#[derive(Debug)]
+pub(crate) enum ClaudeNativeImportError {
+    Access(ClaudeNativeCredentialFailure),
+    Invalid(HaiderError),
+}
+
 pub(crate) fn load_claude_native_import_material(
     generation: u64,
     native: &dyn ClaudeNativeCredentialStore,
-) -> Result<Option<OAuthImportMaterial>, HaiderError> {
-    let Some(mut input) = native.read() else {
-        return Ok(None);
-    };
+    event: ClaudeNativeReadEvent,
+) -> Result<OAuthImportMaterial, ClaudeNativeImportError> {
+    let mut input = native
+        .read(event)
+        .map_err(ClaudeNativeImportError::Access)?;
     input.native_owner = true;
-    let spec = oauth_import_source_spec("claude-code")?;
-    load_oauth_import_material_from_input(spec, generation, input).map(Some)
+    let spec = oauth_import_source_spec("claude-code").map_err(ClaudeNativeImportError::Invalid)?;
+    load_oauth_import_material_from_input(spec, generation, input)
+        .map_err(ClaudeNativeImportError::Invalid)
+}
+
+pub(crate) fn claude_native_access_error(failure: ClaudeNativeCredentialFailure) -> HaiderError {
+    let message = match failure {
+        ClaudeNativeCredentialFailure::Denied => {
+            "Claude Code credential access was denied; re-allow Keychain access or re-link"
+        }
+        ClaudeNativeCredentialFailure::Locked => {
+            "Claude Code Keychain is locked; unlock the login keychain (its password may have changed)"
+        }
+        ClaudeNativeCredentialFailure::Missing => {
+            "Claude Code credential is missing; re-link the account"
+        }
+        ClaudeNativeCredentialFailure::Unavailable => {
+            "Claude Code credential store is unavailable; retry after the system store recovers"
+        }
+    };
+    HaiderError::new(ErrorCode::CredentialMissing, message, true)
 }
 
 fn load_oauth_import_material_from_input(
@@ -1286,15 +1510,18 @@ fn load_oauth_import_material_from_input(
         "kimi-code" => kimi_import_bundle(&path, &bytes, &registration, generation),
         _ => unreachable!("source spec is closed"),
     }?;
-    if spec.source == "claude-code" {
-        bundle
+    match spec.source {
+        "codex" => bundle.identity.display_identity.push_str(" · Codex"),
+        "claude-code" => bundle
             .identity
             .display_identity
             .push_str(if claude_native_owner {
-                " · linked to Claude Code"
+                " · Linked to Claude Code"
             } else {
                 " · independently imported"
-            });
+            }),
+        "kimi-code" => bundle.identity.display_identity.push_str(" · Kimi Code"),
+        _ => {}
     }
     let kimi_device_id = if spec.source == "kimi-code" {
         let device_path = crate::device_discovery::kimi_device_id_path().ok_or_else(|| {
@@ -4761,11 +4988,15 @@ impl CredentialBroker {
                     .map_err(|error| imported_refresh_error(error, descriptor, &source));
                 }
                 crate::accounts::OAuthImportHealResult::LiveOwnerStore { source } => {
-                    // The external app owns this rotating credential. An
-                    // unchanged/unusable owner-store read is terminal for
-                    // this attempt; spending Haider's drifting snapshot here
-                    // would invalidate whichever app refreshed most recently.
-                    return Err(imported_credential_expired(descriptor, &source));
+                    // The external app owns this rotating credential. The
+                    // actor has either persisted the successfully re-read
+                    // snapshot or observed a newer durable generation. Re-read
+                    // Haider's vault; never spend its rotating refresh token.
+                    let _ = source;
+                    return Ok(RefreshFlightOutcome::Refreshed);
+                }
+                crate::accounts::OAuthImportHealResult::LiveOwnerUnavailable { failure } => {
+                    return Err(claude_native_access_error(failure));
                 }
                 crate::accounts::OAuthImportHealResult::NotImported => {}
             }
@@ -5263,7 +5494,10 @@ impl CredentialBroker {
                             && current.identity == expected.identity
                     })
                     .map_or(SnapshotOAuthState::Replaced, |current| {
-                        if matches!(&current.status, CredentialStatus::Expired) {
+                        if matches!(
+                            &current.status,
+                            CredentialStatus::Expired | CredentialStatus::NeedsAttention { .. }
+                        ) {
                             SnapshotOAuthState::Expired
                         } else {
                             SnapshotOAuthState::Current
@@ -5281,7 +5515,10 @@ impl CredentialBroker {
                 && current.provider == expected.provider
                 && current.base_url == expected.base_url
                 && current.auth_method == expected.auth_method
-                && !matches!(&current.status, CredentialStatus::Expired))
+                && !matches!(
+                    &current.status,
+                    CredentialStatus::Expired | CredentialStatus::NeedsAttention { .. }
+                ))
             .then(|| current.clone())
         })
     }

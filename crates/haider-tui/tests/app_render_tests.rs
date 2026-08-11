@@ -204,8 +204,8 @@ fn reducer_handles_quit_composer_and_navigation() {
 
     assert_eq!(model.screen, Screen::Session);
     // Esc mid-turn INTERRUPTS and stays; OWNER DIRECTIVE: esc is
-    // SESSION-SCOPED — the idle esc also stays (a hint names the real
-    // back affordances); ⌃C remains the keyboard walk-back.
+    // SESSION-SCOPED — the first idle esc also stays and arms prompt
+    // backtracking; ⌃C remains the keyboard walk-back.
     model.handle(key(KeyCode::Esc));
     assert_eq!(model.screen, Screen::Session, "mid-turn esc interrupts");
     assert!(model.projection.interrupted(), "idle (i) marker set");
@@ -215,8 +215,8 @@ fn reducer_handles_quit_composer_and_navigation() {
         model
             .flash
             .as_deref()
-            .is_some_and(|flash| flash.contains("← main")),
-        "the hint names the back affordance"
+            .is_some_and(|flash| flash.contains("previous prompts")),
+        "the idle Esc names the second-Esc history affordance"
     );
     model.handle(ctrl('c'));
     assert_eq!(model.screen, Screen::Launcher);

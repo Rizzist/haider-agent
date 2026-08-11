@@ -515,7 +515,10 @@ fn render_launcher(
     // The BIG centered mark and the shahada belong to the boot splash
     // alone now — people open many terminals; the settled launcher scans
     // like a working surface, not a poster.
-    let palette = if model.palette_open() {
+    let showing_backtrack = model.backtrack.is_some();
+    let palette = if showing_backtrack {
+        backtrack_block(model, theme, area.width)
+    } else if model.palette_open() {
         palette_block(model, theme, area.width)
     } else {
         Vec::new()
@@ -964,7 +967,9 @@ fn render_launcher(
     }
     if palette_height > 0 {
         frame.render_widget(Paragraph::new(Text::from(palette)), palette_area);
-        palette_row_hits(model, palette_area, hits);
+        if !showing_backtrack {
+            palette_row_hits(model, palette_area, hits);
+        }
     }
     if theme_picker_showing(model) {
         render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
@@ -1091,136 +1096,6 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
         }
         lines_out.push(Line::raw(""));
     }
-}
-
-/// The "found on this device" section (D2) — the daemon's metadata-only
-/// discovery of first-party CLI credential stores, shared by /accounts and
-/// /providers exactly like the add buttons below it. ABSENT entirely when
-/// there is nothing to offer: demo mode and an ungated daemon never
-/// populate the list, and an empty or switched-off discovery keeps it
-/// empty — the section is an enhancement, never a notice.
-///
-/// Row anatomy: SUPPORTED candidates are numbered `[n]` (the one-key
-/// import coordinate — digits, ⏎ on the highlight, or a click on the
-/// full-width hit) and show provider · source label · freshness (+ the
-/// account label when the store itself carried one). UNSUPPORTED
-/// candidates render DIM with their honest reason and get no number, no
-/// hit, and no cursor slot — inert by construction.
-///
-/// `cursor_base` is `Some(accounts-row-count)` on /accounts (the flattened
-/// selectable rows extend into the numbered candidates); `None` on
-/// /providers, whose cursor stays over the provider rows.
-fn push_device_candidates_section<'a>(
-    model: &'a AppModel,
-    theme: &Theme,
-    width: u16,
-    cursor_base: Option<usize>,
-    lines_out: &mut Vec<Line<'a>>,
-    rects_out: &mut Vec<(usize, u16, u16, Hit)>,
-) {
-    if model.device.candidates.is_empty() {
-        return;
-    }
-    // P1 MASK LAW: the candidate `account_label` is a real identity (the
-    // store's signed-in email) — masked unless the OWNING screen's visit
-    // revealed it. The section is shared, so the pin travels with the
-    // screen that hosts it; any other host renders masked-always.
-    let revealed = match model.screen {
-        crate::app::Screen::Accounts => model.accounts.revealed,
-        crate::app::Screen::Providers => model.providers.revealed,
-        _ => false,
-    };
-    lines_out.push(Line::from(vec![
-        Span::styled(
-            "found on this device",
-            theme
-                .bright_style()
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        ),
-        Span::styled(
-            " — the daemon can import these · nothing is read until you ask",
-            theme.dim_style(),
-        ),
-    ]));
-    if let Some(message) = &model.device.message {
-        lines_out.push(Line::styled(message.clone(), theme.gold_style()));
-    }
-    let mut number = 0usize;
-    for candidate in &model.device.candidates {
-        let freshness_style = match candidate.freshness.as_str() {
-            "fresh" => theme.ok_style(),
-            "expiring" | "expired" => theme.warn_style(),
-            _ => theme.dim_style(),
-        };
-        if candidate.import_supported {
-            let re_adopt = model
-                .accounts
-                .rows
-                .iter()
-                .any(|row| row.provider == candidate.provider);
-            let hit = Hit::DeviceImport(candidate.candidate.clone());
-            let hovered = model.hovered.as_ref() == Some(&hit);
-            let selected = cursor_base.is_some_and(|base| model.accounts.cursor == base + number);
-            let pending =
-                model.device.pending_import.as_deref() == Some(candidate.candidate.as_str());
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(format!("[{}] ", number + 1), theme.gold_style()),
-                Span::styled(
-                    candidate.source_label.clone(),
-                    theme
-                        .bright_style()
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-                Span::styled(format!(" · {}", candidate.provider), theme.dim_style()),
-            ];
-            if let Some(label) = &candidate.account_label {
-                let label = if revealed {
-                    label.clone()
-                } else {
-                    crate::format::mask_identity(label)
-                };
-                spans.push(Span::styled(format!(" · {label}"), theme.dim_style()));
-            }
-            spans.push(Span::styled(
-                format!(" · {}", candidate.freshness),
-                freshness_style,
-            ));
-            if re_adopt {
-                spans.push(Span::styled(" · re-adopt/refresh", theme.gold_style()));
-            }
-            if pending {
-                // In-flight feedback WITHOUT installing anything —
-                // forbidden optimism, the §5.1 discipline.
-                spans.push(Span::styled(
-                    " importing…",
-                    theme.pulse_ink(theme.gold, model.anim_phase),
-                ));
-            }
-            rects_out.push((lines_out.len(), 0, width, hit));
-            let mut line = Line::from(spans);
-            if hovered || selected {
-                line = hover_band(line, true, width, theme);
-            }
-            lines_out.push(line);
-            number += 1;
-        } else {
-            // Dim, honest, inert: the reason rides the row, and no hit or
-            // number exists to dispatch it.
-            let reason = candidate
-                .unsupported_reason
-                .clone()
-                .unwrap_or_else(|| "import not supported".to_owned());
-            lines_out.push(Line::styled(
-                format!(
-                    "      {} · {} · {} — {reason}",
-                    candidate.source_label, candidate.provider, candidate.freshness
-                ),
-                theme.dim_style(),
-            ));
-        }
-    }
-    lines_out.push(Line::raw(""));
 }
 
 /// The account add-button rows (OAuth/API/Kimi/Gemini/HF/custom) with
@@ -1389,6 +1264,24 @@ fn render_accounts(
                 }
                 haider_protocol::credential::CredentialStatus::Expired => "expired".to_owned(),
                 haider_protocol::credential::CredentialStatus::Revoked => "revoked".to_owned(),
+                haider_protocol::credential::CredentialStatus::NeedsAttention { reason } => {
+                    use haider_protocol::credential::CredentialAttentionReason;
+                    match reason {
+                        CredentialAttentionReason::KeychainDenied => {
+                            "needs attention — keychain access denied · re-link or re-allow"
+                        }
+                        CredentialAttentionReason::KeychainLocked => {
+                            "needs attention — keychain locked · unlock login keychain (password may have changed)"
+                        }
+                        CredentialAttentionReason::KeychainMissing => {
+                            "needs attention — Claude Code credential missing · re-link"
+                        }
+                        CredentialAttentionReason::KeychainUnavailable => {
+                            "needs attention — keychain unavailable · retry refresh or re-link"
+                        }
+                    }
+                    .to_owned()
+                }
             };
             let mut spans = vec![
                 Span::raw("  "),
@@ -1564,32 +1457,10 @@ fn render_accounts(
     // = the editable name/origin fields (the provider.configure front
     // door).
     push_custom_card_lines(model, theme, &mut footer_lines);
-    // D2: the discovered-candidate section sits with the add chrome — the
-    // cursor's flattened selectable rows continue past the account rows
-    // into its numbered candidates.
-    push_device_candidates_section(
-        model,
-        theme,
-        area.width,
-        Some(model.accounts.rows.len()),
-        &mut footer_lines,
-        &mut add_button_rects,
-    );
     push_account_add_buttons(model, theme, &mut footer_lines, &mut add_button_rects);
     footer_lines.push(Line::raw(""));
     footer_lines.push(Line::styled(
-        // D2: the key map names the digit import only while numbered
-        // candidates are actually on screen.
-        if model
-            .device
-            .candidates
-            .iter()
-            .any(|candidate| candidate.import_supported)
-        {
-            "click an account to make it active · + adds via OAuth / API · digits import found credentials · x removes · r reveals · esc back"
-        } else {
-            "click an account to make it active · + adds via OAuth / API · x removes · r reveals · esc back"
-        },
+        "click an account to make it active · + adds via OAuth / API · x removes · r reveals · esc back",
         theme.faint_style(),
     ));
 
@@ -1828,31 +1699,15 @@ fn render_providers(
         lines.push(Line::raw(""));
     }
 
-    lines.push(Line::raw(""));
-    // D2: the shared buttons area carries the same "found on this device"
-    // section here — digits import; the provider cursor is untouched.
-    push_device_candidates_section(model, theme, area.width, None, &mut lines, &mut chip_hits);
-
     // F2b: the add-login actions are PINNED at the bottom (owner: "the
     // providers page I should be able to scroll it and bottom should have
     // the add login buttons") — a fixed footer under a scrolling roster.
     // Tiny frames keep the flowed layout instead: everything stays in the
     // scroll body, still reachable by scrolling to the end.
-    // P1: the key map names the reveal only while a masked identity is
-    // actually on screen (the shared device section's account labels).
     // G4a: the preset roster outgrew one hint line at narrow widths — the
-    // key map splits into the action line and the preset line so `r
-    // reveals`/`esc back` stay visible at 100-118 columns.
-    let hint = if model
-        .device
-        .candidates
-        .iter()
-        .any(|candidate| candidate.account_label.is_some())
-    {
-        "click a model to set the default · e edits · x removes · f refresh · r reveals · esc back"
-    } else {
-        "click a model to set the default · e edits · x removes · f refresh · esc back"
-    };
+    // key map splits into the action line and the preset line so `esc back`
+    // stays visible at 100-118 columns.
+    let hint = "click a model to set the default · e edits · x removes · f refresh · esc back";
     let preset_hint = "presets: h HuggingFace · z Zen · g Go · o Ollama · l LM Studio";
     let enterprise_hint = "named: d DeepSeek · enterprise: a Azure · b Bedrock · v Vertex";
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
@@ -3093,7 +2948,10 @@ fn render_session(
         u16::try_from(model.msg_queue.len() + 1).unwrap_or(4)
     };
     let mut subtree_height = subtree_needed(model, false);
-    let palette = if model.palette_open() {
+    let showing_backtrack = model.backtrack.is_some();
+    let palette = if showing_backtrack {
+        backtrack_block(model, theme, area.width)
+    } else if model.palette_open() {
         palette_block(model, theme, area.width)
     } else {
         Vec::new()
@@ -3625,7 +3483,9 @@ fn render_session(
 
     if palette_height > 0 {
         frame.render_widget(Paragraph::new(Text::from(palette)), palette_area);
-        palette_row_hits(model, palette_area, hits);
+        if !showing_backtrack {
+            palette_row_hits(model, palette_area, hits);
+        }
     }
 
     if let Some(menu) = menu {
@@ -6571,6 +6431,54 @@ fn palette_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'stati
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(PALETTE_HINT, theme.faint_style()),
+    ]));
+    lines
+}
+
+/// Compact durable-prompt chooser above the composer. Each prompt is one
+/// physical line: journal bytes are preserved in the model and flattened
+/// only for display, so Enter can load the exact original text.
+fn backtrack_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    const MAX_ROWS: usize = 8;
+    let Some(chooser) = model.backtrack else {
+        return Vec::new();
+    };
+    let width = usize::from(width);
+    let mut lines = vec![Line::styled("─".repeat(width), theme.frame_style())];
+    let start = chooser.selection.saturating_add(1).saturating_sub(MAX_ROWS);
+    for (index, prompt) in model
+        .prompt_history
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(MAX_ROWS)
+    {
+        let one_line = prompt.replace(['\r', '\n'], " ");
+        let number = format!(" {:>2}. ", index + 1);
+        let shown = ellipsize(&one_line, width.saturating_sub(number.chars().count()));
+        let selected = index == chooser.selection;
+        let style = if selected {
+            theme.selection_style()
+        } else {
+            theme.text_style()
+        };
+        let mut line = Line::from(vec![
+            Span::styled(number, theme.gold_style()),
+            Span::styled(shown, style),
+        ])
+        .style(style);
+        let pad = width.saturating_sub(line.width());
+        if pad > 0 {
+            line.push_span(Span::raw(" ".repeat(pad)));
+        }
+        lines.push(line);
+    }
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "↑↓ / digits choose · ⏎ load · esc older / close",
+            theme.faint_style(),
+        ),
     ]));
     lines
 }

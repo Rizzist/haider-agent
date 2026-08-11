@@ -107,6 +107,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         "",
     ),
     session_cmd("tokens", "Token panel — context by model (also ⌃G)", ""),
+    session_cmd(
+        "history",
+        "Recall durable prompts — newest first (also esc esc)",
+        "[number]",
+    ),
     session_cmd("hooks", "Hooks — review and trust third-party hooks", ""),
     session_cmd("voice", "Voice — enable and pick STT / TTS providers", ""),
     session_cmd(
@@ -444,6 +449,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /clear · /back     back to the main screen; typing there starts a fresh session",
     "  /compact           compact context now",
     "  /tokens            token panel — context by model (also ⌃G)",
+    "  /history [number]  recall durable prompts newest-first — also esc esc",
     "  /hooks             hooks screen — daemon-discovered hooks · digest trust/revoke · recent firings",
     "  /voice             enable voice · pick STT / TTS providers (menu card) — demo only",
     "  /say <words>       speak a turn once voice is on (simulated STT) — demo only",

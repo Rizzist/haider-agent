@@ -74,6 +74,7 @@ pub fn slug_name(text: &str) -> String {
 /// The shell builtins the demo VFS serves locally — instant, NO model turn
 /// (sim `SHELL_CMDS`, tui.js:1993-2008).
 pub const SHELL_CMDS: [&str; 6] = ["ls", "dir", "pwd", "cd", "mkdir", "touch"];
+const BACKTRACK_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// The demo VFS seed (sim tui.js:418-426).
 #[must_use]
@@ -309,8 +310,8 @@ pub struct AccountsState {
     /// Keyboard highlight over the flattened selectable rows (W5
     /// accessibility extension — separately goldened).
     pub cursor: usize,
-    /// P1 MASK LAW (the U2 owner addendum extended): row identities and
-    /// the shared device-section labels render MASKED unless this is set.
+    /// P1 MASK LAW (the U2 owner addendum extended): row identities render
+    /// MASKED unless this is set.
     /// `r` toggles it for the CURRENT visit only — the one door in
     /// ([`AppModel::enter_accounts`]) and the esc exit both reset to
     /// masked, so the screen never OPENS revealed (the U2 ⌃C lesson: the
@@ -326,11 +327,9 @@ impl AppModel {
         self.mode.fabricates_locally() || self.daemon_features.contains(feature)
     }
 
-    /// Whether the LIVE daemon serves D1's device-credential discovery
-    /// (D2). Deliberately NOT [`Self::daemon_serves`] — that predicate is
-    /// demo-true, and the demo has no device to probe: the section is
-    /// sim-honestly ABSENT there, exactly like an ungated daemon (no
-    /// notice either way — discovery is an enhancement).
+    /// Whether the connected daemon can run the hidden device-credential
+    /// auto-adoption refresh. The discovery report is no longer rendered;
+    /// this feature gate only schedules the daemon policy pass.
     #[must_use]
     pub fn device_discovery_available(&self) -> bool {
         !self.mode.fabricates_locally()
@@ -388,67 +387,6 @@ impl AccountsState {
             self.cursor = self.rows.len().saturating_sub(1);
         }
         true
-    }
-}
-
-/// The "found on this device" section (D2): metadata-only credential
-/// candidates the DAEMON discovered in first-party CLI stores (D1's
-/// `account.device_candidates`). LIVE-ONLY truth: the demo never populates
-/// it (the sim has no device to probe — sim-honest absent), an ungated
-/// daemon is never asked. Import installs NOTHING locally — the daemon
-/// re-reads the store itself and the new account lands via the normal
-/// `account.list` refresh chained to the receipt.
-#[derive(Debug, Default)]
-pub struct DeviceCandidatesState {
-    /// The daemon's last discovery report. Refreshed on SCREEN ENTRY only
-    /// (no polling) — freshness hints are hints, not live meters.
-    pub candidates: Vec<haider_rpc::DeviceCredentialCandidateWire>,
-    /// The daemon's honest configured-off state — never an empty-device
-    /// claim (D1's wire contract).
-    pub discovery_disabled: bool,
-    /// In-flight `account.import_device` candidate id. One at a time; the
-    /// correlated receipt or failure clears it — never a render.
-    pub pending_import: Option<String>,
-    /// Last import outcome, rendered inside the section on BOTH screens
-    /// that show it (the section is shared, so the message travels with
-    /// it rather than with one screen's message slot).
-    pub message: Option<String>,
-}
-
-impl DeviceCandidatesState {
-    /// Applies a discovery report (screen-entry refresh). Wholesale
-    /// replacement: candidate ids are daemon-derived and opaque, so there
-    /// is nothing to merge.
-    pub fn apply(
-        &mut self,
-        candidates: Vec<haider_rpc::DeviceCredentialCandidateWire>,
-        discovery_disabled: bool,
-    ) {
-        self.candidates = candidates;
-        self.discovery_disabled = discovery_disabled;
-    }
-
-    /// How many candidates are actually importable — the numbered,
-    /// selectable rows. Unsupported rows render dim + inert and are
-    /// deliberately NOT in this count.
-    #[must_use]
-    pub fn supported_len(&self) -> usize {
-        self.candidates
-            .iter()
-            .filter(|candidate| candidate.import_supported)
-            .count()
-    }
-
-    /// The `index`th SUPPORTED candidate's opaque id — the digit/⏎/click
-    /// coordinate. Numbering skips unsupported rows by construction, so a
-    /// key can never land an inert row's id.
-    #[must_use]
-    pub fn supported_id(&self, index: usize) -> Option<String> {
-        self.candidates
-            .iter()
-            .filter(|candidate| candidate.import_supported)
-            .nth(index)
-            .map(|candidate| candidate.candidate.clone())
     }
 }
 
@@ -585,11 +523,6 @@ pub struct ProvidersState {
     /// Armed by a cursor move: the next frame scrolls the cursor's
     /// provider block into view, then clears the latch.
     pub follow_cursor: std::cell::Cell<bool>,
-    /// P1 MASK LAW: the only identity this screen renders is the shared
-    /// device-section's `account_label` — masked unless this is set. Same
-    /// per-visit `r` semantics as `/accounts`/`/usage`: reset on the one
-    /// door in ([`AppModel::enter_providers`]) and on the esc exit.
-    pub revealed: bool,
 }
 
 impl ProvidersState {
@@ -2202,17 +2135,10 @@ pub enum AppRequest {
     /// Fetch/refresh the `/accounts` rows (`account.list`). Pushed on
     /// entering the screen; the demo driver answers from the seed list.
     AccountsRefresh,
-    /// Read the daemon's device-credential discovery report (D2,
-    /// `account.device_candidates`). Pushed on SCREEN ENTRY only —
-    /// `/accounts` and `/providers`, both feature-gated by the reducer —
-    /// never polled. Unreachable in demo by that gate.
+    /// Trigger the daemon's device-credential auto-adoption pass through
+    /// the existing discovery RPC. Pushed on accounts/provider entry only;
+    /// its metadata response is intentionally not rendered.
     DeviceCandidatesRefresh,
-    /// Import one discovered candidate by its opaque daemon-derived id
-    /// (D2, `account.import_device`). Receipted + durable: the daemon
-    /// re-reads the local store itself — no credential bytes ride this
-    /// request, and NOTHING is installed locally on the reply; the new
-    /// account lands via the chained `account.list` refresh.
-    DeviceImport { candidate: String },
     /// `account.set_active` for the clicked/entered row. The model already
     /// holds `pending_select` — the dot moves only when the driver's reply
     /// applies (optimism forbidden, report §5.1).
@@ -2488,11 +2414,6 @@ pub enum Hit {
     AccountRow(String),
     /// One add-row button on `/accounts` (sim tui.js:3621-3628).
     AccountAdd(AccountAddKind),
-    /// One SUPPORTED "found on this device" candidate row (D2), by its
-    /// opaque daemon-derived id (value-carrying: a stale rect can only
-    /// ever import the candidate it was measured on). Unsupported rows
-    /// get NO hit at all — dim, honest, inert.
-    DeviceImport(String),
     /// One `/providers` model chip: click sets the provider default.
     ProviderModel {
         provider: String,
@@ -2707,6 +2628,11 @@ pub struct ThemePicker {
     pub prior: ThemeChoice,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptBacktrack {
+    pub selection: usize,
+}
+
 /// The `/effort` picker (G3): a composer-slot card listing the CURRENT
 /// pair's declared ladder (daemon truth — the TUI holds no tables) plus a
 /// leading "default" row that reverts to the provider default. ⏎ / digit
@@ -2867,6 +2793,12 @@ pub struct AppModel {
     /// The full-screen `/model` picker overlay (F2a). MODEL-LOCAL — never
     /// a projection card, so it can never ride a session checkout.
     pub model_picker: Option<ModelPicker>,
+    /// Compact previous-prompt chooser above the composer. The prompt
+    /// bytes live in `prompt_history`; this is transient selection chrome.
+    pub backtrack: Option<PromptBacktrack>,
+    /// Last Esc in the rapid backtrack gesture. An Esc outside the window
+    /// closes an open chooser; rapid Esc presses walk to older prompts.
+    last_backtrack_escape: Option<std::time::Instant>,
     /// COMMIT counter for the theme choice (ui-themes-fix): bumped by
     /// every user commit — picker ⏎/digit/click, `/theme <name>`, ⌃T —
     /// and never by boot resolution or previews. The runtime's
@@ -2875,6 +2807,9 @@ pub struct AppModel {
     pub theme_commits: u64,
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
+    /// Durable-journal prompt recall for the attached session, newest first.
+    /// Identical redo prompts are distinct entries by design.
+    pub prompt_history: std::collections::VecDeque<String>,
     /// Session-wide latest-snapshot usage fold. Kept outside branch/chip
     /// projections so every billed lane survives view switches.
     pub cache_usage: crate::cache_usage::SessionUsageFold,
@@ -3176,9 +3111,6 @@ pub struct AppModel {
     pub wordmark: std::cell::RefCell<Option<crate::wordmark::Wordmark>>,
     /// `/accounts` screen state (rows, revision gate, pending select).
     pub accounts: AccountsState,
-    /// The "found on this device" discovery section (D2), shared by
-    /// `/accounts` and the `/providers` buttons area.
-    pub device: DeviceCandidatesState,
     /// `/providers` screen state (report §5.2).
     pub providers: ProvidersState,
     /// What the CONNECTED daemon advertised in `Welcome` (features +
@@ -3240,9 +3172,12 @@ impl Default for AppModel {
             theme_picker: None,
             effort_picker: None,
             model_picker: None,
+            backtrack: None,
+            last_backtrack_escape: None,
             theme_commits: 0,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
+            prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             pending_cache_change: None,
             identity: IdentityLine::default(),
@@ -3331,7 +3266,6 @@ impl Default for AppModel {
             // render falls back to the half-block art in `crate::mark`.
             wordmark: std::cell::RefCell::new(None),
             accounts: AccountsState::default(),
-            device: DeviceCandidatesState::default(),
             providers: ProvidersState::default(),
             daemon_features: std::collections::BTreeSet::new(),
             daemon_version: None,
@@ -3729,6 +3663,7 @@ impl AppModel {
     /// sites outside this function are enumerated on the `screen` field's
     /// doc (the founding donation and the two identity-flip split seams).
     pub(crate) fn switch_surface(&mut self, to: Screen) {
+        self.close_backtrack();
         let from = self.screen;
         let from_key = self.surface_key();
         self.screen = to;
@@ -4229,6 +4164,11 @@ impl AppModel {
     /// the runtime drains [`Self::outbox`] and [`Self::requests`].
     /// `StreamEnded` is a no-op and must NOT dirty the frame (r1 P1).
     pub fn handle(&mut self, event: AppEvent) {
+        self.handle_at(event, std::time::Instant::now());
+    }
+
+    /// Deterministic clock seam for rapid Esc backtracking laws.
+    pub fn handle_at(&mut self, event: AppEvent, now: std::time::Instant) {
         match event {
             AppEvent::Key(key) => {
                 self.dirty = true;
@@ -4265,7 +4205,7 @@ impl AppModel {
                 // A keypress clears a finished selection's highlight
                 // (owner item 9's clearing law; clicks clear via Down).
                 self.selection = None;
-                self.handle_key(key);
+                self.handle_key(key, now);
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
@@ -4302,6 +4242,7 @@ impl AppModel {
                 if self.talk.engaged() {
                     self.talk_commit_to_composer();
                 }
+                self.close_backtrack();
                 // While a blocking menu replaces the composer, paste has no
                 // target (r2 P2).
                 if self.screen == Screen::Session
@@ -4332,6 +4273,9 @@ impl AppModel {
             }
             AppEvent::Envelope(payload) => {
                 self.dirty = true;
+                if let EventPayload::UserMessage { text, .. } = payload.as_ref() {
+                    self.record_prompt(text.clone());
+                }
                 self.handle_envelope(&payload);
             }
             AppEvent::StreamEnded => {}
@@ -4446,7 +4390,7 @@ impl AppModel {
         self.dirty = true;
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
         if self.screen == Screen::Tools {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 self.screen = Screen::Session;
@@ -4671,6 +4615,18 @@ impl AppModel {
             self.handle_menu_key(key.code);
             return;
         }
+        // The prompt chooser is session chrome. A turn that started while
+        // it was open (for example from a concurrent client) closes it and
+        // restores Esc's interrupt ownership; otherwise the chooser owns
+        // every key until it loads a prompt or closes.
+        if self.backtrack.is_some() {
+            if self.screen != Screen::Session || self.turn_active {
+                self.close_backtrack();
+            } else {
+                self.handle_backtrack_key(key.code, now);
+                return;
+            }
+        }
         // ⇧⏎ (kitty-protocol terminals report SHIFT) / ⌥⏎ (the universal
         // path) insert a newline (sim Shift+Enter, tui.js:2792-2796). Must
         // precede the palette branch — a newline also closes the palette.
@@ -4772,6 +4728,10 @@ impl AppModel {
                     self.dirty = true;
                     return;
                 }
+                // Esc always cancels a held talk before choosing its
+                // streaming/idle meaning. Prompt backtracking must not let
+                // the old TalkFire timer survive.
+                self.listening = false;
                 if self.turn_active {
                     // Esc mid-turn INTERRUPTS (sim, tui.js:2533-2539 +
                     // 1551-1567): the script stops, run → cancelled, badge
@@ -4779,7 +4739,6 @@ impl AppModel {
                     // stays on screen. Only an idle esc walks back. The
                     // held queue drops with the turn (sim tui.js:1557).
                     self.turn_active = false;
-                    self.listening = false;
                     self.msg_queue.clear();
                     self.requests.push(AppRequest::Interrupt {
                         branch: self.branch_state.active().cloned(),
@@ -4797,12 +4756,26 @@ impl AppModel {
                         self.projection
                             .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
                     }
+                } else if self.composer.is_empty()
+                    && self.composer.attachments().is_empty()
+                    && self.rapid_backtrack_escape(now)
+                {
+                    self.open_backtrack(now);
+                } else if self.composer.is_empty()
+                    && self.composer.attachments().is_empty()
+                    && !self.prompt_history.is_empty()
+                {
+                    // The first empty-idle Esc arms the short Claude Code
+                    // gesture. The second opens history; no timer/task is
+                    // needed because the next key supplies the clock.
+                    self.last_backtrack_escape = Some(now);
+                    self.flash = Some("· esc again — previous prompts".to_owned());
+                    self.dirty = true;
                 } else {
                     // OWNER DIRECTIVE: esc is SESSION-SCOPED — it
                     // interrupts, cancels menus and a held talk (P1-3's
                     // hold-cancel law survives the navigation change),
                     // never navigates. Back is `← main` (and ⌃C).
-                    self.listening = false;
                     self.flash = Some("· back — click ← main (or ⌃C)".to_owned());
                     self.dirty = true;
                 }
@@ -4955,6 +4928,106 @@ impl AppModel {
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
+        self.close_backtrack();
+    }
+
+    fn record_prompt(&mut self, text: String) {
+        self.prompt_history.push_front(text);
+        self.close_backtrack();
+    }
+
+    fn rapid_backtrack_escape(&self, now: std::time::Instant) -> bool {
+        self.last_backtrack_escape.is_some_and(|prior| {
+            now.checked_duration_since(prior)
+                .is_some_and(|elapsed| elapsed <= BACKTRACK_ESC_WINDOW)
+        })
+    }
+
+    fn close_backtrack(&mut self) {
+        self.backtrack = None;
+        self.last_backtrack_escape = None;
+    }
+
+    fn open_backtrack(&mut self, now: std::time::Instant) {
+        if self.prompt_history.is_empty() {
+            self.flash = Some("· no previous prompts in this session".to_owned());
+            self.last_backtrack_escape = None;
+            return;
+        }
+        self.backtrack = Some(PromptBacktrack { selection: 0 });
+        self.last_backtrack_escape = Some(now);
+        self.flash = None;
+        self.dirty = true;
+    }
+
+    fn handle_backtrack_key(&mut self, code: KeyCode, now: std::time::Instant) {
+        let Some(mut chooser) = self.backtrack else {
+            return;
+        };
+        let last = self.prompt_history.len().saturating_sub(1);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                chooser.selection = chooser.selection.saturating_sub(1);
+                self.backtrack = Some(chooser);
+                self.last_backtrack_escape = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                chooser.selection = (chooser.selection + 1).min(last);
+                self.backtrack = Some(chooser);
+                self.last_backtrack_escape = None;
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = (c as usize) - ('1' as usize);
+                if index < self.prompt_history.len() {
+                    chooser.selection = index;
+                    self.backtrack = Some(chooser);
+                }
+                self.last_backtrack_escape = None;
+            }
+            KeyCode::Enter => {
+                if let Some(prompt) = self.prompt_history.get(chooser.selection).cloned() {
+                    self.composer.set_text(prompt);
+                }
+                self.close_backtrack();
+            }
+            KeyCode::Esc if self.rapid_backtrack_escape(now) => {
+                chooser.selection = (chooser.selection + 1).min(last);
+                self.backtrack = Some(chooser);
+                self.last_backtrack_escape = Some(now);
+            }
+            KeyCode::Esc => self.close_backtrack(),
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn history_command(&mut self, remainder: &str) {
+        if self.screen != Screen::Session {
+            self.flash = Some("· /history — session only".to_owned());
+            return;
+        }
+        if self.turn_active {
+            self.flash = Some("· /history — wait for the turn to end".to_owned());
+            return;
+        }
+        if remainder.is_empty() {
+            self.open_backtrack(std::time::Instant::now());
+            return;
+        }
+        let Some(index) = remainder
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+        else {
+            self.flash = Some("· /history <number> — choose a previous prompt".to_owned());
+            return;
+        };
+        if let Some(prompt) = self.prompt_history.get(index).cloned() {
+            self.composer.set_text(prompt);
+            self.close_backtrack();
+        } else {
+            self.flash = Some(format!("· /history {} — no such prompt", index + 1));
+        }
     }
 
     /// Sim submit() preprocessing, exact order (tui.js:1966-2041 — the
@@ -6383,9 +6456,9 @@ impl AppModel {
         self.accounts.revealed = false;
         self.switch_surface(Screen::Accounts);
         self.requests.push(AppRequest::AccountsRefresh);
-        // D2: the device-discovery read rides SCREEN ENTRY only (no
-        // polling), and only when the live daemon serves it — demo and
-        // ungated daemons keep the section honestly absent.
+        // Automatic device adoption rides the existing screen-entry
+        // discovery cadence. Its report stays hidden; the daemon commits
+        // any roster changes and the reply chains a fresh account list.
         if self.device_discovery_available() {
             self.requests.push(AppRequest::DeviceCandidatesRefresh);
         }
@@ -6441,7 +6514,8 @@ impl AppModel {
         // refused locally with an honest reason instead of a doomed RPC.
         match row.status {
             haider_protocol::credential::CredentialStatus::Expired
-            | haider_protocol::credential::CredentialStatus::Revoked => {
+            | haider_protocol::credential::CredentialStatus::Revoked
+            | haider_protocol::credential::CredentialStatus::NeedsAttention { .. } => {
                 self.accounts.message = Some(format!(
                     "· {alias} is not usable — /login to re-authenticate"
                 ));
@@ -6678,66 +6752,24 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// One-key import of a discovered device credential (D2). The TUI
-    /// sends ONLY the opaque candidate id — the daemon re-discovers and
-    /// reads the local store itself, so no credential bytes cross the
-    /// wire and nothing is installed locally: the pending pulse is the
-    /// only visible change until the receipt lands and the chained
-    /// `account.list` refresh materializes the account (daemon truth
-    /// only, the §5.1 discipline).
-    ///
-    /// An UNSUPPORTED candidate is inert here by construction: its row
-    /// carries no hit, no number, and no cursor slot, and this method
-    /// re-checks the flag so even a stale coordinate cannot dispatch it.
-    pub fn import_device_candidate(&mut self, candidate_id: &str) {
-        let Some(candidate) = self
-            .device
-            .candidates
-            .iter()
-            .find(|candidate| candidate.candidate == candidate_id)
-        else {
-            return;
-        };
-        if !candidate.import_supported {
-            return;
-        }
-        if self.device.pending_import.is_some() {
-            self.device.message =
-                Some("· one import at a time — waiting for the daemon".to_owned());
-            self.dirty = true;
-            return;
-        }
-        self.device.pending_import = Some(candidate.candidate.clone());
-        self.device.message = None;
-        self.requests.push(AppRequest::DeviceImport {
-            candidate: candidate.candidate.clone(),
-        });
-        self.dirty = true;
-    }
-
     /// THE ONE DOOR into `/providers` (report §5.2).
     fn enter_providers(&mut self) {
         if self.screen == Screen::Providers {
             return;
         }
         self.providers.message = None;
-        // P1 MASK LAW: same one-door reset as `/accounts` — the shared
-        // device section's labels always open masked here too.
-        self.providers.revealed = false;
         self.switch_surface(Screen::Providers);
         self.requests.push(AppRequest::ProvidersRefresh);
-        // D2: the shared buttons area shows the same "found on this
-        // device" section here — same entry-only refresh, same gate.
+        // Preserve the existing discovery cadence as a hidden auto-adopt
+        // trigger; the candidate report itself has no TUI surface.
         if self.device_discovery_available() {
             self.requests.push(AppRequest::DeviceCandidatesRefresh);
         }
         self.dirty = true;
     }
 
-    /// Esc from `/providers`: same routing as `/accounts`. Closing
-    /// RESTORES the mask (P1) — a reveal is per-visit.
+    /// Esc from `/providers`: same routing as `/accounts`.
     fn exit_providers(&mut self) {
-        self.providers.revealed = false;
         let target = if self.active_session.is_some()
             || !self.projection.entries().is_empty()
             || self.session_name.is_some()
@@ -7054,22 +7086,6 @@ impl AppModel {
                     self.requests
                         .push(AppRequest::ProviderModelsRefresh { provider });
                     self.dirty = true;
-                }
-            }
-            KeyCode::Char('r') => {
-                // P1 (the U2 owner addendum): `r` toggles the identity
-                // REVEAL for this visit only — the device section's
-                // account labels are the only identity this screen shows.
-                self.providers.revealed = !self.providers.revealed;
-                self.dirty = true;
-            }
-            // D2: the shared "found on this device" section is numbered
-            // here too — the same one-key import as `/accounts` (the
-            // provider cursor keeps ↑/↓; digits belong to the section).
-            KeyCode::Char(c @ '1'..='9') => {
-                let index = (c as usize) - ('1' as usize);
-                if let Some(id) = self.device.supported_id(index) {
-                    self.import_device_candidate(&id);
                 }
             }
             KeyCode::Up => {
@@ -7789,7 +7805,7 @@ impl AppModel {
                 card.name
             ),
             CustomCardKind::Vertex => format!(
-                "✓ provider {} configured · Vertex — paste an access token (~1h), or import gcloud from the device rows",
+                "✓ provider {} configured · Vertex — paste an access token (~1h); detected gcloud credentials auto-link",
                 card.name
             ),
             CustomCardKind::Generic => format!(
@@ -8008,26 +8024,11 @@ impl AppModel {
                 self.dirty = true;
             }
             KeyCode::Down => {
-                // D2: the flattened selectable rows extend into the
-                // "found on this device" section's SUPPORTED candidates
-                // (unsupported rows are inert and get no cursor slot).
-                let total = self.accounts.rows.len() + self.device.supported_len();
+                let total = self.accounts.rows.len();
                 if total > 0 {
                     self.accounts.cursor = (self.accounts.cursor + 1).min(total - 1);
                 }
                 self.dirty = true;
-            }
-            // D2 one-key import (the owner menu law, the hooks digits
-            // precedent): `[n]` names the nth SUPPORTED candidate. The
-            // cursor follows so the pending pulse lands under the
-            // highlight the user just addressed.
-            KeyCode::Char(c @ '1'..='9') => {
-                let index = (c as usize) - ('1' as usize);
-                if let Some(id) = self.device.supported_id(index) {
-                    self.accounts.cursor = self.accounts.rows.len() + index;
-                    self.import_device_candidate(&id);
-                    self.dirty = true;
-                }
             }
             KeyCode::Char('r') => {
                 // P1 (the U2 owner addendum): `r` toggles the identity
@@ -8047,18 +8048,6 @@ impl AppModel {
                     .map(|row| row.alias.clone())
                 {
                     self.select_account(&alias);
-                } else if let Some(id) = self
-                    .device
-                    .supported_id(
-                        self.accounts
-                            .cursor
-                            .saturating_sub(self.accounts.rows.len()),
-                    )
-                    .filter(|_| self.accounts.cursor >= self.accounts.rows.len())
-                {
-                    // ⏎ on a highlighted candidate row imports it — the
-                    // same dispatch as its digit.
-                    self.import_device_candidate(&id);
                 }
             }
             _ => {}
@@ -8360,6 +8349,10 @@ impl AppModel {
             .map(str::to_ascii_lowercase);
         match name.as_str() {
             "help" => self.help_open = true,
+            // Explicit parity for terminals/frontends where a rapid double
+            // Esc cannot be distinguished. Bare opens the same chooser;
+            // an ordinal loads that durable prompt verbatim.
+            "history" => self.history_command(&remainder),
             // W-C M2: the desktop-notification toggle. Works everywhere (it is
             // a display preference, not a session command); bare `/notifications`
             // flips it, `on`/`off` set it explicitly, and the runtime persists
@@ -9226,21 +9219,28 @@ impl AppModel {
                         }
                     }
                 }
-                if matches!(note, crate::branch::AdmittedNote::Content)
-                    && admission == Admission::Apply
-                {
+                if matches!(note, crate::branch::AdmittedNote::Content) {
                     match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                        Ok(payload) => self.route_admitted(
-                            &payload,
-                            envelope.branch_id.as_ref(),
-                            envelope.agent_id.as_ref(),
-                            envelope.committed_at_ms,
-                        ),
+                        Ok(payload) => {
+                            if envelope.agent_id.is_none()
+                                && let EventPayload::UserMessage { text, .. } = &payload
+                            {
+                                self.record_prompt(text.clone());
+                            }
+                            if admission == Admission::Apply {
+                                self.route_admitted(
+                                    &payload,
+                                    envelope.branch_id.as_ref(),
+                                    envelope.agent_id.as_ref(),
+                                    envelope.committed_at_ms,
+                                );
+                            }
+                        }
                         // S3/W-A: the additive agent- and task-event unions
                         // ride raw envelopes OUTSIDE `EventPayload` — try
                         // them before counting the payload unknown (both
                         // twins).
-                        Err(_) => {
+                        Err(_) if admission == Admission::Apply => {
                             if !crate::session::route_agent_event(
                                 &mut self.branch_state,
                                 &mut self.projection,
@@ -9255,6 +9255,7 @@ impl AppModel {
                                 self.projection.count_unknown_payload();
                             }
                         }
+                        Err(_) => {}
                     }
                 }
                 RawOutcome::Applied
@@ -9747,6 +9748,8 @@ impl AppModel {
         // session, so their by-id origin can never match.
         self.outbox.clear();
         self.projection = SessionProjection::new();
+        self.prompt_history.clear();
+        self.close_backtrack();
         self.branch_state = crate::branch::BranchState::default();
         self.hook_facts = crate::hooks::HookFactsLog::default();
         self.tasks = crate::taskrows::TaskPanel::default();
@@ -9941,6 +9944,7 @@ impl AppModel {
         );
         crate::session::sweep_closed_chips(&mut slot.chips);
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
+        self.prompt_history = std::mem::take(&mut slot.prompt_history);
         self.cache_usage = std::mem::take(&mut slot.cache_usage);
         self.chips = std::mem::take(&mut slot.chips);
         // B2b: the branch registry/active/parked views travel as ONE unit
@@ -9996,6 +10000,7 @@ impl AppModel {
             // (identity is the protocol id; the row's generation stays put)
             let slot = &mut self.sessions[index];
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
+            slot.prompt_history = std::mem::take(&mut self.prompt_history);
             slot.cache_usage = std::mem::take(&mut self.cache_usage);
             slot.chips = std::mem::take(&mut self.chips);
             slot.branch_state = std::mem::take(&mut self.branch_state);
@@ -10322,14 +10327,6 @@ impl AppModel {
             // NEVER an optimistic flip — select_account only requests.
             Hit::AccountRow(alias) if self.screen == Screen::Accounts => {
                 self.select_account(&alias);
-            }
-            // D2: click = the row's digit. Only SUPPORTED candidate rows
-            // ever rendered a hit; the dispatch re-checks the flag anyway
-            // (a stale rect can only import what it was measured on).
-            Hit::DeviceImport(candidate)
-                if matches!(self.screen, Screen::Accounts | Screen::Providers) =>
-            {
-                self.import_device_candidate(&candidate);
             }
             Hit::AccountAdd(kind)
                 if matches!(self.screen, Screen::Accounts | Screen::Providers) =>

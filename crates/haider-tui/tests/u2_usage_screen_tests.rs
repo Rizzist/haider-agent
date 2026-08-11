@@ -243,9 +243,9 @@ fn usage_tone_thresholds_are_pinned() {
 }
 
 /// MASK LAW (owner addendum): first character of the local part and of
-/// the domain survive, every other character masks length-preserving, the
-/// final `.tld` stays readable — and the masked form never contains the
-/// full local part.
+/// the domain survive, every hidden run is capped at eight stars, the final
+/// `.tld` stays readable — and the masked form never contains the full local
+/// part.
 ///
 /// MUTATION CHECK (executed): make `mask_identity` return its input
 /// verbatim — the masked-form asserts and the never-leaks assert fail.
@@ -271,6 +271,19 @@ fn identity_masking_keeps_first_chars_and_tld_only() {
         "single-char parts have nothing to hide"
     );
     assert_eq!(mask_identity(""), "", "empty stays empty");
+}
+
+/// P1 length-hiding law: long runs cap at exactly eight stars while short
+/// runs retain their natural size. Removing the cap fails the first assert;
+/// padding every run to eight fails the second.
+#[test]
+fn masked_runs_cap_at_eight_without_padding_short_runs() {
+    assert_eq!(mask_identity(&format!("C{}", "x".repeat(40))), "C********");
+    assert_eq!(mask_identity("Cxyz"), "C***");
+    assert_eq!(
+        mask_identity("somethinglong@gmail.com"),
+        "s********@g****.com"
+    );
 }
 
 // ---- per-state rendering ---------------------------------------------

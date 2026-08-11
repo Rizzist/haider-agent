@@ -19,8 +19,8 @@ email / account id).
 |---|---|---|---|
 | 1 | `/usage` identity line (`render.rs`) | email/handle | ALREADY MASKED (U2) — untouched |
 | 2 | `/accounts` rows (`render.rs` `render_accounts`) | `row.identity` — email for OAuth, key fragment for API | **LEAKED → masked + `r` reveal** |
-| 3 | "found on this device" rows (`push_device_candidates_section`, shared by `/accounts` + `/providers`) | `candidate.account_label` — the store's signed-in email | **LEAKED → masked + per-screen reveal** |
-| 4 | Device-import receipt (`live.rs` `DeviceImported`) | `descriptor.identity` in `device.message` | **LEAKED → masked-always at construction** |
+| 3 | Device discovery | no client-side rows — discovery now auto-adopts into the ordinary roster | **REMOVED by A2** |
+| 4 | Legacy device-import receipt | compatibility-only wire path; no Accounts-screen action reaches it | **NO LONGER RENDERED by A2** |
 | 5 | OAuth completion receipt (`app.rs` `oauth_add_completed`) | `descriptor.identity` in `accounts.message` | **LEAKED → masked-always at construction** |
 | 6 | Login card Done stage (`render.rs` `login_lines`) | the daemon's `LoggedIn` identity | **LEAKED → masked-always at render** |
 | 7 | Launcher header `account <label>` (`render.rs`) | `identity.account` — the ALIAS, only writer `adopt_identity(descriptor.alias)` | NOT an identity — unmasked BY DESIGN (below) |
@@ -34,9 +34,9 @@ email / account id).
 
 `format::mask_identity` is THE mask — no second implementation, no
 re-export needed (every surface lives in `haider-tui`). Doc extended to
-name all surfaces. Shape unchanged (U2 owner addendum): first char of
-local part + first char of domain survive, `*` for the rest
-(length-preserving), final `.tld` readable; non-emails mask as one part;
+name all surfaces. A2 caps every masked run at eight stars: first char of
+local part + first char of domain survive, up to eight `*` for the rest
+(never length-revealing beyond the cap), final `.tld` readable; non-emails mask as one part;
 the full local part never survives.
 
 ## Reveal semantics per surface (chosen honestly, per the directive)
@@ -47,13 +47,7 @@ the full local part never survives.
   BOTH lanes: `exit_accounts` (esc) AND the one door `enter_accounts` —
   the U2 survivor lesson (⌃C walks `back_to_launcher` and bypasses the
   exit) baked in from the start. Key map names `r reveals`.
-- **`/providers`** — its OWN `ProvidersState::revealed` pin with the same
-  enter/exit resets: the shared device section takes the pin of the
-  screen that HOSTS it (`model.screen` match; any other host renders
-  masked-always). A reveal on `/accounts` never travels to `/providers`
-  — per-surface pins, law-tested. Hint names `r reveals` only while a
-  candidate actually carries an `account_label`.
-- **Receipts (import + OAuth)** — masked-ALWAYS at construction: they
+- **OAuth receipts** — masked-ALWAYS at construction: they
   are transient chrome with no key loop of their own; the durable,
   revealable surface is the account row the chained refresh lands.
 - **Login card Done** — masked-ALWAYS at render: the card's keys belong
@@ -69,21 +63,19 @@ the full local part never survives.
 ## Laws (pinned in `p1_masking_sweep_tests.rs` + extended surface suites)
 
 1. **Masked-by-default per surface** — `/accounts` rows (email AND key
-   fragment), device labels on BOTH screens; raw never renders on open.
+   fragment); raw never renders on open.
 2. **Never-leaks-full-local-part** — every assert pairs the masked-form
    check with a `!contains(raw)` check; receipts and the login card get
    the same pair.
 3. **Reveal+reset** — `r` per visit; esc lane AND the ⌃C Sub-Escape-Lane
-   both restored by the enter-door reset; `/providers` re-visit resets
-   its own pin.
+   both restored by the enter-door reset.
 4. **One authority / no second dialect** — all surfaces assert the SAME
    masked literals (`y**@w***.com`, `s*******`, `p*****@e******.invalid`)
    produced by the one helper; U2's helper tests still own its shape.
 5. **Alias law** — launcher header carries the alias, never the identity.
 
 Extended (not forked): `w5d_accounts_tests` (hierarchy/expired/pending
-rows now assert the masked forms + no-raw), `d2_device_discovery_tests`
-(masked label + masked receipt), `w3c3_login_tests` (Done stage masked +
+rows now assert the masked forms + no-raw), `w3c3_login_tests` (Done stage masked +
 no-raw). `u2_usage_screen_tests` untouched — still green.
 
 ## Ledger

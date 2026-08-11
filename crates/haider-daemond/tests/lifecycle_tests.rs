@@ -157,11 +157,15 @@ impl Drop for ManagedChild {
 }
 
 fn test_config(root: &tempfile::TempDir, profile: &str) -> DaemonConfig {
-    DaemonConfig::new(
+    let mut config = DaemonConfig::new(
         profile,
         root.path().join("store"),
         root.path().join("runtime"),
-    )
+    );
+    // Hermetic: direct spawns here bypass support::ready's guard; never
+    // probe the developer machine's real credential stores (A2 auto-adopt).
+    config.discovery_disabled = true;
+    config
 }
 
 fn child_command(config: &DaemonConfig) -> Command {

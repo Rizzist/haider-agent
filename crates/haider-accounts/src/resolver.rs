@@ -134,6 +134,11 @@ where
                 &active.alias,
                 RotationTrigger::AuthExpired,
             ),
+            CredentialStatus::NeedsAttention { .. } => self.resolve_alternate_descriptor(
+                provider,
+                &active.alias,
+                RotationTrigger::AuthExpired,
+            ),
             CredentialStatus::Revoked => Err(unusable(&active.alias, "revoked")),
         }
     }
@@ -191,6 +196,9 @@ where
                         Err(limited(&alternate.alias, until_ms, true))
                     }
                     CredentialStatus::Expired => Err(unusable(&alternate.alias, "expired")),
+                    CredentialStatus::NeedsAttention { .. } => {
+                        Err(unusable(&alternate.alias, "needs attention"))
+                    }
                     CredentialStatus::Revoked => Err(unusable(&alternate.alias, "revoked")),
                 }
             }
