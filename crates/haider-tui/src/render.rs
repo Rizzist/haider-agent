@@ -2071,8 +2071,7 @@ fn render_usage(
                     .then_some(" · metered lanes only")
                     .unwrap_or("");
                 let equivalent = if cache.breakdowns.iter().any(|breakdown| {
-                    breakdown.auth_method
-                        == Some(haider_protocol::credential::AuthMethod::OAuth)
+                    breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
                 }) {
                     match (
                         cache.api_equivalent_input_with_cache_usd,

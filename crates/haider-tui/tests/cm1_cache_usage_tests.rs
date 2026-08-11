@@ -285,12 +285,8 @@ fn part_a_mixed_unpriced_oauth_lane_keeps_labeled_unknown_all_lane_rate() {
     assert!(rich.contains("$— API rate (all lanes)"), "{rich}");
     assert!(rich.contains("plan · input $— API rate"), "{rich}");
 
-    let plain = render_plain_with_cache(
-        &SessionProjection::new(),
-        200_000,
-        None,
-        &model.cache_usage,
-    );
+    let plain =
+        render_plain_with_cache(&SessionProjection::new(), 200_000, None, &model.cache_usage);
     assert!(plain.contains("$— API rate (all lanes)"), "{plain}");
     assert!(plain.contains("plan · input $— API rate"), "{plain}");
 }

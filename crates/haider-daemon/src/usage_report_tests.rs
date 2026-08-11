@@ -872,12 +872,7 @@ fn mv2_latest_snapshot_replaces_same_key_and_distinct_keys_sum() {
 fn mv3_agent_dimension_preserved_and_account_report_unchanged() {
     let mut folder = SessionFolder::new("gpt-5.2");
     for (seq, agent, logical) in [(1, "agent-a", 100), (2, "agent-b", 200)] {
-        let mut usage = metrics_usage(
-            logical,
-            10,
-            "gpt-5.2",
-            UsageRequestKind::MainTurn,
-        );
+        let mut usage = metrics_usage(logical, 10, "gpt-5.2", UsageRequestKind::MainTurn);
         usage.cached = logical / 2;
         let normalized = usage.normalized.as_mut().expect("normalized");
         normalized.uncached_input = logical - usage.cached;
@@ -920,12 +915,7 @@ fn mv3_agent_dimension_preserved_and_account_report_unchanged() {
         Some("root-run"),
         None,
         1,
-        usage_payload(metrics_usage(
-            75,
-            5,
-            "gpt-5.2",
-            UsageRequestKind::MainTurn,
-        )),
+        usage_payload(metrics_usage(75, 5, "gpt-5.2", UsageRequestKind::MainTurn)),
     ));
     root.push(&envelope(
         2,

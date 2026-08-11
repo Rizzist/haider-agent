@@ -678,7 +678,7 @@ fn mv4_unpriced_and_missing_usage_never_render_zero_truth() {
 
     unpriced.head_seq = 10;
     unpriced.usage = None;
-    note_child_metrics(&mut model, &unpriced);
+    model.route_raw(&raw_metrics(3, SPAWN_MS + 2, &unpriced));
     let row = chip_row(&draw_rows(&model, 150, 36));
     assert!(row.contains("3 tools"), "{row:?}");
     assert!(!row.contains("tokens") && !row.contains('$'), "{row:?}");

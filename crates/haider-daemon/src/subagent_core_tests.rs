@@ -2499,10 +2499,7 @@ async fn parent_cancel_sweeps_its_outstanding_child() {
                 .filter_map(|event| {
                     serde_json::from_value::<EventPayload>(event.payload.clone())
                         .is_ok_and(|payload| {
-                            matches!(
-                                payload,
-                                EventPayload::RunState(RunState::Cancelled)
-                            )
+                            matches!(payload, EventPayload::RunState(RunState::Cancelled))
                         })
                         .then_some(event.seq)
                 })
