@@ -37,6 +37,7 @@ use haider_protocol::provider::{
     Block, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
 };
 use serde::{Deserialize, Serialize};
+use std::error::Error as _;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -361,6 +362,14 @@ pub enum ProviderErrorKind {
     MalformedFrame,
     InvalidUtf8,
     Internal,
+    /// The account cannot serve requests until billing, credits, or quota are
+    /// changed. Retrying the same request cannot repair it.
+    QuotaExhausted,
+    /// A response stream ended before its terminal frame. Core retries this
+    /// only when no semantic content has been committed.
+    StreamInterrupted,
+    /// Permanent endpoint/proxy/certificate-trust configuration failure.
+    ConnectionConfiguration,
 }
 
 /// Typed failure yielded by a provider stream.
@@ -392,7 +401,63 @@ impl ProviderError {
 
 impl ProviderErrorKind {
     const fn default_retryable(self) -> bool {
-        matches!(self, Self::RateLimited | Self::Overloaded | Self::Transport)
+        matches!(
+            self,
+            Self::RateLimited | Self::Overloaded | Self::Transport | Self::StreamInterrupted
+        )
+    }
+}
+
+/// Classifies one reqwest connection failure without exposing a credential-
+/// bearing URL. Builder failures and certificate/proxy trust failures require
+/// configuration changes; DNS/connect/reset/timeout and transient TLS errors
+/// remain retryable transport failures.
+pub(crate) fn reqwest_transport_error(provider: &str, error: reqwest::Error) -> ProviderError {
+    let mut diagnostic = error.to_string();
+    let mut permanent_tls = false;
+    let mut source = error.source();
+    while let Some(cause) = source {
+        permanent_tls |= cause.downcast_ref::<rustls::Error>().is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::InvalidCertificate(_)
+                    | rustls::Error::NoCertificatesPresented
+                    | rustls::Error::UnsupportedNameType
+            )
+        });
+        diagnostic.push_str(": ");
+        diagnostic.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    let lower = diagnostic.to_ascii_lowercase();
+    let permanent = error.is_builder()
+        || permanent_tls
+        || [
+            "invalid url",
+            "builder error",
+            "invalid peer certificate",
+            "unknown issuer",
+            "certificate verify failed",
+            "certificate has expired",
+            "not valid for name",
+            "hostname mismatch",
+            "invalid proxy",
+            "proxy configuration",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    if permanent {
+        ProviderError::new(
+            ProviderErrorKind::ConnectionConfiguration,
+            format!(
+                "{provider} connection configuration failed; check the endpoint, proxy, and certificate trust settings"
+            ),
+        )
+    } else {
+        ProviderError::new(
+            ProviderErrorKind::Transport,
+            format!("{provider} HTTP transport failed: {error}"),
+        )
     }
 }
 
@@ -557,6 +622,21 @@ pub enum FakeStep {
     },
     /// Produces no more data until the consumer drops the stream.
     Hang,
+    /// Emits model refusal content on its distinct provider channel.
+    EmitRefusal {
+        text: String,
+    },
+    /// Closes a request stream without a terminal finish/error event.
+    PrematureEof,
+    /// Test seam for asserting kind-level retry gates independently from an
+    /// adapter's default retryability classification.
+    ErrorWithRetryability {
+        kind: ProviderErrorKind,
+        message: String,
+        retryable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,6 +751,8 @@ impl FakeProvider {
                 FakeStep::Finish { .. }
                     | FakeStep::Error { .. }
                     | FakeStep::Hang
+                    | FakeStep::PrematureEof
+                    | FakeStep::ErrorWithRetryability { .. }
                     | FakeStep::MalformedFrame
             ) {
                 break;
@@ -696,6 +778,11 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
             }
             FakeStep::EmitReasoning { text } => {
                 if !send_event(&sender, StreamEvent::ReasoningDelta { text }).await {
+                    return;
+                }
+            }
+            FakeStep::EmitRefusal { text } => {
+                if !send_event(&sender, StreamEvent::RefusalDelta { text }).await {
                     return;
                 }
             }
@@ -837,10 +924,27 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                     .await;
                 return;
             }
+            FakeStep::ErrorWithRetryability {
+                kind,
+                message,
+                retryable,
+                retry_after_ms,
+            } => {
+                let _ = sender
+                    .send(Err(ProviderError {
+                        kind,
+                        message,
+                        retryable,
+                        retry_after_ms,
+                    }))
+                    .await;
+                return;
+            }
             FakeStep::Hang => {
                 sender.closed().await;
                 return;
             }
+            FakeStep::PrematureEof => return,
         }
     }
 

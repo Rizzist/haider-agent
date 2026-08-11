@@ -152,6 +152,17 @@ async fn task_dispatcher(
     label: &str,
     context_run: &RunId,
 ) -> Arc<dyn ToolDispatcher> {
+    task_dispatcher_with_grant(hub, session_id, cwd, label, context_run, None).await
+}
+
+async fn task_dispatcher_with_grant(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    cwd: &str,
+    label: &str,
+    context_run: &RunId,
+    grant: Option<haider_protocol::agent::Grant>,
+) -> Arc<dyn ToolDispatcher> {
     let lease = hub
         .acquire_worker_lease(session_id.clone())
         .await
@@ -168,12 +179,65 @@ async fn task_dispatcher(
             delegation: crate::delegation::DelegationHandle::new(hub.clone()),
             tasks: TaskFacade::with_kill_grace(hub.clone(), Duration::from_millis(300)),
             agent_id: None,
+            grant,
             web_search: None,
         },
     )
     .await
     .expect("create tool dispatcher")
     .expect("dispatcher available")
+}
+
+/// E1d dispatch fence: even a forged/unadvertised write call is rejected
+/// before the broker can create an effect or permission menu.
+#[tokio::test]
+async fn e1d_dispatch_rejects_tool_above_child_grant_ceiling() {
+    use haider_protocol::agent::Grant;
+    use haider_protocol::effect::EffectClass;
+    use haider_protocol::tool::ToolResultStatus;
+
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = create_task_session(&hub, "e1-grant-dispatch", &cwd).await;
+    let run_id = RunId::new("e1-grant-dispatch-run");
+    prepare_tool_run(&hub, &session_id, &run_id, "e1-grant-dispatch").await;
+    let dispatcher = task_dispatcher_with_grant(
+        &hub,
+        &session_id,
+        &cwd,
+        "e1-grant-dispatch",
+        &run_id,
+        Some(Grant {
+            tools: vec!["fs_read".into()],
+            effect_ceiling: vec![EffectClass::FsRead],
+        }),
+    )
+    .await;
+    let outcome = dispatcher
+        .execute(
+            &run_id,
+            &ItemId::new("e1-grant-dispatch-item"),
+            "e1-grant-dispatch-call",
+            "fs_write",
+            serde_json::json!({"path": "forbidden.txt", "content": "no"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("surface-and-continue result");
+    let ToolDispatchResult::Completed(result) = outcome else {
+        panic!("grant violation must be a completed dispatch result");
+    };
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    assert!(result.preview.contains("grant_ceiling_violation"));
+    assert!(!std::path::Path::new(&cwd).join("forbidden.txt").exists());
+
+    dispatcher.close().await.expect("dispatcher close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 async fn dispatch(
@@ -448,6 +512,68 @@ async fn foreground_process_exec_is_unchanged_and_journals_no_task_facts() {
         task_facts(&envelopes).is_empty(),
         "a foreground command must never journal task facts"
     );
+
+    dispatcher.close().await.expect("dispatcher close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// LAW E1a background half: a nonzero background exit is Failed, never the
+/// green Completed state. MUTATION: map every observed exit code to Completed
+/// and this assertion fails.
+#[tokio::test]
+async fn e1a_background_nonzero_exit_is_failed() {
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = create_task_session(&hub, "e1-background-fail", &cwd).await;
+    let run_id = RunId::new("e1-background-fail-run");
+    prepare_tool_run(&hub, &session_id, &run_id, "e1-background-fail").await;
+    let dispatcher = task_dispatcher(&hub, &session_id, &cwd, "e1-background-fail", &run_id).await;
+
+    let receipt = dispatch(
+        &dispatcher,
+        &run_id,
+        "e1-background-fail-call",
+        "process_exec",
+        serde_json::json!({
+            "command": "exit 7",
+            "background": true,
+            "name": "failing",
+        }),
+    )
+    .await;
+    let task = TaskId::new(receipt["task_id"].as_str().expect("task id"));
+    let (_, completed) = wait_for_completed(&store, &session_id, &task).await;
+    assert_eq!(
+        completed.state,
+        TaskTerminalState::Failed {
+            reason: "process exited with code 7".into()
+        }
+    );
+
+    let signal_receipt = dispatch(
+        &dispatcher,
+        &run_id,
+        "e1-background-signal-call",
+        "process_exec",
+        serde_json::json!({
+            "command": "kill -9 $$",
+            "background": true,
+            "name": "signalled",
+        }),
+    )
+    .await;
+    let signal_task = TaskId::new(signal_receipt["task_id"].as_str().expect("task id"));
+    let (_, signalled) = wait_for_completed(&store, &session_id, &signal_task).await;
+    assert!(matches!(
+        signalled.state,
+        TaskTerminalState::Failed { ref reason }
+            if reason.contains("signal 9") && reason.contains("out-of-memory")
+    ));
 
     dispatcher.close().await.expect("dispatcher close");
     hub.shutdown().await.expect("hub shutdown");

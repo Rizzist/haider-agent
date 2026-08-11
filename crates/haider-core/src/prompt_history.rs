@@ -867,7 +867,12 @@ fn render_journal(
                     call_id,
                     name,
                     args,
-                    status: haider_protocol::item::ToolStatus::Completed,
+                    status:
+                        haider_protocol::item::ToolStatus::Completed
+                        | haider_protocol::item::ToolStatus::Rejected
+                        | haider_protocol::item::ToolStatus::Conflict
+                        | haider_protocol::item::ToolStatus::Failed
+                        | haider_protocol::item::ToolStatus::Unknown,
                 } => {
                     messages.push(Message::assistant(vec![Block::ToolCall {
                         call_id: call_id.clone(),
@@ -986,7 +991,9 @@ pub fn task_event_notice(event: &TaskEventPayload) -> String {
                 TaskTerminalState::Failed { reason } => format!("failed: {reason}"),
                 TaskTerminalState::Killed => "was killed".into(),
             };
-            let truncation = if completed.truncated {
+            let truncation = if completed.full_output_unavailable {
+                " (full output unavailable; bounded tail retained below)"
+            } else if completed.truncated {
                 " (truncated; full retained output in the task artifact)"
             } else {
                 ""

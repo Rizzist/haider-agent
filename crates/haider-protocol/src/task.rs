@@ -8,6 +8,10 @@
 use crate::ids::{ArtifactRef, TaskId};
 use serde::{Deserialize, Serialize};
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Rolling tail preview retained per task for cheap reads (bytes).
 pub const TASK_TAIL_BYTES: usize = 4 * 1024;
 
@@ -74,6 +78,10 @@ pub struct TaskCompleted {
     /// Full bounded output (cap [`TASK_OUTPUT_RETAIN_BYTES`]) in the CAS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
+    /// The bounded tail is still present, but the retained full-output CAS
+    /// object could not be stored.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub full_output_unavailable: bool,
     /// True when `output_bytes` exceeded the retained cap.
     pub truncated: bool,
     pub delivery: TaskCompletionDelivery,

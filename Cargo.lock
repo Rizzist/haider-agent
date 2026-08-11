@@ -1110,6 +1110,7 @@ dependencies = [
  "haider-protocol",
  "httpdate",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -2842,6 +2843,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",

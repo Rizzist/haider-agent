@@ -13,6 +13,7 @@ haider-accounts = { path = "../haider-accounts" }
 haider-protocol = { path = "../haider-protocol" }
 httpdate.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

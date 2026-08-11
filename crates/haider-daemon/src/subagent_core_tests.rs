@@ -42,6 +42,99 @@ use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Duration, timeout};
 
+/// LAW E1d: a child resolves to the intersection of its requested grant and
+/// its durable parent's ceiling. MUTATION: return the requested grant without
+/// intersection and `fs_write` reappears, failing this test.
+#[test]
+fn e1d_child_grant_cannot_exceed_parent_and_within_ceiling_survives() {
+    use haider_protocol::agent::Grant;
+    use haider_protocol::effect::EffectClass;
+
+    let parent = Grant {
+        tools: vec!["fs_read".into(), "fs_list".into(), "spawn_subagent".into()],
+        effect_ceiling: vec![EffectClass::FsRead, EffectClass::AgentSpawn],
+    };
+    let resolved = crate::worker::intersect_grant(crate::worker::default_child_grant(), &parent);
+
+    assert!(resolved.tools.contains(&"fs_read".to_owned()));
+    assert!(resolved.tools.contains(&"fs_list".to_owned()));
+    assert!(resolved.tools.contains(&"spawn_subagent".to_owned()));
+    assert!(!resolved.tools.contains(&"fs_write".to_owned()));
+    assert!(!resolved.tools.contains(&"process_exec".to_owned()));
+    assert!(resolved.effect_ceiling.contains(&EffectClass::FsRead));
+    assert!(!resolved.effect_ceiling.contains(&EffectClass::FsWrite));
+
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(crate::worker::BrokerToolFactory);
+    let declared = crate::worker::advertised_tool_definitions(
+        &factory,
+        Some(&resolved),
+        "fake",
+        crate::worker::WebCapabilityDegrade::default(),
+    );
+    let names = declared
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"fs_read"));
+    assert!(!names.contains(&"fs_write"));
+    assert!(!names.contains(&"process_exec"));
+}
+
+#[test]
+fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
+    use haider_protocol::ids::EffectId;
+    use haider_protocol::item::ToolStatus;
+    use haider_protocol::tool::ToolResultStatus;
+    use haider_tools::{FsEditAnchorMismatch, ProcessResult};
+
+    let denied = crate::worker::typed_tool_result(&haider_tools::ToolError::PermissionDenied {
+        reason: "policy says no".into(),
+    })
+    .expect("typed denial");
+    assert_eq!(denied.status, ToolResultStatus::Rejected);
+    assert!(
+        denied
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("denied"))
+    );
+
+    let anchor = crate::worker::typed_tool_result(&haider_tools::ToolError::EditAnchor(
+        FsEditAnchorMismatch {
+            path: "missing.txt".into(),
+            matches: 0,
+            replace_all: false,
+        },
+    ))
+    .expect("typed anchor conflict");
+    assert_eq!(anchor.status, ToolResultStatus::Conflict);
+    assert!(
+        anchor
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("anchor"))
+    );
+
+    let failed = crate::worker::process_result(ProcessResult {
+        call_id: "exit-1".into(),
+        effect: EffectId::new("effect-exit-1"),
+        status: ToolStatus::Failed,
+        exit_code: Some(1),
+        signal: None,
+        output_bytes: 0,
+        inline_output: Vec::new(),
+        artifact: None,
+        escalation_note: None,
+        limit_reached: None,
+        wall_timeout_ms: 1_000,
+        max_output_bytes: 1_024,
+        transcript_high_water_bytes: 0,
+        lifecycle_events: Vec::new(),
+    });
+    assert_eq!(failed.status, ToolResultStatus::Failed);
+    assert_eq!(failed.reason.as_deref(), Some("process exited with code 1"));
+}
+
 /// MUTATION CHECK: hard-code parent chip projection to `branch_id: None` or
 /// omit `parent_branch_id` from the durable record. Expected RUNTIME failure:
 /// the late child chip below paints main instead of branch A.
@@ -716,6 +809,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             delegation: delegation.clone(),
             tasks: crate::tasks::TaskFacade::new(hub.clone()),
             agent_id: None,
+            grant: None,
             web_search: None,
         },
     )

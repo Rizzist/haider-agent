@@ -435,6 +435,7 @@ fn golden_additive_task_facts_and_unknown_kind_tolerance() {
             "blake3:9c1185a5c5e9fc54612808977ee8f548b2258d31",
         )),
         truncated: true,
+        full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredQueued,
     });
     golden("task_completed", &completed);

@@ -68,8 +68,28 @@ fn completed(task: &str, name: &str, state: TaskTerminalState, tail: &str) -> Ta
         tail: tail.to_owned(),
         artifact: None,
         truncated: false,
+        full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredQueued,
     })
+}
+
+#[test]
+fn e1a_task_cas_loss_keeps_tail_and_marks_full_output_unavailable() {
+    let mut fact = completed(
+        "task-cas-loss",
+        "builder",
+        TaskTerminalState::Failed {
+            reason: "process exited with code 1".into(),
+        },
+        "last useful output",
+    );
+    let TaskEventPayload::TaskCompleted(completed) = &mut fact else {
+        unreachable!();
+    };
+    completed.full_output_unavailable = true;
+    let note = haider_tui::taskrows::task_note(&fact);
+    assert!(note.contains("full output unavailable"));
+    assert!(note.contains("last useful output"));
 }
 
 fn live_session() -> AppModel {

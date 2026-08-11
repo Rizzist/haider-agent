@@ -476,7 +476,7 @@ fn web_fetch_advertises_on_every_pair_except_first_party_anthropic() {
         "fake",
     ] {
         let pack =
-            advertised_tool_definitions(&factory, false, provider, WebCapabilityDegrade::default());
+            advertised_tool_definitions(&factory, None, provider, WebCapabilityDegrade::default());
         assert!(
             pack.iter().any(|tool| tool.name == "web_fetch"),
             "`{provider}` advertises the local web_fetch"
@@ -484,13 +484,17 @@ fn web_fetch_advertises_on_every_pair_except_first_party_anthropic() {
     }
     for provider in ["anthropic", "anthropic-oauth"] {
         let pack =
-            advertised_tool_definitions(&factory, false, provider, WebCapabilityDegrade::default());
+            advertised_tool_definitions(&factory, None, provider, WebCapabilityDegrade::default());
         assert!(
             !pack.iter().any(|tool| tool.name == "web_fetch"),
             "`{provider}` withholds the local tool — the server tool owns the name"
         );
-        let child =
-            advertised_tool_definitions(&factory, true, provider, WebCapabilityDegrade::default());
+        let child = advertised_tool_definitions(
+            &factory,
+            Some(&crate::worker::default_child_grant()),
+            provider,
+            WebCapabilityDegrade::default(),
+        );
         assert!(
             !child.iter().any(|tool| tool.name == "todo_write"),
             "the child filter still applies beside the pair filter"
@@ -499,7 +503,7 @@ fn web_fetch_advertises_on_every_pair_except_first_party_anthropic() {
         // SERVER web tools 400ed, the local tool returns to the pack.
         let fallback = advertised_tool_definitions(
             &factory,
-            false,
+            None,
             provider,
             WebCapabilityDegrade {
                 anthropic_web_tools: true,
@@ -523,7 +527,7 @@ fn client_web_search_advertises_on_lite_only_and_a_gone_endpoint_unadvertises_it
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let lite = advertised_tool_definitions(
         &factory,
-        false,
+        None,
         OPENAI_OAUTH_PROVIDER_NAME,
         WebCapabilityDegrade::default(),
     );
@@ -534,7 +538,7 @@ fn client_web_search_advertises_on_lite_only_and_a_gone_endpoint_unadvertises_it
     // Decision 8: subagents inherit the same derivation.
     let child = advertised_tool_definitions(
         &factory,
-        true,
+        Some(&crate::worker::default_child_grant()),
         OPENAI_OAUTH_PROVIDER_NAME,
         WebCapabilityDegrade::default(),
     );
@@ -554,7 +558,7 @@ fn client_web_search_advertises_on_lite_only_and_a_gone_endpoint_unadvertises_it
         "fake",
     ] {
         let pack =
-            advertised_tool_definitions(&factory, false, provider, WebCapabilityDegrade::default());
+            advertised_tool_definitions(&factory, None, provider, WebCapabilityDegrade::default());
         assert!(
             !pack.iter().any(|tool| tool.name == "web_search"),
             "`{provider}` must NOT carry the lite-only client search"
@@ -562,7 +566,7 @@ fn client_web_search_advertises_on_lite_only_and_a_gone_endpoint_unadvertises_it
     }
     let degraded = advertised_tool_definitions(
         &factory,
-        false,
+        None,
         OPENAI_OAUTH_PROVIDER_NAME,
         WebCapabilityDegrade {
             anthropic_web_tools: false,

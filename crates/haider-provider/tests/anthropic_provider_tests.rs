@@ -363,6 +363,22 @@ fn http_auth_permission_overload_and_server_failures_are_classified() {
 }
 
 #[test]
+fn e1c_anthropic_billing_exhaustion_is_non_retryable_quota() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "billing_error",
+            "message": "Credit balance is too low; update billing"
+        }
+    }))
+    .expect("body");
+    let error = replay_anthropic_http_error(429, Some("2"), &body);
+    assert_eq!(error.kind, ProviderErrorKind::QuotaExhausted);
+    assert!(!error.retryable);
+    assert_eq!(error.retry_after_ms, None);
+}
+
+#[test]
 fn provider_debug_never_exposes_resolved_secret() {
     let secret = "never-log-anthropic-key";
     let vault = MemoryVault::new();

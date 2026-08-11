@@ -175,6 +175,12 @@ impl DelegationHandle {
         let child_session_id = SessionId::new(format!("session-child-{identity}"));
         let child_run_id = RunId::new(format!("run-child-{identity}"));
         let lease = LeaseId::new(format!("lease-child-{identity}"));
+        let requested_grant = crate::worker::default_child_grant();
+        let grant = match ancestry.parent_grant.as_ref() {
+            Some(parent) => crate::worker::intersect_grant(requested_grant, parent),
+            None => requested_grant,
+        };
+        crate::worker::validate_grant(&grant)?;
         let manifest = AgentManifest {
             agent: agent_id.clone(),
             role: AgentRole::Subagent,
@@ -184,32 +190,7 @@ impl DelegationHandle {
             // deterministically from journal order.
             callsign: None,
             model_profile: coordinates.metadata.model.clone(),
-            grant: Grant {
-                tools: vec![
-                    "fs_read".into(),
-                    "fs_list".into(),
-                    "fs_search".into(),
-                    "fs_glob".into(),
-                    "fs_write".into(),
-                    "fs_patch".into(),
-                    "fs_edit".into(),
-                    "process_exec".into(),
-                    "spawn_subagent".into(),
-                    "message_subagent".into(),
-                    // W-B: children inherit the web derivation (decision 8);
-                    // the empty-host Network entry is the class-family grant.
-                    "web_fetch".into(),
-                ],
-                effect_ceiling: vec![
-                    EffectClass::FsRead,
-                    EffectClass::FsWrite,
-                    EffectClass::ProcessExec,
-                    EffectClass::AgentSpawn,
-                    EffectClass::Network {
-                        host: String::new(),
-                    },
-                ],
-            },
+            grant: grant.clone(),
             budget_tokens: Some(coordinates.metadata.max_tokens),
             placement: Placement::Local,
             lease,
@@ -231,8 +212,8 @@ impl DelegationHandle {
         // policy `Allow`); spawning a child is itself the standing
         // permission. The parent's own surface keeps its Ask defaults.
         let child_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
-            allow_writes: true,
-            allow_exec: true,
+            allow_writes: crate::worker::effect_within_grant(&grant, &EffectClass::FsWrite),
+            allow_exec: crate::worker::effect_within_grant(&grant, &EffectClass::ProcessExec),
         });
         let create_json = serde_json::to_string(&serde_json::json!({
             "cwd": coordinates.metadata.cwd,
@@ -473,6 +454,36 @@ impl DelegationHandle {
             .delegation_for_child_session(session_id.clone())
             .await?
             .map(|record| record.agent_id))
+    }
+
+    pub(crate) async fn record_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<DelegationRecord>, HaiderError> {
+        let record = self
+            .hub
+            .delegation_for_child_session(session_id.clone())
+            .await?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        crate::worker::validate_grant(&record.manifest.grant)?;
+        if let Some(parent_agent) = &record.parent_agent_id {
+            let parent = self
+                .hub
+                .delegation(parent_agent.clone())
+                .await?
+                .ok_or_else(|| grant_state_corrupt("delegated child has no durable parent"))?;
+            crate::worker::validate_grant(&parent.manifest.grant)?;
+            if crate::worker::intersect_grant(record.manifest.grant.clone(), &parent.manifest.grant)
+                != record.manifest.grant
+            {
+                return Err(grant_state_corrupt(
+                    "delegated child grant exceeds its durable parent ceiling",
+                ));
+            }
+        }
+        Ok(Some(record))
     }
 
     /// Returns the parent's shared, ephemeral handoff path for a delegated
@@ -1019,6 +1030,7 @@ impl DelegationHandle {
             return Ok(SpawnAncestry {
                 root_session_id: parent_session_id.clone(),
                 depth: 1,
+                parent_grant: None,
             });
         };
         let parent = self
@@ -1039,6 +1051,7 @@ impl DelegationHandle {
                 false,
             ));
         }
+        crate::worker::validate_grant(&parent.manifest.grant)?;
         let depth = parent.depth.saturating_add(1);
         if depth > RECURSION_DEPTH_LIMIT {
             return Err(HaiderError::new(
@@ -1050,6 +1063,7 @@ impl DelegationHandle {
         Ok(SpawnAncestry {
             root_session_id: parent.root_session_id,
             depth,
+            parent_grant: Some(parent.manifest.grant),
         })
     }
 
@@ -1411,6 +1425,15 @@ impl DelegationHandle {
 struct SpawnAncestry {
     root_session_id: SessionId,
     depth: u32,
+    parent_grant: Option<Grant>,
+}
+
+fn grant_state_corrupt(message: &str) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::StoreCorrupt,
+        format!("{message}; repair or recreate the delegated session before retrying"),
+        false,
+    )
 }
 
 struct SessionProgress {

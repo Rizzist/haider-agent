@@ -288,6 +288,8 @@ pub struct ProcessResult {
     pub effect: EffectId,
     pub status: ToolStatus,
     pub exit_code: Option<i32>,
+    /// Terminating signal when no conventional exit code exists.
+    pub signal: Option<i32>,
     pub output_bytes: usize,
     pub inline_output: Vec<ProcessOutputChunk>,
     pub artifact: Option<ArtifactRef>,
@@ -1328,6 +1330,9 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         exit_code: exit_status
             .as_ref()
             .and_then(std::process::ExitStatus::code),
+        signal: exit_status
+            .as_ref()
+            .and_then(std::os::unix::process::ExitStatusExt::signal),
         output_bytes,
         inline_output,
         artifact,
