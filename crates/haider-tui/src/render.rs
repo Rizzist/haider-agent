@@ -1153,6 +1153,11 @@ fn push_device_candidates_section<'a>(
             _ => theme.dim_style(),
         };
         if candidate.import_supported {
+            let re_adopt = model
+                .accounts
+                .rows
+                .iter()
+                .any(|row| row.provider == candidate.provider);
             let hit = Hit::DeviceImport(candidate.candidate.clone());
             let hovered = model.hovered.as_ref() == Some(&hit);
             let selected = cursor_base.is_some_and(|base| model.accounts.cursor == base + number);
@@ -1181,6 +1186,9 @@ fn push_device_candidates_section<'a>(
                 format!(" · {}", candidate.freshness),
                 freshness_style,
             ));
+            if re_adopt {
+                spans.push(Span::styled(" · re-adopt/refresh", theme.gold_style()));
+            }
             if pending {
                 // In-flight feedback WITHOUT installing anything —
                 // forbidden optimism, the §5.1 discipline.

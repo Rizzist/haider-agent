@@ -1023,6 +1023,9 @@ pub(crate) fn oauth_home_dir() -> Option<std::ffi::OsString> {
 pub(crate) struct ClaudeCredentialInput {
     pub location: PathBuf,
     pub bytes: Zeroizing<Vec<u8>>,
+    /// True only when the bytes came from Claude Code's live native owner
+    /// store (Keychain/Credential Manager), never from an imported file.
+    pub native_owner: bool,
 }
 
 pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
@@ -1176,6 +1179,7 @@ fn native_claude_input(store: &str, bytes: Zeroizing<Vec<u8>>) -> Option<ClaudeC
     (u64::try_from(bytes.len()).ok()? <= IMPORT_FILE_LIMIT).then(|| ClaudeCredentialInput {
         location: PathBuf::from(format!("{store}: {CLAUDE_CODE_CREDENTIAL_SERVICE}")),
         bytes,
+        native_owner: true,
     })
 }
 
@@ -1183,20 +1187,20 @@ pub(crate) fn load_claude_credential_input(
     file_path: &Path,
     native: &dyn ClaudeNativeCredentialStore,
 ) -> Result<ClaudeCredentialInput, HaiderError> {
+    if let Some(mut input) = native.read() {
+        input.native_owner = true;
+        return Ok(input);
+    }
     match std::fs::File::open(file_path) {
         Ok(file) => read_oauth_import_reader(file_path, "claude-code", file),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            native.read().ok_or_else(|| {
-                HaiderError::new(
-                    ErrorCode::CredentialMissing,
-                    format!(
-                        "cannot find Claude Code credentials at `{}` or in the native secure store",
-                        file_path.display()
-                    ),
-                    false,
-                )
-            })
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(HaiderError::new(
+            ErrorCode::CredentialMissing,
+            format!(
+                "cannot find Claude Code credentials at `{}` or in the native secure store",
+                file_path.display()
+            ),
+            false,
+        )),
         Err(error) => Err(oauth_import_read_error(file_path, "claude-code", &error)),
     }
 }
@@ -1204,12 +1208,16 @@ pub(crate) fn load_claude_credential_input(
 pub(crate) struct OAuthImportMaterial {
     pub bundle: OAuthTokenBundleV1,
     pub kimi_device_id: Option<Zeroizing<Vec<u8>>>,
+    /// Claude Code remains the credential owner, so expiry resolution must
+    /// read through to its native store and must not spend Haider's snapshot.
+    pub claude_native_owner: bool,
 }
 
 /// Reads and converts one daemon-local CLI credential file.
 ///
 /// The returned material is the first and only object allowed to leave this
 /// function. File bytes and all token fields stay in zeroizing storage.
+#[allow(dead_code)]
 pub(crate) fn load_oauth_import_material(
     source: &str,
     generation: u64,
@@ -1231,8 +1239,33 @@ pub(crate) fn load_oauth_import_material_with_native(
         ClaudeCredentialInput {
             location: path,
             bytes,
+            native_owner: false,
         }
     };
+    load_oauth_import_material_from_input(spec, generation, input)
+}
+
+/// Reads Claude Code's live owner store directly, ahead of any imported
+/// credential file. `None` is the sole signal that the independent grant
+/// fallback is eligible for a file-only credential.
+pub(crate) fn load_claude_native_import_material(
+    generation: u64,
+    native: &dyn ClaudeNativeCredentialStore,
+) -> Result<Option<OAuthImportMaterial>, HaiderError> {
+    let Some(mut input) = native.read() else {
+        return Ok(None);
+    };
+    input.native_owner = true;
+    let spec = oauth_import_source_spec("claude-code")?;
+    load_oauth_import_material_from_input(spec, generation, input).map(Some)
+}
+
+fn load_oauth_import_material_from_input(
+    spec: OAuthImportSourceSpec,
+    generation: u64,
+    input: ClaudeCredentialInput,
+) -> Result<OAuthImportMaterial, HaiderError> {
+    let claude_native_owner = input.native_owner;
     let path = input.location;
     let bytes = input.bytes;
     let registration = OAuthProviderCatalog::default()
@@ -1247,12 +1280,22 @@ pub(crate) fn load_oauth_import_material_with_native(
                 false,
             )
         })?;
-    let bundle = match spec.source {
+    let mut bundle = match spec.source {
         "codex" => codex_import_bundle(&path, &bytes, &registration, generation),
         "claude-code" => claude_import_bundle(&path, &bytes, &registration, generation),
         "kimi-code" => kimi_import_bundle(&path, &bytes, &registration, generation),
         _ => unreachable!("source spec is closed"),
     }?;
+    if spec.source == "claude-code" {
+        bundle
+            .identity
+            .display_identity
+            .push_str(if claude_native_owner {
+                " · linked to Claude Code"
+            } else {
+                " · independently imported"
+            });
+    }
     let kimi_device_id = if spec.source == "kimi-code" {
         let device_path = crate::device_discovery::kimi_device_id_path().ok_or_else(|| {
             HaiderError::new(
@@ -1273,6 +1316,7 @@ pub(crate) fn load_oauth_import_material_with_native(
     Ok(OAuthImportMaterial {
         bundle,
         kimi_device_id,
+        claude_native_owner,
     })
 }
 
@@ -1306,6 +1350,7 @@ fn read_oauth_import_reader(
     Ok(ClaudeCredentialInput {
         location: path.to_owned(),
         bytes,
+        native_owner: false,
     })
 }
 
@@ -4022,12 +4067,39 @@ struct BrokerInner {
     fences: RefreshFenceRegistry,
     shutting_down: AtomicBool,
     client: reqwest::Client,
+    refresh_exchange: Arc<dyn OAuthRefreshExchange>,
     refresh_skew: Duration,
     /// G4b (LV2): the mockable `gcloud auth print-access-token` source the
     /// vertex gcloud-refresh credential re-mints through on auth failure.
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     #[cfg(test)]
     panic_refresh_worker: AtomicBool,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait OAuthRefreshExchange: Send + Sync {
+    async fn exchange(
+        &self,
+        client: &reqwest::Client,
+        registration: &OAuthProviderRegistration,
+        refresh_token: &[u8],
+        device_id: Option<&SecretHandle>,
+    ) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError>;
+}
+
+struct ProductionOAuthRefreshExchange;
+
+#[async_trait::async_trait]
+impl OAuthRefreshExchange for ProductionOAuthRefreshExchange {
+    async fn exchange(
+        &self,
+        client: &reqwest::Client,
+        registration: &OAuthProviderRegistration,
+        refresh_token: &[u8],
+        device_id: Option<&SecretHandle>,
+    ) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
+        exchange_refresh_token(client, registration, refresh_token, device_id).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4225,6 +4297,7 @@ impl CredentialBroker {
                 fences,
                 shutting_down: AtomicBool::new(false),
                 client,
+                refresh_exchange: Arc::new(ProductionOAuthRefreshExchange),
                 refresh_skew: OAUTH_REFRESH_SKEW,
                 gcloud: Arc::new(crate::gcloud::GcloudCli),
                 #[cfg(test)]
@@ -4249,6 +4322,25 @@ impl CredentialBroker {
             ));
         };
         inner.gcloud = gcloud;
+        Ok(self)
+    }
+
+    /// Replaces the refresh transport for hermetic tests. Like the gcloud
+    /// seam, installation is construction-only so a shared broker can never
+    /// retain a production exchanger accidentally.
+    #[cfg(test)]
+    pub(crate) fn with_refresh_exchange(
+        mut self,
+        refresh_exchange: Arc<dyn OAuthRefreshExchange>,
+    ) -> Result<Self, HaiderError> {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "OAuth refresh exchange must be installed before the broker is shared",
+                false,
+            ));
+        };
+        inner.refresh_exchange = refresh_exchange;
         Ok(self)
     }
 
@@ -4477,7 +4569,12 @@ impl CredentialBroker {
                         // account actor for durable import provenance; only a
                         // current Codex import receives rotating-token
                         // serialization below.
-                        || descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+                        || descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME
+                        // Claude Code owns native-store imports. Every
+                        // Anthropic refresh/auth-failure boundary must ask
+                        // the actor whether read-through is required before
+                        // the independent grant fallback is even eligible.
+                        || descriptor.provider == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
                     snapshot_state != SnapshotOAuthState::Expired,
                 );
             }
@@ -4663,6 +4760,13 @@ impl CredentialBroker {
                     .map(|_| RefreshFlightOutcome::Refreshed)
                     .map_err(|error| imported_refresh_error(error, descriptor, &source));
                 }
+                crate::accounts::OAuthImportHealResult::LiveOwnerStore { source } => {
+                    // The external app owns this rotating credential. An
+                    // unchanged/unusable owner-store read is terminal for
+                    // this attempt; spending Haider's drifting snapshot here
+                    // would invalidate whichever app refreshed most recently.
+                    return Err(imported_credential_expired(descriptor, &source));
+                }
                 crate::accounts::OAuthImportHealResult::NotImported => {}
             }
         }
@@ -4798,8 +4902,10 @@ impl CredentialBroker {
                 ));
             }
         }
-        let response =
-            exchange_refresh_token(&inner.client, &registration, refresh_token, None).await;
+        let response = inner
+            .refresh_exchange
+            .exchange(&inner.client, &registration, refresh_token, None)
+            .await;
         let refreshed = match response {
             Ok(bytes) => refresh_bundle_from_response(&registration, &bytes, bundle),
             Err(error) if error.retryable => return Err(oauth_error(error)),
@@ -4966,13 +5072,15 @@ impl CredentialBroker {
         let mut attempts = 0_usize;
         let response = loop {
             attempts = attempts.saturating_add(1);
-            let response = exchange_refresh_token(
-                &inner.client,
-                &registration,
-                refresh_token,
-                device_id.as_ref(),
-            )
-            .await;
+            let response = inner
+                .refresh_exchange
+                .exchange(
+                    &inner.client,
+                    &registration,
+                    refresh_token,
+                    device_id.as_ref(),
+                )
+                .await;
             let Some(delay) = response
                 .as_ref()
                 .err()

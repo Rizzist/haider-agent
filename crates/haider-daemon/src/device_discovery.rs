@@ -37,6 +37,7 @@ pub(crate) struct DeviceCandidate {
     pub import_source: Option<&'static str>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn discover_device_candidates(disabled: bool) -> Vec<DeviceCandidate> {
     discover_device_candidates_with_native(disabled, &PlatformClaudeNativeCredentialStore)
 }
@@ -74,8 +75,17 @@ pub(crate) fn discovery_is_disabled(profile_disabled: bool) -> bool {
     profile_disabled || discovery_disabled_by_env()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn candidate_by_id(disabled: bool, id: &str) -> Option<DeviceCandidate> {
-    discover_device_candidates(disabled)
+    candidate_by_id_with_native(disabled, id, &PlatformClaudeNativeCredentialStore)
+}
+
+pub(crate) fn candidate_by_id_with_native(
+    disabled: bool,
+    id: &str,
+    native: &dyn ClaudeNativeCredentialStore,
+) -> Option<DeviceCandidate> {
+    discover_device_candidates_with_native(disabled, native)
         .into_iter()
         .find(|candidate| candidate.wire.candidate == id)
 }
@@ -171,6 +181,11 @@ pub(crate) fn discover_claude_at(
     native: &dyn ClaudeNativeCredentialStore,
 ) -> Option<DeviceCandidate> {
     let input = load_claude_credential_input(&path, native).ok()?;
+    let source_label = if input.native_owner {
+        "Linked to Claude Code"
+    } else {
+        "Claude Code credential file"
+    };
     let parsed = parse_claude_credential_metadata(&input.location, &input.bytes).ok()?;
     if !parsed.has_inference_scope {
         return None;
@@ -178,7 +193,7 @@ pub(crate) fn discover_claude_at(
     Some(candidate(
         "claude-code",
         "anthropic-oauth",
-        "Claude Code",
+        source_label,
         None,
         Some(parsed.expires_at_ms),
         input.location,

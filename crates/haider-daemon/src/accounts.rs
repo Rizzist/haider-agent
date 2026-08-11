@@ -66,10 +66,11 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::oauth::{
-    CredentialBroker, KIMI_DEVICE_ALIAS, OAuthCoordinator, OAuthCoordinatorConfig,
-    OAuthImportMaterial, OAuthInferenceAuthMode, OAuthInferenceHeaderSet, OAuthProviderCatalog,
-    OAuthReadyClaim, RefreshFenceRegistry, load_oauth_import_material, oauth_import_source_spec,
-    sanctioned_inference,
+    ClaudeNativeCredentialStore, CredentialBroker, KIMI_DEVICE_ALIAS, OAuthCoordinator,
+    OAuthCoordinatorConfig, OAuthImportMaterial, OAuthInferenceAuthMode, OAuthInferenceHeaderSet,
+    OAuthProviderCatalog, OAuthReadyClaim, PlatformClaudeNativeCredentialStore,
+    RefreshFenceRegistry, load_claude_native_import_material,
+    load_oauth_import_material_with_native, oauth_import_source_spec, sanctioned_inference,
 };
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
@@ -885,8 +886,17 @@ pub(crate) struct OAuthRefreshFence {
 #[derive(Debug, Clone)]
 pub(crate) enum OAuthImportHealResult {
     NotImported,
-    RefreshFallback { source: String },
-    Committed { expected: OAuthRefreshFence },
+    RefreshFallback {
+        source: String,
+    },
+    /// A live external owner store exists. Haider may re-read it, but must
+    /// never spend the independently snapshotted rotating refresh token.
+    LiveOwnerStore {
+        source: String,
+    },
+    Committed {
+        expected: OAuthRefreshFence,
+    },
 }
 
 pub(crate) enum AccountCommand {
@@ -1064,6 +1074,7 @@ pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHan
         None,
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(crate::gcloud::GcloudCli),
+        Arc::new(PlatformClaudeNativeCredentialStore),
     )
 }
 
@@ -1072,6 +1083,7 @@ fn start_account_actor_with_services(
     build_broker: impl FnOnce(mpsc::Sender<AccountCommand>) -> Result<CredentialBroker, HaiderError>,
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) -> Result<(AccountActorHandle, CredentialBroker), HaiderError> {
     let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
     let (force_stop, forced) = watch::channel(false);
@@ -1085,6 +1097,7 @@ fn start_account_actor_with_services(
         Some(broker.clone()),
         model_discoverer,
         gcloud,
+        claude_native,
     );
     Ok((handle, broker))
 }
@@ -1099,6 +1112,7 @@ fn spawn_account_actor(
     broker: Option<CredentialBroker>,
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) -> AccountActorHandle {
     let task = tokio::spawn(run_account_actor(
         config,
@@ -1108,6 +1122,7 @@ fn spawn_account_actor(
         broker,
         model_discoverer,
         gcloud,
+        claude_native,
     ));
     AccountActorHandle {
         commands,
@@ -1129,6 +1144,7 @@ async fn run_account_actor(
     broker: Option<CredentialBroker>,
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) {
     let AccountActorConfig {
         store,
@@ -1243,6 +1259,7 @@ async fn run_account_actor(
                     None,
                     OAuthCommitResponse::ImportLegacy,
                     None,
+                    Arc::clone(&claude_native),
                 )
                 .await;
             }
@@ -1250,8 +1267,12 @@ async fn run_account_actor(
                 discovery_disabled,
                 completed,
             } => {
+                let claude_native = Arc::clone(&claude_native);
                 let candidates = tokio::task::spawn_blocking(move || {
-                    crate::device_discovery::discover_device_candidates(discovery_disabled)
+                    crate::device_discovery::discover_device_candidates_with_native(
+                        discovery_disabled,
+                        claude_native.as_ref(),
+                    )
                 })
                 .await
                 .unwrap_or_default()
@@ -1279,6 +1300,7 @@ async fn run_account_actor(
                     &reserved_aliases,
                     &refresh_fences,
                     Arc::clone(&gcloud),
+                    Arc::clone(&claude_native),
                     *job,
                 )
                 .await;
@@ -1421,6 +1443,7 @@ async fn run_account_actor(
                     &refresh_fences,
                     &descriptor,
                     &expected,
+                    Arc::clone(&claude_native),
                 )
                 .await;
                 let _ = completed.send(result);
@@ -4090,12 +4113,18 @@ async fn handle_device_import(
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
     job: DeviceImportJob,
 ) {
     let candidate_id = job.candidate.clone();
     let disabled = job.discovery_disabled;
+    let native_for_discovery = Arc::clone(&claude_native);
     let candidate = tokio::task::spawn_blocking(move || {
-        crate::device_discovery::candidate_by_id(disabled, &candidate_id)
+        crate::device_discovery::candidate_by_id_with_native(
+            disabled,
+            &candidate_id,
+            native_for_discovery.as_ref(),
+        )
     })
     .await
     .ok()
@@ -4155,6 +4184,7 @@ async fn handle_device_import(
         None,
         OAuthCommitResponse::ImportDevice,
         receipt_candidate,
+        claude_native,
     )
     .await;
 }
@@ -4278,6 +4308,7 @@ async fn handle_oauth_import_heal(
     refresh_fences: &RefreshFenceRegistry,
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) -> Result<OAuthImportHealResult, HaiderError> {
     if refresh_fences.current(&descriptor.alias) != expected.fence_epoch
         || !accounts
@@ -4324,7 +4355,26 @@ async fn handle_oauth_import_heal(
         // that commit. Preserve import provenance so the contender enters
         // the serialized refresh path: its under-lease re-read adopts N+1
         // instead of attempting a conservative refresh with stale N.
-        return Ok(OAuthImportHealResult::RefreshFallback { source });
+        let live_owner =
+            if source == "claude-code" && descriptor.provider == ANTHROPIC_OAUTH_PROVIDER_NAME {
+                let native_for_read = Arc::clone(&claude_native);
+                tokio::task::spawn_blocking(move || native_for_read.read().is_some())
+                    .await
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::ProviderError,
+                            "Claude Code credential-store worker failed",
+                            true,
+                        )
+                    })?
+            } else {
+                false
+            };
+        return Ok(if live_owner {
+            OAuthImportHealResult::LiveOwnerStore { source }
+        } else {
+            OAuthImportHealResult::RefreshFallback { source }
+        });
     }
     let Some(generation) = current.generation.checked_add(1) else {
         return Err(HaiderError::new(
@@ -4334,20 +4384,72 @@ async fn handle_oauth_import_heal(
         ));
     };
     let source_for_read = source.clone();
-    let imported = match tokio::task::spawn_blocking(move || {
-        load_oauth_import_material(&source_for_read, generation)
-    })
-    .await
-    {
-        Ok(Ok(imported)) => imported,
-        Ok(Err(_)) | Err(_) => return Ok(OAuthImportHealResult::RefreshFallback { source }),
-    };
+    let native_for_read = Arc::clone(&claude_native);
+    let imported =
+        if source == "claude-code" && descriptor.provider == ANTHROPIC_OAUTH_PROVIDER_NAME {
+            match tokio::task::spawn_blocking(move || {
+                load_claude_native_import_material(generation, native_for_read.as_ref())
+            })
+            .await
+            {
+                Ok(Ok(Some(imported))) => imported,
+                // A present but malformed/invalid owner store is still owner
+                // controlled. Returning the parse error is fail-closed: the
+                // snapshotted rotating refresh token remains untouched.
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err(HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "Claude Code credential-store worker failed",
+                        true,
+                    ));
+                }
+                Ok(Ok(None)) => {
+                    let native_for_fallback = Arc::clone(&claude_native);
+                    match tokio::task::spawn_blocking(move || {
+                        load_oauth_import_material_with_native(
+                            &source_for_read,
+                            generation,
+                            native_for_fallback.as_ref(),
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(imported)) => imported,
+                        Ok(Err(_)) | Err(_) => {
+                            return Ok(OAuthImportHealResult::RefreshFallback { source });
+                        }
+                    }
+                }
+            }
+        } else {
+            match tokio::task::spawn_blocking(move || {
+                load_oauth_import_material_with_native(
+                    &source_for_read,
+                    generation,
+                    native_for_read.as_ref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(imported)) => imported,
+                Ok(Err(_)) | Err(_) => {
+                    return Ok(OAuthImportHealResult::RefreshFallback { source });
+                }
+            }
+        };
+    let live_owner = imported.claude_native_owner;
     if bool::from(current.access_token().ct_eq(imported.bundle.access_token())) {
-        return Ok(OAuthImportHealResult::RefreshFallback { source });
+        return Ok(if live_owner {
+            OAuthImportHealResult::LiveOwnerStore { source }
+        } else {
+            OAuthImportHealResult::RefreshFallback { source }
+        });
     }
     let source_access_fingerprint = *blake3::hash(imported.bundle.access_token()).as_bytes();
-    if current.import_source_access_fingerprint() == Some(source_access_fingerprint)
-        || (current.import_source_access_fingerprint().is_none() && current.generation > 1)
+    if !live_owner
+        && (current.import_source_access_fingerprint() == Some(source_access_fingerprint)
+            || (current.import_source_access_fingerprint().is_none() && current.generation > 1))
     {
         // The external CLI may still hold the exact source generation Haider
         // imported before its own broker refresh rotated the shared token.
@@ -4387,6 +4489,7 @@ async fn handle_oauth_import_heal(
         Some(imported),
         OAuthCommitResponse::ImportLegacy,
         None,
+        claude_native,
     )
     .await;
     let committed_descriptor = sink.take().ok_or_else(|| {
@@ -4424,6 +4527,7 @@ async fn handle_oauth_import(
     preloaded_material: Option<OAuthImportMaterial>,
     response_kind: OAuthCommitResponse,
     receipt_candidate: Option<String>,
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) {
     let spec = match oauth_import_source_spec(&job.source) {
         Ok(spec) => spec,
@@ -4642,8 +4746,9 @@ async fn handle_oauth_import(
             return;
         }
         None => {
+            let claude_native = Arc::clone(&claude_native);
             match tokio::task::spawn_blocking(move || {
-                load_oauth_import_material(&source, generation)
+                load_oauth_import_material_with_native(&source, generation, claude_native.as_ref())
             })
             .await
             {
@@ -7127,6 +7232,7 @@ impl AccountsRuntime {
                     },
                     Arc::new(ProductionProviderModelDiscoverer),
                     Arc::clone(&gcloud),
+                    Arc::new(PlatformClaudeNativeCredentialStore),
                 )?;
                 let commands = actor.commands();
                 Ok(Self {

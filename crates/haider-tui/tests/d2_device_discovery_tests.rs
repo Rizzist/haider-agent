@@ -227,6 +227,90 @@ fn device_section_lists_candidates_with_freshness() {
     );
 }
 
+/// LAW (c): discovery remains actionable when the same provider already has
+/// an expired account; the row names the read-through relationship and the
+/// resulting same-alias receipt reads as a re-adoption, not a second import.
+///
+/// MUTATION CHECK: filter candidates against `accounts.rows`, or remove the
+/// same-provider `re-adopt/refresh` annotation. Expected runtime failure: the
+/// linked row/action or opaque-id dispatch assertion below fails.
+#[test]
+fn linked_claude_candidate_resurfaces_as_re_adopt_refresh_for_existing_account() {
+    let mut model = live_model(&[haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1]);
+    let expired = CredentialDescriptor {
+        alias: CredentialAlias::new("anthropic-oauth"),
+        provider: "anthropic-oauth".to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "Claude Max subscription · linked to Claude Code".to_owned(),
+        status: CredentialStatus::Expired,
+        active: true,
+    };
+    model.accounts.apply_snapshot(
+        vec![haider_tui::app::AccountRow::from_descriptor(&expired)],
+        Some(2),
+    );
+    let mut driver = LiveDriver::new("test");
+    run_slash(&mut model, "/accounts");
+    let _ = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    driver.apply(
+        &mut model,
+        LiveReply::DeviceCandidates {
+            discovery_disabled: false,
+            candidates: vec![DeviceCredentialCandidateWire {
+                candidate: "dev-claude-linked-1".to_owned(),
+                provider: "anthropic-oauth".to_owned(),
+                source_label: "Linked to Claude Code".to_owned(),
+                account_label: None,
+                freshness: "fresh".to_owned(),
+                expires_at_ms: Some(4_102_444_800_999),
+                path: "macOS Keychain: Claude Code-credentials".to_owned(),
+                import_supported: true,
+                unsupported_reason: None,
+            }],
+        },
+    );
+
+    let (text, _, _) = draw(&model, 118, 40);
+    assert!(
+        text.contains("[1] Linked to Claude Code · anthropic-oauth · fresh · re-adopt/refresh"),
+        "same-provider candidate remains visible and names the action:\n{text}"
+    );
+    model.handle(key(KeyCode::Char('1')));
+    let issued = live_pass(&mut driver, &mut model, None, std::time::Instant::now()).commands;
+    let Some(LiveCommand::DeviceImport {
+        command_id,
+        candidate,
+    }) = issued
+        .iter()
+        .find(|command| matches!(command, LiveCommand::DeviceImport { .. }))
+        .cloned()
+    else {
+        panic!("re-adopt command did not ride: {issued:?}");
+    };
+    assert_eq!(candidate, "dev-claude-linked-1");
+
+    let mut healed = expired;
+    healed.status = CredentialStatus::Ok;
+    driver.apply(
+        &mut model,
+        LiveReply::DeviceImported {
+            command_id,
+            descriptor: healed,
+            revision: 3,
+        },
+    );
+    assert!(
+        model
+            .device
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("re-adopted anthropic-oauth → anthropic-oauth")),
+        "same-alias receipt names re-adoption: {:?}",
+        model.device.message
+    );
+}
+
 /// LAW — a digit (and ⏎ on the highlighted candidate, and a click on the
 /// row's hit) dispatches ONE receipted `account.import_device` through the
 /// outbox, carrying only the opaque candidate id — and installs NOTHING

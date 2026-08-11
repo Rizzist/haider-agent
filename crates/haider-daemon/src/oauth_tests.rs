@@ -30,14 +30,21 @@ const CLAUDE_SECURE_STORE_FIXTURE: &[u8] = br#"{
 }"#;
 
 struct OAuthTestClaudeNative {
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
     reads: AtomicUsize,
 }
 
 impl OAuthTestClaudeNative {
     fn new(bytes: &[u8]) -> Self {
         Self {
-            bytes: bytes.to_vec(),
+            bytes: Some(bytes.to_vec()),
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            bytes: None,
             reads: AtomicUsize::new(0),
         }
     }
@@ -46,9 +53,10 @@ impl OAuthTestClaudeNative {
 impl ClaudeNativeCredentialStore for OAuthTestClaudeNative {
     fn read(&self) -> Option<ClaudeCredentialInput> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        Some(ClaudeCredentialInput {
+        self.bytes.as_ref().map(|bytes| ClaudeCredentialInput {
             location: PathBuf::from("mock secure store: Claude Code-credentials"),
-            bytes: Zeroizing::new(self.bytes.clone()),
+            bytes: Zeroizing::new(bytes.clone()),
+            native_owner: true,
         })
     }
 }
@@ -1476,7 +1484,7 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
 }
 
 /// MUTATION CHECK: give native-store bytes a separate parser or bypass the
-/// file-first resolver. Expected runtime failure: the two metadata records or
+/// shared resolver. Expected runtime failure: the two metadata records or
 /// complete Anthropic bundles no longer agree byte-for-byte on token fields
 /// and the exact source expiry.
 #[test]
@@ -1484,9 +1492,9 @@ fn claude_file_and_native_secret_share_parser_and_fresh_bundle() {
     let fixture_dir = tempfile::tempdir().expect("Claude import fixture directory");
     let file_path = fixture_dir.path().join(".credentials.json");
     std::fs::write(&file_path, CLAUDE_SECURE_STORE_FIXTURE).expect("write Claude fixture");
-    let unused_native = OAuthTestClaudeNative::new(b"not JSON and must not be read");
-    let file = load_claude_credential_input(&file_path, &unused_native).expect("file input");
-    assert_eq!(unused_native.reads.load(Ordering::SeqCst), 0);
+    let absent_native = OAuthTestClaudeNative::unavailable();
+    let file = load_claude_credential_input(&file_path, &absent_native).expect("file input");
+    assert_eq!(absent_native.reads.load(Ordering::SeqCst), 1);
 
     let native = OAuthTestClaudeNative::new(CLAUDE_SECURE_STORE_FIXTURE);
     let missing_path = fixture_dir.path().join("missing-credentials.json");

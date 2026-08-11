@@ -1797,8 +1797,18 @@ impl LiveDriver {
                 // P1 MASK LAW: the identity rides the receipt MASKED-
                 // ALWAYS (one authority — `mask_identity`); receipts are
                 // transient chrome with no reveal loop of their own.
+                let action = if model
+                    .accounts
+                    .rows
+                    .iter()
+                    .any(|row| row.alias == descriptor.alias.as_str())
+                {
+                    "re-adopted"
+                } else {
+                    "imported"
+                };
                 model.device.message = Some(format!(
-                    "✓ imported {} → {} · {}",
+                    "✓ {action} {} → {} · {}",
                     descriptor.provider,
                     descriptor.alias,
                     crate::format::mask_identity(&descriptor.identity)

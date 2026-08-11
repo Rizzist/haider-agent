@@ -16,8 +16,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 use crate::oauth::{
-    OAuthProviderRegistration, OAuthTokenRequestEncoding, oauth_import_read_count,
-    reset_oauth_import_read_count,
+    OAuthProviderRegistration, OAuthPublicError, OAuthRefreshExchange, OAuthTokenRequestEncoding,
+    oauth_import_read_count, reset_oauth_import_read_count,
 };
 
 fn test_store_dir() -> tempfile::TempDir {
@@ -1672,6 +1672,107 @@ const CLAUDE_IMPORT_FIXTURE: &[u8] = br#"{
   }
 }"#;
 
+const CLAUDE_READ_THROUGH_FIXTURE: &[u8] = br#"{
+  "claudeAiOauth": {
+    "accessToken": "fake-claude-live-access-token-2",
+    "refreshToken": "fake-claude-live-refresh-token-2",
+    "expiresAt": 4102444800999,
+    "scopes": ["user:inference"],
+    "subscriptionType": "max"
+  }
+}"#;
+
+struct StubAccountClaudeNative {
+    bytes: StdMutex<Option<Vec<u8>>>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl StubAccountClaudeNative {
+    fn with_bytes(bytes: &[u8]) -> Self {
+        Self {
+            bytes: StdMutex::new(Some(bytes.to_vec())),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            bytes: StdMutex::new(None),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn replace(&self, bytes: &[u8]) {
+        if let Ok(mut current) = self.bytes.lock() {
+            *current = Some(bytes.to_vec());
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ClaudeNativeCredentialStore for StubAccountClaudeNative {
+    fn read(&self) -> Option<crate::oauth::ClaudeCredentialInput> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.bytes
+            .lock()
+            .ok()
+            .and_then(|bytes| bytes.clone())
+            .map(|bytes| crate::oauth::ClaudeCredentialInput {
+                location: std::path::PathBuf::from("mock native store: Claude Code-credentials"),
+                bytes: Zeroizing::new(bytes),
+                native_owner: true,
+            })
+    }
+}
+
+struct CountingAnthropicRefreshExchange {
+    calls: std::sync::atomic::AtomicUsize,
+    refresh_token_fingerprints: StdMutex<Vec<[u8; 32]>>,
+}
+
+impl CountingAnthropicRefreshExchange {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            refresh_token_fingerprints: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn refresh_token_fingerprints(&self) -> Vec<[u8; 32]> {
+        self.refresh_token_fingerprints
+            .lock()
+            .map(|fingerprints| fingerprints.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl OAuthRefreshExchange for CountingAnthropicRefreshExchange {
+    async fn exchange(
+        &self,
+        _client: &reqwest::Client,
+        _registration: &OAuthProviderRegistration,
+        refresh_token: &[u8],
+        _device_id: Option<&SecretHandle>,
+    ) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut fingerprints) = self.refresh_token_fingerprints.lock() {
+            fingerprints.push(*blake3::hash(refresh_token).as_bytes());
+        }
+        Ok(Zeroizing::new(
+            br#"{"access_token":"fake-anthropic-grant-access-token","refresh_token":"fake-anthropic-grant-refresh-token","token_type":"Bearer","expires_in":3600,"scope":"user:inference"}"#
+                .to_vec(),
+        ))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ImportRefreshMode {
     Success,
@@ -1777,6 +1878,25 @@ fn import_refresh_catalog(token_endpoint: &str) -> OAuthProviderCatalog {
     OAuthProviderCatalog::with_test_registrations([registration]).expect("import refresh catalog")
 }
 
+fn anthropic_import_refresh_catalog(token_endpoint: &str) -> OAuthProviderCatalog {
+    let registration = OAuthProviderRegistration::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        "https://claude.ai",
+        "http://127.0.0.1:1/authorize",
+        token_endpoint,
+        crate::oauth::CLAUDE_DEFAULT_CLIENT_ID,
+        ["user:inference".to_owned()],
+        crate::oauth::CLAUDE_DEFAULT_CLIENT_ID,
+        None,
+        true,
+        Arc::new(UnusedIdentityVerifier),
+    )
+    .expect("Anthropic import refresh registration")
+    .with_test_refresh_shape(OAuthTokenRequestEncoding::Json, false);
+    OAuthProviderCatalog::with_test_registrations([registration])
+        .expect("Anthropic import refresh catalog")
+}
+
 async fn serve_import_refresh(
     mut stream: TcpStream,
     mode: ImportRefreshMode,
@@ -1880,6 +2000,27 @@ fn start_oauth_import_heal_test_actor(
     AccountsSnapshot,
     RefreshFenceRegistry,
 ) {
+    start_oauth_import_heal_test_actor_with_native(
+        store,
+        vault,
+        catalog,
+        Arc::new(PlatformClaudeNativeCredentialStore),
+        None,
+    )
+}
+
+fn start_oauth_import_heal_test_actor_with_native(
+    store: &SqliteStoreHandle,
+    vault: Arc<MemoryVault>,
+    catalog: OAuthProviderCatalog,
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
+    refresh_exchange: Option<Arc<dyn OAuthRefreshExchange>>,
+) -> (
+    AccountActorHandle,
+    CredentialBroker,
+    AccountsSnapshot,
+    RefreshFenceRegistry,
+) {
     let accounts = memory_accounts();
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
     let providers = test_provider_registry();
@@ -1904,16 +2045,21 @@ fn start_oauth_import_heal_test_actor(
             refresh_fences: refresh_fences.clone(),
         },
         |commands| {
-            CredentialBroker::new_with_fences(
+            let broker = CredentialBroker::new_with_fences(
                 broker_vault,
                 catalog,
                 broker_snapshot,
                 commands,
                 broker_fences,
-            )
+            )?;
+            match refresh_exchange {
+                Some(exchange) => broker.with_refresh_exchange(exchange),
+                None => Ok(broker),
+            }
         },
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(UnreachableGcloud),
+        claude_native,
     )
     .expect("OAuth import heal actor");
     (actor, broker, snapshot, refresh_fences)
@@ -4635,6 +4781,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         },
         discoverer_trait,
         Arc::new(UnreachableGcloud),
+        Arc::new(PlatformClaudeNativeCredentialStore),
     )
     .expect("custom refresh actor");
 
@@ -4870,6 +5017,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         },
         discoverer_trait,
         Arc::new(UnreachableGcloud),
+        Arc::new(PlatformClaudeNativeCredentialStore),
     )
     .expect("actor with broker");
 
@@ -5217,6 +5365,28 @@ async fn import_codex_for_heal(actor: &AccountActorHandle) -> CredentialDescript
     }
 }
 
+async fn import_claude_for_heal(actor: &AccountActorHandle) -> CredentialDescriptor {
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(
+        &actor.commands(),
+        sink,
+        "import-claude-before-heal",
+        "claude-code",
+    )
+    .await;
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("initial Claude import deadline")
+        .expect("initial Claude import response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountOAuthImport { descriptor, .. },
+            ..
+        } => descriptor,
+        other => panic!("unexpected initial Claude import response: {other:?}"),
+    }
+}
+
 /// Ages the STORED bundle past its expiry WITHOUT marking the account:
 /// the natural-expiry precondition (snapshot Current), where the refresh
 /// fallback stays legal (W5g-8 safety split: a snapshot-EXPIRED mark may
@@ -5314,6 +5484,209 @@ fn openai_import_test_bundle(
         generation,
     )
     .expect("OpenAI import test bundle")
+}
+
+fn start_file_owned_claude_refresh_actor(
+    snapshot: &AccountsSnapshot,
+    vault: Arc<dyn Vault>,
+) -> mpsc::Sender<AccountCommand> {
+    let (sender, mut receiver) = mpsc::channel(8);
+    let snapshot = Arc::clone(snapshot);
+    tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            match command {
+                AccountCommand::BeginOAuthImportHeal { completed, .. } => {
+                    let _ = completed.send(Ok(OAuthImportHealResult::RefreshFallback {
+                        source: "claude-code".to_owned(),
+                    }));
+                }
+                AccountCommand::BeginOAuthRefresh {
+                    descriptor,
+                    completed,
+                    ..
+                } => {
+                    if let Ok(mut descriptors) = snapshot.lock()
+                        && let Some(current) = descriptors
+                            .iter_mut()
+                            .find(|current| current.alias == descriptor.alias)
+                    {
+                        current.status = CredentialStatus::Expired;
+                    }
+                    let _ = completed.send(Ok(true));
+                }
+                AccountCommand::ApplyOAuthRefresh {
+                    descriptor,
+                    encoded_bundle,
+                    completed,
+                    ..
+                } => {
+                    let result = vault
+                        .put(&descriptor.alias, &encoded_bundle)
+                        .map_err(|_| RefreshApplyError::Persist)
+                        .and_then(|()| {
+                            snapshot
+                                .lock()
+                                .map_err(|_| RefreshApplyError::Persist)
+                                .and_then(|mut descriptors| {
+                                    let current = descriptors
+                                        .iter_mut()
+                                        .find(|current| current.alias == descriptor.alias)
+                                        .ok_or(RefreshApplyError::Stale)?;
+                                    current.status = descriptor.status.clone();
+                                    Ok(())
+                                })
+                        });
+                    let _ = completed.send(result);
+                }
+                _ => {}
+            }
+        }
+    });
+    sender
+}
+
+/// LAW (a) + (b): an expired Claude Code snapshot is replaced from the live
+/// owner store, reactivated, and returned without spending the superseded
+/// snapshot refresh token at Anthropic's token endpoint.
+///
+/// MUTATION CHECK: force `handle_oauth_import_heal` to return
+/// `RefreshFallback` while `claude_native_owner` is true. Expected runtime
+/// failure: the returned access token is the fake grant token and the endpoint
+/// call count changes from zero to one.
+#[tokio::test(flavor = "current_thread")]
+async fn expired_claude_snapshot_reads_through_live_owner_without_refresh_grant() {
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let native = Arc::new(StubAccountClaudeNative::with_bytes(CLAUDE_IMPORT_FIXTURE));
+    let exchange = Arc::new(CountingAnthropicRefreshExchange::new());
+    let native_service: Arc<dyn ClaudeNativeCredentialStore> = native.clone();
+    let exchange_service: Arc<dyn OAuthRefreshExchange> = exchange.clone();
+    let (mut actor, broker, snapshot, _refresh_fences) =
+        start_oauth_import_heal_test_actor_with_native(
+            &store,
+            Arc::clone(&vault),
+            anthropic_import_refresh_catalog("http://127.0.0.1:1/token"),
+            native_service,
+            Some(exchange_service),
+        );
+    let descriptor = import_claude_for_heal(&actor).await;
+    assert!(descriptor.identity.ends_with("linked to Claude Code"));
+    native.replace(CLAUDE_READ_THROUGH_FIXTURE);
+    age_import_bundle(vault.as_ref(), &descriptor);
+
+    let access = broker
+        .resolve(&descriptor)
+        .await
+        .expect("live Claude owner store re-adopts the account");
+    assert_eq!(
+        exchange.calls(),
+        0,
+        "the rotated snapshot grant is never sent"
+    );
+    assert_eq!(access.expose_secret(), b"fake-claude-live-access-token-2");
+    assert!(
+        native.reads() >= 2,
+        "initial import plus expiry read-through"
+    );
+    let stored = vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("read-through bundle persisted");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(stored.access_token(), b"fake-claude-live-access-token-2");
+    assert_eq!(
+        stored.refresh_token(),
+        Some(b"fake-claude-live-refresh-token-2".as_slice())
+    );
+    let current = snapshot.lock().expect("snapshot after read-through");
+    assert_eq!(current[0].status, CredentialStatus::Ok);
+    assert!(current[0].active);
+    drop(current);
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// LAW (d): without a live native owner store, a file-only Claude credential
+/// remains independently refreshable and persists the rotated grant.
+///
+/// MUTATION CHECK: forbid every Claude refresh fallback, even when the native
+/// seam returns `None`. Expected runtime failure: resolution returns the
+/// re-import remedy and the endpoint call count remains zero instead of one.
+#[tokio::test(flavor = "current_thread")]
+async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
+    let vault = Arc::new(MemoryVault::new());
+    let native = Arc::new(StubAccountClaudeNative::unavailable());
+    let exchange = Arc::new(CountingAnthropicRefreshExchange::new());
+    assert!(
+        load_claude_native_import_material(2, native.as_ref())
+            .expect("native absence probe")
+            .is_none()
+    );
+    let descriptor = CredentialDescriptor {
+        alias: CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME),
+        provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "Claude Max subscription · independently imported".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let bundle = haider_accounts::OAuthTokenBundleV1::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+        "https://claude.ai".to_owned(),
+        crate::oauth::CLAUDE_DEFAULT_CLIENT_ID.to_owned(),
+        None,
+        "Bearer".to_owned(),
+        Zeroizing::new(b"fake-file-only-claude-access".to_vec()),
+        Some(Zeroizing::new(b"fake-claude-refresh-token-1".to_vec())),
+        1_600_000_000_000,
+        None,
+        vec!["user:inference".to_owned()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "fake-file-only-claude-subject".to_owned(),
+            display_identity: descriptor.identity.clone(),
+        },
+        1,
+    )
+    .expect("file-only Claude bundle");
+    vault
+        .put(
+            &descriptor.alias,
+            &bundle.encode().expect("encode file-only bundle"),
+        )
+        .expect("seed file-only bundle");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let commands =
+        start_file_owned_claude_refresh_actor(&snapshot, Arc::clone(&vault) as Arc<dyn Vault>);
+    let exchange_service: Arc<dyn OAuthRefreshExchange> = exchange.clone();
+    let broker = CredentialBroker::new(
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        anthropic_import_refresh_catalog("http://127.0.0.1:1/token"),
+        Arc::clone(&snapshot),
+        commands,
+    )
+    .and_then(|broker| broker.with_refresh_exchange(exchange_service))
+    .expect("file-owned Claude broker");
+
+    let access = broker
+        .resolve(&descriptor)
+        .await
+        .expect("file-only Claude import owns its refresh rotation");
+    assert_eq!(access.expose_secret(), b"fake-anthropic-grant-access-token");
+    assert_eq!(exchange.calls(), 1);
+    assert_eq!(
+        exchange.refresh_token_fingerprints(),
+        [*blake3::hash(b"fake-claude-refresh-token-1").as_bytes()]
+    );
+    assert_eq!(
+        snapshot.lock().expect("snapshot")[0].status,
+        CredentialStatus::Ok
+    );
+
+    assert!(broker.shutdown().await);
 }
 
 /// MUTATION CHECK: restore the marked-expired short-circuit in
@@ -5674,6 +6047,100 @@ async fn oauth_import_source_ownership_tracks_the_latest_alias_incarnation() {
     store.close().await.expect("close");
 }
 
+/// LAW (c): a live Claude owner credential remains discoverable beside an
+/// existing same-provider account, and the device action re-adopts the
+/// expired default alias in place as active/Ok.
+///
+/// MUTATION CHECK: filter discovery by existing provider, or remove the
+/// expired-default reuse branch in `select_oauth_import_alias`. Expected
+/// runtime failure: the candidate disappears or commits as
+/// `anthropic-oauth-2` instead of healing `anthropic-oauth`.
+#[tokio::test(flavor = "current_thread")]
+async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_account() {
+    let fixture_home = test_store_dir();
+    let missing_file = fixture_home.path().join("missing-claude-credentials.json");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::claude_device_candidate_resurfaces_and_re_adopts_existing_expired_account",
+        &[
+            ("HOME", fixture_home.path()),
+            ("HAIDER_CLAUDE_CREDS_PATH", &missing_file),
+        ],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let mut accounts = memory_accounts();
+    let expired = CredentialDescriptor {
+        alias: CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME),
+        provider: ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "expired Claude subscription".to_owned(),
+        status: CredentialStatus::Expired,
+        active: true,
+    };
+    accounts.add(expired.clone()).expect("seed expired account");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![expired]));
+    let providers = test_provider_registry();
+    let management = ManagementSnapshot::new(
+        0,
+        accounts.list().to_vec(),
+        providers.summaries(&provider_has_credential(&accounts)),
+    );
+    let native = Arc::new(StubAccountClaudeNative::with_bytes(
+        CLAUDE_READ_THROUGH_FIXTURE,
+    ));
+    let candidate =
+        crate::device_discovery::discover_device_candidates_with_native(false, native.as_ref())
+            .into_iter()
+            .find(|candidate| candidate.wire.provider == ANTHROPIC_OAUTH_PROVIDER_NAME)
+            .expect("same-provider Claude candidate remains surfaced");
+    assert_eq!(candidate.wire.source_label, "Linked to Claude Code");
+
+    let (sink, mut frames) = channel_sink();
+    let native_service: Arc<dyn ClaudeNativeCredentialStore> = native;
+    handle_device_import(
+        &store,
+        &mut accounts,
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        &snapshot,
+        Some(&management),
+        &providers,
+        &HashSet::new(),
+        &RefreshFenceRegistry::default(),
+        Arc::new(UnreachableGcloud),
+        native_service,
+        DeviceImportJob {
+            command_id: "re-adopt-claude-device".to_owned(),
+            candidate: candidate.wire.candidate,
+            discovery_disabled: false,
+            route: LoginRoute {
+                request_id: RequestId::new("re-adopt-claude-device-request"),
+                sink,
+            },
+        },
+    )
+    .await;
+    let descriptor = match frames.try_recv().expect("re-adopt response") {
+        WireFrame::Response {
+            body: ResponseBody::AccountImportDevice { descriptor, .. },
+            ..
+        } => descriptor,
+        other => panic!("unexpected re-adopt response: {other:?}"),
+    };
+    assert_eq!(descriptor.alias.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
+    assert_eq!(descriptor.status, CredentialStatus::Ok);
+    assert!(descriptor.active);
+    assert!(descriptor.identity.ends_with("linked to Claude Code"));
+    assert_eq!(accounts.list().len(), 1);
+    assert_eq!(snapshot.lock().expect("snapshot")[0], descriptor);
+
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK: remove the expired-default repair branch in
 /// `select_oauth_import_alias`. Expected runtime failure: the discovered
 /// Claude credential is assigned `anthropic-oauth-2` instead of superseding
@@ -5876,7 +6343,10 @@ async fn claude_code_import_honors_expiry_and_anthropic_registration() {
     };
     assert_eq!(descriptor.alias.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
     assert_eq!(descriptor.provider, ANTHROPIC_OAUTH_PROVIDER_NAME);
-    assert_eq!(descriptor.identity, "Claude Max subscription");
+    assert_eq!(
+        descriptor.identity,
+        "Claude Max subscription · independently imported"
+    );
     assert!(descriptor.active);
     assert_eq!(snapshot.lock().expect("snapshot").len(), 1);
     assert_eq!(management.read().expect("management").revision, 1);
@@ -7934,6 +8404,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+        Arc::new(PlatformClaudeNativeCredentialStore),
         job("gcloud-import-1", "req-1"),
     )
     .await;
@@ -7982,6 +8453,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
         &HashSet::new(),
         &RefreshFenceRegistry::default(),
         gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+        Arc::new(PlatformClaudeNativeCredentialStore),
         job("gcloud-import-2", "req-2"),
     )
     .await;

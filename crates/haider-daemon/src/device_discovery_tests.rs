@@ -121,6 +121,7 @@ impl crate::oauth::ClaudeNativeCredentialStore for StubClaudeNative {
             .map(|bytes| crate::oauth::ClaudeCredentialInput {
                 location: PathBuf::from("mock native store: Claude Code-credentials"),
                 bytes: zeroize::Zeroizing::new(bytes.clone()),
+                native_owner: true,
             })
     }
 }
@@ -132,7 +133,7 @@ fn assert_native_claude_discovered() {
     let candidate = discover_claude_at(&missing_file, &native).expect("native Claude candidate");
     assert_eq!(native.reads.load(Ordering::SeqCst), 1);
     assert_eq!(candidate.wire.provider, "anthropic-oauth");
-    assert_eq!(candidate.wire.source_label, "Claude Code");
+    assert_eq!(candidate.wire.source_label, "Linked to Claude Code");
     assert_eq!(candidate.wire.freshness, "fresh");
     assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_123));
     assert!(candidate.wire.import_supported);
@@ -162,10 +163,10 @@ fn windows_credential_manager_seam_discovers_claude_when_file_is_absent() {
     assert_native_claude_discovered();
 }
 
-/// MUTATION CHECK: query the native store before the file. Expected runtime
-/// failure: the read counter changes and the native expiry replaces the file.
+/// MUTATION CHECK: restore file-first selection. Expected runtime failure:
+/// the native owner label/expiry is replaced by the imported file snapshot.
 #[test]
-fn claude_file_short_circuits_the_native_store() {
+fn claude_native_owner_store_precedes_an_imported_file_snapshot() {
     let home = fixture_home();
     let file = home.path().join(".claude/.credentials.json");
     write_store(
@@ -181,10 +182,14 @@ fn claude_file_short_circuits_the_native_store() {
 }"#,
     );
     let native = StubClaudeNative::with_bytes(CLAUDE_NATIVE_FIXTURE);
-    let candidate = discover_claude_at(&file, &native).expect("file Claude candidate");
-    assert_eq!(native.reads.load(Ordering::SeqCst), 0);
-    assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_999));
-    assert_eq!(candidate.wire.path, file.to_string_lossy());
+    let candidate = discover_claude_at(&file, &native).expect("native Claude candidate");
+    assert_eq!(native.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_123));
+    assert_eq!(candidate.wire.source_label, "Linked to Claude Code");
+    assert_eq!(
+        candidate.wire.path,
+        "mock native store: Claude Code-credentials"
+    );
 }
 
 /// MUTATION CHECK: surface native absence/denial as a discovery error. Expected
@@ -365,7 +370,7 @@ fn discovery_reports_metadata_never_token_bytes() {
     assert_eq!(codex.import_source, Some("codex"));
 
     let claude = by_provider("anthropic-oauth");
-    assert_eq!(claude.wire.source_label, "Claude Code");
+    assert_eq!(claude.wire.source_label, "Claude Code credential file");
     assert_eq!(claude.wire.expires_at_ms, Some(4_102_444_800_123));
     assert!(claude.wire.import_supported);
     assert_eq!(claude.import_source, Some("claude-code"));
