@@ -132,8 +132,18 @@ fn render_plain_impl(
     if let Some(menu) = projection.open_menu() {
         out.push_str(&format!("? {}\n", menu.title));
         // Plain output uses the static provider delay because it has no
-        // render clock for a live countdown.
-        if let haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } = &menu.kind {
+        // render clock for a live countdown. Both recovery families speak
+        // through their typed presentation when they carry one — the E2
+        // provider/account card and the E6 effect-reconciliation card show
+        // the same detail + fact line the styled card renders.
+        let typed_presentation = match &menu.kind {
+            haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } => {
+                Some(presentation)
+            }
+            haider_protocol::menu::MenuKind::Recovery { presentation, .. } => presentation.as_ref(),
+            _ => None,
+        };
+        if let Some(presentation) = typed_presentation {
             for line in presentation.detail.split('\n') {
                 out.push_str("  ");
                 out.push_str(line);
@@ -506,6 +516,10 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             {
                 out.push_str(&transition.display_label());
                 out.push('\n');
+            } else if let Some(label) = crate::projection::retry_marker_label(kind, data) {
+                // E8: a bounded in-flight retry marker — the ⟳ renewal
+                // glyph and the same sentence the styled row shows.
+                out.push_str(&format!("⟳ {label}\n"));
             } else {
                 let label = data
                     .get("label")

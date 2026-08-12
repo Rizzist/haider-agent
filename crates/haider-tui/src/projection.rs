@@ -588,6 +588,21 @@ impl SessionProjection {
         });
     }
 
+    /// E8 visual pass: a client-observed failure that carries its TYPED
+    /// presentation (the busy-retry-exhausted card) records both — the
+    /// flattened text stays the plain/greppable authority while the styled
+    /// renderer gives the row the same card-shaped err treatment a typed
+    /// run failure gets.
+    pub fn record_local_error_card(
+        &mut self,
+        presentation: haider_protocol::error::ErrorPresentation,
+    ) {
+        self.entries.push(TranscriptEntry::Error {
+            text: format_error_presentation(&presentation),
+            presentation: Some(presentation),
+        });
+    }
+
     /// B2b-m3: associate one committed node with the display entry it
     /// stands for. The daemon commits a turn's `UserMessage` and its
     /// `NodeCommitted` adjacently in ONE acceptance transaction (compaction
@@ -1309,6 +1324,44 @@ pub(crate) fn join_error_fact_segments(segments: &[(String, u8)]) -> String {
         joined.push_str(segment);
     }
     joined
+}
+
+/// E8 visual pass: the human label for a bounded in-flight retry marker
+/// (`TurnItem::Extension`), shared by the styled and plain renderers so
+/// both surfaces speak one sentence. `Some` marks the kind as a QUIET
+/// retry fact (dim ⟳ row — recovery in progress, never alarming);
+/// unknown kinds return `None` and keep the generic `⋯` treatment.
+#[must_use]
+pub fn retry_marker_label(kind: &str, data: &serde_json::Value) -> Option<String> {
+    let label = data.get("label").and_then(serde_json::Value::as_str);
+    match kind {
+        // The daemon's fallback marker carries its own sentence
+        // ("provider hosted web tool rejected — using local web_fetch");
+        // a one-time capability switch, not an attempt counter.
+        "provider_tool_fallback" => Some(
+            label
+                .unwrap_or("provider tool rejected — using the local fallback")
+                .to_owned(),
+        ),
+        "tool_json_repair" => {
+            if let Some(label) = label {
+                return Some(label.to_owned());
+            }
+            let tool = data
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let mut composed = format!("malformed {tool} arguments — model asked to reissue");
+            if let (Some(attempt), Some(max)) = (
+                data.get("attempt").and_then(serde_json::Value::as_u64),
+                data.get("max_attempts").and_then(serde_json::Value::as_u64),
+            ) {
+                composed.push_str(&format!(" (attempt {attempt}/{max})"));
+            }
+            Some(composed)
+        }
+        _ => None,
+    }
 }
 
 /// The fact line's request-id form: the first 8 chars, `…`-marked when

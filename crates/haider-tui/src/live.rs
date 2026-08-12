@@ -2320,17 +2320,21 @@ impl LiveDriver {
                         let detail = format!(
                             "busy retry bound exhausted after {BUSY_MAX_ATTEMPTS} attempts — {message}"
                         );
-                        if let Some(session) = session {
-                            model.record_session_error(&session, detail.clone());
-                        }
-                        model.command_diagnostic = Some(ErrorPresentation::new(
+                        let presentation = ErrorPresentation::new(
                             "busy-retry-exhausted",
                             "Command still busy",
                             detail.clone(),
                             haider_protocol::error::ErrorScope::Session,
                             [haider_protocol::error::ErrorAction::Retry],
-                        ));
-                        model.flash = Some(format!("· busy — {detail}"));
+                        );
+                        // Exhausted retries wear the ERROR rail (E8 visual
+                        // pass): the transcript gets the typed card-shaped
+                        // block, not a bare one-liner.
+                        if let Some(session) = session {
+                            model.record_session_error_card(&session, presentation.clone());
+                        }
+                        model.command_diagnostic = Some(presentation);
+                        model.flash = Some(format!("· {detail}"));
                     }
                     model.dirty = true;
                     return Vec::new();
@@ -2710,9 +2714,19 @@ impl LiveDriver {
                 Vec::new()
             }
             LiveReply::SupervisorFailed { component, reason } => {
+                // Title-case the component — the banner's bold title reads
+                // as a sentence head ("Link unavailable"), matching the
+                // talk lane's "Talk unavailable".
+                let mut title = String::with_capacity(component.len() + " unavailable".len());
+                let mut chars = component.chars();
+                if let Some(first) = chars.next() {
+                    title.extend(first.to_uppercase());
+                    title.push_str(chars.as_str());
+                }
+                title.push_str(" unavailable");
                 model.supervisor_diagnostic = Some(ErrorPresentation::new(
                     "supervisor-unavailable",
-                    format!("{component} unavailable"),
+                    title,
                     reason,
                     haider_protocol::error::ErrorScope::Profile,
                     [haider_protocol::error::ErrorAction::Retry],

@@ -8931,6 +8931,11 @@ impl AppModel {
     /// The legacy `/peers` spelling remains decodable, but Haider has no
     /// remote-placement lane. Reuse protocol admission's typed rejection so
     /// the command, launcher hit, and durable agent admission tell one truth.
+    ///
+    /// E7 visual law: the rejection is a MATTER-OF-FACT status line — one
+    /// quiet flash, gone on the next keystroke. Asking for an unsupported
+    /// lane is not an error condition, so it never latches a persistent
+    /// diagnostic banner and never wears an error card.
     fn reject_remote_placement(&mut self) {
         let Err(error) = (haider_protocol::agent::Placement::Device {
             device: DeviceId::new("unsupported-remote-placement"),
@@ -8939,7 +8944,6 @@ impl AppModel {
             return;
         };
         self.flash = Some(format!("· /peers — {}", error.message));
-        self.command_diagnostic = error.presentation;
     }
 
     /// W-C M1: expand a custom command and submit its body as a user turn.
@@ -11312,6 +11316,23 @@ impl AppModel {
             self.projection.record_local_error(text);
         } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
             entry.projection.record_local_error(text);
+        }
+        self.dirty = true;
+    }
+
+    /// [`Self::record_session_error`] with the failure's TYPED presentation
+    /// (E8 visual pass): the transcript row gets the card-shaped err
+    /// treatment — bold title, railed dim detail, muted fact line — instead
+    /// of the baseline one-line ✗.
+    pub fn record_session_error_card(
+        &mut self,
+        session: &SessionId,
+        presentation: haider_protocol::error::ErrorPresentation,
+    ) {
+        if self.active_session.as_ref() == Some(session) {
+            self.projection.record_local_error_card(presentation);
+        } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
+            entry.projection.record_local_error_card(presentation);
         }
         self.dirty = true;
     }
