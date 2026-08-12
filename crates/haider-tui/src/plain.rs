@@ -89,7 +89,10 @@ fn render_plain_impl(
                 out.push_str(text);
                 out.push('\n');
             }
-            TranscriptEntry::Error { text } => {
+            TranscriptEntry::Error { text, .. } => {
+                // `text` is the flattened presentation (title — detail
+                // [subcode] · facts · actions) — plain carries the same
+                // information as the styled block, in honest plain text.
                 out.push_str("✗ ");
                 out.push_str(text);
                 out.push('\n');
@@ -128,6 +131,19 @@ fn render_plain_impl(
     }
     if let Some(menu) = projection.open_menu() {
         out.push_str(&format!("? {}\n", menu.title));
+        // Plain output uses the static provider delay because it has no
+        // render clock for a live countdown.
+        if let haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } = &menu.kind {
+            for line in presentation.detail.split('\n') {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            let facts = crate::projection::error_fact_segments(presentation, None);
+            out.push_str("  ");
+            out.push_str(&crate::projection::join_error_fact_segments(&facts));
+            out.push('\n');
+        }
         for (index, option) in menu.options.iter().enumerate() {
             out.push_str(&format!("  {}. {}\n", index + 1, option.label));
         }
@@ -407,6 +423,13 @@ fn render_item(out: &mut String, block: &ItemBlock) {
                 out.push('▮');
             }
             out.push('\n');
+        }
+        TurnItem::IncompleteAgentMessage { text, interruption } => {
+            out.push_str(text);
+            out.push('\n');
+            out.push_str("⚠ incomplete — stream interrupted (");
+            out.push_str(interruption.subcode.as_str());
+            out.push_str(")\n");
         }
         TurnItem::Reasoning { summary } => {
             out.push_str("· ");

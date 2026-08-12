@@ -16,7 +16,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use crate::anthropic::{
     ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
     ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicProvider, SseChunkSource,
-    replay_anthropic_sse, stream_sse_source,
+    read_error_body_bounded, replay_anthropic_sse, stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
 use crate::{
@@ -1118,4 +1118,45 @@ fn vertex_base_url_shape_is_pinned_global_or_matching_regional() {
         "https://us-east5-aiplatform.googleapis.com/v1/projects/acme-ai/locations/us-east5/publishers/anthropic/models"
     );
     assert!(vertex_models_base_url("", "global").is_err());
+}
+
+/// LAW — Anthropic non-success bodies obey the 64 KiB ceiling exactly like
+/// the OpenAI/Gemini adapters: bytes past the bound are never read into
+/// memory, parsed, or logged. Pinned by the orchestrator after the
+/// delete-the-truncation mutation SURVIVED the E2-E4 suite unpinned.
+#[tokio::test]
+async fn anthropic_error_body_read_is_bounded_to_64kib() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request_head = [0u8; 4096];
+        let _ = socket.read(&mut request_head).await;
+        let body = vec![b'x'; 64 * 1024 + 4096];
+        let head = format!(
+            "HTTP/1.1 529 Overloaded\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(&body).await;
+        let _ = socket.shutdown().await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/v1/messages"))
+        .send()
+        .await
+        .expect("oversized error response");
+    let body = read_error_body_bounded(response)
+        .await
+        .expect("bounded read succeeds");
+    assert_eq!(
+        body.len(),
+        64 * 1024,
+        "exactly the ceiling, never a byte beyond"
+    );
 }

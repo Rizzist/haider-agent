@@ -2833,7 +2833,9 @@ fn render_session(
     let ask_rows: u16 = ask_menu.map_or(0, |menu| {
         u16::try_from(2 + menu.body.len()).unwrap_or(u16::MAX)
     });
-    let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
+    let menu_wrapped_body_rows = menu.map_or(0, |m| {
+        wrapped_menu_body(m, area.width, model.clock_ms).len()
+    });
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width).saturating_add(ask_rows),
         |m| u16::try_from(1 + menu_wrapped_body_rows + m.options.len() + 1).unwrap_or(u16::MAX),
@@ -3504,8 +3506,14 @@ fn render_session(
             menu.id,
             menu.id
         );
-        let (menu_lines, option_rows) =
-            menu_block(menu, model.menu_selection, theme, composer_area, &footer);
+        let (menu_lines, option_rows) = menu_block(
+            menu,
+            model.menu_selection,
+            theme,
+            composer_area,
+            &footer,
+            model.clock_ms,
+        );
         frame.render_widget(
             Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
@@ -4446,8 +4454,10 @@ fn render_subagent(
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width),
         |m| {
-            u16::try_from(1 + wrapped_menu_body(m, area.width).len() + m.options.len() + 1)
-                .unwrap_or(u16::MAX)
+            u16::try_from(
+                1 + wrapped_menu_body(m, area.width, model.clock_ms).len() + m.options.len() + 1,
+            )
+            .unwrap_or(u16::MAX)
         },
     );
     // TUI6.2 fix 4 (review r2 finding 4, overruling the r1 trade): the
@@ -4732,8 +4742,14 @@ fn render_subagent(
             " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
             menu.options.len()
         );
-        let (menu_lines, option_rows) =
-            menu_block(menu, model.menu_selection, theme, composer_area, &footer);
+        let (menu_lines, option_rows) = menu_block(
+            menu,
+            model.menu_selection,
+            theme,
+            composer_area,
+            &footer,
+            model.clock_ms,
+        );
         frame.render_widget(
             Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
@@ -5081,12 +5097,16 @@ fn render_aura(
                     Span::styled(text.as_str(), theme.dim_style()),
                 ]));
             }
-            TranscriptEntry::Error { text } => {
-                lines.push(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled("✗ ", theme.err_style()),
-                    Span::styled(text.as_str(), theme.err_style()),
-                ]));
+            TranscriptEntry::Error { text, presentation } => {
+                // The same card-shaped treatment as the session view
+                // (title / detail / fact line via one shared helper).
+                error_entry_lines(
+                    &mut lines,
+                    text,
+                    presentation.as_ref(),
+                    theme,
+                    transcript_area.width,
+                );
             }
             TranscriptEntry::Item(block) => {
                 if let TurnItem::AgentMessage { text } = &block.item {
@@ -5153,8 +5173,28 @@ fn render_aura(
 
 /// The menu's body lines pre-wrapped by display cells into the menu's
 /// content width (sim `.iml` white-space: pre-wrap, tui.js:4946).
-fn wrapped_menu_body(menu: &haider_protocol::menu::Menu, width: u16) -> Vec<(String, DiffTone)> {
+///
+/// Recovery bodies come from their typed presentation, not the duplicate
+/// menu prose. Detail always uses body tone, even when it starts with a diff
+/// marker. The final fact row sheds only whole segments and uses `now_ms` for
+/// its live reset countdown.
+fn wrapped_menu_body(
+    menu: &haider_protocol::menu::Menu,
+    width: u16,
+    now_ms: u64,
+) -> Vec<(String, DiffTone)> {
     let budget = (width as usize).saturating_sub(2).max(1);
+    if let haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } = &menu.kind {
+        let mut rows: Vec<(String, DiffTone)> = presentation
+            .detail
+            .split('\n')
+            .flat_map(|logical| wrap_body(logical, budget))
+            .map(|row| (row, DiffTone::Body))
+            .collect();
+        let facts = crate::projection::error_fact_segments(presentation, Some(now_ms));
+        rows.push((shed_fact_line(&facts, budget), DiffTone::Body));
+        return rows;
+    }
     menu.body
         .iter()
         .flat_map(|body_line| {
@@ -5168,6 +5208,46 @@ fn wrapped_menu_body(menu: &haider_protocol::menu::Menu, width: u16) -> Vec<(Str
             })
         })
         .collect()
+}
+
+/// Sheds whole error-fact segments until the line fits `budget` display
+/// cells. The highest rank drops first (rightmost on ties); rank zero and
+/// display order are stable.
+#[must_use]
+pub fn shed_fact_line(segments: &[(String, u8)], budget: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let separator_width = " · ".width();
+    let mut kept = segments
+        .iter()
+        .map(|(segment, rank)| (segment.as_str(), *rank, segment.as_str().width()))
+        .collect::<Vec<_>>();
+    let mut width = kept.iter().map(|(_, _, width)| width).sum::<usize>()
+        + kept.len().saturating_sub(1) * separator_width;
+    while kept.len() > 1 && width > budget {
+        let Some((drop_index, _)) = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, rank, _))| *rank > 0)
+            .max_by_key(|(index, (_, rank, _))| (*rank, *index))
+        else {
+            break;
+        };
+        let (_, _, dropped_width) = kept.remove(drop_index);
+        width = width.saturating_sub(dropped_width + separator_width);
+    }
+    let capacity = kept
+        .iter()
+        .map(|(segment, _, _)| segment.len())
+        .sum::<usize>()
+        + kept.len().saturating_sub(1) * " · ".len();
+    let mut joined = String::with_capacity(capacity);
+    for (index, (segment, _, _)) in kept.iter().enumerate() {
+        if index > 0 {
+            joined.push_str(" · ");
+        }
+        joined.push_str(segment);
+    }
+    joined
 }
 
 /// W4a4: diff-aware body tone for the approval card (and any menu whose
@@ -5218,13 +5298,33 @@ fn menu_block(
     theme: &Theme,
     area: Rect,
     footer: &str,
+    now_ms: u64,
 ) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
     let allocated = area.height as usize;
     if allocated == 0 {
         return (Vec::new(), Vec::new());
     }
+    // Recovery cards use warning ink for remediable conditions and error
+    // ink only for hard account failures or an unclassified generic failure.
+    let recovery_ink = match &menu.kind {
+        haider_protocol::menu::MenuKind::ErrorRecovery { card, .. } => {
+            use haider_protocol::menu::ErrorRecoveryCardKind;
+            Some(match card {
+                ErrorRecoveryCardKind::AccountRevoked
+                | ErrorRecoveryCardKind::AccountDeleted
+                | ErrorRecoveryCardKind::Generic => theme.err,
+                ErrorRecoveryCardKind::OauthExpired
+                | ErrorRecoveryCardKind::InvalidApiKey
+                | ErrorRecoveryCardKind::KeychainRelink
+                | ErrorRecoveryCardKind::RateLimit
+                | ErrorRecoveryCardKind::QuotaExhausted
+                | ErrorRecoveryCardKind::PartialStream => theme.warn,
+            })
+        }
+        _ => None,
+    };
     let selection = selection.min(menu.options.len().saturating_sub(1));
-    let mut body_rows = wrapped_menu_body(menu, area.width);
+    let mut body_rows = wrapped_menu_body(menu, area.width, now_ms);
     let needed = 1 + body_rows.len() + menu.options.len() + 1;
     let mut show_title = true;
     let mut show_hint = true;
@@ -5255,14 +5355,31 @@ fn menu_block(
     let mut option_rows: Vec<(u16, usize)> = Vec::new();
     if show_title {
         let glyph = menu_glyph(menu);
-        lines.push(Line::from(vec![Span::styled(
-            format!(" {glyph} {}", menu.title),
-            theme.warn_style(),
-        )]));
+        match recovery_ink {
+            // The accent cell replaces the pad; title in the tone ink,
+            // BOLD — TITLE prominent, severity readable from the rail.
+            Some(ink) => lines.push(Line::from(vec![
+                Span::styled("▏", ratatui::style::Style::default().fg(ink.into())),
+                Span::styled(
+                    format!("{glyph} {}", menu.title),
+                    ratatui::style::Style::default()
+                        .fg(ink.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            None => lines.push(Line::from(vec![Span::styled(
+                format!(" {glyph} {}", menu.title),
+                theme.warn_style(),
+            )])),
+        }
     }
     for (body_row, tone) in body_rows {
+        let gutter = match recovery_ink {
+            Some(ink) => Span::styled("▏", ratatui::style::Style::default().fg(ink.into())),
+            None => Span::raw(" "),
+        };
         lines.push(Line::from(vec![
-            Span::raw(" "),
+            gutter,
             Span::styled(body_row, tone.style(theme)),
         ]));
     }
@@ -5270,6 +5387,9 @@ fn menu_block(
         let index = start + offset;
         let selected = index == selection;
         let cursor = if selected { "❯" } else { " " };
+        // The server's first recovery option is primary; selection styling
+        // takes precedence over its idle gold accent.
+        let primary = index == 0 && recovery_ink.is_some();
         // The gutter's first cell carries the ⋮ viewport marker on edge
         // rows adjacent to hidden options — none may vanish silently.
         let edge = (offset == 0 && hidden_above) || (offset + 1 == window_len && hidden_below);
@@ -5280,15 +5400,29 @@ fn menu_block(
                 format!("{}. {}", index + 1, option.label),
                 if selected {
                     theme.bright_style()
+                } else if primary {
+                    theme.gold_style()
                 } else {
                     theme.menu_style()
                 },
             ),
         ];
+        // Option detail is all-or-nothing; it never truncates mid-word.
+        if selected
+            && recovery_ink.is_some()
+            && let Some(detail) = &option.detail
+        {
+            let suffix = format!(" — {detail}");
+            let used = span_row_width(&spans);
+            if used + unicode_width::UnicodeWidthStr::width(suffix.as_str()) <= area.width as usize
+            {
+                spans.push(Span::styled(suffix, theme.dim_style()));
+            }
+        }
         option_rows.push((u16::try_from(lines.len()).unwrap_or(u16::MAX), index));
         lines.push(if selected {
             // Selection ground spans the full row (sim `.imo.sel`).
-            let pad = (area.width as usize).saturating_sub(Line::from(spans.clone()).width());
+            let pad = (area.width as usize).saturating_sub(span_row_width(&spans));
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
@@ -5304,6 +5438,11 @@ fn menu_block(
         )]));
     }
     (lines, option_rows)
+}
+
+fn span_row_width(spans: &[Span<'_>]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    spans.iter().map(|span| span.content.as_ref().width()).sum()
 }
 
 /// Rows the `/theme` picker card needs: title + body + the five choice
@@ -5390,7 +5529,8 @@ fn render_theme_picker(
         rule_area,
     );
     let footer = " ↑↓ preview · ⏎ keep · 1-5 quick · esc back";
-    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer);
+    // The clock feeds only recovery fact lines; a Choice card ignores it.
+    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer, 0);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.menu_style()),
         composer_area,
@@ -5502,7 +5642,8 @@ fn render_effort_picker(
         rule_area,
     );
     let footer = " ↑↓ pick · ⏎ select · 1-9 quick · esc back";
-    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer);
+    // The clock feeds only recovery fact lines; a Choice card ignores it.
+    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer, 0);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.menu_style()),
         composer_area,
@@ -5527,9 +5668,16 @@ fn render_effort_picker(
 /// The command cards (`voice` ◉ / `tools` ⚒) are `Choice` menus — their
 /// free-form `origin` tag carries the sim kind (MenuKind is frozen).
 fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
-    use haider_protocol::menu::MenuKind;
+    use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
     match &menu.kind {
         MenuKind::Recovery { .. } => "⌁",
+        // Renewable limits use the reset glyph. Other recovery classes use
+        // warning, matching the partial-stream transcript marker.
+        MenuKind::ErrorRecovery {
+            card: ErrorRecoveryCardKind::RateLimit | ErrorRecoveryCardKind::QuotaExhausted,
+            ..
+        } => "⟳",
+        MenuKind::ErrorRecovery { .. } => "⚠",
         MenuKind::Exhausted => "⟳",
         MenuKind::Choice if menu.origin == "voice" => "◉",
         MenuKind::Choice if menu.origin == "tools" => "⚒",
@@ -6796,14 +6944,8 @@ fn transcript_lines<'a>(
                 Span::styled(text.as_str(), theme.dim_style()),
             ]));
         }
-        TranscriptEntry::Error { text } => {
-            // The failed run's public reason (W5g-6) — err ink, ✗ sigil.
-            lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled("✗ ", theme.err_style()),
-                Span::styled(text.as_str(), theme.err_style()),
-            ]));
+        TranscriptEntry::Error { text, presentation } => {
+            error_entry_lines(lines, text, presentation.as_ref(), theme, width);
         }
         TranscriptEntry::Shell { cmd, out } => {
             // Sim ShellRow (tui.js:3910-3918): `$ {cmd}` + output line.
@@ -6821,6 +6963,67 @@ fn transcript_lines<'a>(
             }
         }
     }
+}
+
+/// A typed failed run renders as a card-shaped block behind a severity rail:
+///
+/// ```text
+///  ✗ Provider rate limit reached            ← err ink, BOLD (title)
+///  ▏ Wait for the provider limit to reset,  ← err rail · dim detail,
+///  ▏ then retry.                              wrapped by display cells
+///  ▏ rate-limited · HTTP 429 · req 8f3a2c1… ← dim fact line, whole-
+///                                             segment shed to width
+/// ```
+///
+/// The fact line carries the trailing `actions: …` hint — the transcript
+/// row may be the only guidance when no recovery card follows. A
+/// text-only error (client-observed failures, pre-E2 wire errors) keeps
+/// the baseline one-line `✗` render. The reset figure is the static
+/// provider delay recorded at failure time (a transcript row is a
+/// record, not a countdown).
+fn error_entry_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    text: &'a str,
+    presentation: Option<&'a haider_protocol::error::ErrorPresentation>,
+    theme: &Theme,
+    width: u16,
+) {
+    lines.push(Line::default());
+    let Some(presentation) = presentation else {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("✗ ", theme.err_style()),
+            Span::styled(text, theme.err_style()),
+        ]));
+        return;
+    };
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("✗ ", theme.err_style()),
+        Span::styled(
+            presentation.title.as_str(),
+            theme.err_style().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let budget = (width as usize).saturating_sub(3);
+    if budget == 0 {
+        return;
+    }
+    for logical in presentation.detail.split('\n') {
+        for row in wrap_body(logical, budget) {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("▏ ", theme.err_style()),
+                Span::styled(row, theme.dim_style()),
+            ]));
+        }
+    }
+    let facts = crate::projection::error_fact_segments_with_actions(presentation, None);
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("▏ ", theme.err_style()),
+        Span::styled(shed_fact_line(&facts, budget), theme.dim_style()),
+    ]));
 }
 
 /// User text split into spans, styling sim paste/image tokens gold on the
@@ -7122,6 +7325,35 @@ fn item_lines<'a>(
                     idx += 1;
                 }
             }
+        }
+        TurnItem::IncompleteAgentMessage { text, interruption } => {
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("■ haider", theme.gold_style()),
+            ]));
+            let budget = (width as usize).saturating_sub(3);
+            if budget > 0 {
+                for markdown_line in crate::md::render_markdown(text) {
+                    for row in crate::md::wrap_spans(&markdown_line.spans, budget) {
+                        let mut spans =
+                            vec![Span::raw(" "), Span::styled("▏ ", theme.rail_style())];
+                        spans.extend(
+                            row.into_iter()
+                                .map(|span| Span::styled(span.text, theme.md_style(span.kind))),
+                        );
+                        lines.push(Line::from(spans));
+                    }
+                }
+            }
+            // An interruption is warning metadata, not a failed response.
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("⚠ ", theme.warn_style()),
+                Span::styled("incomplete — stream interrupted (", theme.dim_style()),
+                Span::styled(interruption.subcode.as_str(), theme.dim_style()),
+                Span::styled(")", theme.dim_style()),
+            ]));
         }
         TurnItem::Reasoning { summary } => {
             lines.push(Line::from(vec![

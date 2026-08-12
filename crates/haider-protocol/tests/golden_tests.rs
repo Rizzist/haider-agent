@@ -13,21 +13,24 @@ use haider_protocol::agent::{
 };
 use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
 use haider_protocol::hook::{
     HookAttachmentMetadata, HookAttachmentSet, HookEventPayload, HookFired, HookInput, HookOutput,
     HookRuntimeKind,
 };
 use haider_protocol::ids::*;
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{
-    AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
+    AnswerVia, ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption,
+    MenuScope,
 };
 use haider_protocol::project_instructions::{
     ProjectInstructionFileFact, ProjectInstructionsEventPayload, ProjectInstructionsLoaded,
 };
 use haider_protocol::state::{RunState, SessionState, VerifyStep, WaitReason};
 use haider_protocol::tool::{
-    DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
-    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+    BoundedResult, DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
+    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault, ToolResultStatus,
 };
 use haider_protocol::verify::{Diagnostic, GateReport, Severity, VerifyVerdict};
 use serde::{Serialize, de::DeserializeOwned};
@@ -426,6 +429,108 @@ fn golden_menu_permission() {
             menu: MenuId::new("m-perm-1"),
             reason: MenuCloseReason::Cancelled,
         },
+    );
+}
+
+/// E2/E3/E4 additive wire fixtures. Pre-E2 goldens remain byte-identical;
+/// these pin only the new optional shapes.
+#[test]
+fn golden_error_presentation_contract() {
+    let presentation = ErrorPresentation::new(
+        "rate-limited",
+        "Provider rate limit reached",
+        "Wait for the provider limit to reset, then retry.",
+        ErrorScope::Account,
+        [
+            ErrorAction::Wait,
+            ErrorAction::Retry,
+            ErrorAction::SwitchAccount,
+        ],
+    )
+    .with_http_status(429)
+    .with_request_id(Some("req-safe-42"))
+    .with_retry_after(Some(30_000), 1_753_500_000_000);
+    additive_golden(
+        "run_failed_typed",
+        &EventPayload::RunFailed {
+            code: ErrorCode::ProviderError,
+            message: "legacy safe fallback".into(),
+            retryable: true,
+            presentation: Some(presentation.clone()),
+        },
+    );
+    additive_golden(
+        "tool_result_failed_typed",
+        &EventPayload::ToolResult {
+            call_id: "call-typed-error".into(),
+            result: BoundedResult {
+                preview: "tool failed".into(),
+                truncated: false,
+                artifact: None,
+                cursor: None,
+                status: ToolResultStatus::Failed,
+                reason: Some("legacy safe fallback".into()),
+                presentation: Some(ErrorPresentation::new(
+                    "tool-failed",
+                    "Tool execution failed",
+                    "The tool did not complete successfully.",
+                    ErrorScope::Tool,
+                    [ErrorAction::Retry],
+                )),
+            },
+        },
+    );
+    additive_golden(
+        "menu_error_recovery",
+        &Menu {
+            id: MenuId::new("m-error-1"),
+            kind: MenuKind::ErrorRecovery {
+                card: ErrorRecoveryCardKind::RateLimit,
+                presentation: presentation.clone(),
+                option_actions: vec![ErrorAction::Wait, ErrorAction::Retry],
+                provider: Some("openai".into()),
+                account: Some(CredentialAlias::new("openai-work")),
+                source_run: Some(RunId::new("run-typed-1")),
+                source_item: None,
+            },
+            title: presentation.title.clone(),
+            body: vec![presentation.detail.clone()],
+            options: vec![
+                MenuOption {
+                    key: "wait".into(),
+                    label: "Wait".into(),
+                    detail: Some("Wait for the displayed reset time.".into()),
+                    decision: None,
+                },
+                MenuOption {
+                    key: "retry".into(),
+                    label: "Retry".into(),
+                    detail: None,
+                    decision: None,
+                },
+            ],
+            blocking: false,
+            scope: MenuScope::Session,
+            origin: "error-recovery".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        },
+    );
+    additive_golden(
+        "item_incomplete_agent_message",
+        &EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("item-partial-1"),
+            item: TurnItem::IncompleteAgentMessage {
+                text: "A response prefix".into(),
+                interruption: ErrorPresentation::new(
+                    "stream-interrupted",
+                    "Response stream interrupted",
+                    "The provider connection ended after part of the response was received.",
+                    ErrorScope::Turn,
+                    [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+                ),
+            },
+        }),
     );
 }
 

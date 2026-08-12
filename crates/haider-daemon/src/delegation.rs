@@ -1003,8 +1003,15 @@ impl DelegationHandle {
                     haider_protocol::EventPayload::RunState(state) if state.is_terminal() => {
                         terminal = Some(state);
                     }
-                    haider_protocol::EventPayload::RunFailed { message, .. } => {
-                        failure = Some(message);
+                    haider_protocol::EventPayload::RunFailed {
+                        message,
+                        presentation,
+                        ..
+                    } => {
+                        failure =
+                            Some(presentation.map_or(message, |safe| {
+                                format!("{} — {}", safe.title, safe.detail)
+                            }));
                     }
                     haider_protocol::EventPayload::Item(ItemEvent::Completed {
                         item: TurnItem::AgentMessage { text },

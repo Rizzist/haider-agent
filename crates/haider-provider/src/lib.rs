@@ -32,6 +32,7 @@ mod webfetch_tests;
 mod wire;
 
 use async_trait::async_trait;
+use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::provider::{
     Block, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
@@ -40,8 +41,11 @@ use serde::{Deserialize, Serialize};
 use std::error::Error as _;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
+
+const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
 
 /// Digests Haider-owned tool definitions after recursively sorting object
 /// keys in their schemas.
@@ -381,21 +385,50 @@ pub struct ProviderError {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    #[serde(default)]
+    pub presentation: ErrorPresentation,
 }
 
 impl ProviderError {
     pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self::new_with_presentation(kind, message, provider_error_presentation(kind))
+    }
+
+    fn new_with_presentation(
+        kind: ProviderErrorKind,
+        message: impl Into<String>,
+        presentation: ErrorPresentation,
+    ) -> Self {
         Self {
             kind,
             message: message.into(),
             retryable: kind.default_retryable(),
             retry_after_ms: None,
+            presentation,
         }
     }
 
     #[must_use]
     pub fn with_retry_after_ms(mut self, retry_after_ms: Option<u64>) -> Self {
         self.retry_after_ms = retry_after_ms;
+        self.presentation = self
+            .presentation
+            .with_retry_after(retry_after_ms, unix_time_ms());
+        self
+    }
+
+    #[must_use]
+    pub fn with_http_metadata(mut self, status: u16, request_id: Option<&str>) -> Self {
+        self.presentation = self
+            .presentation
+            .with_http_status(status)
+            .with_request_id(request_id);
+        self
+    }
+
+    #[must_use]
+    pub fn with_presentation(mut self, presentation: ErrorPresentation) -> Self {
+        self.presentation = presentation;
         self
     }
 }
@@ -407,6 +440,180 @@ impl ProviderErrorKind {
             Self::RateLimited | Self::Overloaded | Self::Transport | Self::StreamInterrupted
         )
     }
+}
+
+/// Exhaustive E2 mapping. Adding a provider kind must choose a stable
+/// subcode and at least one server-enumerated recovery action (or `none`).
+fn provider_error_presentation(kind: ProviderErrorKind) -> ErrorPresentation {
+    match kind {
+        ProviderErrorKind::Authentication => ErrorPresentation::new(
+            "authentication-failed",
+            "Sign-in required",
+            "The provider rejected the active credential.",
+            ErrorScope::Account,
+            [
+                ErrorAction::Relogin,
+                ErrorAction::EditKey,
+                ErrorAction::SwitchAccount,
+            ],
+        ),
+        ProviderErrorKind::PermissionDenied => ErrorPresentation::new(
+            "permission-denied",
+            "Provider access denied",
+            "The active account is not allowed to make this request.",
+            ErrorScope::Account,
+            [ErrorAction::SwitchAccount, ErrorAction::ContactAdmin],
+        ),
+        ProviderErrorKind::RateLimited => ErrorPresentation::new(
+            "rate-limited",
+            "Rate limit reached",
+            "The provider asked Haider to wait before trying again.",
+            ErrorScope::Account,
+            [
+                ErrorAction::Wait,
+                ErrorAction::Retry,
+                ErrorAction::SwitchAccount,
+            ],
+        ),
+        ProviderErrorKind::Overloaded => ErrorPresentation::new(
+            "provider-overloaded",
+            "Provider is overloaded",
+            "The provider is temporarily unable to serve this request.",
+            ErrorScope::Turn,
+            [ErrorAction::Retry],
+        ),
+        ProviderErrorKind::ContextExceeded => ErrorPresentation::new(
+            "context-exceeded",
+            "Context window exceeded",
+            "The request does not fit the active model context window.",
+            ErrorScope::Session,
+            [ErrorAction::ChooseModel, ErrorAction::Retry],
+        ),
+        ProviderErrorKind::InvalidRequest => ErrorPresentation::new(
+            "invalid-provider-request",
+            "Provider rejected the request",
+            "The provider could not accept this request shape.",
+            ErrorScope::Turn,
+            [ErrorAction::None],
+        ),
+        ProviderErrorKind::Transport => ErrorPresentation::new(
+            "provider-transport",
+            "Provider connection failed",
+            "Haider could not complete the provider network request.",
+            ErrorScope::Turn,
+            [ErrorAction::Retry],
+        ),
+        ProviderErrorKind::MalformedFrame => ErrorPresentation::new(
+            "malformed-provider-response",
+            "Provider response was malformed",
+            "The provider returned a response Haider could not safely decode.",
+            ErrorScope::Turn,
+            [ErrorAction::RetryFresh],
+        ),
+        ProviderErrorKind::InvalidUtf8 => ErrorPresentation::new(
+            "invalid-provider-utf8",
+            "Provider response was not UTF-8",
+            "The provider stream contained invalid text bytes.",
+            ErrorScope::Turn,
+            [ErrorAction::RetryFresh],
+        ),
+        ProviderErrorKind::Internal => ErrorPresentation::new(
+            "provider-internal",
+            "Provider integration failed",
+            "Haider encountered an internal provider integration error.",
+            ErrorScope::Turn,
+            [ErrorAction::Retry],
+        ),
+        ProviderErrorKind::QuotaExhausted => ErrorPresentation::new(
+            "quota-exhausted",
+            "Credits or quota exhausted",
+            "Billing, credits, or account quota must change before this account can continue.",
+            ErrorScope::Account,
+            [ErrorAction::TopUp, ErrorAction::SwitchAccount],
+        ),
+        ProviderErrorKind::StreamInterrupted => ErrorPresentation::new(
+            "stream-interrupted",
+            "Response stream interrupted",
+            "The provider connection ended before the response completed.",
+            ErrorScope::Turn,
+            [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+        ),
+        ProviderErrorKind::ConnectionConfiguration => ErrorPresentation::new(
+            "connection-configuration",
+            "Provider connection is misconfigured",
+            "Check the provider endpoint, proxy, and certificate trust settings.",
+            ErrorScope::Session,
+            [ErrorAction::None],
+        ),
+    }
+}
+
+fn account_deleted_presentation() -> ErrorPresentation {
+    ErrorPresentation::new(
+        "account-deleted",
+        "Provider account unavailable",
+        "The provider no longer recognizes this account.",
+        ErrorScope::Account,
+        [ErrorAction::SwitchAccount],
+    )
+}
+
+fn account_revoked_presentation() -> ErrorPresentation {
+    ErrorPresentation::new(
+        "account-revoked",
+        "Provider account access revoked",
+        "This provider account can no longer be used.",
+        ErrorScope::Account,
+        [ErrorAction::SwitchAccount, ErrorAction::ContactAdmin],
+    )
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn parse_retry_after_ms(value: Option<&str>) -> Option<u64> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return seconds.checked_mul(1_000);
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    let duration = retry_at
+        .duration_since(SystemTime::now())
+        .unwrap_or_default();
+    u64::try_from(duration.as_millis()).ok()
+}
+
+async fn read_http_error_body_bounded(
+    mut response: reqwest::Response,
+    provider: &'static str,
+) -> Result<Vec<u8>, ProviderError> {
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(HTTP_ERROR_BODY_LIMIT);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| reqwest_transport_error(provider, error))?
+    {
+        let remaining = HTTP_ERROR_BODY_LIMIT.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Classifies one reqwest connection failure without exposing a credential-
@@ -931,14 +1138,10 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 retryable,
                 retry_after_ms,
             } => {
-                let _ = sender
-                    .send(Err(ProviderError {
-                        kind,
-                        message,
-                        retryable,
-                        retry_after_ms,
-                    }))
-                    .await;
+                let mut error =
+                    ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms);
+                error.retryable = retryable;
+                let _ = sender.send(Err(error)).await;
                 return;
             }
             FakeStep::Hang => {
@@ -1092,5 +1295,73 @@ impl Utf8Assembler {
 
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod e2_contract_tests {
+    use super::*;
+
+    fn assert_complete_mapping(kind: ProviderErrorKind) {
+        // Deliberately exhaustive: a new provider kind cannot compile until
+        // its presentation contract is considered here and in production.
+        match kind {
+            ProviderErrorKind::Authentication
+            | ProviderErrorKind::PermissionDenied
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Overloaded
+            | ProviderErrorKind::ContextExceeded
+            | ProviderErrorKind::InvalidRequest
+            | ProviderErrorKind::Transport
+            | ProviderErrorKind::MalformedFrame
+            | ProviderErrorKind::InvalidUtf8
+            | ProviderErrorKind::Internal
+            | ProviderErrorKind::QuotaExhausted
+            | ProviderErrorKind::StreamInterrupted
+            | ProviderErrorKind::ConnectionConfiguration => {}
+        }
+        let presentation = ProviderError::new(kind, "untrusted provider body marker").presentation;
+        assert!(!presentation.subcode.as_str().is_empty());
+        assert!(!presentation.allowed_actions.is_empty());
+    }
+
+    #[test]
+    fn e2b_every_provider_error_kind_has_expected_presentation() {
+        for kind in [
+            ProviderErrorKind::Authentication,
+            ProviderErrorKind::PermissionDenied,
+            ProviderErrorKind::RateLimited,
+            ProviderErrorKind::Overloaded,
+            ProviderErrorKind::ContextExceeded,
+            ProviderErrorKind::InvalidRequest,
+            ProviderErrorKind::Transport,
+            ProviderErrorKind::MalformedFrame,
+            ProviderErrorKind::InvalidUtf8,
+            ProviderErrorKind::Internal,
+            ProviderErrorKind::QuotaExhausted,
+            ProviderErrorKind::StreamInterrupted,
+            ProviderErrorKind::ConnectionConfiguration,
+        ] {
+            assert_complete_mapping(kind);
+        }
+    }
+
+    #[test]
+    fn e2a_provider_429_presentation_carries_retry_metadata_without_body_leak() {
+        const MARKER: &str = "RAW_BODY_MUST_NEVER_RENDER_98c4";
+        let body = format!(r#"{{"error":{{"type":"rate_limit_error","message":"{MARKER}"}}}}"#);
+        let error = replay_openai_http_error(429, Some("3"), body.as_bytes());
+        assert_eq!(error.presentation.subcode.as_str(), "rate-limited");
+        assert_eq!(error.presentation.provider_http_status, Some(429));
+        assert_eq!(error.presentation.retry_after_ms, Some(3_000));
+        assert!(error.presentation.reset_at_ms.is_some());
+        assert!(
+            error
+                .presentation
+                .allowed_actions
+                .contains(&ErrorAction::Retry)
+        );
+        let rendered = serde_json::to_string(&error.presentation).expect("presentation JSON");
+        assert!(!rendered.contains(MARKER));
     }
 }

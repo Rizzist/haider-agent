@@ -1,5 +1,9 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/provider_manifest.rs"]
+mod provider_manifest;
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,64 +14,14 @@ use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent
 use haider_protocol::tool::AttachmentBlock;
 use haider_provider::{
     AnthropicProvider, AnthropicRetryPolicy, Message, MessageRole, Provider, ProviderError,
-    ProviderErrorKind, ProviderStreamItem, ResolvedAttachment, ToolDefinition, TurnRequest,
+    ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
     replay_anthropic_http_error, replay_anthropic_sse,
 };
-use serde::Deserialize;
+
+use provider_manifest::Manifest;
+use support::{ExpectedItem, read_json, reanchor_events};
 
 const FIXTURE_DIR: &str = "tests/fixtures/anthropic";
-
-#[derive(Debug, Deserialize)]
-struct Manifest {
-    schema: String,
-    provisional: bool,
-    provenance: String,
-    fixtures: Vec<Fixture>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Fixture {
-    name: String,
-    transport: String,
-    status: u16,
-    retry_after: Option<String>,
-    wire: String,
-    golden: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "result", content = "value", rename_all = "snake_case")]
-enum ExpectedItem {
-    Ok(StreamEvent),
-    Err(ProviderError),
-}
-
-impl ExpectedItem {
-    fn into_result(self) -> ProviderStreamItem {
-        match self {
-            Self::Ok(event) => Ok(event),
-            Self::Err(error) => Err(error),
-        }
-    }
-}
-
-fn reanchor_events(path: &Path, actual: &[ProviderStreamItem]) {
-    if std::env::var_os("UPDATE_FIXTURES").is_none() {
-        return;
-    }
-    let tagged = actual
-        .iter()
-        .map(|item| match item {
-            Ok(event) => serde_json::json!({"result": "ok", "value": event}),
-            Err(error) => serde_json::json!({"result": "err", "value": error}),
-        })
-        .collect::<Vec<_>>();
-    fs::write(
-        path,
-        serde_json::to_string_pretty(&tagged).expect("serialize event golden"),
-    )
-    .expect("write event golden");
-}
 
 #[test]
 fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
@@ -107,17 +61,16 @@ fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
                 assert_eq!(actual, expected, "fixture `{}`", fixture.name);
             }
             "http" => {
-                let expected: ProviderError = read_json(&directory.join(&fixture.golden));
-                assert_eq!(
-                    replay_anthropic_http_error(
-                        fixture.status,
-                        fixture.retry_after.as_deref(),
-                        &wire,
-                    ),
-                    expected,
-                    "fixture `{}`",
-                    fixture.name
+                let mut expected: ProviderError = read_json(&directory.join(&fixture.golden));
+                let actual = replay_anthropic_http_error(
+                    fixture.status,
+                    fixture.retry_after.as_deref(),
+                    &wire,
                 );
+                // Absolute reset time is intentionally wall-clock derived;
+                // the golden pins every stable field and relative delay.
+                expected.presentation.reset_at_ms = actual.presentation.reset_at_ms;
+                assert_eq!(actual, expected, "fixture `{}`", fixture.name);
             }
             other => panic!("unknown fixture transport `{other}`"),
         }
@@ -448,11 +401,6 @@ fn provider(model: &str) -> AnthropicProvider {
 
 fn fixture_directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIR)
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
-    let bytes = fs::read(path).expect("reads JSON fixture");
-    serde_json::from_slice(&bytes).expect("parses JSON fixture")
 }
 
 /// LAW (LT1, thinking capture): a scripted stream with a SIGNED thinking

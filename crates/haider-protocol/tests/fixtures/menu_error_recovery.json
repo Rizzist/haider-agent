@@ -1,0 +1,49 @@
+{
+  "id": "m-error-1",
+  "kind": {
+    "kind": "error_recovery",
+    "card": "rate_limit",
+    "presentation": {
+      "subcode": "rate-limited",
+      "title": "Provider rate limit reached",
+      "detail": "Wait for the provider limit to reset, then retry.",
+      "provider_http_status": 429,
+      "provider_request_id": "req-safe-42",
+      "retry_after_ms": 30000,
+      "reset_at_ms": 1753500030000,
+      "scope": "account",
+      "allowed_actions": [
+        "wait",
+        "retry",
+        "switch_account"
+      ]
+    },
+    "option_actions": [
+      "wait",
+      "retry"
+    ],
+    "provider": "openai",
+    "account": "openai-work",
+    "source_run": "run-typed-1"
+  },
+  "title": "Provider rate limit reached",
+  "body": [
+    "Wait for the provider limit to reset, then retry."
+  ],
+  "options": [
+    {
+      "key": "wait",
+      "label": "Wait",
+      "detail": "Wait for the displayed reset time."
+    },
+    {
+      "key": "retry",
+      "label": "Retry"
+    }
+  ],
+  "blocking": false,
+  "scope": {
+    "scope": "session"
+  },
+  "origin": "error-recovery"
+}

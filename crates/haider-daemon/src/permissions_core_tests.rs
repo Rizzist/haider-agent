@@ -590,7 +590,9 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
             RecoveredWork::Checkpoint(checkpoint) => {
                 Some((checkpoint.checkpoint.menu.id, checkpoint.accepted.branch_id))
             }
-            RecoveredWork::Queued(_) | RecoveredWork::ChildWait(_) => None,
+            RecoveredWork::Queued(_)
+            | RecoveredWork::PartialStream(_)
+            | RecoveredWork::ChildWait(_) => None,
         })
         .collect::<Vec<_>>();
     recovered_menus.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));

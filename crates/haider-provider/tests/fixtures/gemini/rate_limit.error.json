@@ -1,1 +1,15 @@
-{"kind":"rate_limited","message":"Gemini HTTP 429 returned rate limit","retryable":true,"retry_after_ms":2250}
+{
+  "kind": "rate_limited",
+  "message": "Gemini HTTP 429 returned rate limit",
+  "retryable": true,
+  "retry_after_ms": 2250,
+  "presentation": {
+    "subcode": "rate-limited",
+    "title": "Rate limit reached",
+    "detail": "The provider asked Haider to wait before trying again.",
+    "provider_http_status": 429,
+    "retry_after_ms": 2250,
+    "scope": "account",
+    "allowed_actions": ["wait", "retry", "switch_account"]
+  }
+}

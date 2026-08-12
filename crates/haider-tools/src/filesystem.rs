@@ -1585,6 +1585,7 @@ fn apply_write_at(
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         },
         path: operation.path.clone(),
         bytes_hash,
@@ -1740,6 +1741,7 @@ fn apply_edit_at(
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         },
         path: operation.path.clone(),
         bytes_hash,
@@ -1860,6 +1862,7 @@ fn apply_patch_at_with_commit_hooks(
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         },
         path: operation.path.clone(),
         bytes_hash,
@@ -2534,6 +2537,7 @@ where
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         });
     }
 
@@ -2549,6 +2553,7 @@ where
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
+        presentation: None,
     })
 }
 
@@ -2570,6 +2575,7 @@ where
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         });
     }
     let artifact = cas.put_file(output.complete.path()).await?;
@@ -2580,6 +2586,7 @@ where
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
+        presentation: None,
     })
 }
 
@@ -2607,6 +2614,7 @@ where
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
+        presentation: None,
     })
 }
 

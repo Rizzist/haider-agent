@@ -4,7 +4,14 @@
     "value": {
       "kind": "overloaded",
       "message": "Anthropic API returned an overloaded error",
-      "retryable": true
+      "retryable": true,
+      "presentation": {
+        "subcode": "provider-overloaded",
+        "title": "Provider is overloaded",
+        "detail": "The provider is temporarily unable to serve this request.",
+        "scope": "turn",
+        "allowed_actions": ["retry"]
+      }
     }
   }
 ]

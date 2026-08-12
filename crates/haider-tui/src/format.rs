@@ -148,6 +148,18 @@ pub fn fmt_reset(generated_at_ms: u64, resets_at_ms: u64) -> String {
     }
 }
 
+/// Formats short provider backoffs with second precision. Sub-second or
+/// elapsed delays say `resets soon`; unlike [`fmt_reset`], this must not
+/// floor short delays to minutes.
+#[must_use]
+pub fn fmt_reset_in(delta_ms: u64) -> String {
+    if delta_ms < 1000 {
+        "resets soon".to_owned()
+    } else {
+        format!("resets in {}", fmt_elapsed(delta_ms))
+    }
+}
+
 /// The ink a `/usage` bar's filled cells wear, from the same 0.0–1.0
 /// fraction the bar renders (U2). THRESHOLD LAW: below 0.70 the calm `ok`
 /// slot, from 0.70 the `warn` slot, from 0.90 the `err` slot — theme

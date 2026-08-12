@@ -34,13 +34,14 @@
 
 use haider_core::{
     AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
-    RequestInputCheckpoint, SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
+    PartialStreamCheckpoint, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle,
+    TurnAdmissionDisposition,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
 };
@@ -54,7 +55,14 @@ const PAGE_SIZE: usize = 512;
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
     Checkpoint(Box<RecoveredCheckpoint>),
+    PartialStream(Box<RecoveredPartialStream>),
     ChildWait(Box<RecoveredChildWait>),
+}
+
+pub(crate) struct RecoveredPartialStream {
+    pub(crate) accepted: AcceptedTurn,
+    pub(crate) checkpoint: PartialStreamCheckpoint,
+    pub(crate) committed_answer: Option<RawEnvelope>,
 }
 
 pub(crate) struct RecoveredChildWait {
@@ -77,6 +85,7 @@ struct RunReduction {
     state_generation: u64,
     user_seq: Option<u64>,
     open_items: HashMap<ItemId, OpenItem>,
+    incomplete_items: HashMap<ItemId, String>,
     menu: Option<OpenMenu>,
     menu_answers: HashMap<MenuId, RawEnvelope>,
     tool_results: HashSet<String>,
@@ -197,6 +206,35 @@ pub(crate) async fn recover_interrupted_turns(
                     checkpoint,
                     committed_answer,
                 })));
+                continue;
+            }
+            if let Some(checkpoint) = pending_partial_stream_checkpoint(&reduction)
+                && matches!(
+                    &state,
+                    RunState::InputRequired { menu } if *menu == checkpoint.menu.id
+                )
+            {
+                let committed_answer = reduction.menu_answers.get(&checkpoint.menu.id).cloned();
+                let accepted_seq = reduction.user_seq.ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("partial-stream checkpoint run {run_id} has no user message"),
+                        false,
+                    )
+                })?;
+                recovered.push(RecoveredWork::PartialStream(Box::new(
+                    RecoveredPartialStream {
+                        accepted: recovered_acceptance(
+                            &session_id,
+                            &run_id,
+                            accepted_seq,
+                            store.worker_generation(),
+                            reduction.branch_id.clone(),
+                        ),
+                        checkpoint,
+                        committed_answer,
+                    },
+                )));
                 continue;
             }
             if matches!(
@@ -393,6 +431,14 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
             }
         }
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+            let item = match item {
+                TurnItem::IncompleteAgentMessage { text, .. } => {
+                    reduction.open_items.remove(&item_id);
+                    reduction.incomplete_items.insert(item_id, text);
+                    return;
+                }
+                item => item,
+            };
             if let TurnItem::ToolCall {
                 call_id,
                 name,
@@ -475,6 +521,27 @@ fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint
             }
             _ => None,
         })
+}
+
+fn pending_partial_stream_checkpoint(reduction: &RunReduction) -> Option<PartialStreamCheckpoint> {
+    let open_menu = reduction.menu.clone()?;
+    let MenuKind::ErrorRecovery {
+        card: haider_protocol::menu::ErrorRecoveryCardKind::PartialStream,
+        source_item: Some(item_id),
+        ..
+    } = &open_menu.menu.kind
+    else {
+        return None;
+    };
+    let item_id = item_id.clone();
+    let text = reduction.incomplete_items.get(&item_id)?;
+    Some(PartialStreamCheckpoint {
+        menu: open_menu.menu,
+        request_seq: open_menu.request_seq,
+        opening_generation: open_menu.opening_generation,
+        item_id,
+        text: text.clone(),
+    })
 }
 
 async fn pending_child_wait(
@@ -728,6 +795,17 @@ fn interrupted_terminal_payloads(
             code: failure_code,
             message: failure_message,
             retryable,
+            presentation: Some(ErrorPresentation::new(
+                "run-recovery-interrupted",
+                "Interrupted run could not resume",
+                "Haider recovered the journal but could not safely resume this run.",
+                ErrorScope::Turn,
+                [if retryable {
+                    ErrorAction::RetryFresh
+                } else {
+                    ErrorAction::None
+                }],
+            )),
         });
     }
     payloads.push(EventPayload::RunState(terminal));
@@ -803,4 +881,118 @@ fn recovery_envelopes(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod partial_stream_recovery_tests {
+    use super::*;
+    use haider_protocol::error::ErrorAction;
+    use haider_protocol::menu::{ErrorRecoveryCardKind, MenuOption, MenuScope};
+
+    #[test]
+    fn e4_restart_reconstructs_partial_stream_checkpoint_from_durable_marker() {
+        let session_id = SessionId::new("partial-restart");
+        let run_id = RunId::new("run-partial-restart");
+        let item_id = ItemId::new("partial-item");
+        let menu_id = MenuId::new("partial-menu");
+        let presentation = ErrorPresentation::new(
+            "stream-interrupted",
+            "Response interrupted",
+            "The provider stream ended before the response completed.",
+            ErrorScope::Turn,
+            [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+        );
+        let menu = Menu {
+            id: menu_id.clone(),
+            kind: MenuKind::ErrorRecovery {
+                card: ErrorRecoveryCardKind::PartialStream,
+                presentation: presentation.clone(),
+                option_actions: vec![ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+                provider: Some("fake".into()),
+                account: None,
+                source_run: Some(run_id.clone()),
+                source_item: Some(item_id.clone()),
+            },
+            title: presentation.title.clone(),
+            body: vec![presentation.detail.clone()],
+            options: vec![
+                MenuOption {
+                    key: "continue_partial".into(),
+                    label: "Continue from partial".into(),
+                    detail: None,
+                    decision: None,
+                },
+                MenuOption {
+                    key: "retry_fresh".into(),
+                    label: "Retry from scratch".into(),
+                    detail: None,
+                    decision: None,
+                },
+            ],
+            blocking: true,
+            scope: MenuScope::Session,
+            origin: "provider".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        };
+        let payloads = vec![
+            EventPayload::UserMessage {
+                text: "question".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: item_id.clone(),
+                item: TurnItem::IncompleteAgentMessage {
+                    text: "durable partial".into(),
+                    interruption: presentation,
+                },
+            }),
+            EventPayload::MenuOpened(menu),
+            EventPayload::RunState(RunState::InputRequired {
+                menu: menu_id.clone(),
+            }),
+        ];
+        let mut envelopes = recovery_envelopes(
+            7,
+            &DeviceId::new("restart-device"),
+            &session_id,
+            &run_id,
+            None,
+            payloads,
+        )
+        .expect("recovery envelopes");
+        for (index, envelope) in envelopes.iter_mut().enumerate() {
+            envelope.seq = u64::try_from(index + 1).expect("small sequence");
+        }
+        let mut reductions = HashMap::new();
+        for envelope in envelopes {
+            reduce(&mut reductions, envelope);
+        }
+        let reduction = reductions.get(&run_id).expect("reduced run");
+        let checkpoint = pending_partial_stream_checkpoint(reduction).expect("partial checkpoint");
+        assert_eq!(checkpoint.item_id, item_id);
+        assert_eq!(checkpoint.text, "durable partial");
+        assert_eq!(checkpoint.menu.id, menu_id);
+        assert_eq!(checkpoint.request_seq, 3);
+        assert_eq!(checkpoint.opening_generation, 7);
+        assert_eq!(
+            checkpoint.menu.kind,
+            MenuKind::ErrorRecovery {
+                card: ErrorRecoveryCardKind::PartialStream,
+                presentation: ErrorPresentation::new(
+                    "stream-interrupted",
+                    "Response interrupted",
+                    "The provider stream ended before the response completed.",
+                    ErrorScope::Turn,
+                    [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+                ),
+                option_actions: vec![ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+                provider: Some("fake".into()),
+                account: None,
+                source_run: Some(run_id),
+                source_item: Some(item_id),
+            }
+        );
+    }
 }

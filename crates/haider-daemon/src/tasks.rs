@@ -402,6 +402,7 @@ impl TaskFacade {
                 cursor: None,
                 status: ToolResultStatus::Rejected,
                 reason: Some("background task concurrency cap reached".into()),
+                presentation: None,
             });
         }
         let name = name.unwrap_or_else(|| default_task_name(&command));
@@ -492,6 +493,7 @@ impl TaskFacade {
             cursor: None,
             status: ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         })
     }
 
@@ -678,6 +680,7 @@ impl TaskFacade {
             cursor: result_cursor,
             status: ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         })
     }
 
@@ -711,6 +714,7 @@ impl TaskFacade {
                 cursor: None,
                 status: ToolResultStatus::Completed,
                 reason: None,
+                presentation: None,
             });
         }
         let operation = TaskKillEffect {
@@ -733,6 +737,7 @@ impl TaskFacade {
             cursor: None,
             status: ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         })
     }
 
@@ -1101,6 +1106,7 @@ fn unknown_task_result(task_id: &str) -> BoundedResult {
         cursor: None,
         status: ToolResultStatus::Unknown,
         reason: Some("no background task with this id exists in this session".into()),
+        presentation: None,
     }
 }
 

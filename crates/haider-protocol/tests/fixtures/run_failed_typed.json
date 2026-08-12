@@ -1,0 +1,21 @@
+{
+  "type": "run_failed",
+  "code": "provider_error",
+  "message": "legacy safe fallback",
+  "retryable": true,
+  "presentation": {
+    "subcode": "rate-limited",
+    "title": "Provider rate limit reached",
+    "detail": "Wait for the provider limit to reset, then retry.",
+    "provider_http_status": 429,
+    "provider_request_id": "req-safe-42",
+    "retry_after_ms": 30000,
+    "reset_at_ms": 1753500030000,
+    "scope": "account",
+    "allowed_actions": [
+      "wait",
+      "retry",
+      "switch_account"
+    ]
+  }
+}

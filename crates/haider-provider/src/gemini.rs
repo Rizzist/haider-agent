@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
@@ -28,7 +28,6 @@ pub const GEMINI_CACHED_CONTENTS_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/cachedContents";
 const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
 const STREAM_CAPACITY: usize = 32;
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
 const OPAQUE_KIND: &str = "signed_part";
 const CALL_ID_PREFIX: &str = "gemini-call-";
 const TRANSPORT_CONFIG: GeminiTransportConfig = GeminiTransportConfig {
@@ -240,7 +239,11 @@ impl GeminiProvider {
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let body = response.bytes().await.map_err(transport_error)?.to_vec();
+        let body = if response.status().is_success() {
+            response.bytes().await.map_err(transport_error)?.to_vec()
+        } else {
+            read_error_body_bounded(response).await?
+        };
         Ok(GeminiCapture {
             status,
             retry_after,
@@ -375,17 +378,22 @@ impl Provider for GeminiProvider {
         let response = self.send_request(&request).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .or_else(|| response.headers().get("x-goog-request-id"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
             let body = read_error_body_bounded(response).await?;
-            return Err(replay_gemini_http_error(
-                status,
-                retry_after.as_deref(),
-                &body,
-            ));
+            return Err(
+                replay_gemini_http_error(status, retry_after.as_deref(), &body)
+                    .with_http_metadata(status, request_id.as_deref()),
+            );
         }
 
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
@@ -440,13 +448,23 @@ impl GeminiCacheBackend for GeminiHttpCacheBackend {
         })?
         .map_err(transport_error)?;
         if !response.status().is_success() {
-            return Err(ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                format!(
-                    "Gemini CachedContent create returned HTTP {}",
-                    response.status().as_u16()
-                ),
-            ));
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .or_else(|| response.headers().get("x-goog-request-id"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = read_error_body_bounded(response).await?;
+            return Err(
+                replay_gemini_http_error(status, retry_after.as_deref(), &body)
+                    .with_http_metadata(status, request_id.as_deref()),
+            );
         }
         let body = response.bytes().await.map_err(transport_error)?;
         let value: serde_json::Value = serde_json::from_slice(&body)
@@ -493,13 +511,18 @@ impl GeminiCacheBackend for GeminiHttpCacheBackend {
         if response.status().is_success() || response.status().as_u16() == 404 {
             Ok(())
         } else {
-            Err(ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                format!(
-                    "Gemini CachedContent delete returned HTTP {}",
-                    response.status().as_u16()
-                ),
-            ))
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok());
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .or_else(|| response.headers().get("x-goog-request-id"))
+                .and_then(|value| value.to_str().ok());
+            Err(replay_gemini_http_error(status, retry_after, &[])
+                .with_http_metadata(status, request_id))
         }
     }
 }
@@ -1818,16 +1841,8 @@ pub fn replay_gemini_http_error(
             _ => ProviderErrorKind::InvalidRequest,
         },
     };
-    if let Some(detail) = detail {
-        let bounded = detail
-            .chars()
-            .filter(|character| !character.is_control())
-            .take(200)
-            .collect::<String>();
-        eprintln!("gemini error detail (log-only): {bounded}");
-    }
     let retry_after_ms = if matches!(kind, ProviderErrorKind::RateLimited) {
-        parse_retry_info(api_error).or_else(|| parse_retry_after(retry_after))
+        parse_retry_info(api_error).or_else(|| crate::parse_retry_after_ms(retry_after))
     } else {
         None
     };
@@ -1837,7 +1852,9 @@ pub fn replay_gemini_http_error(
     } else {
         format!("Gemini HTTP {status} returned {}", provider_kind_name(kind))
     };
-    ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+    ProviderError::new(kind, message)
+        .with_retry_after_ms(retry_after_ms)
+        .with_http_metadata(status, None)
 }
 
 fn gemini_billing_exhausted(api_error: Option<&serde_json::Value>, detail: Option<&str>) -> bool {
@@ -1916,34 +1933,8 @@ pub(crate) fn parse_protobuf_duration_ms(value: &str) -> Option<u64> {
     whole.checked_mul(1_000)?.checked_add(millis)
 }
 
-fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    let value = value?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return seconds.checked_mul(1_000);
-    }
-    let retry_at = httpdate::parse_http_date(value).ok()?;
-    let duration = retry_at
-        .duration_since(SystemTime::now())
-        .unwrap_or_default();
-    u64::try_from(duration.as_millis()).ok()
-}
-
-async fn read_error_body_bounded(
-    mut response: reqwest::Response,
-) -> Result<Vec<u8>, ProviderError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-        let remaining = ERROR_BODY_LIMIT.saturating_sub(body.len());
-        if remaining == 0 {
-            break;
-        }
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+async fn read_error_body_bounded(response: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
+    crate::read_http_error_body_bounded(response, "Gemini").await
 }
 
 fn provider_kind_name(kind: ProviderErrorKind) -> &'static str {

@@ -1,1 +1,13 @@
-{"kind":"context_exceeded","message":"Gemini HTTP 400 returned context overflow","retryable":false}
+{
+  "kind": "context_exceeded",
+  "message": "Gemini HTTP 400 returned context overflow",
+  "retryable": false,
+  "presentation": {
+    "subcode": "context-exceeded",
+    "title": "Context window exceeded",
+    "detail": "The request does not fit the active model context window.",
+    "provider_http_status": 400,
+    "scope": "session",
+    "allowed_actions": ["choose_model", "retry"]
+  }
+}

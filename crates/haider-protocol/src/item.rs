@@ -7,6 +7,7 @@
 //! `session/update` fan-out maps 1:1 onto these.
 
 use crate::agent::ChildReport;
+use crate::error::ErrorPresentation;
 use crate::history::TodoItem;
 use crate::ids::{AgentId, ArtifactRef, ItemId};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,14 @@ use serde::{Deserialize, Serialize};
 pub enum TurnItem {
     AgentMessage {
         text: String,
+    },
+    /// Assistant text whose provider stream ended after content committed.
+    /// This variant is deliberately not replayed as completed assistant
+    /// history; an explicit recovery action decides whether to prime a new
+    /// turn from it or retry fresh.
+    IncompleteAgentMessage {
+        text: String,
+        interruption: ErrorPresentation,
     },
     Reasoning {
         summary: String,

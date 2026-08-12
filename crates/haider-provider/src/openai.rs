@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
@@ -62,7 +62,8 @@ const DEEPSEEK_HOST: &str = "api.deepseek.com";
 
 const STREAM_CAPACITY: usize = 32;
 const MODELS_BODY_LIMIT: usize = 1024 * 1024;
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
+#[cfg(test)]
+const ERROR_BODY_LIMIT: usize = crate::HTTP_ERROR_BODY_LIMIT;
 const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     retry_policy: OpenAiRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
@@ -939,12 +940,17 @@ impl Provider for OpenAiCompatibleProvider {
 
 async fn capture(response: reqwest::Response) -> Result<OpenAiCapture, ProviderError> {
     let status = response.status().as_u16();
+    let success = response.status().is_success();
     let retry_after = response
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.bytes().await.map_err(transport_error)?.to_vec();
+    let body = if success {
+        response.bytes().await.map_err(transport_error)?.to_vec()
+    } else {
+        read_body_bounded(response, crate::HTTP_ERROR_BODY_LIMIT, "OpenAI HTTP error").await?
+    };
     Ok(OpenAiCapture {
         status,
         retry_after,
@@ -976,15 +982,24 @@ async fn checked_stream(
 
 async fn http_error_from_response(response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let retry_after = response
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    match read_body_bounded(response, ERROR_BODY_LIMIT, "OpenAI HTTP error").await {
+    let error = match read_body_bounded(response, crate::HTTP_ERROR_BODY_LIMIT, "OpenAI HTTP error")
+        .await
+    {
         Ok(body) => replay_openai_http_error(status, retry_after.as_deref(), &body),
         Err(error) => classify_http_body_read_error(status, retry_after.as_deref(), error),
-    }
+    };
+    error.with_http_metadata(status, request_id.as_deref())
 }
 
 fn classify_http_body_read_error(
@@ -997,6 +1012,7 @@ fn classify_http_body_read_error(
         error.kind = classified.kind;
         error.retryable = classified.retryable;
         error.retry_after_ms = classified.retry_after_ms;
+        error.presentation = classified.presentation;
     }
     error
 }
@@ -2211,24 +2227,32 @@ pub fn replay_openai_http_error(
             | ProviderErrorKind::Overloaded
             | ProviderErrorKind::Transport
     )
-    .then(|| parse_retry_after(retry_after))
+    .then(|| crate::parse_retry_after_ms(retry_after))
     .flatten();
-    if let Some(detail) = parsed
-        .as_ref()
-        .and_then(|envelope| envelope.error.message.as_deref())
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-    {
-        let bounded: String = detail.chars().take(200).collect();
-        eprintln!("openai http {status} error detail (log-only): {bounded}");
-    }
     let message = if kind == ProviderErrorKind::QuotaExhausted {
         "provider quota/credit exhausted — retrying will not help; check billing or switch account"
             .to_owned()
     } else {
         format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind))
     };
-    ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+    let error = match error_code.or(error_type) {
+        Some("account_deleted" | "account_not_found") => ProviderError::new_with_presentation(
+            kind,
+            message,
+            crate::account_deleted_presentation(),
+        ),
+        Some("account_deactivated" | "account_revoked" | "organization_deactivated") => {
+            ProviderError::new_with_presentation(
+                kind,
+                message,
+                crate::account_revoked_presentation(),
+            )
+        }
+        _ => ProviderError::new(kind, message),
+    };
+    error
+        .with_retry_after_ms(retry_after_ms)
+        .with_http_metadata(status, None)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2289,20 +2313,6 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
         }
         _ => ProviderErrorKind::InvalidRequest,
     };
-    // The JOURNALED message stays sanitized (the no-leak law: bodies can
-    // echo request content). The API's own prose — the diagnostic that
-    // names WHY — goes to the owner-local daemon log only (stderr →
-    // daemon.log), bounded. Nine sanitized invalid-request failures
-    // carried no cause anywhere; this is the middle path.
-    if let Some(detail) = error
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-    {
-        let bounded: String = detail.chars().take(200).collect();
-        eprintln!("openai stream error detail (log-only): {bounded}");
-    }
     ProviderError::new(
         provider_kind,
         format!(
@@ -3661,18 +3671,6 @@ fn normalize_chat_finish_reason(reason: &str) -> Result<FinishReason, ProviderEr
             "OpenAI-compatible Chat returned unknown finish_reason `{other}`"
         ))),
     }
-}
-
-fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    let value = value?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return seconds.checked_mul(1_000);
-    }
-    let retry_at = httpdate::parse_http_date(value).ok()?;
-    let duration = retry_at
-        .duration_since(SystemTime::now())
-        .unwrap_or_default();
-    u64::try_from(duration.as_millis()).ok()
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {

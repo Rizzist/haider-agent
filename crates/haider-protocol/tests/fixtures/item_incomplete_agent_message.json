@@ -1,0 +1,19 @@
+{
+  "type": "item",
+  "event": "completed",
+  "item_id": "item-partial-1",
+  "item": {
+    "item": "incomplete_agent_message",
+    "text": "A response prefix",
+    "interruption": {
+      "subcode": "stream-interrupted",
+      "title": "Response stream interrupted",
+      "detail": "The provider connection ended after part of the response was received.",
+      "scope": "turn",
+      "allowed_actions": [
+        "continue_partial",
+        "retry_fresh"
+      ]
+    }
+  }
+}

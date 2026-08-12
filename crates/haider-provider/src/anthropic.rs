@@ -1,7 +1,7 @@
 //! Anthropic Messages API adapter.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
@@ -457,7 +457,11 @@ impl AnthropicProvider {
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let body = response.bytes().await.map_err(transport_error)?.to_vec();
+        let body = if response.status().is_success() {
+            response.bytes().await.map_err(transport_error)?.to_vec()
+        } else {
+            read_error_body_bounded(response).await?
+        };
         Ok(AnthropicCapture {
             status,
             retry_after,
@@ -636,17 +640,22 @@ impl Provider for AnthropicProvider {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let request_id = response
+                .headers()
+                .get("request-id")
+                .or_else(|| response.headers().get("x-request-id"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            let body = response.bytes().await.map_err(transport_error)?;
-            return Err(replay_anthropic_http_error(
-                status,
-                retry_after.as_deref(),
-                &body,
-            ));
+            let body = read_error_body_bounded(response).await?;
+            return Err(
+                replay_anthropic_http_error(status, retry_after.as_deref(), &body)
+                    .with_http_metadata(status, request_id.as_deref()),
+            );
         }
 
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
@@ -657,6 +666,13 @@ impl Provider for AnthropicProvider {
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
+}
+
+/// Bytes beyond the shared HTTP error-body ceiling are never parsed or logged.
+pub(crate) async fn read_error_body_bounded(
+    response: reqwest::Response,
+) -> Result<Vec<u8>, ProviderError> {
+    crate::read_http_error_body_bounded(response, "Anthropic").await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -944,9 +960,28 @@ pub fn replay_anthropic_http_error(
             | ProviderErrorKind::Overloaded
             | ProviderErrorKind::Transport
     )
-    .then(|| parse_retry_after(retry_after))
+    .then(|| crate::parse_retry_after_ms(retry_after))
     .flatten();
-    ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+    let error = match body_kind {
+        Some("account_not_found_error" | "account_deleted_error") => {
+            ProviderError::new_with_presentation(
+                kind,
+                message,
+                crate::account_deleted_presentation(),
+            )
+        }
+        Some("account_deactivated_error" | "account_revoked_error") => {
+            ProviderError::new_with_presentation(
+                kind,
+                message,
+                crate::account_revoked_presentation(),
+            )
+        }
+        _ => ProviderError::new(kind, message),
+    };
+    error
+        .with_retry_after_ms(retry_after_ms)
+        .with_http_metadata(status, None)
 }
 
 pub(crate) fn anthropic_billing_exhausted(kind: &str, message: &str) -> bool {
@@ -962,15 +997,4 @@ pub(crate) fn anthropic_billing_exhausted(kind: &str, message: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct ErrorEnvelope {
     error: WireApiError,
-}
-
-fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    let value = value?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return seconds.checked_mul(1_000);
-    }
-    let retry_at = httpdate::parse_http_date(value).ok()?;
-    let now = SystemTime::now();
-    let duration = retry_at.duration_since(now).unwrap_or_default();
-    u64::try_from(duration.as_millis()).ok()
 }

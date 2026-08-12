@@ -19,12 +19,14 @@
 use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::{ErrorAction, ErrorPresentation};
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{ItemId, NodeId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::Usage;
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState, VerifyStep, WaitReason};
+use std::fmt::Write as _;
 
 /// Command output kept per block for display — the FULL output lives in the
 /// store; the transcript shows a bounded tail (bound at the edge, never let
@@ -54,10 +56,13 @@ pub enum TranscriptEntry {
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
     /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
     Note { text: String },
-    /// A failed run's PUBLIC reason (`EventPayload::RunFailed`, W5g-6).
-    /// The owner hit three silent ✗ ERRORED badges before this row
-    /// existed — the reason was always in the envelope, never on screen.
-    Error { text: String },
+    /// A failed run's public reason. `text` is the plain/greppable
+    /// authority; a typed presentation enables the structured card render.
+    /// Client-observed and legacy wire failures carry `None`.
+    Error {
+        text: String,
+        presentation: Option<ErrorPresentation>,
+    },
     /// A shell builtin run against the demo VFS (sim ShellRow,
     /// tui.js:3910-3918) — deliberately envelope-free: the sim bypasses
     /// the model/harness ("local, instant, no model turn").
@@ -399,6 +404,7 @@ impl SessionProjection {
                     self.run_failure_reported = true;
                     self.entries.push(TranscriptEntry::Error {
                         text: "errored — the daemon reported no public reason".to_owned(),
+                        presentation: None,
                     });
                 }
                 self.run = Some(run.clone());
@@ -428,14 +434,19 @@ impl SessionProjection {
             EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
             // The failed run's PUBLIC reason joins the transcript (W5g-6):
             // the envelope always carried it; only the badge ever showed.
-            EventPayload::RunFailed { code, message, .. } => {
-                let code = serde_json::to_value(code)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| format!("{code:?}"));
+            EventPayload::RunFailed {
+                code,
+                message,
+                presentation,
+                ..
+            } => {
                 self.run_failure_reported = true;
                 self.entries.push(TranscriptEntry::Error {
-                    text: format!("{code} — {message}"),
+                    text: presentation.as_ref().map_or_else(
+                        || format!("{} — {message}", code.as_str()),
+                        format_error_presentation,
+                    ),
+                    presentation: presentation.clone(),
                 });
             }
             // B2b-m3: a committed node ANCHORS its display entry — never a
@@ -453,17 +464,20 @@ impl SessionProjection {
                     EffectOutcome::Failed { error } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("effect failed — {error}"),
+                            presentation: None,
                         });
                     }
                     EffectOutcome::CancelledEscalated { note } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("effect cancel escalated — {note}"),
+                            presentation: None,
                         });
                     }
                     EffectOutcome::Unknown => {
                         self.entries.push(TranscriptEntry::Error {
                             text: "effect outcome unknown — crash window; reconcile via the recovery menu"
                                 .to_owned(),
+                            presentation: None,
                         });
                     }
                     EffectOutcome::Ok | EffectOutcome::Cancelled => {}
@@ -478,16 +492,19 @@ impl SessionProjection {
                             text: format!(
                                 "verify errored — cycle cap exhausted · {new_errors} new error(s)"
                             ),
+                            presentation: None,
                         });
                     }
                     VerifyVerdict::FailedEnv { item } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("verify failed-env — {item}"),
+                            presentation: None,
                         });
                     }
                     VerifyVerdict::Incomplete { reason } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("verify incomplete — {reason}"),
+                            presentation: None,
                         });
                     }
                     VerifyVerdict::AcknowledgedRed => {
@@ -495,6 +512,7 @@ impl SessionProjection {
                             text: format!(
                                 "verify acknowledged-red — {new_errors} new error(s) cited out of scope"
                             ),
+                            presentation: None,
                         });
                     }
                     _ => {}
@@ -552,7 +570,10 @@ impl SessionProjection {
     /// selection refusal landing after its picker closed) — never a
     /// silent IDLE. Local display truth only: nothing durable claims it.
     pub fn record_local_error(&mut self, text: String) {
-        self.entries.push(TranscriptEntry::Error { text });
+        self.entries.push(TranscriptEntry::Error {
+            text,
+            presentation: None,
+        });
     }
 
     /// B2b-m3: associate one committed node with the display entry it
@@ -1151,9 +1172,181 @@ fn bounded_tool_reason(result: &haider_protocol::tool::BoundedResult) -> Option<
     if result.status.is_completed() {
         return None;
     }
+    if let Some(presentation) = &result.presentation {
+        return Some(format_error_presentation(presentation));
+    }
     let reason = result.reason.as_deref().unwrap_or("tool did not complete");
     let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     Some(normalized.chars().take(240).collect())
+}
+
+/// One typed action's lowercase display word — shared by the transcript
+/// string, the styled fact line, and plain mode (one vocabulary).
+#[must_use]
+pub const fn error_action_word(action: ErrorAction) -> &'static str {
+    match action {
+        ErrorAction::Retry => "retry",
+        ErrorAction::Relogin => "re-login",
+        ErrorAction::Reimport => "re-import",
+        ErrorAction::EditKey => "edit key",
+        ErrorAction::SwitchAccount => "switch account",
+        ErrorAction::TopUp => "top up",
+        ErrorAction::Wait => "wait",
+        ErrorAction::ChooseModel => "choose model",
+        ErrorAction::ContactAdmin => "contact admin",
+        ErrorAction::ContinuePartial => "continue partial",
+        ErrorAction::RetryFresh => "retry fresh",
+        ErrorAction::None => "none",
+    }
+}
+
+/// Fact-line shed ranks. Rank zero is permanent; higher ranks shed first.
+pub const FACT_RANK_SUBCODE: u8 = 0;
+pub const FACT_RANK_RESET: u8 = 1;
+pub const FACT_RANK_ACTIONS: u8 = 2;
+pub const FACT_RANK_HTTP: u8 = 3;
+pub const FACT_RANK_REQUEST: u8 = 4;
+
+/// The compact fact line's segments, display-ordered (`subcode · HTTP 429
+/// · req 8f3a2c1d… · resets in 2m 14s`), each with its shed rank. A
+/// missing datum DROPS its whole segment — never a placeholder. The
+/// request id is shortened to its first 8 chars (the journal keeps the
+/// full id; the transcript string renders it whole). The reset segment is
+/// LIVE when the caller supplies the daemon clock (`reset_at_ms − now`)
+/// and otherwise the static provider delay recorded at failure time.
+#[must_use]
+pub fn error_fact_segments(
+    presentation: &ErrorPresentation,
+    now_ms: Option<u64>,
+) -> Vec<(String, u8)> {
+    build_error_fact_segments(presentation, now_ms, 0)
+}
+
+fn build_error_fact_segments(
+    presentation: &ErrorPresentation,
+    now_ms: Option<u64>,
+    additional_capacity: usize,
+) -> Vec<(String, u8)> {
+    let reset = match (
+        now_ms,
+        presentation.reset_at_ms,
+        presentation.retry_after_ms,
+    ) {
+        (Some(now), Some(reset_at), _) => {
+            Some(crate::format::fmt_reset_in(reset_at.saturating_sub(now)))
+        }
+        (_, _, Some(retry_after)) => Some(crate::format::fmt_reset_in(retry_after)),
+        _ => None,
+    };
+    let capacity = 1
+        + usize::from(presentation.provider_http_status.is_some())
+        + usize::from(presentation.provider_request_id.is_some())
+        + usize::from(reset.is_some())
+        + additional_capacity;
+    let mut segments = Vec::with_capacity(capacity);
+    segments.push((presentation.subcode.as_str().to_owned(), FACT_RANK_SUBCODE));
+    if let Some(status) = presentation.provider_http_status {
+        segments.push((format!("HTTP {status}"), FACT_RANK_HTTP));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        segments.push((
+            format!("req {}", short_request_id(request_id)),
+            FACT_RANK_REQUEST,
+        ));
+    }
+    if let Some(reset) = reset {
+        segments.push((reset, FACT_RANK_RESET));
+    }
+    segments
+}
+
+/// [`error_fact_segments`] plus the trailing `actions: …` hint — the
+/// transcript row's form, where the card's option list is not on screen
+/// to carry the recovery vocabulary.
+#[must_use]
+pub fn error_fact_segments_with_actions(
+    presentation: &ErrorPresentation,
+    now_ms: Option<u64>,
+) -> Vec<(String, u8)> {
+    let mut segments = build_error_fact_segments(presentation, now_ms, 1);
+    let mut actions = "actions: ".to_owned();
+    push_error_actions(&mut actions, &presentation.allowed_actions);
+    segments.push((actions, FACT_RANK_ACTIONS));
+    segments
+}
+
+pub(crate) fn join_error_fact_segments(segments: &[(String, u8)]) -> String {
+    let capacity = segments
+        .iter()
+        .map(|(segment, _)| segment.len())
+        .sum::<usize>()
+        + segments.len().saturating_sub(1) * " · ".len();
+    let mut joined = String::with_capacity(capacity);
+    for (index, (segment, _)) in segments.iter().enumerate() {
+        if index > 0 {
+            joined.push_str(" · ");
+        }
+        joined.push_str(segment);
+    }
+    joined
+}
+
+/// The fact line's request-id form: the first 8 chars, `…`-marked when
+/// shortened. Support-grade full ids stay in the transcript string and
+/// the journal.
+fn short_request_id(request_id: &str) -> String {
+    let mut characters = request_id.chars();
+    let mut short: String = characters.by_ref().take(8).collect();
+    if characters.next().is_some() {
+        short.push('…');
+    }
+    short
+}
+
+/// The canonical flattened formatter for typed failures and the
+/// plain/greppable authority. Shape: `{title} — {detail} [{subcode}] · HTTP {status} · req {id}
+/// · {resets in …} · actions: {…}` — provider facts additive after the
+/// subcode (full request id here; the styled fact line shortens it), the
+/// reset human-readable via the h/m/s vocabulary, absent facts dropping
+/// their whole segment.
+#[must_use]
+pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
+    let mut out = String::with_capacity(
+        presentation.title.len()
+            + presentation.detail.len()
+            + presentation.subcode.as_str().len()
+            + 32,
+    );
+    write!(
+        out,
+        "{} — {} [{}]",
+        presentation.title,
+        presentation.detail,
+        presentation.subcode.as_str()
+    )
+    .expect("writing to String cannot fail");
+    if let Some(status) = presentation.provider_http_status {
+        write!(out, " · HTTP {status}").expect("writing to String cannot fail");
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        write!(out, " · req {request_id}").expect("writing to String cannot fail");
+    }
+    if let Some(retry_after) = presentation.retry_after_ms {
+        out.push_str(" · ");
+        out.push_str(&crate::format::fmt_reset_in(retry_after));
+    }
+    out.push_str(" · actions: ");
+    push_error_actions(&mut out, &presentation.allowed_actions);
+    out
+}
+
+fn push_error_actions(out: &mut String, actions: &[ErrorAction]) {
+    for (index, action) in actions.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(error_action_word(*action));
+    }
 }
 
 /// The sim's badge PULSE set, verbatim (tui.js:5558-5563:

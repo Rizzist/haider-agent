@@ -1866,6 +1866,7 @@ async fn adjacent_store_failure_and_errored_terminal_return_without_hanging() {
                     code: ErrorCode::StoreCorrupt,
                     message: "injected append failure".into(),
                     retryable: false,
+                    presentation: None,
                 },
             ),
         )

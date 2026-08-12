@@ -2,6 +2,7 @@
 //! results are bounded previews + artifact refs — full payloads live in the CAS.
 
 use crate::effect::EffectClass;
+use crate::error::ErrorPresentation;
 use crate::ids::ArtifactRef;
 use crate::item::ToolStatus;
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,10 @@ pub struct BoundedResult {
     /// Bounded, sanitized human-readable reason for a non-success disposition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Safe structured presentation for every non-success result. Optional
+    /// only for backward-compatible decoding of pre-E2 journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ErrorPresentation>,
 }
 
 /// Terminal result status carried independently of the tool-call lifecycle.

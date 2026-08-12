@@ -4,7 +4,7 @@
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::error::ErrorCode;
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
@@ -829,6 +829,13 @@ fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
                 code: ErrorCode::StoreCorrupt,
                 message: "injected terminal append failure".into(),
                 retryable: false,
+                presentation: Some(ErrorPresentation::new(
+                    "store-corrupt",
+                    "Haider could not complete the turn",
+                    "injected terminal append failure",
+                    ErrorScope::Turn,
+                    [ErrorAction::None],
+                )),
             }),
         ]
     );
@@ -879,6 +886,7 @@ fn run_exit_codes_are_table_driven() {
                     code: HeadlessFailureCode::Run(ErrorCode::ProviderError),
                     message: "provider".into(),
                     retryable: false,
+                    presentation: None,
                 }),
             ),
             EX_PROVIDER,
@@ -890,6 +898,7 @@ fn run_exit_codes_are_table_driven() {
                     code: HeadlessFailureCode::Run(ErrorCode::ProviderTimeout),
                     message: "provider timeout".into(),
                     retryable: true,
+                    presentation: None,
                 }),
             ),
             EX_PROVIDER,
@@ -903,6 +912,7 @@ fn run_exit_codes_are_table_driven() {
                     code: HeadlessFailureCode::Blocked(HeadlessBlockingReason::InputRequired),
                     message: "input".into(),
                     retryable: false,
+                    presentation: None,
                 }),
             ),
             EX_BLOCKED,
@@ -914,6 +924,7 @@ fn run_exit_codes_are_table_driven() {
                     code: HeadlessFailureCode::Run(ErrorCode::ProtocolMismatch),
                     message: "protocol".into(),
                     retryable: false,
+                    presentation: None,
                 }),
             ),
             EX_PROTOCOL,
@@ -925,6 +936,7 @@ fn run_exit_codes_are_table_driven() {
                     code: HeadlessFailureCode::Run(ErrorCode::PermissionDenied),
                     message: "permission".into(),
                     retryable: false,
+                    presentation: None,
                 }),
             ),
             EX_BLOCKED,
@@ -936,6 +948,7 @@ fn run_exit_codes_are_table_driven() {
                     code: HeadlessFailureCode::Run(ErrorCode::EffectUnknownOutcome),
                     message: "unknown effect".into(),
                     retryable: false,
+                    presentation: None,
                 }),
             ),
             EX_BLOCKED,
@@ -947,6 +960,7 @@ fn run_exit_codes_are_table_driven() {
                     code: HeadlessFailureCode::Internal,
                     message: "internal".into(),
                     retryable: false,
+                    presentation: None,
                 }),
             ),
             EX_SOFTWARE,
@@ -1201,6 +1215,7 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
             },
             message: "failure".into(),
             retryable: false,
+            presentation: None,
         });
         let failed = result(outcome, failure);
         let mut bytes = Vec::new();

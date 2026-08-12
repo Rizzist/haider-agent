@@ -161,6 +161,7 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
             kind: "permission".into(),
             title: "Allow write?".into(),
             permission_description: Some("write src/lib.rs".into()),
+            presentation: None,
         }),
     );
     let input = digest(
@@ -170,6 +171,7 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
             kind: "secret".into(),
             title: "Credential required".into(),
             permission_description: None,
+            presentation: None,
         }),
     );
     let sessions = SessionsDocument {
@@ -368,6 +370,7 @@ fn human_views_include_the_scoped_observation_facts() {
             kind: "permission".into(),
             title: "Allow write?".into(),
             permission_description: Some("write src/lib.rs".into()),
+            presentation: None,
         }),
     );
     let sessions = SessionsDocument {

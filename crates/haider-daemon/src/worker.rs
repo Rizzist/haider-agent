@@ -38,10 +38,11 @@ use base64::Engine;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, CompiledPromptProjection,
     ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
-    DeferredToolResult, EventIdGenerator, HarnessActor, HarnessConfig, PromptHistoryCompiler,
-    RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn,
-    SubmitCommittedTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
+    DeferredToolResult, EventIdGenerator, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
+    PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn,
+    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
+    estimate_provider_request_input_tokens, presentation_for_haider_error,
     sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
@@ -788,6 +789,7 @@ pub(crate) fn defer_shell_handoff(
 struct PendingTurn {
     accepted: AcceptedTurn,
     checkpoint: Option<RequestInputCheckpoint>,
+    partial_stream: Option<PartialStreamCheckpoint>,
     child_wait: Option<ChildWaitCheckpoint>,
     committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
     recovery_ready: Option<oneshot::Sender<Result<(), HaiderError>>>,
@@ -813,6 +815,7 @@ impl PendingTurn {
         Self {
             accepted,
             checkpoint: None,
+            partial_stream: None,
             child_wait: None,
             committed_answer: None,
             recovery_ready: None,
@@ -1037,6 +1040,26 @@ impl WorkerManagerHandle {
         self.send_recovery(PendingTurn {
             accepted,
             checkpoint: Some(checkpoint),
+            partial_stream: None,
+            child_wait: None,
+            committed_answer,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_partial_stream(
+        &self,
+        accepted: AcceptedTurn,
+        partial_stream: PartialStreamCheckpoint,
+        committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.send_recovery(PendingTurn {
+            accepted,
+            checkpoint: None,
+            partial_stream: Some(partial_stream),
             child_wait: None,
             committed_answer,
             recovery_ready: Some(completed),
@@ -1050,6 +1073,7 @@ impl WorkerManagerHandle {
         self.send_recovery(PendingTurn {
             accepted,
             checkpoint: None,
+            partial_stream: None,
             child_wait: None,
             committed_answer: None,
             recovery_ready: Some(completed),
@@ -1067,6 +1091,7 @@ impl WorkerManagerHandle {
         self.send_recovery(PendingTurn {
             accepted,
             checkpoint: None,
+            partial_stream: None,
             child_wait: Some(child_wait),
             committed_answer: None,
             recovery_ready: Some(completed),
@@ -3484,6 +3509,7 @@ async fn start_turn(
     let PendingTurn {
         accepted,
         checkpoint,
+        partial_stream,
         child_wait,
         mut committed_answer,
         recovery_ready: _,
@@ -3757,8 +3783,8 @@ async fn start_turn(
         Arc::new(lease.clone()),
         dispatcher.clone(),
     );
-    match checkpoint.as_ref() {
-        Some(checkpoint) => {
+    match (checkpoint.as_ref(), partial_stream.as_ref()) {
+        (Some(checkpoint), None) => {
             lease
                 .register_recovered_harness(
                     harness.clone(),
@@ -3769,26 +3795,47 @@ async fn start_turn(
                 .await
                 .map_err(hub_error)?;
         }
-        None => {
+        (None, Some(checkpoint)) => {
+            lease
+                .register_recovered_harness(
+                    harness.clone(),
+                    checkpoint.menu.id.clone(),
+                    checkpoint.request_seq,
+                    checkpoint.opening_generation,
+                )
+                .await
+                .map_err(hub_error)?;
+        }
+        (None, None) => {
             lease
                 .register_harness(harness.clone())
                 .await
                 .map_err(hub_error)?;
         }
+        (Some(_), Some(_)) => {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "recovered turn contains two menu checkpoint kinds",
+                false,
+            ));
+        }
     }
-    if committed_answer.is_none()
-        && let Some(checkpoint) = checkpoint.as_ref()
-    {
-        committed_answer =
-            find_committed_menu_answer(lease, accepted.branch_id.as_ref(), &checkpoint.menu.id)
-                .await?;
+    if committed_answer.is_none() {
+        let menu = checkpoint
+            .as_ref()
+            .map(|checkpoint| &checkpoint.menu)
+            .or_else(|| partial_stream.as_ref().map(|checkpoint| &checkpoint.menu));
+        if let Some(menu) = menu {
+            committed_answer =
+                find_committed_menu_answer(lease, accepted.branch_id.as_ref(), &menu.id).await?;
+        }
     }
     if let Some(answer) = committed_answer {
         harness.apply_committed_menu_event(answer)?;
     }
     let actor = AbortOnDropTask::new(tokio::spawn(actor.run()));
-    let submitted = match (checkpoint, child_wait) {
-        (Some(checkpoint), None) => {
+    let submitted = match (checkpoint, partial_stream, child_wait) {
+        (Some(checkpoint), None, None) => {
             harness
                 .submit_checkpoint_turn(SubmitCheckpointTurn {
                     run_id: accepted.run_id.clone(),
@@ -3797,7 +3844,16 @@ async fn start_turn(
                 })
                 .await
         }
-        (None, Some(checkpoint)) => {
+        (None, Some(checkpoint), None) => {
+            harness
+                .submit_partial_stream_turn(SubmitPartialStreamTurn {
+                    run_id: accepted.run_id.clone(),
+                    messages,
+                    checkpoint,
+                })
+                .await
+        }
+        (None, None, Some(checkpoint)) => {
             harness
                 .submit_child_wait_turn(SubmitChildWaitTurn {
                     run_id: accepted.run_id.clone(),
@@ -3806,7 +3862,7 @@ async fn start_turn(
                 })
                 .await
         }
-        (None, None) => {
+        (None, None, None) => {
             harness
                 .submit_committed_turn(SubmitCommittedTurn {
                     run_id: accepted.run_id.clone(),
@@ -3814,9 +3870,9 @@ async fn start_turn(
                 })
                 .await
         }
-        (Some(_), Some(_)) => Err(HaiderError::new(
+        _ => Err(HaiderError::new(
             ErrorCode::StoreCorrupt,
-            "recovered turn contains two checkpoint kinds",
+            "recovered turn contains multiple checkpoint kinds",
             false,
         )),
     };
@@ -4189,6 +4245,7 @@ async fn append_failure(
                 code: error.code,
                 message: sanitized_failure_message(&error.message),
                 retryable: error.retryable,
+                presentation: Some(presentation_for_haider_error(&error)),
             },
             EventPayload::RunState(RunState::Errored),
         ],
@@ -5458,6 +5515,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         cursor: None,
                         status: ToolResultStatus::Rejected,
                         reason: Some(error.message.clone()),
+                        presentation: None,
                     }));
                 }
                 Err(error) => return Err(error),
@@ -5476,6 +5534,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 cursor: None,
                 status: ToolResultStatus::Completed,
                 reason: None,
+                presentation: None,
             }));
         }
         let result = match route {
@@ -5661,6 +5720,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     cursor: None,
                                     status: ToolResultStatus::Completed,
                                     reason: None,
+                                    presentation: None,
                                 })
                             }
                             Err(error) => {
@@ -5681,6 +5741,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     cursor: None,
                                     status: ToolResultStatus::Failed,
                                     reason: Some(crate::worker::bounded_failure_reason(&message)),
+                                    presentation: None,
                                 })
                             }
                         }
@@ -5754,6 +5815,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         cursor: None,
                         status: ToolResultStatus::Failed,
                         reason: Some("web_search is unavailable in this session".into()),
+                        presentation: None,
                     }),
                     Some(executor) => {
                         match executor
@@ -5769,6 +5831,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     cursor: None,
                                     status: ToolResultStatus::Completed,
                                     reason: None,
+                                    presentation: None,
                                 })
                             }
                             Err(failure) => {
@@ -5785,6 +5848,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     cursor: None,
                                     status: ToolResultStatus::Failed,
                                     reason: Some(bounded_failure_reason(&failure.message)),
+                                    presentation: None,
                                 })
                             }
                         }
@@ -6099,6 +6163,7 @@ fn typed_error_result(
             _ => ToolResultStatus::Failed,
         },
         reason: Some(bounded_failure_reason(&error.to_string())),
+        presentation: None,
     }
 }
 
@@ -6121,6 +6186,7 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(bounded_failure_reason(&refusal.message())),
+        presentation: None,
     }
 }
 
@@ -6140,6 +6206,7 @@ fn recursion_limit_result() -> BoundedResult {
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(crate::delegation::RECURSION_LIMIT_MESSAGE.into()),
+        presentation: None,
     }
 }
 
@@ -6162,6 +6229,7 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(reason),
+        presentation: None,
     }
 }
 
@@ -6477,6 +6545,7 @@ pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
             | haider_protocol::item::ToolStatus::InProgress => ToolResultStatus::Unknown,
         },
         reason,
+        presentation: None,
     }
 }
 

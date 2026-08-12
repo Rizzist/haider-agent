@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
-use haider_rpc::haider_protocol::error::ErrorCode;
+use haider_rpc::haider_protocol::error::{ErrorCode, ErrorPresentation};
 use haider_rpc::haider_protocol::ids::{ArtifactRef, MenuId, RunId, SessionId};
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{DecisionKind, MenuKind};
@@ -298,6 +298,8 @@ pub struct HeadlessRunFailure {
     pub code: HeadlessFailureCode,
     pub message: String,
     pub retryable: bool,
+    /// Safe typed presentation copied from the durable protocol event/card.
+    pub presentation: Option<ErrorPresentation>,
 }
 
 /// Failure-code source retained without string-parsing durable run codes.
@@ -314,7 +316,7 @@ impl HeadlessFailureCode {
     #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Run(code) => error_code_name(*code),
+            Self::Run(code) => code.as_str(),
             Self::Rpc(code) => code,
             Self::Timeout => "timeout",
             Self::Blocked(reason) => reason.code(),
@@ -535,6 +537,7 @@ struct HeadlessReducer {
     usage: Option<Usage>,
     permission_denials: Vec<HeadlessPermissionDenial>,
     pending_run_failure: Option<(u64, HeadlessRunFailure)>,
+    blocking_presentation: Option<ErrorPresentation>,
     terminal: Option<NaturalTerminal>,
     menu_resolutions: BTreeMap<String, DurableMenuResolution>,
     cancel_observed: bool,
@@ -556,6 +559,7 @@ impl HeadlessReducer {
             usage: None,
             permission_denials: Vec::new(),
             pending_run_failure: None,
+            blocking_presentation: None,
             terminal: None,
             menu_resolutions: BTreeMap::new(),
             cancel_observed: false,
@@ -624,18 +628,27 @@ impl HeadlessReducer {
                 item: TurnItem::AgentMessage { text },
                 ..
             }) => self.response = Some(text),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::IncompleteAgentMessage { text, .. },
+                ..
+            }) => self.response = Some(text),
             EventPayload::Usage(usage) => self.usage = Some(usage),
             EventPayload::RunFailed {
                 code,
                 message,
                 retryable,
+                presentation,
             } => {
+                let message = presentation
+                    .as_ref()
+                    .map_or(message, |safe| format!("{} — {}", safe.title, safe.detail));
                 self.pending_run_failure = Some((
                     envelope.seq,
                     HeadlessRunFailure {
                         code: HeadlessFailureCode::Run(code),
                         message,
                         retryable,
+                        presentation,
                     },
                 ));
             }
@@ -674,9 +687,17 @@ impl HeadlessReducer {
                         option_index,
                     });
                 }
-                _ => self
+                MenuKind::ErrorRecovery { presentation, .. } => {
+                    if menu.blocking {
+                        self.blocking_presentation = Some(presentation);
+                        self.actions
+                            .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired));
+                    }
+                }
+                _ if menu.blocking => self
                     .actions
                     .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired)),
+                _ => {}
             },
             EventPayload::MenuAnswered(answer) => {
                 self.menu_resolutions.insert(
@@ -723,6 +744,7 @@ impl HeadlessReducer {
                         code: HeadlessFailureCode::Internal,
                         message: "errored run had no adjacent correlated RunFailed".into(),
                         retryable: false,
+                        presentation: None,
                     });
                 self.terminal = Some(NaturalTerminal {
                     outcome: HeadlessOutcome::Errored,
@@ -2452,6 +2474,16 @@ fn finalize(
     attachments: Vec<ArtifactRef>,
     forced: Option<ForcedOutcome>,
 ) -> HeadlessRunResult {
+    let HeadlessReducer {
+        session_id,
+        response,
+        usage,
+        permission_denials,
+        blocking_presentation,
+        terminal,
+        background_tasks,
+        ..
+    } = reducer;
     let (outcome, failure, terminal_seq) = match forced {
         Some(ForcedOutcome::Timeout) => (
             HeadlessOutcome::Timeout,
@@ -2459,19 +2491,27 @@ fn finalize(
                 code: HeadlessFailureCode::Timeout,
                 message: "run exceeded its wall-clock timeout".into(),
                 retryable: false,
+                presentation: None,
             }),
-            reducer.terminal.as_ref().map(|terminal| terminal.seq),
+            terminal.as_ref().map(|terminal| terminal.seq),
         ),
-        Some(ForcedOutcome::Blocked(reason)) => (
-            HeadlessOutcome::InputRequired,
-            Some(HeadlessRunFailure {
-                code: HeadlessFailureCode::Blocked(reason),
-                message: reason.message().into(),
-                retryable: false,
-            }),
-            reducer.terminal.as_ref().map(|terminal| terminal.seq),
-        ),
-        None => reducer.terminal.as_ref().map_or_else(
+        Some(ForcedOutcome::Blocked(reason)) => {
+            let message = blocking_presentation.as_ref().map_or_else(
+                || reason.message().into(),
+                |safe| format!("{} — {}", safe.title, safe.detail),
+            );
+            (
+                HeadlessOutcome::InputRequired,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Blocked(reason),
+                    message,
+                    retryable: false,
+                    presentation: blocking_presentation,
+                }),
+                terminal.as_ref().map(|terminal| terminal.seq),
+            )
+        }
+        None => terminal.map_or_else(
             || {
                 (
                     HeadlessOutcome::Errored,
@@ -2479,21 +2519,15 @@ fn finalize(
                         code: HeadlessFailureCode::Internal,
                         message: "event stream ended without a correlated terminal".into(),
                         retryable: false,
+                        presentation: None,
                     }),
                     None,
                 )
             },
-            |terminal| {
-                (
-                    terminal.outcome,
-                    terminal.failure.clone(),
-                    Some(terminal.seq),
-                )
-            },
+            |terminal| (terminal.outcome, terminal.failure, Some(terminal.seq)),
         ),
     };
-    let background_tasks_running = reducer
-        .background_tasks
+    let background_tasks_running = background_tasks
         .iter()
         .filter(|(_, (_, running))| *running)
         .map(|(task_id, (name, _))| HeadlessBackgroundTask {
@@ -2502,15 +2536,15 @@ fn finalize(
         })
         .collect();
     HeadlessRunResult {
-        session_id: reducer.session_id,
+        session_id,
         run_id,
         provider,
         model,
         attachments,
         outcome,
-        response: reducer.response,
-        usage: reducer.usage,
-        permission_denials: reducer.permission_denials,
+        response,
+        usage,
+        permission_denials,
         failure,
         terminal_seq,
         background_tasks_running,
@@ -2574,34 +2608,6 @@ fn command_id(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     format!("{prefix}-{}-{nanos}-{sequence}", std::process::id())
-}
-
-fn error_code_name(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::InvalidArgument => "invalid_argument",
-        ErrorCode::UnknownMethod => "unknown_method",
-        ErrorCode::ProtocolMismatch => "protocol_mismatch",
-        ErrorCode::Unauthorized => "unauthorized",
-        ErrorCode::CredentialMissing => "credential_missing",
-        ErrorCode::CredentialLimited => "credential_limited",
-        ErrorCode::SessionNotFound => "session_not_found",
-        ErrorCode::RunNotActive => "run_not_active",
-        ErrorCode::MenuNotFound => "menu_not_found",
-        ErrorCode::MenuAlreadyAnswered => "menu_already_answered",
-        ErrorCode::SingleWriterViolation => "single_writer_violation",
-        ErrorCode::Busy => "busy",
-        ErrorCode::RevisionConflict => "revision_conflict",
-        ErrorCode::LoopLimit => "loop_limit",
-        ErrorCode::ProviderError => "provider_error",
-        ErrorCode::ProviderTimeout => "provider_timeout",
-        ErrorCode::VisionUnsupported => "vision_unsupported",
-        ErrorCode::StoreCorrupt => "store_corrupt",
-        ErrorCode::StoreLocked => "store_locked",
-        ErrorCode::PermissionDenied => "permission_denied",
-        ErrorCode::EffectUnknownOutcome => "effect_unknown_outcome",
-        ErrorCode::Internal => "internal",
-        ErrorCode::Unknown => "unknown",
-    }
 }
 
 /// The required feature set after normalizing a headless request. Exposed for
