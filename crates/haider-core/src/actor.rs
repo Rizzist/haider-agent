@@ -2701,17 +2701,17 @@ impl HarnessActor {
             .retry_after_ms
             .is_some_and(|delay| delay > MAX_PROVIDER_RETRY_AFTER_MS)
         {
-            let mut capped = ProviderError::new(
-                error.kind,
-                format!(
+            let capped = ProviderError {
+                kind: error.kind,
+                message: format!(
                     "provider retry-after {}ms exceeds the {}ms respect cap",
                     error.retry_after_ms.unwrap_or_default(),
                     MAX_PROVIDER_RETRY_AFTER_MS
                 ),
-            )
-            .with_retry_after_ms(error.retry_after_ms)
-            .with_presentation(error.presentation.clone());
-            capped.retryable = true;
+                retryable: true,
+                retry_after_ms: error.retry_after_ms,
+                presentation: error.presentation.clone(),
+            };
             return Err(DriveError::Provider(capped));
         }
         let reason = if error.kind == ProviderErrorKind::RateLimited {
@@ -4199,8 +4199,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
-        provider_error.presentation =
-            specialized_provider_presentation(&self.config.usage_scope.auth_scope, &provider_error);
+        specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(
                 self.next_menu_id(),
@@ -4997,15 +4996,15 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
     error
 }
 
-fn specialized_provider_presentation(auth_scope: &str, error: &ProviderError) -> ErrorPresentation {
+fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError) {
     if error.kind != ProviderErrorKind::Authentication {
-        return error.presentation.clone();
+        return;
     }
     if matches!(
         error.presentation.subcode.as_str(),
         "account-revoked" | "account-deleted"
     ) {
-        return error.presentation.clone();
+        return;
     }
     let mut specialized = match auth_scope {
         "api_key" => ErrorPresentation::new(
@@ -5026,10 +5025,10 @@ fn specialized_provider_presentation(auth_scope: &str, error: &ProviderError) ->
                 ErrorAction::SwitchAccount,
             ],
         ),
-        _ => return error.presentation.clone(),
+        _ => return,
     };
     copy_provider_metadata(&mut specialized, &error.presentation);
-    specialized
+    error.presentation = specialized;
 }
 
 fn stream_interruption_presentation(error: &ProviderError) -> ErrorPresentation {
@@ -5120,6 +5119,7 @@ fn recovery_menu(
     blocking: bool,
 ) -> Menu {
     let mut body = vec![presentation.detail.clone()];
+    let title = presentation.title.clone();
     if let Some(status) = presentation.provider_http_status {
         body.push(format!("Provider HTTP status: {status}"));
     }
@@ -5154,14 +5154,14 @@ fn recovery_menu(
         id,
         kind: MenuKind::ErrorRecovery {
             card,
-            presentation: presentation.clone(),
+            presentation,
             option_actions,
             provider,
             account,
             source_run: Some(source_run.clone()),
             source_item,
         },
-        title: presentation.title,
+        title,
         body,
         options,
         blocking,
@@ -5230,21 +5230,16 @@ pub fn presentation_for_haider_error(error: &HaiderError) -> ErrorPresentation {
     if let Some(presentation) = &error.presentation {
         return presentation.clone();
     }
-    let subcode = serde_json::to_value(error.code)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "internal".into())
-        .replace('_', "-");
     ErrorPresentation::new(
-        subcode,
+        error.code.as_subcode(),
         "Haider could not complete the turn",
         sanitized_failure_message(&error.message),
         ErrorScope::Turn,
-        if error.retryable {
-            vec![ErrorAction::Retry]
+        [if error.retryable {
+            ErrorAction::Retry
         } else {
-            vec![ErrorAction::None]
-        },
+            ErrorAction::None
+        }],
     )
 }
 
@@ -5806,37 +5801,37 @@ fn ensure_tool_result_presentation(result: &mut BoundedResult) {
     if result.status.is_completed() || result.presentation.is_some() {
         return;
     }
-    let (subcode, title, detail, actions) = match result.status {
+    let (subcode, title, detail, action) = match result.status {
         ToolResultStatus::Completed => return,
         ToolResultStatus::Rejected => (
             "tool-rejected",
             "Tool request rejected",
             "The tool request was not authorized.",
-            vec![ErrorAction::None],
+            ErrorAction::None,
         ),
         ToolResultStatus::Conflict => (
             "tool-conflict",
             "Tool request conflicted",
             "The tool could not safely apply because the target changed.",
-            vec![ErrorAction::Retry],
+            ErrorAction::Retry,
         ),
         ToolResultStatus::Failed => (
             "tool-failed",
             "Tool execution failed",
             "The tool did not complete successfully.",
-            vec![ErrorAction::Retry],
+            ErrorAction::Retry,
         ),
         ToolResultStatus::Cancelled => (
             "tool-cancelled",
             "Tool execution cancelled",
             "The tool stopped before it completed.",
-            vec![ErrorAction::Retry],
+            ErrorAction::Retry,
         ),
         ToolResultStatus::Unknown => (
             "tool-outcome-unknown",
             "Tool outcome unknown",
             "Haider could not confirm whether the tool completed.",
-            vec![ErrorAction::None],
+            ErrorAction::None,
         ),
     };
     result.presentation = Some(ErrorPresentation::new(
@@ -5844,7 +5839,7 @@ fn ensure_tool_result_presentation(result: &mut BoundedResult) {
         title,
         detail,
         ErrorScope::Tool,
-        actions,
+        [action],
     ));
 }
 

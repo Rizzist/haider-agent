@@ -1,11 +1,10 @@
 //! Anthropic Messages API adapter.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
-use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{CapabilityDoc, FeatureResolve};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -66,7 +65,6 @@ pub const ANTHROPIC_FAST_BETA_VALUE: &str = "fast-mode-2026-02-01";
 const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
 const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
     retry_policy: AnthropicRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
@@ -670,24 +668,11 @@ impl Provider for AnthropicProvider {
     }
 }
 
-/// Anthropic error bodies obey the same 64 KiB ceiling as the OpenAI and
-/// Gemini adapters. Bytes beyond the bound are never parsed or logged.
+/// Bytes beyond the shared HTTP error-body ceiling are never parsed or logged.
 pub(crate) async fn read_error_body_bounded(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
 ) -> Result<Vec<u8>, ProviderError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-        let remaining = ERROR_BODY_LIMIT.saturating_sub(body.len());
-        if remaining == 0 {
-            break;
-        }
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    crate::read_http_error_body_bounded(response, "Anthropic").await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -975,25 +960,24 @@ pub fn replay_anthropic_http_error(
             | ProviderErrorKind::Overloaded
             | ProviderErrorKind::Transport
     )
-    .then(|| parse_retry_after(retry_after))
+    .then(|| crate::parse_retry_after_ms(retry_after))
     .flatten();
-    let mut error = ProviderError::new(kind, message);
-    error.presentation = match body_kind {
-        Some("account_not_found_error" | "account_deleted_error") => ErrorPresentation::new(
-            "account-deleted",
-            "Provider account unavailable",
-            "The provider no longer recognizes this account.",
-            ErrorScope::Account,
-            [ErrorAction::SwitchAccount],
-        ),
-        Some("account_deactivated_error" | "account_revoked_error") => ErrorPresentation::new(
-            "account-revoked",
-            "Provider account access revoked",
-            "This provider account can no longer be used.",
-            ErrorScope::Account,
-            [ErrorAction::SwitchAccount, ErrorAction::ContactAdmin],
-        ),
-        _ => error.presentation,
+    let error = match body_kind {
+        Some("account_not_found_error" | "account_deleted_error") => {
+            ProviderError::new_with_presentation(
+                kind,
+                message,
+                crate::account_deleted_presentation(),
+            )
+        }
+        Some("account_deactivated_error" | "account_revoked_error") => {
+            ProviderError::new_with_presentation(
+                kind,
+                message,
+                crate::account_revoked_presentation(),
+            )
+        }
+        _ => ProviderError::new(kind, message),
     };
     error
         .with_retry_after_ms(retry_after_ms)
@@ -1013,15 +997,4 @@ pub(crate) fn anthropic_billing_exhausted(kind: &str, message: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct ErrorEnvelope {
     error: WireApiError,
-}
-
-fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    let value = value?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return seconds.checked_mul(1_000);
-    }
-    let retry_at = httpdate::parse_http_date(value).ok()?;
-    let now = SystemTime::now();
-    let duration = retry_at.duration_since(now).unwrap_or_default();
-    u64::try_from(duration.as_millis()).ok()
 }

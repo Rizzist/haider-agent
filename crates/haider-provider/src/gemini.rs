@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
@@ -28,7 +28,6 @@ pub const GEMINI_CACHED_CONTENTS_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/cachedContents";
 const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
 const STREAM_CAPACITY: usize = 32;
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
 const OPAQUE_KIND: &str = "signed_part";
 const CALL_ID_PREFIX: &str = "gemini-call-";
 const TRANSPORT_CONFIG: GeminiTransportConfig = GeminiTransportConfig {
@@ -1843,7 +1842,7 @@ pub fn replay_gemini_http_error(
         },
     };
     let retry_after_ms = if matches!(kind, ProviderErrorKind::RateLimited) {
-        parse_retry_info(api_error).or_else(|| parse_retry_after(retry_after))
+        parse_retry_info(api_error).or_else(|| crate::parse_retry_after_ms(retry_after))
     } else {
         None
     };
@@ -1934,34 +1933,8 @@ pub(crate) fn parse_protobuf_duration_ms(value: &str) -> Option<u64> {
     whole.checked_mul(1_000)?.checked_add(millis)
 }
 
-fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    let value = value?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return seconds.checked_mul(1_000);
-    }
-    let retry_at = httpdate::parse_http_date(value).ok()?;
-    let duration = retry_at
-        .duration_since(SystemTime::now())
-        .unwrap_or_default();
-    u64::try_from(duration.as_millis()).ok()
-}
-
-async fn read_error_body_bounded(
-    mut response: reqwest::Response,
-) -> Result<Vec<u8>, ProviderError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-        let remaining = ERROR_BODY_LIMIT.saturating_sub(body.len());
-        if remaining == 0 {
-            break;
-        }
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+async fn read_error_body_bounded(response: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
+    crate::read_http_error_body_bounded(response, "Gemini").await
 }
 
 fn provider_kind_name(kind: ProviderErrorKind) -> &'static str {

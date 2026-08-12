@@ -45,6 +45,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
+const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
+
 /// Digests Haider-owned tool definitions after recursively sorting object
 /// keys in their schemas.
 ///
@@ -389,12 +391,20 @@ pub struct ProviderError {
 
 impl ProviderError {
     pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self::new_with_presentation(kind, message, provider_error_presentation(kind))
+    }
+
+    fn new_with_presentation(
+        kind: ProviderErrorKind,
+        message: impl Into<String>,
+        presentation: ErrorPresentation,
+    ) -> Self {
         Self {
             kind,
             message: message.into(),
             retryable: kind.default_retryable(),
             retry_after_ms: None,
-            presentation: provider_error_presentation(kind),
+            presentation,
         }
     }
 
@@ -538,12 +548,72 @@ fn provider_error_presentation(kind: ProviderErrorKind) -> ErrorPresentation {
     }
 }
 
+fn account_deleted_presentation() -> ErrorPresentation {
+    ErrorPresentation::new(
+        "account-deleted",
+        "Provider account unavailable",
+        "The provider no longer recognizes this account.",
+        ErrorScope::Account,
+        [ErrorAction::SwitchAccount],
+    )
+}
+
+fn account_revoked_presentation() -> ErrorPresentation {
+    ErrorPresentation::new(
+        "account-revoked",
+        "Provider account access revoked",
+        "This provider account can no longer be used.",
+        ErrorScope::Account,
+        [ErrorAction::SwitchAccount, ErrorAction::ContactAdmin],
+    )
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+fn parse_retry_after_ms(value: Option<&str>) -> Option<u64> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return seconds.checked_mul(1_000);
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    let duration = retry_at
+        .duration_since(SystemTime::now())
+        .unwrap_or_default();
+    u64::try_from(duration.as_millis()).ok()
+}
+
+async fn read_http_error_body_bounded(
+    mut response: reqwest::Response,
+    provider: &'static str,
+) -> Result<Vec<u8>, ProviderError> {
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(HTTP_ERROR_BODY_LIMIT);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| reqwest_transport_error(provider, error))?
+    {
+        let remaining = HTTP_ERROR_BODY_LIMIT.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Classifies one reqwest connection failure without exposing a credential-

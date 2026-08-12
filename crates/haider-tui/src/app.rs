@@ -9681,12 +9681,22 @@ impl AppModel {
                     |key| menu.options.iter().position(|option| option.key == key),
                 )?;
                 option_actions.get(index).copied().map(|action| {
-                    (
-                        action,
-                        provider.clone(),
-                        account.as_ref().map(|alias| alias.as_str().to_owned()),
-                        presentation.reset_at_ms,
-                    )
+                    let provider = if matches!(action, ErrorAction::Relogin | ErrorAction::TopUp) {
+                        provider.clone()
+                    } else {
+                        None
+                    };
+                    let account = if action == ErrorAction::Relogin {
+                        account.as_ref().map(|alias| alias.as_str().to_owned())
+                    } else {
+                        None
+                    };
+                    let reset_at_ms = if action == ErrorAction::Wait {
+                        presentation.reset_at_ms
+                    } else {
+                        None
+                    };
+                    (action, provider, account, reset_at_ms)
                 })
             })
         } else {

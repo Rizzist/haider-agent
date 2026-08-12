@@ -26,6 +26,7 @@ use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::Usage;
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState, VerifyStep, WaitReason};
+use std::fmt::Write as _;
 
 /// Command output kept per block for display — the FULL output lives in the
 /// store; the transcript shows a bounded tail (bound at the edge, never let
@@ -55,15 +56,9 @@ pub enum TranscriptEntry {
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
     /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
     Note { text: String },
-    /// A failed run's PUBLIC reason (`EventPayload::RunFailed`, W5g-6).
-    /// The owner hit three silent ✗ ERRORED badges before this row
-    /// existed — the reason was always in the envelope, never on screen.
-    /// `presentation` keeps the TYPED contract beside the flattened text
-    /// (E-wave visual pass) so the styled renderer can give it the card
-    /// treatment — err title, dim detail, muted fact line — while `text`
-    /// stays the plain/greppable authority; client-observed failures and
-    /// non-presentation wire errors carry `None` and keep the baseline
-    /// one-line render.
+    /// A failed run's public reason. `text` is the plain/greppable
+    /// authority; a typed presentation enables the structured card render.
+    /// Client-observed and legacy wire failures carry `None`.
     Error {
         text: String,
         presentation: Option<ErrorPresentation>,
@@ -448,13 +443,7 @@ impl SessionProjection {
                 self.run_failure_reported = true;
                 self.entries.push(TranscriptEntry::Error {
                     text: presentation.as_ref().map_or_else(
-                        || {
-                            let code = serde_json::to_value(code)
-                                .ok()
-                                .and_then(|value| value.as_str().map(str::to_owned))
-                                .unwrap_or_else(|| format!("{code:?}"));
-                            format!("{code} — {message}")
-                        },
+                        || format!("{} — {message}", code.as_str()),
                         format_error_presentation,
                     ),
                     presentation: presentation.clone(),
@@ -1211,11 +1200,7 @@ pub const fn error_action_word(action: ErrorAction) -> &'static str {
     }
 }
 
-/// Fact-line SHED RANKS (E-wave visual pass): under width pressure the
-/// fact line drops WHOLE segments, highest rank first, display order
-/// untouched — the S4 metrics-degradation idiom. The subcode is the
-/// stable identity and never sheds; the reset countdown outranks the
-/// actions hint, which outranks provider metadata.
+/// Fact-line shed ranks. Rank zero is permanent; higher ranks shed first.
 pub const FACT_RANK_SUBCODE: u8 = 0;
 pub const FACT_RANK_RESET: u8 = 1;
 pub const FACT_RANK_ACTIONS: u8 = 2;
@@ -1234,16 +1219,14 @@ pub fn error_fact_segments(
     presentation: &ErrorPresentation,
     now_ms: Option<u64>,
 ) -> Vec<(String, u8)> {
-    let mut segments = vec![(presentation.subcode.as_str().to_owned(), FACT_RANK_SUBCODE)];
-    if let Some(status) = presentation.provider_http_status {
-        segments.push((format!("HTTP {status}"), FACT_RANK_HTTP));
-    }
-    if let Some(request_id) = &presentation.provider_request_id {
-        segments.push((
-            format!("req {}", short_request_id(request_id)),
-            FACT_RANK_REQUEST,
-        ));
-    }
+    build_error_fact_segments(presentation, now_ms, 0)
+}
+
+fn build_error_fact_segments(
+    presentation: &ErrorPresentation,
+    now_ms: Option<u64>,
+    additional_capacity: usize,
+) -> Vec<(String, u8)> {
     let reset = match (
         now_ms,
         presentation.reset_at_ms,
@@ -1255,6 +1238,22 @@ pub fn error_fact_segments(
         (_, _, Some(retry_after)) => Some(crate::format::fmt_reset_in(retry_after)),
         _ => None,
     };
+    let capacity = 1
+        + usize::from(presentation.provider_http_status.is_some())
+        + usize::from(presentation.provider_request_id.is_some())
+        + usize::from(reset.is_some())
+        + additional_capacity;
+    let mut segments = Vec::with_capacity(capacity);
+    segments.push((presentation.subcode.as_str().to_owned(), FACT_RANK_SUBCODE));
+    if let Some(status) = presentation.provider_http_status {
+        segments.push((format!("HTTP {status}"), FACT_RANK_HTTP));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        segments.push((
+            format!("req {}", short_request_id(request_id)),
+            FACT_RANK_REQUEST,
+        ));
+    }
     if let Some(reset) = reset {
         segments.push((reset, FACT_RANK_RESET));
     }
@@ -1269,60 +1268,85 @@ pub fn error_fact_segments_with_actions(
     presentation: &ErrorPresentation,
     now_ms: Option<u64>,
 ) -> Vec<(String, u8)> {
-    let mut segments = error_fact_segments(presentation, now_ms);
-    let actions = presentation
-        .allowed_actions
-        .iter()
-        .map(|action| error_action_word(*action))
-        .collect::<Vec<_>>()
-        .join(", ");
-    segments.push((format!("actions: {actions}"), FACT_RANK_ACTIONS));
+    let mut segments = build_error_fact_segments(presentation, now_ms, 1);
+    let mut actions = "actions: ".to_owned();
+    push_error_actions(&mut actions, &presentation.allowed_actions);
+    segments.push((actions, FACT_RANK_ACTIONS));
     segments
+}
+
+pub(crate) fn join_error_fact_segments(segments: &[(String, u8)]) -> String {
+    let capacity = segments
+        .iter()
+        .map(|(segment, _)| segment.len())
+        .sum::<usize>()
+        + segments.len().saturating_sub(1) * " · ".len();
+    let mut joined = String::with_capacity(capacity);
+    for (index, (segment, _)) in segments.iter().enumerate() {
+        if index > 0 {
+            joined.push_str(" · ");
+        }
+        joined.push_str(segment);
+    }
+    joined
 }
 
 /// The fact line's request-id form: the first 8 chars, `…`-marked when
 /// shortened. Support-grade full ids stay in the transcript string and
 /// the journal.
 fn short_request_id(request_id: &str) -> String {
-    let mut short: String = request_id.chars().take(8).collect();
-    if request_id.chars().count() > 8 {
+    let mut characters = request_id.chars();
+    let mut short: String = characters.by_ref().take(8).collect();
+    if characters.next().is_some() {
         short.push('…');
     }
     short
 }
 
-/// The single baseline text formatter for typed failures — the transcript
-/// row's flattened text and the plain/greppable authority. E-wave visual
-/// pass shape: `{title} — {detail} [{subcode}] · HTTP {status} · req {id}
+/// The canonical flattened formatter for typed failures and the
+/// plain/greppable authority. Shape: `{title} — {detail} [{subcode}] · HTTP {status} · req {id}
 /// · {resets in …} · actions: {…}` — provider facts additive after the
 /// subcode (full request id here; the styled fact line shortens it), the
 /// reset human-readable via the h/m/s vocabulary, absent facts dropping
 /// their whole segment.
 #[must_use]
 pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
-    let actions = presentation
-        .allowed_actions
-        .iter()
-        .map(|action| error_action_word(*action))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut out = format!(
+    let mut out = String::with_capacity(
+        presentation.title.len()
+            + presentation.detail.len()
+            + presentation.subcode.as_str().len()
+            + 32,
+    );
+    write!(
+        out,
         "{} — {} [{}]",
         presentation.title,
         presentation.detail,
-        presentation.subcode.as_str(),
-    );
+        presentation.subcode.as_str()
+    )
+    .expect("writing to String cannot fail");
     if let Some(status) = presentation.provider_http_status {
-        out.push_str(&format!(" · HTTP {status}"));
+        write!(out, " · HTTP {status}").expect("writing to String cannot fail");
     }
     if let Some(request_id) = &presentation.provider_request_id {
-        out.push_str(&format!(" · req {request_id}"));
+        write!(out, " · req {request_id}").expect("writing to String cannot fail");
     }
     if let Some(retry_after) = presentation.retry_after_ms {
-        out.push_str(&format!(" · {}", crate::format::fmt_reset_in(retry_after)));
+        out.push_str(" · ");
+        out.push_str(&crate::format::fmt_reset_in(retry_after));
     }
-    out.push_str(&format!(" · actions: {actions}"));
+    out.push_str(" · actions: ");
+    push_error_actions(&mut out, &presentation.allowed_actions);
     out
+}
+
+fn push_error_actions(out: &mut String, actions: &[ErrorAction]) {
+    for (index, action) in actions.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(error_action_word(*action));
+    }
 }
 
 /// The sim's badge PULSE set, verbatim (tui.js:5558-5563:

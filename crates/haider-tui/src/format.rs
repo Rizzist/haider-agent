@@ -148,14 +148,9 @@ pub fn fmt_reset(generated_at_ms: u64, resets_at_ms: u64) -> String {
     }
 }
 
-/// Reset countdowns for error presentations (E-wave visual pass): the
-/// remaining delay as `resets in {fmt_elapsed}` — the SAME law-pinned
-/// h/m/s vocabulary the subtree rows wear (`resets in 2m 14s`), seconds
-/// kept because a provider backoff is short and a minutes-floored figure
-/// would idle for a whole minute. A sub-second or elapsed delta says
-/// `resets soon` ([`fmt_reset`]'s vocabulary for the same case). Distinct
-/// from [`fmt_reset`] by design: `/usage` windows span hours-to-days and
-/// floor to minutes; an error card counts seconds.
+/// Formats short provider backoffs with second precision. Sub-second or
+/// elapsed delays say `resets soon`; unlike [`fmt_reset`], this must not
+/// floor short delays to minutes.
 #[must_use]
 pub fn fmt_reset_in(delta_ms: u64) -> String {
     if delta_ms < 1000 {

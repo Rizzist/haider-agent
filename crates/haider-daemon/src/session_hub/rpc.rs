@@ -246,18 +246,16 @@ impl ObserveProjection {
                 }
             }
             EventPayload::MenuOpened(menu) => {
-                let permission_description = match &menu.kind {
-                    MenuKind::Permission { effect_summary } => Some(effect_summary.clone()),
-                    _ => None,
-                };
-                let presentation = match &menu.kind {
-                    MenuKind::ErrorRecovery { presentation, .. } => Some(presentation.clone()),
-                    _ => None,
+                let kind = observe_menu_kind(&menu.kind);
+                let (permission_description, presentation) = match menu.kind {
+                    MenuKind::Permission { effect_summary } => (Some(effect_summary), None),
+                    MenuKind::ErrorRecovery { presentation, .. } => (None, Some(presentation)),
+                    _ => (None, None),
                 };
                 self.menus.insert(
                     menu.id.as_str().to_owned(),
                     haider_rpc::ObserveMenuWire {
-                        kind: observe_menu_kind(&menu.kind).into(),
+                        kind: kind.into(),
                         title: menu.title,
                         permission_description,
                         presentation,

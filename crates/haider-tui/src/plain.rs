@@ -131,21 +131,18 @@ fn render_plain_impl(
     }
     if let Some(menu) = projection.open_menu() {
         out.push_str(&format!("? {}\n", menu.title));
-        // E-wave visual pass: a recovery card's typed presentation reaches
-        // plain mode too — detail plus the compact fact line (unshedded:
-        // plain has no width), so the pipe/CI oracle sees what the styled
-        // card says. The reset figure is the static provider delay (plain
-        // rendering has no daemon clock to count down against).
+        // Plain output uses the static provider delay because it has no
+        // render clock for a live countdown.
         if let haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } = &menu.kind {
             for line in presentation.detail.split('\n') {
-                out.push_str(&format!("  {line}\n"));
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
             }
-            let facts = crate::projection::error_fact_segments(presentation, None)
-                .into_iter()
-                .map(|(segment, _)| segment)
-                .collect::<Vec<_>>()
-                .join(" · ");
-            out.push_str(&format!("  {facts}\n"));
+            let facts = crate::projection::error_fact_segments(presentation, None);
+            out.push_str("  ");
+            out.push_str(&crate::projection::join_error_fact_segments(&facts));
+            out.push('\n');
         }
         for (index, option) in menu.options.iter().enumerate() {
             out.push_str(&format!("  {}. {}\n", index + 1, option.label));
@@ -430,10 +427,9 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         TurnItem::IncompleteAgentMessage { text, interruption } => {
             out.push_str(text);
             out.push('\n');
-            out.push_str(&format!(
-                "⚠ incomplete — stream interrupted ({})\n",
-                interruption.subcode.as_str()
-            ));
+            out.push_str("⚠ incomplete — stream interrupted (");
+            out.push_str(interruption.subcode.as_str());
+            out.push_str(")\n");
         }
         TurnItem::Reasoning { summary } => {
             out.push_str("· ");

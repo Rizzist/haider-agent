@@ -85,7 +85,7 @@ struct RunReduction {
     state_generation: u64,
     user_seq: Option<u64>,
     open_items: HashMap<ItemId, OpenItem>,
-    incomplete_items: HashMap<ItemId, (String, u64)>,
+    incomplete_items: HashMap<ItemId, String>,
     menu: Option<OpenMenu>,
     menu_answers: HashMap<MenuId, RawEnvelope>,
     tool_results: HashSet<String>,
@@ -431,11 +431,14 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
             }
         }
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
-            if let TurnItem::IncompleteAgentMessage { text, .. } = &item {
-                reduction
-                    .incomplete_items
-                    .insert(item_id.clone(), (text.clone(), envelope.seq));
-            }
+            let item = match item {
+                TurnItem::IncompleteAgentMessage { text, .. } => {
+                    reduction.open_items.remove(&item_id);
+                    reduction.incomplete_items.insert(item_id, text);
+                    return;
+                }
+                item => item,
+            };
             if let TurnItem::ToolCall {
                 call_id,
                 name,
@@ -531,7 +534,7 @@ fn pending_partial_stream_checkpoint(reduction: &RunReduction) -> Option<Partial
         return None;
     };
     let item_id = item_id.clone();
-    let (text, _) = reduction.incomplete_items.get(&item_id)?;
+    let text = reduction.incomplete_items.get(&item_id)?;
     Some(PartialStreamCheckpoint {
         menu: open_menu.menu,
         request_seq: open_menu.request_seq,
@@ -797,11 +800,11 @@ fn interrupted_terminal_payloads(
                 "Interrupted run could not resume",
                 "Haider recovered the journal but could not safely resume this run.",
                 ErrorScope::Turn,
-                if retryable {
-                    vec![ErrorAction::RetryFresh]
+                [if retryable {
+                    ErrorAction::RetryFresh
                 } else {
-                    vec![ErrorAction::None]
-                },
+                    ErrorAction::None
+                }],
             )),
         });
     }

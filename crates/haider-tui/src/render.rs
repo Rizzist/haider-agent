@@ -5174,14 +5174,10 @@ fn render_aura(
 /// The menu's body lines pre-wrapped by display cells into the menu's
 /// content width (sim `.iml` white-space: pre-wrap, tui.js:4946).
 ///
-/// E-wave visual pass: a recovery card's body is composed from its TYPED
-/// presentation — the detail wraps dim (forced Body tone: recovery prose
-/// starting with `+`/`-` must never wear diff green/red), then ONE
-/// compact fact row (`subcode · HTTP 429 · req 8f3a2c1d… · resets in
-/// 2m 14s`) that sheds whole segments under width pressure, its reset
-/// counting down live against the daemon clock `now_ms`. The daemon's
-/// baseline `body` strings carry the same data as prose and are not
-/// double-rendered.
+/// Recovery bodies come from their typed presentation, not the duplicate
+/// menu prose. Detail always uses body tone, even when it starts with a diff
+/// marker. The final fact row sheds only whole segments and uses `now_ms` for
+/// its live reset countdown.
 fn wrapped_menu_body(
     menu: &haider_protocol::menu::Menu,
     width: u16,
@@ -5196,7 +5192,7 @@ fn wrapped_menu_body(
             .map(|row| (row, DiffTone::Body))
             .collect();
         let facts = crate::projection::error_fact_segments(presentation, Some(now_ms));
-        rows.push((shed_fact_line(&facts, budget), DiffTone::Fact));
+        rows.push((shed_fact_line(&facts, budget), DiffTone::Body));
         return rows;
     }
     menu.body
@@ -5214,37 +5210,44 @@ fn wrapped_menu_body(
         .collect()
 }
 
-/// Whole-segment width shedding for error fact lines (E-wave visual
-/// pass): segments join with ` · `; while the joined line overflows
-/// `budget` display cells, the segment with the HIGHEST shed rank drops
-/// whole (ties: the rightmost) — never a mid-word truncation, and the
-/// rank-0 identity segment (the subcode) never sheds. Display order is
-/// never rearranged.
+/// Sheds whole error-fact segments until the line fits `budget` display
+/// cells. The highest rank drops first (rightmost on ties); rank zero and
+/// display order are stable.
 #[must_use]
 pub fn shed_fact_line(segments: &[(String, u8)], budget: usize) -> String {
     use unicode_width::UnicodeWidthStr;
-    let mut kept: Vec<&(String, u8)> = segments.iter().collect();
-    let joined_width = |kept: &[&(String, u8)]| {
-        kept.iter()
-            .map(|(segment, _)| segment.as_str().width())
-            .sum::<usize>()
-            + kept.len().saturating_sub(1) * " · ".width()
-    };
-    while kept.len() > 1 && joined_width(&kept) > budget {
+    let separator_width = " · ".width();
+    let mut kept = segments
+        .iter()
+        .map(|(segment, rank)| (segment.as_str(), *rank, segment.as_str().width()))
+        .collect::<Vec<_>>();
+    let mut width = kept.iter().map(|(_, _, width)| width).sum::<usize>()
+        + kept.len().saturating_sub(1) * separator_width;
+    while kept.len() > 1 && width > budget {
         let Some((drop_index, _)) = kept
             .iter()
             .enumerate()
-            .filter(|(_, (_, rank))| *rank > 0)
-            .max_by_key(|(index, (_, rank))| (*rank, *index))
+            .filter(|(_, (_, rank, _))| *rank > 0)
+            .max_by_key(|(index, (_, rank, _))| (*rank, *index))
         else {
             break;
         };
-        kept.remove(drop_index);
+        let (_, _, dropped_width) = kept.remove(drop_index);
+        width = width.saturating_sub(dropped_width + separator_width);
     }
-    kept.iter()
-        .map(|(segment, _)| segment.as_str())
-        .collect::<Vec<_>>()
-        .join(" · ")
+    let capacity = kept
+        .iter()
+        .map(|(segment, _, _)| segment.len())
+        .sum::<usize>()
+        + kept.len().saturating_sub(1) * " · ".len();
+    let mut joined = String::with_capacity(capacity);
+    for (index, (segment, _, _)) in kept.iter().enumerate() {
+        if index > 0 {
+            joined.push_str(" · ");
+        }
+        joined.push_str(segment);
+    }
+    joined
 }
 
 /// W4a4: diff-aware body tone for the approval card (and any menu whose
@@ -5257,11 +5260,6 @@ enum DiffTone {
     Add,
     Del,
     Meta,
-    /// A recovery card's compact fact row (E-wave visual pass) — its own
-    /// tone class so the classification stays pinnable; renders in the
-    /// metadata slot (`dim`, the ≥ 3.4:1 floor — `faint` is the
-    /// barely-there band and a request id must stay readable).
-    Fact,
 }
 
 impl DiffTone {
@@ -5279,7 +5277,7 @@ impl DiffTone {
 
     fn style(self, theme: &Theme) -> ratatui::style::Style {
         match self {
-            Self::Body | Self::Fact => theme.dim_style(),
+            Self::Body => theme.dim_style(),
             Self::Add => theme.ok_style(),
             Self::Del => theme.err_style(),
             Self::Meta => theme.faint_style(),
@@ -5306,13 +5304,8 @@ fn menu_block(
     if allocated == 0 {
         return (Vec::new(), Vec::new());
     }
-    // E-wave visual pass: a recovery card wears a severity-toned left
-    // accent (`▏`) binding title + detail + fact row into one block, and
-    // its title takes the tone ink BOLD — the card reads at a glance.
-    // The tone is calm `warn` for action-needed classes (auth, keys,
-    // limits, billing, interruption — never scary red for a bill or a
-    // hiccup) and `err` only for hard account failures and the
-    // unclassified generic card. Options stay the existing idiom below.
+    // Recovery cards use warning ink for remediable conditions and error
+    // ink only for hard account failures or an unclassified generic failure.
     let recovery_ink = match &menu.kind {
         haider_protocol::menu::MenuKind::ErrorRecovery { card, .. } => {
             use haider_protocol::menu::ErrorRecoveryCardKind;
@@ -5394,10 +5387,8 @@ fn menu_block(
         let index = start + offset;
         let selected = index == selection;
         let cursor = if selected { "❯" } else { " " };
-        // Affordance ordering (E-wave visual pass): a recovery card's
-        // FIRST option is the server-enumerated primary action — it
-        // wears the gold accent when unselected, so the recommended key
-        // reads before any cursor movement. Selection styling outranks it.
+        // The server's first recovery option is primary; selection styling
+        // takes precedence over its idle gold accent.
         let primary = index == 0 && recovery_ink.is_some();
         // The gutter's first cell carries the ⋮ viewport marker on edge
         // rows adjacent to hidden options — none may vanish silently.
@@ -5416,15 +5407,13 @@ fn menu_block(
                 },
             ),
         ];
-        // The SELECTED recovery option explains itself: its typed detail
-        // rides the row dim, whole-segment-or-nothing (drops entirely
-        // when the row cannot hold it — never a mid-word cut).
+        // Option detail is all-or-nothing; it never truncates mid-word.
         if selected
             && recovery_ink.is_some()
             && let Some(detail) = &option.detail
         {
             let suffix = format!(" — {detail}");
-            let used = Line::from(spans.clone()).width();
+            let used = span_row_width(&spans);
             if used + unicode_width::UnicodeWidthStr::width(suffix.as_str()) <= area.width as usize
             {
                 spans.push(Span::styled(suffix, theme.dim_style()));
@@ -5433,7 +5422,7 @@ fn menu_block(
         option_rows.push((u16::try_from(lines.len()).unwrap_or(u16::MAX), index));
         lines.push(if selected {
             // Selection ground spans the full row (sim `.imo.sel`).
-            let pad = (area.width as usize).saturating_sub(Line::from(spans.clone()).width());
+            let pad = (area.width as usize).saturating_sub(span_row_width(&spans));
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
@@ -5449,6 +5438,11 @@ fn menu_block(
         )]));
     }
     (lines, option_rows)
+}
+
+fn span_row_width(spans: &[Span<'_>]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    spans.iter().map(|span| span.content.as_ref().width()).sum()
 }
 
 /// Rows the `/theme` picker card needs: title + body + the five choice
@@ -5677,11 +5671,8 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
     use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
     match &menu.kind {
         MenuKind::Recovery { .. } => "⌁",
-        // E-wave visual pass: the limit/billing cards wear the ⟳ renewal
-        // glyph — the Exhausted card's established vocabulary for "wait,
-        // it comes back" — instead of a warning triangle; every other
-        // recovery class keeps ⚠ (PartialStream deliberately matches the
-        // transcript's `⚠ incomplete` marker).
+        // Renewable limits use the reset glyph. Other recovery classes use
+        // warning, matching the partial-stream transcript marker.
         MenuKind::ErrorRecovery {
             card: ErrorRecoveryCardKind::RateLimit | ErrorRecoveryCardKind::QuotaExhausted,
             ..
@@ -6974,8 +6965,7 @@ fn transcript_lines<'a>(
     }
 }
 
-/// The failed run's transcript block (E-wave visual pass). A TYPED
-/// presentation renders as a card-shaped block behind a severity rail:
+/// A typed failed run renders as a card-shaped block behind a severity rail:
 ///
 /// ```text
 ///  ✗ Provider rate limit reached            ← err ink, BOLD (title)
@@ -6994,7 +6984,7 @@ fn transcript_lines<'a>(
 fn error_entry_lines<'a>(
     lines: &mut Vec<Line<'a>>,
     text: &'a str,
-    presentation: Option<&haider_protocol::error::ErrorPresentation>,
+    presentation: Option<&'a haider_protocol::error::ErrorPresentation>,
     theme: &Theme,
     width: u16,
 ) {
@@ -7011,7 +7001,7 @@ fn error_entry_lines<'a>(
         Span::raw(" "),
         Span::styled("✗ ", theme.err_style()),
         Span::styled(
-            presentation.title.clone(),
+            presentation.title.as_str(),
             theme.err_style().add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -7356,21 +7346,13 @@ fn item_lines<'a>(
                     }
                 }
             }
-            // E-wave visual pass: an interruption is not a failure — the
-            // marker reads as quiet metadata with a warning accent (warn
-            // glyph, dim text, never err ink), and the partial body above
-            // keeps its normal styling. The text is byte-identical to the
-            // plain-mode marker (the e4 pin).
+            // An interruption is warning metadata, not a failed response.
             lines.push(Line::from(vec![
                 Span::raw(" "),
                 Span::styled("⚠ ", theme.warn_style()),
-                Span::styled(
-                    format!(
-                        "incomplete — stream interrupted ({})",
-                        interruption.subcode.as_str()
-                    ),
-                    theme.dim_style(),
-                ),
+                Span::styled("incomplete — stream interrupted (", theme.dim_style()),
+                Span::styled(interruption.subcode.as_str(), theme.dim_style()),
+                Span::styled(")", theme.dim_style()),
             ]));
         }
         TurnItem::Reasoning { summary } => {

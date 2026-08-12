@@ -131,11 +131,14 @@ impl ErrorPresentation {
         scope: ErrorScope,
         allowed_actions: impl IntoIterator<Item = ErrorAction>,
     ) -> Self {
+        let mut seen_actions = 0_u16;
         let mut allowed_actions =
             allowed_actions
                 .into_iter()
                 .fold(Vec::new(), |mut actions, action| {
-                    if actions.len() < 16 && !actions.contains(&action) {
+                    let bit = error_action_bit(action);
+                    if actions.len() < 16 && seen_actions & bit == 0 {
+                        seen_actions |= bit;
                         actions.push(action);
                     }
                     actions
@@ -188,6 +191,23 @@ impl ErrorPresentation {
         self.retry_after_ms = retry_after_ms;
         self.reset_at_ms = retry_after_ms.and_then(|delay| now_ms.checked_add(delay));
         self
+    }
+}
+
+const fn error_action_bit(action: ErrorAction) -> u16 {
+    1 << match action {
+        ErrorAction::Retry => 0,
+        ErrorAction::Relogin => 1,
+        ErrorAction::Reimport => 2,
+        ErrorAction::EditKey => 3,
+        ErrorAction::SwitchAccount => 4,
+        ErrorAction::TopUp => 5,
+        ErrorAction::Wait => 6,
+        ErrorAction::ChooseModel => 7,
+        ErrorAction::ContactAdmin => 8,
+        ErrorAction::ContinuePartial => 9,
+        ErrorAction::RetryFresh => 10,
+        ErrorAction::None => 11,
     }
 }
 
@@ -311,6 +331,68 @@ pub enum ErrorCode {
     /// Forward-compat catch-all: unknown codes from newer peers land here.
     #[serde(other)]
     Unknown,
+}
+
+impl ErrorCode {
+    /// Stable snake-case name used by protocol-facing text projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "invalid_argument",
+            Self::UnknownMethod => "unknown_method",
+            Self::ProtocolMismatch => "protocol_mismatch",
+            Self::Unauthorized => "unauthorized",
+            Self::CredentialMissing => "credential_missing",
+            Self::CredentialLimited => "credential_limited",
+            Self::SessionNotFound => "session_not_found",
+            Self::RunNotActive => "run_not_active",
+            Self::MenuNotFound => "menu_not_found",
+            Self::MenuAlreadyAnswered => "menu_already_answered",
+            Self::SingleWriterViolation => "single_writer_violation",
+            Self::Busy => "busy",
+            Self::RevisionConflict => "revision_conflict",
+            Self::LoopLimit => "loop_limit",
+            Self::ProviderError => "provider_error",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::VisionUnsupported => "vision_unsupported",
+            Self::StoreCorrupt => "store_corrupt",
+            Self::StoreLocked => "store_locked",
+            Self::PermissionDenied => "permission_denied",
+            Self::EffectUnknownOutcome => "effect_unknown_outcome",
+            Self::Internal => "internal",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Stable kebab-case form used by [`ErrorPresentation::subcode`].
+    #[must_use]
+    pub const fn as_subcode(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "invalid-argument",
+            Self::UnknownMethod => "unknown-method",
+            Self::ProtocolMismatch => "protocol-mismatch",
+            Self::Unauthorized => "unauthorized",
+            Self::CredentialMissing => "credential-missing",
+            Self::CredentialLimited => "credential-limited",
+            Self::SessionNotFound => "session-not-found",
+            Self::RunNotActive => "run-not-active",
+            Self::MenuNotFound => "menu-not-found",
+            Self::MenuAlreadyAnswered => "menu-already-answered",
+            Self::SingleWriterViolation => "single-writer-violation",
+            Self::Busy => "busy",
+            Self::RevisionConflict => "revision-conflict",
+            Self::LoopLimit => "loop-limit",
+            Self::ProviderError => "provider-error",
+            Self::ProviderTimeout => "provider-timeout",
+            Self::VisionUnsupported => "vision-unsupported",
+            Self::StoreCorrupt => "store-corrupt",
+            Self::StoreLocked => "store-locked",
+            Self::PermissionDenied => "permission-denied",
+            Self::EffectUnknownOutcome => "effect-unknown-outcome",
+            Self::Internal => "internal",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 impl HaiderError {

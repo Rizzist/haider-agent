@@ -13,11 +13,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
-use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
@@ -63,7 +62,8 @@ const DEEPSEEK_HOST: &str = "api.deepseek.com";
 
 const STREAM_CAPACITY: usize = 32;
 const MODELS_BODY_LIMIT: usize = 1024 * 1024;
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
+#[cfg(test)]
+const ERROR_BODY_LIMIT: usize = crate::HTTP_ERROR_BODY_LIMIT;
 const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     retry_policy: OpenAiRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
@@ -949,7 +949,7 @@ async fn capture(response: reqwest::Response) -> Result<OpenAiCapture, ProviderE
     let body = if success {
         response.bytes().await.map_err(transport_error)?.to_vec()
     } else {
-        read_body_bounded(response, ERROR_BODY_LIMIT, "OpenAI HTTP error").await?
+        read_body_bounded(response, crate::HTTP_ERROR_BODY_LIMIT, "OpenAI HTTP error").await?
     };
     Ok(OpenAiCapture {
         status,
@@ -993,7 +993,9 @@ async fn http_error_from_response(response: reqwest::Response) -> ProviderError 
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let error = match read_body_bounded(response, ERROR_BODY_LIMIT, "OpenAI HTTP error").await {
+    let error = match read_body_bounded(response, crate::HTTP_ERROR_BODY_LIMIT, "OpenAI HTTP error")
+        .await
+    {
         Ok(body) => replay_openai_http_error(status, retry_after.as_deref(), &body),
         Err(error) => classify_http_body_read_error(status, retry_after.as_deref(), error),
     };
@@ -2225,7 +2227,7 @@ pub fn replay_openai_http_error(
             | ProviderErrorKind::Overloaded
             | ProviderErrorKind::Transport
     )
-    .then(|| parse_retry_after(retry_after))
+    .then(|| crate::parse_retry_after_ms(retry_after))
     .flatten();
     let message = if kind == ProviderErrorKind::QuotaExhausted {
         "provider quota/credit exhausted — retrying will not help; check billing or switch account"
@@ -2233,25 +2235,20 @@ pub fn replay_openai_http_error(
     } else {
         format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind))
     };
-    let mut error = ProviderError::new(kind, message);
-    error.presentation = match error_code.or(error_type) {
-        Some("account_deleted" | "account_not_found") => ErrorPresentation::new(
-            "account-deleted",
-            "Provider account unavailable",
-            "The provider no longer recognizes this account.",
-            ErrorScope::Account,
-            [ErrorAction::SwitchAccount],
+    let error = match error_code.or(error_type) {
+        Some("account_deleted" | "account_not_found") => ProviderError::new_with_presentation(
+            kind,
+            message,
+            crate::account_deleted_presentation(),
         ),
         Some("account_deactivated" | "account_revoked" | "organization_deactivated") => {
-            ErrorPresentation::new(
-                "account-revoked",
-                "Provider account access revoked",
-                "This provider account can no longer be used.",
-                ErrorScope::Account,
-                [ErrorAction::SwitchAccount, ErrorAction::ContactAdmin],
+            ProviderError::new_with_presentation(
+                kind,
+                message,
+                crate::account_revoked_presentation(),
             )
         }
-        _ => error.presentation,
+        _ => ProviderError::new(kind, message),
     };
     error
         .with_retry_after_ms(retry_after_ms)
@@ -3674,18 +3671,6 @@ fn normalize_chat_finish_reason(reason: &str) -> Result<FinishReason, ProviderEr
             "OpenAI-compatible Chat returned unknown finish_reason `{other}`"
         ))),
     }
-}
-
-fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    let value = value?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return seconds.checked_mul(1_000);
-    }
-    let retry_at = httpdate::parse_http_date(value).ok()?;
-    let duration = retry_at
-        .duration_since(SystemTime::now())
-        .unwrap_or_default();
-    u64::try_from(duration.as_millis()).ok()
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
