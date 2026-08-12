@@ -20,6 +20,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// The logical wire protocol encoded by this crate.
 ///
 /// Decoding is deliberately strict about the top-level `"v"` field: any other
@@ -997,6 +1001,10 @@ pub struct FleetNodeWire {
     /// `(terminal_at_ms | snapshot.generated_at_ms) - started_at_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<AgentMetricsSnapshot>,
+    /// Exact number of this node's direct durable children omitted by the
+    /// snapshot bounds. Zero means the empty `children` list is a real leaf.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub folded_children: u32,
     #[serde(default)]
     pub children: Vec<FleetNodeWire>,
 }

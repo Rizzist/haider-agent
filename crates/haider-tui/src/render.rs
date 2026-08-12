@@ -4970,11 +4970,8 @@ fn render_fleet(
                     ),
                     Span::styled(format!(" {callsign}"), name_style),
                 ];
-                if !node.children.is_empty() {
-                    spans.push(Span::styled(
-                        format!(" ▸{}", node.children.len()),
-                        theme.faint_style(),
-                    ));
+                if let Some(marker) = fleet::child_marker(node) {
+                    spans.push(Span::styled(format!(" {marker}"), theme.faint_style()));
                 }
                 let metric = fleet::node_metric(node);
                 let left = Line::from(spans.clone()).width();
@@ -5070,10 +5067,17 @@ fn render_fleet(
                     }
                     // Callsign under the cell — the selected cell wears the
                     // selection band (ground shifts, ink stays legible).
-                    let mut name: String =
-                        fleet::callsign(node).chars().take(FLEET_CELL_W).collect();
+                    let marker = fleet::child_marker(node);
+                    let marker_width = marker
+                        .as_ref()
+                        .map_or(0, |marker| marker.chars().count() + 1);
+                    let callsign_budget = FLEET_CELL_W.saturating_sub(marker_width);
+                    let mut name: String = fleet::callsign(node)
+                        .chars()
+                        .take(callsign_budget)
+                        .collect();
                     let name_width = name.chars().count();
-                    name.push_str(&" ".repeat(FLEET_CELL_W - name_width));
+                    name.push_str(&" ".repeat(callsign_budget - name_width));
                     names.push(Span::styled(
                         name,
                         if selected {
@@ -5084,6 +5088,9 @@ fn render_fleet(
                             theme.dim_style()
                         },
                     ));
+                    if let Some(marker) = marker {
+                        names.push(Span::styled(format!(" {marker}"), theme.faint_style()));
+                    }
                     names.push(Span::raw(" ".repeat(FLEET_CELL_GAP)));
                     cell_hits.push((
                         lines.len(),

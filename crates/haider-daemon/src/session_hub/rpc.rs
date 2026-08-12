@@ -226,6 +226,7 @@ struct FleetFlatNode {
     record: haider_core::DelegationRecord,
     state: haider_rpc::FleetAgentStateWire,
     metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+    direct_child_count: u32,
 }
 
 fn fleet_snapshot(
@@ -278,6 +279,7 @@ fn fleet_snapshot(
                 parent_agent_id: node.record.parent_agent_id,
                 state: node.state,
                 metrics: node.metrics,
+                folded_children: node.direct_child_count,
                 children: Vec::new(),
             })
         })
@@ -300,6 +302,17 @@ fn fleet_snapshot(
             for child in children {
                 nested.push(take_tree(*child, nodes, children_by_parent)?);
             }
+            let returned_children = u32::try_from(nested.len()).unwrap_or(u32::MAX);
+            node.folded_children = node
+                .folded_children
+                .checked_sub(returned_children)
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "bounded fleet graph contains more children than durable relation truth",
+                        false,
+                    )
+                })?;
             node.children = nested;
         }
         Ok(node)
@@ -5055,6 +5068,7 @@ impl HubConnection {
         let generated_at_ms = fleet_now_ms();
         let mut nodes = Vec::with_capacity(bounded.descendants.len());
         for descendant in bounded.descendants {
+            let direct_child_count = descendant.direct_child_count;
             let record = descendant.record;
             let head_seq = self
                 .hub
@@ -5075,6 +5089,7 @@ impl HubConnection {
                 record,
                 state: truth.state,
                 metrics: truth.metrics,
+                direct_child_count,
             });
         }
         let snapshot = fleet_snapshot(session_id, generated_at_ms, nodes, bounded.truncated)?;

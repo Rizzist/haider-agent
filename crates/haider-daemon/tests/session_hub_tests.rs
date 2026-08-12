@@ -2445,11 +2445,50 @@ async fn session_fleet_caps_historical_response_at_512_nodes() {
     let generation = store.worker_generation();
     let root = SessionId::new("fleet-bounded-root");
     create_typed_session(&store, &root, "openai").await;
-    for index in 0..513_u32 {
+    let parent_session = SessionId::new("fleet-bounded-parent");
+    create_typed_session(&store, &parent_session, "openai").await;
+    let parent = fleet_delegation(&root, &root, &parent_session, "bounded-parent", None, 1);
+    store
+        .create_delegation(parent.clone())
+        .await
+        .expect("bounded parent relation");
+    let mut parent_done = envelope(
+        &parent.child_session_id,
+        "fleet-bounded-parent-done",
+        generation,
+    );
+    parent_done.run_id = Some(parent.child_run_id.clone());
+    parent_done.agent_id = Some(parent.agent_id.clone());
+    parent_done.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("parent done state");
+    hub.append(&mut [parent_done])
+        .await
+        .expect("terminal parent state");
+    store
+        .record_delegation_report(
+            parent.agent_id.clone(),
+            ChildReport {
+                agent: parent.agent_id.clone(),
+                summary: "complete".into(),
+                verified: ReportVerification::Unverified,
+                workspace_revision: None,
+            },
+        )
+        .await
+        .expect("terminal parent bookkeeping");
+
+    for index in 0..512_u32 {
         let suffix = format!("bounded-{index:03}");
         let child = SessionId::new(format!("fleet-bounded-child-{index:03}"));
         create_typed_session(&store, &child, "openai").await;
-        let record = fleet_delegation(&root, &root, &child, &suffix, None, 1);
+        let record = fleet_delegation(
+            &root,
+            &parent_session,
+            &child,
+            &suffix,
+            Some(parent.agent_id.clone()),
+            2,
+        );
         store
             .create_delegation(record.clone())
             .await
@@ -2500,7 +2539,16 @@ async fn session_fleet_caps_historical_response_at_512_nodes() {
     else {
         panic!("expected bounded fleet response");
     };
-    assert_eq!(snapshot.roots.len(), 512);
+    assert_eq!(snapshot.roots.len(), 1);
+    assert_eq!(snapshot.roots[0].children.len(), 511);
+    assert_eq!(snapshot.roots[0].folded_children, 1);
+    assert!(
+        snapshot.roots[0]
+            .children
+            .iter()
+            .all(|child| child.folded_children == 0),
+        "real returned leaves carry no fold witness"
+    );
     assert_eq!(snapshot.node_limit, 512);
     assert_eq!(snapshot.depth_limit, haider_rpc::FLEET_MAX_DEPTH);
     assert_eq!(snapshot.rollup.node_count, 512);
@@ -2508,6 +2556,94 @@ async fn session_fleet_caps_historical_response_at_512_nodes() {
     assert!(snapshot.truncated);
     assert!(!snapshot.rollup.complete);
     assert!(!snapshot.rollup.metrics_complete);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// DEPTH-WITNESS LAW: children just outside the depth bound are not
+/// materialized, but the returned boundary row carries their exact direct
+/// count so it cannot be mistaken for a durable leaf.
+#[tokio::test]
+async fn session_fleet_counts_children_folded_at_the_depth_bound() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let root = SessionId::new("fleet-depth-root");
+    create_typed_session(&store, &root, "openai").await;
+
+    let mut parent_session = root.clone();
+    let mut parent_agent = None;
+    for depth in 1..=haider_rpc::FLEET_MAX_DEPTH {
+        let suffix = format!("depth-{depth:02}");
+        let child = SessionId::new(format!("fleet-depth-session-{depth:02}"));
+        create_typed_session(&store, &child, "openai").await;
+        let record = fleet_delegation(
+            &root,
+            &parent_session,
+            &child,
+            &suffix,
+            parent_agent.clone(),
+            depth,
+        );
+        store
+            .create_delegation(record.clone())
+            .await
+            .expect("depth chain relation");
+        parent_session = child;
+        parent_agent = Some(record.agent_id);
+    }
+    for index in 0..3_u32 {
+        let suffix = format!("outside-depth-{index}");
+        let child = SessionId::new(format!("fleet-outside-depth-{index}"));
+        create_typed_session(&store, &child, "openai").await;
+        let record = fleet_delegation(
+            &root,
+            &parent_session,
+            &child,
+            &suffix,
+            parent_agent.clone(),
+            haider_rpc::FLEET_MAX_DEPTH + 1,
+        );
+        store
+            .create_delegation(record)
+            .await
+            .expect("outside-depth relation");
+    }
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("fleet connection");
+    connection
+        .request(
+            RequestId::new("fleet-depth-bound"),
+            RequestBody::SessionFleet { session_id: root },
+        )
+        .await
+        .expect("depth-bounded fleet routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionFleet { snapshot },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected depth-bounded fleet response");
+    };
+    assert!(snapshot.truncated);
+    assert_eq!(snapshot.rollup.node_count, haider_rpc::FLEET_MAX_DEPTH);
+    let mut node = snapshot.roots.first().expect("depth root row");
+    for expected_depth in 1..haider_rpc::FLEET_MAX_DEPTH {
+        assert_eq!(node.depth, expected_depth);
+        assert_eq!(node.folded_children, 0);
+        assert_eq!(node.children.len(), 1);
+        node = &node.children[0];
+    }
+    assert_eq!(node.depth, haider_rpc::FLEET_MAX_DEPTH);
+    assert!(node.children.is_empty());
+    assert_eq!(node.folded_children, 3);
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

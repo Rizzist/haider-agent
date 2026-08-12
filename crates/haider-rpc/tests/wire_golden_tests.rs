@@ -1581,11 +1581,11 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3 + 4,
+        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
          G3's four session-tuning frames, F1's three fleet frames, then \
-         WIRE-GAPS' four read frames — the \
+         WIRE-GAPS' four read frames, then Slice 2's folded response — the \
          accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
@@ -1852,8 +1852,8 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3 + 4,
-        "G2's three frames, then G3's four tuning frames, F1's three fleet frames, then WIRE-GAPS' four read frames"
+        3 + 4 + 3 + 4 + 1,
+        "G2's three frames, then G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read frames, then Slice 2's folded response"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -1969,7 +1969,7 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     // F1's three fleet frames at the transcript tail (each later wave's own
     // law pins its append).
     let frames = transcript();
-    let tail = &frames[frames.len() - 24..frames.len() - 17];
+    let tail = &frames[frames.len() - 25..frames.len() - 18];
     let methods: Vec<String> = tail
         .iter()
         .map(|frame| {
@@ -2095,10 +2095,10 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3 + 4,
+        3 + 3 + 4 + 3 + 4 + 1,
         "three U1 frames, then G2's three session-rename frames, then G3's \
          four session-tuning frames, F1's three fleet frames, then \
-         WIRE-GAPS' four read frames (each later \
+         WIRE-GAPS' four read frames, then Slice 2's folded response (each later \
          wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
@@ -2369,7 +2369,7 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
             )
         })
         .expect("fleet feature welcome");
-    assert_eq!(frames.len() - fleet_start, 3 + 4);
+    assert_eq!(frames.len() - fleet_start, 3 + 4 + 1);
     assert!(matches!(
         &frames[fleet_start],
         WireFrame::Welcome(welcome)
@@ -2408,4 +2408,31 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         serde_json::from_str(r#"{"method":"session.fleet_v2","session_id":"root"}"#)
             .expect("future fleet method");
     assert!(matches!(future_method, RequestBody::Unknown));
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyFleetNode {
+        agent_id: haider_protocol::ids::AgentId,
+        #[serde(default)]
+        children: Vec<LegacyFleetNode>,
+    }
+
+    let legacy_json = r#"{"agent_id":"legacy-agent","session_id":"legacy-session","task":"leaf","depth":1,"parent_session_id":"legacy-root","state":"done","children":[]}"#;
+    let legacy: haider_rpc::FleetNodeWire =
+        serde_json::from_str(legacy_json).expect("pre-fold-witness node decodes");
+    assert_eq!(legacy.folded_children, 0);
+    assert!(
+        !serde_json::to_string(&legacy)
+            .expect("legacy-shaped node re-encodes")
+            .contains("folded_children"),
+        "zero stays absent so an old peer sees the exact historical shape"
+    );
+
+    let mut folded = legacy;
+    folded.folded_children = 3;
+    let folded_json = serde_json::to_string(&folded).expect("folded node encodes");
+    assert!(folded_json.contains(r#""folded_children":3"#));
+    let old_decoder: LegacyFleetNode =
+        serde_json::from_str(&folded_json).expect("old decoder ignores additive witness");
+    assert_eq!(old_decoder.agent_id.as_str(), "legacy-agent");
+    assert!(old_decoder.children.is_empty());
 }

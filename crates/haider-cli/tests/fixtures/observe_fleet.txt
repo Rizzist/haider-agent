@@ -1,0 +1,6 @@
+fleet of 4 · ✓1 ◉1 ✗1 ◌1 · depth 2
+  ◉ alpha ▸2 — coordinate the sweep · 3t · 1.5k · ≈$0.42
+   │ ✓ done — verify output · 3t · 1.5k · ≈$0.42
+   │ ✗ fold ⊞2 — deep branch · 3t · 1.5k · ≈$0.42
+  ◌ queued — await capacity · queued
+512-node view cap reached — deepest branches folded

@@ -1,0 +1,3 @@
+session-z · new fleet · fleet of 4 · ✓1 ◉1 ✗1 ◌1 · depth 2
+session-a · tie a · fleet of 4 · ✓1 ◉1 ✗1 ◌1 · depth 2
+session-b · tie b · fleet of 4 · ✓1 ◉1 ✗1 ◌1 · depth 2

@@ -12,9 +12,9 @@ use haider_rpc::haider_protocol::credential::CredentialDescriptor;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{
-    AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, FEATURE_SESSION_FLEET_V1,
-    FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody, ResponseBody, SessionFleetSnapshot,
-    SessionObserveDigest, Welcome, WireFrame,
+    AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, ERROR_CODE_NOT_FOUND,
+    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody,
+    ResponseBody, SessionFleetSnapshot, SessionObserveDigest, Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -40,6 +40,7 @@ pub enum ObserveError {
         actual: String,
     },
     MissingFeature(&'static str),
+    UnknownSession(SessionId),
     Client(ClientError),
     Rpc {
         code: String,
@@ -67,6 +68,9 @@ impl std::fmt::Display for ObserveError {
                     formatter,
                     "daemon does not advertise required feature `{feature}`"
                 )
+            }
+            Self::UnknownSession(session_id) => {
+                write!(formatter, "session `{session_id}` was not found")
             }
             Self::Client(error) => write!(formatter, "{error}"),
             Self::Rpc {
@@ -222,15 +226,17 @@ impl ObserveClient {
     /// Reads the bounded durable descendant tree and daemon-side rollup for
     /// one live or terminal session.
     pub async fn fleet(&self, session_id: SessionId) -> Result<SessionFleetSnapshot, ObserveError> {
-        if !self.welcome.features.contains(FEATURE_SESSION_FLEET_V1) {
-            return Err(ObserveError::MissingFeature(FEATURE_SESSION_FLEET_V1));
-        }
+        self.require_fleet_feature()?;
+        let requested_session = session_id.clone();
         match self
             .client
             .request(RequestBody::SessionFleet { session_id })
             .await?
         {
             ResponseBody::SessionFleet { snapshot } => Ok(snapshot),
+            ResponseBody::Error { code, .. } if code == ERROR_CODE_NOT_FOUND => {
+                Err(ObserveError::UnknownSession(requested_session))
+            }
             ResponseBody::Error {
                 code,
                 message,
@@ -244,6 +250,16 @@ impl ObserveClient {
             _ => Err(ObserveError::Protocol(
                 "session.fleet response method mismatch",
             )),
+        }
+    }
+
+    /// Fails with the same typed feature error as [`Self::fleet`] before a
+    /// list-mode caller performs any per-session reads.
+    pub fn require_fleet_feature(&self) -> Result<(), ObserveError> {
+        if self.welcome.features.contains(FEATURE_SESSION_FLEET_V1) {
+            Ok(())
+        } else {
+            Err(ObserveError::MissingFeature(FEATURE_SESSION_FLEET_V1))
         }
     }
 
