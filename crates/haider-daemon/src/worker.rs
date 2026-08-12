@@ -3805,15 +3805,13 @@ async fn start_turn(
     )
     .await?;
     let prompt_compile_started = Instant::now();
-    let mut compiled = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
-        lease,
-        lease,
-        lease.session_id(),
-        accepted.branch_id.as_ref(),
-        agent_id.as_ref(),
-        &accepted.run_id,
-    )
-    .await?;
+    let mut compiled = lease
+        .compile_prompt_projection(
+            accepted.branch_id.as_ref(),
+            agent_id.as_ref(),
+            &accepted.run_id,
+        )
+        .await?;
     // G3 (LT3): provider-opaque continuation facts are only valid on the
     // wire family that minted them — every adapter REJECTS a foreign tag.
     // After a cross-provider model switch the compiled history still carries

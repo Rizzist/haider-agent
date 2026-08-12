@@ -10,9 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,7 +26,9 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AF
 use serde::Deserialize;
 use tokio::sync::{OnceCell, mpsc};
 
-use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
+#[cfg(test)]
+use crate::origin::FixedDnsResolver;
+use crate::origin::{FixedOriginGuard, SystemFixedDnsResolver};
 use crate::wire::provider_kind_name;
 use crate::{
     MessageRole, Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem,
@@ -70,6 +71,126 @@ const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     response_open_timeout: Duration::from_secs(30),
     chunk_idle_timeout: Duration::from_secs(90),
 };
+
+static SHARED_OPENAI_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+static SHARED_OPENAI_FIXED_CLIENTS: OnceLock<Mutex<HashMap<String, SharedOpenAiFixedTransport>>> =
+    OnceLock::new();
+static SHARED_COMPATIBLE_CLIENTS: OnceLock<
+    Mutex<HashMap<String, SharedOpenAiCompatibleTransport>>,
+> = OnceLock::new();
+static OPENAI_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone)]
+struct SharedOpenAiFixedTransport {
+    client: reqwest::Client,
+    guard: Arc<FixedOriginGuard>,
+}
+
+#[derive(Clone)]
+struct SharedOpenAiCompatibleTransport {
+    client: reqwest::Client,
+    guard: Option<Arc<CompatibleOriginGuard>>,
+}
+
+fn build_openai_client(
+    origin_guard: Option<Arc<CompatibleOriginGuard>>,
+    fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+) -> Result<reqwest::Client, ProviderError> {
+    let transport = TRANSPORT_CONFIG;
+    let mut client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(match transport.retry_policy {
+            OpenAiRetryPolicy::Never => reqwest::retry::never(),
+        })
+        .connect_timeout(transport.connect_timeout);
+    if let Some(guard) = origin_guard {
+        client = client.dns_resolver(guard);
+    }
+    if let Some(guard) = fixed_origin_guard {
+        client = client.dns_resolver(guard);
+    }
+    client.build().map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            format!("could not construct OpenAI HTTP client: {error}"),
+        )
+    })
+}
+
+fn shared_openai_client() -> Result<reqwest::Client, ProviderError> {
+    SHARED_OPENAI_CLIENT
+        .get_or_init(|| {
+            OPENAI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+            build_openai_client(None, None).map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(|message| ProviderError::new(ProviderErrorKind::Internal, message))
+}
+
+fn shared_openai_fixed_transport(
+    endpoints: &[&str],
+    trusted_host: &str,
+) -> Result<SharedOpenAiFixedTransport, ProviderError> {
+    let key = format!("{trusted_host}\0{}", endpoints.join("\0"));
+    let transports = SHARED_OPENAI_FIXED_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut transports = transports.lock().map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            "OpenAI fixed-origin HTTP client pool is unavailable",
+        )
+    })?;
+    if let Some(transport) = transports.get(&key) {
+        return Ok(transport.clone());
+    }
+    let guard = Arc::new(FixedOriginGuard::new_allowing(
+        endpoints,
+        trusted_host,
+        Arc::new(SystemFixedDnsResolver),
+    )?);
+    let client = build_openai_client(None, Some(Arc::clone(&guard)))?;
+    let transport = SharedOpenAiFixedTransport { client, guard };
+    transports.insert(key, transport.clone());
+    Ok(transport)
+}
+
+fn shared_compatible_transport(
+    endpoints: &CompatibleEndpoints,
+    policy: CompatibleOriginPolicy,
+) -> Result<SharedOpenAiCompatibleTransport, ProviderError> {
+    let key = format!("{policy:?}\0{}", endpoints.base_url);
+    let transports = SHARED_COMPATIBLE_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut transports = transports.lock().map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            "OpenAI-compatible HTTP client pool is unavailable",
+        )
+    })?;
+    if let Some(transport) = transports.get(&key) {
+        return Ok(transport.clone());
+    }
+    let guard = endpoints.origin.as_ref().map(|origin| {
+        Arc::new(CompatibleOriginGuard::new(
+            origin.host.clone(),
+            origin.port,
+            origin.plain_http,
+            policy,
+            Arc::new(SystemCompatibleDnsResolver),
+        ))
+    });
+    let client = build_openai_client(guard.clone(), None)?;
+    let transport = SharedOpenAiCompatibleTransport { client, guard };
+    transports.insert(key, transport.clone());
+    Ok(transport)
+}
+
+/// Process-lifetime construction counter used by performance regression
+/// harnesses. Ordinary first-party adapters share the one initialized client.
+#[doc(hidden)]
+#[must_use]
+pub fn openai_http_client_build_count() -> usize {
+    OPENAI_CLIENT_BUILD_COUNT.load(Ordering::Relaxed)
+}
 
 /// Retry behavior owned by the OpenAI HTTP adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +243,7 @@ impl OpenAiHttp {
         Self::new_with_origin_guards(credential, model, None, None, false)
     }
 
+    #[cfg(test)]
     fn new_with_origin_guard(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -130,6 +252,24 @@ impl OpenAiHttp {
         Self::new_with_origin_guards(credential, model, origin_guard, None, false)
     }
 
+    fn new_with_shared_origin_transport(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        transport: SharedOpenAiCompatibleTransport,
+    ) -> Self {
+        Self {
+            client: transport.client,
+            credential,
+            account: None,
+            model: model.into(),
+            origin_guard: transport.guard,
+            fixed_origin_guard: None,
+            codex_responses_lite: false,
+            auth_header_mode: OpenAiAuthHeaderMode::Bearer,
+        }
+    }
+
+    #[cfg(test)]
     fn new_subscription(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -146,6 +286,7 @@ impl OpenAiHttp {
         )
     }
 
+    #[cfg(test)]
     fn new_fixed_origin(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -164,6 +305,7 @@ impl OpenAiHttp {
         )
     }
 
+    #[cfg(test)]
     fn new_fixed_origins(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -186,6 +328,27 @@ impl OpenAiHttp {
         )
     }
 
+    fn new_fixed_origins_shared_system(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        endpoints: &[&str],
+        trusted_host: &str,
+        codex_responses_lite: bool,
+    ) -> Result<Self, ProviderError> {
+        let SharedOpenAiFixedTransport { client, guard } =
+            shared_openai_fixed_transport(endpoints, trusted_host)?;
+        Ok(Self {
+            client,
+            credential,
+            account: None,
+            model: model.into(),
+            origin_guard: None,
+            fixed_origin_guard: Some(guard),
+            codex_responses_lite,
+            auth_header_mode: OpenAiAuthHeaderMode::Bearer,
+        })
+    }
+
     fn new_with_origin_guards(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -193,26 +356,11 @@ impl OpenAiHttp {
         fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
         codex_responses_lite: bool,
     ) -> Result<Self, ProviderError> {
-        let transport = TRANSPORT_CONFIG;
-        let mut client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(match transport.retry_policy {
-                OpenAiRetryPolicy::Never => reqwest::retry::never(),
-            })
-            .connect_timeout(transport.connect_timeout);
-        if let Some(guard) = &origin_guard {
-            client = client.dns_resolver(Arc::clone(guard));
-        }
-        if let Some(guard) = &fixed_origin_guard {
-            client = client.dns_resolver(Arc::clone(guard));
-        }
-        let client = client.build().map_err(|error| {
-            ProviderError::new(
-                ProviderErrorKind::Internal,
-                format!("could not construct OpenAI HTTP client: {error}"),
-            )
-        })?;
+        let client = if origin_guard.is_none() && fixed_origin_guard.is_none() {
+            shared_openai_client()?
+        } else {
+            build_openai_client(origin_guard.clone(), fixed_origin_guard.clone())?
+        };
         Ok(Self {
             client,
             credential,
@@ -383,14 +531,26 @@ impl OpenAiProvider {
         model: impl Into<String>,
         base_url: &str,
     ) -> Result<Self, ProviderError> {
-        Self::new_subscription_with_dns_resolver(
-            credential,
-            model,
-            base_url,
-            Arc::new(SystemFixedDnsResolver),
-        )
+        if base_url != OPENAI_SUBSCRIPTION_BASE_URL {
+            return Err(invalid_request(
+                "OpenAI subscription inference base URL is not sanctioned",
+            ));
+        }
+        Ok(Self {
+            http: OpenAiHttp::new_fixed_origins_shared_system(
+                credential,
+                model,
+                &[OPENAI_SUBSCRIPTION_RESPONSES_URL],
+                OPENAI_SUBSCRIPTION_HOST,
+                true,
+            )?,
+            api_url: OPENAI_SUBSCRIPTION_RESPONSES_URL.into(),
+            effort: None,
+            web_search: false,
+        })
     }
 
+    #[cfg(test)]
     fn new_subscription_with_dns_resolver(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -591,12 +751,7 @@ impl OpenAiCompatibleProvider {
         model: impl Into<String>,
         base_url: impl AsRef<str>,
     ) -> Result<Self, ProviderError> {
-        Self::new_with_dns_resolver(
-            credential,
-            model,
-            base_url,
-            Arc::new(SystemCompatibleDnsResolver),
-        )
+        Self::new_with_policy_shared(credential, model, base_url, CompatibleOriginPolicy::Strict)
     }
 
     /// Constructs the CUSTOM-provenance adapter under
@@ -607,12 +762,11 @@ impl OpenAiCompatibleProvider {
         model: impl Into<String>,
         base_url: impl AsRef<str>,
     ) -> Result<Self, ProviderError> {
-        Self::new_with_policy_and_dns_resolver(
+        Self::new_with_policy_shared(
             credential,
             model,
             base_url,
             CompatibleOriginPolicy::TrustedLan,
-            Arc::new(SystemCompatibleDnsResolver),
         )
     }
 
@@ -632,17 +786,59 @@ impl OpenAiCompatibleProvider {
                 "Azure OpenAI endpoints must be https on *.openai.azure.com or *.services.ai.azure.com",
             ));
         }
-        let mut provider = Self::new_with_policy_and_dns_resolver(
+        let mut provider = Self::new_with_policy_shared(
             credential,
             model,
             base_url,
             CompatibleOriginPolicy::Strict,
-            Arc::new(SystemCompatibleDnsResolver),
         )?;
         provider.http.auth_header_mode = OpenAiAuthHeaderMode::AzureApiKey;
         Ok(provider)
     }
 
+    #[cfg(test)]
+    fn new_azure_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+        resolver: Arc<dyn CompatibleDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if !azure_openai_origin(base_url.as_ref()) {
+            return Err(invalid_request(
+                "Azure OpenAI endpoints must be https on *.openai.azure.com or *.services.ai.azure.com",
+            ));
+        }
+        let mut provider = Self::new_with_policy_and_dns_resolver(
+            credential,
+            model,
+            base_url,
+            CompatibleOriginPolicy::Strict,
+            resolver,
+        )?;
+        provider.http.auth_header_mode = OpenAiAuthHeaderMode::AzureApiKey;
+        Ok(provider)
+    }
+
+    fn new_with_policy_shared(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+        policy: CompatibleOriginPolicy,
+    ) -> Result<Self, ProviderError> {
+        let endpoints = compatible_endpoints(base_url.as_ref(), policy)?;
+        let transport = shared_compatible_transport(&endpoints, policy)?;
+        Ok(Self {
+            http: OpenAiHttp::new_with_shared_origin_transport(credential, model, transport),
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+            dialect: CompatibleDialect::Generic,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
+    }
+
+    #[cfg(test)]
     fn new_with_dns_resolver(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -658,6 +854,7 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    #[cfg(test)]
     fn new_with_policy_and_dns_resolver(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -692,14 +889,31 @@ impl OpenAiCompatibleProvider {
         model: impl Into<String>,
         base_url: &str,
     ) -> Result<Self, ProviderError> {
-        Self::new_kimi_subscription_with_dns_resolver(
+        if base_url != KIMI_OAUTH_BASE_URL {
+            return Err(invalid_request(
+                "Kimi OAuth inference base URL is not sanctioned",
+            ));
+        }
+        let endpoints = compatible_endpoints(base_url, CompatibleOriginPolicy::Strict)?;
+        let http = OpenAiHttp::new_fixed_origins_shared_system(
             credential,
             model,
-            base_url,
-            Arc::new(SystemFixedDnsResolver),
-        )
+            &[&endpoints.chat_url, &endpoints.models_url],
+            KIMI_OAUTH_HOST,
+            false,
+        )?;
+        Ok(Self {
+            http,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+            dialect: CompatibleDialect::KimiOAuth,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
     }
 
+    #[cfg(test)]
     fn new_kimi_subscription_with_dns_resolver(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -739,14 +953,32 @@ impl OpenAiCompatibleProvider {
         model: impl Into<String>,
         base_url: &str,
     ) -> Result<Self, ProviderError> {
-        Self::new_deepseek_api_with_dns_resolver(
+        if base_url != DEEPSEEK_BASE_URL {
+            return Err(invalid_request(
+                "DeepSeek inference base URL is not sanctioned",
+            ));
+        }
+        let chat_url = format!("{base_url}/chat/completions");
+        let models_url = format!("{base_url}/models");
+        let http = OpenAiHttp::new_fixed_origins_shared_system(
             credential,
             model,
-            base_url,
-            Arc::new(SystemFixedDnsResolver),
-        )
+            &[&chat_url, &models_url],
+            DEEPSEEK_HOST,
+            false,
+        )?;
+        Ok(Self {
+            http,
+            base_url: base_url.to_owned(),
+            chat_url,
+            models_url,
+            dialect: CompatibleDialect::DeepSeekApi,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
     }
 
+    #[cfg(test)]
     fn new_deepseek_api_with_dns_resolver(
         credential: SecretHandle,
         model: impl Into<String>,

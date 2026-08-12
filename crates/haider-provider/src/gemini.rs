@@ -1,7 +1,8 @@
 //! Google Gemini GenerateContent API adapter.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -36,6 +37,95 @@ const TRANSPORT_CONFIG: GeminiTransportConfig = GeminiTransportConfig {
     response_open_timeout: Duration::from_secs(30),
     chunk_idle_timeout: Duration::from_secs(90),
 };
+
+#[derive(Clone)]
+struct SharedGeminiTransport {
+    client: reqwest::Client,
+    fixed_origin_guard: Arc<FixedOriginGuard>,
+}
+
+static SHARED_GEMINI_CLIENTS: OnceLock<StdMutex<HashMap<String, SharedGeminiTransport>>> =
+    OnceLock::new();
+static GEMINI_CLIENT_BUILDS_BY_ENDPOINT: OnceLock<StdMutex<HashMap<String, usize>>> =
+    OnceLock::new();
+static GEMINI_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn build_gemini_transport(
+    api_url: &str,
+    resolver: Arc<dyn FixedDnsResolver>,
+) -> Result<SharedGeminiTransport, ProviderError> {
+    let fixed_origin_guard = Arc::new(FixedOriginGuard::new_allowing(
+        &[api_url, GEMINI_CACHED_CONTENTS_URL],
+        GEMINI_API_HOST,
+        resolver,
+    )?);
+    let transport = GeminiProvider::transport_config();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(match transport.retry_policy {
+            GeminiRetryPolicy::Never => reqwest::retry::never(),
+        })
+        .connect_timeout(transport.connect_timeout)
+        .dns_resolver(Arc::clone(&fixed_origin_guard))
+        .build()
+        .map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                format!("could not construct Gemini HTTP client: {error}"),
+            )
+        })?;
+    Ok(SharedGeminiTransport {
+        client,
+        fixed_origin_guard,
+    })
+}
+
+fn shared_gemini_transport(api_url: &str) -> Result<SharedGeminiTransport, ProviderError> {
+    let transports = SHARED_GEMINI_CLIENTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut transports = transports.lock().map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            "Gemini HTTP client pool is unavailable",
+        )
+    })?;
+    if let Some(transport) = transports.get(api_url) {
+        return Ok(transport.clone());
+    }
+    GEMINI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+    let transport = build_gemini_transport(api_url, Arc::new(SystemFixedDnsResolver))?;
+    if let Ok(mut builds) = GEMINI_CLIENT_BUILDS_BY_ENDPOINT
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        *builds.entry(api_url.to_owned()).or_default() += 1;
+    }
+    transports.insert(api_url.to_owned(), transport.clone());
+    Ok(transport)
+}
+
+/// Process-lifetime construction counter used by performance regression
+/// harnesses. A model endpoint has one client and exact fixed-origin guard.
+#[doc(hidden)]
+#[must_use]
+pub fn gemini_http_client_build_count() -> usize {
+    GEMINI_CLIENT_BUILD_COUNT.load(Ordering::Relaxed)
+}
+
+/// Exact-endpoint construction count for the pooling law.
+#[doc(hidden)]
+#[must_use]
+pub fn gemini_model_http_client_build_count(model: &str) -> usize {
+    let Ok(api_url) = gemini_stream_endpoint(model) else {
+        return 0;
+    };
+    GEMINI_CLIENT_BUILDS_BY_ENDPOINT
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|builds| builds.get(&api_url).copied())
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeminiRetryPolicy {
@@ -112,9 +202,13 @@ struct GeminiHttpCacheBackend {
 
 impl GeminiProvider {
     pub fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
-        Self::new_with_dns_resolver(credential, model, Arc::new(SystemFixedDnsResolver))
+        let model = model.into();
+        let api_url = gemini_stream_endpoint(&model)?;
+        let transport = shared_gemini_transport(&api_url)?;
+        Ok(Self::with_transport(credential, model, api_url, transport))
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_dns_resolver(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -122,34 +216,27 @@ impl GeminiProvider {
     ) -> Result<Self, ProviderError> {
         let model = model.into();
         let api_url = gemini_stream_endpoint(&model)?;
-        let fixed_origin_guard = Arc::new(FixedOriginGuard::new_allowing(
-            &[&api_url, GEMINI_CACHED_CONTENTS_URL],
-            GEMINI_API_HOST,
-            resolver,
-        )?);
-        let transport = Self::transport_config();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(match transport.retry_policy {
-                GeminiRetryPolicy::Never => reqwest::retry::never(),
-            })
-            .connect_timeout(transport.connect_timeout)
-            .dns_resolver(Arc::clone(&fixed_origin_guard))
-            .build()
-            .map_err(|error| {
-                ProviderError::new(
-                    ProviderErrorKind::Internal,
-                    format!("could not construct Gemini HTTP client: {error}"),
-                )
-            })?;
+        let transport = build_gemini_transport(&api_url, resolver)?;
+        Ok(Self::with_transport(credential, model, api_url, transport))
+    }
+
+    fn with_transport(
+        credential: SecretHandle,
+        model: String,
+        api_url: String,
+        transport: SharedGeminiTransport,
+    ) -> Self {
+        let SharedGeminiTransport {
+            client,
+            fixed_origin_guard,
+        } = transport;
         let credential = Arc::new(credential);
         let cache_backend = Arc::new(GeminiHttpCacheBackend {
             client: client.clone(),
             credential: Arc::clone(&credential),
             fixed_origin_guard: Arc::clone(&fixed_origin_guard),
         });
-        Ok(Self {
+        Self {
             client,
             credential,
             account: None,
@@ -160,7 +247,7 @@ impl GeminiProvider {
             web_builtins: false,
             cache_registry: None,
             cache_backend,
-        })
+        }
     }
 
     #[must_use]

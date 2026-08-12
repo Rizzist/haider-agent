@@ -867,6 +867,7 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         removing: dto.closed,
         children: dto.children.into_iter().map(chip_from_dto).collect(),
         transcript: projection_from_dto(dto.transcript),
+        transcript_layout: std::cell::RefCell::new(Default::default()),
     }
 }
 

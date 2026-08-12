@@ -17,6 +17,7 @@ use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, MessageRole};
 use std::collections::{HashMap, HashSet};
+use tokio::sync::Mutex;
 
 const HISTORY_PAGE: usize = 256;
 
@@ -31,6 +32,35 @@ pub trait ArtifactReader: Send + Sync {
 
 /// Branch/agent-scoped committed-history compiler.
 pub struct PromptHistoryCompiler;
+
+/// Daemon-lifetime prompt cache.
+///
+/// Durable journal bytes remain the only authority: the cache first samples
+/// the session head, reads only the missing suffix, and keys a compiled
+/// projection by that head plus its compaction epoch and complete branch,
+/// agent, and current-run scope. A restart starts empty and rebuilds from the
+/// same journal, so this is never a persistence seam.
+#[derive(Default)]
+pub struct PromptHistoryCache {
+    sessions: Mutex<HashMap<SessionId, CachedPromptSession>>,
+}
+
+#[derive(Default)]
+struct CachedPromptSession {
+    head_seq: u64,
+    compaction_epoch: u64,
+    envelopes: Vec<RawEnvelope>,
+    projections: HashMap<PromptProjectionKey, CompiledPromptProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PromptProjectionKey {
+    head_seq: u64,
+    compaction_epoch: u64,
+    branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
+    current_run: RunId,
+}
 
 /// Provider-facing prompt projection plus ephemeral cache boundaries.
 ///
@@ -167,40 +197,46 @@ impl PromptHistoryCompiler {
         current_run: &RunId,
     ) -> Result<CompiledPromptProjection, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
-        if legacy_journal_only(&envelopes, branch_id, agent_id) {
-            return render_journal(
-                &envelopes,
-                &envelopes,
-                branch_id,
-                agent_id,
-                Some(current_run),
-                true,
-            )
-            .map(CompiledPromptProjection::from_rendered);
-        }
-        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
-        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
-        let Some(ancestry) = tree.ancestry_for_run(current_run)? else {
-            // Upgrade compatibility: a session written before tree activation
-            // keeps the exact journal projection until its first node exists.
-            return render_journal(
-                &envelopes,
-                &envelopes,
-                branch_id,
-                agent_id,
-                Some(current_run),
-                true,
-            )
-            .map(CompiledPromptProjection::from_rendered);
-        };
-        compile_ancestry(
-            &envelopes,
-            &ancestry,
+        compile_projection_from_envelopes(
+            store,
             artifacts,
+            session_id,
+            branch_id,
             agent_id,
-            Some(current_run),
+            current_run,
+            &envelopes,
         )
         .await
+    }
+
+    /// Creates an empty daemon-lifetime incremental cache.
+    #[must_use]
+    pub fn cache() -> PromptHistoryCache {
+        PromptHistoryCache::default()
+    }
+
+    /// Compiles through a daemon-lifetime incremental journal/projection
+    /// cache. The returned value is always equivalent to a fresh compile at
+    /// the sampled durable head.
+    pub async fn compile_cached_provider_projection_with_artifacts(
+        cache: &PromptHistoryCache,
+        store: &dyn StoreHandle,
+        artifacts: &dyn ArtifactReader,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+        current_run: &RunId,
+    ) -> Result<CompiledPromptProjection, HaiderError> {
+        cache
+            .compile_provider_projection_with_artifacts(
+                store,
+                artifacts,
+                session_id,
+                branch_id,
+                agent_id,
+                current_run,
+            )
+            .await
     }
 
     /// Compiles the terminal active head without inventing a current user
@@ -316,6 +352,135 @@ impl PromptHistoryCompiler {
             resume_cause: CompactionResume::ManualIdle,
         })
     }
+}
+
+impl PromptHistoryCache {
+    async fn compile_provider_projection_with_artifacts(
+        &self,
+        store: &dyn StoreHandle,
+        artifacts: &dyn ArtifactReader,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+        current_run: &RunId,
+    ) -> Result<CompiledPromptProjection, HaiderError> {
+        let head_seq = store.latest_seq(session_id).await?;
+        let mut cached = self
+            .sessions
+            .lock()
+            .await
+            .remove(session_id)
+            .unwrap_or_default();
+        if cached.head_seq > head_seq {
+            cached = CachedPromptSession::default();
+        }
+        let mut cursor = cached.head_seq;
+        while cursor < head_seq {
+            let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+            let before = cached.envelopes.len();
+            for envelope in page {
+                if envelope.seq > head_seq {
+                    break;
+                }
+                cursor = envelope.seq;
+                if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::NodeCommitted(TreeNode {
+                                kind: NodeKind::Compaction { .. },
+                                ..
+                            })
+                        )
+                    },
+                ) {
+                    cached.compaction_epoch = envelope.seq;
+                }
+                cached.envelopes.push(envelope);
+            }
+            if cached.envelopes.len() == before {
+                return Err(corrupt(format!(
+                    "prompt cache could not read durable head {head_seq} after sequence {cursor}"
+                )));
+            }
+        }
+        if cached.head_seq < head_seq {
+            cached.head_seq = head_seq;
+            cached.projections.clear();
+        }
+
+        let key = PromptProjectionKey {
+            head_seq,
+            compaction_epoch: cached.compaction_epoch,
+            branch_id: branch_id.cloned(),
+            agent_id: agent_id.cloned(),
+            current_run: current_run.clone(),
+        };
+        if let Some(projection) = cached.projections.get(&key).cloned() {
+            self.install(session_id.clone(), cached).await;
+            return Ok(projection);
+        }
+
+        let projection = compile_projection_from_envelopes(
+            store,
+            Some(artifacts),
+            session_id,
+            branch_id,
+            agent_id,
+            current_run,
+            &cached.envelopes,
+        )
+        .await?;
+        cached.projections.insert(key, projection.clone());
+        self.install(session_id.clone(), cached).await;
+        Ok(projection)
+    }
+
+    async fn install(&self, session_id: SessionId, cached: CachedPromptSession) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&session_id)
+            .is_none_or(|current| current.head_seq <= cached.head_seq)
+        {
+            sessions.insert(session_id, cached);
+        }
+    }
+}
+
+async fn compile_projection_from_envelopes(
+    store: &dyn StoreHandle,
+    artifacts: Option<&dyn ArtifactReader>,
+    session_id: &SessionId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    current_run: &RunId,
+    envelopes: &[RawEnvelope],
+) -> Result<CompiledPromptProjection, HaiderError> {
+    if legacy_journal_only(envelopes, branch_id, agent_id) {
+        return render_journal(
+            envelopes,
+            envelopes,
+            branch_id,
+            agent_id,
+            Some(current_run),
+            true,
+        )
+        .map(CompiledPromptProjection::from_rendered);
+    }
+    let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+    let tree = TreeProjection::build(envelopes, &lineage, agent_id)?;
+    let Some(ancestry) = tree.ancestry_for_run(current_run)? else {
+        return render_journal(
+            envelopes,
+            envelopes,
+            branch_id,
+            agent_id,
+            Some(current_run),
+            true,
+        )
+        .map(CompiledPromptProjection::from_rendered);
+    };
+    compile_ancestry(envelopes, &ancestry, artifacts, agent_id, Some(current_run)).await
 }
 
 struct LineageScope {
@@ -650,6 +815,18 @@ async fn compile_ancestry(
     current_run: Option<&RunId>,
 ) -> Result<CompiledPromptProjection, HaiderError> {
     let plan = ProjectionPlan::build(ancestry)?;
+    // Index once by the already-fixed agent and owning branch. An ancestry
+    // node can then select its `(fragment_after, seq]` slice with two binary
+    // searches instead of rescanning the complete journal for every node.
+    let mut fragments = HashMap::<Option<BranchId>, Vec<&RawEnvelope>>::new();
+    for envelope in envelopes {
+        if envelope.agent_id.as_ref() == agent_id {
+            fragments
+                .entry(envelope.branch_id.clone())
+                .or_default()
+                .push(envelope);
+        }
+    }
     let mut messages = Vec::new();
     let mut current_user_seen = false;
     let mut current_user_start = None;
@@ -714,16 +891,15 @@ async fn compile_ancestry(
             }
             verbatim_owner = Some(entry.owner_branch.clone());
         }
-        verbatim.extend(
-            envelopes
-                .iter()
-                .filter(|envelope| {
-                    scoped(envelope, entry.owner_branch.as_ref(), agent_id)
-                        && envelope.seq > entry.fragment_after
-                        && envelope.seq <= entry.seq
-                })
-                .cloned(),
-        );
+        if let Some(scoped) = fragments.get(&entry.owner_branch) {
+            let start = scoped.partition_point(|envelope| envelope.seq <= entry.fragment_after);
+            let end = scoped.partition_point(|envelope| envelope.seq <= entry.seq);
+            verbatim.extend(
+                scoped[start..end]
+                    .iter()
+                    .map(|envelope| (*envelope).clone()),
+            );
+        }
     }
     if let Some(owner) = verbatim_owner {
         flush_verbatim(

@@ -143,6 +143,80 @@ async fn current_run_recovery_keeps_every_durable_steer_message() {
     );
 }
 
+/// Cache law: advancing the durable head by an append must produce the exact
+/// same provider projection as a fresh journal read and compile.
+#[tokio::test]
+async fn prompt_cache_matches_fresh_compile_after_append() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let cache = PromptHistoryCompiler::cache();
+    let session_id = SessionId::new("prompt-cache-append-session");
+    let run_id = RunId::new("prompt-cache-append-run");
+    let mut initial = vec![envelope(
+        &session_id,
+        &run_id,
+        "prompt-cache-initial",
+        EventPayload::UserMessage {
+            text: "inspect the cache".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        },
+        PromptRender::Verbatim,
+    )];
+    StoreHandle::append(&store, &mut initial)
+        .await
+        .expect("append initial prompt");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &run_id,
+    )
+    .await
+    .expect("prime prompt cache");
+
+    let mut suffix = vec![envelope(
+        &session_id,
+        &run_id,
+        "prompt-cache-steer",
+        EventPayload::UserMessage {
+            text: "include the invalidation law".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Steer,
+        },
+        PromptRender::Verbatim,
+    )];
+    StoreHandle::append(&store, &mut suffix)
+        .await
+        .expect("append cache-invalidating suffix");
+
+    let cached = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &run_id,
+    )
+    .await
+    .expect("compile cached projection after append");
+    let fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &run_id,
+    )
+    .await
+    .expect("compile fresh projection after append");
+    assert_eq!(cached, fresh);
+}
+
 #[tokio::test]
 async fn provider_opaque_extension_rehydrates_for_a_terminal_prior_run() {
     let store = MemoryStore::new();
@@ -582,10 +656,38 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
             },
         ),
     ];
+    let mut compacted_suffix = events.split_off(5);
     StoreHandle::append(&store, &mut events)
         .await
-        .expect("append compacted history");
-    let first_projection = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        .expect("append pre-compaction history");
+    let cache = PromptHistoryCompiler::cache();
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &store,
+        &session_id,
+        None,
+        None,
+        &first,
+    )
+    .await
+    .expect("prime cache before compaction");
+    StoreHandle::append(&store, &mut compacted_suffix)
+        .await
+        .expect("append compacted suffix");
+    let first_projection =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &cache,
+            &store,
+            &store,
+            &session_id,
+            None,
+            None,
+            &current,
+        )
+        .await
+        .expect("compile cached compacted projection");
+    let fresh_projection = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
         &store,
         &store,
         &session_id,
@@ -594,7 +696,8 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
         &current,
     )
     .await
-    .expect("compile compacted projection");
+    .expect("compile fresh compacted projection");
+    assert_eq!(first_projection, fresh_projection);
     store.close().await.expect("close before restart");
     let restarted = SqliteStoreHandle::open(root.path())
         .await
@@ -1301,6 +1404,30 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
     StoreHandle::append(&tree_store, &mut tree_events)
         .await
         .expect("append named lineage");
+    let cache = PromptHistoryCompiler::cache();
+    let artifacts = TestArtifacts(HashMap::new());
+    let cached_main = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &tree_store,
+        &artifacts,
+        &tree_session,
+        None,
+        Some(&agent),
+        &source_suffix_run,
+    )
+    .await
+    .expect("compile cached main-branch projection");
+    let fresh_main = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &tree_store,
+        &artifacts,
+        &tree_session,
+        None,
+        Some(&agent),
+        &source_suffix_run,
+    )
+    .await
+    .expect("compile fresh main-branch projection");
+    assert_eq!(cached_main, fresh_main);
     let named_messages = PromptHistoryCompiler::compile(
         &tree_store,
         &tree_session,
@@ -1310,6 +1437,57 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
     )
     .await
     .expect("compile named lineage");
+    let cached_named = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &tree_store,
+        &artifacts,
+        &tree_session,
+        Some(&branch),
+        Some(&agent),
+        &current,
+    )
+    .await
+    .expect("compile cached named-branch projection");
+    let fresh_named = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &tree_store,
+        &artifacts,
+        &tree_session,
+        Some(&branch),
+        Some(&agent),
+        &current,
+    )
+    .await
+    .expect("compile fresh named-branch projection");
+    assert_eq!(cached_named, fresh_named);
+    assert_eq!(cached_named.messages, named_messages);
+    let cached_other_agent_error =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &cache,
+            &tree_store,
+            &artifacts,
+            &tree_session,
+            Some(&branch),
+            Some(&other_agent),
+            &wrong_agent,
+        )
+        .await
+        .expect_err("invalid switched-agent ancestry fails from cache");
+    let fresh_other_agent_error =
+        PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+            &tree_store,
+            &artifacts,
+            &tree_session,
+            Some(&branch),
+            Some(&other_agent),
+            &wrong_agent,
+        )
+        .await
+        .expect_err("invalid switched-agent ancestry fails fresh");
+    assert_eq!(cached_other_agent_error.code, fresh_other_agent_error.code);
+    assert_eq!(
+        cached_other_agent_error.message,
+        fresh_other_agent_error.message
+    );
     let named_rendered = named_messages
         .iter()
         .flat_map(|message| &message.blocks)

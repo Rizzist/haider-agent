@@ -1844,10 +1844,15 @@ async fn lz1_azure_request_rides_api_key_header_and_deployment_model() {
     vault
         .put(&alias, b"AZURE_API_KEY_SENTINEL_5c1e")
         .expect("store azure key");
-    let provider = OpenAiCompatibleProvider::new_azure(
+    let resolver: Arc<dyn CompatibleDnsResolver> = Arc::new(StubDnsResolver::new([
+        vec![SocketAddr::from(([192, 0, 2, 1], 443))],
+        vec![SocketAddr::from(([192, 0, 2, 1], 443))],
+    ]));
+    let provider = OpenAiCompatibleProvider::new_azure_with_dns_resolver(
         vault.resolve(&alias).expect("resolve azure key"),
         "my-gpt-deployment",
         "https://contoso.openai.azure.com/openai/v1",
+        resolver,
     )
     .expect("azure adapter");
     assert_eq!(

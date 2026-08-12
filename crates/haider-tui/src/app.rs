@@ -784,6 +784,7 @@ pub struct ChipModel {
     pub removing: bool,
     pub children: Vec<ChipModel>,
     pub transcript: SessionProjection,
+    pub(crate) transcript_layout: std::cell::RefCell<crate::render::TranscriptLayoutCache>,
 }
 
 impl ChipModel {
@@ -848,6 +849,7 @@ impl ChipModel {
             removing: false,
             children: Vec::new(),
             transcript,
+            transcript_layout: std::cell::RefCell::new(Default::default()),
         }
     }
 
@@ -902,6 +904,7 @@ impl ChipModel {
             removing: false,
             children: Vec::new(),
             transcript: SessionProjection::new(),
+            transcript_layout: std::cell::RefCell::new(Default::default()),
         }
     }
 
@@ -2828,6 +2831,7 @@ pub struct AppModel {
     pub theme_commits: u64,
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
+    pub(crate) transcript_layout: std::cell::RefCell<crate::render::TranscriptLayoutCache>,
     /// Durable-journal prompt recall for the attached session, newest first.
     /// Identical redo prompts are distinct entries by design.
     pub prompt_history: std::collections::VecDeque<String>,
@@ -3212,6 +3216,7 @@ impl Default for AppModel {
             theme_commits: 0,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
+            transcript_layout: std::cell::RefCell::new(Default::default()),
             prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             pending_cache_change: None,
@@ -10261,6 +10266,7 @@ impl AppModel {
         // session, so their by-id origin can never match.
         self.outbox.clear();
         self.projection = SessionProjection::new();
+        *self.transcript_layout.get_mut() = Default::default();
         self.prompt_history.clear();
         self.close_backtrack();
         self.branch_state = crate::branch::BranchState::default();
@@ -10457,6 +10463,7 @@ impl AppModel {
         );
         crate::session::sweep_closed_chips(&mut slot.chips);
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
+        *self.transcript_layout.get_mut() = Default::default();
         self.prompt_history = std::mem::take(&mut slot.prompt_history);
         self.cache_usage = std::mem::take(&mut slot.cache_usage);
         self.chips = std::mem::take(&mut slot.chips);
@@ -10513,6 +10520,7 @@ impl AppModel {
             // (identity is the protocol id; the row's generation stays put)
             let slot = &mut self.sessions[index];
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
+            *self.transcript_layout.get_mut() = Default::default();
             slot.prompt_history = std::mem::take(&mut self.prompt_history);
             slot.cache_usage = std::mem::take(&mut self.cache_usage);
             slot.chips = std::mem::take(&mut self.chips);

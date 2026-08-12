@@ -53,7 +53,8 @@ pub use haider_store::{
     TurnCancellationStatus,
 };
 pub use prompt_history::{
-    ArtifactReader, CompiledPromptProjection, PromptHistoryCompiler, task_event_notice,
+    ArtifactReader, CompiledPromptProjection, PromptHistoryCache, PromptHistoryCompiler,
+    task_event_notice,
 };
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};
 pub use sqlite_store::{ProfileStoreFault, SqliteStoreHandle};

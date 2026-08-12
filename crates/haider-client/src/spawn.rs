@@ -53,6 +53,15 @@ pub const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 /// The race loser's expected exit code (`EX_TEMPFAIL`).
 pub const RACE_LOSER_EXIT_CODE: i32 = 75;
 
+/// Returns whether the authenticated endpoint is served by this launcher's
+/// retained daemon candidate. Kept public only so the no-wait law can run in
+/// a socket-independent test sandbox.
+#[doc(hidden)]
+#[must_use]
+pub fn authenticated_peer_is_candidate(peer_pid: Option<u32>, candidate_pid: u32) -> bool {
+    peer_pid == Some(candidate_pid)
+}
+
 /// Options for [`ensure_daemon`].
 #[derive(Debug, Clone)]
 pub struct EnsureOptions {
@@ -258,7 +267,9 @@ pub async fn ensure_daemon(
         match try_attach(profile, &options).await {
             Attach::Ready(connected) => {
                 let Connected {
-                    client, welcome, ..
+                    client,
+                    welcome,
+                    peer_credentials,
                 } = *connected;
                 // Reap a still-running race-loser candidate before returning:
                 // its store-lock loss makes exit 75 imminent, and the parent
@@ -266,16 +277,23 @@ pub async fn ensure_daemon(
                 // would linger as a zombie for the parent's lifetime (W3c2
                 // review finding 6). One bounded grace poll, then release.
                 if let Some(mut active) = child.take() {
-                    for _ in 0..40u8 {
-                        match active.try_wait() {
-                            Ok(Some(status)) => {
-                                if status.code() == Some(RACE_LOSER_EXIT_CODE) {
-                                    race_lost = true;
+                    // The authenticated endpoint PID distinguishes our
+                    // healthy winner from a candidate that lost to another
+                    // launcher. Waiting for the healthy child to exit would
+                    // add the entire one-second loser grace to every cold
+                    // launch even though that daemon is meant to outlive us.
+                    if !authenticated_peer_is_candidate(peer_credentials.pid, active.id()) {
+                        for _ in 0..40u8 {
+                            match active.try_wait() {
+                                Ok(Some(status)) => {
+                                    if status.code() == Some(RACE_LOSER_EXIT_CODE) {
+                                        race_lost = true;
+                                    }
+                                    break;
                                 }
-                                break;
+                                Ok(None) => sleep(Duration::from_millis(25)).await,
+                                Err(_) => break,
                             }
-                            Ok(None) => sleep(Duration::from_millis(25)).await,
-                            Err(_) => break,
                         }
                     }
                 }
