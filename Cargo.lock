@@ -1186,7 +1186,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "haider-accounts"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "haider-protocol",
  "hex",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "haider-cli"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "async-trait",
  "haider-accounts",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "haider-client"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "blake3",
  "haider-pdf",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "haider-core"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "haider-daemon"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "async-trait",
  "base64",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "haider-daemond"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "async-trait",
  "base64",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "haider-pdf"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "flate2",
  "lopdf 0.44.0",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "haider-protocol"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "serde",
  "serde_json",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "haider-provider"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "haider-rpc"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "haider-protocol",
  "serde",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "haider-store"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "blake3",
  "haider-protocol",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "haider-stt"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "cpal",
  "futures-util",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tools"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "async-trait",
  "base64",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tui"
-version = "0.0.905"
+version = "0.0.906"
 dependencies = [
  "base64",
  "haider-client",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "haider-verify"
-version = "0.0.905"
+version = "0.0.906"
 
 [[package]]
 name = "hashbrown"
@@ -4906,7 +4906,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.905"
+version = "0.0.906"
 
 [[package]]
 name = "yoke"
