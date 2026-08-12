@@ -97,5 +97,7 @@ fn protocol_error(code: &str, message: String) -> ProtocolError {
         code: code.to_owned(),
         message,
         fatal: true,
+        presentation: None,
+        failed_write_ids: Vec::new(),
     }
 }

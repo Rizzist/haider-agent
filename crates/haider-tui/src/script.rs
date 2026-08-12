@@ -1025,6 +1025,8 @@ fn branch_crash(b: &mut B) {
         id: menu_id.clone(),
         kind: MenuKind::Recovery {
             effect: EffectId::new("e-4411"),
+            presentation: None,
+            option_actions: Vec::new(),
         },
         title: "recovery — process_exec outcome unknown".to_owned(),
         body: vec![
@@ -1706,6 +1708,8 @@ fn chip_question_menu(
     let kind = if recovery {
         MenuKind::Recovery {
             effect: EffectId::new(format!("e-{agent}")),
+            presentation: None,
+            option_actions: Vec::new(),
         }
     } else {
         MenuKind::Question

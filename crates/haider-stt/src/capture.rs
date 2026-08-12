@@ -199,6 +199,9 @@ pub enum CaptureHealth {
     Stalled { hint: String },
     /// Signal returned after a reported episode.
     Recovered,
+    /// CPAL reported a post-start stream failure (device vanished,
+    /// permission revoked, backend reset). This is terminal for the worker.
+    Failed { error: String },
 }
 
 /// One observable capture emission.
@@ -422,6 +425,7 @@ enum WorkerMessage {
     Audio { data: Vec<f32>, channels: usize },
     StartRecording,
     StopRecording(mpsc::Sender<Vec<f32>>),
+    StreamError(String),
     Shutdown,
 }
 
@@ -458,6 +462,7 @@ impl CaptureWorker {
         let channels = usize::from(default_config.channels());
         let (message_tx, message_rx) = mpsc::channel::<WorkerMessage>();
         let audio_tx = message_tx.clone();
+        let stream_message_tx = message_tx.clone();
         let stream_config: cpal::StreamConfig = default_config.config();
         let sample_format = default_config.sample_format();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), SttError>>();
@@ -469,7 +474,9 @@ impl CaptureWorker {
                     hint: format!("could not open input stream ({error}); {MIC_GRANT_HINT}"),
                 };
                 let stream = match sample_format {
-                    cpal::SampleFormat::F32 => device.build_input_stream(
+                    cpal::SampleFormat::F32 => {
+                        let stream_error_tx = stream_message_tx.clone();
+                        device.build_input_stream(
                         &stream_config,
                         move |data: &[f32], _: &cpal::InputCallbackInfo| {
                             let _ = audio_tx.send(WorkerMessage::Audio {
@@ -477,10 +484,17 @@ impl CaptureWorker {
                                 channels,
                             });
                         },
-                        |_| {},
+                        move |error| {
+                            let _ = stream_error_tx.send(WorkerMessage::StreamError(
+                                format!("microphone stream failed after start: {error}; {MIC_GRANT_HINT}"),
+                            ));
+                        },
                         None,
-                    ),
-                    cpal::SampleFormat::I16 => device.build_input_stream(
+                    )
+                    }
+                    cpal::SampleFormat::I16 => {
+                        let stream_error_tx = stream_message_tx.clone();
+                        device.build_input_stream(
                         &stream_config,
                         move |data: &[i16], _: &cpal::InputCallbackInfo| {
                             let converted = data
@@ -492,10 +506,17 @@ impl CaptureWorker {
                                 channels,
                             });
                         },
-                        |_| {},
+                        move |error| {
+                            let _ = stream_error_tx.send(WorkerMessage::StreamError(
+                                format!("microphone stream failed after start: {error}; {MIC_GRANT_HINT}"),
+                            ));
+                        },
                         None,
-                    ),
-                    cpal::SampleFormat::U16 => device.build_input_stream(
+                    )
+                    }
+                    cpal::SampleFormat::U16 => {
+                        let stream_error_tx = stream_message_tx.clone();
+                        device.build_input_stream(
                         &stream_config,
                         move |data: &[u16], _: &cpal::InputCallbackInfo| {
                             let converted = data
@@ -507,9 +528,14 @@ impl CaptureWorker {
                                 channels,
                             });
                         },
-                        |_| {},
+                        move |error| {
+                            let _ = stream_error_tx.send(WorkerMessage::StreamError(
+                                format!("microphone stream failed after start: {error}; {MIC_GRANT_HINT}"),
+                            ));
+                        },
                         None,
-                    ),
+                    )
+                    }
                     other => {
                         let _ = ready_tx.send(Err(SttError::MicUnavailable {
                             hint: format!("unsupported input sample format {other:?}"),
@@ -542,6 +568,12 @@ impl CaptureWorker {
                         Ok(WorkerMessage::StartRecording) => state.start_recording(),
                         Ok(WorkerMessage::StopRecording(reply)) => {
                             let _ = reply.send(state.stop_recording());
+                        }
+                        Ok(WorkerMessage::StreamError(error)) => {
+                            let _ = events.send(CaptureEvent::Health(CaptureHealth::Failed {
+                                error,
+                            }));
+                            return;
                         }
                         Ok(WorkerMessage::Shutdown) => return,
                         Err(mpsc::RecvTimeoutError::Timeout) => {

@@ -40,6 +40,28 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     frame.render_widget(Block::default().style(theme.text_style()), area);
 
     let mut hits: Vec<(Rect, Hit)> = Vec::new();
+    let persistent_diagnostic = model
+        .profile_diagnostic
+        .as_ref()
+        .or(model.compatibility_diagnostic.as_ref())
+        .or(model.voice_diagnostic.as_ref())
+        .or(model.supervisor_diagnostic.as_ref());
+    let (area, diagnostic) = if persistent_diagnostic.is_some() && area.height > 1 {
+        let [diagnostic, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        (body, Some(diagnostic))
+    } else {
+        (area, None)
+    };
+    if let (Some(rect), Some(presentation)) = (diagnostic, persistent_diagnostic) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" STORE UNWRITABLE — ", theme.warn_style()),
+                Span::styled(presentation.detail.clone(), theme.warn_style()),
+            ])),
+            rect,
+        );
+    }
     // The status row is the FIRST chrome to yield when a session's sacred
     // input — a blocking menu's options OR the composer's cursor row
     // (review r5 P2-1 + r6 P2-1) — cannot otherwise fit. Minimal need
@@ -852,8 +874,7 @@ fn render_launcher(
             LauncherRow::Aura,
             "◉",
             "Aura",
-            "voice session · orchestrator — spawns & steers sessions across devices, never codes"
-                .to_owned(),
+            "voice session · orchestrator — spawns & steers local sessions, never codes".to_owned(),
         ),
         (
             LauncherRow::Accounts,
@@ -5318,7 +5339,8 @@ fn menu_block(
                 | ErrorRecoveryCardKind::KeychainRelink
                 | ErrorRecoveryCardKind::RateLimit
                 | ErrorRecoveryCardKind::QuotaExhausted
-                | ErrorRecoveryCardKind::PartialStream => theme.warn,
+                | ErrorRecoveryCardKind::PartialStream
+                | ErrorRecoveryCardKind::StoreUnwritable => theme.warn,
             })
         }
         _ => None,
@@ -7411,7 +7433,11 @@ fn item_lines<'a>(
                 if budget > 0 {
                     spans.push(Span::styled(
                         format!(" · {}", ellipsize(reason, budget)),
-                        theme.err_style(),
+                        if status == &haider_protocol::item::ToolStatus::Completed {
+                            theme.warn_style()
+                        } else {
+                            theme.err_style()
+                        },
                     ));
                 }
             }

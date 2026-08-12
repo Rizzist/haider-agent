@@ -414,6 +414,8 @@ async fn no_wire_overlap_is_a_fatal_mismatch_and_never_spawns() {
             code: "protocol_version_mismatch".into(),
             message: "client range 1..=1 does not overlap server range 9..=9".into(),
             fatal: true,
+            presentation: None,
+            failed_write_ids: Vec::new(),
         }),
         echo_serve,
     );
@@ -508,6 +510,8 @@ async fn fatal_protocol_error_frame_fails_pending_requests() {
                             code: "overloaded".into(),
                             message: "fatal fake".into(),
                             fatal: true,
+                            presentation: None,
+                            failed_write_ids: Vec::new(),
                         }),
                     )
                     .await;

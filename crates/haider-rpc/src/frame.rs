@@ -1027,6 +1027,14 @@ pub enum RequestBody {
         #[serde(default)]
         last_event_limit: u32,
     },
+    /// Persists a client-detected compatibility fault in the session journal.
+    #[serde(rename = "session.diagnostic")]
+    SessionDiagnostic {
+        command_id: CommandId,
+        session_id: SessionId,
+        code: String,
+        message: String,
+    },
     /// Discovers the effective hooks for one canonicalizable workspace.
     #[serde(rename = "hooks.list")]
     HooksList { cwd: String },
@@ -1434,6 +1442,8 @@ pub enum ResponseBody {
     SessionRead { result: SessionReadResult },
     #[serde(rename = "session.observe")]
     SessionObserve { digest: SessionObserveDigest },
+    #[serde(rename = "session.diagnostic")]
+    SessionDiagnostic { recorded_seq: u64 },
     #[serde(rename = "hooks.list")]
     HooksList {
         policy: String,
@@ -1883,6 +1893,14 @@ pub struct ProtocolError {
     pub message: String,
     /// When `true`, the sender will close the connection after this frame.
     pub fatal: bool,
+    /// Typed cross-surface presentation. Optional for negotiation errors from
+    /// older peers and mandatory for daemon profile diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<haider_protocol::error::ErrorPresentation>,
+    /// Durable write ids that did not commit. This out-of-band list is needed
+    /// precisely when the journal cannot record its own failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_write_ids: Vec<String>,
 }
 
 impl std::fmt::Display for ProtocolError {

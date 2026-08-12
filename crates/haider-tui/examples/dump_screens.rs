@@ -429,6 +429,8 @@ fn main() {
                 id: haider_protocol::ids::MenuId::new("t1-docs-q"),
                 kind: haider_protocol::menu::MenuKind::Recovery {
                     effect: haider_protocol::ids::EffectId::new("e-t1-docs"),
+                    presentation: None,
+                    option_actions: Vec::new(),
                 },
                 title: recovery_text.to_owned(),
                 body: vec![],

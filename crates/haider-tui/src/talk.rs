@@ -387,10 +387,24 @@ pub struct TalkSetupSnapshot {
 /// ones whole.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TalkEvent {
+    /// Unexpected supervisor death is restarted once, with both edges visible.
+    SupervisorRestarting {
+        attempt: u8,
+        max: u8,
+    },
+    SupervisorFailed {
+        reason: String,
+    },
     /// Mic + engine are live; audio is flowing.
-    Started { generation: u64, sample_rate: u32 },
+    Started {
+        generation: u64,
+        sample_rate: u32,
+    },
     /// One ~60 ms envelope sample (recording only).
-    Envelope { generation: u64, level: f32 },
+    Envelope {
+        generation: u64,
+        level: f32,
+    },
     /// One engine transcript frame (cumulative for local, interim/final
     /// for Deepgram).
     Partial {
@@ -403,7 +417,9 @@ pub enum TalkEvent {
         health: CaptureHealth,
     },
     /// The 900 s capture cap: recording stopped accumulating.
-    CapReached { generation: u64 },
+    CapReached {
+        generation: u64,
+    },
     /// The engine's assembled session result (after `Finish`).
     Finished {
         generation: u64,
@@ -411,9 +427,14 @@ pub enum TalkEvent {
     },
     /// The session could not start (mic denied, model missing, runtime
     /// missing, bad key, endpoint down, …).
-    StartFailed { generation: u64, error: SttError },
+    StartFailed {
+        generation: u64,
+        error: SttError,
+    },
     /// Setup snapshot answer.
-    SetupSnapshot { snapshot: TalkSetupSnapshot },
+    SetupSnapshot {
+        snapshot: TalkSetupSnapshot,
+    },
     /// The probed key validated; the streaming model list rode along. The
     /// SAME secret travels back so the reducer can vault it without ever
     /// holding two live copies.
@@ -422,7 +443,9 @@ pub enum TalkEvent {
         models: Vec<DeepgramModelRow>,
     },
     /// The probed key was refused (401/403) or the endpoint failed.
-    KeyRejected { error: SttError },
+    KeyRejected {
+        error: SttError,
+    },
     /// Whisper model download progress (`None` percent = unknown total).
     DownloadProgress {
         model_id: String,

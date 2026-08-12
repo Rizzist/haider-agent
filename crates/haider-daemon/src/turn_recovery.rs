@@ -717,6 +717,16 @@ async fn resumption_terminal_payloads(
             false,
         ));
     }
+    // E6: supervisor loss may have parked a dispatched effect behind the
+    // standard reconciliation card. Do not immediately erase that honest
+    // state with the generic interrupted-run terminalizer. The committed
+    // menu answer and reconciliation handler now own closure.
+    if matches!(
+        reduction.state.as_ref().map(|(state, _)| state),
+        Some(RunState::EffectOutcomeUnknown)
+    ) {
+        return Ok(Vec::new());
+    }
     Ok(interrupted_terminal_payloads(
         reduction,
         cancelling,

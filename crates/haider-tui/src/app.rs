@@ -863,7 +863,9 @@ impl ChipModel {
             .find(|(name, _, _)| *name == callsign);
         let device = match &manifest.placement {
             haider_protocol::agent::Placement::Local => local_device_name().to_owned(),
-            haider_protocol::agent::Placement::Device { device } => device.as_str().to_owned(),
+            haider_protocol::agent::Placement::Device { .. } => {
+                "not supported — local-only".to_owned()
+            }
         };
         Self {
             agent: manifest.agent.as_str().to_owned(),
@@ -3014,6 +3016,14 @@ pub struct AppModel {
     /// One-line transient notice shown in the status bar until the next
     /// keystroke (honest stubs: "/tree lands with the daemon").
     pub flash: Option<String>,
+    /// Persistent profile-level diagnostic, cleared only by an explicit
+    /// healthy edge from the daemon after a real write probe succeeds.
+    pub profile_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
+    /// Latched after sustained unknown-payload/sequence mismatch.
+    pub compatibility_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
+    /// Post-start microphone failure, persistent until a later Start succeeds.
+    pub voice_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
+    pub supervisor_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
     /// Answers the user produced; the runtime drains these to the client
     /// (side effects never happen inside the reducer).
     pub outbox: Vec<OutboundAnswer>,
@@ -3242,6 +3252,10 @@ impl Default for AppModel {
             palette_dismissed: false,
             help_open: false,
             flash: None,
+            profile_diagnostic: None,
+            compatibility_diagnostic: None,
+            voice_diagnostic: None,
+            supervisor_diagnostic: None,
             outbox: Vec::new(),
             requests: Vec::new(),
             turn_active: false,
@@ -5732,8 +5746,32 @@ impl AppModel {
     pub fn handle_talk(&mut self, event: crate::talk::TalkEvent) {
         use crate::talk::{CommitIntent, TalkEvent, TalkPhase};
         match event {
+            TalkEvent::SupervisorRestarting { attempt, max } => {
+                self.flash = Some(format!(
+                    "· talk supervisor restarting — attempt {attempt}/{max}"
+                ));
+                self.dirty = true;
+            }
+            TalkEvent::SupervisorFailed { reason } => {
+                let ghost = self.talk.ghost.trim().to_owned();
+                if !ghost.is_empty() {
+                    self.composer
+                        .insert_str(crate::talk::clamp_realized(&ghost));
+                }
+                self.talk.settle();
+                self.listening = false;
+                self.supervisor_diagnostic = Some(haider_protocol::error::ErrorPresentation::new(
+                    "talk-supervisor-unavailable",
+                    "Talk unavailable",
+                    reason,
+                    haider_protocol::error::ErrorScope::Profile,
+                    [haider_protocol::error::ErrorAction::Retry],
+                ));
+                self.dirty = true;
+            }
             TalkEvent::Started { generation, .. } => {
                 if generation == self.talk.generation && self.talk.phase == TalkPhase::Starting {
+                    self.voice_diagnostic = None;
                     self.talk.phase = TalkPhase::Listening;
                     self.dirty = true;
                 }
@@ -5760,6 +5798,24 @@ impl AppModel {
                         }
                         haider_stt::capture::CaptureHealth::Recovered => {
                             "· mic signal recovered".to_owned()
+                        }
+                        haider_stt::capture::CaptureHealth::Failed { error } => {
+                            let ghost = self.talk.ghost.trim().to_owned();
+                            if !ghost.is_empty() {
+                                self.composer
+                                    .insert_str(crate::talk::clamp_realized(&ghost));
+                            }
+                            self.talk.settle();
+                            self.listening = false;
+                            self.voice_diagnostic =
+                                Some(haider_protocol::error::ErrorPresentation::new(
+                                    "microphone-unavailable",
+                                    "Microphone unavailable",
+                                    &error,
+                                    haider_protocol::error::ErrorScope::Profile,
+                                    [haider_protocol::error::ErrorAction::Retry],
+                                ));
+                            format!("· mic: {error}")
                         }
                     });
                 }
@@ -9174,6 +9230,19 @@ impl AppModel {
         match outcome {
             RawOutcome::Applied => {
                 self.dirty = true;
+                if let Ok(EventPayload::ClientDiagnostic { code, message, .. }) =
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    && code == "client-daemon-incompatible"
+                {
+                    self.compatibility_diagnostic =
+                        Some(haider_protocol::error::ErrorPresentation::new(
+                            code,
+                            "Client/daemon incompatible — update",
+                            message,
+                            haider_protocol::error::ErrorScope::Session,
+                            [haider_protocol::error::ErrorAction::None],
+                        ));
+                }
                 // S4: applied journal truth advances the render clock —
                 // the first paint after a spawn reads a clock already
                 // inside the journal's own time base, tick or no tick.

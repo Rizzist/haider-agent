@@ -78,6 +78,31 @@ fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
 }
 
 #[test]
+fn explicit_hosted_web_tool_rejection_has_the_one_shot_fallback_discriminator() {
+    let error = replay_anthropic_http_error(
+        400,
+        None,
+        br#"{"type":"error","error":{"type":"invalid_request_error","message":"web_search is not enabled for this organization"}}"#,
+    );
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert_eq!(
+        error.presentation.subcode.as_str(),
+        "provider-web-tool-rejected"
+    );
+
+    let generic = replay_anthropic_http_error(
+        400,
+        None,
+        br#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is invalid"}}"#,
+    );
+    assert_ne!(
+        generic.presentation.subcode.as_str(),
+        "provider-web-tool-rejected",
+        "generic invalid requests must never trigger capability fallback"
+    );
+}
+
+#[test]
 fn constructor_transport_config_disables_retries_and_bounds_connects_and_chunk_idle() {
     let config = AnthropicProvider::transport_config();
 

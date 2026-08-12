@@ -449,6 +449,18 @@ impl SessionProjection {
                     presentation: presentation.clone(),
                 });
             }
+            EventPayload::ClientDiagnostic { code, message, .. } => {
+                self.entries.push(TranscriptEntry::Error {
+                    text: format!("{code} — {message}"),
+                    presentation: Some(haider_protocol::error::ErrorPresentation::new(
+                        code,
+                        "Client/daemon incompatible — update",
+                        message,
+                        haider_protocol::error::ErrorScope::Session,
+                        [haider_protocol::error::ErrorAction::None],
+                    )),
+                });
+            }
             // B2b-m3: a committed node ANCHORS its display entry — never a
             // transcript row of its own (the sim's tree reads entries; the
             // node is the durable identity riding beside them).
@@ -1170,7 +1182,15 @@ impl SessionProjection {
 
 fn bounded_tool_reason(result: &haider_protocol::tool::BoundedResult) -> Option<String> {
     if result.status.is_completed() {
-        return None;
+        return result.reason.as_deref().map(|reason| {
+            reason
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(240)
+                .collect()
+        });
     }
     if let Some(presentation) = &result.presentation {
         return Some(format_error_presentation(presentation));
@@ -1389,9 +1409,9 @@ fn wait_reason_label(reason: &WaitReason) -> String {
     match reason {
         WaitReason::ProviderBackoff => "provider backoff".to_owned(),
         WaitReason::RateLimit => "rate limit".to_owned(),
-        WaitReason::RemoteChild => "remote subagent".to_owned(),
+        WaitReason::RemoteChild => "unsupported remote wait — local-only".to_owned(),
         WaitReason::LocalChild => "subagent".to_owned(),
-        WaitReason::DeviceUnreachable => "device unreachable".to_owned(),
+        WaitReason::DeviceUnreachable => "unsupported device wait — local-only".to_owned(),
         WaitReason::BlockingHook => "hook".to_owned(),
         WaitReason::Dependency => "dependency".to_owned(),
         WaitReason::VerifyHold => "verify hold".to_owned(),

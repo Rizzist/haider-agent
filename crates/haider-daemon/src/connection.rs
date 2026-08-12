@@ -1026,6 +1026,8 @@ pub(crate) async fn serve(
                             code: "invalid_frame".into(),
                             message: error.to_string(),
                             fatal: true,
+                            presentation: None,
+                            failed_write_ids: Vec::new(),
                         };
                         let _ = enqueue(
                             &lane,
@@ -1307,6 +1309,8 @@ async fn handle_frame(
                     code: "unknown_frame".into(),
                     message: "frame kind is not implemented".into(),
                     fatal: false,
+                    presentation: None,
+                    failed_write_ids: Vec::new(),
                 }),
                 *outbound_limit,
             )?;
@@ -1426,6 +1430,8 @@ fn enqueue_fatal(
             code: code.into(),
             message: message.into(),
             fatal: true,
+            presentation: None,
+            failed_write_ids: Vec::new(),
         }),
         outbound_limit,
     )
@@ -1511,6 +1517,8 @@ pub(crate) fn reject_over_limit(stream: &UnixStream, context: &ConnectionContext
             context.max_connections
         ),
         fatal: true,
+        presentation: None,
+        failed_write_ids: Vec::new(),
     });
     let Ok(bytes) = encode_outbound(&frame, context.frame_limit) else {
         return;

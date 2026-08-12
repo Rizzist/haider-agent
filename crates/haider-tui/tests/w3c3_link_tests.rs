@@ -603,6 +603,8 @@ fn map_frame_translates_every_uncorrelated_frame_it_owns() {
             code: "overloaded".into(),
             message: "try later".into(),
             fatal: false,
+            presentation: None,
+            failed_write_ids: Vec::new(),
         })),
         vec![LiveReply::Failed {
             command_id: None,

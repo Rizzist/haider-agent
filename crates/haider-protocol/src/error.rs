@@ -78,6 +78,7 @@ impl<'de> Deserialize<'de> for ErrorSubcode {
 pub enum ErrorScope {
     Turn,
     Session,
+    Profile,
     Account,
     Tool,
 }
@@ -323,6 +324,9 @@ pub enum ErrorCode {
     // storage
     StoreCorrupt,
     StoreLocked,
+    StoreFull,
+    StoreReadOnly,
+    StoreUnavailable,
     // effects / permissions
     PermissionDenied,
     EffectUnknownOutcome,
@@ -357,6 +361,9 @@ impl ErrorCode {
             Self::VisionUnsupported => "vision_unsupported",
             Self::StoreCorrupt => "store_corrupt",
             Self::StoreLocked => "store_locked",
+            Self::StoreFull => "store_full",
+            Self::StoreReadOnly => "store_read_only",
+            Self::StoreUnavailable => "store_unavailable",
             Self::PermissionDenied => "permission_denied",
             Self::EffectUnknownOutcome => "effect_unknown_outcome",
             Self::Internal => "internal",
@@ -387,6 +394,9 @@ impl ErrorCode {
             Self::VisionUnsupported => "vision-unsupported",
             Self::StoreCorrupt => "store-corrupt",
             Self::StoreLocked => "store-locked",
+            Self::StoreFull => "store-full",
+            Self::StoreReadOnly => "store-read-only",
+            Self::StoreUnavailable => "store-unavailable",
             Self::PermissionDenied => "permission-denied",
             Self::EffectUnknownOutcome => "effect-unknown-outcome",
             Self::Internal => "internal",

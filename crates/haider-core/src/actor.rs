@@ -121,6 +121,9 @@ pub struct HarnessConfig {
     pub system_prompt: Option<String>,
     /// General tools the paired dispatcher can execute.
     pub tools: Vec<ToolDefinition>,
+    /// Local equivalents advertised after one exact provider-hosted-tool
+    /// rejection. Empty means this provider has no safe fallback pack.
+    pub provider_tool_fallback_tools: Vec<ToolDefinition>,
     /// CAS-backed attachments resolved before crossing the provider boundary.
     pub attachments: Vec<ResolvedAttachment>,
     /// Account pinned by the turn-scoped provider resolver.
@@ -195,6 +198,7 @@ impl HarnessConfig {
             context_compaction_v1: false,
             system_prompt: None,
             tools: Vec::new(),
+            provider_tool_fallback_tools: Vec::new(),
             attachments: Vec::new(),
             usage_account: None,
             usage_scope: UsageScope::default(),
@@ -374,6 +378,12 @@ pub enum ProviderAttemptDecision {
     /// Retry with refreshed credentials for the same account. This does not
     /// consume the account-rotation allowance.
     Retry {
+        provider: Arc<dyn Provider>,
+        account: CredentialAlias,
+    },
+    /// Retry this same logical request using a provider rebuilt without the
+    /// rejected hosted capability; core swaps in its local-equivalent pack.
+    Fallback {
         provider: Arc<dyn Provider>,
         account: CredentialAlias,
     },
@@ -1230,6 +1240,7 @@ impl HarnessActor {
         let mut provider = Arc::clone(&self.provider);
         let mut usage_account = self.config.usage_account.clone();
         let mut rotation_budget_consumed = self.config.rotation_budget_consumed;
+        let mut capability_fallback_consumed = false;
         if let Some(initial_rotation) = self.config.initial_rotation.take() {
             if let Err(error) = self
                 .commit_payload(
@@ -1254,6 +1265,10 @@ impl HarnessActor {
         // exactly once, under the finished message.
         let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
+        // E8a: one repair request for malformed model-authored tool JSON per
+        // logical turn. This lives outside the request loop so a retry cannot
+        // reset the bound into an unbounded repair cycle.
+        let mut tool_json_repair_used = false;
 
         'requests: loop {
             messages.extend(
@@ -1437,6 +1452,7 @@ impl HarnessActor {
                                 &mut provider,
                                 &mut usage_account,
                                 &mut rotation_budget_consumed,
+                                &mut capability_fallback_consumed,
                                 error,
                             )
                             .await
@@ -1587,6 +1603,7 @@ impl HarnessActor {
                                 &mut provider,
                                 &mut usage_account,
                                 &mut rotation_budget_consumed,
+                                &mut capability_fallback_consumed,
                                 error,
                             )
                             .await
@@ -1914,6 +1931,57 @@ impl HarnessActor {
                                     &cancel,
                                 )
                                 .await
+                            }
+                            Err(DriveError::Provider(error))
+                                if error.presentation.subcode.as_str()
+                                    == "malformed-tool-arguments"
+                                    && !tool_json_repair_used =>
+                            {
+                                tool_json_repair_used = true;
+                                let repair = match self
+                                    .close_malformed_tool_for_repair(
+                                        &run_id, &mut tools, &call_id, &error,
+                                    )
+                                    .await
+                                {
+                                    Ok(repair) => repair,
+                                    Err(error) => {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                };
+                                assistant_blocks.push(repair.0);
+                                messages.push(Message::assistant(std::mem::take(
+                                    &mut assistant_blocks,
+                                )));
+                                messages.push(repair.1);
+                                if let Err(error) =
+                                    finalize_request_usage(&mut completed_usage, &mut request_usage)
+                                {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                                provider_attempt = 0;
+                                if let Err(error) =
+                                    self.commit_state(&run_id, RunState::Thinking).await
+                                {
+                                    return self.errored_state_outcome(&run_id, error).await;
+                                }
+                                continue 'requests;
                             }
                             Err(error) => Err(error),
                         }
@@ -2461,10 +2529,13 @@ impl HarnessActor {
         provider: &mut Arc<dyn Provider>,
         account: &mut Option<CredentialAlias>,
         rotation_budget_consumed: &mut bool,
+        capability_fallback_consumed: &mut bool,
         error: ProviderError,
     ) -> Result<(), DriveError> {
-        if !*rotation_budget_consumed
-            && provider_error_allows_rotation(&error)
+        let hosted_fallback = error.presentation.subcode.as_str() == "provider-web-tool-rejected"
+            && !*capability_fallback_consumed;
+        if ((!*rotation_budget_consumed && provider_error_allows_rotation(&error))
+            || hosted_fallback)
             && let (Some(resolver), Some(current_account)) = (
                 self.config.provider_attempt_resolver.clone(),
                 account.clone(),
@@ -2477,6 +2548,35 @@ impl HarnessActor {
             }
             .map_err(DriveError::Account)?;
             match resolution {
+                ProviderAttemptDecision::Fallback {
+                    provider: fallback,
+                    account: fallback_account,
+                } => {
+                    if !hosted_fallback || fallback_account != current_account {
+                        return Err(DriveError::Provider(provider_protocol_error(
+                            "provider capability fallback returned inconsistent coordinates",
+                        )));
+                    }
+                    if self.config.provider_tool_fallback_tools.is_empty() {
+                        return Err(DriveError::Provider(error));
+                    }
+                    self.commit_ui_extension_marker(
+                        context.run_id,
+                        "provider_tool_fallback",
+                        serde_json::json!({
+                            "label": "provider hosted web tool rejected — using local web_fetch",
+                            "attempt": 1,
+                            "max_attempts": 1,
+                        }),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    *provider = fallback;
+                    *account = Some(fallback_account);
+                    self.config.tools = self.config.provider_tool_fallback_tools.clone();
+                    *capability_fallback_consumed = true;
+                    return Ok(());
+                }
                 ProviderAttemptDecision::Retry {
                     provider: refreshed,
                     account: refreshed_account,
@@ -2900,6 +3000,68 @@ impl HarnessActor {
         .await
         .map_err(DriveError::Store)?;
         Ok(())
+    }
+
+    async fn close_malformed_tool_for_repair(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        call_id: &str,
+        error: &ProviderError,
+    ) -> Result<(Block, Message), DriveError> {
+        let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
+            return Err(DriveError::Provider(provider_protocol_error(format!(
+                "provider ended unknown tool call `{call_id}`",
+            ))));
+        };
+        let tool = &tools[index];
+        let safe_detail = format!(
+            "Tool `{}` arguments could not be parsed. Return the same call with one valid JSON object; this is the only repair attempt.",
+            tool.name
+        );
+        let result = BoundedResult {
+            preview: safe_detail.clone(),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+            status: ToolResultStatus::Failed,
+            reason: Some("malformed JSON — repair attempt 1/1".into()),
+            presentation: Some(error.presentation.clone()),
+        };
+        self.commit_payload(
+            run_id,
+            EventPayload::ToolResult {
+                call_id: tool.call_id.clone(),
+                result,
+            },
+            prompt_verbatim_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_tool_completed(run_id, tool, ToolStatus::Failed)
+            .await?;
+        self.commit_ui_extension_marker(
+            run_id,
+            "tool_json_repair",
+            serde_json::json!({
+                "attempt": 1,
+                "max_attempts": 1,
+                "call_id": tool.call_id,
+                "tool": tool.name,
+            }),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        let block = Block::ToolCall {
+            call_id: tool.call_id.clone(),
+            name: tool.name.clone(),
+            // Keep the provider protocol pair valid without pretending the
+            // malformed fragment was a successfully parsed argument object.
+            args: serde_json::json!({ "_malformed_json": tool.args }),
+        };
+        let message = Message::tool_result(tool.call_id.clone(), safe_detail, false);
+        tools.remove(index);
+        Ok((block, message))
     }
 
     /// Closes the matching tool item for a provider `ToolCallEnd`.
@@ -4843,10 +5005,22 @@ fn parse_tool_args(tool: &ToolAccumulator) -> Result<serde_json::Value, DriveErr
         return Ok(serde_json::json!({}));
     }
     serde_json::from_str(&tool.args).map_err(|error| {
-        DriveError::Provider(provider_protocol_error(format!(
-            "tool call `{}` ended with malformed JSON arguments: {error}",
-            tool.call_id,
-        )))
+        DriveError::Provider(
+            ProviderError::new(
+                ProviderErrorKind::MalformedFrame,
+                format!(
+                    "tool call `{}` ended with malformed JSON arguments: {error}",
+                    tool.call_id,
+                ),
+            )
+            .with_presentation(ErrorPresentation::new(
+                "malformed-tool-arguments",
+                "Tool arguments were malformed",
+                "The model did not produce a valid JSON object for this tool call.",
+                ErrorScope::Tool,
+                [ErrorAction::Retry],
+            )),
+        )
     })
 }
 

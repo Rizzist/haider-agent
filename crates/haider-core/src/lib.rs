@@ -55,7 +55,7 @@ pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptHistoryCompiler, task_event_notice,
 };
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};
-pub use sqlite_store::SqliteStoreHandle;
+pub use sqlite_store::{ProfileStoreFault, SqliteStoreHandle};
 
 use async_trait::async_trait;
 use haider_protocol::branch::BranchDescriptor;

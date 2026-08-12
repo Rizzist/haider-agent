@@ -40,7 +40,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use haider_client::{ClientConfig, ClientError, DisconnectReason, ResolvedProfile, RpcClient};
+use haider_client::{ClientConfig, ClientError, ResolvedProfile, RpcClient};
 use haider_rpc::{AttachMode, RequestBody, ResponseBody, WireFrame};
 use tokio::sync::mpsc;
 
@@ -116,6 +116,12 @@ async fn run_link(
     replies: mpsc::Sender<LiveReply>,
 ) {
     let Some(mut events) = client.take_events() else {
+        let _ = replies
+            .send(LiveReply::SupervisorFailed {
+                component: "link",
+                reason: "link event channel was unavailable at startup".into(),
+            })
+            .await;
         return;
     };
     // THE ATTACH BARRIER. Attach responses come back on their own channel so
@@ -226,9 +232,6 @@ async fn run_link(
         let (fresh_tx, fresh_rx) = mpsc::channel::<Vec<LiveReply>>(LINK_CAPACITY);
         attaches_tx = fresh_tx;
         attaches_rx = fresh_rx;
-        if matches!(reason, DisconnectReason::Closed) {
-            return;
-        }
         if replies
             .send(LiveReply::Disconnected {
                 reason: reason.to_string(),
@@ -242,7 +245,21 @@ async fn run_link(
         // was running a moment ago, and spawning a competitor while it
         // restarts is exactly what R8 forbids.
         let mut backoff = REDIAL_MIN;
+        let mut attempt = 0_u8;
+        const MAX_RESTARTS: u8 = 5;
         loop {
+            attempt += 1;
+            if replies
+                .send(LiveReply::SupervisorRestarting {
+                    component: "link",
+                    attempt,
+                    max: MAX_RESTARTS,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
             match haider_client::connect(&profile.endpoint_path, config.clone()).await {
                 Ok(connected) => {
                     let fresh = Arc::new(connected.client);
@@ -258,9 +275,20 @@ async fn run_link(
                     }
                     break;
                 }
-                Err(_) => {
+                Err(_) if attempt < MAX_RESTARTS => {
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(REDIAL_MAX);
+                }
+                Err(error) => {
+                    let _ = replies
+                        .send(LiveReply::SupervisorFailed {
+                            component: "link",
+                            reason: format!(
+                                "bounded restart exhausted after {MAX_RESTARTS} attempts: {error}"
+                            ),
+                        })
+                        .await;
+                    return;
                 }
             }
         }
@@ -547,6 +575,17 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         },
         LiveCommand::Detach { attachment } => RequestBody::SessionDetach {
             attachment_id: attachment,
+        },
+        LiveCommand::SessionDiagnostic {
+            command_id,
+            session,
+            code,
+            message,
+        } => RequestBody::SessionDiagnostic {
+            command_id,
+            session_id: session,
+            code,
+            message,
         },
         LiveCommand::Create {
             command_id,
@@ -960,6 +999,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionDetach { attachment_id } => vec![LiveReply::Detached {
             attachment: attachment_id,
         }],
+        ResponseBody::SessionDiagnostic { .. } => context
+            .command_id
+            .clone()
+            .map_or_else(Vec::new, |command_id| {
+                vec![LiveReply::Answered { command_id }]
+            }),
         ResponseBody::SessionCreate {
             session_id,
             worker_generation,
@@ -1419,6 +1464,17 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             high_water_seq,
         }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
+        WireFrame::ProtocolError(error)
+            if error.presentation.is_some() || error.code == "store_healthy" =>
+        {
+            vec![LiveReply::ProfileDiagnostic {
+                card: error.presentation.as_ref().map(|_| {
+                    haider_protocol::menu::ErrorRecoveryCardKind::StoreUnwritable
+                }),
+                presentation: error.presentation,
+                failed_write_ids: error.failed_write_ids,
+            }]
+        }
         WireFrame::ProtocolError(error) => vec![LiveReply::Failed {
             command_id: None,
             code: error.code.clone(),

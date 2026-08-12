@@ -6631,6 +6631,7 @@ struct AccountsAttemptResolver {
     /// capability, so the resolver replays this tuning verbatim.
     tuning: ProviderTuning,
     auth_refresh_attempted: AtomicBool,
+    web_fallback_attempted: AtomicBool,
     oauth_access_fingerprint: Option<[u8; 32]>,
 }
 
@@ -6646,6 +6647,7 @@ impl AccountsAttemptResolver {
             metadata,
             tuning,
             auth_refresh_attempted: AtomicBool::new(false),
+            web_fallback_attempted: AtomicBool::new(false),
             oauth_access_fingerprint,
         }
     }
@@ -6679,6 +6681,29 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
         current_account: &CredentialAlias,
         error: &haider_provider::ProviderError,
     ) -> Result<haider_core::ProviderAttemptDecision, HaiderError> {
+        if error.presentation.subcode.as_str() == "provider-web-tool-rejected"
+            && self.tuning.web_tools
+            && matches!(
+                self.metadata.provider.as_str(),
+                haider_provider::ANTHROPIC_PROVIDER_NAME
+                    | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
+            )
+            && !self.web_fallback_attempted.swap(true, Ordering::AcqRel)
+        {
+            let Some(current) = self.current_descriptor(current_account) else {
+                return Ok(haider_core::ProviderAttemptDecision::Stop);
+            };
+            let credential = self.factory.resolve_secret(&current).await?;
+            let mut tuning = self.tuning.clone();
+            tuning.web_tools = false;
+            let provider =
+                self.factory
+                    .build_provider(&current, credential, &self.metadata, &tuning)?;
+            return Ok(haider_core::ProviderAttemptDecision::Fallback {
+                provider,
+                account: current.alias,
+            });
+        }
         let trigger = match error.kind {
             ProviderErrorKind::RateLimited => {
                 let Some(delay_ms) = error.retry_after_ms else {

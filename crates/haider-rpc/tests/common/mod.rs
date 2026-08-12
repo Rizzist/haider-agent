@@ -377,6 +377,8 @@ pub fn transcript() -> Vec<WireFrame> {
             code: "invalid_frame".into(),
             message: "connection framing failed".into(),
             fatal: true,
+            presentation: None,
+            failed_write_ids: Vec::new(),
         }),
         WireFrame::Unknown,
         // ── W3c2 additive account/vault surface (R7) ─────────────────────

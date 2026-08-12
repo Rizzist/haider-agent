@@ -38,11 +38,24 @@ use std::collections::HashMap;
 
 use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::ErrorPresentation;
 use haider_protocol::ids::{MenuId, RunId, SessionId};
 use haider_rpc::{AttachmentId, CommandId, MenuInput, SessionSummary, SubmitDisposition};
 
 use crate::app::{AppModel, AppRequest, OutboundAnswer};
 use crate::projection::RawOutcome;
+
+fn recognized_payload(payload: &serde_json::Value) -> bool {
+    serde_json::from_value::<haider_protocol::EventPayload>(payload.clone()).is_ok()
+        || serde_json::from_value::<haider_protocol::agent::AgentEventPayload>(payload.clone())
+            .is_ok()
+        || serde_json::from_value::<haider_protocol::task::TaskEventPayload>(payload.clone())
+            .is_ok()
+        || serde_json::from_value::<haider_protocol::session::SessionConfigEventPayload>(
+            payload.clone(),
+        )
+        .is_ok()
+}
 
 /// The daemon's per-connection attachment ceiling
 /// (`haider-daemon/src/session_hub/mod.rs`: `max_attachments_per_connection`).
@@ -77,6 +90,13 @@ pub enum LiveCommand {
     },
     Detach {
         attachment: AttachmentId,
+    },
+    /// Durable report raised after a sustained forward-compat mismatch.
+    SessionDiagnostic {
+        command_id: CommandId,
+        session: SessionId,
+        code: String,
+        message: String,
     },
     Create {
         command_id: CommandId,
@@ -421,6 +441,7 @@ impl LiveCommand {
     pub const fn command_id(&self) -> Option<&CommandId> {
         match self {
             Self::Create { command_id, .. }
+            | Self::SessionDiagnostic { command_id, .. }
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
             | Self::Compact { command_id, .. }
@@ -828,6 +849,21 @@ pub enum LiveReply {
     Draining {
         reason: String,
     },
+    /// Profile-level durable-store health. `None` is the explicit clear edge.
+    ProfileDiagnostic {
+        card: Option<haider_protocol::menu::ErrorRecoveryCardKind>,
+        presentation: Option<ErrorPresentation>,
+        failed_write_ids: Vec<String>,
+    },
+    SupervisorRestarting {
+        component: &'static str,
+        attempt: u8,
+        max: u8,
+    },
+    SupervisorFailed {
+        component: &'static str,
+        reason: String,
+    },
 }
 
 /// A durable mutation awaiting its response — the outbox.
@@ -835,7 +871,13 @@ pub enum LiveReply {
 struct Pending {
     command_id: CommandId,
     command: LiveCommand,
+    /// Number of wire issues under this exact durable command id.
+    attempts: u8,
+    retry_at: Option<std::time::Instant>,
 }
+
+const BUSY_MAX_ATTEMPTS: u8 = 3;
+const BUSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The driver's OAuth add flight (W5e-1). One at a time — the card is total
 /// over the accounts screen. Poll cadence bounded by [`OAUTH_POLL_INTERVAL`].
@@ -1018,6 +1060,10 @@ pub struct LiveDriver {
     /// deadlines are a pure function of the value it was handed — a test
     /// moves time by calling [`Self::set_now`], never by sleeping.
     now: std::time::Instant,
+    /// Consecutive forward-compat mismatches. One unknown additive event or
+    /// one recoverable gap remains tolerated; sustained mismatch escalates.
+    mismatch_streaks: HashMap<SessionId, u8>,
+    incompatible_sessions: std::collections::HashSet<SessionId>,
 }
 
 /// How long the login card may sit in `Submitting` before it says so —
@@ -1087,6 +1133,8 @@ impl LiveDriver {
             creating: HashMap::new(),
             models_requested: std::collections::HashSet::new(),
             now: std::time::Instant::now(),
+            mismatch_streaks: HashMap::new(),
+            incompatible_sessions: std::collections::HashSet::new(),
         }
     }
 
@@ -1196,6 +1244,8 @@ impl LiveDriver {
             self.outbox.push(Pending {
                 command_id: id.clone(),
                 command: command.clone(),
+                attempts: 1,
+                retry_at: None,
             });
         }
         command
@@ -2250,6 +2300,34 @@ impl LiveDriver {
                 message,
                 retryable,
             } => {
+                if code == haider_rpc::ERROR_CODE_BUSY
+                    && let Some(id) = command_id.as_ref()
+                    && let Some(pending) = self
+                        .outbox
+                        .iter_mut()
+                        .find(|pending| &pending.command_id == id)
+                {
+                    if pending.attempts < BUSY_MAX_ATTEMPTS {
+                        pending.attempts += 1;
+                        pending.retry_at = Some(self.now + BUSY_RETRY_DELAY);
+                        model.flash = Some(format!(
+                            "· busy — retrying same command id (attempt {}/{BUSY_MAX_ATTEMPTS})",
+                            pending.attempts
+                        ));
+                    } else {
+                        let session = command_session(&pending.command).cloned();
+                        self.retire(id);
+                        let detail = format!(
+                            "busy retry bound exhausted after {BUSY_MAX_ATTEMPTS} attempts — {message}"
+                        );
+                        if let Some(session) = session {
+                            model.record_session_error(&session, detail.clone());
+                        }
+                        model.flash = Some(format!("· busy — {detail}"));
+                    }
+                    model.dirty = true;
+                    return Vec::new();
+                }
                 // TUI6.4 (review r4): no-id failures NEVER touch login
                 // state — 6.3b's positional consumption is REMOVED, and
                 // stage-level errors arrive as the identity-tagged
@@ -2595,11 +2673,43 @@ impl LiveDriver {
             LiveReply::Reconnected => {
                 self.connected = true;
                 model.flash = None;
+                model.supervisor_diagnostic = None;
                 model.dirty = true;
                 self.resume(model)
             }
             LiveReply::Draining { reason } => {
                 model.flash = Some(format!("· daemon draining — {reason}"));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::ProfileDiagnostic {
+                card: _,
+                presentation,
+                failed_write_ids: _,
+            } => {
+                model.profile_diagnostic = presentation;
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::SupervisorRestarting {
+                component,
+                attempt,
+                max,
+            } => {
+                model.flash = Some(format!(
+                    "· {component} supervisor restarting — attempt {attempt}/{max}"
+                ));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::SupervisorFailed { component, reason } => {
+                model.supervisor_diagnostic = Some(ErrorPresentation::new(
+                    "supervisor-unavailable",
+                    format!("{component} unavailable"),
+                    reason,
+                    haider_protocol::error::ErrorScope::Profile,
+                    [haider_protocol::error::ErrorAction::Retry],
+                ));
                 model.dirty = true;
                 Vec::new()
             }
@@ -2682,10 +2792,37 @@ impl LiveDriver {
             .filter(|flight| flight.flow.is_some() && flight.add_command.is_none())
             .and_then(|flight| flight.last_poll)
             .map(|last| last + OAUTH_POLL_INTERVAL);
-        match (login, oauth) {
+        let busy = self
+            .outbox
+            .iter()
+            .filter_map(|pending| pending.retry_at)
+            .min();
+        let existing = match (login, oauth) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match (existing, busy) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// Reissues due busy mutations under the exact same command id. The
+    /// pending row owns the fixed three-attempt bound; unrelated traffic is
+    /// never required to wake it.
+    pub(crate) fn busy_retries_due(&mut self) -> Vec<LiveCommand> {
+        self.outbox
+            .iter_mut()
+            .filter_map(|pending| {
+                pending
+                    .retry_at
+                    .filter(|deadline| *deadline <= self.now)
+                    .map(|_| {
+                        pending.retry_at = None;
+                        pending.command.clone()
+                    })
+            })
+            .collect()
     }
 
     /// The OAuth poll sweep (W5e-1), driven by the same pass that expires
@@ -2758,9 +2895,45 @@ impl LiveDriver {
         // hears a detach for — a permanent slot against its 16-per-
         // connection ceiling, plus duplicate delivery of every later
         // envelope for that session (review P1-3).
-        if model.route_raw(envelope) == RawOutcome::Applied {
-            self.record_menu(session, envelope);
-            self.apply_tuning_fact(model, session, envelope);
+        let recognized = recognized_payload(&envelope.payload);
+        let outcome = model.route_raw(envelope);
+        match outcome {
+            RawOutcome::Applied if recognized => {
+                self.mismatch_streaks.remove(session);
+                self.record_menu(session, envelope);
+                self.apply_tuning_fact(model, session, envelope);
+            }
+            RawOutcome::Applied | RawOutcome::Gap { .. } => {
+                let streak = self.mismatch_streaks.entry(session.clone()).or_default();
+                *streak = streak.saturating_add(1);
+                let should_report =
+                    *streak >= 3 && self.incompatible_sessions.insert(session.clone());
+                if should_report {
+                    let presentation = ErrorPresentation::new(
+                        "client-daemon-incompatible",
+                        "Client/daemon incompatible — update",
+                        "This client repeatedly received unknown events or unrecoverable sequence gaps. Update Haider before continuing this session.",
+                        haider_protocol::error::ErrorScope::Session,
+                        [haider_protocol::error::ErrorAction::None],
+                    );
+                    model.compatibility_diagnostic = Some(presentation);
+                    model.record_session_error(
+                        session,
+                        "client/daemon incompatible — update".into(),
+                    );
+                    model.dirty = true;
+                    let command = LiveCommand::SessionDiagnostic {
+                        command_id: self.mint(),
+                        session: session.clone(),
+                        code: "client-daemon-incompatible".into(),
+                        message:
+                            "sustained unknown-payload or sequence-gap mismatch — update Haider"
+                                .into(),
+                    };
+                    return vec![self.enqueue(command)];
+                }
+            }
+            RawOutcome::Duplicate | RawOutcome::WrongSession => {}
         }
         Vec::new()
     }
@@ -2961,7 +3134,10 @@ impl LiveDriver {
         commands.extend(
             self.outbox
                 .iter()
-                .filter(|pending| command_session(&pending.command).is_none())
+                .filter(|pending| {
+                    command_session(&pending.command).is_none()
+                        && pending.retry_at.is_none_or(|deadline| deadline <= self.now)
+                })
                 .map(|pending| pending.command.clone()),
         );
         commands
@@ -3555,6 +3731,7 @@ const fn demo_only_label(request: &AppRequest) -> &'static str {
 const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
     match command {
         LiveCommand::Submit { session, .. }
+        | LiveCommand::SessionDiagnostic { session, .. }
         | LiveCommand::Cancel { session, .. }
         | LiveCommand::Compact { session, .. }
         | LiveCommand::BranchCreate { session, .. }

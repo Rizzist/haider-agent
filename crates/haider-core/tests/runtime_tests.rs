@@ -1402,6 +1402,69 @@ async fn malformed_frame_is_errored_with_typed_error() {
     ));
 }
 
+/// E8a mutation law: moving the repair-used flag inside the provider-request
+/// loop makes this request a third time (or forever); removing the repair arm
+/// makes only one request and omits the durable repair marker.
+#[tokio::test]
+async fn e8a_malformed_tool_json_repairs_exactly_once_then_typed_failure() {
+    let (handle, store, provider) = runtime(vec![
+        FakeStep::EmitToolCallStart {
+            call_id: "bad-1".into(),
+            name: "demo".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: "bad-1".into(),
+            fragment: "{broken".into(),
+        },
+        FakeStep::EmitToolCallEnd {
+            call_id: "bad-1".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitToolCallStart {
+            call_id: "bad-2".into(),
+            name: "demo".into(),
+        },
+        FakeStep::EmitToolArgsDelta {
+            call_id: "bad-2".into(),
+            fragment: "[still-broken".into(),
+        },
+        FakeStep::EmitToolCallEnd {
+            call_id: "bad-2".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("make a tool call"))
+        .await
+        .expect("submit")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(provider.requests().len(), 2, "exactly one repair request");
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| completed_extension(event, "tool_json_repair"))
+            .count(),
+        1,
+        "repair is visibly journaled once"
+    );
+    assert!(events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::RunFailed {
+            presentation: Some(ref presentation),
+            ..
+        } if presentation.subcode.as_str() == "malformed-tool-arguments"
+    )));
+    handle.stop().await.expect("actor stops");
+}
+
 #[tokio::test]
 async fn provider_retry_classification_and_retry_after_survive_actor_boundary() {
     let provider = Arc::new(ImmediateErrorProvider {
@@ -1521,6 +1584,61 @@ async fn provider_error_after_first_event_is_never_retried() {
         .expect("retry-fresh answer");
     assert_eq!(turn.wait().await.expect("outcome").state, RunState::Done);
     assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn explicit_hosted_web_rejection_falls_back_locally_once_in_the_same_turn() {
+    let rejected = ProviderError::new(
+        ProviderErrorKind::InvalidRequest,
+        "hosted web search rejected",
+    )
+    .with_presentation(haider_protocol::error::ErrorPresentation::new(
+        "provider-web-tool-rejected",
+        "Provider web tool unavailable",
+        "use the local equivalent",
+        haider_protocol::error::ErrorScope::Tool,
+        [haider_protocol::error::ErrorAction::Retry],
+    ));
+    let primary = Arc::new(CountingOpeningErrorProvider::new(rejected));
+    let fallback = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let resolver = Arc::new(CapabilityFallbackResolver {
+        calls: AtomicUsize::new(0),
+        provider: fallback.clone(),
+    });
+    let store = Arc::new(MemoryStore::new());
+    let mut cfg = config();
+    cfg.usage_account = Some(CredentialAlias::new("web-account"));
+    cfg.provider_attempt_resolver = Some(resolver.clone());
+    cfg.provider_tool_fallback_tools = vec![haider_provider::ToolDefinition {
+        name: "web_fetch".into(),
+        description: "local fallback".into(),
+        input_schema: serde_json::json!({"type":"object"}),
+    }];
+    let handle = HarnessActor::spawn(cfg, primary.clone(), store.clone());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("search"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(primary.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback.requests().len(), 1);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback.requests()[0].tools[0].name, "web_fetch");
+    assert_eq!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .filter(|event| completed_extension(event, "provider_tool_fallback"))
+            .count(),
+        1,
+        "the same-turn fallback is visibly labeled once"
+    );
 }
 
 /// MUTATION CHECK (W5c.1 safe-boundary rotation): clear the logical-turn
@@ -2997,6 +3115,39 @@ struct ScriptedRotationResolver {
     first_alias: CredentialAlias,
     second: Arc<dyn Provider>,
     second_alias: CredentialAlias,
+}
+
+struct CapabilityFallbackResolver {
+    calls: AtomicUsize,
+    provider: Arc<dyn Provider>,
+}
+
+impl std::fmt::Debug for CapabilityFallbackResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapabilityFallbackResolver")
+            .field("calls", &self.calls.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderAttemptResolver for CapabilityFallbackResolver {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        assert_eq!(
+            error.presentation.subcode.as_str(),
+            "provider-web-tool-rejected"
+        );
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ProviderAttemptDecision::Fallback {
+            provider: Arc::clone(&self.provider),
+            account: current_account.clone(),
+        })
+    }
 }
 
 #[derive(Debug)]

@@ -196,14 +196,14 @@ fn n_way_race_commits_exactly_one_answer_and_returns_one_resolution_coordinate()
     let winners = outcomes
         .iter()
         .filter_map(|outcome| match outcome {
-            MenuResolutionOutcome::Committed { envelope } => Some(envelope.seq),
+            MenuResolutionOutcome::Committed { envelope, .. } => Some(envelope.seq),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(winners.len(), 1);
     let winner_seq = winners[0];
     assert!(outcomes.iter().all(|outcome| match outcome {
-        MenuResolutionOutcome::Committed { envelope } => envelope.seq == winner_seq,
+        MenuResolutionOutcome::Committed { envelope, .. } => envelope.seq == winner_seq,
         MenuResolutionOutcome::AlreadyResolved { resolution_seq } => {
             *resolution_seq == winner_seq
         }
@@ -298,7 +298,7 @@ fn lost_response_retry_after_reopen_is_idempotent_and_never_reappends() {
             0,
             "allow",
         );
-        let MenuResolutionOutcome::Committed { envelope } =
+        let MenuResolutionOutcome::Committed { envelope, .. } =
             store.resolve_menu(&command).expect("first answer commits")
         else {
             panic!("first answer did not commit");

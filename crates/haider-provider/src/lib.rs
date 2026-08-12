@@ -163,8 +163,9 @@ pub use usage::{
     parse_rfc3339_to_unix_ms,
 };
 pub use webfetch::{
-    WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchOutcome, fetch_public_url,
-    fetch_public_url_with_deadline, fetch_public_url_with_resolver, reduce_html_to_text,
+    WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchExecution, WebFetchOutcome,
+    fetch_public_url, fetch_public_url_with_deadline, fetch_public_url_with_one_retry,
+    fetch_public_url_with_resolver, reduce_html_to_text,
 };
 
 /// Provider classes backed by production account credentials in this release.
@@ -794,6 +795,11 @@ pub enum FakeStep {
         call_id: String,
         fragment: String,
     },
+    /// Ends a manually-opened tool call. This lets laws inject malformed raw
+    /// argument fragments that the value-based `EmitToolCall` cannot express.
+    EmitToolCallEnd {
+        call_id: String,
+    },
     /// Emits the canonical `request_input` tool call. The actor, rather than
     /// the fake provider, allocates and journals the protocol menu.
     EmitRequestInput {
@@ -1064,6 +1070,11 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 )
                 .await
                 {
+                    return;
+                }
+            }
+            FakeStep::EmitToolCallEnd { call_id } => {
+                if !send_event(&sender, StreamEvent::ToolCallEnd { call_id }).await {
                     return;
                 }
             }

@@ -14,6 +14,7 @@
 use super::*;
 use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
+use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
@@ -469,6 +470,78 @@ fn observe_title(text: &str) -> String {
 
 // ─────────── connection RPC surface: list/read/attach/detach/menu ───────────
 
+impl SessionHub {
+    /// Starts the real fresh turn selected by E6's `retry` handler. The
+    /// original ambiguous effect is durably settled before this is called;
+    /// the new turn receives an explicit probe-first instruction so it never
+    /// blindly duplicates the prior mutation.
+    async fn submit_effect_retry(
+        &self,
+        session_id: SessionId,
+        effect: haider_protocol::ids::EffectId,
+        menu_id: MenuId,
+        resolution_seq: u64,
+    ) -> Result<(), HaiderError> {
+        let worker_generation = self.inner.store.worker_generation();
+        let text = format!(
+            "Retry unresolved effect {effect}. Probe the current state first; perform the operation only if it is still needed."
+        );
+        let command_id = format!("effect-retry-{menu_id}-{resolution_seq}");
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "effect": &effect,
+            "menu": &menu_id,
+            "resolution_seq": resolution_seq,
+            "text": &text,
+            "mode": DeliveryMode::Queue,
+        }))
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("effect retry coordinates could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let command = TurnAcceptCommand {
+            command_id,
+            request_digest,
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation,
+            run_id: RunId::new(random_id("effect-retry-run").map_err(hub_error_as_store)?),
+            agent_id: None,
+            branch_id: None,
+            text,
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new(
+                random_id("effect-retry-queued").map_err(hub_error_as_store)?,
+            ),
+            user_event_id: EventId::new(
+                random_id("effect-retry-user").map_err(hub_error_as_store)?,
+            ),
+            active_event_id: EventId::new(
+                random_id("effect-retry-active").map_err(hub_error_as_store)?,
+            ),
+            device_id: self.inner.device_id.clone(),
+        };
+        let accepted = match self
+            .accept_turn(command)
+            .await
+            .map_err(hub_error_as_store)?
+        {
+            TurnAcceptOutcome::Committed { accepted, .. }
+            | TurnAcceptOutcome::IdempotentReplay { accepted } => accepted,
+        };
+        self.worker_manager()
+            .map_err(hub_error_as_store)?
+            .submit(accepted)
+            .await
+    }
+}
+
 impl HubConnection {
     async fn artifact_put(
         &self,
@@ -670,6 +743,36 @@ impl HubConnection {
                     );
                 }
                 self.session_observe(request_id, session_id, last_event_limit)
+                    .await
+            }
+            RequestBody::SessionDiagnostic {
+                command_id,
+                session_id,
+                code,
+                message,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "session diagnostic requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_diagnostic(request_id, command_id, session_id, code, message)
                     .await
             }
             RequestBody::HooksList { cwd } => {
@@ -4431,6 +4534,119 @@ impl HubConnection {
         })
     }
 
+    async fn session_diagnostic(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        code: String,
+        message: String,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty()
+            || code != "client-daemon-incompatible"
+            || message.trim().is_empty()
+            || message.len() > 1_024
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session diagnostic coordinates are invalid",
+                false,
+                None,
+            );
+        }
+        let mut cursor = 0_u64;
+        let mut last = None;
+        loop {
+            let page = self
+                .hub
+                .inner
+                .store
+                .read(&session_id, cursor, REPLAY_PAGE_SIZE)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                if let Ok(EventPayload::ClientDiagnostic {
+                    command_id: existing,
+                    code: existing_code,
+                    message: existing_message,
+                }) = serde_json::from_value(envelope.payload.clone())
+                    && existing == command_id.as_str()
+                {
+                    if existing_code != code || existing_message != message {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "session diagnostic command id was reused with different content",
+                            false,
+                            None,
+                        );
+                    }
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SessionDiagnostic {
+                            recorded_seq: envelope.seq,
+                        },
+                    });
+                }
+                last = Some(envelope);
+            }
+        }
+        let Some(last) = last else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        };
+        let payload = EventPayload::ClientDiagnostic {
+            command_id: command_id.as_str().to_owned(),
+            code,
+            message,
+        };
+        let mut envelopes = [haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id: EventId::new(format!(
+                "client-diagnostic-{}",
+                blake3::hash(command_id.as_str().as_bytes()).to_hex()
+            )),
+            seq: 0,
+            session_id,
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: self.hub.inner.device_id.clone(),
+            authority_epoch: last.authority_epoch,
+            worker_generation: self.hub.inner.store.worker_generation(),
+            causation_id: Some(last.event_id),
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).map_err(|error| {
+                SessionHubError::Task(format!("cannot encode session diagnostic: {error}"))
+            })?,
+        }];
+        let recorded = match self.hub.append(&mut envelopes).await {
+            Ok(_) => envelopes[0].seq,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionDiagnostic {
+                recorded_seq: recorded,
+            },
+        })
+    }
+
     async fn session_attach(
         &self,
         request_id: RequestId,
@@ -4696,6 +4912,8 @@ impl HubConnection {
             );
         }
         let actor = self.hub.actor_for(session_id.clone()).await?;
+        let recovery_answer = answer.clone();
+        let recovery_session = session_id.clone();
         let command = MenuResolutionCommand {
             command_id: command_id.0,
             session_id,
@@ -4713,7 +4931,31 @@ impl HubConnection {
             .await
             .map_err(|_| SessionHubError::Closed)?;
         match result.await.map_err(|_| SessionHubError::Closed)? {
-            Ok(MenuResolutionOutcome::Committed { ref envelope }) => {
+            Ok(MenuResolutionOutcome::Committed {
+                ref envelope,
+                ref menu,
+            }) => {
+                if super::actor::selected_effect_recovery_action(menu, &recovery_answer)
+                    == Some(EffectRecoveryAction::Retry)
+                    && let MenuKind::Recovery { effect, .. } = &menu.kind
+                    && let Err(error) = self
+                        .hub
+                        .submit_effect_retry(
+                            recovery_session,
+                            effect.clone(),
+                            menu.id.clone(),
+                            envelope.seq,
+                        )
+                        .await
+                {
+                    return self.menu_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        &error.message,
+                        error.retryable,
+                        None,
+                    );
+                }
                 self.menu_success(request_id, envelope.seq)
             }
             Ok(MenuResolutionOutcome::IdempotentReplay { resolution_seq }) => {
@@ -4766,6 +5008,8 @@ impl HubConnection {
                 code: code.into(),
                 message: message.into(),
                 fatal: false,
+                presentation: None,
+                failed_write_ids: Vec::new(),
             })),
         }
     }

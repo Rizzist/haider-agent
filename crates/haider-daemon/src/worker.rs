@@ -52,7 +52,7 @@ use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
@@ -60,7 +60,7 @@ use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EffectId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
-use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
+use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, effect_recovery_menu};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{
     AccountUsage, CacheBoundaryIdentity, FeatureResolve, FinishReason, PrefixDigests, StreamEvent,
@@ -1669,19 +1669,14 @@ impl Drop for ActiveTurn {
     }
 }
 
-/// W-B: does a turn failure carry the provider's INVALID-REQUEST kind? The
-/// core actor stamps the kind into the error details; that is the only
-/// honest discriminator for "the request shape was refused" as opposed to
-/// auth, rate limits, or transport. Used exclusively to decide whether to
-/// stop re-declaring the Anthropic server web tools for this session — the
-/// error itself is never rewritten.
-fn is_invalid_request_failure(error: &HaiderError) -> bool {
+/// Exact discriminator for a hosted-web capability refusal that escaped the
+/// same-turn local fallback. Generic invalid requests must never silently
+/// disable provider functionality on a later turn.
+fn is_hosted_web_tool_rejection(error: &HaiderError) -> bool {
     error
-        .details
+        .presentation
         .as_ref()
-        .and_then(|details| details.get("provider_error_kind"))
-        .and_then(serde_json::Value::as_str)
-        == Some("InvalidRequest")
+        .is_some_and(|presentation| presentation.subcode.as_str() == "provider-web-tool-rejected")
 }
 
 trait FutureTurn:
@@ -2034,21 +2029,16 @@ async fn run_supervisor(
                             Ok(outcome) => (Some(outcome.state), outcome.error, None),
                             Err(error) => (None, None, Some(error)),
                         };
-                        // W-B (decision 1, "local fallback on refusal"): an
-                        // org can disable the Anthropic server web tools, and
-                        // the DECLARED tool then 400s every turn forever. A
-                        // turn that declared them and ended on an INVALID
-                        // REQUEST latches the session degrade: the error still
-                        // surfaces verbatim, but the NEXT turn declares none
-                        // and advertises the local `web_fetch` instead. A
-                        // committed `Errored` outcome is the ordinary shape
-                        // here; a drive error is the same fact escaping
-                        // before the turn could commit one.
+                        // The core actor performs the normal exact refusal
+                        // fallback in this SAME turn. This latch is only the
+                        // terminal safety net if that exact typed refusal
+                        // escapes before fallback can be installed. A generic
+                        // invalid request never disables hosted tools.
                         if finished.anthropic_web_tools
                             && outcome_error
                                 .as_ref()
                                 .or(drive_error.as_ref())
-                                .is_some_and(is_invalid_request_failure)
+                                .is_some_and(is_hosted_web_tool_rejection)
                         {
                             lease.hub().degrade_anthropic_web_tools(lease.session_id());
                         }
@@ -2621,7 +2611,9 @@ async fn reconcile_unknown_effects(
     event_ids: &EventIdGenerator,
 ) -> Result<(), HaiderError> {
     let mut dispatched = HashSet::<EffectId>::new();
-    let mut terminal = HashSet::<EffectId>::new();
+    let mut summaries = HashMap::<EffectId, String>::new();
+    let mut outcomes = HashMap::<EffectId, EffectOutcome>::new();
+    let mut open_recovery = HashSet::<EffectId>::new();
     let mut cursor = 0;
     loop {
         let page = StoreHandle::read(store, store.session_id(), cursor, 512).await?;
@@ -2632,11 +2624,13 @@ async fn reconcile_unknown_effects(
         for envelope in page {
             if envelope.run_id.as_ref() != Some(run_id)
                 || envelope.branch_id.as_ref() != branch_id
-                || envelope
-                    .payload
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("effect")
+                || !matches!(
+                    envelope
+                        .payload
+                        .get("type")
+                        .and_then(serde_json::Value::as_str),
+                    Some("effect" | "menu_opened")
+                )
             {
                 continue;
             }
@@ -2653,42 +2647,59 @@ async fn reconcile_unknown_effects(
                     )
                 })?;
             match payload {
+                EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                    summaries.insert(intent.effect, intent.summary);
+                }
                 EventPayload::Effect(EffectPhase::Dispatched { effect }) => {
                     dispatched.insert(effect);
                 }
-                EventPayload::Effect(EffectPhase::Outcome { effect, .. }) => {
-                    terminal.insert(effect);
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect, outcome, ..
+                }) => {
+                    outcomes.insert(effect, outcome);
+                }
+                EventPayload::MenuOpened(menu) => {
+                    if let MenuKind::Recovery { effect, .. } = menu.kind {
+                        open_recovery.insert(effect);
+                    }
                 }
                 _ => {}
             }
         }
     }
     let mut pending = dispatched
-        .difference(&terminal)
-        .cloned()
+        .into_iter()
+        .filter(|effect| {
+            outcomes
+                .get(effect)
+                .is_none_or(|outcome| matches!(outcome, EffectOutcome::Unknown))
+                && !open_recovery.contains(effect)
+        })
         .collect::<Vec<_>>();
     pending.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     if pending.is_empty() {
         return Ok(());
     }
-    append_payloads(
-        store,
-        device_id,
-        run_id,
-        branch_id,
-        event_ids,
-        pending
-            .into_iter()
-            .map(|effect| {
-                EventPayload::Effect(EffectPhase::Outcome {
-                    effect,
-                    outcome: EffectOutcome::Unknown,
-                    freshness: None,
-                })
-            })
-            .collect(),
-    )
-    .await
+    let mut payloads = Vec::with_capacity(pending.len().saturating_mul(3));
+    for effect in pending {
+        if !outcomes.contains_key(&effect) {
+            payloads.push(EventPayload::Effect(EffectPhase::Outcome {
+                effect: effect.clone(),
+                outcome: EffectOutcome::Unknown,
+                freshness: None,
+            }));
+        }
+        payloads.push(EventPayload::MenuOpened(effect_recovery_menu(
+            MenuId::new(format!("effect-recovery-{run_id}-{effect}")),
+            effect.clone(),
+            summaries
+                .get(&effect)
+                .map(String::as_str)
+                .unwrap_or("unknown dispatched effect"),
+        )));
+        payloads.push(EventPayload::RunState(RunState::EffectOutcomeUnknown));
+    }
+    append_payloads(store, device_id, run_id, branch_id, event_ids, payloads).await
 }
 
 async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<RunState> {
@@ -3687,6 +3698,21 @@ async fn start_turn(
         &resolved.provider_name,
         web_degrade,
     );
+    if matches!(
+        resolved.provider_name.as_str(),
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+    ) && !web_degrade.anthropic_web_tools
+    {
+        config.provider_tool_fallback_tools = advertised_tool_definitions(
+            &dependencies.tool_factory,
+            grant.as_ref(),
+            &resolved.provider_name,
+            WebCapabilityDegrade {
+                anthropic_web_tools: true,
+                ..web_degrade
+            },
+        );
+    }
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let account_scope = resolved
         .account_alias
@@ -5687,7 +5713,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let operation = WebFetch::from_tool_args(&args).map_err(tool_error)?;
                 match broker.begin_web_fetch(&operation, &policy).await {
                     Ok(intent) => {
-                        let fetched = tokio::select! {
+                        let execution = tokio::select! {
                             () = cancel.cancelled() => {
                                 broker
                                     .journal_outcome(&intent, EffectOutcome::Cancelled)
@@ -5699,11 +5725,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     false,
                                 ));
                             }
-                            fetched = haider_provider::fetch_public_url(
+                            fetched = haider_provider::fetch_public_url_with_one_retry(
                                 operation.url(),
                                 operation.max_bytes(),
                             ) => fetched,
                         };
+                        let retried = execution.attempts == 2;
+                        let fetched = execution.outcome;
                         match fetched {
                             Ok(outcome) => {
                                 broker
@@ -5719,7 +5747,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     artifact: None,
                                     cursor: None,
                                     status: ToolResultStatus::Completed,
-                                    reason: None,
+                                    reason: retried.then(|| {
+                                        "transient web_fetch failure — retry 2/2 succeeded".into()
+                                    }),
                                     presentation: None,
                                 })
                             }
@@ -5740,8 +5770,25 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     artifact: None,
                                     cursor: None,
                                     status: ToolResultStatus::Failed,
-                                    reason: Some(crate::worker::bounded_failure_reason(&message)),
-                                    presentation: None,
+                                    reason: Some(if retried {
+                                        format!(
+                                            "retry 2/2 exhausted — {}",
+                                            crate::worker::bounded_failure_reason(&message)
+                                        )
+                                    } else {
+                                        crate::worker::bounded_failure_reason(&message)
+                                    }),
+                                    presentation: Some(if retried {
+                                        ErrorPresentation::new(
+                                            "web-fetch-retry-exhausted",
+                                            "Web fetch failed after retry",
+                                            "The idempotent GET was attempted twice and still failed.",
+                                            ErrorScope::Tool,
+                                            [ErrorAction::Retry],
+                                        )
+                                    } else {
+                                        error.presentation
+                                    }),
                                 })
                             }
                         }

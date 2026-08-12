@@ -32,6 +32,11 @@ pub enum Attention {
     Input,
     /// Parked waiting on an unreachable device.
     WaitingDevice,
+    /// Parked until a provider reset/user decision rather than an in-flight
+    /// retry timer.
+    WaitingRateLimit,
+    /// A crash-window effect needs explicit reconciliation.
+    EffectUnknown,
 }
 
 impl Attention {
@@ -54,6 +59,10 @@ pub fn attention_for(state: &RunState) -> Option<Attention> {
         RunState::Waiting {
             reason: WaitReason::DeviceUnreachable,
         } => Some(Attention::WaitingDevice),
+        RunState::Waiting {
+            reason: WaitReason::RateLimit,
+        } => Some(Attention::WaitingRateLimit),
+        RunState::EffectOutcomeUnknown => Some(Attention::EffectUnknown),
         // M4: a retry backoff is mid-run work, never a terminal/park — it must
         // stay silent (only the final Errored, once retries exhaust, notifies).
         RunState::Retrying { .. } => None,
@@ -71,6 +80,8 @@ pub fn notification_line(attention: Attention, session_title: Option<&str>) -> S
         Attention::Permission => "haider: needs your approval",
         Attention::Input => "haider: needs your input",
         Attention::WaitingDevice => "haider: waiting on a device",
+        Attention::WaitingRateLimit => "haider: rate limit needs attention",
+        Attention::EffectUnknown => "haider: reconcile an unknown effect",
     };
     let line = match session_title
         .map(str::trim)
