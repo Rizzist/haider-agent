@@ -22,7 +22,7 @@ use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
@@ -50,6 +50,14 @@ use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_PAGE_SIZE: usize = 1_024;
+
+/// Device-profile-wide hard admission bound for durable live delegations.
+///
+/// Admission is serialized by the same SQLite `IMMEDIATE` transaction that
+/// inserts a delegation. The count is always rebuilt from delegation rows and
+/// each candidate child's exact durable run head; it is never cached in
+/// process memory.
+pub const SUBAGENT_LIVE_LIMIT: u64 = 512;
 
 /// The inclusive sequence range allocated by one atomic append.
 ///
@@ -171,6 +179,25 @@ pub enum DelegationState {
 pub enum DelegationCreateOutcome {
     Committed(DelegationRecord),
     IdempotentReplay(DelegationRecord),
+}
+
+/// One durable descendant together with its distance from the session used
+/// as the traversal root. `record.depth` remains the agent's absolute tree
+/// depth; `relative_depth` exists solely to enforce a bounded subtree read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelegationDescendant {
+    pub record: DelegationRecord,
+    pub relative_depth: u32,
+}
+
+/// Bounded breadth-first descendant reduction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelegationDescendants {
+    pub descendants: Vec<DelegationDescendant>,
+    /// True only when at least one durable edge was observed outside either
+    /// requested bound. Consumers must treat rollups over `descendants` as
+    /// partial when this is set.
+    pub truncated: bool,
 }
 
 /// Result of the atomic session-creation transaction.
@@ -1099,6 +1126,26 @@ impl Store {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(DelegationCreateOutcome::IdempotentReplay(existing));
         }
+        let live_count = live_delegation_count(&transaction)?;
+        if live_count >= SUBAGENT_LIVE_LIMIT {
+            let detail = format!(
+                "Haider allows at most {SUBAGENT_LIVE_LIMIT} live subagents on this device; the current live count is {live_count}."
+            );
+            let mut error = store_error(ErrorCode::Busy, detail.clone(), true).with_presentation(
+                ErrorPresentation::new(
+                    "subagent-limit-reached",
+                    "Subagent limit reached",
+                    detail,
+                    ErrorScope::Tool,
+                    [ErrorAction::Retry],
+                ),
+            );
+            error.details = Some(serde_json::json!({
+                "limit": SUBAGENT_LIVE_LIMIT,
+                "live_count": live_count,
+            }));
+            return Err(error);
+        }
         let now = now_ms()?;
         transaction
             .execute(
@@ -1143,6 +1190,14 @@ impl Store {
         lookup_delegation_by_agent(&connection, agent)
     }
 
+    /// Rebuilds the current global live count from durable delegation and
+    /// exact child-run truth. Exposed for diagnostics and restart laws; spawn
+    /// admission invokes the same reducer inside its write transaction.
+    pub fn live_delegation_count(&self) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        live_delegation_count(&connection)
+    }
+
     pub fn delegation_for_child_session(
         &self,
         session_id: &SessionId,
@@ -1172,6 +1227,75 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)?;
         rows.into_iter().map(decode_delegation).collect()
+    }
+
+    /// Returns a deterministic, bounded breadth-first subtree rooted at a
+    /// session. Every edge comes from the durable delegation relation, so a
+    /// daemon restart observes the same terminal and live history.
+    ///
+    /// Direct-child queries fetch at most the remaining node budget plus one
+    /// witness. At the depth boundary they fetch one edge solely to set the
+    /// honest truncation marker. No response-sized read can materialize an
+    /// unbounded historical fleet.
+    pub fn delegation_descendants(
+        &self,
+        session_id: &SessionId,
+        max_nodes: usize,
+        max_depth: u32,
+    ) -> StoreResult<DelegationDescendants> {
+        let connection = self.connection()?;
+        let mut pending = std::collections::VecDeque::from([(session_id.clone(), 0_u32)]);
+        let mut seen_sessions = HashSet::from([session_id.clone()]);
+        let mut descendants = Vec::with_capacity(max_nodes.min(512));
+        let mut truncated = false;
+
+        while let Some((parent_session_id, parent_depth)) = pending.pop_front() {
+            let remaining = max_nodes.saturating_sub(descendants.len());
+            let at_depth_limit = parent_depth >= max_depth;
+            let query_limit = if at_depth_limit || remaining == 0 {
+                1
+            } else {
+                remaining.saturating_add(1)
+            };
+            let mut children = delegations_for_parent_session_limited(
+                &connection,
+                &parent_session_id,
+                query_limit,
+            )?;
+            if children.is_empty() {
+                continue;
+            }
+            if at_depth_limit || remaining == 0 {
+                truncated = true;
+                break;
+            }
+            if children.len() > remaining {
+                children.truncate(remaining);
+                truncated = true;
+            }
+            let relative_depth = parent_depth.saturating_add(1);
+            for child in children {
+                if !seen_sessions.insert(child.child_session_id.clone()) {
+                    return Err(corrupt(format!(
+                        "delegation graph revisits child session {}",
+                        child.child_session_id
+                    )));
+                }
+                pending.push_back((child.child_session_id.clone(), relative_depth));
+                descendants.push(DelegationDescendant {
+                    record: child,
+                    relative_depth,
+                });
+            }
+            if truncated {
+                break;
+            }
+        }
+
+        Ok(DelegationDescendants {
+            descendants,
+            truncated,
+        })
     }
 
     pub fn mark_delegation_running(&self, agent: &AgentId) -> StoreResult<DelegationRecord> {
@@ -6029,6 +6153,62 @@ fn lookup_delegation_by_parent_call(
         .map_err(map_sqlite_error)?
         .map(decode_delegation)
         .transpose()
+}
+
+fn delegations_for_parent_session_limited(
+    connection: &Connection,
+    session_id: &SessionId,
+    limit: usize,
+) -> StoreResult<Vec<DelegationRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "{} WHERE parent_session_id = ?1
+         ORDER BY created_at_ms, call_id, agent_id LIMIT ?2",
+        delegation_select()
+    );
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(&sql).map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map(params![session_id.as_str(), limit], stored_delegation)
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    rows.into_iter().map(decode_delegation).collect()
+}
+
+/// Crash-honest global live-set reduction used inside delegation admission.
+///
+/// Reported/collected rows are terminal bookkeeping truth (including launch
+/// failures that never produced a child run). Spawned/running rows remain live
+/// unless the exact durable child run has reached Done, Errored, or Cancelled.
+/// A missing run head is live: it represents the crash window after the link
+/// committed but before the first child turn was accepted.
+fn live_delegation_count(connection: &Connection) -> StoreResult<u64> {
+    let sql = format!(
+        "{} WHERE state IN ('spawned', 'running')
+         ORDER BY created_at_ms, agent_id",
+        delegation_select()
+    );
+    let mut statement = connection.prepare_cached(&sql).map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map([], stored_delegation)
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    let mut live = 0_u64;
+    for stored in rows {
+        let record = decode_delegation(stored)?;
+        let states = latest_run_states(connection, &record.child_session_id)?;
+        let terminal = states
+            .get(&record.child_run_id)
+            .is_some_and(|(state, _, _)| state.is_terminal());
+        if !terminal {
+            live = live.saturating_add(1);
+        }
+    }
+    Ok(live)
 }
 
 fn validate_delegation(record: &DelegationRecord) -> StoreResult<()> {

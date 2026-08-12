@@ -5819,6 +5819,25 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     let spawn_error = ToolError::Runtime {
                         message: error.message.clone(),
                     };
+                    if error.presentation.as_ref().is_some_and(|presentation| {
+                        presentation.subcode.as_str() == "subagent-limit-reached"
+                    }) {
+                        // The broker's `finish` helper deliberately passes a
+                        // failed result back to its caller. For this admitted,
+                        // continuable tool rejection, journal the identical
+                        // failed effect outcome directly and keep the typed
+                        // result on the model's tool loop.
+                        broker
+                            .journal_outcome(
+                                &intent,
+                                EffectOutcome::Failed {
+                                    error: spawn_error.to_string(),
+                                },
+                            )
+                            .await
+                            .map_err(tool_error)?;
+                        return Ok(ToolDispatchResult::Completed(subagent_limit_result(&error)));
+                    }
                     broker
                         .finish_agent_spawn(&intent, Err(spawn_error))
                         .await
@@ -6595,6 +6614,31 @@ fn recursion_limit_result() -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(crate::delegation::RECURSION_LIMIT_MESSAGE.into()),
         presentation: None,
+    }
+}
+
+/// The hard global admission cap is a typed tool rejection, not a parent-turn
+/// failure. Preserve the store's E2-E4 presentation verbatim so every client
+/// receives the owner-pinned subcode/title/action vocabulary.
+fn subagent_limit_result(error: &HaiderError) -> BoundedResult {
+    let presentation = error.presentation.clone();
+    let details = error.details.clone().unwrap_or(serde_json::Value::Null);
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "rejected",
+            "error": {
+                "kind": "subagent_limit_reached",
+                "message": error.message,
+                "details": details,
+            }
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(bounded_failure_reason(&error.message)),
+        presentation,
     }
 }
 

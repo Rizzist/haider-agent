@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
-use haider_protocol::agent::{AgentMessageDelivery, AgentMessageReceipt};
+use haider_protocol::agent::{
+    AgentMessageDelivery, AgentMessageReceipt, AgentMetricsSnapshot, AgentUsageMetrics,
+};
 use haider_protocol::context::ContextFootprintTruth;
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::effect::EffectClass;
@@ -27,15 +29,16 @@ use haider_rpc::{
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1,
     FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
-    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, ModelDetailWire,
-    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
-    OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
+    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_FLEET_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire, FleetMetricsTotalsWire,
+    FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello, LifecyclePhase, MenuInput,
+    ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
+    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
     ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionObserveDigest, SessionReadResult,
-    SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
+    RequestId, ResponseBody, SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest,
+    SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -1393,6 +1396,99 @@ pub fn transcript() -> Vec<WireFrame> {
                 enabled: true,
                 selected_seq: 44,
                 worker_generation: 7,
+            },
+        },
+        // Fleet snapshot frames are append-only: the additive method and
+        // response shape do not alter any earlier protocol-v1 bytes.
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-session-fleet".into(),
+            daemon_generation: 15,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.906".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View]),
+            features: BTreeSet::from([FEATURE_SESSION_FLEET_V1.to_owned()]),
+        }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-session-fleet"),
+            body: RequestBody::SessionFleet {
+                session_id: SessionId::new("session-1"),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-fleet"),
+            body: ResponseBody::SessionFleet {
+                snapshot: SessionFleetSnapshot {
+                    session_id: SessionId::new("session-1"),
+                    generated_at_ms: 1_753_500_050_000,
+                    node_limit: 512,
+                    depth_limit: 32,
+                    roots: vec![FleetNodeWire {
+                        agent_id: AgentId::new("agent-child-1"),
+                        session_id: SessionId::new("session-child-1"),
+                        callsign: Some("Ada".into()),
+                        task: "inspect parser".into(),
+                        depth: 1,
+                        parent_session_id: SessionId::new("session-1"),
+                        parent_agent_id: None,
+                        state: FleetAgentStateWire::Waiting,
+                        metrics: Some(AgentMetricsSnapshot {
+                            agent: Some(AgentId::new("agent-child-1")),
+                            session_id: SessionId::new("session-child-1"),
+                            head_seq: 9,
+                            started_at_ms: 1_753_500_040_000,
+                            terminal_at_ms: None,
+                            live: true,
+                            tool_attempts: 2,
+                            usage: Some(AgentUsageMetrics {
+                                logical_input_tokens: 800,
+                                billed_output_tokens: 200,
+                                additional_reasoning_tokens: 50,
+                                cache_read_tokens: 300,
+                                cache_write_tokens: 0,
+                                cache_hit_basis_points: Some(3_750),
+                                metered_cost_microusd: Some(4_200),
+                                api_equivalent_cost_microusd: Some(4_200),
+                                all_lanes_priced: true,
+                                has_metered_lanes: true,
+                                has_oauth_lanes: false,
+                                breakdowns: Vec::new(),
+                            }),
+                        }),
+                        children: Vec::new(),
+                    }],
+                    rollup: FleetRollupWire {
+                        node_count: 1,
+                        states: FleetStateCountsWire {
+                            waiting: 1,
+                            ..FleetStateCountsWire::default()
+                        },
+                        max_depth: 1,
+                        metrics: FleetMetricsTotalsWire {
+                            elapsed_ms: 10_000,
+                            tool_attempts: 2,
+                            usage: Some(AgentUsageMetrics {
+                                logical_input_tokens: 800,
+                                billed_output_tokens: 200,
+                                additional_reasoning_tokens: 50,
+                                cache_read_tokens: 300,
+                                cache_write_tokens: 0,
+                                cache_hit_basis_points: Some(3_750),
+                                metered_cost_microusd: Some(4_200),
+                                api_equivalent_cost_microusd: Some(4_200),
+                                all_lanes_priced: true,
+                                has_metered_lanes: true,
+                                has_oauth_lanes: false,
+                                breakdowns: Vec::new(),
+                            }),
+                        },
+                        metrics_complete: true,
+                        complete: true,
+                    },
+                    truncated: false,
+                },
             },
         },
     ]

@@ -92,6 +92,7 @@ mod session_hub_private_tests;
 mod actor;
 mod replay;
 mod rpc;
+#[cfg(test)]
 pub(crate) use rpc::pdf_delivery_for_provider;
 
 use crate::DaemonError;
@@ -1378,6 +1379,18 @@ impl SessionHub {
         self.inner
             .store
             .delegations_for_parent_run(session_id, run_id)
+            .await
+    }
+
+    pub(crate) async fn delegation_descendants(
+        &self,
+        session_id: SessionId,
+        max_nodes: usize,
+        max_depth: u32,
+    ) -> Result<haider_core::DelegationDescendants, HaiderError> {
+        self.inner
+            .store
+            .delegation_descendants(session_id, max_nodes, max_depth)
             .await
     }
 

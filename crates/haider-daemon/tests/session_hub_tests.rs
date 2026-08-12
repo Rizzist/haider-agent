@@ -7,8 +7,8 @@
 
 use base64::Engine as _;
 use haider_core::{
-    HarnessActor, HarnessConfig, SessionCreateCommand, SqliteStoreHandle, StoreHandle,
-    SubmitCommittedTurn,
+    DelegationRecord, DelegationState, HarnessActor, HarnessConfig, SessionCreateCommand,
+    SqliteStoreHandle, StoreHandle, SubmitCommittedTurn,
 };
 use haider_daemon::ConnectionTransport;
 use haider_daemon::{
@@ -18,18 +18,22 @@ use haider_daemon::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::agent::{
+    AgentManifest, AgentRole, ChildReport, Grant, Placement, ReportVerification,
+};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, ItemId, LeaseId, MenuId,
+    NodeId, RunId, SessionId,
 };
-use haider_protocol::item::ItemEvent;
+use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
-use haider_protocol::provider::FinishReason;
-use haider_protocol::state::RunState;
+use haider_protocol::provider::{FinishReason, Usage, UsageRequestKind, UsageScope, UsageSource};
+use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
 use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
 use haider_rpc::{
@@ -37,8 +41,8 @@ use haider_rpc::{
     ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
     ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
-    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, ObserveRunStateWire,
-    RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary, WireFrame,
+    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, FleetAgentStateWire,
+    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary, WireFrame,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -548,28 +552,7 @@ async fn create_and_attach_typed_session(
     session_id: &SessionId,
     provider: &str,
 ) {
-    store
-        .create_session(SessionCreateCommand {
-            command_id: format!("create-{session_id}"),
-            request_digest: format!("create-digest-{session_id}"),
-            request_json: format!(
-                r#"{{"cwd":"/tmp","max_tokens":4096,"model":"test-model","provider":"{provider}"}}"#
-            ),
-            session_id: session_id.clone(),
-            cwd: "/tmp".into(),
-            provider: provider.into(),
-            model: "test-model".into(),
-            max_tokens: 4096,
-            permission_overrides: None,
-            effort: None,
-            fast: false,
-            cache_policy: Default::default(),
-            system_prompt_version: "test-system-v1".into(),
-            event_id: EventId::new(format!("created-{session_id}")),
-            device_id: DeviceId::new("hub-test"),
-        })
-        .await
-        .expect("typed session creates");
+    create_typed_session(store, session_id, provider).await;
     connection
         .request(
             RequestId::new(format!("attach-{session_id}")),
@@ -596,6 +579,149 @@ async fn create_and_attach_typed_session(
             ..
         }
     ));
+}
+
+async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId, provider: &str) {
+    store
+        .create_session(SessionCreateCommand {
+            command_id: format!("create-{session_id}"),
+            request_digest: format!("create-digest-{session_id}"),
+            request_json: format!(
+                r#"{{"cwd":"/tmp","max_tokens":4096,"model":"test-model","provider":"{provider}"}}"#
+            ),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: provider.into(),
+            model: "test-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "test-system-v1".into(),
+            event_id: EventId::new(format!("created-{session_id}")),
+            device_id: DeviceId::new("hub-test"),
+        })
+        .await
+        .expect("typed session creates");
+}
+
+fn fleet_delegation(
+    root_session_id: &SessionId,
+    parent_session_id: &SessionId,
+    child_session_id: &SessionId,
+    suffix: &str,
+    parent_agent_id: Option<AgentId>,
+    depth: u32,
+) -> DelegationRecord {
+    let agent_id = AgentId::new(format!("fleet-agent-{suffix}"));
+    DelegationRecord {
+        agent_id: agent_id.clone(),
+        child_session_id: child_session_id.clone(),
+        child_run_id: RunId::new(format!("fleet-child-run-{suffix}")),
+        parent_session_id: parent_session_id.clone(),
+        parent_run_id: RunId::new(format!("fleet-parent-run-{suffix}")),
+        parent_branch_id: None,
+        call_id: format!("fleet-call-{suffix}"),
+        tool_item_id: ItemId::new(format!("fleet-tool-item-{suffix}")),
+        parent_agent_id: parent_agent_id.clone(),
+        root_session_id: root_session_id.clone(),
+        depth,
+        task: format!("task {suffix}"),
+        prompt: format!("prompt {suffix}"),
+        manifest: AgentManifest {
+            agent: agent_id,
+            role: AgentRole::Subagent,
+            task: format!("task {suffix}"),
+            callsign: Some(format!("CALL-{suffix}")),
+            model_profile: "gpt-5.2".into(),
+            grant: Grant {
+                tools: vec!["fs_read".into()],
+                effect_ceiling: Vec::new(),
+            },
+            budget_tokens: Some(4096),
+            placement: Placement::Local,
+            lease: LeaseId::new(format!("fleet-lease-{suffix}")),
+            fencing_epoch: 1,
+            attempt: 0,
+            parent: parent_agent_id,
+            coordinates: None,
+        },
+        state: DelegationState::Spawned,
+        report: None,
+    }
+}
+
+async fn append_fleet_metrics(
+    hub: &SessionHub,
+    generation: u64,
+    record: &DelegationRecord,
+    final_state: RunState,
+    tokens: u64,
+) {
+    let scoped = |suffix: &str, payload: serde_json::Value| {
+        let mut event = envelope(
+            &record.child_session_id,
+            format!("fleet-{suffix}-{}", record.agent_id),
+            generation,
+        );
+        event.run_id = Some(record.child_run_id.clone());
+        event.agent_id = Some(record.agent_id.clone());
+        event.payload = payload;
+        event
+    };
+    let started = scoped(
+        "started",
+        serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("thinking state"),
+    );
+    let tool = scoped(
+        "tool",
+        serde_json::to_value(EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new(format!("fleet-metrics-tool-{}", record.agent_id)),
+            item: TurnItem::ToolCall {
+                call_id: format!("fleet-metrics-call-{}", record.agent_id),
+                name: "fs_read".into(),
+                args: serde_json::json!({}),
+                status: ToolStatus::InProgress,
+            },
+        }))
+        .expect("tool event"),
+    );
+    let usage = scoped(
+        "usage",
+        serde_json::to_value(EventPayload::Usage(Usage {
+            input: tokens,
+            output: 1,
+            reasoning: 0,
+            cached: 0,
+            source: UsageSource::ProviderReported,
+            account: Some(CredentialAlias::new("fleet-billing")),
+            accounts: Vec::new(),
+            normalized: None,
+            scope: Some(UsageScope {
+                provider: "openai".into(),
+                model: "gpt-5.2".into(),
+                account_scope: Some(CredentialAlias::new("fleet-billing")),
+                auth_scope: "api_key".into(),
+                cache_epoch: "fleet-test".into(),
+                stable_prefix_tokens: 0,
+                cache_boundaries: None,
+                request_kind: UsageRequestKind::DelegatedAgent,
+                run: Some(record.child_run_id.clone()),
+                agent: Some(record.agent_id.clone()),
+                prefix_digests: None,
+            }),
+            cache_cost: None,
+        }))
+        .expect("usage event"),
+    );
+    let terminal = scoped(
+        "state",
+        serde_json::to_value(EventPayload::RunState(final_state)).expect("final state"),
+    );
+    hub.append(&mut [started, tool, usage, terminal])
+        .await
+        .expect("fleet metrics commit");
 }
 
 fn pdf_fixture(pages: u32, content: Option<&str>) -> Vec<u8> {
@@ -2114,6 +2240,255 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let json = serde_json::to_string(&digests).expect("digests serialize");
     assert!(!json.contains(VAULT_SENTINEL));
     assert!(!json.contains(OAUTH_SENTINEL));
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// FLEET LAW: a View-only, receipt-free read rebuilds nested shape, every
+/// display state, direct v0.0.902 metrics, and the complete rollup from
+/// durable child journals even after the root session itself is terminal.
+/// A connection without View is denied without requiring a control attach.
+#[tokio::test]
+async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capability() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let root = SessionId::new("fleet-root");
+    create_typed_session(&store, &root, "openai").await;
+
+    let specs = [
+        ("queued", RunState::Queued, 10_u64),
+        ("live", RunState::Thinking, 20),
+        ("done", RunState::Done, 30),
+        ("failed", RunState::Errored, 40),
+        ("cancelled", RunState::Cancelled, 50),
+    ];
+    let mut records = Vec::new();
+    for (suffix, state, tokens) in specs {
+        let child = SessionId::new(format!("fleet-session-{suffix}"));
+        create_typed_session(&store, &child, "openai").await;
+        let record = fleet_delegation(&root, &root, &child, suffix, None, 1);
+        store
+            .create_delegation(record.clone())
+            .await
+            .expect("root fleet relation");
+        append_fleet_metrics(&hub, generation, &record, state, tokens).await;
+        records.push(record);
+    }
+    let live = records
+        .iter()
+        .find(|record| record.agent_id.as_str() == "fleet-agent-live")
+        .expect("live parent");
+    let waiting_session = SessionId::new("fleet-session-waiting");
+    create_typed_session(&store, &waiting_session, "openai").await;
+    let waiting = fleet_delegation(
+        &root,
+        &live.child_session_id,
+        &waiting_session,
+        "waiting",
+        Some(live.agent_id.clone()),
+        2,
+    );
+    store
+        .create_delegation(waiting.clone())
+        .await
+        .expect("nested fleet relation");
+    append_fleet_metrics(
+        &hub,
+        generation,
+        &waiting,
+        RunState::Waiting {
+            reason: WaitReason::LocalChild,
+        },
+        60,
+    )
+    .await;
+
+    let mut root_terminal = envelope(&root, "fleet-root-terminal", generation);
+    root_terminal.run_id = Some(RunId::new("fleet-root-run"));
+    root_terminal.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("root terminal");
+    hub.append(&mut [root_terminal])
+        .await
+        .expect("terminal root commits");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("view-only fleet connection");
+    connection
+        .request(
+            RequestId::new("fleet-tree"),
+            RequestBody::SessionFleet {
+                session_id: root.clone(),
+            },
+        )
+        .await
+        .expect("session.fleet routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionFleet { snapshot },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected session.fleet response");
+    };
+    assert_eq!(snapshot.session_id, root);
+    assert!(!snapshot.truncated);
+    assert_eq!(snapshot.roots.len(), 5);
+    assert_eq!(snapshot.rollup.node_count, 6);
+    assert_eq!(snapshot.rollup.max_depth, 2);
+    assert!(snapshot.rollup.complete);
+    assert!(snapshot.rollup.metrics_complete);
+    assert_eq!(snapshot.rollup.states.queued, 1);
+    assert_eq!(snapshot.rollup.states.live, 1);
+    assert_eq!(snapshot.rollup.states.waiting, 1);
+    assert_eq!(snapshot.rollup.states.done, 1);
+    assert_eq!(snapshot.rollup.states.failed, 1);
+    assert_eq!(snapshot.rollup.states.cancelled, 1);
+    assert_eq!(snapshot.rollup.metrics.tool_attempts, 6);
+    let mut expected_elapsed = 0_u64;
+    let mut pending = snapshot.roots.iter().collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        let metrics = node.metrics.as_ref().expect("direct child metrics");
+        expected_elapsed = expected_elapsed.saturating_add(
+            metrics
+                .terminal_at_ms
+                .unwrap_or(snapshot.generated_at_ms)
+                .saturating_sub(metrics.started_at_ms),
+        );
+        pending.extend(node.children.iter());
+    }
+    assert_eq!(snapshot.rollup.metrics.elapsed_ms, expected_elapsed);
+    let totals = snapshot
+        .rollup
+        .metrics
+        .usage
+        .as_ref()
+        .expect("all child usage is durable");
+    assert_eq!(totals.logical_input_tokens, 210);
+    assert_eq!(totals.billed_output_tokens, 6);
+    assert!(totals.metered_cost_microusd.is_some());
+    assert!(totals.api_equivalent_cost_microusd.is_some());
+    let live_node = snapshot
+        .roots
+        .iter()
+        .find(|node| node.agent_id.as_str() == "fleet-agent-live")
+        .expect("live root node");
+    assert_eq!(live_node.state, FleetAgentStateWire::Live);
+    assert_eq!(live_node.callsign.as_deref(), Some("CALL-live"));
+    assert_eq!(live_node.children.len(), 1);
+    assert_eq!(live_node.children[0].state, FleetAgentStateWire::Waiting);
+    assert_eq!(
+        live_node.children[0].parent_agent_id.as_ref(),
+        Some(&live.agent_id)
+    );
+
+    let denied_sink = Arc::new(CollectSink::default());
+    let denied = hub
+        .open_connection(
+            CapabilitySet::new(),
+            denied_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("unprivileged connection");
+    denied
+        .request(
+            RequestId::new("fleet-denied"),
+            RequestBody::SessionFleet { session_id: root },
+        )
+        .await
+        .expect("fleet denial routes");
+    assert!(matches!(
+        denied_sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == haider_rpc::ERROR_CODE_CAPABILITY_DENIED
+    ));
+
+    denied.close().await.expect("denied connection closes");
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// BOUND LAW: historical terminal children can exceed the concurrent live
+/// cap, but the read returns exactly 512 nodes and marks both the tree and its
+/// rollup incomplete. No provider work is involved in this fixture.
+#[tokio::test]
+async fn session_fleet_caps_historical_response_at_512_nodes() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let root = SessionId::new("fleet-bounded-root");
+    create_typed_session(&store, &root, "openai").await;
+    for index in 0..513_u32 {
+        let suffix = format!("bounded-{index:03}");
+        let child = SessionId::new(format!("fleet-bounded-child-{index:03}"));
+        create_typed_session(&store, &child, "openai").await;
+        let record = fleet_delegation(&root, &root, &child, &suffix, None, 1);
+        store
+            .create_delegation(record.clone())
+            .await
+            .expect("historical fleet relation");
+        let mut done = envelope(
+            &record.child_session_id,
+            format!("fleet-bounded-done-{index:03}"),
+            generation,
+        );
+        done.run_id = Some(record.child_run_id.clone());
+        done.agent_id = Some(record.agent_id.clone());
+        done.payload =
+            serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("done state");
+        hub.append(&mut [done]).await.expect("terminal child state");
+        store
+            .record_delegation_report(
+                record.agent_id.clone(),
+                ChildReport {
+                    agent: record.agent_id,
+                    summary: "complete".into(),
+                    verified: ReportVerification::Unverified,
+                    workspace_revision: None,
+                },
+            )
+            .await
+            .expect("terminal delegation bookkeeping");
+    }
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("fleet connection");
+    connection
+        .request(
+            RequestId::new("fleet-bounded"),
+            RequestBody::SessionFleet { session_id: root },
+        )
+        .await
+        .expect("bounded fleet routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionFleet { snapshot },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected bounded fleet response");
+    };
+    assert_eq!(snapshot.roots.len(), 512);
+    assert_eq!(snapshot.node_limit, 512);
+    assert_eq!(snapshot.depth_limit, haider_rpc::FLEET_MAX_DEPTH);
+    assert_eq!(snapshot.rollup.node_count, 512);
+    assert_eq!(snapshot.rollup.states.done, 512);
+    assert!(snapshot.truncated);
+    assert!(!snapshot.rollup.complete);
+    assert!(!snapshot.rollup.metrics_complete);
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

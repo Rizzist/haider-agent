@@ -24,6 +24,7 @@ use haider_protocol::menu::MenuKind;
 use haider_protocol::state::RunState;
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
@@ -139,6 +140,287 @@ async fn session_agent_metrics_truth(
         }
     }
     Ok(folder.primary_agent_snapshot(session_id, through_seq))
+}
+
+struct FleetChildTruth {
+    state: haider_rpc::FleetAgentStateWire,
+    metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+}
+
+/// Reduces one child's exact durable run and direct metrics from the same
+/// sealed journal head. Delegation bookkeeping is only the fallback for the
+/// launch-crash window; it cannot distinguish failed from cancelled.
+async fn fleet_child_truth(
+    store: &dyn StoreHandle,
+    record: &haider_core::DelegationRecord,
+    through_seq: u64,
+    initial_model: &str,
+) -> Result<FleetChildTruth, HaiderError> {
+    let mut folder = crate::usage_report::SessionFolder::new(initial_model);
+    let mut latest_state = None;
+    let mut since_seq = 0;
+    while since_seq < through_seq {
+        let page = store
+            .read(&record.child_session_id, since_seq, REPLAY_PAGE_SIZE)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        let mut advanced = false;
+        for envelope in page {
+            if envelope.seq > through_seq {
+                break;
+            }
+            since_seq = envelope.seq;
+            advanced = true;
+            if envelope.run_id.as_ref() == Some(&record.child_run_id)
+                && let Ok(EventPayload::RunState(state)) =
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            {
+                latest_state = Some(state);
+            }
+            folder.push(&envelope);
+        }
+        if !advanced {
+            break;
+        }
+    }
+    let state = fleet_agent_state(record, latest_state.as_ref());
+    let metrics = folder.agent_snapshot(
+        &record.child_session_id,
+        Some(&record.agent_id),
+        through_seq,
+    );
+    Ok(FleetChildTruth { state, metrics })
+}
+
+fn fleet_agent_state(
+    record: &haider_core::DelegationRecord,
+    state: Option<&RunState>,
+) -> haider_rpc::FleetAgentStateWire {
+    use haider_rpc::FleetAgentStateWire as FleetState;
+    match state {
+        Some(RunState::Queued) => FleetState::Queued,
+        Some(RunState::Done) => FleetState::Done,
+        Some(RunState::Errored) => FleetState::Failed,
+        Some(RunState::Cancelled) => FleetState::Cancelled,
+        Some(state) if state.is_parked() => FleetState::Waiting,
+        Some(_) => FleetState::Live,
+        None => match record.state {
+            haider_core::DelegationState::Spawned => FleetState::Queued,
+            haider_core::DelegationState::Running => FleetState::Live,
+            haider_core::DelegationState::Reported | haider_core::DelegationState::Collected => {
+                if record.report.as_ref().is_some_and(|report| {
+                    report.verified == haider_protocol::agent::ReportVerification::Red
+                }) {
+                    FleetState::Failed
+                } else {
+                    FleetState::Done
+                }
+            }
+        },
+    }
+}
+
+struct FleetFlatNode {
+    record: haider_core::DelegationRecord,
+    state: haider_rpc::FleetAgentStateWire,
+    metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+}
+
+fn fleet_snapshot(
+    session_id: SessionId,
+    generated_at_ms: u64,
+    nodes: Vec<FleetFlatNode>,
+    truncated: bool,
+) -> Result<haider_rpc::SessionFleetSnapshot, HaiderError> {
+    let mut states = haider_rpc::FleetStateCountsWire::default();
+    let mut max_depth = 0_u32;
+    for node in &nodes {
+        max_depth = max_depth.max(node.record.depth);
+        let count = match node.state {
+            haider_rpc::FleetAgentStateWire::Queued => &mut states.queued,
+            haider_rpc::FleetAgentStateWire::Live => &mut states.live,
+            haider_rpc::FleetAgentStateWire::Waiting => &mut states.waiting,
+            haider_rpc::FleetAgentStateWire::Done => &mut states.done,
+            haider_rpc::FleetAgentStateWire::Failed => &mut states.failed,
+            haider_rpc::FleetAgentStateWire::Cancelled => &mut states.cancelled,
+            _ => continue,
+        };
+        *count = count.saturating_add(1);
+    }
+    let (metrics, metrics_complete) = fleet_metrics_totals(&nodes, generated_at_ms);
+    let rollup = haider_rpc::FleetRollupWire {
+        node_count: u32::try_from(nodes.len()).unwrap_or(u32::MAX),
+        states,
+        max_depth,
+        metrics,
+        metrics_complete,
+        complete: !truncated,
+    };
+
+    let mut children_by_parent = HashMap::<SessionId, Vec<usize>>::new();
+    let mut wire_nodes = nodes
+        .into_iter()
+        .enumerate()
+        .map(|(index, node)| {
+            children_by_parent
+                .entry(node.record.parent_session_id.clone())
+                .or_default()
+                .push(index);
+            Some(haider_rpc::FleetNodeWire {
+                agent_id: node.record.agent_id,
+                session_id: node.record.child_session_id,
+                callsign: node.record.manifest.callsign,
+                task: node.record.task,
+                depth: node.record.depth,
+                parent_session_id: node.record.parent_session_id,
+                parent_agent_id: node.record.parent_agent_id,
+                state: node.state,
+                metrics: node.metrics,
+                children: Vec::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    fn take_tree(
+        index: usize,
+        nodes: &mut [Option<haider_rpc::FleetNodeWire>],
+        children_by_parent: &HashMap<SessionId, Vec<usize>>,
+    ) -> Result<haider_rpc::FleetNodeWire, HaiderError> {
+        let mut node = nodes.get_mut(index).and_then(Option::take).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "bounded fleet graph contains a duplicate node index",
+                false,
+            )
+        })?;
+        if let Some(children) = children_by_parent.get(&node.session_id) {
+            let mut nested = Vec::with_capacity(children.len());
+            for child in children {
+                nested.push(take_tree(*child, nodes, children_by_parent)?);
+            }
+            node.children = nested;
+        }
+        Ok(node)
+    }
+
+    let root_indices = children_by_parent
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut roots = Vec::with_capacity(root_indices.len());
+    for index in root_indices {
+        roots.push(take_tree(index, &mut wire_nodes, &children_by_parent)?);
+    }
+    Ok(haider_rpc::SessionFleetSnapshot {
+        session_id,
+        generated_at_ms,
+        node_limit: haider_rpc::FLEET_MAX_NODES,
+        depth_limit: haider_rpc::FLEET_MAX_DEPTH,
+        roots,
+        rollup,
+        truncated,
+    })
+}
+
+fn fleet_metrics_totals(
+    nodes: &[FleetFlatNode],
+    generated_at_ms: u64,
+) -> (haider_rpc::FleetMetricsTotalsWire, bool) {
+    let metrics_complete = nodes.iter().all(|node| {
+        node.metrics
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.usage.is_some())
+    });
+    let mut totals = haider_rpc::FleetMetricsTotalsWire::default();
+    for snapshot in nodes.iter().filter_map(|node| node.metrics.as_ref()) {
+        totals.elapsed_ms = totals.elapsed_ms.saturating_add(
+            snapshot
+                .terminal_at_ms
+                .unwrap_or(generated_at_ms)
+                .saturating_sub(snapshot.started_at_ms),
+        );
+        totals.tool_attempts = totals.tool_attempts.saturating_add(snapshot.tool_attempts);
+    }
+    if nodes.is_empty() || !metrics_complete {
+        return (totals, metrics_complete);
+    }
+
+    let mut usage = haider_protocol::agent::AgentUsageMetrics {
+        all_lanes_priced: true,
+        ..haider_protocol::agent::AgentUsageMetrics::default()
+    };
+    let mut metered_cost = 0_u64;
+    let mut api_cost = 0_u64;
+    let mut metered_priced = true;
+    let mut api_priced = true;
+    for item in nodes
+        .iter()
+        .filter_map(|node| node.metrics.as_ref())
+        .filter_map(|snapshot| snapshot.usage.as_ref())
+    {
+        usage.logical_input_tokens = usage
+            .logical_input_tokens
+            .saturating_add(item.logical_input_tokens);
+        usage.billed_output_tokens = usage
+            .billed_output_tokens
+            .saturating_add(item.billed_output_tokens);
+        usage.additional_reasoning_tokens = usage
+            .additional_reasoning_tokens
+            .saturating_add(item.additional_reasoning_tokens);
+        usage.cache_read_tokens = usage
+            .cache_read_tokens
+            .saturating_add(item.cache_read_tokens);
+        usage.cache_write_tokens = usage
+            .cache_write_tokens
+            .saturating_add(item.cache_write_tokens);
+        usage.has_metered_lanes |= item.has_metered_lanes;
+        usage.has_oauth_lanes |= item.has_oauth_lanes;
+        usage.all_lanes_priced &= item.all_lanes_priced;
+        if item.has_metered_lanes {
+            if let Some(cost) = item.metered_cost_microusd {
+                metered_cost = metered_cost.saturating_add(cost);
+            } else {
+                metered_priced = false;
+            }
+        }
+        if let Some(cost) = item.api_equivalent_cost_microusd {
+            api_cost = api_cost.saturating_add(cost);
+        } else {
+            api_priced = false;
+        }
+    }
+    usage.metered_cost_microusd =
+        (usage.has_metered_lanes && metered_priced).then_some(metered_cost);
+    usage.api_equivalent_cost_microusd = (usage.all_lanes_priced && api_priced).then_some(api_cost);
+    usage.cache_hit_basis_points = nodes
+        .iter()
+        .filter_map(|node| node.metrics.as_ref())
+        .filter_map(|snapshot| snapshot.usage.as_ref())
+        .all(|item| item.cache_hit_basis_points.is_some())
+        .then(|| {
+            if usage.logical_input_tokens == 0 {
+                0
+            } else {
+                u32::try_from(
+                    usage.cache_read_tokens.saturating_mul(10_000) / usage.logical_input_tokens,
+                )
+                .unwrap_or(10_000)
+                .min(10_000)
+            }
+        });
+    totals.usage = Some(usage);
+    (totals, metrics_complete)
+}
+
+fn fleet_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// Projects one replayed truth into the summary's additive wire fields.
@@ -916,6 +1198,18 @@ impl HubConnection {
                 }
                 self.session_observe(request_id, session_id, last_event_limit)
                     .await
+            }
+            RequestBody::SessionFleet { session_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_fleet(request_id, session_id).await
             }
             RequestBody::SessionDiagnostic {
                 command_id,
@@ -4732,6 +5026,60 @@ impl HubConnection {
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionObserve { digest },
+        })
+    }
+
+    async fn session_fleet(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        let bounded = self
+            .hub
+            .delegation_descendants(
+                session_id.clone(),
+                haider_rpc::FLEET_MAX_NODES as usize,
+                haider_rpc::FLEET_MAX_DEPTH,
+            )
+            .await?;
+        let generated_at_ms = fleet_now_ms();
+        let mut nodes = Vec::with_capacity(bounded.descendants.len());
+        for descendant in bounded.descendants {
+            let record = descendant.record;
+            let head_seq = self
+                .hub
+                .inner
+                .store
+                .latest_seq(&record.child_session_id)
+                .await?;
+            let initial_model = self
+                .hub
+                .inner
+                .store
+                .session_metadata(&record.child_session_id)
+                .await?
+                .map_or_else(String::new, |metadata| metadata.model);
+            let truth =
+                fleet_child_truth(&self.hub.inner.store, &record, head_seq, &initial_model).await?;
+            nodes.push(FleetFlatNode {
+                record,
+                state: truth.state,
+                metrics: truth.metrics,
+            });
+        }
+        let snapshot = fleet_snapshot(session_id, generated_at_ms, nodes, bounded.truncated)?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionFleet { snapshot },
         })
     }
 

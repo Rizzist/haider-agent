@@ -2726,6 +2726,192 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
     store.close().await.expect("store close");
 }
 
+/// HARD-CAP E2 LAW: after 512 durable live children across unrelated trees,
+/// `spawn_subagent` returns the owner-pinned rejected tool card and the parent
+/// reaches Done on its next provider round. No seeded child runs provider work.
+#[tokio::test]
+async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
+    use haider_core::{DelegationRecord, DelegationState, SUBAGENT_LIVE_LIMIT};
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::error::ErrorAction;
+    use haider_protocol::ids::{ItemId, LeaseId};
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let seed_parent = SessionId::new("cap-seed-parent");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-cap-seed-parent".into(),
+        request_digest: "create-cap-seed-parent-digest".into(),
+        request_json: r#"{"session":"cap-seed-parent"}"#.into(),
+        session_id: seed_parent.clone(),
+        cwd: test_cwd(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-cap-seed-parent"),
+        device_id: DeviceId::new("cap-test-device"),
+    })
+    .await
+    .expect("seed parent");
+    for index in 0..SUBAGENT_LIVE_LIMIT {
+        let suffix = format!("{index:03}");
+        let child_session_id = SessionId::new(format!("cap-seed-child-{suffix}"));
+        hub.create_internal_session(SessionCreateCommand {
+            command_id: format!("create-cap-seed-child-{suffix}"),
+            request_digest: format!("create-cap-seed-child-{suffix}-digest"),
+            request_json: format!(r#"{{"session":"cap-seed-child-{suffix}"}}"#),
+            session_id: child_session_id.clone(),
+            cwd: test_cwd(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new(format!("created-cap-seed-child-{suffix}")),
+            device_id: DeviceId::new("cap-test-device"),
+        })
+        .await
+        .expect("seed child session");
+        let agent_id = AgentId::new(format!("cap-seed-agent-{suffix}"));
+        hub.create_delegation(DelegationRecord {
+            agent_id: agent_id.clone(),
+            child_session_id,
+            child_run_id: RunId::new(format!("cap-seed-run-{suffix}")),
+            parent_session_id: seed_parent.clone(),
+            parent_run_id: RunId::new(format!("cap-seed-parent-run-{suffix}")),
+            parent_branch_id: None,
+            call_id: format!("cap-seed-call-{suffix}"),
+            tool_item_id: ItemId::new(format!("cap-seed-item-{suffix}")),
+            parent_agent_id: None,
+            root_session_id: seed_parent.clone(),
+            depth: 1,
+            task: format!("seed {suffix}"),
+            prompt: "remain live without provider work".into(),
+            manifest: AgentManifest {
+                agent: agent_id,
+                role: AgentRole::Subagent,
+                task: format!("seed {suffix}"),
+                callsign: None,
+                model_profile: "fake-model".into(),
+                grant: Grant {
+                    tools: Vec::new(),
+                    effect_ceiling: Vec::new(),
+                },
+                budget_tokens: Some(4096),
+                placement: Placement::Local,
+                lease: LeaseId::new(format!("cap-seed-lease-{suffix}")),
+                fencing_epoch: hub.worker_generation(),
+                attempt: 0,
+                parent: None,
+                coordinates: None,
+            },
+            state: DelegationState::Spawned,
+            report: None,
+        })
+        .await
+        .expect("seed live delegation");
+    }
+
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "cap-513-rejected".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"overflow","prompt":"must reject typed"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "cap-513-rejected".into(),
+        },
+        FakeStep::EmitText {
+            text: "parent continued after cap".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    let manager_handle = manager.handle();
+    hub.install_worker_manager(manager_handle.clone())
+        .expect("install manager");
+    let parent_session = SessionId::new("cap-rejection-parent");
+    let parent_run = RunId::new("cap-rejection-parent-run");
+    let accepted = accept_parent(&hub, &parent_session, &parent_run, "cap-rejection").await;
+    manager_handle
+        .submit(accepted)
+        .await
+        .expect("submit parent");
+    wait_for_state(&store, &parent_session, RunState::is_terminal).await;
+    let terminal_events = store
+        .read(&parent_session, 0, 1024)
+        .await
+        .expect("parent terminal journal");
+    assert!(
+        terminal_events.iter().any(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone())
+                .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+        }),
+        "parent must continue to Done after cap rejection: {terminal_events:#?}"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                Block::ToolResult { call_id, preview, .. }
+                    if call_id == "cap-513-rejected"
+                        && preview.contains("subagent_limit_reached")
+                        && preview.contains("\"live_count\":512")
+            )
+        })
+    }));
+    let events = store
+        .read(&parent_session, 0, 1024)
+        .await
+        .expect("parent journal");
+    let presentation = events
+        .into_iter()
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .find_map(|payload| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "cap-513-rejected" => {
+                result.presentation
+            }
+            _ => None,
+        })
+        .expect("typed cap tool presentation");
+    assert_eq!(presentation.subcode.as_str(), "subagent-limit-reached");
+    assert_eq!(presentation.title, "Subagent limit reached");
+    assert!(presentation.detail.contains("512"));
+    assert_eq!(presentation.allowed_actions, vec![ErrorAction::Retry]);
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// MUTATION CHECK: terminalize delegated children during startup recovery or
 /// arm supervision only at spawn time. Expected runtime failure: the resumed
 /// parent receives a generic restart failure (or waits forever) instead of
