@@ -525,6 +525,7 @@ fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
     assert_eq!(sessions[0].footprint_tokens, None);
     assert_eq!(sessions[0].footprint_truth, None);
     assert_eq!(sessions[0].agent_metrics, None);
+    assert_eq!(sessions[0].workspace_cwd, None);
 
     let newer_daemon = r#"{
         "method":"session.list",
@@ -579,6 +580,47 @@ fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
             .and_then(|usage| usage.metered_cost_microusd),
         Some(123_000)
     );
+}
+
+/// WIRE-GAPS item 4 is a plain optional summary coordinate: new readers
+/// preserve absence from older daemons, and an older field projection ignores
+/// the current writer's workspace path.
+#[test]
+fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
+    let current = haider_rpc::SessionSummary {
+        session_id: haider_protocol::ids::SessionId::new("session-workspace"),
+        head_seq: 17,
+        worker_generation: 15,
+        metadata: None,
+        workspace_cwd: Some("/work/original".into()),
+        turn_count: None,
+        footprint_tokens: None,
+        footprint_truth: None,
+        title: None,
+        agent_metrics: None,
+    };
+    let value = serde_json::to_value(&current).expect("encode current summary");
+    assert_eq!(value["workspace_cwd"], "/work/original");
+
+    #[derive(Deserialize)]
+    struct LegacySummary {
+        session_id: haider_protocol::ids::SessionId,
+        head_seq: u64,
+        worker_generation: u64,
+    }
+    let legacy: LegacySummary =
+        serde_json::from_value(value).expect("legacy summary ignores workspace_cwd");
+    assert_eq!(legacy.session_id.as_str(), "session-workspace");
+    assert_eq!(legacy.head_seq, 17);
+    assert_eq!(legacy.worker_generation, 15);
+
+    let older: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-workspace",
+        "head_seq": 17,
+        "worker_generation": 15,
+    }))
+    .expect("older summary decodes");
+    assert_eq!(older.workspace_cwd, None);
 }
 
 /// R7 additive-field tolerance for the two turn mutation methods
@@ -656,6 +698,76 @@ fn hooks_rpc_and_run_scoped_trust_shapes_round_trip_exactly() {
         serde_json::from_value::<RequestBody>(value).expect("decode hooks list"),
         list
     );
+}
+
+/// WIRE-GAPS items 2-3: current hook listings carry one monotonic revision
+/// and daemon-owned trust classification. Both additions default cleanly for
+/// an older daemon and are ignored by an older response projection.
+#[test]
+fn hooks_list_revision_and_trust_state_are_additive_and_tolerant() {
+    let current = ResponseBody::HooksList {
+        policy: "per_digest".into(),
+        revision: 7,
+        hooks: vec![haider_rpc::HookSummaryWire {
+            name: "format".into(),
+            digest: "d".repeat(64),
+            source: "/work/original/hooks.json".into(),
+            kind: "exec".into(),
+            event: "run_finished".into(),
+            trusted: false,
+            trust_state: Some(haider_rpc::HookTrustStateWire::RevokedByEdit),
+            decision: false,
+            timeout_ms: 30_000,
+        }],
+    };
+    let value = serde_json::to_value(&current).expect("encode current hook list");
+    assert_eq!(value["revision"], 7);
+    assert_eq!(value["hooks"][0]["trust_state"], "revoked_by_edit");
+
+    #[derive(Deserialize)]
+    struct LegacyHookSummary {
+        name: String,
+        trusted: bool,
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "method")]
+    enum LegacyResponseBody {
+        #[serde(rename = "hooks.list")]
+        HooksList {
+            policy: String,
+            hooks: Vec<LegacyHookSummary>,
+        },
+    }
+    let legacy: LegacyResponseBody =
+        serde_json::from_value(value).expect("legacy hook decoder ignores additions");
+    let LegacyResponseBody::HooksList { policy, hooks } = legacy;
+    assert_eq!(policy, "per_digest");
+    assert_eq!(hooks[0].name, "format");
+    assert!(!hooks[0].trusted);
+
+    let older: ResponseBody = serde_json::from_value(serde_json::json!({
+        "method": "hooks.list",
+        "policy": "per_digest",
+        "hooks": [{
+            "name": "format",
+            "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "source": "/work/original/hooks.json",
+            "kind": "exec",
+            "event": "run_finished",
+            "trusted": false,
+            "decision": false,
+            "timeout_ms": 30000
+        }]
+    }))
+    .expect("older hook list decodes");
+    let ResponseBody::HooksList {
+        revision, hooks, ..
+    } = older
+    else {
+        panic!("expected hooks.list")
+    };
+    assert_eq!(revision, 0);
+    assert_eq!(hooks[0].trust_state, None);
 }
 
 /// MUTATION CHECK: remove the additive `ResponseBody::MenuAnswer` variant or
@@ -1469,10 +1581,11 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3,
+        6 + 7 + 3 + 3 + 4 + 3 + 4,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
-         G3's four session-tuning frames, then F1's three fleet frames — the \
+         G3's four session-tuning frames, F1's three fleet frames, then \
+         WIRE-GAPS' four read frames — the \
          accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
@@ -1739,8 +1852,8 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3,
-        "G2's three frames, then G3's four tuning frames, then F1's three fleet frames"
+        3 + 4 + 3 + 4,
+        "G2's three frames, then G3's four tuning frames, F1's three fleet frames, then WIRE-GAPS' four read frames"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -1814,6 +1927,7 @@ fn session_rename_frames_are_additive_and_golden() {
         head_seq: 9,
         worker_generation: 7,
         metadata: None,
+        workspace_cwd: None,
         turn_count: None,
         footprint_tokens: None,
         footprint_truth: None,
@@ -1855,7 +1969,7 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     // F1's three fleet frames at the transcript tail (each later wave's own
     // law pins its append).
     let frames = transcript();
-    let tail = &frames[frames.len() - 20..frames.len() - 13];
+    let tail = &frames[frames.len() - 24..frames.len() - 17];
     let methods: Vec<String> = tail
         .iter()
         .map(|frame| {
@@ -1981,9 +2095,10 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3,
+        3 + 3 + 4 + 3 + 4,
         "three U1 frames, then G2's three session-rename frames, then G3's \
-         four session-tuning frames, then F1's three fleet frames (each later \
+         four session-tuning frames, F1's three fleet frames, then \
+         WIRE-GAPS' four read frames (each later \
          wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
@@ -2237,7 +2352,7 @@ fn model_detail_tuning_fields_are_additive_and_skip_empty() {
 }
 
 /// FLEET WIRE LAW: the new feature/request/response trio is the exact
-/// transcript tail, keeps protocol v1, and retains the open-enum tolerance
+/// historical transcript block, keeps protocol v1, and retains the open-enum tolerance
 /// used throughout the existing read surfaces.
 #[test]
 fn session_fleet_frames_are_additive_and_unknown_tolerant() {
@@ -2254,7 +2369,7 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
             )
         })
         .expect("fleet feature welcome");
-    assert_eq!(frames.len() - fleet_start, 3);
+    assert_eq!(frames.len() - fleet_start, 3 + 4);
     assert!(matches!(
         &frames[fleet_start],
         WireFrame::Welcome(welcome)

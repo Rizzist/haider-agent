@@ -41,6 +41,7 @@ fn summary(
         head_seq,
         worker_generation: 7,
         metadata: None,
+        workspace_cwd: None,
         turn_count: Some(2),
         footprint_tokens: None,
         footprint_truth: None,

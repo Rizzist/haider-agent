@@ -1879,6 +1879,25 @@ async fn list_summaries(hub: &SessionHub) -> Vec<SessionSummary> {
     sessions
 }
 
+/// WIRE-GAPS item 4: a non-attached roster read carries the workspace that
+/// was committed at session creation, independent of the listing process's
+/// own cwd.
+#[tokio::test]
+async fn session_summary_carries_its_committed_workspace_cwd() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("summary-workspace");
+    create_typed_session(&store, &session_id, "fake").await;
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("created session summary");
+    assert_eq!(summary.workspace_cwd.as_deref(), Some("/tmp"));
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// The owner bug (launcher roster "0 turns · 0 tok" until attach): rosters
 /// hydrate from `session.list` summaries, so a session with COMMITTED
 /// turns and a durable footprint snapshot must report both from the

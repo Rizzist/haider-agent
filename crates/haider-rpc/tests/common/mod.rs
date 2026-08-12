@@ -32,13 +32,14 @@ use haider_rpc::{
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_FLEET_V1,
     FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1,
     FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire, FleetMetricsTotalsWire,
-    FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello, LifecyclePhase, MenuInput,
-    ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest,
-    SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
+    FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello, HookSummaryWire,
+    HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire,
+    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire,
+    ObserveRunStateWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
+    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
+    SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest, SessionReadResult,
+    SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -143,6 +144,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     head_seq: 9,
                     worker_generation: 7,
                     metadata: None,
+                    workspace_cwd: None,
                     turn_count: None,
                     footprint_tokens: None,
                     footprint_truth: None,
@@ -163,6 +165,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     head_seq: 9,
                     worker_generation: 7,
                     metadata: None,
+                    workspace_cwd: None,
                     turn_count: Some(4),
                     footprint_tokens: Some(33_500),
                     footprint_truth: Some(ContextFootprintTruth::Exact),
@@ -1489,6 +1492,57 @@ pub fn transcript() -> Vec<WireFrame> {
                     },
                     truncated: false,
                 },
+            },
+        },
+        // WIRE-GAPS: current session/hook read shapes are appended after
+        // every historical frame. Older transcript bytes stay frozen.
+        WireFrame::Request {
+            request_id: RequestId::new("request-list-workspace"),
+            body: RequestBody::SessionList {
+                cursor: None,
+                limit: 64,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-list-workspace"),
+            body: ResponseBody::SessionList {
+                sessions: vec![SessionSummary {
+                    session_id: SessionId::new("session-workspace"),
+                    head_seq: 17,
+                    worker_generation: 15,
+                    metadata: None,
+                    workspace_cwd: Some("/work/original".into()),
+                    turn_count: None,
+                    footprint_tokens: None,
+                    footprint_truth: None,
+                    title: None,
+                    agent_metrics: None,
+                }],
+                next_cursor: None,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-hooks-wire-gaps"),
+            body: RequestBody::HooksList {
+                cwd: "/work/original".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-hooks-wire-gaps"),
+            body: ResponseBody::HooksList {
+                policy: "per_digest".into(),
+                revision: 7,
+                hooks: vec![HookSummaryWire {
+                    name: "format".into(),
+                    digest: "d".repeat(64),
+                    source: "/work/original/hooks.json".into(),
+                    kind: "exec".into(),
+                    event: "run_finished".into(),
+                    trusted: false,
+                    trust_state: Some(HookTrustStateWire::RevokedByEdit),
+                    decision: false,
+                    timeout_ms: 30_000,
+                }],
             },
         },
     ]

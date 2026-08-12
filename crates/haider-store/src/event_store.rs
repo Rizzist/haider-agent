@@ -581,6 +581,10 @@ pub struct HookTrustCommand {
 pub struct HookTrustChange {
     pub digest: String,
     pub trusted: bool,
+    /// Monotonic position in the hook-trust receipt domain. Older stored
+    /// receipts decode as zero and are repaired at the service boundary.
+    #[serde(default)]
+    pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
 }
@@ -3475,9 +3479,22 @@ impl Store {
             &command.request_json,
             now_ms()?,
         )?;
+        let committed: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM command_receipts
+                 WHERE state = 'committed' AND method IN (?1, ?2)",
+                params![HOOKS_TRUST_METHOD, HOOKS_REVOKE_METHOD],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let revision = u64::try_from(committed)
+            .map_err(|_| corrupt("hook trust receipt count is negative"))?
+            .checked_add(1)
+            .ok_or_else(|| corrupt("hook trust revision space is exhausted"))?;
         let response = HookTrustChange {
             digest: command.digest.clone(),
             trusted: command.trusted,
+            revision,
             workspace: command.workspace.clone(),
         };
         finalize_command_receipt(

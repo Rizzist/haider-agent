@@ -165,7 +165,8 @@ impl DelegationHandle {
                 coordinates.parent_agent_id.as_ref(),
             )
             .await?;
-        self.ensure_handoff_dir(&coordinates.metadata.cwd, &coordinates.parent_session_id)
+        let handoff_dir = self
+            .ensure_handoff_dir(&coordinates.metadata.cwd, &coordinates.parent_session_id)
             .await?;
         let identity = stable_digest(&[
             coordinates.parent_session_id.as_str(),
@@ -205,6 +206,9 @@ impl DelegationHandle {
                 "tool_item_id": coordinates.tool_item_id,
                 // W6d: the chip view attaches to the child directly.
                 "child_session_id": child_session_id,
+                // S3: this exact coordinate is also the child prompt's
+                // authority; clients never reproduce the private hash seam.
+                "handoff_dir": handoff_dir.to_string_lossy(),
             })),
         };
         manifest.placement.ensure_local()?;
@@ -529,7 +533,18 @@ impl DelegationHandle {
             .hub
             .delegation_for_child_session(child_session_id.clone())
             .await?
-            .map(|record| handoff_dir(workspace, &record.parent_session_id)))
+            .map(|record| {
+                record
+                    .manifest
+                    .coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.get("handoff_dir"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from)
+                    // Durable delegations created by older daemons lack the
+                    // additive coordinate; retain their historical prompt.
+                    .unwrap_or_else(|| handoff_dir(workspace, &record.parent_session_id))
+            }))
     }
 
     /// Best-effort cleanup used only after the parent session's durable

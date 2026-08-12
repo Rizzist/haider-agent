@@ -832,6 +832,10 @@ pub struct SessionSummary {
     /// readers must not infer anything from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
+    /// Additive canonical workspace coordinate for clients that list a
+    /// session from a different process cwd. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_cwd: Option<String>,
     /// Additive roster-truth field: committed main-timeline user turns
     /// (durable `UserMessage` envelopes not scoped to a subagent), computed
     /// from the same sealed journal the observe surface replays. `None`
@@ -1056,8 +1060,21 @@ pub struct HookSummaryWire {
     pub kind: String,
     pub event: String,
     pub trusted: bool,
+    /// Additive daemon-owned classification. `None` means an older daemon;
+    /// consumers may fall back only to the legacy `trusted` boolean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_state: Option<HookTrustStateWire>,
     pub decision: bool,
     pub timeout_ms: u64,
+}
+
+/// Daemon truth for a discovered hook's digest-pinned trust state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookTrustStateWire {
+    Trusted,
+    Untrusted,
+    RevokedByEdit,
 }
 
 /// v0.1 request method bodies.
@@ -1560,6 +1577,10 @@ pub enum ResponseBody {
     #[serde(rename = "hooks.list")]
     HooksList {
         policy: String,
+        /// Monotonic count of committed hook trust mutations. Defaults to
+        /// zero when an older daemon omits it.
+        #[serde(default)]
+        revision: u64,
         #[serde(default)]
         hooks: Vec<HookSummaryWire>,
     },

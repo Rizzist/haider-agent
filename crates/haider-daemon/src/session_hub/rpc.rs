@@ -4885,6 +4885,7 @@ impl HubConnection {
                 session_id: session_id.clone(),
                 head_seq,
                 worker_generation: self.hub.inner.store.worker_generation(),
+                workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
                 metadata,
                 turn_count: Some(turns),
                 footprint_tokens,
@@ -5281,10 +5282,11 @@ impl HubConnection {
             );
         };
         match hooks.list(std::path::PathBuf::from(cwd)).await {
-            Ok((policy, hooks)) => self.send(WireFrame::Response {
+            Ok((policy, revision, hooks)) => self.send(WireFrame::Response {
                 request_id,
                 body: ResponseBody::HooksList {
                     policy: policy.as_str().to_owned(),
+                    revision,
                     hooks,
                 },
             }),

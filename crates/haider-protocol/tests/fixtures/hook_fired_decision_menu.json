@@ -1,0 +1,22 @@
+{
+  "type": "hook_fired",
+  "hook": "permission-guard",
+  "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "kind": "decision",
+  "observed_seq": 73,
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout": {
+    "preview": "",
+    "bytes": 0,
+    "truncated": false
+  },
+  "stderr": {
+    "preview": "",
+    "bytes": 0,
+    "truncated": false
+  },
+  "proposed_decision": "allow",
+  "menu_id": "menu-permission-73",
+  "decision_applied": true
+}

@@ -1,0 +1,6 @@
+{
+  "type": "hook_trust_changed",
+  "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "trusted": false,
+  "revision": 7
+}

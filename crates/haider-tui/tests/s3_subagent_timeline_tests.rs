@@ -265,6 +265,39 @@ fn chip_view_shows_steer_messages() {
     );
 }
 
+/// WIRE-GAPS S3: the chip consumes the manifest coordinate directly and
+/// names the handoff directory in its dim identity/fact line. No client-side
+/// session hashing is involved.
+#[test]
+fn chip_header_names_manifest_handoff_directory() {
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    model.sessions.clear();
+    model.upsert_live_session(&sid());
+    model.open_session(&sid());
+    let mut child = manifest("stitch the timeline");
+    child.coordinates = Some(serde_json::json!({
+        "child_session_id": "session-child-s3",
+        "handoff_dir": "/work/project/.haider/handoff/0123456789abcdef",
+    }));
+    model.route_raw(&raw(1, None, &EventPayload::AgentSpawned(child)));
+    let chip = haider_tui::app::find_chip(&model.chips, CHILD).expect("chip installed");
+    assert_eq!(
+        chip.handoff_dir.as_deref(),
+        Some("/work/project/.haider/handoff/0123456789abcdef")
+    );
+
+    model.screen = Screen::Subagent;
+    model.view_path = vec![CHILD.to_owned()];
+    let (rows, _, _) = draw(&model, 120, 30);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("· handoff 0123456789abcdef")),
+        "the chip header names the advertised directory: {}",
+        rows.join("\n")
+    );
+}
+
 // ---- (3) the chip composer rides the wire ------------------------------
 
 /// MUTATION CHECK: restore the old `refuse_demo_only("steering a

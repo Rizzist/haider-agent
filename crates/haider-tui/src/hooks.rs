@@ -17,14 +17,15 @@
 //!   (the `/tree`-shows-`NodeCommitted` precedent). The decision-hook chip
 //!   derives from the recorded facts, never from display state.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::hook::{
     HookDecisionKind, HookEventPayload, HookRuntimeKind, HookSubscriptionState,
 };
-use haider_protocol::ids::RunId;
-use haider_rpc::HookSummaryWire;
+use haider_protocol::ids::{MenuId, RunId};
+use haider_protocol::menu::Menu;
+use haider_rpc::{HookSummaryWire, HookTrustStateWire};
 
 /// Journal facts retained per session — the STORE bound. The screen shows
 /// at most [`FIRING_ROWS_MAX`] of these (newest first); the store keeps a
@@ -47,6 +48,7 @@ pub struct HookRow {
     /// The matcher's event kind.
     pub event: String,
     pub trusted: bool,
+    pub trust_state: Option<HookTrustStateWire>,
     pub decision: bool,
     pub timeout_ms: u64,
 }
@@ -61,17 +63,15 @@ impl HookRow {
             kind: wire.kind,
             event: wire.event,
             trusted: wire.trusted,
+            trust_state: wire.trust_state,
             decision: wire.decision,
             timeout_ms: wire.timeout_ms,
         }
     }
 }
 
-/// The rendered trust state of one row. `RevokedByEdit` is DERIVED from two
-/// daemon snapshots — the daemon reported this hook trusted under one
-/// digest, and now reports the SAME name+source untrusted under another —
-/// never from a local guess: an edit revokes (H3 law), and the glyph says
-/// which kind of untrusted this is.
+/// The rendered trust state of one row. New daemons send the classification
+/// directly; the legacy boolean remains the only fallback for older peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustGlyph {
     Trusted,
@@ -131,17 +131,10 @@ pub struct HooksScreenState {
     /// The digest of the receipted command in flight. While `Some`, further
     /// trust actions are refused (one at a time) and the row wears `…`.
     pub pending: Option<String>,
-    /// DAEMON-TRUTH memory: the digest each hook (name + source file) wore
-    /// when the daemon last reported it TRUSTED — written from list
-    /// snapshots and trust receipts only. An untrusted row whose identity
-    /// is here under a DIFFERENT digest renders ✗ revoked-by-edit.
-    baseline: HashMap<String, String>,
-}
-
-/// The baseline identity of one hook: name + defining file. The digest
-/// deliberately stays OUT of the key — it is the value being tracked.
-fn identity_key(name: &str, source: &str) -> String {
-    format!("{name}\u{0}{source}")
+    /// Read-only decision-menu drill-down opened from a firing row.
+    pub drilldown: Option<Menu>,
+    /// Greatest hook trust revision installed by a list response.
+    pub revision: u64,
 }
 
 /// The 8-hex short form of a digest, for rows and messages.
@@ -152,14 +145,15 @@ pub fn short_digest(digest: &str) -> &str {
 
 impl HooksScreenState {
     /// Enter the screen in LIVE mode: the listing is a daemon read in
-    /// flight. The trust baseline survives re-entry on purpose — it is
-    /// remembered daemon truth, and forgetting it would demote ✗ back to ○.
+    /// flight. The revision survives re-entry so an older in-flight reply
+    /// cannot replace newer daemon truth.
     pub fn open_live(&mut self) {
         self.rows = None;
         self.policy = None;
         self.message = None;
         self.cursor = 0;
         self.confirm = None;
+        self.drilldown = None;
     }
 
     /// Enter the screen in DEMO mode: a sim-honest EMPTY listing — the demo
@@ -170,23 +164,21 @@ impl HooksScreenState {
         self.message = Some("· demo — no hook engine; live mode lists hooks.json truth".to_owned());
         self.cursor = 0;
         self.confirm = None;
+        self.drilldown = None;
     }
 
-    /// Apply one `hooks.list` snapshot — the ONLY writer of the rows. Every
-    /// trusted row pins its identity's digest into the baseline (daemon
-    /// truth), so a later edit renders ✗ rather than pretending the hook
-    /// was never trusted.
-    pub fn apply_snapshot(&mut self, policy: String, hooks: Vec<HookSummaryWire>) {
-        for hook in &hooks {
-            if hook.trusted {
-                self.baseline
-                    .insert(identity_key(&hook.name, &hook.source), hook.digest.clone());
-            }
+    /// Apply one `hooks.list` snapshot — the ONLY writer of the rows. Trust
+    /// classification comes directly from each wire row; this client keeps
+    /// no digest baseline from which it could infer revocation.
+    pub fn apply_snapshot(&mut self, policy: String, revision: u64, hooks: Vec<HookSummaryWire>) {
+        if revision < self.revision {
+            return;
         }
         let rows: Vec<HookRow> = hooks.into_iter().map(HookRow::from_wire).collect();
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         self.rows = Some(rows);
         self.policy = Some(policy);
+        self.revision = revision;
     }
 
     /// The daemon refused the listing — say so instead of "fetching…"
@@ -195,24 +187,11 @@ impl HooksScreenState {
         self.message = Some(format!("· hooks list failed — {message}"));
     }
 
-    /// A trust/revoke receipt landed. Retires the in-flight marker and
-    /// updates the BASELINE (an explicit revoke forgets the pin, so the row
-    /// renders ○ untrusted, not ✗). The rows themselves do NOT move here —
+    /// A trust/revoke receipt landed. Retires the in-flight marker. The rows
+    /// themselves do NOT move here —
     /// the caller chains a fresh `hooks.list` and daemon truth moves them.
     pub fn note_receipt(&mut self, digest: &str, trusted: bool) {
         self.pending = None;
-        if let Some(row) = self
-            .rows
-            .as_ref()
-            .and_then(|rows| rows.iter().find(|row| row.digest == digest))
-        {
-            let key = identity_key(&row.name, &row.source);
-            if trusted {
-                self.baseline.insert(key, digest.to_owned());
-            } else {
-                self.baseline.remove(&key);
-            }
-        }
         self.message = Some(if trusted {
             format!("✓ trusted {}", short_digest(digest))
         } else {
@@ -230,12 +209,12 @@ impl HooksScreenState {
     /// The rendered trust state of one row (see [`TrustGlyph`]).
     #[must_use]
     pub fn glyph(&self, row: &HookRow) -> TrustGlyph {
-        if row.trusted {
-            return TrustGlyph::Trusted;
-        }
-        match self.baseline.get(&identity_key(&row.name, &row.source)) {
-            Some(pinned) if pinned != &row.digest => TrustGlyph::RevokedByEdit,
-            _ => TrustGlyph::Untrusted,
+        match row.trust_state {
+            Some(HookTrustStateWire::Trusted) => TrustGlyph::Trusted,
+            Some(HookTrustStateWire::RevokedByEdit) => TrustGlyph::RevokedByEdit,
+            Some(HookTrustStateWire::Untrusted) => TrustGlyph::Untrusted,
+            None if row.trusted => TrustGlyph::Trusted,
+            None => TrustGlyph::Untrusted,
         }
     }
 }
@@ -253,6 +232,7 @@ pub enum HookFactEntry {
         /// with `decision_applied == false` and never counts as authority).
         decision: Option<(HookDecisionKind, bool)>,
         observed_seq: u64,
+        menu_id: Option<MenuId>,
     },
     Notice {
         hook: Option<String>,
@@ -277,6 +257,7 @@ impl HookFactEntry {
                 timed_out,
                 decision,
                 observed_seq,
+                ..
             } => {
                 let kind = match kind {
                     HookRuntimeKind::Exec => "exec",
@@ -325,6 +306,14 @@ impl HookFactEntry {
             }
         }
     }
+
+    #[must_use]
+    pub const fn menu_id(&self) -> Option<&MenuId> {
+        match self {
+            Self::Fired { menu_id, .. } => menu_id.as_ref(),
+            Self::Notice { .. } | Self::Subscription { .. } => None,
+        }
+    }
 }
 
 /// Per-session record of journaled hook-engine facts, plus the derived
@@ -341,6 +330,8 @@ pub struct HookFactsLog {
     /// The run in which a decision hook's answer was APPLIED by the menu
     /// CAS (`decision_applied == true` in the journaled fact).
     decision_run: Option<RunId>,
+    /// Recent decision menus retained for read-only firing drill-down.
+    menus: VecDeque<Menu>,
 }
 
 impl HookFactsLog {
@@ -353,6 +344,15 @@ impl HookFactsLog {
             && self.current_run.as_ref() != Some(run)
         {
             self.current_run = Some(run.clone());
+        }
+        if let Ok(haider_protocol::EventPayload::MenuOpened(menu)) =
+            serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload.clone())
+        {
+            self.menus.retain(|held| held.id != menu.id);
+            self.menus.push_front(menu);
+            while self.menus.len() > HOOK_FACTS_CAP {
+                self.menus.pop_back();
+            }
         }
         if !HookEventPayload::is_engine_fact(&envelope.payload) {
             return;
@@ -383,6 +383,7 @@ impl HookFactsLog {
                         .proposed_decision
                         .map(|answer| (answer, fired.decision_applied)),
                     observed_seq: fired.observed_seq,
+                    menu_id: fired.menu_id,
                 }
             }
             HookEventPayload::HookSubscription(subscription) => HookFactEntry::Subscription {
@@ -390,8 +391,8 @@ impl HookFactsLog {
                 state: subscription.state,
                 restart_attempt: subscription.restart_attempt,
             },
-            // `is_engine_fact` filtered to the three kinds above; anything
-            // else is a future engine fact — tolerated, not displayed.
+            // Trust-change cadence facts (and future engine facts) are not
+            // display rows here; the live driver consumes their revisions.
             _ => return,
         };
         self.entries.push_front(entry);
@@ -422,5 +423,18 @@ impl HookFactsLog {
     #[must_use]
     pub fn decision_chip(&self) -> bool {
         self.decision_run.is_some() && self.decision_run == self.current_run
+    }
+
+    /// Newest firing row linked to this exact decision menu.
+    #[must_use]
+    pub fn has_menu(&self, menu: &MenuId) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(entry, HookFactEntry::Fired { menu_id: Some(link), .. } if link == menu)
+        })
+    }
+
+    #[must_use]
+    pub fn menu(&self, id: &MenuId) -> Option<&Menu> {
+        self.menus.iter().find(|menu| &menu.id == id)
     }
 }

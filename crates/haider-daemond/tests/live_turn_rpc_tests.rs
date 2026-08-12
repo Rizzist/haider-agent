@@ -4403,6 +4403,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             head_seq: 1,
             worker_generation: created.worker_generation,
             metadata: Some(metadata.clone()),
+            workspace_cwd: Some(metadata.cwd.clone()),
             // A just-created session is truly empty: zero committed user
             // turns, so exactly-zero tokens is honest roster truth.
             turn_count: Some(0),
