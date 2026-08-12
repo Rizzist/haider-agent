@@ -22,7 +22,7 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId};
 use haider_protocol::menu::{MenuKind, effect_recovery_menu};
 use haider_protocol::state::RunState;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 const RECOVERY_PAGE_SIZE: usize = 1_024;
 
@@ -49,7 +49,7 @@ pub async fn reconcile_dispatched_effects(
         let mut cursor = 0;
         let mut dispatched = HashMap::<EffectId, RawEnvelope>::new();
         let mut outcomes = HashMap::<EffectId, EffectOutcome>::new();
-        let mut recovery_menus = HashSet::<EffectId>::new();
+        let mut recovery_menus = HashMap::<MenuId, EffectId>::new();
         loop {
             let page = store.read(&session_id, cursor, RECOVERY_PAGE_SIZE).await?;
             if page.is_empty() {
@@ -61,11 +61,12 @@ pub async fn reconcile_dispatched_effects(
 
         let mut pending = dispatched
             .into_iter()
-            .filter(|(effect, _)| {
-                outcomes
-                    .get(effect)
-                    .is_none_or(|outcome| matches!(outcome, EffectOutcome::Unknown))
-                    && !recovery_menus.contains(effect)
+            .filter(|(effect, dispatch)| match outcomes.get(effect) {
+                None => true,
+                Some(EffectOutcome::Unknown) => {
+                    dispatch.run_id.is_some() && !recovery_menus.values().any(|open| open == effect)
+                }
+                Some(_) => false,
             })
             .collect::<Vec<_>>();
         pending.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
@@ -138,7 +139,7 @@ fn reduce_page(
     page: &[RawEnvelope],
     dispatched: &mut HashMap<EffectId, RawEnvelope>,
     outcomes: &mut HashMap<EffectId, EffectOutcome>,
-    recovery_menus: &mut HashSet<EffectId>,
+    recovery_menus: &mut HashMap<MenuId, EffectId>,
 ) -> Result<(), HaiderError> {
     for envelope in page {
         if !matches!(
@@ -146,7 +147,7 @@ fn reduce_page(
                 .payload
                 .get("type")
                 .and_then(|value| value.as_str()),
-            Some("effect" | "menu_opened")
+            Some("effect" | "menu_opened" | "menu_answered" | "menu_closed")
         ) {
             continue;
         }
@@ -172,8 +173,14 @@ fn reduce_page(
             }
             EventPayload::MenuOpened(menu) => {
                 if let MenuKind::Recovery { effect, .. } = menu.kind {
-                    recovery_menus.insert(effect);
+                    recovery_menus.insert(menu.id, effect);
                 }
+            }
+            EventPayload::MenuAnswered(answer) => {
+                recovery_menus.remove(&answer.menu);
+            }
+            EventPayload::MenuClosed { menu, .. } => {
+                recovery_menus.remove(&menu);
             }
             _ => {}
         }

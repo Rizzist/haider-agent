@@ -45,7 +45,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         .as_ref()
         .or(model.compatibility_diagnostic.as_ref())
         .or(model.voice_diagnostic.as_ref())
-        .or(model.supervisor_diagnostic.as_ref());
+        .or(model.supervisor_diagnostic.as_ref())
+        .or(model.command_diagnostic.as_ref());
     let (area, diagnostic) = if persistent_diagnostic.is_some() && area.height > 1 {
         let [diagnostic, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
@@ -56,7 +57,10 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     if let (Some(rect), Some(presentation)) = (diagnostic, persistent_diagnostic) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" STORE UNWRITABLE — ", theme.warn_style()),
+                Span::styled(
+                    format!(" {} — ", presentation.title.to_uppercase()),
+                    theme.warn_style(),
+                ),
                 Span::styled(presentation.detail.clone(), theme.warn_style()),
             ])),
             rect,
@@ -864,11 +868,9 @@ fn render_launcher(
         ));
         recent.push((spans, Some(Hit::AttachSession(entry.id.clone()))));
     }
-    // Sim `.aurarow` metas VERBATIM (tui.js:3278-3300) — the earlier port
-    // abbreviated all three (review P2-8). The Accounts/Peers counts come
-    // from the sim's own seed lists: 7 credentials across 5 providers
-    // (tui.js:146-154), and 3 host-capable nodes of the 4 seeded — the
-    // `shell` rung does not host (tui.js:165-174).
+    // Accounts reflects the local credential registry. The legacy Peers row
+    // remains recognizable but advertises no mesh/SSH lane: activating it
+    // produces the same typed local-only rejection as durable admission.
     for (row, glyph, name, blurb) in [
         (
             LauncherRow::Aura,
@@ -890,10 +892,7 @@ fn render_launcher(
             LauncherRow::Peers,
             "⇄",
             "Peers",
-            format!(
-                "reachability ladder — enrolled peers · sponsored SSH nodes · shell targets · {} host-capable",
-                crate::mock::SEED_HOST_CAPABLE_PEERS
-            ),
+            "remote placement — not supported · Haider runs local-only".to_owned(),
         ),
     ] {
         // Sim `.aurarow` (tui.js:4403-4413): gold glyph, gold name, dim
@@ -5024,7 +5023,7 @@ fn render_aura(
             .alignment(Alignment::Center),
             Line::from(Span::styled(
                 format!(
-                    "{} · never writes code — it spawns and steers sessions on your devices",
+                    "{} · never writes code — it spawns and steers local sessions",
                     aura.engine_kind()
                 ),
                 theme.dim_style(),
@@ -6401,7 +6400,7 @@ fn composer_lines<'a>(
             ),
             // Sim aura composer placeholder (tui.js:3508-3586), verbatim.
             Screen::Aura => {
-                "speak or type — e.g. “spin up billing-service on workstation and run its tests”"
+                "speak or type — e.g. “spin up billing-service locally and run its tests”"
                     .to_owned()
             }
             _ => PLACEHOLDER_SESSION.to_owned(),
@@ -7585,7 +7584,7 @@ fn item_lines<'a>(
                 Span::styled(reason.as_str(), theme.text_style()),
             ]));
         }
-        TurnItem::Extension { kind, .. } => {
+        TurnItem::Extension { kind, data } => {
             if let Some(transition) =
                 haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(&block.item)
             {
@@ -7594,7 +7593,11 @@ fn item_lines<'a>(
                     theme.gold_style(),
                 ));
             } else {
-                lines.push(Line::styled(format!("  ⋯ {kind}"), theme.faint_style()));
+                let label = data
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(kind);
+                lines.push(Line::styled(format!("  ⋯ {label}"), theme.faint_style()));
             }
         }
     }

@@ -30,8 +30,6 @@ pub enum Attention {
     Permission,
     /// Parked on an input/question menu.
     Input,
-    /// Parked waiting on an unreachable device.
-    WaitingDevice,
     /// Parked until a provider reset/user decision rather than an in-flight
     /// retry timer.
     WaitingRateLimit,
@@ -57,8 +55,8 @@ pub fn attention_for(state: &RunState) -> Option<Attention> {
         RunState::PermissionRequired { .. } => Some(Attention::Permission),
         RunState::InputRequired { .. } => Some(Attention::Input),
         RunState::Waiting {
-            reason: WaitReason::DeviceUnreachable,
-        } => Some(Attention::WaitingDevice),
+            reason: WaitReason::DeviceUnreachable | WaitReason::RemoteChild,
+        } => None,
         RunState::Waiting {
             reason: WaitReason::RateLimit,
         } => Some(Attention::WaitingRateLimit),
@@ -79,7 +77,6 @@ pub fn notification_line(attention: Attention, session_title: Option<&str>) -> S
         Attention::Errored => "haider: turn errored",
         Attention::Permission => "haider: needs your approval",
         Attention::Input => "haider: needs your input",
-        Attention::WaitingDevice => "haider: waiting on a device",
         Attention::WaitingRateLimit => "haider: rate limit needs attention",
         Attention::EffectUnknown => "haider: reconcile an unknown effect",
     };

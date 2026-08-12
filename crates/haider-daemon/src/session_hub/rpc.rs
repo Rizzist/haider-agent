@@ -18,6 +18,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::MenuKind;
 use haider_protocol::state::RunState;
@@ -471,6 +472,114 @@ fn observe_title(text: &str) -> String {
 // ─────────── connection RPC surface: list/read/attach/detach/menu ───────────
 
 impl SessionHub {
+    /// Executes a read-only check for one ambiguous effect, then reopens the
+    /// standard card with the observation. The check intentionally lives
+    /// outside the serialized session actor: filesystem/network inspection
+    /// may block, while the actor's charter permits store awaits only.
+    async fn probe_effect_outcome(
+        &self,
+        session_id: SessionId,
+        effect: haider_protocol::ids::EffectId,
+        menu_id: MenuId,
+        answer: &RawEnvelope,
+    ) -> Result<(), HaiderError> {
+        let mut cursor = 0_u64;
+        let mut intent = None::<EffectIntent>;
+        loop {
+            let page = self.inner.store.read(&session_id, cursor, 256).await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                if envelope.run_id != answer.run_id {
+                    continue;
+                }
+                if let Ok(EventPayload::Effect(EffectPhase::Intent(candidate))) =
+                    serde_json::from_value(envelope.payload)
+                    && candidate.effect == effect
+                {
+                    intent = Some(candidate);
+                }
+            }
+        }
+        let intent = intent.ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("recovery effect {effect} has no durable intent"),
+                false,
+            )
+        })?;
+        let metadata = self
+            .inner
+            .store
+            .session_metadata(&session_id)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "effect probe session metadata is unavailable",
+                    false,
+                )
+            })?;
+        let delegation_count = if intent.class == EffectClass::AgentSpawn {
+            match answer.run_id.clone() {
+                Some(run) => Some(
+                    self.inner
+                        .store
+                        .delegations_for_parent_run(session_id.clone(), run)
+                        .await?
+                        .len(),
+                ),
+                None => Some(0),
+            }
+        } else {
+            None
+        };
+        let observation = effect_probe_observation(&intent, &metadata.cwd, delegation_count).await;
+        let probe_menu = effect_recovery_menu(
+            MenuId::new(format!("{menu_id}-probe-{}", answer.seq)),
+            effect,
+            format!("{}; probe result: {observation}", intent.summary),
+        );
+        let payloads = [
+            EventPayload::MenuOpened(probe_menu),
+            EventPayload::RunState(RunState::EffectOutcomeUnknown),
+        ];
+        let mut envelopes = Vec::with_capacity(payloads.len());
+        for (index, payload) in payloads.into_iter().enumerate() {
+            envelopes.push(haider_protocol::envelope::EventEnvelope {
+                schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+                event_id: EventId::new(format!("effect-probe-{}-{}", answer.event_id, index + 1)),
+                seq: 0,
+                session_id: session_id.clone(),
+                branch_id: answer.branch_id.clone(),
+                run_id: answer.run_id.clone(),
+                agent_id: answer.agent_id.clone(),
+                device_id: self.inner.device_id.clone(),
+                authority_epoch: answer.authority_epoch,
+                worker_generation: self.inner.store.worker_generation(),
+                causation_id: Some(answer.event_id.clone()),
+                correlation_id: answer.correlation_id.clone(),
+                committed_at_ms: 0,
+                render: haider_protocol::envelope::RenderTargets {
+                    ui: true,
+                    durable: true,
+                    prompt: haider_protocol::envelope::PromptRender::Pruned,
+                },
+                payload: serde_json::to_value(payload).map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("effect probe payload could not serialize: {error}"),
+                        false,
+                    )
+                })?,
+            });
+        }
+        self.append(&mut envelopes).await?;
+        Ok(())
+    }
+
     /// Starts the real fresh turn selected by E6's `retry` handler. The
     /// original ambiguous effect is durably settled before this is called;
     /// the new turn receives an explicit probe-first instruction so it never
@@ -539,6 +648,68 @@ impl SessionHub {
             .map_err(hub_error_as_store)?
             .submit(accepted)
             .await
+    }
+}
+
+async fn effect_probe_observation(
+    intent: &EffectIntent,
+    cwd: &str,
+    delegation_count: Option<usize>,
+) -> String {
+    match &intent.class {
+        EffectClass::FsRead | EffectClass::FsWrite => {
+            let path = ["read ", "list ", "edit ", "write ", "patch "]
+                .into_iter()
+                .find_map(|prefix| intent.summary.strip_prefix(prefix));
+            let Some(path) = path else {
+                return "inconclusive — the durable file intent has no probeable path".into();
+            };
+            let path = std::path::PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                std::path::Path::new(cwd).join(path)
+            };
+            match tokio::task::spawn_blocking(move || std::fs::read(&path)).await {
+                Ok(Ok(bytes)) => format!(
+                    "re-read succeeded ({} bytes, blake3:{})",
+                    bytes.len(),
+                    blake3::hash(&bytes).to_hex()
+                ),
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    "re-read found the target absent".into()
+                }
+                Ok(Err(error)) => format!("re-read failed: {error}"),
+                Err(error) => format!("re-read task failed: {error}"),
+            }
+        }
+        EffectClass::Network { .. } => {
+            let Some(url) = intent.summary.strip_prefix("fetch ") else {
+                return "inconclusive — this network effect has no safe idempotent probe".into();
+            };
+            let execution =
+                haider_provider::fetch_public_url_with_one_retry(url, Some(8 * 1024)).await;
+            match execution.outcome {
+                Ok(outcome) => format!(
+                    "GET probe succeeded after {} attempt(s): {} ({})",
+                    execution.attempts, outcome.final_url, outcome.content_type
+                ),
+                Err(error) => format!(
+                    "GET probe failed after {} attempt(s): {}",
+                    execution.attempts, error.message
+                ),
+            }
+        }
+        EffectClass::AgentSpawn => format!(
+            "durable delegation probe found {} child record(s)",
+            delegation_count.unwrap_or(0)
+        ),
+        EffectClass::ProcessExec
+        | EffectClass::GitOp
+        | EffectClass::CredentialAccess
+        | EffectClass::GuiAct => {
+            "inconclusive — no safe automatic probe exists for this effect class".into()
+        }
     }
 }
 
@@ -4935,26 +5106,41 @@ impl HubConnection {
                 ref envelope,
                 ref menu,
             }) => {
-                if super::actor::selected_effect_recovery_action(menu, &recovery_answer)
-                    == Some(EffectRecoveryAction::Retry)
-                    && let MenuKind::Recovery { effect, .. } = &menu.kind
-                    && let Err(error) = self
-                        .hub
-                        .submit_effect_retry(
-                            recovery_session,
-                            effect.clone(),
-                            menu.id.clone(),
-                            envelope.seq,
-                        )
-                        .await
-                {
-                    return self.menu_error(
-                        request_id,
-                        ERROR_CODE_INVALID_ARGUMENT,
-                        &error.message,
-                        error.retryable,
-                        None,
-                    );
+                if let MenuKind::Recovery { effect, .. } = &menu.kind {
+                    let action =
+                        super::actor::selected_effect_recovery_action(menu, &recovery_answer);
+                    let follow_up = match action {
+                        Some(EffectRecoveryAction::Probe) => {
+                            self.hub
+                                .probe_effect_outcome(
+                                    recovery_session,
+                                    effect.clone(),
+                                    menu.id.clone(),
+                                    envelope,
+                                )
+                                .await
+                        }
+                        Some(EffectRecoveryAction::Retry) => {
+                            self.hub
+                                .submit_effect_retry(
+                                    recovery_session,
+                                    effect.clone(),
+                                    menu.id.clone(),
+                                    envelope.seq,
+                                )
+                                .await
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = follow_up {
+                        return self.menu_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            &error.message,
+                            error.retryable,
+                            None,
+                        );
+                    }
                 }
                 self.menu_success(request_id, envelope.seq)
             }
@@ -5289,4 +5475,35 @@ async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
     })
     .await
     .map_err(|error| format!("session cwd validation task failed: {error}"))?
+}
+
+#[cfg(test)]
+mod error_wave3_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn e6a_probe_reexecutes_the_filesystem_check() {
+        let root = tempfile::tempdir().expect("workspace");
+        let target = root.path().join("outcome.txt");
+        std::fs::write(&target, b"first").expect("first write");
+        let intent = EffectIntent {
+            effect: haider_protocol::ids::EffectId::new("effect-e6a-probe"),
+            class: EffectClass::FsWrite,
+            summary: "write outcome.txt".into(),
+            args_digest: "args-e6a".into(),
+            workspace_revision: None,
+        };
+
+        let first =
+            effect_probe_observation(&intent, root.path().to_str().expect("utf8 workspace"), None)
+                .await;
+        std::fs::write(&target, b"second content").expect("second write");
+        let second =
+            effect_probe_observation(&intent, root.path().to_str().expect("utf8 workspace"), None)
+                .await;
+
+        assert!(first.contains("5 bytes"), "{first}");
+        assert!(second.contains("14 bytes"), "{second}");
+        assert_ne!(first, second, "probe must inspect current state each time");
+    }
 }

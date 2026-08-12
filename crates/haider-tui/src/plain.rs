@@ -500,14 +500,18 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             _ => out.push_str("⊟ context compacted\n"),
         },
         TurnItem::Refusal { reason } => out.push_str(&format!("✗ model refused — {reason}\n")),
-        TurnItem::Extension { kind, .. } => {
+        TurnItem::Extension { kind, data } => {
             if let Some(transition) =
                 haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(&block.item)
             {
                 out.push_str(&transition.display_label());
                 out.push('\n');
             } else {
-                out.push_str(&format!("⋯ {kind}\n"));
+                let label = data
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(kind);
+                out.push_str(&format!("⋯ {label}\n"));
             }
         }
     }

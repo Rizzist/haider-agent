@@ -279,10 +279,6 @@ pub struct SampleSession {
 /// provider.list, so the demo world wears the honest registry id.
 pub const SEED_ACCOUNTS: usize = 7;
 pub const SEED_ACCOUNT_PROVIDERS: usize = 5;
-/// The sim's seeded peer list minus the `shell` rung (tui.js:169-174):
-/// this-mac + workstation (peer) and hetzner-1 (attached) host sessions;
-/// ci-runner-7 is exec-only. The launcher's Peers meta quotes this count.
-pub const SEED_HOST_CAPABLE_PEERS: usize = 3;
 
 /// The sim's seed accounts VERBATIM (tui.js:146-154) as `/accounts` rows.
 /// `SEED_ACCOUNTS`/`SEED_ACCOUNT_PROVIDERS` above must stay derived from
@@ -528,7 +524,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             turns: 4,
             tokens: 41_000,
             model: "gpt-5.6",
-            device: "hetzner-1",
+            device: "local",
             ago: "2h",
             running: false,
             live_subagents: 0,
@@ -543,7 +539,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             turns: 6,
             tokens: 22_000,
             model: "gemini-3",
-            device: "mac-studio",
+            device: "this-mac",
             ago: "1d",
             running: false,
             live_subagents: 1,
@@ -663,7 +659,7 @@ pub fn sample_seed_chip(index: usize) -> Option<crate::script::ChipSeed> {
         full: name.full,
         name: "web-index".to_owned(),
         model: "gpt-5.6".to_owned(),
-        device: "mac-studio".to_owned(),
+        device: "this-mac".to_owned(),
         state: crate::script::ChipDisplayState::Running,
         tokens: 2100,
         prefill: vec![

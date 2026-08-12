@@ -6011,6 +6011,7 @@ fn lookup_delegation_by_parent_call(
 }
 
 fn validate_delegation(record: &DelegationRecord) -> StoreResult<()> {
+    record.manifest.placement.ensure_local()?;
     if record.depth == 0
         || record.task.trim().is_empty()
         || record.prompt.trim().is_empty()

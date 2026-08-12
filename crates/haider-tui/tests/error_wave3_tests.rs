@@ -1,10 +1,30 @@
 #![allow(clippy::expect_used)]
 
+mod common;
+
 use haider_protocol::ids::SessionId;
 use haider_rpc::{AttachmentId, ERROR_CODE_BUSY, SessionSummary};
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
+
+#[test]
+fn e7_legacy_peers_command_is_a_typed_local_only_rejection() {
+    let mut model = common::launcher_model();
+    common::submit(&mut model, "/peers");
+
+    let presentation = model
+        .command_diagnostic
+        .as_ref()
+        .expect("typed local-only rejection");
+    assert_eq!(presentation.subcode.as_str(), "local-only");
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|text| text.contains("not supported — Haider runs local-only"))
+    );
+}
 
 /// E8 busy mutation law: changing the command id, removing the deadline, or
 /// dropping the three-issue cap breaks the exact sequence below.
@@ -101,7 +121,47 @@ fn busy_same_command_id_retries_visibly_and_stops_after_three_issues() {
             .as_deref()
             .is_some_and(|text| text.contains("bound exhausted"))
     );
+    assert_eq!(
+        model
+            .command_diagnostic
+            .as_ref()
+            .map(|presentation| presentation.subcode.as_str()),
+        Some("busy-retry-exhausted")
+    );
     assert!(driver.next_deadline().is_none());
+}
+
+#[test]
+fn link_supervisor_restart_is_visible_and_terminal_failure_is_persistent() {
+    let mut model = AppModel::new();
+    let mut driver = LiveDriver::new("e5-link-supervisor");
+    driver.apply(
+        &mut model,
+        LiveReply::SupervisorRestarting {
+            component: "link",
+            attempt: 2,
+            max: 2,
+        },
+    );
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|text| text.contains("attempt 2/2"))
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::SupervisorFailed {
+            component: "link",
+            reason: "unexpected task death".into(),
+        },
+    );
+    let diagnostic = model
+        .supervisor_diagnostic
+        .as_ref()
+        .expect("persistent supervisor card");
+    assert_eq!(diagnostic.subcode.as_str(), "supervisor-unavailable");
+    assert!(diagnostic.detail.contains("unexpected task death"));
 }
 
 #[test]

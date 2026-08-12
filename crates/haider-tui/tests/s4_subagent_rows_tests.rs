@@ -62,11 +62,7 @@ fn manifest(agent: &str, task: &str, child_session: Option<&str>) -> AgentManife
             effect_ceiling: vec![],
         },
         budget_tokens: None,
-        // A NAMED device: `Placement::Local` renders the host's own name,
-        // which would make every width assertion host-dependent.
-        placement: Placement::Device {
-            device: DeviceId::new("test-box"),
-        },
+        placement: Placement::Local,
         lease: LeaseId::new(format!("lease-{agent}")),
         fencing_epoch: 1,
         attempt: 0,
@@ -187,6 +183,9 @@ fn live_session_with_chip() -> AppModel {
         SPAWN_MS,
         &EventPayload::AgentSpawned(manifest(CHILD_A, "stitch", Some(CHILD_A_SESSION))),
     ));
+    // Keep width-law fixtures host-independent without admitting a remote
+    // placement into the durable manifest.
+    model.chips[0].device = "test-box".into();
     model.requests.clear();
     model
 }

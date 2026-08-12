@@ -43,6 +43,8 @@ struct StoreOwner {
     fault: tokio::sync::watch::Sender<Option<ProfileStoreFault>>,
     #[cfg(test)]
     injected_append_error: Mutex<Option<HaiderError>>,
+    #[cfg(test)]
+    injected_profile_write_error: Mutex<Option<HaiderError>>,
 }
 
 /// Out-of-band durable-store health. This deliberately does not use the
@@ -93,6 +95,8 @@ impl SqliteStoreHandle {
                 fault,
                 #[cfg(test)]
                 injected_append_error: Mutex::new(None),
+                #[cfg(test)]
+                injected_profile_write_error: Mutex::new(None),
             }),
         }
     }
@@ -722,7 +726,13 @@ impl SqliteStoreHandle {
     /// receipt. Durable management commands use their atomic finalizers.
     pub async fn advance_management_revision(&self) -> Result<u64, HaiderError> {
         let owner = Arc::clone(&self.owner);
-        run_blocking(move || owner.with_store(Store::advance_management_revision)).await
+        run_blocking(move || {
+            owner.with_store_write(
+                vec!["profile:management-revision".into()],
+                Store::advance_management_revision,
+            )
+        })
+        .await
     }
 
     /// Reads a provider's durable last-known model catalog.
@@ -1091,6 +1101,34 @@ impl StoreOwner {
         result
     }
 
+    /// Executes a profile mutation with a stable identifier that can be
+    /// shown even when the direct caller drops its returned error. Journal
+    /// append has its own batch-aware variant; profile mutations use this
+    /// seam whenever the operation has no event envelope to name it.
+    fn with_store_write<T>(
+        &self,
+        failed_write_ids: Vec<String>,
+        operation: impl FnOnce(&Store) -> Result<T, HaiderError>,
+    ) -> Result<T, HaiderError> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .injected_profile_write_error
+            .lock()
+            .map_err(|_| owner_lock_error())?
+            .take()
+        {
+            self.note_failed_write(&error, failed_write_ids);
+            return Err(error);
+        }
+        let store = self.store.lock().map_err(|_| owner_lock_error())?;
+        let store = store.as_ref().ok_or_else(closed_error)?;
+        let result = operation(store);
+        if let Err(error) = &result {
+            self.note_failed_write(error, failed_write_ids);
+        }
+        result
+    }
+
     fn note_failed_write(&self, error: &HaiderError, failed_write_ids: Vec<String>) {
         if !matches!(
             error.code,
@@ -1104,24 +1142,31 @@ impl StoreOwner {
             ErrorCode::StoreUnavailable => "profile storage is unavailable",
             _ => unreachable!(),
         };
-        let detail = if failed_write_ids.is_empty() {
-            format!("Store unwritable — {reason}. Free space or restore write access, then retry.")
-        } else {
-            format!(
-                "Store unwritable — {reason}. Not committed: {}. Free space or restore write access, then retry.",
-                failed_write_ids.join(", ")
-            )
-        };
         let mut fault = self.fault.borrow().clone().unwrap_or(ProfileStoreFault {
             presentation: ErrorPresentation::new(
                 error.code.as_subcode(),
                 "Store unwritable",
-                detail.clone(),
+                format!(
+                    "Store unwritable — {reason}. Free space or restore write access, then retry."
+                ),
                 ErrorScope::Profile,
                 [ErrorAction::Retry],
             ),
             failed_write_ids: Vec::new(),
         });
+        for id in failed_write_ids {
+            if fault.failed_write_ids.len() < 32 && !fault.failed_write_ids.contains(&id) {
+                fault.failed_write_ids.push(id);
+            }
+        }
+        let detail = if fault.failed_write_ids.is_empty() {
+            format!("Store unwritable — {reason}. Free space or restore write access, then retry.")
+        } else {
+            format!(
+                "Store unwritable — {reason}. Not committed: {}. Free space or restore write access, then retry.",
+                fault.failed_write_ids.join(", ")
+            )
+        };
         fault.presentation = ErrorPresentation::new(
             error.code.as_subcode(),
             "Store unwritable",
@@ -1129,11 +1174,6 @@ impl StoreOwner {
             ErrorScope::Profile,
             [ErrorAction::Retry],
         );
-        for id in failed_write_ids {
-            if fault.failed_write_ids.len() < 32 && !fault.failed_write_ids.contains(&id) {
-                fault.failed_write_ids.push(id);
-            }
-        }
         self.fault.send_replace(Some(fault));
     }
 
@@ -1189,6 +1229,48 @@ where
 mod error_wave_tests {
     use super::*;
 
+    /// E5a profile-level pin: this operation has no journal envelope, but a
+    /// swallowed write error must still identify the durable write that was
+    /// lost. Replacing `with_store_write` with `with_store` makes this fail.
+    #[tokio::test]
+    async fn e5a_swallowed_profile_write_surfaces_stable_lost_id() {
+        let root = tempfile::tempdir().expect("profile");
+        let handle = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let mut faults = handle.subscribe_profile_fault();
+        *handle
+            .owner
+            .injected_profile_write_error
+            .lock()
+            .expect("inject lock") = Some(HaiderError::new(
+            ErrorCode::StoreReadOnly,
+            "injected SQLITE_READONLY outside the journal",
+            true,
+        ));
+
+        // Simulates a profile-level `let _ = mutation(...)` call site.
+        let _ = handle.advance_management_revision().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), faults.changed())
+            .await
+            .expect("profile write fault must surface promptly")
+            .expect("fault edge");
+        let fault = faults.borrow().clone().expect("latched fault");
+        assert_eq!(fault.presentation.subcode.as_str(), "store-read-only");
+        assert_eq!(
+            fault.failed_write_ids,
+            vec!["profile:management-revision".to_owned()]
+        );
+        assert!(
+            fault
+                .presentation
+                .detail
+                .contains("profile:management-revision")
+        );
+
+        handle.probe_writable().await.expect("same store recovers");
+        assert!(handle.profile_fault().is_none());
+        handle.close().await.expect("close");
+    }
+
     /// E5a mutation law: deleting `note_failed_write` from `with_store` or
     /// append makes the watch stay empty even though the caller deliberately
     /// swallows the returned mutation error.
@@ -1232,7 +1314,10 @@ mod error_wave_tests {
         // must happen inside the shared store owner before the caller drops
         // the typed mutation error.
         let _ = StoreHandle::append(&handle, &mut failed).await;
-        faults.changed().await.expect("fault edge");
+        tokio::time::timeout(std::time::Duration::from_secs(1), faults.changed())
+            .await
+            .expect("journal write fault must surface promptly")
+            .expect("fault edge");
         let fault = faults.borrow().clone().expect("latched fault");
         assert_eq!(fault.presentation.subcode.as_str(), "store-full");
         assert_eq!(

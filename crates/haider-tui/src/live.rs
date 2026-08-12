@@ -2323,6 +2323,13 @@ impl LiveDriver {
                         if let Some(session) = session {
                             model.record_session_error(&session, detail.clone());
                         }
+                        model.command_diagnostic = Some(ErrorPresentation::new(
+                            "busy-retry-exhausted",
+                            "Command still busy",
+                            detail.clone(),
+                            haider_protocol::error::ErrorScope::Session,
+                            [haider_protocol::error::ErrorAction::Retry],
+                        ));
                         model.flash = Some(format!("· busy — {detail}"));
                     }
                     model.dirty = true;

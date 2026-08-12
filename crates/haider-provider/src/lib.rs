@@ -834,6 +834,14 @@ pub enum FakeStep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
     },
+    /// Emits an error with an exact typed presentation. This keeps
+    /// capability-rejection tests at the provider boundary instead of
+    /// teaching the generic fake to infer semantics from message text.
+    ErrorPresented {
+        kind: ProviderErrorKind,
+        message: String,
+        presentation: ErrorPresentation,
+    },
     /// Produces no more data until the consumer drops the stream.
     Hang,
     /// Emits model refusal content on its distinct provider channel.
@@ -964,6 +972,7 @@ impl FakeProvider {
                 self.script[end - 1],
                 FakeStep::Finish { .. }
                     | FakeStep::Error { .. }
+                    | FakeStep::ErrorPresented { .. }
                     | FakeStep::Hang
                     | FakeStep::PrematureEof
                     | FakeStep::ErrorWithRetryability { .. }
@@ -1139,6 +1148,18 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 let _ = sender
                     .send(Err(
                         ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+                    ))
+                    .await;
+                return;
+            }
+            FakeStep::ErrorPresented {
+                kind,
+                message,
+                presentation,
+            } => {
+                let _ = sender
+                    .send(Err(
+                        ProviderError::new(kind, message).with_presentation(presentation)
                     ))
                     .await;
                 return;

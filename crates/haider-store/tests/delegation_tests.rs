@@ -108,6 +108,42 @@ fn replayed_spawn_returns_the_original_child_relation() {
     );
 }
 
+/// E7 local-only law: deleting the durable admission check lets a stale or
+/// future remote manifest become runnable even though production has no
+/// remote-lane state machine.
+#[test]
+fn device_placement_is_rejected_by_durable_admission_with_typed_local_only_error() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = Store::open(root.path()).expect("open store");
+    let parent = SessionId::new("parent-local-only");
+    let child = SessionId::new("child-local-only");
+    create_session(&store, &parent);
+    create_session(&store, &child);
+    let mut requested = record(&parent, &child);
+    requested.manifest.placement = Placement::Device {
+        device: DeviceId::new("remote-device"),
+    };
+
+    let error = store
+        .create_delegation(&requested)
+        .expect_err("remote placement must be rejected");
+    assert_eq!(error.message, "not supported — Haider runs local-only");
+    assert_eq!(
+        error
+            .presentation
+            .as_ref()
+            .map(|presentation| presentation.subcode.as_str()),
+        Some("local-only")
+    );
+    assert!(
+        store
+            .delegations_for_parent_run(&parent, &RunId::new("parent-run"))
+            .expect("read delegations")
+            .is_empty(),
+        "rejection commits no remote scaffold"
+    );
+}
+
 /// MUTATION CHECK: overwrite an existing report or collect before a report.
 /// Expected runtime failure: durable terminal truth changes, or collection
 /// succeeds without a report that can settle the parent tool call.

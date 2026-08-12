@@ -1437,12 +1437,13 @@ async fn e8a_malformed_tool_json_repairs_exactly_once_then_typed_failure() {
             reason: FinishReason::ToolUse,
         },
     ]);
-    let outcome = handle
+    let turn = handle
         .submit_turn(SubmitTurn::new("make a tool call"))
         .await
-        .expect("submit")
-        .wait()
+        .expect("submit");
+    let outcome = timeout(Duration::from_secs(2), turn.wait())
         .await
+        .expect("malformed JSON recovery must remain bounded")
         .expect("outcome");
     assert_eq!(outcome.state, RunState::Errored);
     assert_eq!(provider.requests().len(), 2, "exactly one repair request");

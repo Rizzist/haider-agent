@@ -1536,12 +1536,18 @@ pub(crate) async fn terminalize_supervisor_exit(
         .into_iter()
         .filter(|(_, state, _, _)| !state.is_terminal())
         .collect::<Vec<_>>();
+    let mut terminalized = false;
     for (run_id, state, _, branch_id) in &runs {
         // Panic can strand a dispatched effect regardless of the run state.
         // Reconcile before either cancellation-shaped or failure-shaped
         // terminalization; a reconciliation error fences every terminal.
         reconcile_unknown_effects(&lease, &device_id, run_id, branch_id.as_ref(), &event_ids)
             .await?;
+        if durable_run_state(&lease, run_id).await == Some(RunState::EffectOutcomeUnknown) {
+            // Unknown outcome is an intentional durable park with its own
+            // four-choice card. Do not overwrite it with Errored/Idle.
+            continue;
+        }
         if *state == RunState::Cancelling {
             let mut payloads = cancelled_resumption_payloads(&lease, session_id, run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
@@ -1554,6 +1560,7 @@ pub(crate) async fn terminalize_supervisor_exit(
                 payloads,
             )
             .await?;
+            terminalized = true;
             continue;
         }
         let error = HaiderError::new(
@@ -1572,8 +1579,9 @@ pub(crate) async fn terminalize_supervisor_exit(
             payloads,
         )
         .await?;
+        terminalized = true;
     }
-    if !runs.is_empty() {
+    if terminalized {
         append_session_idle(&lease, &device_id, &event_ids, true).await?;
     }
     let _ = lease.unregister_worker().await;
@@ -2078,6 +2086,12 @@ async fn run_supervisor(
                                 let _ = lease.unregister_worker().await;
                                 return false;
                             }
+                            if durable_run_state(&lease, &finished.run_id).await
+                                == Some(RunState::EffectOutcomeUnknown)
+                            {
+                                let _ = lease.unregister_worker().await;
+                                return true;
+                            }
                             match failed_resumption_payloads(
                                 &lease,
                                 lease.session_id(),
@@ -2147,6 +2161,10 @@ async fn run_supervisor(
                             return false;
                         }
                         let durable = durable_run_state(&lease, &finished.run_id).await;
+                        if durable == Some(RunState::EffectOutcomeUnknown) {
+                            let _ = lease.unregister_worker().await;
+                            return true;
+                        }
                         let cancelled =
                             idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
                         if cancelled {
@@ -2613,7 +2631,7 @@ async fn reconcile_unknown_effects(
     let mut dispatched = HashSet::<EffectId>::new();
     let mut summaries = HashMap::<EffectId, String>::new();
     let mut outcomes = HashMap::<EffectId, EffectOutcome>::new();
-    let mut open_recovery = HashSet::<EffectId>::new();
+    let mut open_recovery = HashMap::<MenuId, EffectId>::new();
     let mut cursor = 0;
     loop {
         let page = StoreHandle::read(store, store.session_id(), cursor, 512).await?;
@@ -2629,7 +2647,7 @@ async fn reconcile_unknown_effects(
                         .payload
                         .get("type")
                         .and_then(serde_json::Value::as_str),
-                    Some("effect" | "menu_opened")
+                    Some("effect" | "menu_opened" | "menu_answered" | "menu_closed")
                 )
             {
                 continue;
@@ -2660,8 +2678,14 @@ async fn reconcile_unknown_effects(
                 }
                 EventPayload::MenuOpened(menu) => {
                     if let MenuKind::Recovery { effect, .. } = menu.kind {
-                        open_recovery.insert(effect);
+                        open_recovery.insert(menu.id, effect);
                     }
+                }
+                EventPayload::MenuAnswered(answer) => {
+                    open_recovery.remove(&answer.menu);
+                }
+                EventPayload::MenuClosed { menu, .. } => {
+                    open_recovery.remove(&menu);
                 }
                 _ => {}
             }
@@ -2673,7 +2697,7 @@ async fn reconcile_unknown_effects(
             outcomes
                 .get(effect)
                 .is_none_or(|outcome| matches!(outcome, EffectOutcome::Unknown))
-                && !open_recovery.contains(effect)
+                && !open_recovery.values().any(|open| open == effect)
         })
         .collect::<Vec<_>>();
     pending.sort_by(|left, right| left.as_str().cmp(right.as_str()));

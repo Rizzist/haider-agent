@@ -65,7 +65,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     cmd(
         "peers",
-        "Peers — the reachability ladder: enrolled peers, sponsored nodes, shell targets",
+        "Remote placement — not supported; Haider runs local-only",
         "",
     ),
     cmd(
@@ -441,7 +441,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /branch [new|name] branches — numbered picker · direct switch · new forks at the last committed node",
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
-    "  /peers             reachability ladder — enrolled peers · sponsored SSH nodes · shell targets",
+    "  /peers             not supported — Haider runs local-only",
     "  /usage [provider]  cross-provider usage — OAuth limit bars + resets · API-key tokens/cost · local stats",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",

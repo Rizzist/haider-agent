@@ -276,7 +276,7 @@ async fn aura_runs_survive_clear_but_reset_stops_them() {
             .aura
             .log
             .iter()
-            .any(|line| line == "billing on workstation: tests green ✓"),
+            .any(|line| line == "billing on local: tests green ✓"),
         "and ran to its final log line"
     );
 
@@ -862,7 +862,7 @@ fn launcher_liveness_and_metas_follow_the_sim_seeds() {
     // sim's text character for character.
     assert!(row_with("◉ Aura").contains("voice session · orchestrator — spawns & steers"));
     assert!(row_with("⚿ Accounts").contains("provider credentials — OAuth & API keys, har"));
-    assert!(row_with("⇄ Peers").contains("reachability ladder — enrolled peers · sponsored"));
+    assert!(row_with("⇄ Peers").contains("remote placement — not supported · Haider runs local"));
     // P2-9: hits carry identity, never a mutable ordinal.
     let l1 = common::session_named(&model, "l1-remote-projects");
     assert!(hits.iter().any(|(_, hit)| matches!(

@@ -48,7 +48,8 @@ fn attention_fires_on_terminal_and_park_states_only() {
         notify::attention_for(&RunState::Waiting {
             reason: WaitReason::DeviceUnreachable
         }),
-        Some(Attention::WaitingDevice)
+        None,
+        "remote placement waits are unsupported in the local-only product"
     );
     // Mid-stream states NEVER notify.
     assert_eq!(notify::attention_for(&RunState::Thinking), None);

@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use haider_client::{ClientConfig, ClientError, ResolvedProfile, RpcClient};
 use haider_rpc::{AttachMode, RequestBody, ResponseBody, WireFrame};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::live::{LiveCommand, LiveReply};
 
@@ -53,6 +53,7 @@ const REDIAL_MAX: Duration = Duration::from_secs(5);
 
 /// Channel depth for commands and replies. Both are UI-paced.
 const LINK_CAPACITY: usize = 256;
+const MAX_LINK_STARTS: u8 = 2;
 
 /// How many attachment-scoped replies the link will hold behind an
 /// outstanding attach response before it gives up and reports a gap.
@@ -85,11 +86,11 @@ impl Link {
         let daemon_version = client.welcome().daemon_version.clone();
         let (commands_tx, commands_rx) = mpsc::channel(LINK_CAPACITY);
         let (replies_tx, replies) = mpsc::channel(LINK_CAPACITY);
-        let task = tokio::spawn(run_link(
-            Arc::new(client),
+        let task = tokio::spawn(supervise_link(
+            client,
             profile,
             config,
-            commands_rx,
+            Arc::new(Mutex::new(commands_rx)),
             replies_tx,
         ));
         Self {
@@ -108,11 +109,76 @@ impl Drop for Link {
     }
 }
 
+/// Restarts the whole Link future once if it panics. Socket disconnects are
+/// handled inside `run_link`; this outer boundary is for an unexpected task
+/// death that would otherwise only close the reply channel. The command
+/// receiver lives outside the child so queued durable command ids survive.
+async fn supervise_link(
+    initial_client: RpcClient,
+    profile: ResolvedProfile,
+    config: ClientConfig,
+    commands: Arc<Mutex<mpsc::Receiver<LiveCommand>>>,
+    replies: mpsc::Sender<LiveReply>,
+) {
+    let mut client = Some(initial_client);
+    for start in 1..=MAX_LINK_STARTS {
+        let active = match client.take() {
+            Some(client) => client,
+            None => match haider_client::connect(&profile.endpoint_path, config.clone()).await {
+                Ok(connected) => connected.client,
+                Err(error) => {
+                    let _ = replies
+                        .send(LiveReply::SupervisorFailed {
+                            component: "link",
+                            reason: format!("bounded task restart could not reconnect: {error}"),
+                        })
+                        .await;
+                    return;
+                }
+            },
+        };
+        let child = tokio::spawn(run_link(
+            Arc::new(active),
+            profile.clone(),
+            config.clone(),
+            Arc::clone(&commands),
+            replies.clone(),
+        ));
+        match child.await {
+            Ok(()) => return,
+            Err(error) if error.is_panic() && start < MAX_LINK_STARTS => {
+                if replies
+                    .send(LiveReply::SupervisorRestarting {
+                        component: "link",
+                        attempt: start + 1,
+                        max: MAX_LINK_STARTS,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = replies
+                    .send(LiveReply::SupervisorFailed {
+                        component: "link",
+                        reason: format!(
+                            "unexpected link task death after {start}/{MAX_LINK_STARTS} starts: {error}"
+                        ),
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
 async fn run_link(
     mut client: Arc<RpcClient>,
     profile: ResolvedProfile,
     config: ClientConfig,
-    mut commands: mpsc::Receiver<LiveCommand>,
+    commands: Arc<Mutex<mpsc::Receiver<LiveCommand>>>,
     replies: mpsc::Sender<LiveReply>,
 ) {
     let Some(mut events) = client.take_events() else {
@@ -160,7 +226,7 @@ async fn run_link(
             }
         }
         let dead = tokio::select! {
-            command = commands.recv() => {
+            command = async { commands.lock().await.recv().await } => {
                 let Some(command) = command else { return };
                 if issue(&client, command, &replies, &attaches_tx).await {
                     outstanding_attaches += 1;
@@ -264,6 +330,12 @@ async fn run_link(
                 Ok(connected) => {
                     let fresh = Arc::new(connected.client);
                     let Some(fresh_events) = fresh.take_events() else {
+                        let _ = replies
+                            .send(LiveReply::SupervisorFailed {
+                                component: "link",
+                                reason: "reconnected link had no event channel".into(),
+                            })
+                            .await;
                         return;
                     };
                     client = fresh;
@@ -1465,7 +1537,10 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
         WireFrame::ProtocolError(error)
-            if error.presentation.is_some() || error.code == "store_healthy" =>
+            if matches!(
+                error.code.as_str(),
+                "store_full" | "store_read_only" | "store_unavailable" | "store_healthy"
+            ) =>
         {
             vec![LiveReply::ProfileDiagnostic {
                 card: error

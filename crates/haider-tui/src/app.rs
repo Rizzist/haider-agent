@@ -11,7 +11,7 @@ use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHR
 use crate::theme::{ThemeChoice, ThemeKey};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorAction;
-use haider_protocol::ids::{MenuId, SessionId};
+use haider_protocol::ids::{DeviceId, MenuId, SessionId};
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -849,7 +849,7 @@ impl ChipModel {
     /// A chip built from a live `AgentSpawned` manifest (W3c3, report R11
     /// cut 2). The manifest is the ONLY source: `callsign` is display-only
     /// identity (§5.1 — never an address), `model_profile` is the model
-    /// line, and `placement` names the device. The chip starts IDLE because
+    /// line. Placement is local-only. The chip starts IDLE because
     /// `AgentChipState` is the sole chip-state authority; nothing here
     /// guesses at a running state the stream has not reported.
     #[must_use]
@@ -1600,7 +1600,7 @@ impl AuraModel {
             haider_protocol::item::ItemEvent::Completed {
                 item_id: haider_protocol::ids::ItemId::new("aura-seed"),
                 item: haider_protocol::item::TurnItem::AgentMessage {
-                    text: "Aura online. I orchestrate sessions across your devices — I don't write code myself. Say or type what to spin up.".to_owned(),
+                    text: "Aura online. I orchestrate local sessions — I don't write code myself. Say or type what to spin up.".to_owned(),
                 },
             },
         ));
@@ -1611,12 +1611,12 @@ impl AuraModel {
             state: AuraState::Idle,
             roster: vec![AuraAgentRow {
                 name: "billing-service".to_owned(),
-                device: "workstation".to_owned(),
+                device: "local".to_owned(),
                 state: ChipDisplayState::Done,
                 activity: "webhook tests green".to_owned(),
             }],
             log: vec![
-                "spawned billing-service on workstation".to_owned(),
+                "spawned billing-service locally".to_owned(),
                 "ran cargo test -p billing — 216 passed".to_owned(),
             ],
             transcript,
@@ -3024,6 +3024,8 @@ pub struct AppModel {
     /// Post-start microphone failure, persistent until a later Start succeeds.
     pub voice_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
     pub supervisor_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
+    /// A durable mutation exhausted its bounded client-side recovery budget.
+    pub command_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
     /// Answers the user produced; the runtime drains these to the client
     /// (side effects never happen inside the reducer).
     pub outbox: Vec<OutboundAnswer>,
@@ -3256,6 +3258,7 @@ impl Default for AppModel {
             compatibility_diagnostic: None,
             voice_diagnostic: None,
             supervisor_diagnostic: None,
+            command_diagnostic: None,
             outbox: Vec::new(),
             requests: Vec::new(),
             turn_active: false,
@@ -5772,6 +5775,7 @@ impl AppModel {
             TalkEvent::Started { generation, .. } => {
                 if generation == self.talk.generation && self.talk.phase == TalkPhase::Starting {
                     self.voice_diagnostic = None;
+                    self.supervisor_diagnostic = None;
                     self.talk.phase = TalkPhase::Listening;
                     self.dirty = true;
                 }
@@ -8814,6 +8818,7 @@ impl AppModel {
                 );
             }
             "accounts" => self.enter_accounts(),
+            "peers" => self.reject_remote_placement(),
             "providers" => self.enter_providers(),
             "hooks" => self.enter_hooks(),
             // U2: `/usage [provider]` — the cross-provider usage report;
@@ -8912,7 +8917,6 @@ impl AppModel {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
                     "fork" => Some("the daemon wave (W3)"),
-                    "peers" => Some("the mesh wave (post-v0.1)"),
                     "update" => Some("the gates wave (W4)"),
                     _ => None,
                 };
@@ -8922,6 +8926,20 @@ impl AppModel {
                 });
             }
         }
+    }
+
+    /// The legacy `/peers` spelling remains decodable, but Haider has no
+    /// remote-placement lane. Reuse protocol admission's typed rejection so
+    /// the command, launcher hit, and durable agent admission tell one truth.
+    fn reject_remote_placement(&mut self) {
+        let Err(error) = (haider_protocol::agent::Placement::Device {
+            device: DeviceId::new("unsupported-remote-placement"),
+        })
+        .ensure_local() else {
+            return;
+        };
+        self.flash = Some(format!("· /peers — {}", error.message));
+        self.command_diagnostic = error.presentation;
     }
 
     /// W-C M1: expand a custom command and submit its body as a user turn.
@@ -10524,11 +10542,7 @@ impl AppModel {
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
                 LauncherRow::Aura => self.enter_aura(),
                 LauncherRow::Accounts => self.enter_accounts(),
-                LauncherRow::Peers => {
-                    self.flash = Some(
-                        "· /peers — UI ready; lands with the mesh wave (post-v0.1)".to_owned(),
-                    );
-                }
+                LauncherRow::Peers => self.reject_remote_placement(),
             },
             // `/accounts` rows: click = make active for its provider (sim
             // tui.js:3604 onClick useAccount). Value-carrying alias, and
@@ -11800,7 +11814,7 @@ pub fn tools_card(seq: u64) -> Menu {
             "custom   notify_slack (fire-and-forget) · preview_deploy (await) · preview_smoke (deferred)"
                 .to_owned(),
             "dispatch each custom tool declares a mode: how the turn treats its result".to_owned(),
-            "register adding a tool is itself a menu-answerable action — a remote agent can provision another"
+            "register adding a tool is itself a menu-answerable action — a local agent can provision another"
                 .to_owned(),
         ],
         options: vec![
