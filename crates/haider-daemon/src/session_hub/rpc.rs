@@ -3898,13 +3898,7 @@ impl HubConnection {
                 }
                 Err(error) => return self.respond_turn_error(request_id, error),
             };
-            if haider_provider::pdf_document_capability(&metadata.provider)
-                == haider_protocol::provider::FeatureResolve::Native
-            {
-                haider_protocol::tool::PdfDeliveryMode::NativeDocument
-            } else {
-                haider_protocol::tool::PdfDeliveryMode::ExtractedText
-            }
+            pdf_delivery_for_provider(&metadata.provider)
         } else {
             haider_protocol::tool::PdfDeliveryMode::ExtractedText
         };
@@ -5330,6 +5324,21 @@ fn auto_title_slug(text: &str) -> String {
         "session".to_owned()
     } else {
         slug
+    }
+}
+
+/// The capability→delivery JOIN: the single decision that turns a session
+/// provider's PDF capability into the delivery mode journaled on the user
+/// message. Pinned directly (wd_pdf_runtime_tests) because the capability
+/// table and the downstream shaping are each pinned yet an inverted join
+/// survived both.
+pub(crate) fn pdf_delivery_for_provider(provider: &str) -> haider_protocol::tool::PdfDeliveryMode {
+    if haider_provider::pdf_document_capability(provider)
+        == haider_protocol::provider::FeatureResolve::Native
+    {
+        haider_protocol::tool::PdfDeliveryMode::NativeDocument
+    } else {
+        haider_protocol::tool::PdfDeliveryMode::ExtractedText
     }
 }
 

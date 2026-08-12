@@ -92,6 +92,7 @@ mod session_hub_private_tests;
 mod actor;
 mod replay;
 mod rpc;
+pub(crate) use rpc::pdf_delivery_for_provider;
 
 use crate::DaemonError;
 use crate::worker::WorkerManagerHandle;

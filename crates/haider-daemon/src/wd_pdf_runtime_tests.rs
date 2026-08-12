@@ -120,3 +120,34 @@ async fn image_only_pdf_is_typed_for_extraction_but_valid_natively() {
         .expect("native image-only PDF remains valid");
     assert_eq!(resolved.len(), 1);
 }
+
+/// The capability→delivery join, pinned both ways. An inverted join survived
+/// the capability-table and shaping laws (each end was pinned, the join was
+/// not); this law observes the decision itself.
+///
+/// MUTATION CHECK: invert the `== FeatureResolve::Native` comparison in
+/// `pdf_delivery_for_provider`. Expected failure: every row below flips.
+#[test]
+fn pdf_delivery_join_maps_capability_to_mode() {
+    use crate::session_hub::pdf_delivery_for_provider;
+    for provider in ["anthropic", "anthropic-oauth", "bedrock", "vertex"] {
+        assert_eq!(
+            pdf_delivery_for_provider(provider),
+            PdfDeliveryMode::NativeDocument,
+            "{provider} is native-capable"
+        );
+    }
+    for provider in [
+        "openai",
+        "openai-oauth",
+        "deepseek",
+        "kimi",
+        "custom-profile",
+    ] {
+        assert_eq!(
+            pdf_delivery_for_provider(provider),
+            PdfDeliveryMode::ExtractedText,
+            "{provider} must fall back to extraction"
+        );
+    }
+}
