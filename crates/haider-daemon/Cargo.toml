@@ -14,6 +14,7 @@ bytes.workspace = true
 getrandom.workspace = true
 haider-client = { path = "../haider-client" }
 haider-core = { path = "../haider-core" }
+haider-pdf = { path = "../haider-pdf" }
 haider-accounts = { path = "../haider-accounts" }
 haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }

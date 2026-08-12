@@ -1,0 +1,7 @@
+{
+  "kind": "pdf",
+  "artifact": "blake3:pdf",
+  "name": "report.pdf",
+  "pages": 12,
+  "delivery": "native_document"
+}

@@ -496,6 +496,7 @@ async fn issue(
                     code: "encode_failed".to_owned(),
                     message: error.to_string(),
                     retryable: false,
+                    presentation: None,
                 }
             };
             let _ = replies.send(reply).await;
@@ -514,6 +515,7 @@ async fn issue(
                 code: "encode_failed".to_owned(),
                 message: error.to_string(),
                 retryable: false,
+                presentation: None,
             }],
         };
         if is_attach {
@@ -1410,7 +1412,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             code,
             message,
             retryable,
-            ..
+            data,
         } => context.attach.clone().map_or_else(
             || {
                 // TUI6.4: a STAGE request's error is identity-tagged from
@@ -1486,6 +1488,10 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     code: code.clone(),
                     message: message.clone(),
                     retryable,
+                    presentation: data
+                        .as_ref()
+                        .and_then(haider_rpc::ErrorData::presentation)
+                        .cloned(),
                 }]
             },
             |session| {
@@ -1556,6 +1562,7 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             code: error.code.clone(),
             message: error.message.clone(),
             retryable: !error.fatal,
+            presentation: error.presentation,
         }],
         // Handshake, correlated, and heartbeat frames never reach here; an
         // unknown frame from a newer daemon is tolerated, never fatal.

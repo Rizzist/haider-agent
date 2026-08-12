@@ -331,6 +331,7 @@ fn e8c_busy_exhausted_renders_the_err_card_and_banner() {
         code: ERROR_CODE_BUSY.into(),
         message: message.into(),
         retryable: true,
+        presentation: None,
     };
     let _ = live_pass(
         &mut driver,

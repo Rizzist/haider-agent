@@ -2438,25 +2438,13 @@ pub fn rendered_selection_text(
 /// opened …"). Failure must not strand the user behind copy that claims a
 /// browser opened: the URL lands on the clipboard and the flash says so.
 /// The `/attach` read effect (B4b + G2) — the ONE filesystem touch in the
-/// attach pipeline, shell-owned like every other IO. Bounded read + magic
-/// sniff ride `haider-client`'s `load_image_attachment` (the SAME
-/// allowlist and 5 MiB cap `haider run --attach` enforces — jpeg/png/gif/
-/// webp by magic bytes, never by extension); a readable NON-image falls
-/// back to `load_text_attachment` — the UTF-8 text-file lane (G2), same
-/// fallback order as `haider run --attach`. Failure is an honest flash
+/// attach pipeline, shell-owned like every other IO. The shared client
+/// loader handles images, `.pdf` page-tree admission, then UTF-8 files in
+/// the same order as `haider run --attach`. Failure is a typed card plus flash
 /// and NOTHING uploads; success chips the draft and issues the
 /// receipt-free upload through the model's one issuance seam.
 pub fn attach_read_effects(model: &mut AppModel, path: &str) {
-    let loaded = match haider_client::load_image_attachment(std::path::Path::new(path)) {
-        Ok(image) => Ok(haider_client::HeadlessAttachment::Image(image)),
-        Err(haider_client::HeadlessRunError::Attachment { ref code, .. })
-            if code == "unsupported_attachment_type" =>
-        {
-            haider_client::load_text_attachment(std::path::Path::new(path))
-                .map(haider_client::HeadlessAttachment::File)
-        }
-        Err(error) => Err(error),
-    };
+    let loaded = haider_client::load_attachment(std::path::Path::new(path));
     match loaded {
         Ok(haider_client::HeadlessAttachment::Image(image)) => {
             let name = std::path::Path::new(path).file_name().map_or_else(
@@ -2481,14 +2469,32 @@ pub fn attach_read_effects(model: &mut AppModel, path: &str) {
                 label,
             );
         }
+        Ok(haider_client::HeadlessAttachment::Pdf(pdf)) => {
+            let label = format!("{} · {}p", pdf.name, pdf.pages);
+            model.begin_attachment_upload(
+                pdf.bytes,
+                crate::composer::PendingKind::Pdf {
+                    name: pdf.name,
+                    pages: pdf.pages,
+                },
+                label,
+            );
+        }
         Err(error) => {
-            // The client error's own wording names the reason (binary /
-            // over the cap / unreadable); strip its headless framing down
-            // to the message.
-            let note = match error {
-                haider_client::HeadlessRunError::Attachment { message, .. } => message,
-                other => other.to_string(),
+            let (note, presentation) = match error {
+                haider_client::HeadlessRunError::Attachment {
+                    message,
+                    presentation,
+                    ..
+                } => (message, Some(presentation)),
+                other => (other.to_string(), None),
             };
+            if let Some(presentation) = presentation {
+                if let Some(session) = model.active_session.clone() {
+                    model.record_session_error_card(&session, presentation.clone());
+                }
+                model.command_diagnostic = Some(presentation);
+            }
             model.flash = Some(format!("· /attach — {note}"));
             model.dirty = true;
         }

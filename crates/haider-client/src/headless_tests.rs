@@ -1,6 +1,9 @@
 #![allow(clippy::expect_used)]
 
-use super::headless_submit_body;
+use super::{
+    HeadlessAttachment, HeadlessRunError, headless_submit_body, load_attachment,
+    load_pdf_attachment,
+};
 use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{CommandId, RequestBody};
 
@@ -33,5 +36,72 @@ fn submit_builder_selects_hook_trust_without_changing_ordinary_turns() {
             branch_id: None,
             ..
         }
+    ));
+}
+
+fn pdf_fixture(pages: u32) -> Vec<u8> {
+    let mut pdf = String::from("%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let kids = (0..pages)
+        .map(|index| format!("{} 0 R", index + 3))
+        .collect::<Vec<_>>()
+        .join(" ");
+    pdf.push_str(&format!(
+        "2 0 obj\n<< /Type /Pages /Count {pages} /Kids [{kids}] >>\nendobj\n"
+    ));
+    for index in 0..pages {
+        pdf.push_str(&format!(
+            "{} 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n",
+            index + 3
+        ));
+    }
+    pdf.push_str("trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    pdf.into_bytes()
+}
+
+#[test]
+fn pdf_loader_accepts_case_insensitive_extension_and_records_pages() {
+    let directory = tempfile::tempdir().expect("PDF tempdir");
+    let path = directory.path().join("Report.PDF");
+    std::fs::write(&path, pdf_fixture(12)).expect("write PDF");
+    let loaded = load_attachment(&path).expect("PDF loads through shared ingress");
+    let HeadlessAttachment::Pdf(pdf) = loaded else {
+        panic!("PDF extension must select the PDF lane");
+    };
+    assert_eq!(pdf.name, "Report.PDF");
+    assert_eq!(pdf.pages, 12);
+
+    let large_path = directory.path().join("Large.pdf");
+    let mut large_pdf = pdf_fixture(1);
+    large_pdf.resize(6 * 1024 * 1024, b' ');
+    std::fs::write(&large_path, large_pdf).expect("write PDF above image cap");
+    assert!(matches!(
+        load_attachment(&large_path),
+        Ok(HeadlessAttachment::Pdf(_))
+    ));
+}
+
+#[test]
+fn pdf_loader_page_and_byte_caps_are_typed_presentations() {
+    let directory = tempfile::tempdir().expect("PDF tempdir");
+    let too_many = directory.path().join("too-many.pdf");
+    std::fs::write(&too_many, pdf_fixture(haider_pdf::MAX_PDF_PAGES + 1))
+        .expect("write page-heavy PDF");
+    let error = load_pdf_attachment(&too_many).expect_err("page cap rejects");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Attachment { ref code, ref presentation, .. }
+            if code == "pdf-too-many-pages"
+                && presentation.subcode.as_str() == "pdf-too-many-pages"
+    ));
+
+    let too_large = directory.path().join("too-large.pdf");
+    let file = std::fs::File::create(&too_large).expect("create sparse PDF");
+    file.set_len((haider_pdf::MAX_PDF_BYTES + 1) as u64)
+        .expect("size sparse PDF");
+    let error = load_pdf_attachment(&too_large).expect_err("byte cap rejects");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Attachment { ref code, ref presentation, .. }
+            if code == "pdf-too-large" && presentation.subcode.as_str() == "pdf-too-large"
     ));
 }

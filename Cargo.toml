@@ -12,6 +12,7 @@ members = [
     "crates/haider-accounts",
     "crates/haider-rpc",
     "crates/haider-client",
+    "crates/haider-pdf",
     "crates/haider-stt",
     "crates/haider-tui",
     "crates/haider-cli",
@@ -36,6 +37,7 @@ bytes = "1"
 getrandom = "0.3"
 httpdate = "1"
 jsonwebtoken = "9"
+flate2 = "1"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "0.38", features = ["bundled"] }

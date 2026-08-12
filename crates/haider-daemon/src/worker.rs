@@ -28,6 +28,9 @@ mod g1_todo_runtime_tests;
 #[cfg(test)]
 #[path = "pair_switch_runtime_tests.rs"]
 mod pair_switch_runtime_tests;
+#[cfg(test)]
+#[path = "wd_pdf_runtime_tests.rs"]
+mod wd_pdf_runtime_tests;
 
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::project_instructions::{self, LoadedProjectInstructions};
@@ -2522,6 +2525,7 @@ async fn refill_queued_turns(
             branch_id,
             disposition: haider_core::TurnAdmissionDisposition::Queued,
             first_user_turn: false,
+            pdf_attachments: Vec::new(),
         }));
     }
     more
@@ -3821,6 +3825,7 @@ async fn start_turn(
     let compiled_current_user_start = compiled.current_user_start;
     let compiled_compaction_summary_end = compiled.latest_compaction_summary_end;
     let mut messages = compiled.messages;
+    let provider_capabilities = resolved.provider.capabilities().await;
     if messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(
@@ -3830,7 +3835,7 @@ async fn start_turn(
                 )
             )
         })
-    }) && resolved.provider.capabilities().await.vision == FeatureResolve::Unsupported
+    }) && provider_capabilities.vision == FeatureResolve::Unsupported
     {
         return Err(HaiderError::new(
             ErrorCode::VisionUnsupported,
@@ -3849,7 +3854,9 @@ async fn start_turn(
         compile_micros = prompt_compile_started.elapsed().as_micros(),
         "prompt history compiled"
     );
-    let attachments = resolve_prompt_attachments(lease, &mut messages).await?;
+    let attachments =
+        resolve_prompt_attachments(lease, &mut messages, provider_capabilities.pdf_documents)
+            .await?;
     let dispatcher = dependencies
         .tool_factory
         .create(WorkerToolContext {
@@ -4273,9 +4280,65 @@ fn file_attachment_text(name: &str, lines: u32, text: &str) -> String {
     format!("<file name=\"{name}\" lines=\"{lines}\">\n{text}\n</file>")
 }
 
+fn pdf_attachment_text(name: &str, pages: u32, text: &str) -> String {
+    format!("<file name=\"{name}\" pages=\"{pages}\" source=\"pdf\">\n{text}\n</file>")
+}
+
+fn pdf_extraction_error(error: haider_pdf::PdfError) -> HaiderError {
+    let (subcode, title) = match error.kind {
+        haider_pdf::PdfErrorKind::Encrypted => ("pdf-encrypted", "PDF is encrypted"),
+        haider_pdf::PdfErrorKind::NoExtractableText => {
+            ("pdf-no-extractable-text", "PDF has no text layer")
+        }
+        haider_pdf::PdfErrorKind::Malformed => ("pdf-malformed", "PDF could not be read"),
+        haider_pdf::PdfErrorKind::Unsupported => (
+            "pdf-extraction-unsupported",
+            "PDF text encoding is unsupported",
+        ),
+        haider_pdf::PdfErrorKind::DecompressionLimit => {
+            ("pdf-extraction-too-large", "PDF page content is too large")
+        }
+    };
+    HaiderError::new(ErrorCode::InvalidArgument, error.message.clone(), false).with_presentation(
+        ErrorPresentation::new(
+            subcode,
+            title,
+            error.message,
+            ErrorScope::Turn,
+            [ErrorAction::None],
+        ),
+    )
+}
+
+async fn extract_pdf_attachment(
+    bytes: Vec<u8>,
+    name: &str,
+    pages: u32,
+) -> Result<String, HaiderError> {
+    let extracted = tokio::task::spawn_blocking(move || haider_pdf::extract_text_bounded(&bytes))
+        .await
+        .map_err(|_| {
+            HaiderError::new(
+                ErrorCode::ProviderError,
+                "PDF extraction worker stopped unexpectedly",
+                true,
+            )
+        })?
+        .map_err(pdf_extraction_error)?;
+    if extracted.total_pages != pages {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "PDF page count changed after admission",
+            false,
+        ));
+    }
+    Ok(pdf_attachment_text(name, pages, &extracted.text))
+}
+
 async fn resolve_prompt_attachments(
-    store: &HubStoreHandle,
+    store: &dyn haider_core::ArtifactReader,
     messages: &mut [Message],
+    pdf_documents: FeatureResolve,
 ) -> Result<Vec<ResolvedAttachment>, HaiderError> {
     let mut resolved = Vec::<ResolvedAttachment>::new();
     for message in messages {
@@ -4291,7 +4354,7 @@ async fn resolve_prompt_attachments(
                         continue;
                     }
                     let artifact = artifact.clone();
-                    let bytes = store.get_artifact(artifact.clone()).await?;
+                    let bytes = store.read_artifact(&artifact).await?;
                     resolved.push(ResolvedAttachment {
                         artifact,
                         data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -4301,7 +4364,7 @@ async fn resolve_prompt_attachments(
                     haider_protocol::tool::AttachmentBlock::PastedText { artifact, .. },
                 ) => {
                     let artifact = artifact.clone();
-                    let bytes = store.get_artifact(artifact.clone()).await?;
+                    let bytes = store.read_artifact(&artifact).await?;
                     let text = String::from_utf8(bytes).map_err(|_| {
                         HaiderError::new(
                             ErrorCode::InvalidArgument,
@@ -4322,7 +4385,7 @@ async fn resolve_prompt_attachments(
                     // PastedText, with a header naming the file — providers
                     // must never see a File block.
                     let artifact = artifact.clone();
-                    let bytes = store.get_artifact(artifact.clone()).await?;
+                    let bytes = store.read_artifact(&artifact).await?;
                     let text = String::from_utf8(bytes).map_err(|_| {
                         HaiderError::new(
                             ErrorCode::InvalidArgument,
@@ -4333,6 +4396,52 @@ async fn resolve_prompt_attachments(
                     *block = haider_protocol::provider::Block::Text {
                         text: file_attachment_text(name, *lines, &text),
                     };
+                }
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::Pdf {
+                        artifact,
+                        name,
+                        pages,
+                        delivery,
+                    },
+                ) => {
+                    let artifact = artifact.clone();
+                    let bytes = store.read_artifact(&artifact).await?;
+                    match delivery {
+                        haider_protocol::tool::PdfDeliveryMode::NativeDocument => {
+                            if pdf_documents != FeatureResolve::Native {
+                                return Err(HaiderError::new(
+                                    ErrorCode::InvalidArgument,
+                                    "the durable PDF payload requires native document support from the selected provider",
+                                    false,
+                                )
+                                .with_presentation(
+                                    haider_protocol::error::ErrorPresentation::new(
+                                        "pdf-native-document-unsupported",
+                                        "Provider cannot receive this PDF",
+                                        "This turn was admitted for native PDF delivery, but the selected provider no longer supports native document blocks. Switch back to the original provider or attach the PDF again.",
+                                        haider_protocol::error::ErrorScope::Turn,
+                                        [haider_protocol::error::ErrorAction::None],
+                                    ),
+                                ));
+                            }
+                            if !resolved
+                                .iter()
+                                .any(|attachment| attachment.artifact.as_str() == artifact.as_str())
+                            {
+                                resolved.push(ResolvedAttachment {
+                                    artifact,
+                                    data_base64: base64::engine::general_purpose::STANDARD
+                                        .encode(bytes),
+                                });
+                            }
+                        }
+                        haider_protocol::tool::PdfDeliveryMode::ExtractedText => {
+                            *block = haider_protocol::provider::Block::Text {
+                                text: extract_pdf_attachment(bytes, name, *pages).await?,
+                            };
+                        }
+                    }
                 }
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::Skill { name, .. },
@@ -4377,6 +4486,29 @@ async fn prepare_compaction_messages(
                     })?;
                     message.blocks[index] = haider_protocol::provider::Block::Text { text };
                     index += 1;
+                }
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::Pdf {
+                        artifact,
+                        name,
+                        pages,
+                        ..
+                    },
+                ) => {
+                    let bytes = store.get_artifact(artifact).await?;
+                    match extract_pdf_attachment(bytes, &name, pages).await {
+                        Ok(text) => {
+                            message.blocks[index] = haider_protocol::provider::Block::Text { text };
+                            index += 1;
+                        }
+                        // A native-only scanned/encrypted PDF was valid for
+                        // its original turn; compaction omits it just as it
+                        // omits image attachments instead of retroactively
+                        // failing the session.
+                        Err(_) => {
+                            message.blocks.remove(index);
+                        }
+                    }
                 }
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::File {

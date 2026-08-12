@@ -234,6 +234,7 @@ fn a_failed_configure_reopens_the_fields_with_the_reason() {
             code: "invalid_argument".to_owned(),
             message: "origin must be loopback".to_owned(),
             retryable: false,
+            presentation: None,
         }),
         std::time::Instant::now(),
     );

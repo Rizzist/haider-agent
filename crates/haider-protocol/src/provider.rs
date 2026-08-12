@@ -324,6 +324,9 @@ pub struct CapabilityDoc {
     pub parallel_tools: FeatureResolve,
     pub streaming_tool_args: FeatureResolve,
     pub vision: FeatureResolve,
+    /// Native document blocks versus daemon-emulated extracted text.
+    #[serde(default)]
+    pub pdf_documents: FeatureResolve,
     pub thinking_visible: FeatureResolve,
     pub context_limit: u64,
 }
@@ -334,4 +337,10 @@ pub enum FeatureResolve {
     Native,
     ExplicitlyEmulated,
     Unsupported,
+}
+
+impl Default for FeatureResolve {
+    fn default() -> Self {
+        Self::Unsupported
+    }
 }

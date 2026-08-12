@@ -28,17 +28,19 @@ fn is_false(value: &bool) -> bool {
 /// cross-version decoding is not.
 pub const WIRE_PROTOCOL_VERSION: u32 = 1;
 
-/// Default v0.1 JSON body limit: 8 MiB.
+/// Default v0.1 JSON body limit: 48 MiB. This admits one 32 MiB PDF after
+/// base64 expansion plus request framing.
 ///
 /// W3b advertises its actual configured value in [`Welcome::frame_limit`].
-pub const DEFAULT_FRAME_LIMIT: usize = 8 * 1024 * 1024;
+pub const DEFAULT_FRAME_LIMIT: usize = 48 * 1024 * 1024;
 
 /// Maximum decoded payload accepted by one `artifact.put` request.
 ///
 /// The payload is base64 on the wire, so callers must also keep the encoded
-/// request within the negotiated frame limit. The default 8 MiB frame admits
-/// the attachment lane's maximum 5 MiB image in one request.
-pub const ARTIFACT_PUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// request within the negotiated frame limit. This is deliberately one MiB
+/// above the PDF lane's 32 MiB cap so the daemon can identify an uploaded
+/// over-cap PDF with the PDF-specific typed rejection at turn admission.
+pub const ARTIFACT_PUT_MAX_BYTES: usize = 33 * 1024 * 1024;
 
 const fn default_frame_limit_u32() -> u32 {
     DEFAULT_FRAME_LIMIT as u32
@@ -165,6 +167,12 @@ pub const ERROR_CODE_ATTACHMENT_NOT_FOUND: &str = "attachment_not_found";
 pub const ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED: &str = "attachment_mime_unsupported";
 /// Stable rejection for one attachment above its per-object byte cap.
 pub const ERROR_CODE_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
+/// Stable typed refusal for a PDF over its distinct byte cap.
+pub const ERROR_CODE_PDF_TOO_LARGE: &str = "pdf_too_large";
+/// Stable typed refusal for a PDF over the page-tree cap.
+pub const ERROR_CODE_PDF_TOO_MANY_PAGES: &str = "pdf_too_many_pages";
+/// Stable typed refusal for bytes that cannot be parsed as a PDF.
+pub const ERROR_CODE_PDF_MALFORMED: &str = "pdf_malformed";
 /// Stable rejection for more attachment blocks than one turn may carry.
 pub const ERROR_CODE_TOO_MANY_ATTACHMENTS: &str = "too_many_attachments";
 /// Stable rejection for attachment bytes above the per-turn aggregate cap.
@@ -1795,6 +1803,28 @@ pub enum ErrorData {
         actual_bytes: u64,
         max_bytes: u64,
     },
+    /// A verified PDF exceeded the PDF-specific byte cap.
+    PdfTooLarge {
+        index: u32,
+        artifact: ArtifactRef,
+        actual_bytes: u64,
+        max_bytes: u64,
+        presentation: haider_protocol::error::ErrorPresentation,
+    },
+    /// The parsed PDF page tree exceeded the page cap.
+    PdfTooManyPages {
+        index: u32,
+        artifact: ArtifactRef,
+        actual_pages: u32,
+        max_pages: u32,
+        presentation: haider_protocol::error::ErrorPresentation,
+    },
+    /// The PDF header/object/page tree could not be parsed safely.
+    PdfMalformed {
+        index: u32,
+        artifact: ArtifactRef,
+        presentation: haider_protocol::error::ErrorPresentation,
+    },
     /// A turn carried too many attachment blocks.
     TooManyAttachments { actual_count: u32, max_count: u32 },
     /// Verified attachment bytes exceeded the aggregate turn cap.
@@ -1869,6 +1899,20 @@ pub enum ErrorData {
     /// discipline).
     #[serde(other)]
     Unknown,
+}
+
+impl ErrorData {
+    /// Returns the typed E2-E4 presentation carried by error-data variants
+    /// that own one. Older/fact-only variants intentionally return `None`.
+    #[must_use]
+    pub fn presentation(&self) -> Option<&haider_protocol::error::ErrorPresentation> {
+        match self {
+            Self::PdfTooLarge { presentation, .. }
+            | Self::PdfTooManyPages { presentation, .. }
+            | Self::PdfMalformed { presentation, .. } => Some(presentation),
+            _ => None,
+        }
+    }
 }
 
 /// Machine-readable reason a `provider.remove` command was refused.

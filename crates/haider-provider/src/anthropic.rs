@@ -12,6 +12,11 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AF
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+/// Anthropic documents this as a limit on the complete JSON request, not the
+/// decoded PDF. Check the final payload because base64 expansion and prompt
+/// history both count toward it.
+const ANTHROPIC_PDF_REQUEST_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use crate::wire::ANTHROPIC_OAUTH_SYSTEM_IDENTITY;
 use crate::wire::{
@@ -441,6 +446,37 @@ impl AnthropicProvider {
                 serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.into()),
             );
         }
+        let has_pdf = request.messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    haider_protocol::provider::Block::Attachment(
+                        haider_protocol::tool::AttachmentBlock::Pdf { .. }
+                    )
+                )
+            })
+        });
+        if has_pdf {
+            let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    format!("could not measure Anthropic PDF request: {error}"),
+                )
+            })?;
+            if payload_bytes.len() > ANTHROPIC_PDF_REQUEST_MAX_BYTES {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "Anthropic PDF request exceeds the provider's 32 MiB request limit",
+                )
+                .with_presentation(ErrorPresentation::new(
+                    "pdf-provider-request-too-large",
+                    "PDF request is too large for Anthropic",
+                    "The complete request, including the base64 PDF and conversation history, exceeds Anthropic's 32 MiB limit. Attach a smaller PDF or start a fresh session.",
+                    ErrorScope::Turn,
+                    [ErrorAction::RetryFresh],
+                )));
+            }
+        }
         Ok(payload)
     }
 
@@ -631,6 +667,7 @@ impl Provider for AnthropicProvider {
             parallel_tools: FeatureResolve::Native,
             streaming_tool_args: FeatureResolve::Native,
             vision: FeatureResolve::Native,
+            pdf_documents: FeatureResolve::Native,
             thinking_visible: model.thinking_visible,
             context_limit: model.context_limit,
         }

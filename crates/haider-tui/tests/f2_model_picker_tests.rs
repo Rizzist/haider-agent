@@ -370,6 +370,7 @@ fn typed_refusal_lands_inline_and_the_row_stays_selectable() {
             code: "provider_unavailable".to_owned(),
             message: "provider `anthropic` is not creatable here".to_owned(),
             retryable: false,
+            presentation: None,
         }),
     );
     let picker = model.model_picker.as_ref().expect("picker stays open");
@@ -420,6 +421,7 @@ fn refusal_after_close_reaches_the_session_view() {
             code: "model_unknown".to_owned(),
             message: "no such model in the discovered inventory".to_owned(),
             retryable: false,
+            presentation: None,
         }),
     );
     let error = model

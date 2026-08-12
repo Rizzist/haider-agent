@@ -74,11 +74,21 @@ pub struct HeadlessFileAttachment {
     pub lines: u32,
 }
 
+/// One daemon-bound PDF. The client inspects only admission metadata; text
+/// extraction and provider encoding remain daemon-owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessPdfAttachment {
+    pub bytes: Vec<u8>,
+    pub name: String,
+    pub pages: u32,
+}
+
 /// One loaded attachment of either supported kind (G2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadlessAttachment {
     Image(HeadlessImageAttachment),
     File(HeadlessFileAttachment),
+    Pdf(HeadlessPdfAttachment),
 }
 
 impl HeadlessAttachment {
@@ -86,6 +96,7 @@ impl HeadlessAttachment {
         match self {
             Self::Image(image) => &image.bytes,
             Self::File(file) => &file.bytes,
+            Self::Pdf(pdf) => &pdf.bytes,
         }
     }
 }
@@ -102,35 +113,66 @@ impl From<HeadlessFileAttachment> for HeadlessAttachment {
     }
 }
 
+impl From<HeadlessPdfAttachment> for HeadlessAttachment {
+    fn from(pdf: HeadlessPdfAttachment) -> Self {
+        Self::Pdf(pdf)
+    }
+}
+
+fn attachment_error(code: &str, title: &str, message: impl Into<String>) -> HeadlessRunError {
+    let message = message.into();
+    HeadlessRunError::Attachment {
+        code: code.into(),
+        message: message.clone(),
+        presentation: haider_rpc::haider_protocol::error::ErrorPresentation::new(
+            code,
+            title,
+            &message,
+            haider_rpc::haider_protocol::error::ErrorScope::Turn,
+            [haider_rpc::haider_protocol::error::ErrorAction::None],
+        ),
+    }
+}
+
 /// Reads at most the accepted image size plus one byte and identifies the
 /// format from magic bytes rather than the path extension.
 pub fn load_image_attachment(path: &Path) -> Result<HeadlessImageAttachment, HeadlessRunError> {
-    let file = std::fs::File::open(path).map_err(|error| HeadlessRunError::Attachment {
-        code: "attachment_io".into(),
-        message: format!("cannot open attachment {}: {error}", path.display()),
+    let file = std::fs::File::open(path).map_err(|error| {
+        attachment_error(
+            "attachment_io",
+            "Attachment could not be opened",
+            format!("cannot open attachment {}: {error}", path.display()),
+        )
     })?;
     let mut bytes = Vec::new();
     file.take((MAX_HEADLESS_ATTACHMENT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| HeadlessRunError::Attachment {
-            code: "attachment_io".into(),
-            message: format!("cannot read attachment {}: {error}", path.display()),
+        .map_err(|error| {
+            attachment_error(
+                "attachment_io",
+                "Attachment could not be read",
+                format!("cannot read attachment {}: {error}", path.display()),
+            )
         })?;
     if bytes.len() > MAX_HEADLESS_ATTACHMENT_BYTES {
-        return Err(HeadlessRunError::Attachment {
-            code: "attachment_too_large".into(),
-            message: format!(
+        return Err(attachment_error(
+            "attachment_too_large",
+            "Attachment is too large",
+            format!(
                 "attachment {} exceeds the 5 MiB per-attachment limit",
                 path.display()
             ),
-        });
+        ));
     }
-    let mime = sniff_image_mime(&bytes).ok_or_else(|| HeadlessRunError::Attachment {
-        code: "unsupported_attachment_type".into(),
-        message: format!(
-            "attachment {} is not a JPEG, PNG, GIF, or WebP image",
-            path.display()
-        ),
+    let mime = sniff_image_mime(&bytes).ok_or_else(|| {
+        attachment_error(
+            "unsupported_attachment_type",
+            "Unsupported attachment type",
+            format!(
+                "attachment {} is not a JPEG, PNG, GIF, or WebP image",
+                path.display()
+            ),
+        )
     })?;
     Ok(HeadlessImageAttachment {
         bytes,
@@ -143,32 +185,39 @@ pub fn load_image_attachment(path: &Path) -> Result<HeadlessImageAttachment, Hea
 /// non-UTF-8 payload is a DISTINCT typed refusal
 /// (`unsupported_attachment_encoding`), never a lossy re-encode.
 pub fn load_text_attachment(path: &Path) -> Result<HeadlessFileAttachment, HeadlessRunError> {
-    let file = std::fs::File::open(path).map_err(|error| HeadlessRunError::Attachment {
-        code: "attachment_io".into(),
-        message: format!("cannot open attachment {}: {error}", path.display()),
+    let file = std::fs::File::open(path).map_err(|error| {
+        attachment_error(
+            "attachment_io",
+            "Attachment could not be opened",
+            format!("cannot open attachment {}: {error}", path.display()),
+        )
     })?;
     let mut bytes = Vec::new();
     file.take((MAX_HEADLESS_ATTACHMENT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| HeadlessRunError::Attachment {
-            code: "attachment_io".into(),
-            message: format!("cannot read attachment {}: {error}", path.display()),
+        .map_err(|error| {
+            attachment_error(
+                "attachment_io",
+                "Attachment could not be read",
+                format!("cannot read attachment {}: {error}", path.display()),
+            )
         })?;
     if bytes.len() > MAX_HEADLESS_ATTACHMENT_BYTES {
-        return Err(HeadlessRunError::Attachment {
-            code: "attachment_too_large".into(),
-            message: format!(
+        return Err(attachment_error(
+            "attachment_too_large",
+            "Attachment is too large",
+            format!(
                 "attachment {} exceeds the 5 MiB per-attachment limit",
                 path.display()
             ),
-        });
+        ));
     }
-    let text = std::str::from_utf8(&bytes).map_err(|_| HeadlessRunError::Attachment {
-        code: "unsupported_attachment_encoding".into(),
-        message: format!(
-            "attachment {} is not UTF-8 text (PDFs and other binary formats are not supported)",
-            path.display()
-        ),
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        attachment_error(
+            "unsupported_attachment_encoding",
+            "Attachment is not UTF-8 text",
+            format!("attachment {} is not UTF-8 text", path.display()),
+        )
     })?;
     let lines = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
     let name = sanitize_attachment_name(
@@ -177,6 +226,103 @@ pub fn load_text_attachment(path: &Path) -> Result<HeadlessFileAttachment, Headl
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
     );
     Ok(HeadlessFileAttachment { bytes, name, lines })
+}
+
+/// Loads a PDF under the PDF-specific byte and page caps. Only the page tree
+/// is inspected here; the daemon performs text extraction/provider shaping.
+pub fn load_pdf_attachment(path: &Path) -> Result<HeadlessPdfAttachment, HeadlessRunError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        attachment_error(
+            "attachment_io",
+            "PDF could not be opened",
+            format!("cannot open attachment {}: {error}", path.display()),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take((haider_pdf::MAX_PDF_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            attachment_error(
+                "attachment_io",
+                "PDF could not be read",
+                format!("cannot read attachment {}: {error}", path.display()),
+            )
+        })?;
+    if bytes.len() > haider_pdf::MAX_PDF_BYTES {
+        return Err(attachment_error(
+            "pdf-too-large",
+            "PDF is too large",
+            format!("{} exceeds the 32 MiB PDF attachment limit", path.display()),
+        ));
+    }
+    let metadata = haider_pdf::inspect_pdf(&bytes).map_err(|error| {
+        attachment_error(
+            "pdf-malformed",
+            "PDF could not be read",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    if metadata.pages > haider_pdf::MAX_PDF_PAGES {
+        return Err(attachment_error(
+            "pdf-too-many-pages",
+            "PDF has too many pages",
+            format!(
+                "{} has {} pages; the PDF attachment limit is {} pages",
+                path.display(),
+                metadata.pages,
+                haider_pdf::MAX_PDF_PAGES
+            ),
+        ));
+    }
+    let name = sanitize_attachment_name(
+        &path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+    );
+    Ok(HeadlessPdfAttachment {
+        bytes,
+        name,
+        pages: metadata.pages,
+    })
+}
+
+/// Shared ingress order for `haider run --attach` and TUI `/attach`.
+pub fn load_attachment(path: &Path) -> Result<HeadlessAttachment, HeadlessRunError> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+    {
+        // Preserve image-magic precedence without forcing a legitimate PDF
+        // through the image lane's much smaller 5 MiB read cap.
+        let mut prefix = [0_u8; 16];
+        let mut file = std::fs::File::open(path).map_err(|error| {
+            attachment_error(
+                "attachment_io",
+                "Attachment could not be opened",
+                format!("cannot open attachment {}: {error}", path.display()),
+            )
+        })?;
+        let read = file.read(&mut prefix).map_err(|error| {
+            attachment_error(
+                "attachment_io",
+                "Attachment could not be read",
+                format!("cannot read attachment {}: {error}", path.display()),
+            )
+        })?;
+        if sniff_image_mime(&prefix[..read]).is_some() {
+            return load_image_attachment(path).map(HeadlessAttachment::Image);
+        }
+        return load_pdf_attachment(path).map(HeadlessAttachment::Pdf);
+    }
+    match load_image_attachment(path) {
+        Ok(image) => Ok(HeadlessAttachment::Image(image)),
+        Err(HeadlessRunError::Attachment { ref code, .. })
+            if code == "unsupported_attachment_type" =>
+        {
+            load_text_attachment(path).map(HeadlessAttachment::File)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The ONE name-sanitizing seam (G2): basename in, ≤ 120 chars out, control
@@ -360,6 +506,7 @@ pub enum HeadlessRunError {
     Attachment {
         code: String,
         message: String,
+        presentation: haider_rpc::haider_protocol::error::ErrorPresentation,
     },
     Ensure(EnsureError),
     Transport {
@@ -391,7 +538,7 @@ pub enum HeadlessRunError {
 impl std::fmt::Display for HeadlessRunError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Attachment { code, message } => {
+            Self::Attachment { code, message, .. } => {
                 write!(formatter, "headless attachment failed ({code}): {message}")
             }
             Self::Ensure(error) => write!(formatter, "{error}"),
@@ -852,13 +999,14 @@ async fn run_headless_inner(
     output: mpsc::UnboundedSender<HeadlessEvent>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
-        return Err(HeadlessRunError::Attachment {
-            code: "too_many_attachments".into(),
-            message: format!(
+        return Err(attachment_error(
+            "too_many_attachments",
+            "Too many attachments",
+            format!(
                 "headless run carries {} attachments; the limit is {MAX_HEADLESS_ATTACHMENTS}",
                 request.attachments.len()
             ),
-        });
+        ));
     }
     normalize_ensure_options(
         &mut ensure,
@@ -1357,6 +1505,13 @@ async fn upload_attachments(
                             artifact: artifact.clone(),
                             name: file.name.clone(),
                             lines: file.lines,
+                        },
+                        HeadlessAttachment::Pdf(pdf) => AttachmentBlock::Pdf {
+                            artifact: artifact.clone(),
+                            name: pdf.name.clone(),
+                            pages: pdf.pages,
+                            delivery:
+                                haider_rpc::haider_protocol::tool::PdfDeliveryMode::ExtractedText,
                         },
                     });
                     refs.push(artifact);

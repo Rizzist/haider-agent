@@ -59,6 +59,7 @@ fn busy_same_command_id_retries_visibly_and_stops_after_three_issues() {
             code: ERROR_CODE_BUSY.into(),
             message: "busy".into(),
             retryable: true,
+            presentation: None,
         }),
         base,
     );
@@ -100,6 +101,7 @@ fn busy_same_command_id_retries_visibly_and_stops_after_three_issues() {
             code: ERROR_CODE_BUSY.into(),
             message: "still busy".into(),
             retryable: true,
+            presentation: None,
         }),
         base + std::time::Duration::from_millis(250),
     );
@@ -127,6 +129,7 @@ fn busy_same_command_id_retries_visibly_and_stops_after_three_issues() {
             code: ERROR_CODE_BUSY.into(),
             message: "still busy".into(),
             retryable: true,
+            presentation: None,
         }),
         base + std::time::Duration::from_millis(500),
     );

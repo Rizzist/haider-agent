@@ -709,6 +709,7 @@ pub enum LiveReply {
         code: String,
         message: String,
         retryable: bool,
+        presentation: Option<haider_protocol::error::ErrorPresentation>,
     },
     /// `account.list` answered (W5d `/accounts`).
     Accounts {
@@ -2299,6 +2300,7 @@ impl LiveDriver {
                 code,
                 message,
                 retryable,
+                presentation,
             } => {
                 if code == haider_rpc::ERROR_CODE_BUSY
                     && let Some(id) = command_id.as_ref()
@@ -2607,10 +2609,15 @@ impl LiveDriver {
                         // the SESSION VIEW, not just a transient flash —
                         // an api/oauth/endpoint rejection must never end
                         // as a silent IDLE.
-                        model.record_session_error(
-                            &session,
-                            format!("submit rejected — {code}: {message}"),
-                        );
+                        if let Some(presentation) = presentation.clone() {
+                            model.record_session_error_card(&session, presentation.clone());
+                            model.command_diagnostic = Some(presentation);
+                        } else {
+                            model.record_session_error(
+                                &session,
+                                format!("submit rejected — {code}: {message}"),
+                            );
+                        }
                     }
                     if !retryable {
                         self.retire(id);
@@ -2628,7 +2635,15 @@ impl LiveDriver {
                 if owns && model.login.is_some() {
                     model.login_result(Err((code, message)));
                 } else {
-                    model.flash = Some(format!("· {code} — {message}"));
+                    model.flash = Some(presentation.as_ref().map_or_else(
+                        || format!("· {code} — {message}"),
+                        |presentation| {
+                            format!(
+                                "· {}",
+                                crate::projection::format_error_presentation(presentation)
+                            )
+                        },
+                    ));
                 }
                 if let Some(id) = &command_id
                     && !retryable

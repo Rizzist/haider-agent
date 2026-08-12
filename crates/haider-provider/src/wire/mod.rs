@@ -386,6 +386,24 @@ fn content_block(
         Block::Attachment(AttachmentBlock::Image { .. }) => Err(invalid_request(
             "Anthropic image blocks are only valid in user messages",
         )),
+        Block::Attachment(AttachmentBlock::Pdf { artifact, .. }) if role == MessageRole::User => {
+            let data = attachments.get(artifact.as_str()).ok_or_else(|| {
+                invalid_request(format!(
+                    "PDF attachment `{artifact}` has no resolved base64 data"
+                ))
+            })?;
+            Ok(serde_json::json!({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": data,
+                }
+            }))
+        }
+        Block::Attachment(AttachmentBlock::Pdf { .. }) => Err(invalid_request(
+            "Anthropic document blocks are only valid in user messages",
+        )),
         Block::Attachment(AttachmentBlock::PastedText { artifact, .. }) => Err(invalid_request(
             format!("pasted-text attachment `{artifact}` was not resolved by the prompt compiler"),
         )),

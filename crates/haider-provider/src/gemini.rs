@@ -362,6 +362,7 @@ impl Provider for GeminiProvider {
             // whole; the adapter normalizes it to one complete args delta.
             streaming_tool_args: FeatureResolve::ExplicitlyEmulated,
             vision: FeatureResolve::Native,
+            pdf_documents: FeatureResolve::ExplicitlyEmulated,
             thinking_visible: if self.model.starts_with("gemini-2.5")
                 || self.model.starts_with("gemini-3")
             {
@@ -896,6 +897,11 @@ pub(crate) fn gemini_request_json(
                 Block::Attachment(AttachmentBlock::File { artifact, .. }) => {
                     return Err(invalid_request(format!(
                         "file attachment `{artifact}` was not resolved by the prompt compiler"
+                    )));
+                }
+                Block::Attachment(AttachmentBlock::Pdf { artifact, .. }) => {
+                    return Err(invalid_request(format!(
+                        "PDF attachment `{artifact}` was not resolved by the prompt compiler"
                     )));
                 }
                 Block::Attachment(AttachmentBlock::Skill { name, .. }) => {

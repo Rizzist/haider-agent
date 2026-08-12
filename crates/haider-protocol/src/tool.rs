@@ -163,9 +163,37 @@ pub enum AttachmentBlock {
         name: String,
         lines: u32,
     },
+    /// A first-class PDF. Bytes stay in the daemon CAS; `pages` is the
+    /// daemon-verified page-tree count and `delivery` is the provider shaping
+    /// mode durably selected when the turn was accepted.
+    Pdf {
+        artifact: ArtifactRef,
+        name: String,
+        pages: u32,
+        #[serde(default)]
+        delivery: PdfDeliveryMode,
+    },
     /// Inline `/skill` reference, pinned by hash (reserved until §9.4 lands).
     Skill {
         name: String,
         version_hash: String,
     },
+}
+
+/// Durable provider shaping used for a PDF attachment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfDeliveryMode {
+    NativeDocument,
+    #[default]
+    ExtractedText,
+}
+
+/// Receipt projection for PDFs in an accepted turn. The command receipt and
+/// the journaled [`AttachmentBlock::Pdf`] agree on these facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdfAttachmentReceipt {
+    pub artifact: ArtifactRef,
+    pub pages: u32,
+    pub delivery: PdfDeliveryMode,
 }

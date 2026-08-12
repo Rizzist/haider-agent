@@ -626,6 +626,7 @@ fn recovered_acceptance(
         // Recovery reconstructions never re-title (G2): the auto-title
         // consumed its own durable receipt at the original acceptance.
         first_user_turn: false,
+        pdf_attachments: Vec::new(),
     }
 }
 

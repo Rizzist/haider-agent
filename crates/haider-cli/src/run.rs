@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use haider_client::{
     ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
-    EnsureOptions, HeadlessAttachment, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
-    HeadlessRunError, HeadlessRunRequest, HeadlessRunResult, ProfileEnv, load_image_attachment,
-    load_text_attachment, resolve_profile, run_headless,
+    EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome, HeadlessRunError,
+    HeadlessRunRequest, HeadlessRunResult, ProfileEnv, load_attachment, resolve_profile,
+    run_headless,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::session::SessionPermissionOverridesV1;
@@ -230,19 +230,9 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     };
     let mut attachments = Vec::with_capacity(options.attachments.len());
     for path in &options.attachments {
-        // G2: image sniff first (existing behavior); a readable non-image
-        // falls back to the UTF-8 text-file lane — the SAME fallback the
-        // TUI's `/attach` performs. Any other failure (unreadable, over the
-        // cap, non-UTF-8 binary) reports the honest loader error.
-        let loaded = match load_image_attachment(path) {
-            Ok(image) => Ok(HeadlessAttachment::Image(image)),
-            Err(HeadlessRunError::Attachment { ref code, .. })
-                if code == "unsupported_attachment_type" =>
-            {
-                load_text_attachment(path).map(HeadlessAttachment::File)
-            }
-            Err(error) => Err(error),
-        };
+        // One shared ingress order: magic-sniffed images, `.pdf` page-tree
+        // admission, then strict UTF-8 files.
+        let loaded = load_attachment(path);
         match loaded {
             Ok(attachment) => attachments.push(attachment),
             Err(error) => {
