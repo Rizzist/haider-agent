@@ -33,7 +33,7 @@ use haider_protocol::tool::{
     ToolInventorySnapshot, ToolManifest, ToolPermissionDefault, ToolResultStatus,
 };
 use haider_protocol::verify::{Diagnostic, GateReport, Severity, VerifyVerdict};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -606,6 +606,7 @@ fn golden_additive_hook_fired_fact_and_unknown_kind_tolerance() {
             artifact: None,
         },
         proposed_decision: None,
+        menu_id: None,
         decision_applied: false,
     });
     additive_golden("hook_fired", &fact);
@@ -617,6 +618,68 @@ fn golden_additive_hook_fired_fact_and_unknown_kind_tolerance() {
     let decoded: haider_protocol::envelope::RawEnvelope =
         serde_json::from_value(envelope).expect("raw envelope tolerates additive kind");
     assert_eq!(decoded.payload, raw);
+}
+
+/// WIRE-GAPS hook additions stay satellite facts: the current writer may
+/// name the decision menu and trust revision, while a legacy field reader
+/// ignores `menu_id` and the closed core event union preserves either fact
+/// through `RawEnvelope`.
+#[test]
+fn golden_hook_menu_coordinate_and_trust_revision_are_additive() {
+    let output = HookOutput {
+        preview: String::new(),
+        bytes: 0,
+        truncated: false,
+        artifact: None,
+    };
+    let fired = HookEventPayload::HookFired(HookFired {
+        hook: "permission-guard".into(),
+        digest: "b".repeat(64),
+        kind: HookRuntimeKind::Decision,
+        observed_seq: 73,
+        exit_code: Some(0),
+        timed_out: false,
+        stdout: output.clone(),
+        stderr: output,
+        proposed_decision: Some(haider_protocol::hook::HookDecisionKind::Allow),
+        menu_id: Some(MenuId::new("menu-permission-73")),
+        decision_applied: true,
+    });
+    additive_golden("hook_fired_decision_menu", &fired);
+
+    #[derive(Deserialize)]
+    struct LegacyHookFired {
+        #[serde(rename = "type")]
+        event_type: String,
+        hook: String,
+        decision_applied: bool,
+    }
+    let legacy: LegacyHookFired = serde_json::from_value(
+        fired
+            .to_payload_value()
+            .expect("serialize decision hook fact"),
+    )
+    .expect("legacy decoder ignores additive menu_id");
+    assert_eq!(legacy.event_type, "hook_fired");
+    assert_eq!(legacy.hook, "permission-guard");
+    assert!(legacy.decision_applied);
+
+    let trust = HookEventPayload::HookTrustChanged {
+        digest: "c".repeat(64),
+        trusted: false,
+        revision: 7,
+    };
+    additive_golden("hook_trust_changed", &trust);
+    for fact in [fired, trust] {
+        let raw = fact.to_payload_value().expect("serialize hook fact");
+        assert!(serde_json::from_value::<EventPayload>(raw.clone()).is_err());
+        let mut raw_envelope =
+            serde_json::to_value(envelope(EventPayload::IdleDecayed)).expect("envelope value");
+        raw_envelope["payload"] = raw.clone();
+        let decoded: haider_protocol::envelope::RawEnvelope =
+            serde_json::from_value(raw_envelope).expect("legacy raw envelope keeps hook fact");
+        assert_eq!(decoded.payload, raw);
+    }
 }
 
 /// MUTATION CHECK: erase hook provenance or reuse RPC provenance. Expected
@@ -1286,6 +1349,55 @@ fn golden_agent_family() {
             workspace_revision: Some(WorkspaceRevision::new("blake3:r2")),
         },
     );
+}
+
+/// WIRE-GAPS S3: the manifest advertises the exact daemon-generated handoff
+/// path as one additive coordinate. A legacy coordinate reader keeps all of
+/// its known fields and ignores the new one.
+#[test]
+fn golden_agent_spawned_handoff_coordinate_is_additive() {
+    use haider_protocol::agent::*;
+
+    let fact = EventPayload::AgentSpawned(AgentManifest {
+        agent: AgentId::new("agent-child-handoff"),
+        role: AgentRole::Subagent,
+        task: "inspect parser".into(),
+        callsign: None,
+        model_profile: "gpt-5.6".into(),
+        grant: Grant {
+            tools: vec!["fs_read".into()],
+            effect_ceiling: Vec::new(),
+        },
+        budget_tokens: Some(8_192),
+        placement: Placement::Local,
+        lease: LeaseId::new("lease-child-handoff"),
+        fencing_epoch: 9,
+        attempt: 0,
+        parent: None,
+        coordinates: Some(serde_json::json!({
+            "parent_session_id": "session-parent",
+            "parent_run_id": "run-parent",
+            "call_id": "call-spawn",
+            "tool_item_id": "item-spawn",
+            "child_session_id": "session-child-handoff",
+            "handoff_dir": "/work/project/.haider/handoff/0123456789abcdef",
+        })),
+    });
+    additive_golden("agent_spawned_handoff", &fact);
+
+    #[derive(Deserialize)]
+    struct LegacyCoordinates {
+        parent_session_id: SessionId,
+        child_session_id: SessionId,
+    }
+    let EventPayload::AgentSpawned(manifest) = fact else {
+        unreachable!("constructed agent_spawned")
+    };
+    let legacy: LegacyCoordinates =
+        serde_json::from_value(manifest.coordinates.expect("coordinates"))
+            .expect("legacy coordinates ignore additive handoff_dir");
+    assert_eq!(legacy.parent_session_id.as_str(), "session-parent");
+    assert_eq!(legacy.child_session_id.as_str(), "session-child-handoff");
 }
 
 /// MUTATION CHECK: remove/rename the additive fact or collapse either

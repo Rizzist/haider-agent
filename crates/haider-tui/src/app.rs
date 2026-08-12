@@ -766,6 +766,9 @@ pub struct ChipModel {
     /// truth; `None` (older daemon, demo seeds) never joins — a figure is
     /// never guessed off another row.
     pub child_session: Option<String>,
+    /// Exact daemon-advertised parent handoff path. Display code may name
+    /// its final directory component but never re-derive it.
+    pub handoff_dir: Option<String>,
     /// Epoch-ms the child spawned: the `AgentSpawned` envelope's
     /// `committed_at_ms` on live streams, the local wall clock at chip
     /// creation in demo mode (the demo fabricates locally). `None` renders
@@ -841,6 +844,7 @@ impl ChipModel {
             // simply shows no elapsed. The demo driver's LIVE ChipAdd arm
             // stamps `spawned_at_ms` at creation instead.
             child_session: None,
+            handoff_dir: None,
             spawned_at_ms: None,
             last_event_at_ms: None,
             metrics: None,
@@ -894,6 +898,12 @@ impl ChipModel {
                 .coordinates
                 .as_ref()
                 .and_then(|coordinates| coordinates.get("child_session_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            handoff_dir: manifest
+                .coordinates
+                .as_ref()
+                .and_then(|coordinates| coordinates.get("handoff_dir"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             spawned_at_ms: None,
@@ -2449,6 +2459,10 @@ pub enum Hit {
     /// only ever select the hook it was measured on — a refresh that
     /// replaced the digest matches nothing and the click is dropped).
     HookRow(String),
+    /// One decision-hook firing linked to the exact permission menu it
+    /// inspected. A stale hit is dropped unless the retained committed menu
+    /// snapshot and firing coordinate still agree.
+    HookFiring(MenuId),
 }
 
 /// The `/accounts` add-row buttons (sim order, tui.js:3621-3628; B6b adds
@@ -2929,6 +2943,9 @@ pub struct AppModel {
     pub cwd: String,
     /// The session's working dir — shown in the header; `cd` retargets it.
     pub session_dir: String,
+    /// Canonical workspace of the attached session, learned from
+    /// `SessionSummary` or the create response.
+    pub session_workspace_cwd: Option<String>,
     /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
     /// each time, exactly as the sim's `nid()` does (review r2 P1-1 — fixed
     /// ids let a stale answer apply its consequences to a later card).
@@ -3242,6 +3259,7 @@ impl Default for AppModel {
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             cwd: "/".to_owned(),
             session_dir: "~/dev/enterprise-suite".to_owned(),
+            session_workspace_cwd: None,
             card_seq: 0,
             vfs: vfs_seed(),
             launcher_shellout: None,
@@ -8463,11 +8481,15 @@ impl AppModel {
         }
         self.hooks.open_live();
         self.screen = Screen::Hooks;
-        // The cwd is CAPTURED AT ISSUANCE (the B2b capture law): the
-        // listing is for the workspace this process runs in — the same
-        // absolute directory `session.create` carried.
+        // The cwd is CAPTURED AT ISSUANCE (the B2b capture law): prefer the
+        // active session's daemon summary coordinate, even when this TUI was
+        // launched from another directory. Older daemons fall back to the
+        // process cwd.
         self.requests.push(AppRequest::HooksRefresh {
-            cwd: self.cwd.clone(),
+            cwd: self
+                .session_workspace_cwd
+                .clone()
+                .unwrap_or_else(|| self.cwd.clone()),
         });
     }
 
@@ -8477,6 +8499,13 @@ impl AppModel {
     /// menu law (arrow highlight, digits pick, ⏎ opens the card) and esc
     /// walks back to the session.
     fn handle_hooks_key(&mut self, code: KeyCode) {
+        if self.hooks.drilldown.is_some() {
+            if code == KeyCode::Esc {
+                self.hooks.drilldown = None;
+                self.dirty = true;
+            }
+            return;
+        }
         if self.hooks.confirm.is_some() {
             match code {
                 KeyCode::Esc => {
@@ -8536,10 +8565,11 @@ impl AppModel {
         else {
             return;
         };
+        let grant = self.hooks.glyph(row) != crate::hooks::TrustGlyph::Trusted;
         self.hooks.confirm = Some(crate::hooks::TrustConfirm {
             digest: row.digest.clone(),
             name: row.name.clone(),
-            grant: !row.trusted,
+            grant,
         });
     }
 
@@ -10275,6 +10305,7 @@ impl AppModel {
         self.throughput.reset();
         self.session_title = None;
         self.session_name = None;
+        self.session_workspace_cwd = None;
         self.turn_active = false;
         self.msg_queue.clear();
         self.queue_mode = false;
@@ -10486,6 +10517,7 @@ impl AppModel {
         self.session_name = slot.name.take();
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
+        self.session_workspace_cwd = slot.workspace_cwd.take();
         self.sessions[index] = slot;
         self.active_session = Some(id.clone());
         self.menu_selection = 0;
@@ -10541,6 +10573,7 @@ impl AppModel {
                 ("Hasan".to_owned(), "(a)".to_owned()),
             );
             slot.dir = std::mem::replace(&mut self.session_dir, self.launcher_dir.clone());
+            slot.workspace_cwd = self.session_workspace_cwd.take();
         }
         self.last_detached = Some(active);
         self.msg_queue.clear();
@@ -10662,6 +10695,22 @@ impl AppModel {
     ///   ([`crate::session::SessionState::turns`] / `row_tokens`), so a
     ///   checkin AFTER this call still beats a stale summary.
     pub fn note_summary_counts(&mut self, summary: &haider_rpc::SessionSummary) {
+        if let Some(workspace) = &summary.workspace_cwd {
+            if self.active_session.as_ref() == Some(&summary.session_id) {
+                if self.session_workspace_cwd.as_ref() != Some(workspace) {
+                    self.session_workspace_cwd = Some(workspace.clone());
+                    self.dirty = true;
+                }
+            } else if let Some(entry) = self
+                .sessions
+                .iter_mut()
+                .find(|row| row.id == summary.session_id)
+                && entry.workspace_cwd.as_ref() != Some(workspace)
+            {
+                entry.workspace_cwd = Some(workspace.clone());
+                self.dirty = true;
+            }
+        }
         // G2: the wire title names the row FIRST — the counts gate below
         // must not starve it. Absence hydrates nothing (an older daemon
         // omits the field; a live rename reply is the clearing authority).
@@ -11167,6 +11216,14 @@ impl AppModel {
                 {
                     self.hooks.cursor = index;
                     self.open_hook_confirm();
+                    self.dirty = true;
+                }
+            }
+            Hit::HookFiring(menu) if self.screen == Screen::Hooks => {
+                if self.hook_facts.has_menu(&menu)
+                    && let Some(card) = self.hook_facts.menu(&menu).cloned()
+                {
+                    self.hooks.drilldown = Some(card);
                     self.dirty = true;
                 }
             }

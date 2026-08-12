@@ -96,6 +96,7 @@ fn listed(n: usize) -> LiveReply {
                 head_seq: 0,
                 worker_generation: 7,
                 metadata: None,
+                workspace_cwd: None,
                 turn_count: None,
                 footprint_tokens: None,
                 footprint_truth: None,

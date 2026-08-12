@@ -59,14 +59,14 @@ pub use frame::{
     FEATURE_TOOL_INVENTORY_V1, FEATURE_TRANSCRIPTION_V1, FEATURE_TURN_CONTROL_V1,
     FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FLEET_MAX_DEPTH, FLEET_MAX_NODES,
     FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
-    FleetStateCountsWire, Hello, HookSummaryWire, LifecyclePhase, MenuInput, ModelDetailWire,
-    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
-    OAuthReadyRefWire, ObserveMenuWire, ObserveRunStateWire, ObserveSubagentWire, ProtocolError,
-    ProviderActiveWire, ProviderApiFamilyWire, ProviderAuthRequirementWire,
-    ProviderAvailabilityWire, ProviderDefaultWire, ProviderRemoveRefusalReasonWire,
-    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SecretWire, SeqRange,
-    SessionFleetSnapshot, SessionObserveDigest, SessionReadResult, SessionSummary, StagePurpose,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
+    FleetStateCountsWire, Hello, HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput,
+    ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
+    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveMenuWire, ObserveRunStateWire,
+    ObserveSubagentWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
+    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
+    SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest, SessionReadResult,
+    SessionSummary, StagePurpose, SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

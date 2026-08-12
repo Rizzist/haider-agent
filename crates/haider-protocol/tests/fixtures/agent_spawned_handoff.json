@@ -1,0 +1,28 @@
+{
+  "type": "agent_spawned",
+  "agent": "agent-child-handoff",
+  "role": "subagent",
+  "task": "inspect parser",
+  "model_profile": "gpt-5.6",
+  "grant": {
+    "tools": [
+      "fs_read"
+    ],
+    "effect_ceiling": []
+  },
+  "budget_tokens": 8192,
+  "placement": {
+    "placement": "local"
+  },
+  "lease": "lease-child-handoff",
+  "fencing_epoch": 9,
+  "attempt": 0,
+  "coordinates": {
+    "call_id": "call-spawn",
+    "child_session_id": "session-child-handoff",
+    "handoff_dir": "/work/project/.haider/handoff/0123456789abcdef",
+    "parent_run_id": "run-parent",
+    "parent_session_id": "session-parent",
+    "tool_item_id": "item-spawn"
+  }
+}

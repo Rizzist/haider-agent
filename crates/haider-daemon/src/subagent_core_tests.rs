@@ -589,6 +589,15 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
         )
         .await
         .expect("establish child");
+    let manifest_handoff = established
+        .ticket
+        .manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("handoff_dir"))
+        .and_then(serde_json::Value::as_str)
+        .expect("manifest handoff coordinate");
+    assert_eq!(manifest_handoff, handoff.to_string_lossy());
     assert_eq!(
         std::fs::read(handoff.join(".gitignore")).expect("ignore"),
         b"*"
@@ -604,8 +613,9 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
         .expect("first child request");
     let first_request = provider.requests().remove(0);
     let system = first_request.system_prompt.expect("child system prompt");
-    assert!(system.contains(&handoff.to_string_lossy().into_owned()));
-    assert!(system.contains("EPHEMERAL"));
+    assert!(system.contains(&format!(
+        "Ephemeral parent handoff directory: {manifest_handoff} (EPHEMERAL; use it for shared specs, never durable storage)."
+    )));
 
     let mut control = UdsControlClient::connect(hub.clone()).await;
     control.attach_control(parent_session.clone()).await;

@@ -88,12 +88,20 @@ pub(crate) async fn hooks_command(rest: &[String]) -> ExitCode {
     let response = ensured.client.request(request).await;
     ensured.client.close();
     match (command, response) {
-        (HooksCommand::List { json: machine }, Ok(ResponseBody::HooksList { policy, hooks })) => {
+        (
+            HooksCommand::List { json: machine },
+            Ok(ResponseBody::HooksList {
+                policy,
+                revision,
+                hooks,
+            }),
+        ) => {
             if machine {
                 let value = json!({
                     "schema": haider_protocol::hook::HOOKS_LIST_SCHEMA,
                     "kind": "hooks",
                     "policy": policy,
+                    "revision": revision,
                     "hooks": hooks,
                 });
                 match serde_json::to_string(&value) {

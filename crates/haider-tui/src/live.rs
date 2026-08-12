@@ -55,6 +55,8 @@ fn recognized_payload(payload: &serde_json::Value) -> bool {
             payload.clone(),
         )
         .is_ok()
+        || serde_json::from_value::<haider_protocol::hook::HookEventPayload>(payload.clone())
+            .is_ok()
 }
 
 /// The daemon's per-connection attachment ceiling
@@ -623,6 +625,7 @@ pub enum LiveReply {
     /// `hooks.list` answered — discovery truth for /hooks (H4).
     Hooks {
         policy: String,
+        revision: u64,
         hooks: Vec<haider_rpc::HookSummaryWire>,
     },
     /// `hooks.list` FAILED. Identity-tagged from the link's request context
@@ -1519,11 +1522,12 @@ impl LiveDriver {
                 if let Some(row) = model.sessions.iter_mut().find(|row| row.id == session) {
                     // The ROW shows the display form; `cwd` is the absolute
                     // path the daemon was given.
-                    let _ = cwd;
+                    row.workspace_cwd = Some(cwd.clone());
                     row.model_short = model_name;
                 }
                 let commands = self.ensure_attached(model, &session);
                 model.open_session(&session);
+                model.session_workspace_cwd = Some(cwd);
                 // THE ORDER (R11 cut 4): create response → attach response
                 // → turn.submit. The turn waits for the ATTACHMENT, not
                 // merely for the attach to be requested: the daemon rejects
@@ -1577,10 +1581,14 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
-            LiveReply::Hooks { policy, hooks } => {
+            LiveReply::Hooks {
+                policy,
+                revision,
+                hooks,
+            } => {
                 // The ONLY writer of the /hooks rows (H4): daemon
-                // discovery truth, trusted rows pinning the trust baseline.
-                model.hooks.apply_snapshot(policy, hooks);
+                // discovery and trust-classification truth.
+                model.hooks.apply_snapshot(policy, revision, hooks);
                 model.dirty = true;
                 Vec::new()
             }
@@ -3066,7 +3074,21 @@ impl LiveDriver {
         // The fleet screen's event-cadence chase (see `fleet_event_chase`):
         // only an APPLIED envelope can have moved the tree.
         if applied {
-            return self.fleet_event_chase(model, session);
+            let mut commands = self.fleet_event_chase(model, session);
+            if model.screen == crate::app::Screen::Hooks
+                && model.active_session.as_ref() == Some(session)
+                && let Ok(haider_protocol::hook::HookEventPayload::HookTrustChanged {
+                    revision,
+                    ..
+                }) = haider_protocol::hook::HookEventPayload::from_payload_value(
+                    envelope.payload.clone(),
+                )
+                && revision > model.hooks.revision
+                && let Some(cwd) = self.hooks_cwd.clone()
+            {
+                commands.push(LiveCommand::HooksList { cwd });
+            }
+            return commands;
         }
         Vec::new()
     }

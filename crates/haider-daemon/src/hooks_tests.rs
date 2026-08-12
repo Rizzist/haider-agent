@@ -20,7 +20,7 @@ use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, Run
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::AttachmentBlock;
-use haider_rpc::CommandId;
+use haider_rpc::{CommandId, HookTrustStateWire};
 use haider_tools::{EffectBroker, JournalSink, PermissionPolicy, ProcessExec, ToolResult};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -280,7 +280,7 @@ impl EngineFixture {
         .await
         .expect("create session");
         if trust {
-            let (_, hooks) = service.list(workspace.clone()).await.expect("list hooks");
+            let (_, _, hooks) = service.list(workspace.clone()).await.expect("list hooks");
             let digest = hooks.first().expect("discovered hook").digest.clone();
             service
                 .apply_trust(CommandId::new("trust-hooks-test"), digest, true)
@@ -508,6 +508,121 @@ async fn untrusted_notice_dedup_is_digest_sensitive() {
         .collect::<Vec<_>>();
     assert!(digests.iter().any(|digest| digest == &first_digest));
     assert!(digests.iter().any(|digest| digest != &first_digest));
+    fixture.close().await;
+}
+
+/// WIRE-GAPS H4: revoked-by-edit is classified by the daemon and sent as
+/// wire truth. A client needs no remembered digest baseline to distinguish
+/// it from a hook that was never trusted.
+#[tokio::test]
+async fn hooks_list_reports_revoked_by_edit_as_wire_truth() {
+    let fixture = EngineFixture::start("printf first", 1_000, false, "exec").await;
+    let (_, revision, trusted) = fixture
+        .service
+        .list(fixture.workspace.clone())
+        .await
+        .expect("trusted list");
+    assert_eq!(revision, 1);
+    assert!(trusted[0].trusted);
+    assert_eq!(trusted[0].trust_state, Some(HookTrustStateWire::Trusted));
+
+    write_hook(
+        &fixture.workspace,
+        "test_hook",
+        "run_started",
+        "printf edited",
+        1_000,
+        false,
+        "exec",
+    );
+    let (_, edited_revision, edited) = fixture
+        .service
+        .list(fixture.workspace.clone())
+        .await
+        .expect("edited list");
+    assert_eq!(edited_revision, revision, "an edit is not a trust mutation");
+    assert!(!edited[0].trusted);
+    assert_eq!(
+        edited[0].trust_state,
+        Some(HookTrustStateWire::RevokedByEdit)
+    );
+    fixture.close().await;
+}
+
+/// WIRE-GAPS H4: every new trust receipt advances the list revision exactly
+/// once and mirrors one durable, non-UI fact into open session journals.
+/// Same-command replay returns the original revision and cannot duplicate
+/// the fact.
+#[tokio::test]
+async fn hook_trust_revision_and_journal_fact_are_receipted_once() {
+    let fixture = EngineFixture::start_untrusted("printf first", 1_000).await;
+    let (_, revision, hooks) = fixture
+        .service
+        .list(fixture.workspace.clone())
+        .await
+        .expect("initial list");
+    assert_eq!(revision, 0);
+    let digest = hooks[0].digest.clone();
+    let command = CommandId::new("trust-revision-once");
+    let trusted = fixture
+        .service
+        .apply_trust(command.clone(), digest.clone(), true)
+        .await
+        .expect("trust");
+    assert_eq!(trusted.revision, 1);
+
+    let facts = fixture
+        .events()
+        .await
+        .into_iter()
+        .filter_map(|event| {
+            HookEventPayload::from_payload_value(event.payload.clone())
+                .ok()
+                .map(|payload| (event, payload))
+        })
+        .filter_map(|(event, payload)| match payload {
+            HookEventPayload::HookTrustChanged {
+                digest,
+                trusted,
+                revision,
+            } => Some((event, digest, trusted, revision)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].1, digest);
+    assert!(facts[0].2);
+    assert_eq!(facts[0].3, 1);
+    assert!(!facts[0].0.render.ui);
+    assert!(facts[0].0.render.durable);
+
+    let replay = fixture
+        .service
+        .apply_trust(command, digest, true)
+        .await
+        .expect("same-command replay");
+    assert_eq!(replay.revision, 1);
+    let replay_fact_count = fixture
+        .events()
+        .await
+        .iter()
+        .filter(|event| {
+            matches!(
+                HookEventPayload::from_payload_value(event.payload.clone()),
+                Ok(HookEventPayload::HookTrustChanged { revision: 1, .. })
+            )
+        })
+        .count();
+    assert_eq!(replay_fact_count, 1);
+    assert_eq!(
+        fixture
+            .service
+            .list(fixture.workspace.clone())
+            .await
+            .expect("revised list")
+            .1,
+        1
+    );
     fixture.close().await;
 }
 
@@ -1128,12 +1243,13 @@ async fn decision_hook_cannot_exceed_committed_ask_scope() {
     }));
     let fired = events
         .iter()
-        .find_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
-        .and_then(|payload| match payload {
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .find_map(|payload| match payload {
             HookEventPayload::HookFired(fired) => Some(fired),
             _ => None,
         })
         .expect("hook fired fact");
+    assert_eq!(fired.menu_id, Some(MenuId::new("hook-permission-menu")));
     assert!(!fired.decision_applied);
     fixture.close().await;
 }
@@ -1329,7 +1445,7 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
     })
     .await
     .expect("create");
-    let digest = service.list(workspace.clone()).await.expect("list").1[0]
+    let digest = service.list(workspace.clone()).await.expect("list").2[0]
         .digest
         .clone();
     service
@@ -1550,7 +1666,7 @@ async fn trust_workspace_pins_its_first_digest_across_restart() {
         .expect("engine");
     hub.install_hooks(service.clone()).expect("install");
     assert!(
-        service.list(workspace.clone()).await.expect("list").1[0].trusted,
+        service.list(workspace.clone()).await.expect("list").2[0].trusted,
         "first workspace digest is policy-pinned"
     );
     write_hook(
@@ -1567,7 +1683,7 @@ async fn trust_workspace_pins_its_first_digest_across_restart() {
             .list(workspace.clone())
             .await
             .expect("changed list")
-            .1[0]
+            .2[0]
             .trusted,
         "changed digest is revoked"
     );
@@ -1584,7 +1700,7 @@ async fn trust_workspace_pins_its_first_digest_across_restart() {
         .expect("reopen engine");
     hub.install_hooks(service.clone()).expect("reinstall");
     assert!(
-        !service.list(workspace).await.expect("reopen list").1[0].trusted,
+        !service.list(workspace).await.expect("reopen list").2[0].trusted,
         "restart must not bless the edited digest"
     );
     engine.shutdown().await;
@@ -1880,7 +1996,7 @@ async fn subscribe_revoke_kills_the_entire_process_group() {
         .list(fixture.workspace.clone())
         .await
         .expect("list")
-        .1[0]
+        .2[0]
         .digest
         .clone();
     fixture

@@ -68,6 +68,14 @@ pub enum HookEventPayload {
     HookRunTrust {
         enabled: bool,
     },
+    /// Profile-wide digest trust moved. The daemon mirrors this committed
+    /// management truth into session journals so attached clients can chase
+    /// a fresh `hooks.list` without polling.
+    HookTrustChanged {
+        digest: String,
+        trusted: bool,
+        revision: u64,
+    },
 }
 
 impl HookEventPayload {
@@ -82,7 +90,7 @@ impl HookEventPayload {
     pub fn is_engine_fact(value: &serde_json::Value) -> bool {
         matches!(
             value.get("type").and_then(serde_json::Value::as_str),
-            Some("hook_notice" | "hook_fired" | "hook_subscription")
+            Some("hook_notice" | "hook_fired" | "hook_subscription" | "hook_trust_changed")
         )
     }
 }
@@ -118,6 +126,10 @@ pub struct HookFired {
     pub stderr: HookOutput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposed_decision: Option<HookDecisionKind>,
+    /// Permission menu this decision hook inspected. Absent for non-decision
+    /// hooks and older writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_id: Option<crate::ids::MenuId>,
     /// `true` only when the menu CAS committed this hook's answer. A proposal
     /// that lost to another surface is never represented as authority.
     pub decision_applied: bool,

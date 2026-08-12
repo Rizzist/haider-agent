@@ -22,6 +22,7 @@ use haider_core::{
 };
 use haider_protocol::effect::{AuthorizationVerdict, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::error::ErrorCode;
 use haider_protocol::hook::{
     HOOKS_CONFIG_SCHEMA, HookAttachmentMetadata, HookAttachmentSet, HookDecisionKind,
     HookEventPayload, HookFired, HookInput, HookNotice, HookOutput, HookRuntimeKind,
@@ -32,7 +33,7 @@ use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::{DeliveryMode, EventPayload};
-use haider_rpc::{CommandId, HookSummaryWire};
+use haider_rpc::{CommandId, HookSummaryWire, HookTrustStateWire};
 use rustix::fd::OwnedFd;
 use rustix::fs::{FileType, Mode, OFlags};
 use serde::Deserialize;
@@ -216,6 +217,10 @@ struct HookServiceInner {
     shutdown: watch::Sender<bool>,
     pins: RwLock<HashSet<String>>,
     workspace_baselines: Mutex<HashMap<String, String>>,
+    /// Hook identity → latest digest the daemon itself observed as trusted.
+    /// This is the authority for revoked-by-edit classification; clients do
+    /// not infer it by comparing snapshots.
+    observed_trusted: Mutex<HashMap<String, String>>,
     next_event: AtomicU64,
 }
 
@@ -249,12 +254,40 @@ impl HookService {
     pub(crate) async fn list(
         &self,
         cwd: PathBuf,
-    ) -> Result<(HookTrustPolicy, Vec<HookSummaryWire>), String> {
+    ) -> Result<(HookTrustPolicy, u64, Vec<HookSummaryWire>), String> {
         let discovery = discover_async(cwd, self.inner.profile_root.clone()).await?;
         self.prepare_workspace_trust(&discovery).await;
+        let revision = self
+            .inner
+            .store
+            .hook_trust_changes()
+            .await
+            .map_err(|error| error.message)?
+            .len() as u64;
         let mut hooks = Vec::with_capacity(discovery.hooks.len());
         for definition in discovery.hooks.values() {
             let trusted = self.is_trusted(definition, false, discovery.policy);
+            let identity = workspace_identity(definition);
+            let trust_state = if trusted {
+                self.inner
+                    .observed_trusted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(identity, definition.digest.clone());
+                HookTrustStateWire::Trusted
+            } else if discovery.policy != HookTrustPolicy::TrustNone
+                && self
+                    .inner
+                    .observed_trusted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&identity)
+                    .is_some_and(|digest| digest != &definition.digest)
+            {
+                HookTrustStateWire::RevokedByEdit
+            } else {
+                HookTrustStateWire::Untrusted
+            };
             hooks.push(HookSummaryWire {
                 name: definition.name.clone(),
                 digest: definition.digest.clone(),
@@ -262,11 +295,12 @@ impl HookService {
                 kind: definition.kind.as_str().to_owned(),
                 event: definition.matcher.event.as_str().to_owned(),
                 trusted,
+                trust_state: Some(trust_state),
                 decision: definition.decision,
                 timeout_ms: duration_ms(definition.timeout),
             });
         }
-        Ok((discovery.policy, hooks))
+        Ok((discovery.policy, revision, hooks))
     }
 
     pub(crate) async fn apply_trust(
@@ -316,13 +350,76 @@ impl HookService {
                 pins.insert(change.digest.clone());
             } else {
                 pins.remove(&change.digest);
+                self.inner
+                    .observed_trusted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|_, digest| digest != &change.digest);
             }
         }
         let _ = self
             .inner
             .committed
             .send(EngineMessage::TrustChanged(change.clone()));
+        let revision = if change.revision == 0 {
+            u64::try_from(self.inner.store.hook_trust_changes().await?.len()).unwrap_or(u64::MAX)
+        } else {
+            change.revision
+        };
+        self.journal_trust_change(&change.digest, change.trusted, revision)
+            .await;
         Ok(change)
+    }
+
+    async fn journal_trust_change(&self, digest: &str, trusted: bool, revision: u64) {
+        let payload = match (HookEventPayload::HookTrustChanged {
+            digest: digest.to_owned(),
+            trusted,
+            revision,
+        })
+        .to_payload_value()
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "hook trust fact serialization failed");
+                return;
+            }
+        };
+        let session_ids = match self.inner.hub.session_ids().await {
+            Ok(session_ids) => session_ids,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "hook trust journal session listing failed");
+                return;
+            }
+        };
+        for session_id in session_ids {
+            let mut envelope = [RawEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: EventId::new(format!("hook-trust-{revision}-{}", session_id.as_str())),
+                seq: 0,
+                session_id,
+                branch_id: None,
+                run_id: None,
+                agent_id: None,
+                device_id: self.inner.hub.device_id(),
+                authority_epoch: 0,
+                worker_generation: self.inner.hub.worker_generation(),
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: RenderTargets {
+                    ui: false,
+                    durable: true,
+                    prompt: PromptRender::Omit,
+                },
+                payload: payload.clone(),
+            }];
+            if let Err(error) = self.inner.hub.append(&mut envelope).await
+                && error.code != ErrorCode::InvalidArgument
+            {
+                tracing::warn!(target: "haider.hooks", ?error, "hook trust fact append failed");
+            }
+        }
     }
 
     fn is_trusted(
@@ -490,6 +587,7 @@ impl HookEngine {
         }
         let (sender, receiver) = mpsc::unbounded_channel();
         let (shutdown, _) = watch::channel(false);
+        let observed_trusted = workspace_baselines.clone();
         let service = HookService {
             inner: Arc::new(HookServiceInner {
                 profile_root,
@@ -499,6 +597,7 @@ impl HookEngine {
                 shutdown,
                 pins: RwLock::new(pins),
                 workspace_baselines: Mutex::new(workspace_baselines),
+                observed_trusted: Mutex::new(observed_trusted),
                 next_event: AtomicU64::new(0),
             }),
         };
@@ -1347,6 +1446,7 @@ async fn fire_exec(
                 stdout: result.stdout,
                 stderr: result.stderr,
                 proposed_decision: None,
+                menu_id: None,
                 decision_applied: false,
             }),
         )
@@ -1417,6 +1517,7 @@ async fn fire_decision(
                 stdout: result.stdout,
                 stderr: result.stderr,
                 proposed_decision: result.proposed_decision,
+                menu_id: Some(decision.permission.menu.id.clone()),
                 decision_applied: applied,
             }),
         )

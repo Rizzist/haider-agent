@@ -7,8 +7,9 @@
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::hook::{HookDecisionKind, HookEventPayload, HookFired, HookOutput};
-use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
-use haider_rpc::{HookSummaryWire, ResponseBody};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
+use haider_rpc::{AttachmentId, HookSummaryWire, HookTrustStateWire, ResponseBody, SessionSummary};
 use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode, Screen};
 use haider_tui::hooks::HookRow;
 use haider_tui::link::{CommandContext, map_response, request_body};
@@ -56,6 +57,7 @@ fn wire(
         kind: kind.to_owned(),
         event: event.to_owned(),
         trusted,
+        trust_state: None,
         decision,
         timeout_ms: 30_000,
     }
@@ -133,6 +135,7 @@ fn hook_fired_env(
         stdout: output.clone(),
         stderr: output,
         proposed_decision: decision.map(|(kind, _)| kind),
+        menu_id: None,
         decision_applied: decision.is_some_and(|(_, applied)| applied),
     };
     raw(
@@ -201,6 +204,7 @@ fn hooks_screen_lists_daemon_truth_with_trust_states() {
         &mut model,
         LiveReply::Hooks {
             policy: "per_digest".to_owned(),
+            revision: 0,
             hooks: vec![
                 wire(
                     "fmt-on-finish",
@@ -269,6 +273,7 @@ fn trust_and_revoke_dispatch_receipted_commands_and_install_nothing_locally() {
         &mut model,
         LiveReply::Hooks {
             policy: "per_digest".to_owned(),
+            revision: 0,
             hooks: vec![wire(
                 "guard",
                 &"b".repeat(64),
@@ -381,6 +386,7 @@ fn trust_and_revoke_dispatch_receipted_commands_and_install_nothing_locally() {
         &mut model,
         LiveReply::Hooks {
             policy: "per_digest".to_owned(),
+            revision: 0,
             hooks: vec![wire(
                 "guard",
                 &"b".repeat(64),
@@ -425,45 +431,31 @@ fn trust_and_revoke_dispatch_receipted_commands_and_install_nothing_locally() {
     assert_eq!(body["digest"], "b".repeat(64).as_str());
 }
 
-/// MUTATION CHECK (H4 law 3): forget the trusted baseline, key it by
-/// digest, or collapse ✗ into ○. Expected runtime failure: the edited
-/// hook renders plain `untrusted` below, or the never-trusted contrast row
-/// wrongly wears ✗.
+/// MUTATION CHECK (H4 law 3): infer trust from client snapshot history or
+/// ignore the wire classification. Expected runtime failure: this one-shot
+/// daemon snapshot cannot render ✗, or its trust card offers revoke.
 #[test]
 fn edited_hook_renders_revoked_state() {
     let mut model = live_hooks_model();
     submit(&mut model, "/hooks");
-    // Daemon truth 1: `fmt` trusted under its first digest.
-    model.hooks.apply_snapshot(
-        "per_digest".to_owned(),
-        vec![
-            wire("fmt", &"a".repeat(64), true, "exec", "run_finished", false),
-            wire(
-                "never",
-                &"e".repeat(64),
-                false,
-                "exec",
-                "run_started",
-                false,
-            ),
-        ],
+    let mut edited = wire("fmt", &"d".repeat(64), true, "exec", "run_finished", false);
+    edited.trust_state = Some(HookTrustStateWire::RevokedByEdit);
+    let mut never = wire(
+        "never",
+        &"e".repeat(64),
+        false,
+        "exec",
+        "run_started",
+        false,
     );
-    // Daemon truth 2 — the EDIT: same hook name + source, new digest,
-    // untrusted (any digest change revokes, H3).
-    model.hooks.apply_snapshot(
-        "per_digest".to_owned(),
-        vec![
-            wire("fmt", &"d".repeat(64), false, "exec", "run_finished", false),
-            wire(
-                "never",
-                &"e".repeat(64),
-                false,
-                "exec",
-                "run_started",
-                false,
-            ),
-        ],
-    );
+    never.trust_state = Some(HookTrustStateWire::Untrusted);
+    // One daemon snapshot is sufficient; the TUI has no prior digest from
+    // which it could derive revocation. The legacy boolean is deliberately
+    // contradictory so both the glyph and confirmation-card assertions pin
+    // the new classification as the authority.
+    model
+        .hooks
+        .apply_snapshot("per_digest".to_owned(), 4, vec![edited, never]);
     let (rows, _) = draw(&model, 120, 34);
     let listing = rows.join("\n");
     assert!(
@@ -474,6 +466,117 @@ fn edited_hook_renders_revoked_state() {
     assert!(
         listing.contains("○ never") && listing.contains("· untrusted"),
         "a never-trusted hook stays untrusted, not revoked"
+    );
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model
+            .hooks
+            .confirm
+            .as_ref()
+            .is_some_and(|confirm| confirm.grant),
+        "a revoked-by-edit card offers trust from wire state"
+    );
+}
+
+/// WIRE-GAPS items 3-4: a trust-change fact on the existing attached event
+/// cadence chases `hooks.list` only when its revision advances, and uses the
+/// active session's summary workspace rather than this process's cwd.
+#[test]
+fn trust_revision_event_refreshes_the_summary_workspace() {
+    let mut model = live_hooks_model();
+    model.cwd = "/opened/elsewhere".to_owned();
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![SessionSummary {
+                session_id: sid(),
+                head_seq: 0,
+                worker_generation: 7,
+                metadata: None,
+                workspace_cwd: Some("/work/original".into()),
+                turn_count: None,
+                footprint_tokens: None,
+                footprint_truth: None,
+                title: None,
+                agent_metrics: None,
+            }],
+            next_cursor: None,
+        },
+    );
+    submit(&mut model, "/hooks");
+    let refresh = model
+        .requests
+        .drain(..)
+        .find(|request| matches!(request, AppRequest::HooksRefresh { .. }))
+        .expect("summary-scoped refresh");
+    assert_eq!(
+        refresh,
+        AppRequest::HooksRefresh {
+            cwd: "/work/original".into()
+        }
+    );
+    assert_eq!(
+        driver.handle_request(&mut model, refresh),
+        vec![LiveCommand::HooksList {
+            cwd: "/work/original".into()
+        }]
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Hooks {
+            policy: "per_digest".into(),
+            revision: 4,
+            hooks: Vec::new(),
+        },
+    );
+    let attachment = AttachmentId::new("hooks-revision-attachment");
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(),
+            attachment: attachment.clone(),
+            worker_generation: 7,
+            replay_through_seq: 0,
+        },
+    );
+    let changed = raw(
+        1,
+        None,
+        false,
+        HookEventPayload::HookTrustChanged {
+            digest: "f".repeat(64),
+            trusted: true,
+            revision: 5,
+        }
+        .to_payload_value()
+        .expect("trust fact"),
+    );
+    assert_eq!(
+        driver.apply(
+            &mut model,
+            LiveReply::Event {
+                attachment: attachment.clone(),
+                session: sid(),
+                envelope: Box::new(changed.clone()),
+            },
+        ),
+        vec![LiveCommand::HooksList {
+            cwd: "/work/original".into()
+        }]
+    );
+    assert!(
+        driver
+            .apply(
+                &mut model,
+                LiveReply::Event {
+                    attachment,
+                    session: sid(),
+                    envelope: Box::new(changed),
+                },
+            )
+            .is_empty(),
+        "a duplicate fact cannot trigger another refresh"
     );
 }
 
@@ -501,7 +604,9 @@ fn firings_render_bounded_newest_first() {
     assert!(newest.contains("hk-53"), "newest first: {newest}");
     // The screen paints a BOUNDED newest-first window.
     submit(&mut model, "/hooks");
-    model.hooks.apply_snapshot("per_digest".to_owned(), vec![]);
+    model
+        .hooks
+        .apply_snapshot("per_digest".to_owned(), 0, vec![]);
     let (rows, _) = draw(&model, 120, 40);
     // (matched WITHOUT the ⚡ glyph — a double-width symbol leaves a filler
     // cell in the test buffer's per-cell reconstruction)
@@ -521,6 +626,84 @@ fn firings_render_bounded_newest_first() {
         !rows.iter().any(|row| row.contains("hk-45 ·")),
         "older firings stay out of the window"
     );
+}
+
+/// WIRE-GAPS item 5: a decision firing retains its menu coordinate, paints
+/// a value-carrying hit, and opens the committed menu as a read-only
+/// drill-down rather than fabricating a new decision.
+#[test]
+fn decision_firing_jumps_to_its_committed_menu() {
+    let mut model = live_hooks_model();
+    let menu = Menu {
+        id: MenuId::new("hook-menu-drilldown"),
+        kind: MenuKind::Permission {
+            effect_summary: "run formatter".into(),
+        },
+        title: "Allow formatter?".into(),
+        body: vec!["The decision hook inspected this menu.".into()],
+        options: vec![MenuOption {
+            key: "allow_once".into(),
+            label: "Allow once".into(),
+            detail: None,
+            decision: Some(haider_protocol::menu::DecisionKind::AllowOnce),
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "process_exec".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    assert_eq!(
+        model.route_raw(&raw(
+            1,
+            Some("run-menu"),
+            true,
+            serde_json::to_value(EventPayload::MenuOpened(menu.clone())).expect("menu payload"),
+        )),
+        haider_tui::projection::RawOutcome::Applied
+    );
+    let mut fired = hook_fired_env(
+        2,
+        "run-menu",
+        "permission-guard",
+        Some((HookDecisionKind::Allow, true)),
+    );
+    let HookEventPayload::HookFired(mut payload) =
+        HookEventPayload::from_payload_value(fired.payload.clone()).expect("fired payload")
+    else {
+        panic!("expected hook fired")
+    };
+    payload.menu_id = Some(menu.id.clone());
+    fired.payload = HookEventPayload::HookFired(payload)
+        .to_payload_value()
+        .expect("linked fired payload");
+    assert_eq!(
+        model.route_raw(&fired),
+        haider_tui::projection::RawOutcome::Applied
+    );
+    model.screen = Screen::Hooks;
+    model
+        .hooks
+        .apply_snapshot("per_digest".into(), 1, Vec::new());
+    let (rows, hits) = draw(&model, 120, 40);
+    assert!(
+        rows.iter().any(|row| row.contains("[decision menu]")),
+        "linked firing is visibly jump-capable"
+    );
+    let hit = hits
+        .into_iter()
+        .find_map(|(_, hit)| (hit == Hit::HookFiring(menu.id.clone())).then_some(hit))
+        .expect("decision firing hit");
+    model.handle_hit(hit);
+    assert_eq!(
+        model.hooks.drilldown.as_ref().map(|menu| &menu.id),
+        Some(&menu.id)
+    );
+    let (rows, _) = draw(&model, 120, 40);
+    let card = rows.join("\n");
+    assert!(card.contains("decision menu · read-only"));
+    assert!(card.contains("Allow formatter?"));
+    assert!(card.contains("Allow once"));
 }
 
 /// MUTATION CHECK (H4 law 5): open the screen without the daemon feature,

@@ -4225,10 +4225,23 @@ fn render_hooks(
             .recent()
             .take(crate::hooks::FIRING_ROWS_MAX)
         {
+            let linked = entry.menu_id().is_some();
+            let suffix = if linked { "  [decision menu]" } else { "" };
+            let line_index = lines.len();
             lines.push(Line::styled(
-                format!("  {}", entry.line()),
-                theme.dim_style(),
+                format!("  {}{suffix}", entry.line()),
+                if linked {
+                    theme.gold_style()
+                } else {
+                    theme.dim_style()
+                },
             ));
+            if let Some(menu) = entry.menu_id() {
+                hits.push((
+                    row_rect(area, area.y, line_index),
+                    Hit::HookFiring(menu.clone()),
+                ));
+            }
         }
     }
     lines.push(Line::raw(""));
@@ -4262,6 +4275,44 @@ fn render_hooks(
                 .max(area.y),
             width,
             height: height.min(area.height),
+        };
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(
+            Paragraph::new(card_lines).block(
+                Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(theme.frame_style())
+                    .style(theme.text_style()),
+            ),
+            rect,
+        );
+    }
+    if let Some(menu) = &hooks.drilldown {
+        let mut card_lines = vec![
+            Line::styled("decision menu · read-only", theme.gold_style()),
+            Line::styled(menu.title.clone(), theme.bright_style()),
+        ];
+        card_lines.extend(
+            menu.body
+                .iter()
+                .map(|line| Line::styled(line.clone(), theme.dim_style())),
+        );
+        for (index, option) in menu.options.iter().enumerate() {
+            card_lines.push(Line::styled(
+                format!("{}. {}", index + 1, option.label),
+                theme.text_style(),
+            ));
+        }
+        card_lines.push(Line::styled("esc back to firings", theme.faint_style()));
+        let height = u16::try_from(card_lines.len() + 2)
+            .unwrap_or(u16::MAX)
+            .min(area.height);
+        let width = area.width.saturating_sub(4).max(24);
+        let rect = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
         };
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(
@@ -5282,6 +5333,17 @@ fn render_subagent(
         ),
         theme.dim_style(),
     )];
+    if let Some(handoff) = chip
+        .handoff_dir
+        .as_deref()
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .and_then(std::ffi::OsStr::to_str)
+    {
+        header_bottom.push(Span::styled(
+            format!("· handoff {handoff}  "),
+            theme.dim_style(),
+        ));
+    }
     // Sim chip-view state badge (tui.js:5320-5330): input_required wears
     // the warn tone and PULSES (1.2s) until answered; other states keep
     // the port's quiet frame/gold chrome.

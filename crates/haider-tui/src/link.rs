@@ -1177,7 +1177,15 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             session: session_id,
             snapshot: Box::new(inventory),
         }],
-        ResponseBody::HooksList { policy, hooks } => vec![LiveReply::Hooks { policy, hooks }],
+        ResponseBody::HooksList {
+            policy,
+            revision,
+            hooks,
+        } => vec![LiveReply::Hooks {
+            policy,
+            revision,
+            hooks,
+        }],
         ResponseBody::UsageReport { report } => vec![LiveReply::UsageReport {
             report: Box::new(report),
         }],

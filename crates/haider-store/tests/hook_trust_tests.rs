@@ -25,7 +25,8 @@ fn command(id: &str, digest: &str, trusted: bool) -> HookTrustCommand {
 
 /// MUTATION CHECK: commit trust outside its receipt transaction or make the
 /// command share the management revision. Expected RUNTIME failure: replay
-/// diverges, the reduced order changes, or revision zero is advanced.
+/// diverges, the hook revision/order changes, or management revision zero is
+/// advanced.
 #[test]
 fn trust_and_revoke_are_receipted_ordered_and_revision_independent() {
     let root = tempfile::tempdir().expect("profile");
@@ -39,23 +40,27 @@ fn trust_and_revoke_are_receipted_ordered_and_revision_independent() {
         .apply_hook_trust_command(&trust)
         .expect("trust replays");
     assert_eq!(first, replay);
+    assert_eq!(first.revision, 1);
     assert_eq!(store.management_revision().expect("revision"), 0);
 
     let revoke = command("hooks-revoke-a", &digest, false);
-    store
+    let revoked = store
         .apply_hook_trust_command(&revoke)
         .expect("revoke commits");
+    assert_eq!(revoked.revision, 2);
     assert_eq!(
         store.hook_trust_changes().expect("ordered changes"),
         [
             haider_store::HookTrustChange {
                 digest: digest.clone(),
                 trusted: true,
+                revision: 1,
                 workspace: None,
             },
             haider_store::HookTrustChange {
                 digest,
                 trusted: false,
+                revision: 2,
                 workspace: None,
             },
         ]
