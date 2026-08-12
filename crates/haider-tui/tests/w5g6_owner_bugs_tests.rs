@@ -38,7 +38,7 @@ fn a_failed_run_writes_its_reason_into_the_transcript() {
     assert!(
         projection.entries().iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Error { text }
+            TranscriptEntry::Error { text, .. }
                 if text.contains("provider_error") && text.contains("HTTP 400")
         )),
         "the failure reason is a transcript row, not a bare badge: {:?}",

@@ -79,7 +79,7 @@ fn error_texts(model: &AppModel) -> Vec<String> {
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptEntry::Error { text } => Some(text.clone()),
+            TranscriptEntry::Error { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect()

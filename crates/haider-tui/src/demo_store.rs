@@ -582,8 +582,10 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
         },
         TranscriptEntry::Note { text } => EntryDto::Note { text: text.clone() },
         // Demo persistence has no error rows (errors are live-envelope
-        // facts); a note keeps the text without a DTO schema change.
-        TranscriptEntry::Error { text } => EntryDto::Note {
+        // facts); a note keeps the text without a DTO schema change. The
+        // typed presentation is display-only and flattens with it (the
+        // text already carries title/detail/subcode/facts/actions).
+        TranscriptEntry::Error { text, .. } => EntryDto::Note {
             text: format!("✗ {text}"),
         },
         TranscriptEntry::Shell { cmd, out } => EntryDto::Shell {

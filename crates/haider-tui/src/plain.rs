@@ -89,7 +89,10 @@ fn render_plain_impl(
                 out.push_str(text);
                 out.push('\n');
             }
-            TranscriptEntry::Error { text } => {
+            TranscriptEntry::Error { text, .. } => {
+                // `text` is the flattened presentation (title — detail
+                // [subcode] · facts · actions) — plain carries the same
+                // information as the styled block, in honest plain text.
                 out.push_str("✗ ");
                 out.push_str(text);
                 out.push('\n');
@@ -128,6 +131,22 @@ fn render_plain_impl(
     }
     if let Some(menu) = projection.open_menu() {
         out.push_str(&format!("? {}\n", menu.title));
+        // E-wave visual pass: a recovery card's typed presentation reaches
+        // plain mode too — detail plus the compact fact line (unshedded:
+        // plain has no width), so the pipe/CI oracle sees what the styled
+        // card says. The reset figure is the static provider delay (plain
+        // rendering has no daemon clock to count down against).
+        if let haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } = &menu.kind {
+            for line in presentation.detail.split('\n') {
+                out.push_str(&format!("  {line}\n"));
+            }
+            let facts = crate::projection::error_fact_segments(presentation, None)
+                .into_iter()
+                .map(|(segment, _)| segment)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            out.push_str(&format!("  {facts}\n"));
+        }
         for (index, option) in menu.options.iter().enumerate() {
             out.push_str(&format!("  {}. {}\n", index + 1, option.label));
         }

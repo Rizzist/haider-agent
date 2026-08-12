@@ -1051,7 +1051,7 @@ impl ChipModel {
             },
             crate::projection::TranscriptEntry::User { text, .. } => text.clone(),
             crate::projection::TranscriptEntry::Note { text } => text.clone(),
-            crate::projection::TranscriptEntry::Error { text } => format!("✗ {text}"),
+            crate::projection::TranscriptEntry::Error { text, .. } => format!("✗ {text}"),
             crate::projection::TranscriptEntry::Shell { cmd, .. } => format!("$ {cmd}"),
         });
         match last {

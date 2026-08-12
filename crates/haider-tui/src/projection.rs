@@ -58,7 +58,16 @@ pub enum TranscriptEntry {
     /// A failed run's PUBLIC reason (`EventPayload::RunFailed`, W5g-6).
     /// The owner hit three silent ✗ ERRORED badges before this row
     /// existed — the reason was always in the envelope, never on screen.
-    Error { text: String },
+    /// `presentation` keeps the TYPED contract beside the flattened text
+    /// (E-wave visual pass) so the styled renderer can give it the card
+    /// treatment — err title, dim detail, muted fact line — while `text`
+    /// stays the plain/greppable authority; client-observed failures and
+    /// non-presentation wire errors carry `None` and keep the baseline
+    /// one-line render.
+    Error {
+        text: String,
+        presentation: Option<ErrorPresentation>,
+    },
     /// A shell builtin run against the demo VFS (sim ShellRow,
     /// tui.js:3910-3918) — deliberately envelope-free: the sim bypasses
     /// the model/harness ("local, instant, no model turn").
@@ -400,6 +409,7 @@ impl SessionProjection {
                     self.run_failure_reported = true;
                     self.entries.push(TranscriptEntry::Error {
                         text: "errored — the daemon reported no public reason".to_owned(),
+                        presentation: None,
                     });
                 }
                 self.run = Some(run.clone());
@@ -447,6 +457,7 @@ impl SessionProjection {
                         },
                         format_error_presentation,
                     ),
+                    presentation: presentation.clone(),
                 });
             }
             // B2b-m3: a committed node ANCHORS its display entry — never a
@@ -464,17 +475,20 @@ impl SessionProjection {
                     EffectOutcome::Failed { error } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("effect failed — {error}"),
+                            presentation: None,
                         });
                     }
                     EffectOutcome::CancelledEscalated { note } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("effect cancel escalated — {note}"),
+                            presentation: None,
                         });
                     }
                     EffectOutcome::Unknown => {
                         self.entries.push(TranscriptEntry::Error {
                             text: "effect outcome unknown — crash window; reconcile via the recovery menu"
                                 .to_owned(),
+                            presentation: None,
                         });
                     }
                     EffectOutcome::Ok | EffectOutcome::Cancelled => {}
@@ -489,16 +503,19 @@ impl SessionProjection {
                             text: format!(
                                 "verify errored — cycle cap exhausted · {new_errors} new error(s)"
                             ),
+                            presentation: None,
                         });
                     }
                     VerifyVerdict::FailedEnv { item } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("verify failed-env — {item}"),
+                            presentation: None,
                         });
                     }
                     VerifyVerdict::Incomplete { reason } => {
                         self.entries.push(TranscriptEntry::Error {
                             text: format!("verify incomplete — {reason}"),
+                            presentation: None,
                         });
                     }
                     VerifyVerdict::AcknowledgedRed => {
@@ -506,6 +523,7 @@ impl SessionProjection {
                             text: format!(
                                 "verify acknowledged-red — {new_errors} new error(s) cited out of scope"
                             ),
+                            presentation: None,
                         });
                     }
                     _ => {}
@@ -563,7 +581,10 @@ impl SessionProjection {
     /// selection refusal landing after its picker closed) — never a
     /// silent IDLE. Local display truth only: nothing durable claims it.
     pub fn record_local_error(&mut self, text: String) {
-        self.entries.push(TranscriptEntry::Error { text });
+        self.entries.push(TranscriptEntry::Error {
+            text,
+            presentation: None,
+        });
     }
 
     /// B2b-m3: associate one committed node with the display entry it
@@ -1170,36 +1191,138 @@ fn bounded_tool_reason(result: &haider_protocol::tool::BoundedResult) -> Option<
     Some(normalized.chars().take(240).collect())
 }
 
-/// The single baseline text formatter for typed failures. Fable can restyle
-/// this presentation without changing projection or action semantics.
+/// One typed action's lowercase display word — shared by the transcript
+/// string, the styled fact line, and plain mode (one vocabulary).
+#[must_use]
+pub const fn error_action_word(action: ErrorAction) -> &'static str {
+    match action {
+        ErrorAction::Retry => "retry",
+        ErrorAction::Relogin => "re-login",
+        ErrorAction::Reimport => "re-import",
+        ErrorAction::EditKey => "edit key",
+        ErrorAction::SwitchAccount => "switch account",
+        ErrorAction::TopUp => "top up",
+        ErrorAction::Wait => "wait",
+        ErrorAction::ChooseModel => "choose model",
+        ErrorAction::ContactAdmin => "contact admin",
+        ErrorAction::ContinuePartial => "continue partial",
+        ErrorAction::RetryFresh => "retry fresh",
+        ErrorAction::None => "none",
+    }
+}
+
+/// Fact-line SHED RANKS (E-wave visual pass): under width pressure the
+/// fact line drops WHOLE segments, highest rank first, display order
+/// untouched — the S4 metrics-degradation idiom. The subcode is the
+/// stable identity and never sheds; the reset countdown outranks the
+/// actions hint, which outranks provider metadata.
+pub const FACT_RANK_SUBCODE: u8 = 0;
+pub const FACT_RANK_RESET: u8 = 1;
+pub const FACT_RANK_ACTIONS: u8 = 2;
+pub const FACT_RANK_HTTP: u8 = 3;
+pub const FACT_RANK_REQUEST: u8 = 4;
+
+/// The compact fact line's segments, display-ordered (`subcode · HTTP 429
+/// · req 8f3a2c1d… · resets in 2m 14s`), each with its shed rank. A
+/// missing datum DROPS its whole segment — never a placeholder. The
+/// request id is shortened to its first 8 chars (the journal keeps the
+/// full id; the transcript string renders it whole). The reset segment is
+/// LIVE when the caller supplies the daemon clock (`reset_at_ms − now`)
+/// and otherwise the static provider delay recorded at failure time.
+#[must_use]
+pub fn error_fact_segments(
+    presentation: &ErrorPresentation,
+    now_ms: Option<u64>,
+) -> Vec<(String, u8)> {
+    let mut segments = vec![(presentation.subcode.as_str().to_owned(), FACT_RANK_SUBCODE)];
+    if let Some(status) = presentation.provider_http_status {
+        segments.push((format!("HTTP {status}"), FACT_RANK_HTTP));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        segments.push((
+            format!("req {}", short_request_id(request_id)),
+            FACT_RANK_REQUEST,
+        ));
+    }
+    let reset = match (
+        now_ms,
+        presentation.reset_at_ms,
+        presentation.retry_after_ms,
+    ) {
+        (Some(now), Some(reset_at), _) => {
+            Some(crate::format::fmt_reset_in(reset_at.saturating_sub(now)))
+        }
+        (_, _, Some(retry_after)) => Some(crate::format::fmt_reset_in(retry_after)),
+        _ => None,
+    };
+    if let Some(reset) = reset {
+        segments.push((reset, FACT_RANK_RESET));
+    }
+    segments
+}
+
+/// [`error_fact_segments`] plus the trailing `actions: …` hint — the
+/// transcript row's form, where the card's option list is not on screen
+/// to carry the recovery vocabulary.
+#[must_use]
+pub fn error_fact_segments_with_actions(
+    presentation: &ErrorPresentation,
+    now_ms: Option<u64>,
+) -> Vec<(String, u8)> {
+    let mut segments = error_fact_segments(presentation, now_ms);
+    let actions = presentation
+        .allowed_actions
+        .iter()
+        .map(|action| error_action_word(*action))
+        .collect::<Vec<_>>()
+        .join(", ");
+    segments.push((format!("actions: {actions}"), FACT_RANK_ACTIONS));
+    segments
+}
+
+/// The fact line's request-id form: the first 8 chars, `…`-marked when
+/// shortened. Support-grade full ids stay in the transcript string and
+/// the journal.
+fn short_request_id(request_id: &str) -> String {
+    let mut short: String = request_id.chars().take(8).collect();
+    if request_id.chars().count() > 8 {
+        short.push('…');
+    }
+    short
+}
+
+/// The single baseline text formatter for typed failures — the transcript
+/// row's flattened text and the plain/greppable authority. E-wave visual
+/// pass shape: `{title} — {detail} [{subcode}] · HTTP {status} · req {id}
+/// · {resets in …} · actions: {…}` — provider facts additive after the
+/// subcode (full request id here; the styled fact line shortens it), the
+/// reset human-readable via the h/m/s vocabulary, absent facts dropping
+/// their whole segment.
 #[must_use]
 pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
     let actions = presentation
         .allowed_actions
         .iter()
-        .map(|action| match action {
-            ErrorAction::Retry => "retry",
-            ErrorAction::Relogin => "re-login",
-            ErrorAction::Reimport => "re-import",
-            ErrorAction::EditKey => "edit key",
-            ErrorAction::SwitchAccount => "switch account",
-            ErrorAction::TopUp => "top up",
-            ErrorAction::Wait => "wait",
-            ErrorAction::ChooseModel => "choose model",
-            ErrorAction::ContactAdmin => "contact admin",
-            ErrorAction::ContinuePartial => "continue partial",
-            ErrorAction::RetryFresh => "retry fresh",
-            ErrorAction::None => "none",
-        })
+        .map(|action| error_action_word(*action))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "{} — {} [{}] · actions: {}",
+    let mut out = format!(
+        "{} — {} [{}]",
         presentation.title,
         presentation.detail,
         presentation.subcode.as_str(),
-        actions
-    )
+    );
+    if let Some(status) = presentation.provider_http_status {
+        out.push_str(&format!(" · HTTP {status}"));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        out.push_str(&format!(" · req {request_id}"));
+    }
+    if let Some(retry_after) = presentation.retry_after_ms {
+        out.push_str(&format!(" · {}", crate::format::fmt_reset_in(retry_after)));
+    }
+    out.push_str(&format!(" · actions: {actions}"));
+    out
 }
 
 /// The sim's badge PULSE set, verbatim (tui.js:5558-5563:

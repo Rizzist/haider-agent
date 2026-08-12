@@ -2833,7 +2833,9 @@ fn render_session(
     let ask_rows: u16 = ask_menu.map_or(0, |menu| {
         u16::try_from(2 + menu.body.len()).unwrap_or(u16::MAX)
     });
-    let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
+    let menu_wrapped_body_rows = menu.map_or(0, |m| {
+        wrapped_menu_body(m, area.width, model.clock_ms).len()
+    });
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width).saturating_add(ask_rows),
         |m| u16::try_from(1 + menu_wrapped_body_rows + m.options.len() + 1).unwrap_or(u16::MAX),
@@ -3504,8 +3506,14 @@ fn render_session(
             menu.id,
             menu.id
         );
-        let (menu_lines, option_rows) =
-            menu_block(menu, model.menu_selection, theme, composer_area, &footer);
+        let (menu_lines, option_rows) = menu_block(
+            menu,
+            model.menu_selection,
+            theme,
+            composer_area,
+            &footer,
+            model.clock_ms,
+        );
         frame.render_widget(
             Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
@@ -4446,8 +4454,10 @@ fn render_subagent(
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width),
         |m| {
-            u16::try_from(1 + wrapped_menu_body(m, area.width).len() + m.options.len() + 1)
-                .unwrap_or(u16::MAX)
+            u16::try_from(
+                1 + wrapped_menu_body(m, area.width, model.clock_ms).len() + m.options.len() + 1,
+            )
+            .unwrap_or(u16::MAX)
         },
     );
     // TUI6.2 fix 4 (review r2 finding 4, overruling the r1 trade): the
@@ -4732,8 +4742,14 @@ fn render_subagent(
             " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
             menu.options.len()
         );
-        let (menu_lines, option_rows) =
-            menu_block(menu, model.menu_selection, theme, composer_area, &footer);
+        let (menu_lines, option_rows) = menu_block(
+            menu,
+            model.menu_selection,
+            theme,
+            composer_area,
+            &footer,
+            model.clock_ms,
+        );
         frame.render_widget(
             Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
@@ -5081,12 +5097,16 @@ fn render_aura(
                     Span::styled(text.as_str(), theme.dim_style()),
                 ]));
             }
-            TranscriptEntry::Error { text } => {
-                lines.push(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled("✗ ", theme.err_style()),
-                    Span::styled(text.as_str(), theme.err_style()),
-                ]));
+            TranscriptEntry::Error { text, presentation } => {
+                // The same card-shaped treatment as the session view
+                // (title / detail / fact line via one shared helper).
+                error_entry_lines(
+                    &mut lines,
+                    text,
+                    presentation.as_ref(),
+                    theme,
+                    transcript_area.width,
+                );
             }
             TranscriptEntry::Item(block) => {
                 if let TurnItem::AgentMessage { text } = &block.item {
@@ -5153,8 +5173,32 @@ fn render_aura(
 
 /// The menu's body lines pre-wrapped by display cells into the menu's
 /// content width (sim `.iml` white-space: pre-wrap, tui.js:4946).
-fn wrapped_menu_body(menu: &haider_protocol::menu::Menu, width: u16) -> Vec<(String, DiffTone)> {
+///
+/// E-wave visual pass: a recovery card's body is composed from its TYPED
+/// presentation — the detail wraps dim (forced Body tone: recovery prose
+/// starting with `+`/`-` must never wear diff green/red), then ONE
+/// compact fact row (`subcode · HTTP 429 · req 8f3a2c1d… · resets in
+/// 2m 14s`) that sheds whole segments under width pressure, its reset
+/// counting down live against the daemon clock `now_ms`. The daemon's
+/// baseline `body` strings carry the same data as prose and are not
+/// double-rendered.
+fn wrapped_menu_body(
+    menu: &haider_protocol::menu::Menu,
+    width: u16,
+    now_ms: u64,
+) -> Vec<(String, DiffTone)> {
     let budget = (width as usize).saturating_sub(2).max(1);
+    if let haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } = &menu.kind {
+        let mut rows: Vec<(String, DiffTone)> = presentation
+            .detail
+            .split('\n')
+            .flat_map(|logical| wrap_body(logical, budget))
+            .map(|row| (row, DiffTone::Body))
+            .collect();
+        let facts = crate::projection::error_fact_segments(presentation, Some(now_ms));
+        rows.push((shed_fact_line(&facts, budget), DiffTone::Fact));
+        return rows;
+    }
     menu.body
         .iter()
         .flat_map(|body_line| {
@@ -5170,6 +5214,39 @@ fn wrapped_menu_body(menu: &haider_protocol::menu::Menu, width: u16) -> Vec<(Str
         .collect()
 }
 
+/// Whole-segment width shedding for error fact lines (E-wave visual
+/// pass): segments join with ` · `; while the joined line overflows
+/// `budget` display cells, the segment with the HIGHEST shed rank drops
+/// whole (ties: the rightmost) — never a mid-word truncation, and the
+/// rank-0 identity segment (the subcode) never sheds. Display order is
+/// never rearranged.
+#[must_use]
+pub fn shed_fact_line(segments: &[(String, u8)], budget: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut kept: Vec<&(String, u8)> = segments.iter().collect();
+    let joined_width = |kept: &[&(String, u8)]| {
+        kept.iter()
+            .map(|(segment, _)| segment.as_str().width())
+            .sum::<usize>()
+            + kept.len().saturating_sub(1) * " · ".width()
+    };
+    while kept.len() > 1 && joined_width(&kept) > budget {
+        let Some((drop_index, _)) = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, rank))| *rank > 0)
+            .max_by_key(|(index, (_, rank))| (*rank, *index))
+        else {
+            break;
+        };
+        kept.remove(drop_index);
+    }
+    kept.iter()
+        .map(|(segment, _)| segment.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// W4a4: diff-aware body tone for the approval card (and any menu whose
 /// body carries a patch preview). The daemon's `approval_preview` emits
 /// `-`/`+` prefixed preimage/replacement lines and `---`/`+++` headers
@@ -5180,6 +5257,11 @@ enum DiffTone {
     Add,
     Del,
     Meta,
+    /// A recovery card's compact fact row (E-wave visual pass) — its own
+    /// tone class so the classification stays pinnable; renders in the
+    /// metadata slot (`dim`, the ≥ 3.4:1 floor — `faint` is the
+    /// barely-there band and a request id must stay readable).
+    Fact,
 }
 
 impl DiffTone {
@@ -5197,7 +5279,7 @@ impl DiffTone {
 
     fn style(self, theme: &Theme) -> ratatui::style::Style {
         match self {
-            Self::Body => theme.dim_style(),
+            Self::Body | Self::Fact => theme.dim_style(),
             Self::Add => theme.ok_style(),
             Self::Del => theme.err_style(),
             Self::Meta => theme.faint_style(),
@@ -5218,13 +5300,38 @@ fn menu_block(
     theme: &Theme,
     area: Rect,
     footer: &str,
+    now_ms: u64,
 ) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
     let allocated = area.height as usize;
     if allocated == 0 {
         return (Vec::new(), Vec::new());
     }
+    // E-wave visual pass: a recovery card wears a severity-toned left
+    // accent (`▏`) binding title + detail + fact row into one block, and
+    // its title takes the tone ink BOLD — the card reads at a glance.
+    // The tone is calm `warn` for action-needed classes (auth, keys,
+    // limits, billing, interruption — never scary red for a bill or a
+    // hiccup) and `err` only for hard account failures and the
+    // unclassified generic card. Options stay the existing idiom below.
+    let recovery_ink = match &menu.kind {
+        haider_protocol::menu::MenuKind::ErrorRecovery { card, .. } => {
+            use haider_protocol::menu::ErrorRecoveryCardKind;
+            Some(match card {
+                ErrorRecoveryCardKind::AccountRevoked
+                | ErrorRecoveryCardKind::AccountDeleted
+                | ErrorRecoveryCardKind::Generic => theme.err,
+                ErrorRecoveryCardKind::OauthExpired
+                | ErrorRecoveryCardKind::InvalidApiKey
+                | ErrorRecoveryCardKind::KeychainRelink
+                | ErrorRecoveryCardKind::RateLimit
+                | ErrorRecoveryCardKind::QuotaExhausted
+                | ErrorRecoveryCardKind::PartialStream => theme.warn,
+            })
+        }
+        _ => None,
+    };
     let selection = selection.min(menu.options.len().saturating_sub(1));
-    let mut body_rows = wrapped_menu_body(menu, area.width);
+    let mut body_rows = wrapped_menu_body(menu, area.width, now_ms);
     let needed = 1 + body_rows.len() + menu.options.len() + 1;
     let mut show_title = true;
     let mut show_hint = true;
@@ -5255,14 +5362,31 @@ fn menu_block(
     let mut option_rows: Vec<(u16, usize)> = Vec::new();
     if show_title {
         let glyph = menu_glyph(menu);
-        lines.push(Line::from(vec![Span::styled(
-            format!(" {glyph} {}", menu.title),
-            theme.warn_style(),
-        )]));
+        match recovery_ink {
+            // The accent cell replaces the pad; title in the tone ink,
+            // BOLD — TITLE prominent, severity readable from the rail.
+            Some(ink) => lines.push(Line::from(vec![
+                Span::styled("▏", ratatui::style::Style::default().fg(ink.into())),
+                Span::styled(
+                    format!("{glyph} {}", menu.title),
+                    ratatui::style::Style::default()
+                        .fg(ink.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            None => lines.push(Line::from(vec![Span::styled(
+                format!(" {glyph} {}", menu.title),
+                theme.warn_style(),
+            )])),
+        }
     }
     for (body_row, tone) in body_rows {
+        let gutter = match recovery_ink {
+            Some(ink) => Span::styled("▏", ratatui::style::Style::default().fg(ink.into())),
+            None => Span::raw(" "),
+        };
         lines.push(Line::from(vec![
-            Span::raw(" "),
+            gutter,
             Span::styled(body_row, tone.style(theme)),
         ]));
     }
@@ -5270,6 +5394,11 @@ fn menu_block(
         let index = start + offset;
         let selected = index == selection;
         let cursor = if selected { "❯" } else { " " };
+        // Affordance ordering (E-wave visual pass): a recovery card's
+        // FIRST option is the server-enumerated primary action — it
+        // wears the gold accent when unselected, so the recommended key
+        // reads before any cursor movement. Selection styling outranks it.
+        let primary = index == 0 && recovery_ink.is_some();
         // The gutter's first cell carries the ⋮ viewport marker on edge
         // rows adjacent to hidden options — none may vanish silently.
         let edge = (offset == 0 && hidden_above) || (offset + 1 == window_len && hidden_below);
@@ -5280,11 +5409,27 @@ fn menu_block(
                 format!("{}. {}", index + 1, option.label),
                 if selected {
                     theme.bright_style()
+                } else if primary {
+                    theme.gold_style()
                 } else {
                     theme.menu_style()
                 },
             ),
         ];
+        // The SELECTED recovery option explains itself: its typed detail
+        // rides the row dim, whole-segment-or-nothing (drops entirely
+        // when the row cannot hold it — never a mid-word cut).
+        if selected
+            && recovery_ink.is_some()
+            && let Some(detail) = &option.detail
+        {
+            let suffix = format!(" — {detail}");
+            let used = Line::from(spans.clone()).width();
+            if used + unicode_width::UnicodeWidthStr::width(suffix.as_str()) <= area.width as usize
+            {
+                spans.push(Span::styled(suffix, theme.dim_style()));
+            }
+        }
         option_rows.push((u16::try_from(lines.len()).unwrap_or(u16::MAX), index));
         lines.push(if selected {
             // Selection ground spans the full row (sim `.imo.sel`).
@@ -5390,7 +5535,8 @@ fn render_theme_picker(
         rule_area,
     );
     let footer = " ↑↓ preview · ⏎ keep · 1-5 quick · esc back";
-    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer);
+    // The clock feeds only recovery fact lines; a Choice card ignores it.
+    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer, 0);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.menu_style()),
         composer_area,
@@ -5502,7 +5648,8 @@ fn render_effort_picker(
         rule_area,
     );
     let footer = " ↑↓ pick · ⏎ select · 1-9 quick · esc back";
-    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer);
+    // The clock feeds only recovery fact lines; a Choice card ignores it.
+    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer, 0);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.menu_style()),
         composer_area,
@@ -5527,9 +5674,18 @@ fn render_effort_picker(
 /// The command cards (`voice` ◉ / `tools` ⚒) are `Choice` menus — their
 /// free-form `origin` tag carries the sim kind (MenuKind is frozen).
 fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
-    use haider_protocol::menu::MenuKind;
+    use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
     match &menu.kind {
         MenuKind::Recovery { .. } => "⌁",
+        // E-wave visual pass: the limit/billing cards wear the ⟳ renewal
+        // glyph — the Exhausted card's established vocabulary for "wait,
+        // it comes back" — instead of a warning triangle; every other
+        // recovery class keeps ⚠ (PartialStream deliberately matches the
+        // transcript's `⚠ incomplete` marker).
+        MenuKind::ErrorRecovery {
+            card: ErrorRecoveryCardKind::RateLimit | ErrorRecoveryCardKind::QuotaExhausted,
+            ..
+        } => "⟳",
         MenuKind::ErrorRecovery { .. } => "⚠",
         MenuKind::Exhausted => "⟳",
         MenuKind::Choice if menu.origin == "voice" => "◉",
@@ -6797,14 +6953,8 @@ fn transcript_lines<'a>(
                 Span::styled(text.as_str(), theme.dim_style()),
             ]));
         }
-        TranscriptEntry::Error { text } => {
-            // The failed run's public reason (W5g-6) — err ink, ✗ sigil.
-            lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled("✗ ", theme.err_style()),
-                Span::styled(text.as_str(), theme.err_style()),
-            ]));
+        TranscriptEntry::Error { text, presentation } => {
+            error_entry_lines(lines, text, presentation.as_ref(), theme, width);
         }
         TranscriptEntry::Shell { cmd, out } => {
             // Sim ShellRow (tui.js:3910-3918): `$ {cmd}` + output line.
@@ -6822,6 +6972,68 @@ fn transcript_lines<'a>(
             }
         }
     }
+}
+
+/// The failed run's transcript block (E-wave visual pass). A TYPED
+/// presentation renders as a card-shaped block behind a severity rail:
+///
+/// ```text
+///  ✗ Provider rate limit reached            ← err ink, BOLD (title)
+///  ▏ Wait for the provider limit to reset,  ← err rail · dim detail,
+///  ▏ then retry.                              wrapped by display cells
+///  ▏ rate-limited · HTTP 429 · req 8f3a2c1… ← dim fact line, whole-
+///                                             segment shed to width
+/// ```
+///
+/// The fact line carries the trailing `actions: …` hint — the transcript
+/// row may be the only guidance when no recovery card follows. A
+/// text-only error (client-observed failures, pre-E2 wire errors) keeps
+/// the baseline one-line `✗` render. The reset figure is the static
+/// provider delay recorded at failure time (a transcript row is a
+/// record, not a countdown).
+fn error_entry_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    text: &'a str,
+    presentation: Option<&haider_protocol::error::ErrorPresentation>,
+    theme: &Theme,
+    width: u16,
+) {
+    lines.push(Line::default());
+    let Some(presentation) = presentation else {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("✗ ", theme.err_style()),
+            Span::styled(text, theme.err_style()),
+        ]));
+        return;
+    };
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("✗ ", theme.err_style()),
+        Span::styled(
+            presentation.title.clone(),
+            theme.err_style().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let budget = (width as usize).saturating_sub(3);
+    if budget == 0 {
+        return;
+    }
+    for logical in presentation.detail.split('\n') {
+        for row in wrap_body(logical, budget) {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("▏ ", theme.err_style()),
+                Span::styled(row, theme.dim_style()),
+            ]));
+        }
+    }
+    let facts = crate::projection::error_fact_segments_with_actions(presentation, None);
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("▏ ", theme.err_style()),
+        Span::styled(shed_fact_line(&facts, budget), theme.dim_style()),
+    ]));
 }
 
 /// User text split into spans, styling sim paste/image tokens gold on the
@@ -7144,14 +7356,20 @@ fn item_lines<'a>(
                     }
                 }
             }
+            // E-wave visual pass: an interruption is not a failure — the
+            // marker reads as quiet metadata with a warning accent (warn
+            // glyph, dim text, never err ink), and the partial body above
+            // keeps its normal styling. The text is byte-identical to the
+            // plain-mode marker (the e4 pin).
             lines.push(Line::from(vec![
                 Span::raw(" "),
+                Span::styled("⚠ ", theme.warn_style()),
                 Span::styled(
                     format!(
-                        "⚠ incomplete — stream interrupted ({})",
+                        "incomplete — stream interrupted ({})",
                         interruption.subcode.as_str()
                     ),
-                    theme.warn_style(),
+                    theme.dim_style(),
                 ),
             ]));
         }

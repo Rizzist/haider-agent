@@ -427,7 +427,7 @@ fn refusal_after_close_reaches_the_session_view() {
         .entries()
         .iter()
         .find_map(|entry| match entry {
-            TranscriptEntry::Error { text } => Some(text.clone()),
+            TranscriptEntry::Error { text, .. } => Some(text.clone()),
             _ => None,
         })
         .expect("the session view carries the failure");
