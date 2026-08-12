@@ -1468,9 +1468,10 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             if error.presentation.is_some() || error.code == "store_healthy" =>
         {
             vec![LiveReply::ProfileDiagnostic {
-                card: error.presentation.as_ref().map(|_| {
-                    haider_protocol::menu::ErrorRecoveryCardKind::StoreUnwritable
-                }),
+                card: error
+                    .presentation
+                    .as_ref()
+                    .map(|_| haider_protocol::menu::ErrorRecoveryCardKind::StoreUnwritable),
                 presentation: error.presentation,
                 failed_write_ids: error.failed_write_ids,
             }]

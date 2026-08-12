@@ -118,6 +118,7 @@ fn store_unwritable_banner_state_is_persistent_until_healthy_edge() {
     driver.apply(
         &mut model,
         LiveReply::ProfileDiagnostic {
+            card: Some(haider_protocol::menu::ErrorRecoveryCardKind::StoreUnwritable),
             presentation: Some(presentation.clone()),
             failed_write_ids: vec!["event-5".into()],
         },
@@ -131,6 +132,7 @@ fn store_unwritable_banner_state_is_persistent_until_healthy_edge() {
     driver.apply(
         &mut model,
         LiveReply::ProfileDiagnostic {
+            card: None,
             presentation: None,
             failed_write_ids: Vec::new(),
         },
