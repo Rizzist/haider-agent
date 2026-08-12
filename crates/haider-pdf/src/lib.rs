@@ -84,25 +84,165 @@ struct ParsedPdf {
 }
 
 /// Parses page-tree metadata without decoding page content.
+///
+/// The minimal internal parser answers first; when it cannot see the page
+/// tree (fully-compressed PDFs keep page dictionaries inside object streams)
+/// the real-world backend supplies the count instead.
 pub fn inspect_pdf(bytes: &[u8]) -> Result<PdfMetadata, PdfError> {
-    let parsed = parse_pdf(bytes)?;
-    let pages = u32::try_from(parsed.pages.len()).unwrap_or(u32::MAX);
-    Ok(PdfMetadata {
-        pages,
+    let internal = parse_pdf(bytes).map(|parsed| PdfMetadata {
+        pages: u32::try_from(parsed.pages.len()).unwrap_or(u32::MAX),
         encrypted: parsed.encrypted,
+    });
+    match internal {
+        Ok(metadata) if metadata.pages > 0 => Ok(metadata),
+        other => inspect_real_world(bytes).map_or(other, Ok),
+    }
+}
+
+/// Page-tree inspection through `lopdf` for PDFs the minimal parser cannot
+/// read (object streams, xref streams). `lopdf` has panic paths on exotic
+/// inputs, so it runs under `catch_unwind`; a panic means "no answer here",
+/// never a crash.
+fn inspect_real_world(bytes: &[u8]) -> Option<PdfMetadata> {
+    let owned = bytes.to_vec();
+    std::panic::catch_unwind(move || {
+        let document = lopdf::Document::load_mem(&owned).ok()?;
+        let pages = u32::try_from(document.get_pages().len()).ok()?;
+        (pages > 0).then_some(PdfMetadata {
+            pages,
+            encrypted: document.trailer.get(b"Encrypt").is_ok(),
+        })
+    })
+    .ok()
+    .flatten()
+}
+
+/// Real-world extraction backend: `pdf_extract` handles the generator
+/// population the deliberately-minimal internal parser does not (object
+/// streams, xref streams, ToUnicode CMaps, subsetted fonts — e.g. every
+/// Chrome-printed PDF). It runs under `catch_unwind` because it has panic
+/// paths on exotic font programs; a panic or error falls back to the
+/// internal pipeline rather than surfacing.
+fn extract_pages_real_world(bytes: &[u8]) -> Option<Vec<String>> {
+    let owned = bytes.to_vec();
+    std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem_by_pages(&owned).ok())
+        .ok()
+        .flatten()
+}
+
+/// Applies the exact per-page, aggregate and honest-marker bounds to
+/// pre-extracted page texts. Returns `None` when every page is blank so the
+/// caller can fall through to the internal pipeline's typed verdict.
+fn bound_real_world_pages(page_texts: &[String], total_pages: u32) -> Option<ExtractedPdfText> {
+    let mut output = String::new();
+    let mut pages_extracted = 0_u32;
+    let mut truncated = false;
+    for (page_index, raw) in page_texts.iter().enumerate() {
+        let page_number = u32::try_from(page_index + 1).unwrap_or(u32::MAX);
+        pages_extracted = page_number;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let page_was_truncated = trimmed.chars().count() > MAX_PDF_PAGE_TEXT_CHARS;
+        let page_text = take_chars(trimmed, MAX_PDF_PAGE_TEXT_CHARS);
+        let heading = format!("[pdf page {page_number}]\n");
+        let separator = if output.is_empty() { "" } else { "\n\n" };
+        let required =
+            separator.chars().count() + heading.chars().count() + page_text.chars().count();
+        if output.chars().count().saturating_add(required) > MAX_PDF_TOTAL_TEXT_CHARS {
+            let prefix = format!("{separator}{heading}");
+            let room = MAX_PDF_TOTAL_TEXT_CHARS
+                .saturating_sub(output.chars().count())
+                .saturating_sub(prefix.chars().count());
+            output.push_str(&prefix);
+            output.push_str(&take_chars(&page_text, room));
+            truncated = true;
+            break;
+        }
+        output.push_str(separator);
+        output.push_str(&heading);
+        output.push_str(&page_text);
+        if page_was_truncated {
+            truncated = true;
+            break;
+        }
+    }
+    if output.trim().is_empty() {
+        return None;
+    }
+    if pages_extracted < total_pages {
+        truncated = true;
+    }
+    if truncated {
+        let marker = format!("[pdf truncated: {pages_extracted} of {total_pages} pages]");
+        let reserved = marker.chars().count() + 2;
+        let keep = MAX_PDF_TOTAL_TEXT_CHARS.saturating_sub(reserved);
+        output = take_chars(&output, keep);
+        while output.ends_with(char::is_whitespace) {
+            output.pop();
+        }
+        output.push_str("\n\n");
+        output.push_str(&marker);
+    }
+    Some(ExtractedPdfText {
+        text: output,
+        pages_extracted,
+        total_pages,
+        truncated,
     })
 }
 
 /// Extracts text page by page under independent per-page, per-stream and
 /// aggregate bounds. Truncation always ends with the stable honest marker.
+///
+/// Extraction ladder: the internal parser is the encryption authority; the
+/// `pdf_extract` backend then gets the first attempt (it covers the modern
+/// generator population); the internal pipeline is the fallback that also
+/// owns the typed verdict when both produce nothing.
 pub fn extract_text_bounded(bytes: &[u8]) -> Result<ExtractedPdfText, PdfError> {
-    let parsed = parse_pdf(bytes)?;
-    if parsed.encrypted {
+    let parsed = parse_pdf(bytes);
+    if let Ok(parsed) = &parsed
+        && parsed.encrypted
+    {
         return Err(PdfError::new(
             PdfErrorKind::Encrypted,
             "this PDF is encrypted; remove the password and attach it again",
         ));
     }
+    let internal_pages = parsed.as_ref().map(|parsed| parsed.pages.len()).ok();
+    if let Some(page_texts) = extract_pages_real_world(bytes) {
+        let total_pages = u32::try_from(
+            internal_pages
+                .unwrap_or(page_texts.len())
+                .max(page_texts.len()),
+        )
+        .unwrap_or(u32::MAX);
+        if let Some(extracted) = bound_real_world_pages(&page_texts, total_pages) {
+            return Ok(extracted);
+        }
+    }
+    match parsed {
+        Ok(parsed) => extract_text_bounded_internal(&parsed),
+        Err(error) => {
+            // The minimal parser could not read it and neither could the
+            // real-world backend. An /Encrypt marker makes the actionable
+            // verdict "remove the password", not "malformed".
+            if bytes
+                .windows(b"/Encrypt".len())
+                .any(|window| window == b"/Encrypt")
+            {
+                return Err(PdfError::new(
+                    PdfErrorKind::Encrypted,
+                    "this PDF is encrypted; remove the password and attach it again",
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn extract_text_bounded_internal(parsed: &ParsedPdf) -> Result<ExtractedPdfText, PdfError> {
     let total_pages = u32::try_from(parsed.pages.len()).unwrap_or(u32::MAX);
     let mut output = String::new();
     let mut pages_extracted = 0_u32;
