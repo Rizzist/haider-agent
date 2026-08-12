@@ -844,6 +844,7 @@ impl DelegationHandle {
                 worker_generation: self.hub.worker_generation(),
                 branch_id: None,
                 first_user_turn: false,
+                pdf_attachments: Vec::new(),
                 disposition: match message.delivery {
                     AgentMessageDelivery::DeliveredSteer => {
                         haider_core::TurnAdmissionDisposition::SteerPending

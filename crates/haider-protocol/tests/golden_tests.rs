@@ -897,7 +897,7 @@ fn golden_effect_phases() {
 
 #[test]
 fn golden_attachments() {
-    use haider_protocol::tool::AttachmentBlock;
+    use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
     golden(
         "attachment_image",
         &AttachmentBlock::Image {
@@ -923,6 +923,29 @@ fn golden_attachments() {
             lines: 42,
         },
     );
+    additive_golden(
+        "attachment_pdf",
+        &AttachmentBlock::Pdf {
+            artifact: ArtifactRef::new("blake3:pdf"),
+            name: "report.pdf".into(),
+            pages: 12,
+            delivery: PdfDeliveryMode::NativeDocument,
+        },
+    );
+    let legacy_pdf: AttachmentBlock = serde_json::from_value(serde_json::json!({
+        "kind": "pdf",
+        "artifact": "blake3:legacy-pdf",
+        "name": "legacy.pdf",
+        "pages": 3
+    }))
+    .expect("pre-delivery PDF block decodes");
+    assert!(matches!(
+        legacy_pdf,
+        AttachmentBlock::Pdf {
+            delivery: PdfDeliveryMode::ExtractedText,
+            ..
+        }
+    ));
 }
 
 #[test]

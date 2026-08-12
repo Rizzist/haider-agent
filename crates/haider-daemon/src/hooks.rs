@@ -1260,6 +1260,9 @@ async fn prepare_hook_input(
             haider_protocol::tool::AttachmentBlock::File { artifact, .. } => {
                 (artifact, "text/plain".to_owned())
             }
+            haider_protocol::tool::AttachmentBlock::Pdf { artifact, .. } => {
+                (artifact, "application/pdf".to_owned())
+            }
             haider_protocol::tool::AttachmentBlock::Skill { name, .. } => {
                 return Err(format!(
                     "user_message hook input was skipped: skill attachment `{name}` has no artifact metadata"

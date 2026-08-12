@@ -2061,6 +2061,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
         branch_id: None,
         disposition: haider_store::TurnAdmissionDisposition::Queued,
         first_user_turn: false,
+        pdf_attachments: Vec::new(),
     };
     let manager = crate::worker::WorkerManager::start(
         hub.clone(),

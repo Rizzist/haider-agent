@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, VecDeque};
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES_PER_PDF_TURN: usize = 64 * 1024 * 1024;
 
 /// Profile-vault alias holding the transcription secret (the Deepgram API
 /// key). Daemon-internal: clients only ever speak
@@ -3878,8 +3879,43 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         }
-        match validate_turn_attachments(&self.hub.inner.store, &attachments).await {
-            Ok(()) => {}
+        let pdf_delivery = if attachments.iter().any(|attachment| {
+            matches!(
+                attachment,
+                haider_protocol::tool::AttachmentBlock::Pdf { .. }
+            )
+        }) {
+            let metadata = match self.hub.session_metadata(&session_id).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "PDF attachment admission requires typed session metadata",
+                        false,
+                        None,
+                    );
+                }
+                Err(error) => return self.respond_turn_error(request_id, error),
+            };
+            if haider_provider::pdf_document_capability(&metadata.provider)
+                == haider_protocol::provider::FeatureResolve::Native
+            {
+                haider_protocol::tool::PdfDeliveryMode::NativeDocument
+            } else {
+                haider_protocol::tool::PdfDeliveryMode::ExtractedText
+            }
+        } else {
+            haider_protocol::tool::PdfDeliveryMode::ExtractedText
+        };
+        let attachments = match validate_turn_attachments(
+            &self.hub.inner.store,
+            &attachments,
+            pdf_delivery,
+        )
+        .await
+        {
+            Ok(attachments) => attachments,
             Err(failure) => {
                 return self.respond_error(
                     request_id,
@@ -3889,7 +3925,7 @@ impl HubConnection {
                     failure.data,
                 );
             }
-        }
+        };
         // Captured before `text` moves into the acceptance command; only a
         // committed FIRST accept consumes it (G2 auto-title).
         let first_turn_slug = auto_title_slug(&text);
@@ -5300,7 +5336,8 @@ fn auto_title_slug(text: &str) -> String {
 async fn validate_turn_attachments(
     store: &haider_core::SqliteStoreHandle,
     attachments: &[haider_protocol::tool::AttachmentBlock],
-) -> Result<(), AttachmentValidationFailure> {
+    pdf_delivery: haider_protocol::tool::PdfDeliveryMode,
+) -> Result<Vec<haider_protocol::tool::AttachmentBlock>, AttachmentValidationFailure> {
     if attachments.len() > MAX_ATTACHMENTS_PER_TURN {
         let actual_count = u32::try_from(attachments.len()).unwrap_or(u32::MAX);
         return Err(AttachmentValidationFailure {
@@ -5316,12 +5353,22 @@ async fn validate_turn_attachments(
     }
 
     let mut total_bytes = 0_usize;
+    let aggregate_limit = if attachments.iter().any(|attachment| {
+        matches!(
+            attachment,
+            haider_protocol::tool::AttachmentBlock::Pdf { .. }
+        )
+    }) {
+        // PDF is the only attachment lane whose typed per-file budget is
+        // larger than the historical 16 MiB turn aggregate. Keep the legacy
+        // law exact for every pre-PDF turn.
+        MAX_ATTACHMENT_BYTES_PER_PDF_TURN
+    } else {
+        MAX_ATTACHMENT_BYTES_PER_TURN
+    };
+    let mut canonical = Vec::with_capacity(attachments.len());
     for (index, attachment) in attachments.iter().enumerate() {
         let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
-        // Set only for File blocks: the daemon re-verifies the bytes decode
-        // as UTF-8 after the CAS read below (G2 — the client gate is not
-        // trusted; a provider must never receive undecodable "text").
-        let mut requires_utf8 = false;
         let artifact = match attachment {
             haider_protocol::tool::AttachmentBlock::Image { artifact, mime, .. } => {
                 if !IMAGE_ATTACHMENT_MIME_ALLOWLIST.contains(&mime.as_str()) {
@@ -5357,7 +5404,23 @@ async fn validate_turn_attachments(
                         data: None,
                     });
                 }
-                requires_utf8 = true;
+                artifact
+            }
+            haider_protocol::tool::AttachmentBlock::Pdf { artifact, name, .. } => {
+                if name.is_empty()
+                    || name.chars().count() > 120
+                    || name.chars().any(char::is_control)
+                    || name.contains('/')
+                    || name.contains('\\')
+                {
+                    return Err(AttachmentValidationFailure {
+                        code: ERROR_CODE_INVALID_ARGUMENT,
+                        message: format!(
+                            "attachment {index} declares an invalid PDF name; names are non-empty basenames of at most 120 characters with no control characters"
+                        ),
+                        data: None,
+                    });
+                }
                 artifact
             }
             haider_protocol::tool::AttachmentBlock::Skill { name, .. } => {
@@ -5378,46 +5441,142 @@ async fn validate_turn_attachments(
                 artifact: artifact.clone(),
             }),
         })?;
-        if bytes.len() > MAX_ATTACHMENT_BYTES {
-            let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            return Err(AttachmentValidationFailure {
-                code: ERROR_CODE_ATTACHMENT_TOO_LARGE,
-                message: format!(
-                    "attachment {index} is {actual_bytes} bytes; the per-attachment limit is {MAX_ATTACHMENT_BYTES}"
-                ),
-                data: Some(ErrorData::AttachmentTooLarge {
-                    index: index_u32,
+        let canonical_attachment = match attachment {
+            haider_protocol::tool::AttachmentBlock::Pdf { name, .. } => {
+                if bytes.len() > haider_pdf::MAX_PDF_BYTES {
+                    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    let message = format!(
+                        "PDF attachment {index} is {actual_bytes} bytes; the PDF limit is {}",
+                        haider_pdf::MAX_PDF_BYTES
+                    );
+                    let presentation = haider_protocol::error::ErrorPresentation::new(
+                        "pdf-too-large",
+                        "PDF is too large",
+                        &message,
+                        haider_protocol::error::ErrorScope::Turn,
+                        [haider_protocol::error::ErrorAction::None],
+                    );
+                    return Err(AttachmentValidationFailure {
+                        code: ERROR_CODE_PDF_TOO_LARGE,
+                        message,
+                        data: Some(ErrorData::PdfTooLarge {
+                            index: index_u32,
+                            artifact: artifact.clone(),
+                            actual_bytes,
+                            max_bytes: haider_pdf::MAX_PDF_BYTES as u64,
+                            presentation,
+                        }),
+                    });
+                }
+                let metadata = haider_pdf::inspect_pdf(&bytes).map_err(|error| {
+                    let message = format!("PDF attachment {index} could not be parsed: {error}");
+                    AttachmentValidationFailure {
+                        code: ERROR_CODE_PDF_MALFORMED,
+                        data: Some(ErrorData::PdfMalformed {
+                            index: index_u32,
+                            artifact: artifact.clone(),
+                            presentation: haider_protocol::error::ErrorPresentation::new(
+                                "pdf-malformed",
+                                "PDF could not be read",
+                                &message,
+                                haider_protocol::error::ErrorScope::Turn,
+                                [haider_protocol::error::ErrorAction::None],
+                            ),
+                        }),
+                        message,
+                    }
+                })?;
+                if metadata.pages > haider_pdf::MAX_PDF_PAGES {
+                    let message = format!(
+                        "PDF attachment {index} has {} pages; the limit is {} pages",
+                        metadata.pages,
+                        haider_pdf::MAX_PDF_PAGES
+                    );
+                    let presentation = haider_protocol::error::ErrorPresentation::new(
+                        "pdf-too-many-pages",
+                        "PDF has too many pages",
+                        &message,
+                        haider_protocol::error::ErrorScope::Turn,
+                        [haider_protocol::error::ErrorAction::None],
+                    );
+                    return Err(AttachmentValidationFailure {
+                        code: ERROR_CODE_PDF_TOO_MANY_PAGES,
+                        message,
+                        data: Some(ErrorData::PdfTooManyPages {
+                            index: index_u32,
+                            artifact: artifact.clone(),
+                            actual_pages: metadata.pages,
+                            max_pages: haider_pdf::MAX_PDF_PAGES,
+                            presentation,
+                        }),
+                    });
+                }
+                haider_protocol::tool::AttachmentBlock::Pdf {
                     artifact: artifact.clone(),
-                    actual_bytes,
-                    max_bytes: MAX_ATTACHMENT_BYTES as u64,
-                }),
-            });
-        }
-        if requires_utf8 && std::str::from_utf8(&bytes).is_err() {
-            return Err(AttachmentValidationFailure {
-                code: ERROR_CODE_INVALID_ARGUMENT,
-                message: format!(
-                    "attachment {index} is not UTF-8 text; only UTF-8 text files can be attached (unsupported_attachment_encoding)"
-                ),
-                data: None,
-            });
-        }
+                    name: name.clone(),
+                    pages: metadata.pages,
+                    delivery: pdf_delivery,
+                }
+            }
+            haider_protocol::tool::AttachmentBlock::File { .. } => {
+                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                    return Err(oversized_attachment(index_u32, artifact, bytes.len()));
+                }
+                if std::str::from_utf8(&bytes).is_err() {
+                    return Err(AttachmentValidationFailure {
+                        code: ERROR_CODE_INVALID_ARGUMENT,
+                        message: format!(
+                            "attachment {index} is not UTF-8 text; only UTF-8 text files can be attached (unsupported_attachment_encoding)"
+                        ),
+                        data: None,
+                    });
+                }
+                attachment.clone()
+            }
+            _ => {
+                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                    return Err(oversized_attachment(index_u32, artifact, bytes.len()));
+                }
+                attachment.clone()
+            }
+        };
         total_bytes = total_bytes.saturating_add(bytes.len());
-        if total_bytes > MAX_ATTACHMENT_BYTES_PER_TURN {
+        if total_bytes > aggregate_limit {
             let actual_bytes = u64::try_from(total_bytes).unwrap_or(u64::MAX);
             return Err(AttachmentValidationFailure {
                 code: ERROR_CODE_ATTACHMENTS_TOO_LARGE,
                 message: format!(
-                    "turn attachments total {actual_bytes} bytes; the aggregate limit is {MAX_ATTACHMENT_BYTES_PER_TURN}"
+                    "turn attachments total {actual_bytes} bytes; the aggregate limit is {aggregate_limit}"
                 ),
                 data: Some(ErrorData::AttachmentsTooLarge {
                     actual_bytes,
-                    max_bytes: MAX_ATTACHMENT_BYTES_PER_TURN as u64,
+                    max_bytes: aggregate_limit as u64,
                 }),
             });
         }
+        canonical.push(canonical_attachment);
     }
-    Ok(())
+    Ok(canonical)
+}
+
+fn oversized_attachment(
+    index: u32,
+    artifact: &haider_protocol::ids::ArtifactRef,
+    bytes: usize,
+) -> AttachmentValidationFailure {
+    let actual_bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    AttachmentValidationFailure {
+        code: ERROR_CODE_ATTACHMENT_TOO_LARGE,
+        message: format!(
+            "attachment {index} is {actual_bytes} bytes; the per-attachment limit is {MAX_ATTACHMENT_BYTES}"
+        ),
+        data: Some(ErrorData::AttachmentTooLarge {
+            index,
+            artifact: artifact.clone(),
+            actual_bytes,
+            max_bytes: MAX_ATTACHMENT_BYTES as u64,
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

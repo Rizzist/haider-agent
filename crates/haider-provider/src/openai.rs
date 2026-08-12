@@ -2161,6 +2161,7 @@ pub fn replay_kimi_models_response(
         } else {
             FeatureResolve::Unsupported
         },
+        pdf_documents: FeatureResolve::ExplicitlyEmulated,
         thinking_visible: if extensions.supports_reasoning && extensions.supports_thinking_type {
             FeatureResolve::Native
         } else {
@@ -2419,6 +2420,11 @@ fn responses_request_json(
                 Block::Attachment(AttachmentBlock::File { artifact, .. }) => {
                     return Err(invalid_request(format!(
                         "file attachment `{artifact}` was not resolved by the prompt compiler"
+                    )));
+                }
+                Block::Attachment(AttachmentBlock::Pdf { artifact, .. }) => {
+                    return Err(invalid_request(format!(
+                        "PDF attachment `{artifact}` was not resolved by the prompt compiler"
                     )));
                 }
                 Block::Attachment(AttachmentBlock::Skill { name, .. }) => {
@@ -2730,6 +2736,11 @@ fn chat_request_json(
                                 }
                             }));
                         }
+                        Block::Attachment(AttachmentBlock::Pdf { artifact, .. }) => {
+                            return Err(invalid_request(format!(
+                                "PDF attachment `{artifact}` was not resolved by the prompt compiler"
+                            )));
+                        }
                         Block::ToolResult {
                             call_id, preview, ..
                         } => results.push((call_id, preview)),
@@ -2916,6 +2927,7 @@ fn native_capabilities(model: &str) -> CapabilityDoc {
         parallel_tools: FeatureResolve::Native,
         streaming_tool_args: FeatureResolve::Native,
         vision: FeatureResolve::Native,
+        pdf_documents: FeatureResolve::ExplicitlyEmulated,
         thinking_visible: if model_has_reasoning(model) {
             FeatureResolve::Native
         } else {
@@ -2934,6 +2946,7 @@ fn compatible_capabilities(provider: &str) -> CapabilityDoc {
         parallel_tools: FeatureResolve::Unsupported,
         streaming_tool_args: FeatureResolve::Unsupported,
         vision: FeatureResolve::Unsupported,
+        pdf_documents: FeatureResolve::ExplicitlyEmulated,
         thinking_visible: FeatureResolve::Unsupported,
         context_limit: 0,
     }
@@ -2945,6 +2958,7 @@ fn unavailable_compatible_capabilities(provider: &str) -> CapabilityDoc {
         parallel_tools: FeatureResolve::Unsupported,
         streaming_tool_args: FeatureResolve::Unsupported,
         vision: FeatureResolve::Unsupported,
+        pdf_documents: FeatureResolve::ExplicitlyEmulated,
         thinking_visible: FeatureResolve::Unsupported,
         context_limit: 0,
     }

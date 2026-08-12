@@ -1002,6 +1002,7 @@ name = "haider-client"
 version = "0.0.905"
 dependencies = [
  "blake3",
+ "haider-pdf",
  "haider-rpc",
  "rustix 1.1.4",
  "serde",
@@ -1041,6 +1042,7 @@ dependencies = [
  "haider-accounts",
  "haider-client",
  "haider-core",
+ "haider-pdf",
  "haider-protocol",
  "haider-provider",
  "haider-rpc",
@@ -1090,6 +1092,13 @@ dependencies = [
  "tracing",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "haider-pdf"
+version = "0.0.905"
+dependencies = [
+ "flate2",
 ]
 
 [[package]]

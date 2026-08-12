@@ -52,6 +52,18 @@ pub enum PendingKind {
     /// Carries the sanitized BASENAME because the wire block names the
     /// file for the model; the chip shows `name · N lines`.
     File { name: String, lines: u32 },
+    /// `/attach <path.pdf>` — first-class PDF with verified page count.
+    Pdf { name: String, pages: u32 },
+}
+
+impl PendingKind {
+    #[must_use]
+    pub const fn glyph(&self) -> &'static str {
+        match self {
+            Self::Pdf { .. } => "▤",
+            Self::Image { .. } | Self::PastedText { .. } | Self::File { .. } => "⌁",
+        }
+    }
 }
 
 /// One attachment the draft will carry on its next submit (B4b).
@@ -94,6 +106,12 @@ impl PendingAttachment {
                 artifact,
                 name: name.clone(),
                 lines: *lines,
+            },
+            PendingKind::Pdf { name, pages } => AttachmentBlock::Pdf {
+                artifact,
+                name: name.clone(),
+                pages: *pages,
+                delivery: haider_protocol::tool::PdfDeliveryMode::ExtractedText,
             },
         })
     }

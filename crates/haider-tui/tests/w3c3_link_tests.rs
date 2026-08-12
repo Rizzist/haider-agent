@@ -612,6 +612,7 @@ fn map_frame_translates_every_uncorrelated_frame_it_owns() {
             message: "try later".into(),
             // A non-fatal protocol error is retryable; a fatal one is not.
             retryable: true,
+            presentation: None,
         }]
     );
     assert!(
@@ -738,6 +739,7 @@ fn map_response_interprets_attach_outcomes_through_their_context() {
             code: "stale_generation".into(),
             message: "restart".into(),
             retryable: false,
+            presentation: None,
         }]
     );
     assert_eq!(

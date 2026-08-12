@@ -874,6 +874,7 @@ fn non_stage_noid_failure_never_shifts_stage_correlation() {
             code: "list_failed".to_owned(),
             message: "roster unavailable".to_owned(),
             retryable: true,
+            presentation: None,
         }),
         start,
     );
@@ -977,6 +978,7 @@ fn retired_failed_reply_is_silent_no_flash() {
             code: "provider_rejected".to_owned(),
             message: "old attempt failed".to_owned(),
             retryable: false,
+            presentation: None,
         }),
         start,
     );

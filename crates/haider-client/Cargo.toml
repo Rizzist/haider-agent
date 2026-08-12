@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 blake3.workspace = true
 haider-rpc = { path = "../haider-rpc" }
+haider-pdf = { path = "../haider-pdf" }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

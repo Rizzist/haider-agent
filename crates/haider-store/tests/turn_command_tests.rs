@@ -1,9 +1,10 @@
 #![allow(clippy::expect_used)]
 
-use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::tool::{AttachmentBlock, PdfAttachmentReceipt, PdfDeliveryMode};
+use haider_protocol::{DeliveryMode, EventPayload};
 use haider_store::{
     EventStore, SessionCreateCommand, Store, TurnAcceptCommand, TurnAcceptOutcome,
     TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
@@ -308,6 +309,67 @@ fn submit_replay_is_idempotent_and_changed_body_is_rejected() {
     changed.request_json = r#"{"text":"other"}"#.into();
     assert!(store.accept_turn(&changed).is_err());
     assert_eq!(store.latest_seq(&session_id).expect("head"), 5);
+}
+
+#[test]
+fn pdf_page_count_and_delivery_survive_journal_and_receipt_replay() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("session-pdf-replay");
+    create(&store, &session_id);
+    let artifact = ArtifactRef::new("blake3:durable-pdf");
+    let attachment = AttachmentBlock::Pdf {
+        artifact: artifact.clone(),
+        name: "report.pdf".into(),
+        pages: 12,
+        delivery: PdfDeliveryMode::NativeDocument,
+    };
+    let mut command = submit(&store, "submit-pdf", &session_id, "run-pdf");
+    command.request_digest = "submit-pdf-digest".into();
+    command.request_json = r#"{"attachments":[{"kind":"pdf"}]}"#.into();
+    command.attachments = vec![attachment.clone()];
+
+    let TurnAcceptOutcome::Committed {
+        accepted,
+        envelopes,
+    } = store.accept_turn(&command).expect("accept PDF turn")
+    else {
+        panic!("first PDF submit commits")
+    };
+    assert_eq!(
+        accepted.pdf_attachments,
+        vec![PdfAttachmentReceipt {
+            artifact: artifact.clone(),
+            pages: 12,
+            delivery: PdfDeliveryMode::NativeDocument,
+        }]
+    );
+    let journaled = envelopes.iter().any(|envelope| {
+        matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::UserMessage { attachments, .. }) if attachments == vec![attachment.clone()]
+        )
+    });
+    assert!(
+        journaled,
+        "the canonical PDF block is a durable journal fact"
+    );
+
+    let receipt = store
+        .turn_accept_receipt(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )
+        .expect("receipt lookup")
+        .expect("stored receipt");
+    assert_eq!(receipt, accepted);
+    let TurnAcceptOutcome::IdempotentReplay { accepted: replay } =
+        store.accept_turn(&command).expect("replay PDF turn")
+    else {
+        panic!("same PDF command replays")
+    };
+    assert_eq!(replay, accepted);
 }
 
 /// MUTATION CHECK: look up the receipt before taking the IMMEDIATE write

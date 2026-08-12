@@ -147,6 +147,7 @@ fn provider_remove_issues_and_surfaces_the_typed_refusal() {
             code: "invalid_argument".into(),
             message: "provider `probefix` is referenced by credential aliases: probefix".into(),
             retryable: false,
+            presentation: None,
         }),
     );
     assert!(

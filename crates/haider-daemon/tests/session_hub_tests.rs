@@ -7,7 +7,8 @@
 
 use base64::Engine as _;
 use haider_core::{
-    HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitCommittedTurn,
+    HarnessActor, HarnessConfig, SessionCreateCommand, SqliteStoreHandle, StoreHandle,
+    SubmitCommittedTurn,
 };
 use haider_daemon::ConnectionTransport;
 use haider_daemon::{
@@ -29,14 +30,15 @@ use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
-use haider_protocol::tool::AttachmentBlock;
+use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
 use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
 use haider_rpc::{
     ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachmentId, Capability, CapabilitySet, CommandId,
     ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
-    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData,
-    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary, WireFrame,
+    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
+    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, ObserveRunStateWire,
+    RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary, WireFrame,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -539,6 +541,90 @@ async fn attach_control_session(
     ));
 }
 
+async fn create_and_attach_typed_session(
+    store: &SqliteStoreHandle,
+    connection: &HubConnection,
+    sink: &CollectSink,
+    session_id: &SessionId,
+    provider: &str,
+) {
+    store
+        .create_session(SessionCreateCommand {
+            command_id: format!("create-{session_id}"),
+            request_digest: format!("create-digest-{session_id}"),
+            request_json: format!(
+                r#"{{"cwd":"/tmp","max_tokens":4096,"model":"test-model","provider":"{provider}"}}"#
+            ),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: provider.into(),
+            model: "test-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "test-system-v1".into(),
+            event_id: EventId::new(format!("created-{session_id}")),
+            device_id: DeviceId::new("hub-test"),
+        })
+        .await
+        .expect("typed session creates");
+    connection
+        .request(
+            RequestId::new(format!("attach-{session_id}")),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+            },
+        )
+        .await
+        .expect("control attach routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionAttach { .. },
+            ..
+        }
+    ));
+    assert!(matches!(sink.next().await, WireFrame::Event { .. }));
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+}
+
+fn pdf_fixture(pages: u32, content: Option<&str>) -> Vec<u8> {
+    let kids = (0..pages)
+        .map(|index| format!("{} 0 R", index + 3))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let content_id = pages + 3;
+    let mut pdf = format!(
+        "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+         2 0 obj\n<< /Type /Pages /Count {pages} /Kids [{kids}] >>\nendobj\n"
+    );
+    for index in 0..pages {
+        let contents = content.map_or_else(String::new, |_| format!(" /Contents {content_id} 0 R"));
+        pdf.push_str(&format!(
+            "{} 0 obj\n<< /Type /Page /Parent 2 0 R{contents} >>\nendobj\n",
+            index + 3
+        ));
+    }
+    if let Some(content) = content {
+        pdf.push_str(&format!(
+            "{content_id} 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+            content.len()
+        ));
+    }
+    pdf.push_str("trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    pdf.into_bytes()
+}
+
 /// MUTATION CHECK: bypass daemon CAS ingress, return a caller-provided ref,
 /// or rewrite an existing object. Expected RUNTIME failure: the verified
 /// BLAKE3 ref/byte count differs, the stored bytes differ, or the second put
@@ -704,6 +790,120 @@ async fn oversized_put_and_oversized_turn_are_typed_errors() {
             body: ResponseBody::Error { ref code, data: Some(ErrorData::TooManyAttachments { .. }), .. },
             ..
         } if code == ERROR_CODE_TOO_MANY_ATTACHMENTS
+    ));
+    assert_eq!(store.latest_seq(&session_id).await.expect("head"), 1);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+#[tokio::test]
+async fn pdf_byte_page_and_parse_caps_are_typed_at_daemon_admission() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let session_id = SessionId::new("pdf-admission-validation");
+    create_and_attach_typed_session(&store, &connection, &sink, &session_id, "openai").await;
+
+    let cases = [
+        (
+            "pdf-malformed",
+            b"%PDF-1.4\nnot a PDF".to_vec(),
+            ERROR_CODE_PDF_MALFORMED,
+            "pdf-malformed",
+        ),
+        (
+            "pdf-too-many-pages",
+            pdf_fixture(haider_pdf::MAX_PDF_PAGES + 1, None),
+            ERROR_CODE_PDF_TOO_MANY_PAGES,
+            "pdf-too-many-pages",
+        ),
+    ];
+    for (label, bytes, expected_code, expected_subcode) in cases {
+        let ResponseBody::ArtifactPut { artifact, .. } =
+            upload_bytes(&connection, &sink, &format!("put-{label}"), &bytes).await
+        else {
+            panic!("PDF fixture upload succeeds")
+        };
+        connection
+            .request(
+                RequestId::new(format!("submit-{label}")),
+                RequestBody::TurnSubmit {
+                    command_id: CommandId::new(format!("submit-{label}")),
+                    session_id: session_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    text: "read PDF".into(),
+                    attachments: vec![AttachmentBlock::Pdf {
+                        artifact,
+                        name: "report.pdf".into(),
+                        pages: 1,
+                        delivery: PdfDeliveryMode::ExtractedText,
+                    }],
+                    mode: DeliveryMode::Queue,
+                },
+            )
+            .await
+            .expect("PDF submit routes");
+        let WireFrame::Response {
+            body: ResponseBody::Error { code, data, .. },
+            ..
+        } = sink.next().await
+        else {
+            panic!("PDF rejection response")
+        };
+        assert_eq!(code, expected_code);
+        let presentation = match data.expect("typed PDF error data") {
+            ErrorData::PdfMalformed { presentation, .. }
+            | ErrorData::PdfTooManyPages { presentation, .. } => presentation,
+            other => panic!("wrong PDF error data: {other:?}"),
+        };
+        assert_eq!(presentation.subcode.as_str(), expected_subcode);
+    }
+
+    let mut oversized = pdf_fixture(1, None);
+    oversized.resize(haider_pdf::MAX_PDF_BYTES + 1, b' ');
+    let ResponseBody::ArtifactPut { artifact, .. } =
+        upload_bytes(&connection, &sink, "put-pdf-too-large", &oversized).await
+    else {
+        panic!("artifact ingress intentionally exceeds the narrower PDF cap")
+    };
+    connection
+        .request(
+            RequestId::new("submit-pdf-too-large"),
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new("submit-pdf-too-large"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                text: "read oversized PDF".into(),
+                attachments: vec![AttachmentBlock::Pdf {
+                    artifact,
+                    name: "large.pdf".into(),
+                    pages: 1,
+                    delivery: PdfDeliveryMode::ExtractedText,
+                }],
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("oversized PDF submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                ref code,
+                data: Some(ErrorData::PdfTooLarge { ref presentation, .. }),
+                ..
+            },
+            ..
+        } if code == ERROR_CODE_PDF_TOO_LARGE
+            && presentation.subcode.as_str() == "pdf-too-large"
     ));
     assert_eq!(store.latest_seq(&session_id).await.expect("head"), 1);
 

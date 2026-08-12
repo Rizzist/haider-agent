@@ -356,6 +356,7 @@ fn a_rejected_submit_lands_in_the_session_view() {
             code: "unauthorized".to_owned(),
             message: "oauth token expired".to_owned(),
             retryable: false,
+            presentation: None,
         }),
         std::time::Instant::now(),
     );

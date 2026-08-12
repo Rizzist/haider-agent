@@ -420,6 +420,32 @@ fn responses_payload_uses_native_input_tools_and_reasoning_summary() {
 }
 
 #[test]
+fn responses_payload_carries_daemon_extracted_pdf_as_plain_input_text() {
+    let provider = native_provider("gpt-5-test");
+    let extracted = "<file name=\"report.pdf\" pages=\"12\" source=\"pdf\">\nPDF body\n</file>";
+    let request = TurnRequest {
+        messages: vec![Message::user_text(extracted)],
+        model: "gpt-5-test".into(),
+        max_tokens: 256,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        cache_metadata: None,
+    };
+
+    let payload = provider
+        .request_payload(&request)
+        .expect("Responses payload");
+
+    assert_eq!(payload["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(payload["input"][0]["content"][0]["text"], extracted);
+    assert!(
+        payload.to_string().find("application/pdf").is_none(),
+        "emulated providers must never receive native PDF blocks"
+    );
+}
+
+#[test]
 fn compatible_payload_uses_chat_completions_lingua_franca() {
     let provider = compatible_provider("llama-test", "http://127.0.0.1:12345/v1");
     let request = TurnRequest {

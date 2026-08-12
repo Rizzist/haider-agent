@@ -577,6 +577,7 @@ fn a_typed_fork_failure_leaves_topology_unchanged() {
             code: "invalid_argument".to_owned(),
             message: "fork node is not on the source lineage".to_owned(),
             retryable: false,
+            presentation: None,
         },
     );
     assert_eq!(model.branch_state.named_count(), 0);

@@ -11,11 +11,11 @@ use std::time::Duration;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent};
-use haider_protocol::tool::AttachmentBlock;
+use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
 use haider_provider::{
-    AnthropicProvider, AnthropicRetryPolicy, Message, MessageRole, Provider, ProviderError,
-    ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
-    replay_anthropic_http_error, replay_anthropic_sse,
+    AnthropicProvider, AnthropicRetryPolicy, BUILTIN_PROVIDER_NAMES, Message, MessageRole,
+    Provider, ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
+    pdf_document_capability, replay_anthropic_http_error, replay_anthropic_sse,
 };
 
 use provider_manifest::Manifest;
@@ -148,6 +148,7 @@ fn thinking_start_content_is_buffered_and_only_deltas_are_emitted() {
 fn request_payload_maps_system_tools_tool_results_and_a2_images() {
     let provider = provider("claude-sonnet-5");
     let image = ArtifactRef::new("blake3:image");
+    let pdf = ArtifactRef::new("blake3:pdf");
     let request = TurnRequest {
         model: "claude-sonnet-5".into(),
         max_tokens: 512,
@@ -161,10 +162,16 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                 "required": ["city"]
             }),
         }],
-        attachments: vec![ResolvedAttachment {
-            artifact: image.clone(),
-            data_base64: "iVBORw0KGgo=".into(),
-        }],
+        attachments: vec![
+            ResolvedAttachment {
+                artifact: image.clone(),
+                data_base64: "iVBORw0KGgo=".into(),
+            },
+            ResolvedAttachment {
+                artifact: pdf.clone(),
+                data_base64: "JVBERi0xLjQK".into(),
+            },
+        ],
         cache_metadata: None,
         messages: vec![
             Message {
@@ -175,6 +182,12 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                         mime: "image/png".into(),
                         width: Some(1),
                         height: Some(1),
+                    }),
+                    Block::Attachment(AttachmentBlock::Pdf {
+                        artifact: pdf,
+                        name: "report.pdf".into(),
+                        pages: 12,
+                        delivery: PdfDeliveryMode::NativeDocument,
                     }),
                     Block::Text {
                         text: "What is shown?".into(),
@@ -220,9 +233,81 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
             }
         })
     );
+    assert_eq!(
+        payload["messages"][0]["content"][1],
+        serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQK"
+            }
+        })
+    );
     assert_eq!(payload["messages"][1]["content"][0]["type"], "tool_use");
     assert_eq!(payload["messages"][2]["role"], "user");
     assert_eq!(payload["messages"][2]["content"][0]["type"], "tool_result");
+}
+
+#[test]
+fn provider_catalog_declares_the_pdf_capability_split() {
+    for provider in BUILTIN_PROVIDER_NAMES {
+        let expected = if matches!(
+            provider,
+            "anthropic" | "anthropic-oauth" | "bedrock" | "vertex"
+        ) {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::ExplicitlyEmulated
+        };
+        assert_eq!(
+            pdf_document_capability(provider),
+            expected,
+            "PDF capability drifted for {provider}"
+        );
+    }
+    assert_eq!(
+        pdf_document_capability("custom-profile"),
+        FeatureResolve::ExplicitlyEmulated,
+        "unknown/custom providers must take the bounded extraction lane"
+    );
+}
+
+#[test]
+fn native_pdf_enforces_anthropics_complete_request_size_limit() {
+    let provider = provider("claude-sonnet-5");
+    let artifact = ArtifactRef::new("blake3:oversized-native-pdf");
+    let request = TurnRequest {
+        model: "claude-sonnet-5".into(),
+        max_tokens: 128,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: vec![ResolvedAttachment {
+            artifact: artifact.clone(),
+            // Already-base64 data at the documented complete-request cap;
+            // JSON framing necessarily puts the request over it.
+            data_base64: "A".repeat(32 * 1024 * 1024),
+        }],
+        cache_metadata: None,
+        messages: vec![Message {
+            role: MessageRole::User,
+            blocks: vec![Block::Attachment(AttachmentBlock::Pdf {
+                artifact,
+                name: "large.pdf".into(),
+                pages: 1,
+                delivery: PdfDeliveryMode::NativeDocument,
+            })],
+        }],
+    };
+
+    let error = provider
+        .request_payload(&request)
+        .expect_err("complete request cap");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert_eq!(
+        error.presentation.subcode.as_str(),
+        "pdf-provider-request-too-large"
+    );
 }
 
 #[test]

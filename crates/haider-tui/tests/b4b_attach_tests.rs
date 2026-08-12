@@ -11,14 +11,18 @@
 use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
+use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::{ArtifactRef, BranchId, DeviceId, EventId, NodeId, SessionId};
 use haider_protocol::tool::AttachmentBlock;
-use haider_rpc::{RequestBody, ResponseBody};
+use haider_rpc::{ErrorData, RequestBody, ResponseBody};
 use haider_tui::app::{AppEvent, AppModel, AppRequest, Pasted, RuntimeMode, Screen};
 use haider_tui::link::{CommandContext, map_response, request_body};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::projection::RawOutcome;
+use haider_tui::render::render;
 use haider_tui::runtime::{ShellRequest, attach_read_effects, live_pass};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::KeyCode;
 
 mod common;
@@ -90,6 +94,44 @@ fn png_bytes() -> Vec<u8> {
     let mut bytes = PNG_MAGIC.to_vec();
     bytes.extend_from_slice(b"haider-b4b-test-image");
     bytes
+}
+
+fn pdf_bytes(pages: u32) -> Vec<u8> {
+    let kids = (0..pages)
+        .map(|index| format!("{} 0 R", index + 3))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut pdf = format!(
+        "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+         2 0 obj\n<< /Type /Pages /Count {pages} /Kids [{kids}] >>\nendobj\n"
+    );
+    for index in 0..pages {
+        pdf.push_str(&format!(
+            "{} 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n",
+            index + 3
+        ));
+    }
+    pdf.push_str("trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    pdf.into_bytes()
+}
+
+fn draw_text(model: &AppModel, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            render(model, frame);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Drain the reducer's requests through the driver — the `live_pass`
@@ -282,6 +324,141 @@ fn attach_uploads_then_submit_carries_refs() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[test]
+fn pdf_chip_uses_pdf_glyph_basename_pages_and_transcript_plain_parity() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let bytes = pdf_bytes(12);
+    let dir = std::env::temp_dir().join(format!(
+        "haider-b4b-pdf-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("report.pdf");
+    std::fs::write(&path, &bytes).expect("temp PDF writes");
+
+    attach_read_effects(&mut model, &path.display().to_string());
+    let chip = &model.composer.attachments()[0];
+    assert_eq!(chip.kind.glyph(), "▤");
+    assert_eq!(chip.label, "report.pdf · 12p");
+    let commands = drain(&mut driver, &mut model);
+    let put = commands
+        .iter()
+        .find(|command| matches!(command, LiveCommand::ArtifactPut { .. }))
+        .expect("PDF upload")
+        .clone();
+    let upload = match &put {
+        LiveCommand::ArtifactPut { upload, .. } => *upload,
+        _ => unreachable!(),
+    };
+    let artifact = ArtifactRef::new(format!("blake3:{:0>64}", "pdf"));
+    for reply in map_response(
+        &CommandContext::of(&put),
+        ResponseBody::ArtifactPut {
+            artifact: artifact.clone(),
+            bytes: bytes.len() as u64,
+        },
+    ) {
+        driver.apply(&mut model, reply);
+    }
+    assert_eq!(model.composer.attachments()[0].upload, upload);
+
+    let styled = draw_text(&model, 100, 28);
+    assert!(
+        styled.contains("[▤ report.pdf · 12p]"),
+        "styled composer must show the PDF chip: {styled}"
+    );
+
+    assert_eq!(
+        model.route_raw(&raw(
+            1,
+            &EventPayload::UserMessage {
+                text: "summarize the report".into(),
+                attachments: vec![AttachmentBlock::Pdf {
+                    artifact,
+                    name: "report.pdf".into(),
+                    pages: 12,
+                    delivery: haider_protocol::tool::PdfDeliveryMode::NativeDocument,
+                }],
+                mode: haider_protocol::DeliveryMode::Queue,
+            }
+        )),
+        RawOutcome::Applied
+    );
+    let plain = haider_tui::plain::render_plain(&model.projection, 0, None);
+    assert!(
+        plain.contains("summarize the report [+1 attachment(s)]"),
+        "plain transcript keeps attachment-count parity: {plain}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn daemon_pdf_admission_rejection_keeps_its_typed_card_through_the_link() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    submit(&mut model, "read the report");
+    let commands = drain(&mut driver, &mut model);
+    let submit = commands
+        .iter()
+        .find(|command| matches!(command, LiveCommand::Submit { .. }))
+        .expect("submit command");
+    let presentation = ErrorPresentation::new(
+        "pdf-too-many-pages",
+        "PDF has too many pages",
+        "report.pdf has 201 pages; the limit is 100",
+        ErrorScope::Turn,
+        [ErrorAction::None],
+    );
+    let artifact = ArtifactRef::new(format!("blake3:{:0>64}", "pdf-pages"));
+
+    let replies = map_response(
+        &CommandContext::of(submit),
+        ResponseBody::Error {
+            code: "pdf_too_many_pages".into(),
+            message: presentation.detail.clone(),
+            retryable: false,
+            data: Some(ErrorData::PdfTooManyPages {
+                index: 0,
+                artifact,
+                actual_pages: 201,
+                max_pages: 100,
+                presentation: presentation.clone(),
+            }),
+        },
+    );
+    assert!(matches!(
+        replies.as_slice(),
+        [LiveReply::Failed {
+            presentation: Some(mapped),
+            ..
+        }] if mapped == &presentation
+    ));
+    for reply in replies {
+        driver.apply(&mut model, reply);
+    }
+
+    assert_eq!(
+        model
+            .command_diagnostic
+            .as_ref()
+            .map(|card| card.subcode.as_str()),
+        Some("pdf-too-many-pages")
+    );
+    let plain = haider_tui::plain::render_plain(&model.projection, 0, None);
+    assert!(
+        plain.contains(
+            "PDF has too many pages — report.pdf has 201 pages; the limit is 100 [pdf-too-many-pages]"
+        ),
+        "typed E2-E4 card grammar survives in plain rendering: {plain}"
+    );
+}
+
 // ---- law 2: oversized / non-image / over-count are honest, no upload --
 
 #[test]
@@ -303,6 +480,25 @@ fn oversized_and_non_image_attach_are_honest_notices_with_no_upload() {
     );
     assert!(model.composer.attachments().is_empty(), "no chip");
     assert!(model.requests.is_empty(), "no upload request");
+
+    // The PDF-specific page cap uses the typed E2-E4 card grammar even
+    // when the client can reject before uploading.
+    let pdf_file = temp_file("over-pages.pdf", &pdf_bytes(101));
+    attach_read_effects(&mut model, &pdf_file.display().to_string());
+    assert_eq!(
+        model
+            .command_diagnostic
+            .as_ref()
+            .map(|card| card.subcode.as_str()),
+        Some("pdf-too-many-pages")
+    );
+    assert!(
+        haider_tui::plain::render_plain(&model.projection, 0, None)
+            .contains("[pdf-too-many-pages]"),
+        "the local PDF refusal is a typed transcript card"
+    );
+    assert!(model.composer.attachments().is_empty(), "no PDF chip");
+    assert!(model.requests.is_empty(), "no PDF upload request");
     let _ = std::fs::remove_file(&binary_file);
 
     // Over the 5 MiB per-attachment cap (the client mirror of B4a's
@@ -342,6 +538,7 @@ fn oversized_and_non_image_attach_are_honest_notices_with_no_upload() {
     assert!(model.requests.is_empty(), "no read request for the sixth");
 
     let _ = std::fs::remove_file(&big_file);
+    let _ = std::fs::remove_file(&pdf_file);
 }
 
 // ---- law 2b (G2): the text fallback chips a File and rides the wire ----

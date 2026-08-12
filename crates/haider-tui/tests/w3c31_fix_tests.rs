@@ -724,6 +724,7 @@ fn a_login_retry_restages_under_the_original_command_id() {
             code: haider_rpc::ERROR_CODE_OVERLOADED.to_owned(),
             message: "busy".to_owned(),
             retryable: true,
+            presentation: None,
         }),
     );
     for c in "sk-test-key".chars() {

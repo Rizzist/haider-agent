@@ -6043,7 +6043,7 @@ fn attachment_chip_line(model: &AppModel, theme: &Theme) -> Line<'static> {
     for chip in model.composer.attachments() {
         let suffix = if chip.artifact.is_none() { " ⋯" } else { "" };
         spans.push(Span::styled(
-            format!("[⌁ {}{suffix}]", chip.label),
+            format!("[{} {}{suffix}]", chip.kind.glyph(), chip.label),
             theme.gold_style(),
         ));
         spans.push(Span::raw(" "));

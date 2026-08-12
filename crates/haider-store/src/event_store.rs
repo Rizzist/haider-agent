@@ -463,6 +463,10 @@ pub struct AcceptedTurn {
     /// `false` — a replay from before the feature never titles.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub first_user_turn: bool,
+    /// Daemon-verified PDF facts persisted in the command receipt. These are
+    /// derived from the exact canonical blocks journaled with the user turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pdf_attachments: Vec<haider_protocol::tool::PdfAttachmentReceipt>,
 }
 
 /// Result of the atomic turn-acceptance transaction.
@@ -2849,6 +2853,23 @@ impl Store {
             branch_id: command.branch_id.clone(),
             disposition,
             first_user_turn,
+            pdf_attachments: command
+                .attachments
+                .iter()
+                .filter_map(|attachment| match attachment {
+                    AttachmentBlock::Pdf {
+                        artifact,
+                        pages,
+                        delivery,
+                        ..
+                    } => Some(haider_protocol::tool::PdfAttachmentReceipt {
+                        artifact: artifact.clone(),
+                        pages: *pages,
+                        delivery: *delivery,
+                    }),
+                    _ => None,
+                })
+                .collect(),
         };
         finalize_command_receipt(
             &transaction,

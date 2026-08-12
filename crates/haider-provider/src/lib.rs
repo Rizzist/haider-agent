@@ -184,6 +184,24 @@ pub const BUILTIN_PROVIDER_NAMES: [&str; 10] = [
     DEEPSEEK_PROVIDER_NAME,
 ];
 
+/// Provider-catalog declaration for PDF shaping. Every Anthropic Messages
+/// wire endpoint accepts native `document` blocks; all other adapters use the
+/// daemon's bounded extracted-text emulation.
+#[must_use]
+pub fn pdf_document_capability(provider: &str) -> FeatureResolve {
+    if matches!(
+        provider,
+        ANTHROPIC_PROVIDER_NAME
+            | ANTHROPIC_OAUTH_PROVIDER_NAME
+            | BEDROCK_PROVIDER_NAME
+            | VERTEX_PROVIDER_NAME
+    ) {
+        FeatureResolve::Native
+    } else {
+        FeatureResolve::ExplicitlyEmulated
+    }
+}
+
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-provider";
 
@@ -883,6 +901,7 @@ pub struct FakeProvider {
     next_step: Arc<Mutex<usize>>,
     requests: Arc<Mutex<Vec<TurnRequest>>>,
     vision: FeatureResolve,
+    pdf_documents: FeatureResolve,
 }
 
 impl FakeProvider {
@@ -892,6 +911,7 @@ impl FakeProvider {
             next_step: Arc::new(Mutex::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
             vision: FeatureResolve::Unsupported,
+            pdf_documents: FeatureResolve::ExplicitlyEmulated,
         }
     }
 
@@ -899,6 +919,13 @@ impl FakeProvider {
     #[must_use]
     pub fn with_vision_native(mut self) -> Self {
         self.vision = FeatureResolve::Native;
+        self
+    }
+
+    /// Additive fixture switch for native document request tests.
+    #[must_use]
+    pub fn with_pdf_documents_native(mut self) -> Self {
+        self.pdf_documents = FeatureResolve::Native;
         self
     }
 
@@ -931,6 +958,7 @@ impl Provider for FakeProvider {
             parallel_tools: FeatureResolve::Native,
             streaming_tool_args: FeatureResolve::Native,
             vision: self.vision,
+            pdf_documents: self.pdf_documents,
             thinking_visible: FeatureResolve::Native,
             context_limit: 1_000_000,
         }
