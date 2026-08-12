@@ -672,7 +672,7 @@ impl Provider for AnthropicProvider {
 
 /// Anthropic error bodies obey the same 64 KiB ceiling as the OpenAI and
 /// Gemini adapters. Bytes beyond the bound are never parsed or logged.
-async fn read_error_body_bounded(
+pub(crate) async fn read_error_body_bounded(
     mut response: reqwest::Response,
 ) -> Result<Vec<u8>, ProviderError> {
     let mut body = Vec::new();
