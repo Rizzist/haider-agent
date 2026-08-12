@@ -9,7 +9,7 @@ use haider_client::{
 };
 use haider_protocol::context::ContextFootprintTruth;
 use haider_protocol::ids::SessionId;
-use haider_rpc::{ObserveRunStateWire, SessionObserveDigest};
+use haider_rpc::{ObserveRunStateWire, SessionFleetSnapshot, SessionObserveDigest};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -35,6 +35,13 @@ pub(crate) struct SessionOptions {
     pub session_id: String,
     pub json: bool,
     pub watch: bool,
+    pub no_spawn: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FleetOptions {
+    pub session_id: Option<String>,
+    pub json: bool,
     pub no_spawn: bool,
 }
 
@@ -87,6 +94,12 @@ pub(crate) struct SessionDocument {
     pub schema: &'static str,
     pub kind: &'static str,
     pub session: SessionDepthView,
+}
+
+pub(crate) struct FleetListEntry {
+    pub id: String,
+    pub title: String,
+    pub snapshot: SessionFleetSnapshot,
 }
 
 pub(crate) struct SessionSummaryView {
@@ -306,6 +319,35 @@ pub(crate) fn parse_session_options(rest: &[String]) -> Result<Parsed<SessionOpt
     }))
 }
 
+pub(crate) fn parse_fleet_options(rest: &[String]) -> Result<Parsed<FleetOptions>, String> {
+    if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
+        return Ok(Parsed::Help);
+    }
+    let mut session_id = None;
+    let mut json = false;
+    let mut no_spawn = false;
+    for value in rest {
+        match value.as_str() {
+            "--json" if !json => json = true,
+            "--no-spawn" if !no_spawn => no_spawn = true,
+            "--json" | "--no-spawn" => return Err(format!("duplicate {value} flag")),
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            id if session_id.is_none() && !id.is_empty() => session_id = Some(id.to_owned()),
+            _ => {
+                return Err("usage: haider fleet [<session-id>] [--json] [--no-spawn]".into());
+            }
+        }
+    }
+    if json && session_id.is_none() {
+        return Err("--json requires a session id for the raw fleet response".into());
+    }
+    Ok(Parsed::Run(FleetOptions {
+        session_id,
+        json,
+        no_spawn,
+    }))
+}
+
 pub(crate) fn parse_events_options(rest: &[String]) -> Result<Parsed<EventsOptions>, String> {
     if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
         return Ok(Parsed::Help);
@@ -447,6 +489,67 @@ pub(crate) async fn session_command(rest: &[String]) -> ExitCode {
     } else {
         write_session_human(&document)
     }
+}
+
+pub(crate) async fn fleet_command(rest: &[String]) -> ExitCode {
+    let options = match parse_fleet_options(rest) {
+        Ok(Parsed::Run(options)) => options,
+        Ok(Parsed::Help) => {
+            return write_help("usage: haider fleet [<session-id>] [--json] [--no-spawn]");
+        }
+        Err(error) => return usage("fleet", &error),
+    };
+    let profile = match profile() {
+        Ok(profile) => profile,
+        Err(code) => return code,
+    };
+    let observer = match ObserveClient::connect(&profile, !options.no_spawn).await {
+        Ok(observer) => observer,
+        Err(error) => return observe_failure("fleet", &error),
+    };
+    if let Err(error) = observer.require_fleet_feature() {
+        observer.close();
+        return observe_failure("fleet", &error);
+    }
+    if let Some(session_id) = options.session_id {
+        let snapshot = observer.fleet(SessionId::new(session_id)).await;
+        observer.close();
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => return observe_failure("fleet", &error),
+        };
+        return if options.json {
+            write_fleet_json(&snapshot)
+        } else {
+            write_human(fleet_human_text(&snapshot))
+        };
+    }
+
+    let digests = observer.sessions(0).await;
+    let digests = match digests {
+        Ok(digests) => fleet_candidates(digests),
+        Err(error) => {
+            observer.close();
+            return observe_failure("fleet", &error);
+        }
+    };
+    let mut entries = Vec::with_capacity(digests.len());
+    for digest in digests {
+        let snapshot = match observer.fleet(digest.session_id.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                observer.close();
+                return observe_failure("fleet", &error);
+            }
+        };
+        entries.push(FleetListEntry {
+            id: digest.session_id.as_str().to_owned(),
+            title: digest.title,
+            snapshot,
+        });
+    }
+    observer.close();
+    write_human(fleet_list_human_text(&entries))
 }
 
 pub(crate) async fn events_command(rest: &[String]) -> ExitCode {
@@ -645,6 +748,69 @@ pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
     }
 }
 
+/// The bare fleet picker's inclusion and order law: only session digests
+/// with durable subagent rows, newest first with id as the stable tie-break.
+pub(crate) fn fleet_candidates(
+    mut digests: Vec<SessionObserveDigest>,
+) -> Vec<SessionObserveDigest> {
+    digests.retain(|digest| !digest.subagents.is_empty());
+    digests.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+    });
+    digests
+}
+
+pub(crate) fn fleet_human_text(snapshot: &SessionFleetSnapshot) -> String {
+    use haider_tui::fleet;
+    let mut text = fleet::header_line(&fleet::rollup(&snapshot.roots));
+    text.push('\n');
+    for row in fleet::flatten(&snapshot.roots) {
+        text.push_str("  ");
+        text.push_str(&" │ ".repeat(row.rel_depth));
+        text.push_str(fleet::state_glyph(row.node.state));
+        text.push(' ');
+        text.push_str(fleet::callsign(row.node));
+        if let Some(marker) = fleet::child_marker(row.node) {
+            text.push(' ');
+            text.push_str(&marker);
+        }
+        if !row.node.task.is_empty() {
+            text.push_str(" — ");
+            text.push_str(&row.node.task.replace('\n', " "));
+        }
+        let metric = fleet::node_metric(row.node);
+        if !metric.is_empty() {
+            text.push_str(" · ");
+            text.push_str(&metric);
+        }
+        text.push('\n');
+    }
+    if let Some(footer) = fleet::truncation_footer(snapshot) {
+        text.push_str(&footer);
+        text.push('\n');
+    }
+    text
+}
+
+pub(crate) fn fleet_list_human_text(entries: &[FleetListEntry]) -> String {
+    if entries.is_empty() {
+        return "no sessions with subagents\n".to_owned();
+    }
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&format!(
+            "{} · {} · {}\n",
+            entry.id,
+            entry.title.replace('\n', " "),
+            haider_tui::fleet::header_line(&haider_tui::fleet::rollup(&entry.snapshot.roots))
+        ));
+    }
+    text
+}
+
 fn run_state_name(state: ObserveRunStateWire) -> &'static str {
     match state {
         ObserveRunStateWire::Idle => "idle",
@@ -662,6 +828,20 @@ fn write_document(document: &impl ObserveJson) -> ExitCode {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     if let Err(error) = serde_json::to_writer(&mut output, &document.json())
+        .map_err(io::Error::other)
+        .and_then(|()| output.write_all(b"\n"))
+        .and_then(|()| output.flush())
+    {
+        eprintln!("haider: stdout failed: {error}");
+        return ExitCode::from(EX_IOERR);
+    }
+    ExitCode::SUCCESS
+}
+
+fn write_fleet_json(snapshot: &SessionFleetSnapshot) -> ExitCode {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    if let Err(error) = serde_json::to_writer(&mut output, snapshot)
         .map_err(io::Error::other)
         .and_then(|()| output.write_all(b"\n"))
         .and_then(|()| output.flush())
@@ -827,7 +1007,8 @@ pub(crate) fn exit_code_for_observe_error(error: &ObserveError) -> u8 {
         ObserveError::Client(haider_client::ClientError::Disconnected(_))
         | ObserveError::OutputClosed => EX_IOERR,
         ObserveError::Client(haider_client::ClientError::Encode(_))
-        | ObserveError::StreamTask(_) => EX_SOFTWARE,
+        | ObserveError::StreamTask(_)
+        | ObserveError::UnknownSession(_) => EX_SOFTWARE,
         ObserveError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,
         ObserveError::Rpc { code, .. }
             if matches!(

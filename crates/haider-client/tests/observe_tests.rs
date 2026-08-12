@@ -5,7 +5,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use haider_client::{
-    ObserveError, ProfileEnv, ResolvedProfile, observe_stream_session, resolve_profile,
+    ObserveClient, ObserveError, ProfileEnv, ResolvedProfile, observe_stream_session,
+    resolve_profile,
 };
 use haider_rpc::haider_protocol::envelope::{
     PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -13,8 +14,8 @@ use haider_rpc::haider_protocol::envelope::{
 use haider_rpc::haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, DEFAULT_FRAME_LIMIT,
-    LifecyclePhase, RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome,
-    WireFrame, uds_codec,
+    ERROR_CODE_NOT_FOUND, FEATURE_SESSION_FLEET_V1, LifecyclePhase, RequestBody, RequestId,
+    ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -225,6 +226,78 @@ fn drain_ended_stream(receiver: &mut mpsc::UnboundedReceiver<RawEnvelope>) -> Ve
             ),
         }
     }
+}
+
+/// Fleet snapshot failures remain machine-distinct: feature skew is caught
+/// before a request and an existing feature's not-found reply retains the
+/// requested session id. Hermetic hosts that deny AF_UNIX binds exercise the
+/// same enum mapping in the CLI suite and skip only this transport scenario.
+#[tokio::test]
+async fn fleet_reads_return_typed_feature_and_unknown_session_errors() {
+    let (_old_root, old_profile) = profile();
+    let old_listener = match UnixListener::bind(&old_profile.endpoint_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("bind old fleet peer: {error}"),
+    };
+    let old_server_profile = old_profile.clone();
+    let old_server = tokio::spawn(async move {
+        let _peer = accept_peer(
+            &old_listener,
+            welcome(&old_server_profile, "fleet-old-daemon"),
+        )
+        .await;
+    });
+    let old_client = ObserveClient::connect(&old_profile, false)
+        .await
+        .expect("connect old daemon");
+    assert!(matches!(
+        old_client
+            .fleet(SessionId::new("fleet-feature-session"))
+            .await,
+        Err(ObserveError::MissingFeature(FEATURE_SESSION_FLEET_V1))
+    ));
+    old_client.close();
+    old_server.await.expect("old daemon peer");
+
+    let (_new_root, new_profile) = profile();
+    let new_listener = UnixListener::bind(&new_profile.endpoint_path).expect("bind fleet peer");
+    let new_server_profile = new_profile.clone();
+    let new_server = tokio::spawn(async move {
+        let mut advertised = welcome(&new_server_profile, "fleet-new-daemon");
+        advertised
+            .features
+            .insert(FEATURE_SESSION_FLEET_V1.to_owned());
+        let mut peer = accept_peer(&new_listener, advertised).await;
+        let (request_id, body) = peer.request().await;
+        assert!(matches!(
+            body,
+            RequestBody::SessionFleet { ref session_id }
+                if session_id.as_str() == "fleet-missing-session"
+        ));
+        peer.respond(
+            request_id,
+            ResponseBody::Error {
+                code: ERROR_CODE_NOT_FOUND.into(),
+                message: "session was not found".into(),
+                retryable: false,
+                data: None,
+            },
+        )
+        .await;
+    });
+    let new_client = ObserveClient::connect(&new_profile, false)
+        .await
+        .expect("connect fleet daemon");
+    assert!(matches!(
+        new_client
+            .fleet(SessionId::new("fleet-missing-session"))
+            .await,
+        Err(ObserveError::UnknownSession(ref session_id))
+            if session_id.as_str() == "fleet-missing-session"
+    ));
+    new_client.close();
+    new_server.await.expect("fleet daemon peer");
 }
 
 /// MUTATION CHECK: advance the cursor across a gap, narrow raw payloads to

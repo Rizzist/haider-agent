@@ -188,6 +188,10 @@ pub enum DelegationCreateOutcome {
 pub struct DelegationDescendant {
     pub record: DelegationRecord,
     pub relative_depth: u32,
+    /// Exact durable direct-child count for `record.child_session_id`.
+    /// Bounded consumers use this to distinguish a leaf from a node whose
+    /// children fell outside their traversal bounds.
+    pub direct_child_count: u32,
 }
 
 /// Bounded breadth-first descendant reduction.
@@ -1285,10 +1289,13 @@ impl Store {
                         child.child_session_id
                     )));
                 }
+                let direct_child_count =
+                    delegation_count_for_parent_session(&connection, &child.child_session_id)?;
                 pending.push_back((child.child_session_id.clone(), relative_depth));
                 descendants.push(DelegationDescendant {
                     record: child,
                     relative_depth,
+                    direct_child_count,
                 });
             }
             if truncated {
@@ -6193,6 +6200,24 @@ fn delegations_for_parent_session_limited(
         .collect::<Result<Vec<_>, _>>()
         .map_err(map_sqlite_error)?;
     rows.into_iter().map(decode_delegation).collect()
+}
+
+fn delegation_count_for_parent_session(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<u32> {
+    let count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM delegations WHERE parent_session_id = ?1",
+            params![session_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_sqlite_error)?;
+    u32::try_from(count).map_err(|_| {
+        corrupt(format!(
+            "session {session_id} has more direct delegations than the fleet wire can represent"
+        ))
+    })
 }
 
 /// Crash-honest global live-set reduction used inside delegation admission.

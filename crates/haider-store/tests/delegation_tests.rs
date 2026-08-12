@@ -459,6 +459,18 @@ fn bounded_descendant_reduction_preserves_tree_order_and_truncation() {
             ("agent-tree-nested", 2),
         ]
     );
+    assert_eq!(
+        full.descendants
+            .iter()
+            .map(|row| (row.record.agent_id.as_str(), row.direct_child_count))
+            .collect::<Vec<_>>(),
+        vec![
+            ("agent-tree-a", 1),
+            ("agent-tree-b", 0),
+            ("agent-tree-nested", 0),
+        ],
+        "each returned row retains its exact durable direct-child count"
+    );
     let subtree = store
         .delegation_descendants(&child_a, 512, 32)
         .expect("nested subtree");
@@ -476,4 +488,6 @@ fn bounded_descendant_reduction_preserves_tree_order_and_truncation() {
         .expect("depth-bounded descendants");
     assert_eq!(depth_bounded.descendants.len(), 2);
     assert!(depth_bounded.truncated);
+    assert_eq!(depth_bounded.descendants[0].direct_child_count, 1);
+    assert_eq!(depth_bounded.descendants[1].direct_child_count, 0);
 }

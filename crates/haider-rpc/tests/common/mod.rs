@@ -1460,6 +1460,7 @@ pub fn transcript() -> Vec<WireFrame> {
                                 breakdowns: Vec::new(),
                             }),
                         }),
+                        folded_children: 0,
                         children: Vec::new(),
                     }],
                     rollup: FleetRollupWire {
@@ -1543,6 +1544,45 @@ pub fn transcript() -> Vec<WireFrame> {
                     decision: false,
                     timeout_ms: 30_000,
                 }],
+            },
+        },
+        // SLICE 2 appends the non-zero per-node fold witness after every
+        // historical golden frame. The earlier zero-valued fleet node stays
+        // byte-identical because zero is omitted on the wire.
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-fleet-folded"),
+            body: ResponseBody::SessionFleet {
+                snapshot: SessionFleetSnapshot {
+                    session_id: SessionId::new("session-folded"),
+                    generated_at_ms: 1_753_500_060_000,
+                    node_limit: 512,
+                    depth_limit: 32,
+                    roots: vec![FleetNodeWire {
+                        agent_id: AgentId::new("agent-folded"),
+                        session_id: SessionId::new("session-folded-child"),
+                        callsign: Some("Fold".into()),
+                        task: "bounded branch".into(),
+                        depth: 32,
+                        parent_session_id: SessionId::new("session-folded"),
+                        parent_agent_id: None,
+                        state: FleetAgentStateWire::Done,
+                        metrics: None,
+                        folded_children: 3,
+                        children: Vec::new(),
+                    }],
+                    rollup: FleetRollupWire {
+                        node_count: 1,
+                        states: FleetStateCountsWire {
+                            done: 1,
+                            ..FleetStateCountsWire::default()
+                        },
+                        max_depth: 32,
+                        metrics: FleetMetricsTotalsWire::default(),
+                        metrics_complete: false,
+                        complete: false,
+                    },
+                    truncated: true,
+                },
             },
         },
     ]

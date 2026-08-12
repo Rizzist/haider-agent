@@ -4,23 +4,28 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use haider_protocol::agent::ChipState;
+use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageMetrics, ChipState};
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::{AgentId, BranchId, DeviceId, EventId, NodeId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
-use haider_rpc::{ObserveMenuWire, ObserveRunStateWire, ObserveSubagentWire, SessionObserveDigest};
+use haider_rpc::{
+    FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
+    FleetStateCountsWire, ObserveMenuWire, ObserveRunStateWire, ObserveSubagentWire,
+    SessionFleetSnapshot, SessionObserveDigest,
+};
 
 #[allow(dead_code)]
 #[path = "../src/main.rs"]
 mod cli_main;
 
 use cli_main::observe::{
-    AccountView, DaemonView, ObserveJson, Parsed, SessionDocument, SessionsDocument,
-    SnapshotOptions, StatusDocument, UpdateView, depth_view, exit_code_for_observe_error,
-    parse_events_options, parse_session_options, parse_snapshot_options, session_human_text,
-    sessions_human_text, summary_view, write_raw_envelope_jsonl,
+    AccountView, DaemonView, FleetListEntry, FleetOptions, ObserveJson, Parsed, SessionDocument,
+    SessionsDocument, SnapshotOptions, StatusDocument, UpdateView, depth_view,
+    exit_code_for_observe_error, fleet_candidates, fleet_human_text, fleet_list_human_text,
+    parse_events_options, parse_fleet_options, parse_session_options, parse_snapshot_options,
+    session_human_text, sessions_human_text, summary_view, write_raw_envelope_jsonl,
 };
 use cli_main::run::{
     EX_BLOCKED, EX_CANCELLED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT,
@@ -125,6 +130,110 @@ fn digest(
     }
 }
 
+fn fleet_node(
+    id: &str,
+    callsign: &str,
+    task: &str,
+    depth: u32,
+    state: FleetAgentStateWire,
+    folded_children: u32,
+    children: Vec<FleetNodeWire>,
+) -> FleetNodeWire {
+    FleetNodeWire {
+        agent_id: AgentId::new(id),
+        session_id: SessionId::new(format!("session-{id}")),
+        callsign: Some(callsign.into()),
+        task: task.into(),
+        depth,
+        parent_session_id: SessionId::new("fleet-cli-session"),
+        parent_agent_id: None,
+        state,
+        metrics: Some(AgentMetricsSnapshot {
+            agent: Some(AgentId::new(id)),
+            session_id: SessionId::new(format!("session-{id}")),
+            head_seq: 9,
+            started_at_ms: 1_800_000_000_000,
+            terminal_at_ms: Some(1_800_000_042_000),
+            live: state == FleetAgentStateWire::Live,
+            tool_attempts: 3,
+            usage: Some(AgentUsageMetrics {
+                logical_input_tokens: 1_200,
+                billed_output_tokens: 300,
+                api_equivalent_cost_microusd: Some(420_000),
+                all_lanes_priced: true,
+                has_oauth_lanes: true,
+                ..AgentUsageMetrics::default()
+            }),
+        }),
+        folded_children,
+        children,
+    }
+}
+
+fn fleet_snapshot() -> SessionFleetSnapshot {
+    SessionFleetSnapshot {
+        session_id: SessionId::new("fleet-cli-session"),
+        generated_at_ms: 1_800_000_060_000,
+        node_limit: 512,
+        depth_limit: 32,
+        roots: vec![
+            fleet_node(
+                "agent-alpha",
+                "alpha",
+                "coordinate the sweep",
+                1,
+                FleetAgentStateWire::Live,
+                0,
+                vec![
+                    fleet_node(
+                        "agent-done",
+                        "done",
+                        "verify output",
+                        2,
+                        FleetAgentStateWire::Done,
+                        0,
+                        vec![],
+                    ),
+                    fleet_node(
+                        "agent-fold",
+                        "fold",
+                        "deep branch",
+                        2,
+                        FleetAgentStateWire::Failed,
+                        2,
+                        vec![],
+                    ),
+                ],
+            ),
+            fleet_node(
+                "agent-queued",
+                "queued",
+                "await capacity",
+                1,
+                FleetAgentStateWire::Queued,
+                0,
+                vec![],
+            ),
+        ],
+        rollup: FleetRollupWire {
+            node_count: 4,
+            states: FleetStateCountsWire {
+                queued: 1,
+                live: 1,
+                waiting: 0,
+                done: 1,
+                failed: 1,
+                cancelled: 0,
+            },
+            max_depth: 2,
+            metrics: FleetMetricsTotalsWire::default(),
+            metrics_complete: false,
+            complete: false,
+        },
+        truncated: true,
+    }
+}
+
 /// MUTATION CHECK: rename the schema/kind tags, remove a required overview
 /// field, or expose menu bodies/options. Expected RUNTIME failure: the exact
 /// compact golden differs, or one of the literal secret sentinels appears.
@@ -225,6 +334,24 @@ fn observe_parsers_and_stream_help_are_explicit() {
     ));
     assert!(parse_session_options(&["s-1".into(), "--json".into(), "--watch".into()]).is_err());
     assert!(parse_events_options(&["--follow".into(), "--follow".into()]).is_err());
+    assert!(matches!(
+        parse_fleet_options(&["fleet-session".into(), "--json".into(), "--no-spawn".into()]),
+        Ok(Parsed::Run(FleetOptions {
+            session_id: Some(ref id),
+            json: true,
+            no_spawn: true,
+        })) if id == "fleet-session"
+    ));
+    assert!(matches!(
+        parse_fleet_options(&[]),
+        Ok(Parsed::Run(FleetOptions {
+            session_id: None,
+            json: false,
+            no_spawn: false,
+        }))
+    ));
+    assert!(parse_fleet_options(&["--json".into()]).is_err());
+    assert!(parse_fleet_options(&["a".into(), "b".into()]).is_err());
 
     let output = Command::new(env!("CARGO_BIN_EXE_haider"))
         .args(["events", "--help"])
@@ -234,6 +361,16 @@ fn observe_parsers_and_stream_help_are_explicit() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("LF-framed raw event envelopes"));
     assert!(stdout.contains("tolerate unknown kinds and fields"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_haider"))
+        .args(["fleet", "--help"])
+        .output()
+        .expect("run fleet help");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("fleet [<session-id>] [--json] [--no-spawn]")
+    );
 }
 
 /// MUTATION CHECK: route no-spawn through ensure_daemon, panic on a missing
@@ -249,6 +386,8 @@ fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
     for command in [
         vec!["status", "--json", "--no-spawn"],
         vec!["events", "--no-spawn"],
+        vec!["fleet", "--no-spawn"],
+        vec!["fleet", "session-missing", "--no-spawn"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_haider"))
             .args(command)
@@ -352,6 +491,14 @@ fn exit_codes_match_the_headless_table() {
             EX_IOERR,
         ),
         (ObserveError::StreamTask("literal task".into()), EX_SOFTWARE),
+        (
+            ObserveError::UnknownSession(SessionId::new("missing-fleet")),
+            EX_SOFTWARE,
+        ),
+        (
+            ObserveError::MissingFeature(haider_rpc::FEATURE_SESSION_FLEET_V1),
+            EX_PROTOCOL,
+        ),
     ];
     for (error, expected) in cases {
         assert_eq!(exit_code_for_observe_error(&error), expected, "{error}");
@@ -405,6 +552,67 @@ fn human_views_include_the_scoped_observation_facts() {
     ] {
         assert!(depth.contains(expected), "missing `{expected}`: {depth}");
     }
+}
+
+#[test]
+fn fleet_snapshot_rendering_and_raw_json_are_append_only_goldens() {
+    let snapshot = fleet_snapshot();
+    let human = fleet_human_text(&snapshot);
+    golden("observe_fleet.txt", &human);
+    for expected in [
+        "fleet of 4 · ✓1 ◉1 ✗1 ◌1 · depth 2",
+        "◉ alpha ▸2 — coordinate the sweep · 3t · 1.5k · ≈$0.42",
+        "│ ✓ done — verify output · 3t · 1.5k · ≈$0.42",
+        "│ ✗ fold ⊞2 — deep branch · 3t · 1.5k · ≈$0.42",
+        "◌ queued — await capacity · queued",
+        "512-node view cap reached — deepest branches folded",
+    ] {
+        assert!(human.contains(expected), "missing `{expected}`: {human}");
+    }
+
+    let raw = serde_json::to_string(&snapshot).expect("fleet snapshot serializes") + "\n";
+    golden("observe_fleet.json", &raw);
+    assert!(!raw.contains("haider.observe.v1"));
+    assert!(raw.contains(r#""folded_children":2"#));
+    assert_eq!(raw.matches("folded_children").count(), 1);
+}
+
+#[test]
+fn bare_fleet_lists_only_subagent_sessions_most_recent_first() {
+    let mut excluded = digest("session-newest-empty", ObserveRunStateWire::Idle, None);
+    excluded.updated_at_ms = 400;
+    excluded.subagents.clear();
+    let mut later_id = digest("session-z", ObserveRunStateWire::Running, None);
+    later_id.updated_at_ms = 300;
+    later_id.title = "new fleet".into();
+    let mut tied_a = digest("session-a", ObserveRunStateWire::Running, None);
+    tied_a.updated_at_ms = 200;
+    tied_a.title = "tie a".into();
+    let mut tied_b = digest("session-b", ObserveRunStateWire::Running, None);
+    tied_b.updated_at_ms = 200;
+    tied_b.title = "tie b".into();
+
+    let candidates = fleet_candidates(vec![tied_b, excluded, later_id, tied_a]);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|digest| digest.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["session-z", "session-a", "session-b"]
+    );
+    let entries = candidates
+        .into_iter()
+        .map(|digest| FleetListEntry {
+            id: digest.session_id.as_str().to_owned(),
+            title: digest.title,
+            snapshot: fleet_snapshot(),
+        })
+        .collect::<Vec<_>>();
+    let list = fleet_list_human_text(&entries);
+    golden("observe_fleet_list.txt", &list);
+    assert!(!list.contains("session-newest-empty"));
+    assert!(list.starts_with("session-z · new fleet · fleet of 4"));
+    assert!(list.find("session-a").unwrap() < list.find("session-b").unwrap());
 }
 
 /// MUTATION CHECK: wrap stream values in `haider.observe.v1`, omit the final

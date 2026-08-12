@@ -289,6 +289,20 @@ pub fn node_metric(node: &FleetNodeWire) -> String {
     segments.join(" · ")
 }
 
+/// A node's direct-child marker. A fold witness outranks the count of
+/// returned children because it is the information that would otherwise be
+/// lost when a bounded node looks like a leaf.
+#[must_use]
+pub fn child_marker(node: &FleetNodeWire) -> Option<String> {
+    if node.folded_children > 0 {
+        Some(format!("⊞{}", node.folded_children))
+    } else if node.children.is_empty() {
+        None
+    } else {
+        Some(format!("▸{}", node.children.len()))
+    }
+}
+
 /// The honest truncation footer, present only when the daemon bounded the
 /// tree: the deepest branches were folded to fit the node cap.
 #[must_use]
@@ -421,6 +435,7 @@ pub fn snapshot_from_chips(
             parent_agent_id: parent_agent.cloned(),
             state: chip_fleet_state(chip),
             metrics: chip.metrics.clone(),
+            folded_children: 0,
             children,
         }
     }
@@ -506,6 +521,10 @@ pub fn fleet_plain(model: &crate::app::AppModel) -> String {
             out.push_str(state_glyph(row.node.state));
             out.push(' ');
             out.push_str(callsign(row.node));
+            if let Some(marker) = child_marker(row.node) {
+                out.push(' ');
+                out.push_str(&marker);
+            }
             if !row.node.task.is_empty() {
                 out.push_str(" — ");
                 out.push_str(&row.node.task);

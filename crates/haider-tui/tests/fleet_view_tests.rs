@@ -145,6 +145,7 @@ fn node(
         parent_agent_id: None,
         state,
         metrics: Some(metrics(agent, Some(oauth_usage(420_000)))),
+        folded_children: 0,
         children,
     }
 }
@@ -438,7 +439,9 @@ fn twenty_nodes_render_the_list_twenty_one_the_grid() {
     );
     assert!(!list.contains('●'), "no matrix dots in the list: {list}");
 
-    let grid_model = fleet_model(snapshot(nodes(21), false));
+    let mut grid_nodes = nodes(21);
+    grid_nodes[0].folded_children = 4;
+    let grid_model = fleet_model(snapshot(grid_nodes, true));
     let grid = draw_rows(&grid_model, 100, 40).join("\n");
     assert!(grid.contains("fleet of 21"), "rollup header: {grid}");
     assert!(
@@ -448,6 +451,10 @@ fn twenty_nodes_render_the_list_twenty_one_the_grid() {
     assert!(
         grid.contains("cell0"),
         "the callsign sits under the cell: {grid}"
+    );
+    assert!(
+        grid.contains("⊞4"),
+        "a folded grid cell carries its per-node witness: {grid}"
     );
     assert!(
         grid_model.fleet.grid_cols.get() > 1,
@@ -542,14 +549,26 @@ fn rollup_arithmetic_agrees_with_the_wire() {
 
 #[test]
 fn truncation_witness_renders_an_honest_footer() {
-    let bounded = fleet_model(snapshot(drill_tree(), true));
+    let mut roots = drill_tree();
+    roots[0].folded_children = 2;
+    let bounded = fleet_model(snapshot(roots, true));
     let rows = draw_rows(&bounded, 100, 32).join("\n");
+    assert!(
+        rows.contains("alpha ⊞2"),
+        "the row names the exact omitted direct-child count: {rows}"
+    );
+    assert!(
+        !rows.contains("alpha ▸3"),
+        "the fold witness replaces the returned-child marker: {rows}"
+    );
     assert!(
         rows.contains("512-node view cap reached — deepest branches folded"),
         "the styled footer: {rows}"
     );
+    let plain = fleet::fleet_plain(&bounded);
+    assert!(plain.contains("alpha ⊞2"), "the plain fold marker: {plain}");
     assert!(
-        fleet::fleet_plain(&bounded).contains("512-node view cap reached"),
+        plain.contains("512-node view cap reached"),
         "the plain footer"
     );
 
@@ -588,6 +607,11 @@ fn plain_parity_carries_the_styled_information() {
     assert!(
         plain.contains("◌ shim"),
         "queued keeps its glyph in plain: {plain}"
+    );
+    assert!(plain.contains("alpha ▸3"), "real children marker: {plain}");
+    assert!(
+        plain.contains("probe ▸1"),
+        "nested children marker: {plain}"
     );
 
     // The drilled view's plain twin follows the re-root.
