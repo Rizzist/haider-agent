@@ -395,10 +395,8 @@ pub const CHIP_REMOVE_MS: u64 = 5000;
 pub const AUTO_RESUME_DEFER_MS: u64 = 120;
 /// The aura talk hold (tui.js:2128-2132).
 pub const AURA_TALK_MS: u64 = 1100;
-/// The aura talk canned phrase (tui.js:2131).
-pub const AURA_TALK_PHRASE: &str = "spin up the auth service on hetzner-1 and run its tests";
-/// Sim DEVICES (tui.js:139).
-pub const AURA_DEVICES: [&str; 4] = ["workstation", "hetzner-1", "this-mac", "phone"];
+/// The aura talk canned phrase, pinned to Haider's local-only placement.
+pub(crate) const AURA_TALK_PHRASE: &str = "spin up the auth service locally and run its tests";
 pub const AUTO_TITLE_MS: u64 = 1500;
 pub const ERRORED_HOLD_MS: u64 = 1800;
 pub const DEFERRED_CALLBACK_MS: u64 = 2600;
@@ -1025,6 +1023,8 @@ fn branch_crash(b: &mut B) {
         id: menu_id.clone(),
         kind: MenuKind::Recovery {
             effect: EffectId::new("e-4411"),
+            presentation: None,
+            option_actions: Vec::new(),
         },
         title: "recovery — process_exec outcome unknown".to_owned(),
         body: vec![
@@ -1149,13 +1149,13 @@ fn branch_prod(b: &mut B) {
 }
 
 /// §1.4 `/auth|deleg|split|machin|device/` (tui.js:1345-1378): the
-/// hetzner-1 chip is PRE-SEEDED (added before the spawn tool, transcript
+/// local chip is PRE-SEEDED (added before the spawn tool, transcript
 /// pre-filled) and stepped tool → done between the parent's beats.
 fn branch_auth(b: &mut B, roster_counter: &std::sync::atomic::AtomicU64) {
     let auth_name = claim_name(roster_counter);
     let auth_agent = format!("t{}-auth", b.turn);
     b.stream(&format!(
-        "Splitting this: {} {} takes the service core on hetzner-1 while I wire the local side here.",
+        "Splitting this: {} {} takes the service core locally while I wire the main side here.",
         auth_name.callsign, auth_name.hon,
     ));
     b.beats.push(Beat::ChipAdd(Box::new(ChipSeed {
@@ -1167,14 +1167,13 @@ fn branch_auth(b: &mut B, roster_counter: &std::sync::atomic::AtomicU64) {
         full: auth_name.full.clone(),
         name: "auth-svc".to_owned(),
         model: "gpt-5.6".to_owned(),
-        device: "hetzner-1".to_owned(),
+        device: "local".to_owned(),
         state: ChipDisplayState::Running,
         tokens: 2400,
         prefill: vec![
-            ChipPrefill::Note("· delegated over the mesh — lease accepted, epoch 3".to_owned()),
+            ChipPrefill::Note("· delegated locally — lease accepted, epoch 3".to_owned()),
             ChipPrefill::Agent(
-                "Patching the service core on hetzner-1; result returns as a fenced patch."
-                    .to_owned(),
+                "Patching the service core locally; result returns as a fenced patch.".to_owned(),
             ),
             ChipPrefill::ToolOk {
                 name: "fs_patch".to_owned(),
@@ -1185,7 +1184,7 @@ fn branch_auth(b: &mut B, roster_counter: &std::sync::atomic::AtomicU64) {
     })));
     b.tool(
         "agent_spawn",
-        &format!("{} · auth-svc → hetzner-1 · gpt-5.6", auth_name.callsign),
+        &format!("{} · auth-svc → local · gpt-5.6", auth_name.callsign),
         900,
         "lease accepted · epoch 3",
         true,
@@ -1706,6 +1705,8 @@ fn chip_question_menu(
     let kind = if recovery {
         MenuKind::Recovery {
             effect: EffectId::new(format!("e-{agent}")),
+            presentation: None,
+            option_actions: Vec::new(),
         }
     } else {
         MenuKind::Question
@@ -2126,17 +2127,11 @@ pub fn aura_is_status(low: &str) -> bool {
     })
 }
 
-/// The spawn-branch targets: first DEVICE found in the text (else
-/// `workstation`), first `\b(billing|auth|cellular|payments|web|api|docs|search|infra)\w*`
-/// word (else `service`).
+/// The spawn-branch target: local placement plus the first matching service
+/// stem. Device-like words in old/demo prompts never enable remote placement.
 #[must_use]
 pub fn aura_target(low: &str) -> (String, String) {
-    let device = AURA_DEVICES
-        .iter()
-        .find(|device| low.contains(*device))
-        .copied()
-        .unwrap_or("workstation")
-        .to_owned();
+    let device = "local".to_owned();
     const STEMS: [&str; 9] = [
         "billing", "auth", "cellular", "payments", "web", "api", "docs", "search", "infra",
     ];
@@ -2212,7 +2207,8 @@ pub fn aura_status_beats(spoken: bool, summary: &str, run: u64) -> Vec<Beat> {
 
 /// The spawn branch (tui.js:2086-2124), verbatim strings and timings.
 #[must_use]
-pub fn aura_spawn_beats(spoken: bool, name: &str, device: &str, run: u64) -> Vec<Beat> {
+pub fn aura_spawn_beats(spoken: bool, name: &str, _requested_device: &str, run: u64) -> Vec<Beat> {
+    let device = "local";
     let mut beats = vec![
         Beat::AuraVoice(spoken),
         Beat::AuraState(AuraState::Thinking),
@@ -2222,7 +2218,7 @@ pub fn aura_spawn_beats(spoken: bool, name: &str, device: &str, run: u64) -> Vec
         &mut beats,
         &format!("r{run}-plan"),
         &format!(
-            "On it — I'll place a {name} session on {device}, start the work, and report back. I don't touch the code myself."
+            "On it — I'll start a local {name} session, begin the work, and report back. I don't touch the code myself."
         ),
     );
     beats.push(Beat::AuraState(AuraState::Orchestrating));

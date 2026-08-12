@@ -89,7 +89,12 @@ pub struct MenuResolutionCommand {
 pub enum MenuResolutionOutcome {
     /// This call appended the authoritative event. Publish this envelope only
     /// after the transaction has returned successfully.
-    Committed { envelope: Box<RawEnvelope> },
+    Committed {
+        envelope: Box<RawEnvelope>,
+        /// The validated opening card, returned so the daemon actor can run
+        /// typed post-CAS recovery handlers without parsing display text.
+        menu: Menu,
+    },
     /// The same durable command was retried after its response was lost.
     IdempotentReplay { resolution_seq: u64 },
     /// A different command already resolved the menu.
@@ -854,6 +859,21 @@ impl Store {
     pub fn advance_daemon_generation(&self) -> StoreResult<u64> {
         let mut connection = self.connection()?;
         next_profile_counter(&mut connection, "daemon_generation", "daemon generation")
+    }
+
+    /// Commits a harmless write transaction to prove the profile is writable.
+    /// Updating the singleton to its existing value avoids consuming a
+    /// semantic revision while still exercising SQLite, WAL, and fsync.
+    pub fn probe_writable(&self) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(map_sqlite_error)?;
+        transaction
+            .execute(
+                "UPDATE profile_meta SET management_revision = management_revision WHERE singleton = 1",
+                [],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)
     }
 
     /// Reads the revision of the coherently published account/provider
@@ -4989,6 +5009,7 @@ fn resolve_menu_transaction(
         .map_err(map_sqlite_error)?;
     Ok(MenuResolutionOutcome::Committed {
         envelope: Box::new(envelope),
+        menu,
     })
 }
 
@@ -5990,6 +6011,7 @@ fn lookup_delegation_by_parent_call(
 }
 
 fn validate_delegation(record: &DelegationRecord) -> StoreResult<()> {
+    record.manifest.placement.ensure_local()?;
     if record.depth == 0
         || record.task.trim().is_empty()
         || record.prompt.trim().is_empty()
@@ -6141,6 +6163,41 @@ fn map_sqlite_error(error: SqliteError) -> HaiderError {
             store_error(
                 ErrorCode::StoreLocked,
                 format!("SQLite journal is busy: {error}"),
+                true,
+            )
+        }
+        SqliteError::SqliteFailure(inner, _) if inner.code == SqliteErrorCode::DiskFull => {
+            store_error(
+                ErrorCode::StoreFull,
+                format!(
+                    "SQLite journal cannot be written because the profile disk is full: {error}"
+                ),
+                true,
+            )
+        }
+        SqliteError::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                SqliteErrorCode::ReadOnly
+                    | SqliteErrorCode::PermissionDenied
+                    | SqliteErrorCode::AuthorizationForStatementDenied
+            ) =>
+        {
+            store_error(
+                ErrorCode::StoreReadOnly,
+                format!("SQLite journal is read-only: {error}"),
+                true,
+            )
+        }
+        SqliteError::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                SqliteErrorCode::SystemIoFailure | SqliteErrorCode::CannotOpen
+            ) =>
+        {
+            store_error(
+                ErrorCode::StoreUnavailable,
+                format!("SQLite journal is unavailable: {error}"),
                 true,
             )
         }

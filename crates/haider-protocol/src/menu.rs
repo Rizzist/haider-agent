@@ -5,7 +5,7 @@
 //! Freeze decision (ADR-1): `input_required` is unified with Menu — a run
 //! blocked on input carries a `MenuId`; there is no separate input-request type.
 
-use crate::error::ErrorPresentation;
+use crate::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use crate::ids::{AgentId, CredentialAlias, ItemId, MenuId, RunId};
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,12 @@ pub enum MenuKind {
     /// Reconciliation re-emits the effect's terminal `Outcome` phase.
     Recovery {
         effect: crate::ids::EffectId,
+        /// E2 presentation contract for the ambiguity card.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<ErrorPresentation>,
+        /// Index-aligned semantics for the four recovery choices.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        option_actions: Vec<EffectRecoveryAction>,
     },
     /// First-class provider/account/stream recovery card. The presentation
     /// supplies safe copy and typed actions; target coordinates let clients
@@ -92,7 +98,77 @@ pub enum ErrorRecoveryCardKind {
     QuotaExhausted,
     PartialStream,
     KeychainRelink,
+    StoreUnwritable,
     Generic,
+}
+
+/// Exact effect-reconciliation actions. These are intentionally separate
+/// from provider [`ErrorAction`] values: they settle durable side-effect
+/// ambiguity rather than retrying a provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectRecoveryAction {
+    Probe,
+    MarkDone,
+    Retry,
+    Abandon,
+}
+
+/// Standard E6 four-choice card. Producers share this constructor so startup
+/// and live supervisor recovery cannot drift in labels, order, or semantics.
+#[must_use]
+pub fn effect_recovery_menu(
+    id: MenuId,
+    effect: crate::ids::EffectId,
+    summary: impl AsRef<str>,
+) -> Menu {
+    let summary = summary.as_ref();
+    Menu {
+        id,
+        kind: MenuKind::Recovery {
+            effect,
+            presentation: Some(ErrorPresentation::new(
+                "effect-outcome-unknown",
+                "Effect outcome unknown",
+                format!(
+                    "Haider lost contact after dispatching {summary}. Reconcile it before continuing."
+                ),
+                ErrorScope::Tool,
+                [ErrorAction::Retry, ErrorAction::None],
+            )),
+            option_actions: vec![
+                EffectRecoveryAction::Probe,
+                EffectRecoveryAction::MarkDone,
+                EffectRecoveryAction::Retry,
+                EffectRecoveryAction::Abandon,
+            ],
+        },
+        title: "Effect outcome unknown".into(),
+        body: vec![format!("Dispatched effect: {summary}")],
+        options: [
+            ("probe", "Probe", "Re-check whether the effect completed."),
+            ("mark_done", "Mark done", "Record that it completed."),
+            ("retry", "Retry", "Settle this attempt and retry once."),
+            (
+                "abandon",
+                "Abandon",
+                "Record it abandoned and close the run.",
+            ),
+        ]
+        .into_iter()
+        .map(|(key, label, detail)| MenuOption {
+            key: key.into(),
+            label: label.into(),
+            detail: Some(detail.into()),
+            decision: None,
+        })
+        .collect(),
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "effect-recovery".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

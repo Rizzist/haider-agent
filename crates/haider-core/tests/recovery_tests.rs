@@ -6,7 +6,9 @@ use haider_protocol::effect::{EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EffectId, EventId, SessionId};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
+use haider_protocol::menu::MenuKind;
+use haider_protocol::state::RunState;
 use haider_store::{EventStore, Store};
 use std::collections::HashSet;
 
@@ -133,4 +135,87 @@ async fn recovery_event_ids_are_unambiguous_for_opaque_id_tuples() {
     }
     assert_eq!(recovery_ids.len(), 2);
     store.close().await.expect("close recovered store");
+}
+
+/// E6a mutation law: omitting Unknown, the menu, or the parked state breaks
+/// one of these exact counts; treating Unknown as terminal makes the card
+/// disappear entirely.
+#[tokio::test]
+async fn e6a_crash_mid_effect_journals_unknown_and_exact_four_choice_card() {
+    let root = tempfile::tempdir().expect("temporary profile");
+    let session = SessionId::new("e6-session");
+    let run = RunId::new("e6-run");
+    let effect = EffectId::new("e6-effect");
+    {
+        let store = Store::open(root.path()).expect("seed store");
+        let mut dispatched = envelope(
+            &session,
+            "e6-dispatched",
+            store.worker_generation(),
+            EventPayload::Effect(EffectPhase::Dispatched {
+                effect: effect.clone(),
+            }),
+        );
+        dispatched.run_id = Some(run.clone());
+        store.append(&mut [dispatched]).expect("seed crash window");
+    }
+    let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+    let first = reconcile_dispatched_effects(&store, &DeviceId::new("e6-recovery"))
+        .await
+        .expect("recover");
+    let second = reconcile_dispatched_effects(&store, &DeviceId::new("e6-recovery"))
+        .await
+        .expect("idempotent rescan");
+    assert_eq!(first.reconciled_effects, vec![effect.clone()]);
+    assert_eq!(first.opened_recovery_menus, vec![effect.clone()]);
+    assert!(second.reconciled_effects.is_empty());
+    assert!(second.opened_recovery_menus.is_empty());
+    let events = store.read(&session, 0, 100).await.expect("journal");
+    let payloads = events
+        .iter()
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).expect("typed"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect: found,
+                    outcome: EffectOutcome::Unknown,
+                    ..
+                }) if found == &effect
+            ))
+            .count(),
+        1
+    );
+    let menu = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::MenuOpened(menu)
+                if matches!(&menu.kind, MenuKind::Recovery { effect: found, .. } if found == &effect) =>
+            {
+                Some(menu)
+            }
+            _ => None,
+        })
+        .expect("recovery menu");
+    assert_eq!(
+        menu.options
+            .iter()
+            .map(|option| option.key.as_str())
+            .collect::<Vec<_>>(),
+        ["probe", "mark_done", "retry", "abandon"]
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::RunState(RunState::EffectOutcomeUnknown)
+            ))
+            .count(),
+        1
+    );
+    store.close().await.expect("close");
 }

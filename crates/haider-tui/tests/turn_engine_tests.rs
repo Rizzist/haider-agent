@@ -591,7 +591,7 @@ fn roster_claims_draw_in_order_from_index_three_and_wrap_with_roman() {
     );
     assert!(
         agent_texts(&auth)[0]
-            .starts_with("Splitting this: Husayn (a) takes the service core on hetzner-1"),
+            .starts_with("Splitting this: Husayn (a) takes the service core locally"),
         "claims persist across turns (post-increment)"
     );
 }

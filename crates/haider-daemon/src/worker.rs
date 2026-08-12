@@ -52,7 +52,7 @@ use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
@@ -60,7 +60,7 @@ use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EffectId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
-use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
+use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, effect_recovery_menu};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{
     AccountUsage, CacheBoundaryIdentity, FeatureResolve, FinishReason, PrefixDigests, StreamEvent,
@@ -1408,45 +1408,61 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             session_id,
             lease.worker_generation()
         ));
+        let runs = durable_runs(&lease).await?;
+        let candidates = runs
+            .iter()
+            .filter(|(_, state, _, _)| {
+                !state.is_terminal()
+                    && !matches!(
+                        state,
+                        RunState::InputRequired { .. }
+                            | RunState::PermissionRequired { .. }
+                            | RunState::Waiting {
+                                reason: haider_protocol::state::WaitReason::LocalChild
+                            }
+                    )
+            })
+            .collect::<Vec<_>>();
+        let reconciliation_targets = candidates
+            .iter()
+            .map(|(run_id, _, _, branch_id)| UnknownReconcileTarget {
+                run_id,
+                branch_id: branch_id.as_ref(),
+            })
+            .collect::<Vec<_>>();
+        let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
         let mut terminalized = false;
-        for (run_id, state, _, branch_id) in durable_runs(&lease).await? {
-            if state.is_terminal() {
-                continue;
-            }
-            if matches!(
-                state,
-                RunState::InputRequired { .. }
-                    | RunState::PermissionRequired { .. }
-                    | RunState::Waiting {
-                        reason: haider_protocol::state::WaitReason::LocalChild
-                    }
-            ) {
-                // P3-4 (park, don't cancel): a `request_input` checkpoint is
-                // durable, resumable state — the P2-6 sweep exists for
-                // accepted-WITHOUT-HANDOFF (Queued) runs, and must preserve
-                // a parked checkpoint exactly as a crash would; the next
-                // generation's recovery reconstructs it (scenario 10).
-                continue;
-            }
-            if state != RunState::Cancelling {
+        for ((run_id, state, _, branch_id), effect_scan) in candidates.into_iter().zip(effect_scans)
+        {
+            // P3-4 (park, don't cancel): request-input, permission, and local
+            // child checkpoints were excluded from this sweep above.
+            if *state != RunState::Cancelling {
                 append_run_state(
                     &lease,
                     &device_id,
-                    &run_id,
+                    run_id,
                     branch_id.as_ref(),
                     &event_ids,
                     RunState::Cancelling,
                 )
                 .await?;
             }
-            reconcile_unknown_effects(&lease, &device_id, &run_id, branch_id.as_ref(), &event_ids)
-                .await?;
-            let mut payloads = cancelled_resumption_payloads(&lease, &session_id, &run_id).await?;
+            let _ = append_unknown_effect_scan(
+                &lease,
+                &device_id,
+                run_id,
+                branch_id.as_ref(),
+                &event_ids,
+                UnknownReconcile::EvidenceOnly,
+                effect_scan,
+            )
+            .await?;
+            let mut payloads = cancelled_resumption_payloads(&lease, &session_id, run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
             append_payloads(
                 &lease,
                 &device_id,
-                &run_id,
+                run_id,
                 branch_id.as_ref(),
                 &event_ids,
                 payloads,
@@ -1536,12 +1552,34 @@ pub(crate) async fn terminalize_supervisor_exit(
         .into_iter()
         .filter(|(_, state, _, _)| !state.is_terminal())
         .collect::<Vec<_>>();
-    for (run_id, state, _, branch_id) in &runs {
+    let reconciliation_targets = runs
+        .iter()
+        .map(|(run_id, _, _, branch_id)| UnknownReconcileTarget {
+            run_id,
+            branch_id: branch_id.as_ref(),
+        })
+        .collect::<Vec<_>>();
+    let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
+    let mut terminalized = false;
+    for ((run_id, state, _, branch_id), effect_scan) in runs.iter().zip(effect_scans) {
         // Panic can strand a dispatched effect regardless of the run state.
         // Reconcile before either cancellation-shaped or failure-shaped
         // terminalization; a reconciliation error fences every terminal.
-        reconcile_unknown_effects(&lease, &device_id, run_id, branch_id.as_ref(), &event_ids)
-            .await?;
+        let durable_state = append_unknown_effect_scan(
+            &lease,
+            &device_id,
+            run_id,
+            branch_id.as_ref(),
+            &event_ids,
+            UnknownReconcile::Park,
+            effect_scan,
+        )
+        .await?;
+        if durable_state == Some(RunState::EffectOutcomeUnknown) {
+            // Unknown outcome is an intentional durable park with its own
+            // four-choice card. Do not overwrite it with Errored/Idle.
+            continue;
+        }
         if *state == RunState::Cancelling {
             let mut payloads = cancelled_resumption_payloads(&lease, session_id, run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
@@ -1554,6 +1592,7 @@ pub(crate) async fn terminalize_supervisor_exit(
                 payloads,
             )
             .await?;
+            terminalized = true;
             continue;
         }
         let error = HaiderError::new(
@@ -1572,8 +1611,9 @@ pub(crate) async fn terminalize_supervisor_exit(
             payloads,
         )
         .await?;
+        terminalized = true;
     }
-    if !runs.is_empty() {
+    if terminalized {
         append_session_idle(&lease, &device_id, &event_ids, true).await?;
     }
     let _ = lease.unregister_worker().await;
@@ -1669,19 +1709,14 @@ impl Drop for ActiveTurn {
     }
 }
 
-/// W-B: does a turn failure carry the provider's INVALID-REQUEST kind? The
-/// core actor stamps the kind into the error details; that is the only
-/// honest discriminator for "the request shape was refused" as opposed to
-/// auth, rate limits, or transport. Used exclusively to decide whether to
-/// stop re-declaring the Anthropic server web tools for this session — the
-/// error itself is never rewritten.
-fn is_invalid_request_failure(error: &HaiderError) -> bool {
+/// Exact discriminator for a hosted-web capability refusal that escaped the
+/// same-turn local fallback. Generic invalid requests must never silently
+/// disable provider functionality on a later turn.
+fn is_hosted_web_tool_rejection(error: &HaiderError) -> bool {
     error
-        .details
+        .presentation
         .as_ref()
-        .and_then(|details| details.get("provider_error_kind"))
-        .and_then(serde_json::Value::as_str)
-        == Some("InvalidRequest")
+        .is_some_and(|presentation| presentation.subcode.as_str() == "provider-web-tool-rejected")
 }
 
 trait FutureTurn:
@@ -2034,21 +2069,16 @@ async fn run_supervisor(
                             Ok(outcome) => (Some(outcome.state), outcome.error, None),
                             Err(error) => (None, None, Some(error)),
                         };
-                        // W-B (decision 1, "local fallback on refusal"): an
-                        // org can disable the Anthropic server web tools, and
-                        // the DECLARED tool then 400s every turn forever. A
-                        // turn that declared them and ended on an INVALID
-                        // REQUEST latches the session degrade: the error still
-                        // surfaces verbatim, but the NEXT turn declares none
-                        // and advertises the local `web_fetch` instead. A
-                        // committed `Errored` outcome is the ordinary shape
-                        // here; a drive error is the same fact escaping
-                        // before the turn could commit one.
+                        // The core actor performs the normal exact refusal
+                        // fallback in this SAME turn. This latch is only the
+                        // terminal safety net if that exact typed refusal
+                        // escapes before fallback can be installed. A generic
+                        // invalid request never disables hosted tools.
                         if finished.anthropic_web_tools
                             && outcome_error
                                 .as_ref()
                                 .or(drive_error.as_ref())
-                                .is_some_and(is_invalid_request_failure)
+                                .is_some_and(is_hosted_web_tool_rejection)
                         {
                             lease.hub().degrade_anthropic_web_tools(lease.session_id());
                         }
@@ -2071,22 +2101,30 @@ async fn run_supervisor(
                                     true,
                                 )
                             });
-                            if let Err(reconcile_error) = reconcile_unknown_effects(
+                            let durable = match reconcile_unknown_effects(
                                 &lease,
                                 &device_id,
                                 &finished.run_id,
                                 finished.branch_id.as_ref(),
                                 &event_ids,
+                                UnknownReconcile::Park,
                             )
                             .await
                             {
-                                tracing::error!(
-                                    run_id = %finished.run_id,
-                                    ?reconcile_error,
-                                    "failed turn effect reconciliation blocked terminal commit"
-                                );
+                                Ok(durable) => durable,
+                                Err(reconcile_error) => {
+                                    tracing::error!(
+                                        run_id = %finished.run_id,
+                                        ?reconcile_error,
+                                        "failed turn effect reconciliation blocked terminal commit"
+                                    );
+                                    let _ = lease.unregister_worker().await;
+                                    return false;
+                                }
+                            };
+                            if durable == Some(RunState::EffectOutcomeUnknown) {
                                 let _ = lease.unregister_worker().await;
-                                return false;
+                                return true;
                             }
                             match failed_resumption_payloads(
                                 &lease,
@@ -2135,28 +2173,35 @@ async fn run_supervisor(
                         // non-terminal in daemon mode. Broker close above first
                         // reconciles every held dispatch to Unknown; only then
                         // may Cancelled become the durable final envelope.
-                        if let Err(error) = reconcile_unknown_effects(
+                        let durable = match reconcile_unknown_effects(
                             &lease,
                             &device_id,
                             &finished.run_id,
                             finished.branch_id.as_ref(),
                             &event_ids,
+                            UnknownReconcile::EvidenceOnly,
                         )
                         .await
                         {
-                            // Never cross the terminal boundary while a
-                            // Dispatched effect still lacks an outcome. A
-                            // later startup/fresh supervisor may reconcile
-                            // it, but this exit must not synthesize Cancelled.
-                            tracing::error!(
-                                run_id = %finished.run_id,
-                                ?error,
-                                "effect reconciliation failed; terminal commit remains fenced"
-                            );
+                            Ok(durable) => durable,
+                            Err(error) => {
+                                // Never cross the terminal boundary while a
+                                // Dispatched effect still lacks an outcome. A
+                                // later startup/fresh supervisor may reconcile
+                                // it, but this exit must not synthesize Cancelled.
+                                tracing::error!(
+                                    run_id = %finished.run_id,
+                                    ?error,
+                                    "effect reconciliation failed; terminal commit remains fenced"
+                                );
+                                let _ = lease.unregister_worker().await;
+                                return false;
+                            }
+                        };
+                        if durable == Some(RunState::EffectOutcomeUnknown) {
                             let _ = lease.unregister_worker().await;
-                            return false;
+                            return true;
                         }
-                        let durable = durable_run_state(&lease, &finished.run_id).await;
                         let cancelled =
                             idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
                         if cancelled {
@@ -2608,6 +2653,58 @@ async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64
     }
 }
 
+/// How a caller settles dispatched effects that lack a durable outcome.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnknownReconcile {
+    /// Death-shaped exits (supervisor panic, harness actor death): nobody is
+    /// left to settle the run, so append Unknown evidence, open the
+    /// four-choice recovery card, and park the run as `EffectOutcomeUnknown`.
+    Park,
+    /// Settlement-shaped exits (user cancellation, failure terminalization):
+    /// the caller commits its own terminal (Cancelled/Errored) immediately
+    /// after, so append Unknown evidence only — no card and no park. P1-1:
+    /// user cancellation must still end with Cancelled as the final envelope.
+    EvidenceOnly,
+}
+
+#[derive(Default)]
+struct UnknownEffectScan {
+    dispatched: HashSet<EffectId>,
+    summaries: HashMap<EffectId, String>,
+    /// `true` is Unknown; `false` is any terminal outcome.
+    outcomes: HashMap<EffectId, bool>,
+    open_recovery: HashMap<MenuId, EffectId>,
+    durable_state: Option<RunState>,
+    durable_state_branch: Option<BranchId>,
+    durable_state_seen: bool,
+    durable_state_corrupt: bool,
+}
+
+#[derive(Clone, Copy)]
+struct UnknownReconcileTarget<'a> {
+    run_id: &'a RunId,
+    branch_id: Option<&'a BranchId>,
+}
+
+impl UnknownEffectScan {
+    fn observe_durable_state(&mut self, branch_id: Option<&BranchId>, state: Option<RunState>) {
+        if self.durable_state_seen {
+            if self.durable_state_branch.as_ref() != branch_id {
+                self.durable_state_corrupt = true;
+                return;
+            }
+        } else {
+            self.durable_state_seen = true;
+            self.durable_state_branch = branch_id.cloned();
+        }
+        if let Some(state) = state {
+            self.durable_state = Some(state);
+        } else if self.durable_state.is_none() {
+            self.durable_state = Some(RunState::Queued);
+        }
+    }
+}
+
 /// Live counterpart of startup effect reconciliation, scoped to one run.
 ///
 /// Dispatcher close is attempted first, but its return value is not evidence
@@ -2619,9 +2716,31 @@ async fn reconcile_unknown_effects(
     run_id: &RunId,
     branch_id: Option<&BranchId>,
     event_ids: &EventIdGenerator,
-) -> Result<(), HaiderError> {
-    let mut dispatched = HashSet::<EffectId>::new();
-    let mut terminal = HashSet::<EffectId>::new();
+    mode: UnknownReconcile,
+) -> Result<Option<RunState>, HaiderError> {
+    let target = [UnknownReconcileTarget { run_id, branch_id }];
+    let scan = scan_unknown_effects(store, &target)
+        .await?
+        .pop()
+        .unwrap_or_default();
+    append_unknown_effect_scan(store, device_id, run_id, branch_id, event_ids, mode, scan).await
+}
+
+async fn scan_unknown_effects(
+    store: &HubStoreHandle,
+    targets: &[UnknownReconcileTarget<'_>],
+) -> Result<Vec<UnknownEffectScan>, HaiderError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target_indices = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.run_id.as_str(), (index, target.branch_id)))
+        .collect::<HashMap<_, _>>();
+    let mut scans = std::iter::repeat_with(UnknownEffectScan::default)
+        .take(targets.len())
+        .collect::<Vec<_>>();
     let mut cursor = 0;
     loop {
         let page = StoreHandle::read(store, store.session_id(), cursor, 512).await?;
@@ -2629,14 +2748,44 @@ async fn reconcile_unknown_effects(
             break;
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        for envelope in page {
-            if envelope.run_id.as_ref() != Some(run_id)
-                || envelope.branch_id.as_ref() != branch_id
-                || envelope
+        for mut envelope in page {
+            let Some(run_id) = envelope.run_id.as_ref() else {
+                continue;
+            };
+            let Some(&(index, expected_branch)) = target_indices.get(run_id.as_str()) else {
+                continue;
+            };
+            let effect_scoped = envelope.branch_id.as_ref() == expected_branch;
+            let payload_kind = envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str);
+            let scan = &mut scans[index];
+            if payload_kind == Some("user_message") {
+                // The message body and attachments are irrelevant to durable
+                // run-state reduction; avoid materializing them just to infer
+                // the acceptance-time Queued default.
+                scan.observe_durable_state(envelope.branch_id.as_ref(), None);
+                continue;
+            }
+            if payload_kind == Some("run_state") {
+                let Some(state) = envelope
                     .payload
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("effect")
+                    .get_mut("state")
+                    .map(serde_json::Value::take)
+                else {
+                    continue;
+                };
+                if let Ok(state) = serde_json::from_value::<RunState>(state) {
+                    scan.observe_durable_state(envelope.branch_id.as_ref(), Some(state));
+                }
+                continue;
+            }
+            if !effect_scoped
+                || !matches!(
+                    payload_kind,
+                    Some("effect" | "menu_opened" | "menu_answered" | "menu_closed")
+                )
             {
                 continue;
             }
@@ -2653,42 +2802,97 @@ async fn reconcile_unknown_effects(
                     )
                 })?;
             match payload {
-                EventPayload::Effect(EffectPhase::Dispatched { effect }) => {
-                    dispatched.insert(effect);
+                EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                    scan.summaries.insert(intent.effect, intent.summary);
                 }
-                EventPayload::Effect(EffectPhase::Outcome { effect, .. }) => {
-                    terminal.insert(effect);
+                EventPayload::Effect(EffectPhase::Dispatched { effect }) => {
+                    scan.dispatched.insert(effect);
+                }
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect, outcome, ..
+                }) => {
+                    scan.outcomes
+                        .insert(effect, matches!(outcome, EffectOutcome::Unknown));
+                }
+                EventPayload::MenuOpened(menu) => {
+                    if let MenuKind::Recovery { effect, .. } = menu.kind {
+                        scan.open_recovery.insert(menu.id, effect);
+                    }
+                }
+                EventPayload::MenuAnswered(MenuAnswer { menu, .. })
+                | EventPayload::MenuClosed { menu, .. } => {
+                    scan.open_recovery.remove(&menu);
                 }
                 _ => {}
             }
         }
     }
+    Ok(scans)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_unknown_effect_scan(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_ids: &EventIdGenerator,
+    mode: UnknownReconcile,
+    scan: UnknownEffectScan,
+) -> Result<Option<RunState>, HaiderError> {
+    let UnknownEffectScan {
+        dispatched,
+        summaries,
+        outcomes,
+        open_recovery,
+        durable_state,
+        durable_state_branch: _,
+        durable_state_seen: _,
+        durable_state_corrupt,
+    } = scan;
+    let mut durable_state = (!durable_state_corrupt).then_some(durable_state).flatten();
+    let open_recovery_effects = open_recovery
+        .values()
+        .map(EffectId::as_str)
+        .collect::<HashSet<_>>();
     let mut pending = dispatched
-        .difference(&terminal)
-        .cloned()
+        .into_iter()
+        .filter(|effect| {
+            outcomes.get(effect).is_none_or(|unknown| *unknown)
+                && !open_recovery_effects.contains(effect.as_str())
+        })
         .collect::<Vec<_>>();
     pending.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     if pending.is_empty() {
-        return Ok(());
+        return Ok(durable_state);
     }
-    append_payloads(
-        store,
-        device_id,
-        run_id,
-        branch_id,
-        event_ids,
-        pending
-            .into_iter()
-            .map(|effect| {
-                EventPayload::Effect(EffectPhase::Outcome {
-                    effect,
-                    outcome: EffectOutcome::Unknown,
-                    freshness: None,
-                })
-            })
-            .collect(),
-    )
-    .await
+    let mut payloads = Vec::with_capacity(pending.len().saturating_mul(3));
+    for effect in pending {
+        if !outcomes.contains_key(&effect) {
+            payloads.push(EventPayload::Effect(EffectPhase::Outcome {
+                effect: effect.clone(),
+                outcome: EffectOutcome::Unknown,
+                freshness: None,
+            }));
+        }
+        if mode == UnknownReconcile::Park {
+            payloads.push(EventPayload::MenuOpened(effect_recovery_menu(
+                MenuId::new(format!("effect-recovery-{run_id}-{effect}")),
+                effect.clone(),
+                summaries
+                    .get(&effect)
+                    .map(String::as_str)
+                    .unwrap_or("unknown dispatched effect"),
+            )));
+            payloads.push(EventPayload::RunState(RunState::EffectOutcomeUnknown));
+            durable_state = Some(RunState::EffectOutcomeUnknown);
+        }
+    }
+    if payloads.is_empty() {
+        return Ok(durable_state);
+    }
+    append_payloads(store, device_id, run_id, branch_id, event_ids, payloads).await?;
+    Ok(durable_state)
 }
 
 async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<RunState> {
@@ -3363,7 +3567,15 @@ async fn cancel_shell_exec(
     event_ids: &EventIdGenerator,
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
-    reconcile_unknown_effects(lease, device_id, run_id, None, event_ids).await?;
+    let _ = reconcile_unknown_effects(
+        lease,
+        device_id,
+        run_id,
+        None,
+        event_ids,
+        UnknownReconcile::EvidenceOnly,
+    )
+    .await?;
     let mut payloads = cancelled_resumption_payloads(lease, lease.session_id(), run_id).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
     append_payloads(lease, device_id, run_id, None, event_ids, payloads).await?;
@@ -3380,7 +3592,15 @@ async fn fail_shell_exec(
     if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
         return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
     }
-    reconcile_unknown_effects(lease, device_id, run_id, None, event_ids).await?;
+    let _ = reconcile_unknown_effects(
+        lease,
+        device_id,
+        run_id,
+        None,
+        event_ids,
+        UnknownReconcile::EvidenceOnly,
+    )
+    .await?;
     let mut payloads =
         failed_resumption_payloads(lease, lease.session_id(), run_id, &error).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
@@ -3687,6 +3907,21 @@ async fn start_turn(
         &resolved.provider_name,
         web_degrade,
     );
+    if matches!(
+        resolved.provider_name.as_str(),
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+    ) && !web_degrade.anthropic_web_tools
+    {
+        config.provider_tool_fallback_tools = advertised_tool_definitions(
+            &dependencies.tool_factory,
+            grant.as_ref(),
+            &resolved.provider_name,
+            WebCapabilityDegrade {
+                anthropic_web_tools: true,
+                ..web_degrade
+            },
+        );
+    }
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let account_scope = resolved
         .account_alias
@@ -5687,7 +5922,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let operation = WebFetch::from_tool_args(&args).map_err(tool_error)?;
                 match broker.begin_web_fetch(&operation, &policy).await {
                     Ok(intent) => {
-                        let fetched = tokio::select! {
+                        let execution = tokio::select! {
                             () = cancel.cancelled() => {
                                 broker
                                     .journal_outcome(&intent, EffectOutcome::Cancelled)
@@ -5699,11 +5934,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     false,
                                 ));
                             }
-                            fetched = haider_provider::fetch_public_url(
+                            fetched = haider_provider::fetch_public_url_with_one_retry(
                                 operation.url(),
                                 operation.max_bytes(),
                             ) => fetched,
                         };
+                        let retried = execution.attempts == 2;
+                        let fetched = execution.outcome;
                         match fetched {
                             Ok(outcome) => {
                                 broker
@@ -5719,7 +5956,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     artifact: None,
                                     cursor: None,
                                     status: ToolResultStatus::Completed,
-                                    reason: None,
+                                    reason: retried.then(|| {
+                                        "transient web_fetch failure — retry 2/2 succeeded".into()
+                                    }),
                                     presentation: None,
                                 })
                             }
@@ -5740,8 +5979,25 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     artifact: None,
                                     cursor: None,
                                     status: ToolResultStatus::Failed,
-                                    reason: Some(crate::worker::bounded_failure_reason(&message)),
-                                    presentation: None,
+                                    reason: Some(if retried {
+                                        format!(
+                                            "retry 2/2 exhausted — {}",
+                                            crate::worker::bounded_failure_reason(&message)
+                                        )
+                                    } else {
+                                        crate::worker::bounded_failure_reason(&message)
+                                    }),
+                                    presentation: Some(if retried {
+                                        ErrorPresentation::new(
+                                            "web-fetch-retry-exhausted",
+                                            "Web fetch failed after retry",
+                                            "The idempotent GET was attempted twice and still failed.",
+                                            ErrorScope::Tool,
+                                            [ErrorAction::Retry],
+                                        )
+                                    } else {
+                                        error.presentation
+                                    }),
                                 })
                             }
                         }

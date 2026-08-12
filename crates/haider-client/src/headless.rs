@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::{Future, pending};
 use std::io::Read as _;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -469,7 +470,20 @@ fn headless_submit_body(
 }
 
 impl HeadlessConnection {
-    async fn open(
+    /// Boxed on purpose: this future carries the whole `ensure_daemon` →
+    /// `try_attach` spawn subtree, whose debug-build frames are large enough
+    /// that inlining them into every reconnect caller overflows the test
+    /// thread stack now that the E5-E8 protocol types grew (bisected via the
+    /// competing-permission law). Heap-pinning detaches that subtree from
+    /// every caller's stack frame.
+    fn open<'a>(
+        profile: &'a ResolvedProfile,
+        options: EnsureOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, HeadlessRunError>> + Send + 'a>> {
+        Box::pin(Self::open_inner(profile, options))
+    }
+
+    async fn open_inner(
         profile: &ResolvedProfile,
         options: EnsureOptions,
     ) -> Result<Self, HeadlessRunError> {
@@ -2278,7 +2292,11 @@ async fn handle_reducer_actions(
                         ));
                     }
                     Err(error) => {
-                        reconnect_attached_for_run_before_deadline(
+                        // Boxed for the same stack-size reason as
+                        // `HeadlessConnection::open`: this is the deepest
+                        // reconnect subtree and it hangs off the per-event
+                        // reducer loop.
+                        Box::pin(reconnect_attached_for_run_before_deadline(
                             profile,
                             ensure,
                             connection,
@@ -2292,7 +2310,7 @@ async fn handle_reducer_actions(
                             terminal_grace,
                             "menu.answer",
                             error,
-                        )
+                        ))
                         .await?;
                     }
                 }

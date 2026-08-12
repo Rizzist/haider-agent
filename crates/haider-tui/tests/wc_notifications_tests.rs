@@ -48,18 +48,24 @@ fn attention_fires_on_terminal_and_park_states_only() {
         notify::attention_for(&RunState::Waiting {
             reason: WaitReason::DeviceUnreachable
         }),
-        Some(Attention::WaitingDevice)
+        None,
+        "remote placement waits are unsupported in the local-only product"
     );
     // Mid-stream states NEVER notify.
     assert_eq!(notify::attention_for(&RunState::Thinking), None);
     assert_eq!(notify::attention_for(&RunState::Streaming), None);
     assert_eq!(notify::attention_for(&RunState::RunningTool), None);
-    // A non-device wait is not an attention park.
+    // A long provider-reset park needs attention; transient Retrying below
+    // remains silent.
     assert_eq!(
         notify::attention_for(&RunState::Waiting {
             reason: WaitReason::RateLimit
         }),
-        None
+        Some(Attention::WaitingRateLimit)
+    );
+    assert_eq!(
+        notify::attention_for(&RunState::EffectOutcomeUnknown),
+        Some(Attention::EffectUnknown)
     );
     // M4: a retry backoff is mid-run work, NEVER a terminal/park — it must
     // not fire a desktop notification (only the FINAL Errored does).

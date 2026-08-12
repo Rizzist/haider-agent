@@ -269,11 +269,11 @@ fn auto_resume_and_aura_builders_are_verbatim() {
     assert!(!aura_is_status("spin up billing"));
     assert_eq!(
         aura_target("spin up the auth service on hetzner-1 and run its tests"),
-        ("auth".to_owned(), "hetzner-1".to_owned())
+        ("auth".to_owned(), "local".to_owned())
     );
     assert_eq!(
         aura_target("start billing-service please"),
-        ("billing".to_owned(), "workstation".to_owned())
+        ("billing".to_owned(), "local".to_owned())
     );
     let spawn = aura_spawn_beats(true, "auth", "hetzner-1", 1);
     assert!(spawn.iter().any(|beat| matches!(
@@ -281,15 +281,15 @@ fn auto_resume_and_aura_builders_are_verbatim() {
         Beat::AuraEmit(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
             item: haider_protocol::item::TurnItem::AgentMessage { text },
             ..
-        })) if text == "On it — I'll place a auth session on hetzner-1, start the work, and report back. I don't touch the code myself."
+        })) if text == "On it — I'll start a local auth session, begin the work, and report back. I don't touch the code myself."
     )));
     assert!(spawn.iter().any(|beat| matches!(
         beat,
-        Beat::AuraLog(text) if text == "agent_spawn — auth → hetzner-1 · lease ok"
+        Beat::AuraLog(text) if text == "agent_spawn — auth → local · lease ok"
     )));
     assert!(spawn.iter().any(|beat| matches!(
         beat,
-        Beat::AuraLog(text) if text == "auth on hetzner-1: tests green ✓"
+        Beat::AuraLog(text) if text == "auth on local: tests green ✓"
     )));
 }
 
@@ -552,7 +552,7 @@ async fn aura_orchestrates_spawn_and_status_with_talk_and_toggles() {
     .await;
     let row = &model.aura.roster[1];
     assert_eq!(row.name, "billing");
-    assert_eq!(row.device, "workstation");
+    assert_eq!(row.device, "local");
     assert_eq!(row.state, ChipDisplayState::Done);
     assert_eq!(row.activity, "tests green");
     assert!(
@@ -560,7 +560,7 @@ async fn aura_orchestrates_spawn_and_status_with_talk_and_toggles() {
             .aura
             .log
             .iter()
-            .any(|line| line == "billing on workstation: tests green ✓")
+            .any(|line| line == "billing on local: tests green ✓")
     );
     // Spoken agent rows (audio on) tag ♪.
     assert!(model.aura.transcript.entries().iter().any(|entry| matches!(
@@ -627,7 +627,7 @@ async fn aura_orchestrates_spawn_and_status_with_talk_and_toggles() {
     assert!(model.aura.transcript.entries().iter().any(|entry| matches!(
         entry,
         TranscriptEntry::User { text, voice: true, .. }
-            if text == "spin up the auth service on hetzner-1 and run its tests"
+            if text == "spin up the auth service locally and run its tests"
     )));
     // Esc: no session attached → launcher; aura state persists.
     model.handle(key(KeyCode::Esc));
@@ -802,14 +802,14 @@ fn aura_stage_renders_bar_orb_columns_and_transcript() {
     assert!(rows.iter().any(|row| row.contains("[ ♪ audio on ]")));
     assert!(rows.iter().any(|row| row.contains("[ exit ⤶ ]")));
     assert!(rows.iter().any(|row| row.contains("◌ IDLE")));
-    assert!(rows.iter().any(|row| row.contains(
-        "native duplex · never writes code — it spawns and steers sessions on your devices"
-    )));
+    assert!(rows.iter().any(|row| {
+        row.contains("native duplex · never writes code — it spawns and steers local sessions")
+    }));
     assert!(rows.iter().any(|row| row.contains("[ ◉ hold to talk ]")));
     assert!(rows.iter().any(|row| row.contains("controlled sessions")));
     assert!(
         rows.iter()
-            .any(|row| row.contains("✓ billing-service · workstation — webhook tests green"))
+            .any(|row| row.contains("✓ billing-service · local — webhook tests green"))
     );
     assert!(
         rows.iter()
@@ -817,16 +817,16 @@ fn aura_stage_renders_bar_orb_columns_and_transcript() {
     );
     assert!(
         rows.iter()
-            .any(|row| row.contains("· spawned billing-service on workstation"))
+            .any(|row| row.contains("· spawned billing-service locally"))
     );
     assert!(rows.iter().any(|row| row.contains("■ aura · ♪")));
     assert!(
         rows.iter()
-            .any(|row| row.contains("Aura online. I orchestrate sessions across your"))
+            .any(|row| row.contains("Aura online. I orchestrate local sessions"))
     );
-    assert!(rows.iter().any(|row| row.contains(
-        "speak or type — e.g. “spin up billing-service on workstation and run its tests”"
-    )));
+    assert!(rows.iter().any(|row| {
+        row.contains("speak or type — e.g. “spin up billing-service locally and run its tests”")
+    }));
     for hit in [
         Hit::AuraEngine,
         Hit::AuraMute,

@@ -20,6 +20,144 @@
 
 use super::*;
 
+pub(super) fn selected_effect_recovery_action(
+    menu: &Menu,
+    answer: &DurableMenuAnswer,
+) -> Option<EffectRecoveryAction> {
+    let MenuKind::Recovery { option_actions, .. } = &menu.kind else {
+        return None;
+    };
+    if let Some(action) = option_actions.get(answer.option_index as usize).copied() {
+        return Some(action);
+    }
+    let key = answer.option_key.as_deref().or_else(|| {
+        menu.options
+            .get(answer.option_index as usize)
+            .map(|option| option.key.as_str())
+    })?;
+    match key {
+        "probe" => Some(EffectRecoveryAction::Probe),
+        "mark_done" => Some(EffectRecoveryAction::MarkDone),
+        "retry" => Some(EffectRecoveryAction::Retry),
+        "abandon" => Some(EffectRecoveryAction::Abandon),
+        _ => None,
+    }
+}
+
+async fn settle_effect_recovery(
+    store: &SqliteStoreHandle,
+    answer: &RawEnvelope,
+    effect: &haider_protocol::ids::EffectId,
+    action: EffectRecoveryAction,
+    worker_generation: u64,
+) -> Result<Vec<RawEnvelope>, HaiderError> {
+    let mut payloads = effect_recovery_payloads(effect, action)?;
+    let mut envelopes = Vec::with_capacity(payloads.len());
+    for (index, payload) in payloads.drain(..).enumerate() {
+        let session_global = matches!(payload, EventPayload::SessionState(_));
+        envelopes.push(haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id: EventId::new(format!(
+                "effect-resolution-{}-{}",
+                answer.event_id,
+                index + 1
+            )),
+            seq: 0,
+            session_id: answer.session_id.clone(),
+            branch_id: (!session_global)
+                .then(|| answer.branch_id.clone())
+                .flatten(),
+            run_id: (!session_global).then(|| answer.run_id.clone()).flatten(),
+            agent_id: (!session_global).then(|| answer.agent_id.clone()).flatten(),
+            device_id: answer.device_id.clone(),
+            authority_epoch: answer.authority_epoch,
+            worker_generation,
+            causation_id: Some(answer.event_id.clone()),
+            correlation_id: answer.correlation_id.clone(),
+            committed_at_ms: 0,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Pruned,
+            },
+            payload: serde_json::to_value(payload).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("effect reconciliation payload could not serialize: {error}"),
+                    false,
+                )
+            })?,
+        });
+    }
+    store.append(&mut envelopes).await?;
+    Ok(envelopes)
+}
+
+fn effect_recovery_payloads(
+    effect: &haider_protocol::ids::EffectId,
+    action: EffectRecoveryAction,
+) -> Result<Vec<EventPayload>, HaiderError> {
+    let payloads = match action {
+        EffectRecoveryAction::MarkDone => vec![
+            EventPayload::Effect(haider_protocol::effect::EffectPhase::Outcome {
+                effect: effect.clone(),
+                outcome: haider_protocol::effect::EffectOutcome::Ok,
+                freshness: None,
+            }),
+            EventPayload::RunState(RunState::Done),
+            EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
+                interrupted: true,
+            }),
+        ],
+        EffectRecoveryAction::Retry => vec![
+            EventPayload::Effect(haider_protocol::effect::EffectPhase::Outcome {
+                effect: effect.clone(),
+                outcome: haider_protocol::effect::EffectOutcome::Failed {
+                    error: "settled for explicit user retry".into(),
+                },
+                freshness: None,
+            }),
+            EventPayload::RunState(RunState::Errored),
+            EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
+                interrupted: true,
+            }),
+        ],
+        EffectRecoveryAction::Abandon => vec![
+            EventPayload::Effect(haider_protocol::effect::EffectPhase::Outcome {
+                effect: effect.clone(),
+                outcome: haider_protocol::effect::EffectOutcome::Failed {
+                    error: "abandoned by user after unknown outcome".into(),
+                },
+                freshness: None,
+            }),
+            EventPayload::RunFailed {
+                code: ErrorCode::EffectUnknownOutcome,
+                message: "effect was abandoned after its outcome became unknown".into(),
+                retryable: false,
+                presentation: Some(haider_protocol::error::ErrorPresentation::new(
+                    "effect-outcome-abandoned",
+                    "Unknown effect abandoned",
+                    "The ambiguous effect was durably closed without retrying it.",
+                    haider_protocol::error::ErrorScope::Tool,
+                    [haider_protocol::error::ErrorAction::None],
+                )),
+            },
+            EventPayload::RunState(RunState::Errored),
+            EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
+                interrupted: true,
+            }),
+        ],
+        EffectRecoveryAction::Probe => {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "effect probes must execute through the RPC probe handler",
+                false,
+            ));
+        }
+    };
+    Ok(payloads)
+}
+
 // ──────────── session actor: the serialized command loop (§5.5) ─────────────
 
 /// One session's entire command order, in one loop, in one task.
@@ -548,8 +686,9 @@ pub(super) async fn run_session_actor(
                         && recovered.request_seq == command.request_seq
                         && recovered.opening_generation == command.worker_generation
                 });
-                let outcome = store.resolve_menu(command).await;
-                if let Ok(MenuResolutionOutcome::Committed { ref envelope }) = outcome {
+                let answer = command.answer.clone();
+                let mut outcome = store.resolve_menu(command).await;
+                if let Ok(MenuResolutionOutcome::Committed { ref envelope, .. }) = outcome {
                     head = envelope.seq;
                     authority_epoch = envelope.authority_epoch;
                     observer.observe(HubObservation::Persisted {
@@ -577,6 +716,49 @@ pub(super) async fn run_session_actor(
                             error = ?error,
                             "committed menu event could not wake the live harness"
                         );
+                    }
+                }
+                if let Ok(MenuResolutionOutcome::Committed { envelope, menu }) = &outcome
+                    && let MenuKind::Recovery { effect, .. } = &menu.kind
+                    && let Some(action) = selected_effect_recovery_action(menu, &answer)
+                    && action != EffectRecoveryAction::Probe
+                {
+                    match settle_effect_recovery(
+                        &store,
+                        envelope,
+                        effect,
+                        action,
+                        worker_generation,
+                    )
+                    .await
+                    {
+                        Ok(envelopes) => {
+                            if let Some(last) = envelopes.last() {
+                                head = last.seq;
+                                authority_epoch = last.authority_epoch;
+                            }
+                            publish(
+                                &mut attachments,
+                                &envelopes,
+                                catch_up_byte_budget,
+                                &metrics,
+                                &hooks,
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                effect = %effect,
+                                ?error,
+                                "committed effect recovery answer could not settle"
+                            );
+                            // The menu answer is durable, so callers must not
+                            // be told the reconciliation itself succeeded.
+                            // Startup/live reduction consumes MenuAnswered
+                            // and reopens the card if these follow-ups are
+                            // missing.
+                            outcome = Err(error);
+                        }
                     }
                 }
                 let _ = completed.send(outcome);
@@ -800,4 +982,137 @@ async fn session_config_only_delta(
             )
             .is_ok()
         })
+}
+
+#[cfg(test)]
+mod error_wave3_tests {
+    use super::*;
+    use haider_protocol::effect::{EffectOutcome, EffectPhase};
+
+    #[test]
+    fn e6a_effect_recovery_handlers_produce_typed_durable_closure() {
+        let effect = haider_protocol::ids::EffectId::new("effect-e6a-handlers");
+
+        let mark_done =
+            effect_recovery_payloads(&effect, EffectRecoveryAction::MarkDone).expect("mark done");
+        assert!(matches!(
+            &mark_done[0],
+            EventPayload::Effect(EffectPhase::Outcome {
+                outcome: EffectOutcome::Ok,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mark_done[1],
+            EventPayload::RunState(RunState::Done)
+        ));
+
+        let retry = effect_recovery_payloads(&effect, EffectRecoveryAction::Retry).expect("retry");
+        assert!(matches!(
+            &retry[0],
+            EventPayload::Effect(EffectPhase::Outcome {
+                outcome: EffectOutcome::Failed { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            retry[1],
+            EventPayload::RunState(RunState::Errored)
+        ));
+
+        let abandon =
+            effect_recovery_payloads(&effect, EffectRecoveryAction::Abandon).expect("abandon");
+        assert!(matches!(
+            &abandon[1],
+            EventPayload::RunFailed {
+                code: ErrorCode::EffectUnknownOutcome,
+                presentation: Some(presentation),
+                ..
+            } if presentation.subcode.as_str() == "effect-outcome-abandoned"
+        ));
+        assert!(matches!(
+            abandon[2],
+            EventPayload::RunState(RunState::Errored)
+        ));
+
+        assert!(
+            effect_recovery_payloads(&effect, EffectRecoveryAction::Probe).is_err(),
+            "probe is a real RPC check, never a fake durable settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn e6a_abandon_closes_the_unknown_effect_durably() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let session_id = SessionId::new("e6a-abandon-session");
+        store
+            .create_session(haider_store::SessionCreateCommand {
+                command_id: "create-e6a-abandon".into(),
+                request_digest: "digest-e6a-abandon".into(),
+                request_json: r#"{"session":"e6a-abandon"}"#.into(),
+                session_id: session_id.clone(),
+                cwd: root.path().to_string_lossy().into_owned(),
+                provider: "fake".into(),
+                model: "fake-v1".into(),
+                max_tokens: 1_024,
+                permission_overrides: None,
+                effort: None,
+                fast: false,
+                cache_policy: Default::default(),
+                system_prompt_version: "test-system-v1".into(),
+                event_id: EventId::new("created-e6a-abandon"),
+                device_id: DeviceId::new("e6a-device"),
+            })
+            .await
+            .expect("create session");
+        let answer = haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id: EventId::new("answered-e6a-abandon"),
+            seq: 2,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(RunId::new("run-e6a-abandon")),
+            agent_id: None,
+            device_id: DeviceId::new("e6a-device"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Pruned,
+            },
+            payload: serde_json::to_value(EventPayload::IdleDecayed).expect("answer payload"),
+        };
+        settle_effect_recovery(
+            &store,
+            &answer,
+            &haider_protocol::ids::EffectId::new("effect-e6a-abandon"),
+            EffectRecoveryAction::Abandon,
+            store.worker_generation(),
+        )
+        .await
+        .expect("durable abandon");
+
+        let events = store.read(&session_id, 0, 100).await.expect("read journal");
+        assert!(events.iter().any(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::RunFailed {
+                    code: ErrorCode::EffectUnknownOutcome,
+                    ..
+                })
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::RunState(RunState::Errored))
+            )
+        }));
+        store.close().await.expect("close");
+    }
 }

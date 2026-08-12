@@ -40,9 +40,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use haider_client::{ClientConfig, ClientError, DisconnectReason, ResolvedProfile, RpcClient};
+use haider_client::{ClientConfig, ClientError, ResolvedProfile, RpcClient};
 use haider_rpc::{AttachMode, RequestBody, ResponseBody, WireFrame};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::live::{LiveCommand, LiveReply};
 
@@ -53,6 +53,7 @@ const REDIAL_MAX: Duration = Duration::from_secs(5);
 
 /// Channel depth for commands and replies. Both are UI-paced.
 const LINK_CAPACITY: usize = 256;
+const MAX_LINK_STARTS: u8 = 2;
 
 /// How many attachment-scoped replies the link will hold behind an
 /// outstanding attach response before it gives up and reports a gap.
@@ -85,11 +86,11 @@ impl Link {
         let daemon_version = client.welcome().daemon_version.clone();
         let (commands_tx, commands_rx) = mpsc::channel(LINK_CAPACITY);
         let (replies_tx, replies) = mpsc::channel(LINK_CAPACITY);
-        let task = tokio::spawn(run_link(
-            Arc::new(client),
+        let task = tokio::spawn(supervise_link(
+            client,
             profile,
             config,
-            commands_rx,
+            Arc::new(Mutex::new(commands_rx)),
             replies_tx,
         ));
         Self {
@@ -108,14 +109,85 @@ impl Drop for Link {
     }
 }
 
+/// Restarts the whole Link future once if it panics. Socket disconnects are
+/// handled inside `run_link`; this outer boundary is for an unexpected task
+/// death that would otherwise only close the reply channel. The command
+/// receiver lives outside the child so queued durable command ids survive.
+async fn supervise_link(
+    initial_client: RpcClient,
+    profile: ResolvedProfile,
+    config: ClientConfig,
+    commands: Arc<Mutex<mpsc::Receiver<LiveCommand>>>,
+    replies: mpsc::Sender<LiveReply>,
+) {
+    let mut client = Some(initial_client);
+    for start in 1..=MAX_LINK_STARTS {
+        let active = match client.take() {
+            Some(client) => client,
+            None => match haider_client::connect(&profile.endpoint_path, config.clone()).await {
+                Ok(connected) => connected.client,
+                Err(error) => {
+                    let _ = replies
+                        .send(LiveReply::SupervisorFailed {
+                            component: "link",
+                            reason: format!("bounded task restart could not reconnect: {error}"),
+                        })
+                        .await;
+                    return;
+                }
+            },
+        };
+        let child = tokio::spawn(run_link(
+            Arc::new(active),
+            profile.clone(),
+            config.clone(),
+            Arc::clone(&commands),
+            replies.clone(),
+        ));
+        match child.await {
+            Ok(()) => return,
+            Err(error) if error.is_panic() && start < MAX_LINK_STARTS => {
+                if replies
+                    .send(LiveReply::SupervisorRestarting {
+                        component: "link",
+                        attempt: start + 1,
+                        max: MAX_LINK_STARTS,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = replies
+                    .send(LiveReply::SupervisorFailed {
+                        component: "link",
+                        reason: format!(
+                            "unexpected link task death after {start}/{MAX_LINK_STARTS} starts: {error}"
+                        ),
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
 async fn run_link(
     mut client: Arc<RpcClient>,
     profile: ResolvedProfile,
     config: ClientConfig,
-    mut commands: mpsc::Receiver<LiveCommand>,
+    commands: Arc<Mutex<mpsc::Receiver<LiveCommand>>>,
     replies: mpsc::Sender<LiveReply>,
 ) {
     let Some(mut events) = client.take_events() else {
+        let _ = replies
+            .send(LiveReply::SupervisorFailed {
+                component: "link",
+                reason: "link event channel was unavailable at startup".into(),
+            })
+            .await;
         return;
     };
     // THE ATTACH BARRIER. Attach responses come back on their own channel so
@@ -154,7 +226,7 @@ async fn run_link(
             }
         }
         let dead = tokio::select! {
-            command = commands.recv() => {
+            command = async { commands.lock().await.recv().await } => {
                 let Some(command) = command else { return };
                 if issue(&client, command, &replies, &attaches_tx).await {
                     outstanding_attaches += 1;
@@ -226,9 +298,6 @@ async fn run_link(
         let (fresh_tx, fresh_rx) = mpsc::channel::<Vec<LiveReply>>(LINK_CAPACITY);
         attaches_tx = fresh_tx;
         attaches_rx = fresh_rx;
-        if matches!(reason, DisconnectReason::Closed) {
-            return;
-        }
         if replies
             .send(LiveReply::Disconnected {
                 reason: reason.to_string(),
@@ -242,11 +311,31 @@ async fn run_link(
         // was running a moment ago, and spawning a competitor while it
         // restarts is exactly what R8 forbids.
         let mut backoff = REDIAL_MIN;
+        let mut attempt = 0_u8;
+        const MAX_RESTARTS: u8 = 5;
         loop {
+            attempt += 1;
+            if replies
+                .send(LiveReply::SupervisorRestarting {
+                    component: "link",
+                    attempt,
+                    max: MAX_RESTARTS,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
             match haider_client::connect(&profile.endpoint_path, config.clone()).await {
                 Ok(connected) => {
                     let fresh = Arc::new(connected.client);
                     let Some(fresh_events) = fresh.take_events() else {
+                        let _ = replies
+                            .send(LiveReply::SupervisorFailed {
+                                component: "link",
+                                reason: "reconnected link had no event channel".into(),
+                            })
+                            .await;
                         return;
                     };
                     client = fresh;
@@ -258,9 +347,20 @@ async fn run_link(
                     }
                     break;
                 }
-                Err(_) => {
+                Err(_) if attempt < MAX_RESTARTS => {
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(REDIAL_MAX);
+                }
+                Err(error) => {
+                    let _ = replies
+                        .send(LiveReply::SupervisorFailed {
+                            component: "link",
+                            reason: format!(
+                                "bounded restart exhausted after {MAX_RESTARTS} attempts: {error}"
+                            ),
+                        })
+                        .await;
+                    return;
                 }
             }
         }
@@ -547,6 +647,17 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         },
         LiveCommand::Detach { attachment } => RequestBody::SessionDetach {
             attachment_id: attachment,
+        },
+        LiveCommand::SessionDiagnostic {
+            command_id,
+            session,
+            code,
+            message,
+        } => RequestBody::SessionDiagnostic {
+            command_id,
+            session_id: session,
+            code,
+            message,
         },
         LiveCommand::Create {
             command_id,
@@ -960,6 +1071,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionDetach { attachment_id } => vec![LiveReply::Detached {
             attachment: attachment_id,
         }],
+        ResponseBody::SessionDiagnostic { .. } => context
+            .command_id
+            .clone()
+            .map_or_else(Vec::new, |command_id| {
+                vec![LiveReply::Answered { command_id }]
+            }),
         ResponseBody::SessionCreate {
             session_id,
             worker_generation,
@@ -1419,6 +1536,21 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             high_water_seq,
         }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
+        WireFrame::ProtocolError(error)
+            if matches!(
+                error.code.as_str(),
+                "store_full" | "store_read_only" | "store_unavailable" | "store_healthy"
+            ) =>
+        {
+            vec![LiveReply::ProfileDiagnostic {
+                card: error
+                    .presentation
+                    .as_ref()
+                    .map(|_| haider_protocol::menu::ErrorRecoveryCardKind::StoreUnwritable),
+                presentation: error.presentation,
+                failed_write_ids: error.failed_write_ids,
+            }]
+        }
         WireFrame::ProtocolError(error) => vec![LiveReply::Failed {
             command_id: None,
             code: error.code.clone(),

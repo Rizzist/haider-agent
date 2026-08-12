@@ -380,9 +380,10 @@ fn sync_directory(path: &Path) -> StoreResult<()> {
 }
 
 fn io_error(action: &str, path: &Path, error: std::io::Error) -> HaiderError {
-    store_error(
-        ErrorCode::Internal,
-        format!("{action} {}: {error}", path.display()),
-        false,
-    )
+    let code = match error.kind() {
+        ErrorKind::StorageFull => ErrorCode::StoreFull,
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => ErrorCode::StoreReadOnly,
+        _ => ErrorCode::StoreUnavailable,
+    };
+    store_error(code, format!("{action} {}: {error}", path.display()), true)
 }

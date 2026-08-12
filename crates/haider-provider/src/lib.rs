@@ -163,8 +163,9 @@ pub use usage::{
     parse_rfc3339_to_unix_ms,
 };
 pub use webfetch::{
-    WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchOutcome, fetch_public_url,
-    fetch_public_url_with_deadline, fetch_public_url_with_resolver, reduce_html_to_text,
+    WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchExecution, WebFetchOutcome,
+    fetch_public_url, fetch_public_url_with_deadline, fetch_public_url_with_one_retry,
+    fetch_public_url_with_resolver, reduce_html_to_text,
 };
 
 /// Provider classes backed by production account credentials in this release.
@@ -794,6 +795,11 @@ pub enum FakeStep {
         call_id: String,
         fragment: String,
     },
+    /// Ends a manually-opened tool call. This lets laws inject malformed raw
+    /// argument fragments that the value-based `EmitToolCall` cannot express.
+    EmitToolCallEnd {
+        call_id: String,
+    },
     /// Emits the canonical `request_input` tool call. The actor, rather than
     /// the fake provider, allocates and journals the protocol menu.
     EmitRequestInput {
@@ -827,6 +833,14 @@ pub enum FakeStep {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+    },
+    /// Emits an error with an exact typed presentation. This keeps
+    /// capability-rejection tests at the provider boundary instead of
+    /// teaching the generic fake to infer semantics from message text.
+    ErrorPresented {
+        kind: ProviderErrorKind,
+        message: String,
+        presentation: ErrorPresentation,
     },
     /// Produces no more data until the consumer drops the stream.
     Hang,
@@ -958,6 +972,7 @@ impl FakeProvider {
                 self.script[end - 1],
                 FakeStep::Finish { .. }
                     | FakeStep::Error { .. }
+                    | FakeStep::ErrorPresented { .. }
                     | FakeStep::Hang
                     | FakeStep::PrematureEof
                     | FakeStep::ErrorWithRetryability { .. }
@@ -1067,6 +1082,11 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                     return;
                 }
             }
+            FakeStep::EmitToolCallEnd { call_id } => {
+                if !send_event(&sender, StreamEvent::ToolCallEnd { call_id }).await {
+                    return;
+                }
+            }
             FakeStep::EmitRequestInput {
                 call_id,
                 kind,
@@ -1128,6 +1148,18 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 let _ = sender
                     .send(Err(
                         ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+                    ))
+                    .await;
+                return;
+            }
+            FakeStep::ErrorPresented {
+                kind,
+                message,
+                presentation,
+            } => {
+                let _ = sender
+                    .send(Err(
+                        ProviderError::new(kind, message).with_presentation(presentation)
                     ))
                     .await;
                 return;

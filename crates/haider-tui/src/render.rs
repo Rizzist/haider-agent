@@ -40,6 +40,25 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     frame.render_widget(Block::default().style(theme.text_style()), area);
 
     let mut hits: Vec<(Rect, Hit)> = Vec::new();
+    let persistent_diagnostic = persistent_diagnostic(model);
+    let (area, diagnostic) = if persistent_diagnostic.is_some() && area.height > 1 {
+        let [diagnostic, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        (body, Some(diagnostic))
+    } else {
+        (area, None)
+    };
+    if let (Some(rect), Some((presentation, tone))) = (diagnostic, persistent_diagnostic) {
+        frame.render_widget(
+            Paragraph::new(diagnostic_banner_line(
+                presentation,
+                tone,
+                theme,
+                rect.width,
+            )),
+            rect,
+        );
+    }
     // The status row is the FIRST chrome to yield when a session's sacred
     // input — a blocking menu's options OR the composer's cursor row
     // (review r5 P2-1 + r6 P2-1) — cannot otherwise fit. Minimal need
@@ -842,18 +861,15 @@ fn render_launcher(
         ));
         recent.push((spans, Some(Hit::AttachSession(entry.id.clone()))));
     }
-    // Sim `.aurarow` metas VERBATIM (tui.js:3278-3300) — the earlier port
-    // abbreviated all three (review P2-8). The Accounts/Peers counts come
-    // from the sim's own seed lists: 7 credentials across 5 providers
-    // (tui.js:146-154), and 3 host-capable nodes of the 4 seeded — the
-    // `shell` rung does not host (tui.js:165-174).
+    // Accounts reflects the local credential registry. The legacy Peers row
+    // remains recognizable but advertises no mesh/SSH lane: activating it
+    // produces the same typed local-only rejection as durable admission.
     for (row, glyph, name, blurb) in [
         (
             LauncherRow::Aura,
             "◉",
             "Aura",
-            "voice session · orchestrator — spawns & steers sessions across devices, never codes"
-                .to_owned(),
+            "voice session · orchestrator — spawns & steers local sessions, never codes".to_owned(),
         ),
         (
             LauncherRow::Accounts,
@@ -869,10 +885,7 @@ fn render_launcher(
             LauncherRow::Peers,
             "⇄",
             "Peers",
-            format!(
-                "reachability ladder — enrolled peers · sponsored SSH nodes · shell targets · {} host-capable",
-                crate::mock::SEED_HOST_CAPABLE_PEERS
-            ),
+            "remote placement — not supported · Haider runs local-only".to_owned(),
         ),
     ] {
         // Sim `.aurarow` (tui.js:4403-4413): gold glyph, gold name, dim
@@ -5003,7 +5016,7 @@ fn render_aura(
             .alignment(Alignment::Center),
             Line::from(Span::styled(
                 format!(
-                    "{} · never writes code — it spawns and steers sessions on your devices",
+                    "{} · never writes code — it spawns and steers local sessions",
                     aura.engine_kind()
                 ),
                 theme.dim_style(),
@@ -5171,6 +5184,112 @@ fn render_aura(
     }
 }
 
+/// The persistent banner's severity register (E5-E8 visual pass).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticTone {
+    /// The err rail: work is lost or uncertain, or a daemon lane is dead.
+    Failure,
+    /// The calm warn rail: a lane degraded but the session still works —
+    /// action needed, never alarm.
+    ActionNeeded,
+}
+
+/// The one diagnostic the frame's top row shows, worst slot first, with
+/// its severity tone. Store faults, a client/daemon incompatibility, an
+/// exhausted busy-retry bound, and the link supervisor's bounded-restart
+/// exhaustion are FAILURES (err). A degraded voice lane — mic capture
+/// death, the talk supervisor — leaves the session fully usable and wears
+/// the calm warn tone instead.
+fn persistent_diagnostic(
+    model: &AppModel,
+) -> Option<(&haider_protocol::error::ErrorPresentation, DiagnosticTone)> {
+    if let Some(presentation) = &model.profile_diagnostic {
+        return Some((presentation, DiagnosticTone::Failure));
+    }
+    if let Some(presentation) = &model.compatibility_diagnostic {
+        return Some((presentation, DiagnosticTone::Failure));
+    }
+    if let Some(presentation) = &model.voice_diagnostic {
+        return Some((presentation, DiagnosticTone::ActionNeeded));
+    }
+    if let Some(presentation) = &model.supervisor_diagnostic {
+        // The talk supervisor ("talk-supervisor-unavailable") only takes
+        // the voice lane down; the link supervisor takes the daemon with it.
+        let tone = if presentation.subcode.as_str().starts_with("talk") {
+            DiagnosticTone::ActionNeeded
+        } else {
+            DiagnosticTone::Failure
+        };
+        return Some((presentation, tone));
+    }
+    if let Some(presentation) = &model.command_diagnostic {
+        return Some((presentation, DiagnosticTone::Failure));
+    }
+    None
+}
+
+/// The persistent diagnostic banner's single row (E5 visual pass), in the
+/// error-card grammar: severity rail `▏` + glyph + BOLD tone-ink title,
+/// dim detail, then the dim fact segments (subcode + actions — the one
+/// error-fact vocabulary). Severity travels in TEXT via the glyph (✗
+/// failure / ⚠ action-needed), never in ink alone. Under width pressure
+/// the facts shed whole segments first (the subcode never sheds), then
+/// the detail ellipsizes; the title never yields. A detail that opens by
+/// echoing its own title ("Store unwritable — …") drops the echo — the
+/// bold title already said it.
+fn diagnostic_banner_line(
+    presentation: &haider_protocol::error::ErrorPresentation,
+    tone: DiagnosticTone,
+    theme: &Theme,
+    width: u16,
+) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    let (ink, glyph) = match tone {
+        DiagnosticTone::Failure => (theme.err, "✗"),
+        DiagnosticTone::ActionNeeded => (theme.warn, "⚠"),
+    };
+    let title = presentation.title.as_str();
+    let detail = presentation
+        .detail
+        .strip_prefix(title)
+        .and_then(|rest| rest.strip_prefix(" — "))
+        .unwrap_or(presentation.detail.as_str());
+    let head = format!("{glyph} {title}");
+    let after_head = (width as usize).saturating_sub(1 + head.width());
+    let facts = crate::projection::error_fact_segments_with_actions(presentation, None);
+    let subcode_width = facts
+        .first()
+        .map_or(0, |(segment, _)| segment.as_str().width());
+    // The facts claim what a full detail would leave them — but at least
+    // their identity subcode; the detail ellipsizes into the rest.
+    let facts_budget = after_head
+        .saturating_sub(" — ".width() + detail.width() + " · ".width())
+        .max(subcode_width);
+    let fact_line = shed_fact_line(&facts, facts_budget);
+    let detail_budget =
+        after_head.saturating_sub(" — ".width() + " · ".width() + fact_line.width());
+    let detail_shown = ellipsize(detail, detail_budget);
+    let mut spans = vec![
+        Span::styled("▏", ratatui::style::Style::default().fg(ink.into())),
+        Span::styled(
+            head,
+            ratatui::style::Style::default()
+                .fg(ink.into())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !detail_shown.is_empty() {
+        spans.push(Span::styled(
+            format!(" — {detail_shown}"),
+            theme.dim_style(),
+        ));
+    }
+    if !fact_line.is_empty() {
+        spans.push(Span::styled(format!(" · {fact_line}"), theme.dim_style()));
+    }
+    Line::from(spans)
+}
+
 /// The menu's body lines pre-wrapped by display cells into the menu's
 /// content width (sim `.iml` white-space: pre-wrap, tui.js:4946).
 ///
@@ -5184,7 +5303,16 @@ fn wrapped_menu_body(
     now_ms: u64,
 ) -> Vec<(String, DiffTone)> {
     let budget = (width as usize).saturating_sub(2).max(1);
-    if let haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } = &menu.kind {
+    // Both recovery families speak through their typed presentation when
+    // they carry one: the provider/account card (E2) and the E6
+    // effect-reconciliation card. A presentation-less Recovery card (demo
+    // scripts, older daemons) keeps the baseline prose body below.
+    let typed_presentation = match &menu.kind {
+        haider_protocol::menu::MenuKind::ErrorRecovery { presentation, .. } => Some(presentation),
+        haider_protocol::menu::MenuKind::Recovery { presentation, .. } => presentation.as_ref(),
+        _ => None,
+    };
+    if let Some(presentation) = typed_presentation {
         let mut rows: Vec<(String, DiffTone)> = presentation
             .detail
             .split('\n')
@@ -5318,9 +5446,14 @@ fn menu_block(
                 | ErrorRecoveryCardKind::KeychainRelink
                 | ErrorRecoveryCardKind::RateLimit
                 | ErrorRecoveryCardKind::QuotaExhausted
-                | ErrorRecoveryCardKind::PartialStream => theme.warn,
+                | ErrorRecoveryCardKind::PartialStream
+                | ErrorRecoveryCardKind::StoreUnwritable => theme.warn,
             })
         }
+        // E6: the effect-reconciliation card is UNCERTAINTY, not failure —
+        // the write may or may not have committed. Calm amber, never err;
+        // the ⌁ glyph and the options carry the rest.
+        haider_protocol::menu::MenuKind::Recovery { .. } => Some(theme.warn),
         _ => None,
     };
     let selection = selection.min(menu.options.len().saturating_sub(1));
@@ -6379,7 +6512,7 @@ fn composer_lines<'a>(
             ),
             // Sim aura composer placeholder (tui.js:3508-3586), verbatim.
             Screen::Aura => {
-                "speak or type — e.g. “spin up billing-service on workstation and run its tests”"
+                "speak or type — e.g. “spin up billing-service locally and run its tests”"
                     .to_owned()
             }
             _ => PLACEHOLDER_SESSION.to_owned(),
@@ -7409,9 +7542,18 @@ fn item_lines<'a>(
                 let used = Line::from(spans.clone()).width();
                 let budget = (width as usize).saturating_sub(used + 3);
                 if budget > 0 {
+                    // E8 visual pass: a reason on a COMPLETED row is a
+                    // recovered in-flight retry ("transient web_fetch
+                    // failure — retry 2/2 succeeded") — quiet dim
+                    // metadata, never an alarming tone; only failure
+                    // reasons wear the err ink.
                     spans.push(Span::styled(
                         format!(" · {}", ellipsize(reason, budget)),
-                        theme.err_style(),
+                        if status == &haider_protocol::item::ToolStatus::Completed {
+                            theme.dim_style()
+                        } else {
+                            theme.err_style()
+                        },
                     ));
                 }
             }
@@ -7559,7 +7701,7 @@ fn item_lines<'a>(
                 Span::styled(reason.as_str(), theme.text_style()),
             ]));
         }
-        TurnItem::Extension { kind, .. } => {
+        TurnItem::Extension { kind, data } => {
             if let Some(transition) =
                 haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(&block.item)
             {
@@ -7567,8 +7709,18 @@ fn item_lines<'a>(
                     format!("  {}", transition.display_label()),
                     theme.gold_style(),
                 ));
+            } else if let Some(label) = crate::projection::retry_marker_label(kind, data) {
+                // E8 visual pass: a bounded in-flight retry is a QUIET
+                // fact — the ⟳ renewal glyph and dim ink (readable, the
+                // ≥ 3.4:1 floor — recovery in progress deserves better
+                // than the barely-there faint band, and no alarm tone).
+                lines.push(Line::styled(format!("  ⟳ {label}"), theme.dim_style()));
             } else {
-                lines.push(Line::styled(format!("  ⋯ {kind}"), theme.faint_style()));
+                let label = data
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(kind);
+                lines.push(Line::styled(format!("  ⋯ {label}"), theme.faint_style()));
             }
         }
     }

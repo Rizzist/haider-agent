@@ -1571,12 +1571,13 @@ async fn panic_exit_after_cancelling_closes_item_and_menu_before_cancelled() {
 }
 
 /// A supervisor panic with an orphaned dispatch but no cancellation must
-/// reconcile Unknown before failure-shaped terminalization.
+/// reconcile Unknown and park on its recovery card instead of lying with a
+/// failure-shaped terminal.
 ///
 /// MUTATION CHECK: reconcile only the Cancelling branch. Expected failure:
-/// Errored commits without an Unknown predecessor.
+/// the recovery park is absent.
 #[tokio::test]
-async fn panic_exit_reconciles_dispatched_before_errored() {
+async fn panic_exit_reconciles_dispatched_and_parks_effect_unknown() {
     let root = tempfile::tempdir().expect("temp store");
     let store = SqliteStoreHandle::open(root.path())
         .await
@@ -1636,11 +1637,17 @@ async fn panic_exit_reconciles_dispatched_before_errored() {
             )
         })
         .expect("Unknown reconciles");
-    let errored = payloads
+    let parked = payloads
         .iter()
-        .position(|(_, payload)| *payload == EventPayload::RunState(RunState::Errored))
-        .expect("run errors");
-    assert!(unknown < errored);
+        .position(|(_, payload)| *payload == EventPayload::RunState(RunState::EffectOutcomeUnknown))
+        .expect("run parks for reconciliation");
+    assert!(unknown < parked);
+    assert!(
+        !payloads
+            .iter()
+            .any(|(_, payload)| *payload == EventPayload::RunState(RunState::Errored)),
+        "the daemon must not overwrite genuine uncertainty with a false failure"
+    );
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }

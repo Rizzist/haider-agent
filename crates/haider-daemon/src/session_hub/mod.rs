@@ -100,19 +100,23 @@ use async_trait::async_trait;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn,
     CreatedBranch, CreatedSession, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    RenamedSession, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
-    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectEffortCommand,
-    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    ProfileStoreFault, RenamedSession, SelectedEffort, SelectedFast, SelectedModel,
+    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{BranchId, DeviceId, EventId, MenuId, RunId, SessionId};
-use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
+use haider_protocol::menu::{
+    AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind,
+    effect_recovery_menu,
+};
 use haider_protocol::state::RunState;
 use haider_rpc::{
     ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachState, AttachmentId, CancelStatus, Capability,
@@ -144,6 +148,16 @@ const MAX_READ_ENVELOPES: usize = 1_024;
 /// Exact image MIME declarations accepted on durable turn submission.
 pub const IMAGE_ATTACHMENT_MIME_ALLOWLIST: [&str; 4] =
     ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+fn profile_store_fault_frame(fault: &ProfileStoreFault) -> WireFrame {
+    WireFrame::ProtocolError(ProtocolError {
+        code: fault.presentation.subcode.as_str().replace('-', "_"),
+        message: fault.presentation.detail.clone(),
+        fatal: false,
+        presentation: Some(fault.presentation.clone()),
+        failed_write_ids: fault.failed_write_ids.clone(),
+    })
+}
 
 // ────────────────── configuration, sink seam, and observer ──────────────────
 
@@ -506,6 +520,9 @@ struct HubInner {
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
     actors: Mutex<HashMap<SessionId, SessionActorHandle>>,
+    /// Connection-level diagnostic sinks. Store failures cannot rely on a
+    /// session journal, so the shared profile fault watcher fans out here.
+    diagnostic_sinks: Mutex<HashMap<String, Arc<dyn FrameSink>>>,
     /// Permanent tombstones for sessions deleted in this daemon lifetime.
     /// `actor_for` checks them at both sides of its await so deletion cannot
     /// race actor recreation or fresh admission.
@@ -922,30 +939,80 @@ impl SessionHub {
     ) -> Result<Self, SessionHubError> {
         config.validate().map_err(SessionHubError::InvalidConfig)?;
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
-        Ok(Self {
-            inner: Arc::new(HubInner {
-                store,
-                config,
-                observer,
-                metrics: Arc::new(HubMetrics::default()),
-                actors: Mutex::new(HashMap::new()),
-                deleting_sessions: Mutex::new(HashSet::new()),
-                actor_tasks: Mutex::new(Vec::new()),
-                replay_tasks: Mutex::new(Vec::new()),
-                attachments: Mutex::new(HashMap::new()),
-                attachment_slots: Mutex::new(AttachmentSlots::default()),
-                draining: AtomicBool::new(false),
-                force_stop: Arc::new(AtomicBool::new(false)),
-                device_id,
-                worker_manager: Mutex::new(None),
-                accounts: Mutex::new(None),
-                creatable_providers: Mutex::new(None),
-                hooks: Arc::new(Mutex::new(None)),
-                usage_report: Mutex::new(None),
-                tasks: crate::tasks::TaskRegistry::default(),
-                web_degrade: Mutex::new(HashMap::new()),
-            }),
-        })
+        let inner = Arc::new(HubInner {
+            store,
+            config,
+            observer,
+            metrics: Arc::new(HubMetrics::default()),
+            actors: Mutex::new(HashMap::new()),
+            diagnostic_sinks: Mutex::new(HashMap::new()),
+            deleting_sessions: Mutex::new(HashSet::new()),
+            actor_tasks: Mutex::new(Vec::new()),
+            replay_tasks: Mutex::new(Vec::new()),
+            attachments: Mutex::new(HashMap::new()),
+            attachment_slots: Mutex::new(AttachmentSlots::default()),
+            draining: AtomicBool::new(false),
+            force_stop: Arc::new(AtomicBool::new(false)),
+            device_id,
+            worker_manager: Mutex::new(None),
+            accounts: Mutex::new(None),
+            creatable_providers: Mutex::new(None),
+            hooks: Arc::new(Mutex::new(None)),
+            usage_report: Mutex::new(None),
+            tasks: crate::tasks::TaskRegistry::default(),
+            web_degrade: Mutex::new(HashMap::new()),
+        });
+        let hub = Self { inner };
+        hub.spawn_profile_fault_watcher();
+        Ok(hub)
+    }
+
+    fn spawn_profile_fault_watcher(&self) {
+        let mut faults = self.inner.store.subscribe_profile_fault();
+        let weak = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            while faults.changed().await.is_ok() {
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let (frame, fault_latched) = {
+                    let fault = faults.borrow_and_update();
+                    let frame = if let Some(fault) = fault.as_ref() {
+                        profile_store_fault_frame(fault)
+                    } else {
+                        WireFrame::ProtocolError(ProtocolError {
+                            code: "store_healthy".into(),
+                            message: "profile store is writable again".into(),
+                            fatal: false,
+                            presentation: None,
+                            failed_write_ids: Vec::new(),
+                        })
+                    };
+                    (frame, fault.is_some())
+                };
+                let sinks = inner
+                    .diagnostic_sinks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some((last, sinks)) = sinks.split_last() {
+                    for sink in sinks {
+                        let _ = sink.try_send(frame.clone());
+                    }
+                    let _ = last.try_send(frame);
+                }
+                if !fault_latched {
+                    continue;
+                }
+                // A bounded health probe keeps the banner latched until the
+                // filesystem actually accepts a write. It does not replay
+                // failed mutations; their ids remain explicitly reported.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let _ = inner.store.probe_writable().await;
+            }
+        });
     }
 
     pub(crate) fn task_registry(&self) -> &crate::tasks::TaskRegistry {
@@ -1360,9 +1427,14 @@ impl SessionHub {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
+        let connection_id = random_id("connection")?;
+        lock(&self.inner.diagnostic_sinks)?.insert(connection_id.clone(), Arc::clone(&sink));
+        if let Some(fault) = self.inner.store.profile_fault() {
+            let _ = sink.try_send(profile_store_fault_frame(&fault));
+        }
         Ok(HubConnection {
             hub: self.clone(),
-            connection_id: random_id("connection")?,
+            connection_id,
             capabilities,
             sink,
             transport,
@@ -2281,6 +2353,7 @@ impl SessionHub {
     }
 
     async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
+        lock(&self.inner.diagnostic_sinks)?.remove(connection_id);
         let attachments = {
             let owners = lock(&self.inner.attachments)?;
             owners

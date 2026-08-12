@@ -449,6 +449,18 @@ impl SessionProjection {
                     presentation: presentation.clone(),
                 });
             }
+            EventPayload::ClientDiagnostic { code, message, .. } => {
+                self.entries.push(TranscriptEntry::Error {
+                    text: format!("{code} — {message}"),
+                    presentation: Some(haider_protocol::error::ErrorPresentation::new(
+                        code,
+                        "Client/daemon incompatible — update",
+                        message,
+                        haider_protocol::error::ErrorScope::Session,
+                        [haider_protocol::error::ErrorAction::None],
+                    )),
+                });
+            }
             // B2b-m3: a committed node ANCHORS its display entry — never a
             // transcript row of its own (the sim's tree reads entries; the
             // node is the durable identity riding beside them).
@@ -573,6 +585,21 @@ impl SessionProjection {
         self.entries.push(TranscriptEntry::Error {
             text,
             presentation: None,
+        });
+    }
+
+    /// E8 visual pass: a client-observed failure that carries its TYPED
+    /// presentation (the busy-retry-exhausted card) records both — the
+    /// flattened text stays the plain/greppable authority while the styled
+    /// renderer gives the row the same card-shaped err treatment a typed
+    /// run failure gets.
+    pub(crate) fn record_local_error_card(
+        &mut self,
+        presentation: haider_protocol::error::ErrorPresentation,
+    ) {
+        self.entries.push(TranscriptEntry::Error {
+            text: format_error_presentation(&presentation),
+            presentation: Some(presentation),
         });
     }
 
@@ -1170,7 +1197,15 @@ impl SessionProjection {
 
 fn bounded_tool_reason(result: &haider_protocol::tool::BoundedResult) -> Option<String> {
     if result.status.is_completed() {
-        return None;
+        return result.reason.as_deref().map(|reason| {
+            reason
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(240)
+                .collect()
+        });
     }
     if let Some(presentation) = &result.presentation {
         return Some(format_error_presentation(presentation));
@@ -1291,6 +1326,44 @@ pub(crate) fn join_error_fact_segments(segments: &[(String, u8)]) -> String {
     joined
 }
 
+/// E8 visual pass: the human label for a bounded in-flight retry marker
+/// (`TurnItem::Extension`), shared by the styled and plain renderers so
+/// both surfaces speak one sentence. `Some` marks the kind as a QUIET
+/// retry fact (dim ⟳ row — recovery in progress, never alarming);
+/// unknown kinds return `None` and keep the generic `⋯` treatment.
+#[must_use]
+pub(crate) fn retry_marker_label(kind: &str, data: &serde_json::Value) -> Option<String> {
+    let label = data.get("label").and_then(serde_json::Value::as_str);
+    match kind {
+        // The daemon's fallback marker carries its own sentence
+        // ("provider hosted web tool rejected — using local web_fetch");
+        // a one-time capability switch, not an attempt counter.
+        "provider_tool_fallback" => Some(
+            label
+                .unwrap_or("provider tool rejected — using the local fallback")
+                .to_owned(),
+        ),
+        "tool_json_repair" => {
+            if let Some(label) = label {
+                return Some(label.to_owned());
+            }
+            let tool = data
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let mut composed = format!("malformed {tool} arguments — model asked to reissue");
+            if let (Some(attempt), Some(max)) = (
+                data.get("attempt").and_then(serde_json::Value::as_u64),
+                data.get("max_attempts").and_then(serde_json::Value::as_u64),
+            ) {
+                composed.push_str(&format!(" (attempt {attempt}/{max})"));
+            }
+            Some(composed)
+        }
+        _ => None,
+    }
+}
+
 /// The fact line's request-id form: the first 8 chars, `…`-marked when
 /// shortened. Support-grade full ids stay in the transcript string and
 /// the journal.
@@ -1389,9 +1462,9 @@ fn wait_reason_label(reason: &WaitReason) -> String {
     match reason {
         WaitReason::ProviderBackoff => "provider backoff".to_owned(),
         WaitReason::RateLimit => "rate limit".to_owned(),
-        WaitReason::RemoteChild => "remote subagent".to_owned(),
+        WaitReason::RemoteChild => "unsupported remote wait — local-only".to_owned(),
         WaitReason::LocalChild => "subagent".to_owned(),
-        WaitReason::DeviceUnreachable => "device unreachable".to_owned(),
+        WaitReason::DeviceUnreachable => "unsupported device wait — local-only".to_owned(),
         WaitReason::BlockingHook => "hook".to_owned(),
         WaitReason::Dependency => "dependency".to_owned(),
         WaitReason::VerifyHold => "verify hold".to_owned(),

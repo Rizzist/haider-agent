@@ -429,6 +429,8 @@ fn main() {
                 id: haider_protocol::ids::MenuId::new("t1-docs-q"),
                 kind: haider_protocol::menu::MenuKind::Recovery {
                     effect: haider_protocol::ids::EffectId::new("e-t1-docs"),
+                    presentation: None,
+                    option_actions: Vec::new(),
                 },
                 title: recovery_text.to_owned(),
                 body: vec![],
@@ -458,7 +460,7 @@ fn main() {
         "Miqdad ibn al-Aswad",
         "lint",
         "fable-5",
-        "hetzner-1",
+        "local",
         ChipDisplayState::Done,
         1500,
         &[],
@@ -489,21 +491,21 @@ fn main() {
     aura_model.screen = Screen::Aura;
     aura_model.aura.roster.push(AuraAgentRow {
         name: "auth".to_owned(),
-        device: "hetzner-1".to_owned(),
+        device: "local".to_owned(),
         state: ChipDisplayState::Done,
         activity: "tests green".to_owned(),
     });
     for line in [
-        "agent_spawn — auth → hetzner-1 · lease ok",
+        "agent_spawn — auth → local · lease ok",
         "agent_control — auth: run tests",
-        "auth on hetzner-1: tests green ✓",
+        "auth on local: tests green ✓",
     ] {
         aura_model.aura.log.push(line.to_owned());
     }
     aura_model
         .aura
         .transcript
-        .push_user_voice("spin up the auth service on hetzner-1 and run its tests".to_owned());
+        .push_user_voice("spin up the auth service locally and run its tests".to_owned());
     aura_model.aura.transcript.set_voice_live(true);
     aura_model
         .aura
@@ -512,7 +514,7 @@ fn main() {
             haider_protocol::item::ItemEvent::Completed {
                 item_id: haider_protocol::ids::ItemId::new("aura-r1-done"),
                 item: haider_protocol::item::TurnItem::AgentMessage {
-                    text: "Done — auth is live on hetzner-1 and its tests are green. Open it, or spin up another?".to_owned(),
+                    text: "Done — auth is live locally and its tests are green. Open it, or spin up another?".to_owned(),
                 },
             },
         ));

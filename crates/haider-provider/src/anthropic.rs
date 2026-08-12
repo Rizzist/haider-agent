@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
+use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{CapabilityDoc, FeatureResolve};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -928,6 +929,19 @@ pub fn replay_anthropic_http_error(
     let billing_exhausted = parsed.as_ref().is_some_and(|envelope| {
         anthropic_billing_exhausted(&envelope.error.kind, &envelope.error.message)
     });
+    let hosted_web_rejected = parsed.as_ref().is_some_and(|envelope| {
+        let message = envelope.error.message.to_ascii_lowercase();
+        (message.contains("web_search") || message.contains("web_fetch"))
+            && [
+                "unsupported",
+                "unavailable",
+                "not allowed",
+                "not enabled",
+                "rejected",
+            ]
+            .iter()
+            .any(|needle| message.contains(needle))
+    });
     let kind = match status {
         _ if billing_exhausted => ProviderErrorKind::QuotaExhausted,
         401 => ProviderErrorKind::Authentication,
@@ -962,22 +976,32 @@ pub fn replay_anthropic_http_error(
     )
     .then(|| crate::parse_retry_after_ms(retry_after))
     .flatten();
-    let error = match body_kind {
-        Some("account_not_found_error" | "account_deleted_error") => {
-            ProviderError::new_with_presentation(
-                kind,
-                message,
-                crate::account_deleted_presentation(),
-            )
+    let error = if hosted_web_rejected {
+        ProviderError::new(kind, message).with_presentation(ErrorPresentation::new(
+            "provider-web-tool-rejected",
+            "Provider web tool unavailable",
+            "Anthropic explicitly rejected its hosted web tool; Haider can retry this turn with the local web_fetch equivalent.",
+            ErrorScope::Tool,
+            [ErrorAction::Retry],
+        ))
+    } else {
+        match body_kind {
+            Some("account_not_found_error" | "account_deleted_error") => {
+                ProviderError::new_with_presentation(
+                    kind,
+                    message,
+                    crate::account_deleted_presentation(),
+                )
+            }
+            Some("account_deactivated_error" | "account_revoked_error") => {
+                ProviderError::new_with_presentation(
+                    kind,
+                    message,
+                    crate::account_revoked_presentation(),
+                )
+            }
+            _ => ProviderError::new(kind, message),
         }
-        Some("account_deactivated_error" | "account_revoked_error") => {
-            ProviderError::new_with_presentation(
-                kind,
-                message,
-                crate::account_revoked_presentation(),
-            )
-        }
-        _ => ProviderError::new(kind, message),
     };
     error
         .with_retry_after_ms(retry_after_ms)

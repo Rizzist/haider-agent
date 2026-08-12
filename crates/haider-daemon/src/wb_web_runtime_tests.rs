@@ -14,14 +14,15 @@ use crate::worker::{
     advertised_tool_definitions,
 };
 use haider_core::{
-    SessionCreateCommand, SessionSelectModelCommand, SessionSelectModelOutcome, SqliteStoreHandle,
-    StoreHandle, TurnAcceptCommand, TurnAdmissionDisposition,
+    ProviderAttemptDecision, ProviderAttemptResolver, SessionCreateCommand,
+    SessionSelectModelCommand, SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle,
+    TurnAcceptCommand, TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
-use haider_protocol::error::HaiderError;
-use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::ids::{CredentialAlias, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::RunState;
@@ -40,13 +41,47 @@ use tokio::time::{Duration, timeout};
 /// exactly what the advertisement seam derives from.
 struct FixedProviderFactory {
     providers: HashMap<String, Arc<FakeProvider>>,
+    fallback_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
 }
 
 impl FixedProviderFactory {
     fn single(pair: &str, provider: Arc<FakeProvider>) -> Self {
         Self {
             providers: HashMap::from([(pair.to_owned(), provider)]),
+            fallback_resolver: None,
         }
+    }
+
+    fn single_with_web_fallback(pair: &str, provider: Arc<FakeProvider>) -> Self {
+        Self {
+            providers: HashMap::from([(pair.to_owned(), Arc::clone(&provider))]),
+            fallback_resolver: Some(Arc::new(TestWebFallbackResolver { provider })),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TestWebFallbackResolver {
+    provider: Arc<FakeProvider>,
+}
+
+#[async_trait::async_trait]
+impl ProviderAttemptResolver for TestWebFallbackResolver {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        error: &haider_provider::ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        Ok(
+            if error.presentation.subcode.as_str() == "provider-web-tool-rejected" {
+                ProviderAttemptDecision::Fallback {
+                    provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
+                    account: current_account.clone(),
+                }
+            } else {
+                ProviderAttemptDecision::Stop
+            },
+        )
     }
 }
 
@@ -68,10 +103,13 @@ impl ProviderFactory for FixedProviderFactory {
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
             context_window: None,
-            account_alias: None,
+            account_alias: self
+                .fallback_resolver
+                .as_ref()
+                .map(|_| "test-web-account".to_owned()),
             initial_rotation: None,
             rotation_budget_consumed: false,
-            attempt_resolver: None,
+            attempt_resolver: self.fallback_resolver.clone(),
         })
     }
 }
@@ -781,6 +819,7 @@ async fn pair_switch_reshapes_the_web_tool_advertisement_on_the_next_turn() {
                     Arc::clone(&anthropic),
                 ),
             ]),
+            fallback_resolver: None,
         },
         Some(StubWebSearch::with_answers(Vec::new()) as Arc<dyn WebSearchExecutor>),
     )
@@ -820,11 +859,9 @@ async fn pair_switch_reshapes_the_web_tool_advertisement_on_the_next_turn() {
 
 /// LAW (W-B decision 1, "local fallback on refusal" — daemon half): an org
 /// can disable the Anthropic server web tools, and the DECLARED tool then
-/// 400s. That failure surfaces verbatim as an errored turn, AND it latches
-/// the session's web degrade — so the next turn stops declaring the server
-/// tools and hands the model the local `web_fetch` instead. The latch needs
-/// an INVALID-REQUEST refusal: a rate limit or transport blip must never
-/// spend the capability.
+/// 400s. The exact typed refusal triggers one labeled retry in the SAME turn
+/// with local `web_fetch`. A generic invalid request must never spend that
+/// capability fallback.
 #[tokio::test]
 async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch() {
     let script = vec![
@@ -837,12 +874,18 @@ async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch()
             retry_after_ms: None,
         },
         // Turn 2: the org-disabled shape.
-        FakeStep::Error {
+        FakeStep::ErrorPresented {
             kind: haider_provider::ProviderErrorKind::InvalidRequest,
             message: "tool `web_search_20250305` is not available for this organization".into(),
-            retry_after_ms: None,
+            presentation: ErrorPresentation::new(
+                "provider-web-tool-rejected",
+                "Provider web tool unavailable",
+                "use the local equivalent",
+                ErrorScope::Tool,
+                [ErrorAction::Retry],
+            ),
         },
-        // Turn 3: runs on the degraded declaration.
+        // Turn 2's bounded same-turn fallback.
         FakeStep::EmitText {
             text: "fetched locally".into(),
         },
@@ -855,7 +898,10 @@ async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch()
         "wb-degrade",
         ANTHROPIC_OAUTH_PROVIDER_NAME,
         "claude-web",
-        FixedProviderFactory::single(ANTHROPIC_OAUTH_PROVIDER_NAME, Arc::clone(&fake)),
+        FixedProviderFactory::single_with_web_fallback(
+            ANTHROPIC_OAUTH_PROVIDER_NAME,
+            Arc::clone(&fake),
+        ),
         None,
     )
     .await;
@@ -863,10 +909,7 @@ async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch()
     world
         .run_turn_until("wb-degrade-one", "first", RunState::Errored)
         .await;
-    world
-        .run_turn_until("wb-degrade-two", "second", RunState::Errored)
-        .await;
-    world.run_turn("wb-degrade-three", "third").await;
+    world.run_turn("wb-degrade-two", "second").await;
 
     let requests = fake.requests();
     assert_eq!(requests.len(), 3);
@@ -889,6 +932,22 @@ async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch()
             .tools
             .iter()
             .any(|tool| tool.name == "web_fetch"),
-        "after the refusal the pair falls back to the LOCAL fetch tool"
+        "the bounded same-turn retry uses the LOCAL fetch tool"
     );
+    let history = world
+        .store
+        .read(&world.session_id, 0, 256)
+        .await
+        .expect("fallback history");
+    assert!(history.iter().any(|event| {
+        matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                item: haider_protocol::item::TurnItem::Extension { kind, data, .. },
+                ..
+            })) if kind == "provider_tool_fallback"
+                && data.get("label").and_then(serde_json::Value::as_str)
+                    == Some("provider hosted web tool rejected — using local web_fetch")
+        )
+    }));
 }

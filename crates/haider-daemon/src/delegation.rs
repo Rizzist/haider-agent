@@ -207,6 +207,7 @@ impl DelegationHandle {
                 "child_session_id": child_session_id,
             })),
         };
+        manifest.placement.ensure_local()?;
         // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — a child must
         // never park on a human. Children are created with writes+exec
         // pre-allowed through the W9b override seam (journaled as ordinary

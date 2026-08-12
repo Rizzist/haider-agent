@@ -2634,6 +2634,7 @@ pub fn live_pass(
     // a reply racing its own deadline in one pass mints nothing.
     driver.expire_login(model);
     let mut commands = Vec::new();
+    commands.extend(driver.busy_retries_due());
     // The OAuth poll sweep (W5e-1): same clock as the login deadline.
     commands.extend(driver.oauth_poll());
     if let Some(reply) = reply {
@@ -2815,16 +2816,21 @@ pub async fn run_live(
             },
             reply = link.replies.recv() => match reply {
                 Some(reply) => inbound = Some(reply),
-                None => break,
+                None => return Err(std::io::Error::other(
+                    "link supervisor stopped unexpectedly after bounded recovery",
+                )),
             },
             // T2: talk-runtime outcomes (envelopes mark dirty and ride the
             // guarded 30 fps frame tick below — the wave adds NO timer).
             // The supervisor outlives this loop (its handle is owned
             // here), so `None` is unreachable; guarded anyway.
             talk_event = talk_rx.recv() => {
-                if let Some(event) = talk_event {
-                    model.handle_talk(event);
-                }
+                let Some(event) = talk_event else {
+                    return Err(std::io::Error::other(
+                        "talk supervisor stopped unexpectedly after bounded recovery",
+                    ));
+                };
+                model.handle_talk(event);
             }
             _ = anim_tick.tick(), if model.animated() => {
                 model.anim_phase = model.anim_phase.wrapping_add(1);

@@ -1,6 +1,6 @@
-//! Agents and delegation (§5): one abstraction at every scale. A child is the
-//! same object local or remote; placement is a manifest field. Callsigns are
-//! display identity ONLY — the wire keys everything by opaque id.
+//! Agents and delegation (§5). Haider executes agents locally; the historical
+//! device-shaped wire variant is retained only to reject it cleanly when
+//! reading a future/stale manifest. Callsigns are display identity ONLY.
 
 use crate::credential::AuthMethod;
 use crate::ids::{AgentId, DeviceId, LeaseId, RunId, SessionId, WorkspaceRevision};
@@ -53,7 +53,31 @@ pub enum AgentRole {
 #[serde(tag = "placement", rename_all = "snake_case")]
 pub enum Placement {
     Local,
-    Device { device: DeviceId },
+    /// Reserved wire compatibility only. Production admission rejects it.
+    Device {
+        device: DeviceId,
+    },
+}
+
+impl Placement {
+    /// Enforces the owner-scoped local-only product boundary.
+    pub fn ensure_local(&self) -> Result<(), crate::error::HaiderError> {
+        if matches!(self, Self::Local) {
+            return Ok(());
+        }
+        Err(crate::error::HaiderError::new(
+            crate::error::ErrorCode::InvalidArgument,
+            "not supported — Haider runs local-only",
+            false,
+        )
+        .with_presentation(crate::error::ErrorPresentation::new(
+            "local-only",
+            "Not supported — Haider runs local-only",
+            "Cross-device agent placement is not available in Haider.",
+            crate::error::ErrorScope::Tool,
+            [crate::error::ErrorAction::None],
+        )))
+    }
 }
 
 /// The capability grant carried by a manifest. Coarse in v0.1 (tool allowlist

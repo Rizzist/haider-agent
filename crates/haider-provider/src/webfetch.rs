@@ -55,6 +55,14 @@ pub struct WebFetchOutcome {
     pub truncated: bool,
 }
 
+/// Result of the production GET retry seam. `attempts` is always one or two
+/// and is carried to the UI so recovery is visible rather than implicit.
+#[derive(Debug)]
+pub struct WebFetchExecution {
+    pub outcome: Result<WebFetchOutcome, ProviderError>,
+    pub attempts: u8,
+}
+
 /// Fetches one model-supplied URL through the strict-public origin policy.
 pub async fn fetch_public_url(
     url: &str,
@@ -67,6 +75,41 @@ pub async fn fetch_public_url(
         WEB_FETCH_TOTAL_DEADLINE,
     )
     .await
+}
+
+/// Fetches an idempotent public GET with exactly one transient retry.
+/// Origin, MIME, and non-retryable HTTP refusals are never retried.
+pub async fn fetch_public_url_with_one_retry(
+    url: &str,
+    max_bytes: Option<u64>,
+) -> WebFetchExecution {
+    bounded_get_retry(|| fetch_public_url(url, max_bytes)).await
+}
+
+async fn bounded_get_retry<F, Fut>(mut fetch: F) -> WebFetchExecution
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<WebFetchOutcome, ProviderError>>,
+{
+    let first = fetch().await;
+    if !first.as_ref().is_err_and(transient_get_failure) {
+        return WebFetchExecution {
+            outcome: first,
+            attempts: 1,
+        };
+    }
+    WebFetchExecution {
+        outcome: fetch().await,
+        attempts: 2,
+    }
+}
+
+fn transient_get_failure(error: &ProviderError) -> bool {
+    error.retryable
+        && matches!(
+            error.kind,
+            ProviderErrorKind::Transport | ProviderErrorKind::StreamInterrupted
+        )
 }
 
 /// Resolver-injectable variant of [`fetch_public_url`] (tests use stub
@@ -140,10 +183,17 @@ async fn fetch_public_url_inner(
         }
         let status = response.status();
         if !status.is_success() {
+            let code = status.as_u16();
+            let kind = if matches!(code, 408 | 425 | 429) || code >= 500 {
+                ProviderErrorKind::Transport
+            } else {
+                ProviderErrorKind::InvalidRequest
+            };
             return Err(ProviderError::new(
-                ProviderErrorKind::Transport,
-                format!("web_fetch {current} returned HTTP {}", status.as_u16()),
-            ));
+                kind,
+                format!("web_fetch {current} returned HTTP {code}"),
+            )
+            .with_http_metadata(code, None));
         }
         let content_type = declared_media_type(&response)?;
         let (bytes, source_truncated) = read_body_bounded(response, deadline).await?;
@@ -733,4 +783,58 @@ fn collapse_blank_runs(text: &str) -> String {
 
 fn refused(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::InvalidRequest, message)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn success() -> WebFetchOutcome {
+        WebFetchOutcome {
+            final_url: "https://example.test/".into(),
+            content_type: "text/plain".into(),
+            text: "ok".into(),
+            truncated: false,
+        }
+    }
+
+    /// E8 GET law: deleting the retry yields one call; looping on the second
+    /// transient error yields more than two. Both mutations break this test.
+    #[tokio::test]
+    async fn idempotent_web_fetch_transient_failure_retries_exactly_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let execution = bounded_get_retry(|| {
+            let calls = Arc::clone(&calls);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(ProviderError::new(
+                        ProviderErrorKind::Transport,
+                        "injected transient failure",
+                    ))
+                } else {
+                    Ok(success())
+                }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(execution.attempts, 2);
+        assert!(execution.outcome.is_ok());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let execution = bounded_get_retry(|| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "injected non-retryable refusal",
+                ))
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(execution.attempts, 1);
+    }
 }

@@ -55,6 +55,13 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         presentation: Option<error::ErrorPresentation>,
     },
+    /// A client-detected compatibility fault committed through the daemon so
+    /// it survives reconnect/restart and is never reduced to silent omission.
+    ClientDiagnostic {
+        command_id: String,
+        code: String,
+        message: String,
+    },
     IdleDecayed,
     // interaction
     MenuOpened(menu::Menu),

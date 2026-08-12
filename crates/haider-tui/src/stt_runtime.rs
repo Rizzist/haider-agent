@@ -88,7 +88,8 @@ impl TalkRuntime {
     #[must_use]
     pub fn spawn(events: TalkEvents, store_dir: PathBuf) -> Self {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        tokio::spawn(supervise(commands_rx, events, store_dir));
+        let commands = Arc::new(tokio::sync::Mutex::new(commands_rx));
+        tokio::spawn(supervise_with_restart(commands, events, store_dir));
         Self {
             commands: commands_tx,
         }
@@ -101,13 +102,50 @@ impl TalkRuntime {
     }
 }
 
+async fn supervise_with_restart(
+    commands: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<TalkShellCommand>>>,
+    events: TalkEvents,
+    store_dir: PathBuf,
+) {
+    const MAX_STARTS: u8 = 2;
+    for attempt in 1..=MAX_STARTS {
+        let child = tokio::spawn(supervise(
+            Arc::clone(&commands),
+            events.clone(),
+            store_dir.clone(),
+        ));
+        let outcome = child.await;
+        if commands.lock().await.is_closed() {
+            return;
+        }
+        if attempt < MAX_STARTS {
+            let _ = events.send(TalkEvent::SupervisorRestarting {
+                attempt: attempt + 1,
+                max: MAX_STARTS,
+            });
+            continue;
+        }
+        let reason = outcome.map_or_else(
+            |error| format!("talk supervisor task failed: {error}"),
+            |()| "talk supervisor exited unexpectedly".into(),
+        );
+        let _ = events.send(TalkEvent::SupervisorFailed { reason });
+        return;
+    }
+}
+
 async fn supervise(
-    mut commands: mpsc::UnboundedReceiver<TalkShellCommand>,
+    commands: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<TalkShellCommand>>>,
     events: TalkEvents,
     store_dir: PathBuf,
 ) {
     let mut active: Option<ActiveTalk> = None;
-    while let Some(command) = commands.recv().await {
+    loop {
+        let command = commands.lock().await.recv().await;
+        let Some(command) = command else {
+            teardown(&mut active).await;
+            return;
+        };
         match command {
             TalkShellCommand::Start { generation, engine } => {
                 teardown(&mut active).await;
@@ -181,7 +219,6 @@ async fn supervise(
             }
         }
     }
-    teardown(&mut active).await;
 }
 
 /// Drop the capture worker off the async thread (its Drop joins the cpal
