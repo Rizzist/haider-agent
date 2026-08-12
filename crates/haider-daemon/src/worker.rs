@@ -1439,8 +1439,15 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
                 )
                 .await?;
             }
-            reconcile_unknown_effects(&lease, &device_id, &run_id, branch_id.as_ref(), &event_ids)
-                .await?;
+            reconcile_unknown_effects(
+                &lease,
+                &device_id,
+                &run_id,
+                branch_id.as_ref(),
+                &event_ids,
+                UnknownReconcile::EvidenceOnly,
+            )
+            .await?;
             let mut payloads = cancelled_resumption_payloads(&lease, &session_id, &run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
             append_payloads(
@@ -1541,8 +1548,15 @@ pub(crate) async fn terminalize_supervisor_exit(
         // Panic can strand a dispatched effect regardless of the run state.
         // Reconcile before either cancellation-shaped or failure-shaped
         // terminalization; a reconciliation error fences every terminal.
-        reconcile_unknown_effects(&lease, &device_id, run_id, branch_id.as_ref(), &event_ids)
-            .await?;
+        reconcile_unknown_effects(
+            &lease,
+            &device_id,
+            run_id,
+            branch_id.as_ref(),
+            &event_ids,
+            UnknownReconcile::Park,
+        )
+        .await?;
         if durable_run_state(&lease, run_id).await == Some(RunState::EffectOutcomeUnknown) {
             // Unknown outcome is an intentional durable park with its own
             // four-choice card. Do not overwrite it with Errored/Idle.
@@ -2075,6 +2089,7 @@ async fn run_supervisor(
                                 &finished.run_id,
                                 finished.branch_id.as_ref(),
                                 &event_ids,
+                                UnknownReconcile::Park,
                             )
                             .await
                             {
@@ -2145,6 +2160,7 @@ async fn run_supervisor(
                             &finished.run_id,
                             finished.branch_id.as_ref(),
                             &event_ids,
+                            UnknownReconcile::EvidenceOnly,
                         )
                         .await
                         {
@@ -2616,6 +2632,20 @@ async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64
     }
 }
 
+/// How a caller settles dispatched effects that lack a durable outcome.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnknownReconcile {
+    /// Death-shaped exits (supervisor panic, harness actor death): nobody is
+    /// left to settle the run, so append Unknown evidence, open the
+    /// four-choice recovery card, and park the run as `EffectOutcomeUnknown`.
+    Park,
+    /// Settlement-shaped exits (user cancellation, failure terminalization):
+    /// the caller commits its own terminal (Cancelled/Errored) immediately
+    /// after, so append Unknown evidence only — no card and no park. P1-1:
+    /// user cancellation must still end with Cancelled as the final envelope.
+    EvidenceOnly,
+}
+
 /// Live counterpart of startup effect reconciliation, scoped to one run.
 ///
 /// Dispatcher close is attempted first, but its return value is not evidence
@@ -2627,6 +2657,7 @@ async fn reconcile_unknown_effects(
     run_id: &RunId,
     branch_id: Option<&BranchId>,
     event_ids: &EventIdGenerator,
+    mode: UnknownReconcile,
 ) -> Result<(), HaiderError> {
     let mut dispatched = HashSet::<EffectId>::new();
     let mut summaries = HashMap::<EffectId, String>::new();
@@ -2713,15 +2744,20 @@ async fn reconcile_unknown_effects(
                 freshness: None,
             }));
         }
-        payloads.push(EventPayload::MenuOpened(effect_recovery_menu(
-            MenuId::new(format!("effect-recovery-{run_id}-{effect}")),
-            effect.clone(),
-            summaries
-                .get(&effect)
-                .map(String::as_str)
-                .unwrap_or("unknown dispatched effect"),
-        )));
-        payloads.push(EventPayload::RunState(RunState::EffectOutcomeUnknown));
+        if mode == UnknownReconcile::Park {
+            payloads.push(EventPayload::MenuOpened(effect_recovery_menu(
+                MenuId::new(format!("effect-recovery-{run_id}-{effect}")),
+                effect.clone(),
+                summaries
+                    .get(&effect)
+                    .map(String::as_str)
+                    .unwrap_or("unknown dispatched effect"),
+            )));
+            payloads.push(EventPayload::RunState(RunState::EffectOutcomeUnknown));
+        }
+    }
+    if payloads.is_empty() {
+        return Ok(());
     }
     append_payloads(store, device_id, run_id, branch_id, event_ids, payloads).await
 }
@@ -3398,7 +3434,15 @@ async fn cancel_shell_exec(
     event_ids: &EventIdGenerator,
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
-    reconcile_unknown_effects(lease, device_id, run_id, None, event_ids).await?;
+    reconcile_unknown_effects(
+        lease,
+        device_id,
+        run_id,
+        None,
+        event_ids,
+        UnknownReconcile::EvidenceOnly,
+    )
+    .await?;
     let mut payloads = cancelled_resumption_payloads(lease, lease.session_id(), run_id).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
     append_payloads(lease, device_id, run_id, None, event_ids, payloads).await?;
@@ -3415,7 +3459,15 @@ async fn fail_shell_exec(
     if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
         return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
     }
-    reconcile_unknown_effects(lease, device_id, run_id, None, event_ids).await?;
+    reconcile_unknown_effects(
+        lease,
+        device_id,
+        run_id,
+        None,
+        event_ids,
+        UnknownReconcile::EvidenceOnly,
+    )
+    .await?;
     let mut payloads =
         failed_resumption_payloads(lease, lease.session_id(), run_id, &error).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
