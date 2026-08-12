@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
-use haider_rpc::haider_protocol::error::ErrorCode;
+use haider_rpc::haider_protocol::error::{ErrorCode, ErrorPresentation};
 use haider_rpc::haider_protocol::ids::{ArtifactRef, MenuId, RunId, SessionId};
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{DecisionKind, MenuKind};
@@ -298,6 +298,8 @@ pub struct HeadlessRunFailure {
     pub code: HeadlessFailureCode,
     pub message: String,
     pub retryable: bool,
+    /// Safe typed presentation copied from the durable protocol event/card.
+    pub presentation: Option<ErrorPresentation>,
 }
 
 /// Failure-code source retained without string-parsing durable run codes.
@@ -535,6 +537,7 @@ struct HeadlessReducer {
     usage: Option<Usage>,
     permission_denials: Vec<HeadlessPermissionDenial>,
     pending_run_failure: Option<(u64, HeadlessRunFailure)>,
+    blocking_presentation: Option<ErrorPresentation>,
     terminal: Option<NaturalTerminal>,
     menu_resolutions: BTreeMap<String, DurableMenuResolution>,
     cancel_observed: bool,
@@ -556,6 +559,7 @@ impl HeadlessReducer {
             usage: None,
             permission_denials: Vec::new(),
             pending_run_failure: None,
+            blocking_presentation: None,
             terminal: None,
             menu_resolutions: BTreeMap::new(),
             cancel_observed: false,
@@ -624,18 +628,27 @@ impl HeadlessReducer {
                 item: TurnItem::AgentMessage { text },
                 ..
             }) => self.response = Some(text),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::IncompleteAgentMessage { text, .. },
+                ..
+            }) => self.response = Some(text),
             EventPayload::Usage(usage) => self.usage = Some(usage),
             EventPayload::RunFailed {
                 code,
                 message,
                 retryable,
+                presentation,
             } => {
+                let message = presentation
+                    .as_ref()
+                    .map_or(message, |safe| format!("{} — {}", safe.title, safe.detail));
                 self.pending_run_failure = Some((
                     envelope.seq,
                     HeadlessRunFailure {
                         code: HeadlessFailureCode::Run(code),
                         message,
                         retryable,
+                        presentation,
                     },
                 ));
             }
@@ -674,9 +687,17 @@ impl HeadlessReducer {
                         option_index,
                     });
                 }
-                _ => self
+                MenuKind::ErrorRecovery { presentation, .. } => {
+                    if menu.blocking {
+                        self.blocking_presentation = Some(presentation);
+                        self.actions
+                            .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired));
+                    }
+                }
+                _ if menu.blocking => self
                     .actions
                     .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired)),
+                _ => {}
             },
             EventPayload::MenuAnswered(answer) => {
                 self.menu_resolutions.insert(
@@ -723,6 +744,7 @@ impl HeadlessReducer {
                         code: HeadlessFailureCode::Internal,
                         message: "errored run had no adjacent correlated RunFailed".into(),
                         retryable: false,
+                        presentation: None,
                     });
                 self.terminal = Some(NaturalTerminal {
                     outcome: HeadlessOutcome::Errored,
@@ -2459,6 +2481,7 @@ fn finalize(
                 code: HeadlessFailureCode::Timeout,
                 message: "run exceeded its wall-clock timeout".into(),
                 retryable: false,
+                presentation: None,
             }),
             reducer.terminal.as_ref().map(|terminal| terminal.seq),
         ),
@@ -2466,8 +2489,12 @@ fn finalize(
             HeadlessOutcome::InputRequired,
             Some(HeadlessRunFailure {
                 code: HeadlessFailureCode::Blocked(reason),
-                message: reason.message().into(),
+                message: reducer.blocking_presentation.as_ref().map_or_else(
+                    || reason.message().into(),
+                    |safe| format!("{} — {}", safe.title, safe.detail),
+                ),
                 retryable: false,
+                presentation: reducer.blocking_presentation.clone(),
             }),
             reducer.terminal.as_ref().map(|terminal| terminal.seq),
         ),
@@ -2479,6 +2506,7 @@ fn finalize(
                         code: HeadlessFailureCode::Internal,
                         message: "event stream ended without a correlated terminal".into(),
                         retryable: false,
+                        presentation: None,
                     }),
                     None,
                 )

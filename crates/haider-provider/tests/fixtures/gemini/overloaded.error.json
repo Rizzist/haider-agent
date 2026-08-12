@@ -1,1 +1,13 @@
-{"kind":"overloaded","message":"Gemini HTTP 503 returned overload","retryable":true}
+{
+  "kind": "overloaded",
+  "message": "Gemini HTTP 503 returned overload",
+  "retryable": true,
+  "presentation": {
+    "subcode": "provider-overloaded",
+    "title": "Provider is overloaded",
+    "detail": "The provider is temporarily unable to serve this request.",
+    "provider_http_status": 503,
+    "scope": "turn",
+    "allowed_actions": ["retry"]
+  }
+}

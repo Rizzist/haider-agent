@@ -21,6 +21,7 @@ use haider_protocol::ids::{
     ArtifactRef, BranchId, CredentialAlias, DeviceId, ItemId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{AttachmentBlock, BoundedResult};
@@ -1143,6 +1144,7 @@ impl ToolDispatcher for CompletingDispatcher {
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         }))
     }
 }
@@ -1169,6 +1171,7 @@ impl ToolDispatcher for LargeResultDispatcher {
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         }))
     }
 }
@@ -1492,15 +1495,32 @@ async fn provider_error_after_first_event_is_never_retried() {
             reason: FinishReason::EndTurn,
         },
     ]);
-    let outcome = handle
+    let turn = handle
         .submit_turn(SubmitTurn::new("do not duplicate output"))
         .await
-        .expect("turn accepted")
-        .wait()
+        .expect("turn accepted");
+    let mut state = handle.state_receiver();
+    let parked = state
+        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
         .await
-        .expect("outcome");
-    assert_eq!(outcome.state, RunState::Errored);
+        .expect("actor remains available")
+        .clone();
+    let RunState::InputRequired { menu } = parked.expect("input state") else {
+        panic!("expected partial-stream menu");
+    };
     assert_eq!(provider.requests().len(), 1);
+    handle
+        .answer_menu(MenuAnswer {
+            menu,
+            option_key: Some("retry_fresh".into()),
+            option_index: 1,
+            value: None,
+            via: AnswerVia::Rpc,
+        })
+        .await
+        .expect("retry-fresh answer");
+    assert_eq!(turn.wait().await.expect("outcome").state, RunState::Done);
+    assert_eq!(provider.requests().len(), 2);
 }
 
 /// MUTATION CHECK (W5c.1 safe-boundary rotation): clear the logical-turn
@@ -1692,8 +1712,8 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
             .load(Ordering::SeqCst)
     );
 
-    for script in [
-        vec![
+    {
+        let partial = Arc::new(FakeProvider::new(vec![
             FakeStep::EmitText {
                 text: "visible".into(),
             },
@@ -1702,7 +1722,65 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
                 message: "after text".into(),
                 retry_after_ms: Some(0),
             },
-        ],
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]));
+        let forbidden = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }]));
+        let partial_resolver = Arc::new(ScriptedRotationResolver {
+            calls: AtomicUsize::new(0),
+            first: forbidden.clone(),
+            first_alias: CredentialAlias::new("partial-b"),
+            second: forbidden.clone(),
+            second_alias: CredentialAlias::new("partial-c"),
+        });
+        let partial_store = Arc::new(MemoryStore::new());
+        let mut partial_config = config();
+        partial_config.usage_account = Some(CredentialAlias::new("partial-a"));
+        partial_config.provider_attempt_resolver = Some(partial_resolver.clone());
+        let partial_handle =
+            HarnessActor::spawn(partial_config, partial.clone(), partial_store.clone());
+        let turn = partial_handle
+            .submit_turn(SubmitTurn::new("surface partial output honestly"))
+            .await
+            .expect("turn accepted");
+        let mut state = partial_handle.state_receiver();
+        let parked = state
+            .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
+            .await
+            .expect("partial recovery remains answerable")
+            .clone();
+        let RunState::InputRequired { menu } = parked.expect("input state") else {
+            panic!("expected partial-stream menu");
+        };
+        assert_eq!(partial.requests().len(), 1);
+        assert_eq!(partial_resolver.calls.load(Ordering::SeqCst), 0);
+        assert!(forbidden.requests().is_empty());
+        assert!(
+            !partial_store
+                .events(&SessionId::new(SESSION))
+                .await
+                .iter()
+                .any(|event| matches!(typed(event), EventPayload::Rotation(_)))
+        );
+        partial_handle
+            .answer_menu(MenuAnswer {
+                menu,
+                option_key: Some("retry_fresh".into()),
+                option_index: 1,
+                value: None,
+                via: AnswerVia::Rpc,
+            })
+            .await
+            .expect("retry-fresh answer");
+        assert_eq!(turn.wait().await.expect("outcome").state, RunState::Done);
+        assert_eq!(partial.requests().len(), 2);
+        assert_eq!(partial_resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    for script in [
         vec![
             FakeStep::EmitReasoning {
                 text: "visible reasoning".into(),
@@ -2356,6 +2434,7 @@ impl ToolDispatcher for BoundaryRecordingDispatcher {
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
+            presentation: None,
         }))
     }
 }

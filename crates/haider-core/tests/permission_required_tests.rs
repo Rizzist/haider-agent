@@ -43,6 +43,7 @@ impl ToolDispatcher for ApprovalDispatcher {
                 cursor: None,
                 status: haider_protocol::tool::ToolResultStatus::Completed,
                 reason: None,
+                presentation: None,
             }))
         } else {
             Ok(ToolDispatchResult::ApprovalRequired(self.menu.clone()))

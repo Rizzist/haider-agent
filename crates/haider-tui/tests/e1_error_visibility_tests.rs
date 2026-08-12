@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::ItemId;
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
@@ -35,6 +36,7 @@ fn apply_tool(
             cursor: None,
             status,
             reason: reason.map(str::to_owned),
+            presentation: None,
         },
     });
     projection.apply(&EventPayload::Item(ItemEvent::Completed {
@@ -106,4 +108,48 @@ fn e1b_refusal_item_is_visible_in_done_transcript() {
     }));
     let rendered = render_plain(&projection, 0, None);
     assert!(rendered.contains("✗ model refused — The model declined this request."));
+}
+
+#[test]
+fn e2a_typed_run_failure_render_never_uses_legacy_body_marker() {
+    const MARKER: &str = "RAW_BODY_MUST_NEVER_RENDER_98c4";
+    let mut projection = SessionProjection::default();
+    projection.apply(&EventPayload::RunFailed {
+        code: ErrorCode::ProviderError,
+        message: MARKER.into(),
+        retryable: true,
+        presentation: Some(ErrorPresentation::new(
+            "rate-limited",
+            "Provider rate limit reached",
+            "Wait for the provider limit to reset, then retry.",
+            ErrorScope::Account,
+            [ErrorAction::Wait, ErrorAction::Retry],
+        )),
+    });
+    let rendered = render_plain(&projection, 0, None);
+    assert!(rendered.contains("Provider rate limit reached"));
+    assert!(rendered.contains("[rate-limited]"));
+    assert!(rendered.contains("actions: wait, retry"));
+    assert!(!rendered.contains(MARKER));
+}
+
+#[test]
+fn e4_incomplete_assistant_item_has_explicit_plain_label() {
+    let mut projection = SessionProjection::default();
+    projection.apply(&EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("partial"),
+        item: TurnItem::IncompleteAgentMessage {
+            text: "partial answer".into(),
+            interruption: ErrorPresentation::new(
+                "stream-interrupted",
+                "Response stream interrupted",
+                "The provider connection ended after content.",
+                ErrorScope::Turn,
+                [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+            ),
+        },
+    }));
+    let rendered = render_plain(&projection, 0, None);
+    assert!(rendered.contains("partial answer"));
+    assert!(rendered.contains("⚠ incomplete — stream interrupted (stream-interrupted)"));
 }

@@ -24,6 +24,7 @@ use haider_core::{
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{DeviceId, SessionId};
+use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::{RunState, WaitReason};
 use haider_provider::{FakeProvider, FakeStep, ProviderErrorKind};
@@ -292,8 +293,9 @@ fn m4_backoff_schedule_is_a_pure_function_of_attempt() {
     }
 }
 
-/// A failure AFTER content was committed for the turn is NEVER auto-retried —
-/// re-issuing would duplicate the already-streamed output.
+/// A failure AFTER content was committed for the turn is NEVER auto-retried.
+/// It parks for an explicit partial-stream choice; only that user choice may
+/// issue another request.
 #[tokio::test]
 async fn m4_failure_after_committed_content_is_not_retried() {
     let sleeper = Arc::new(RecordingSleeper::default());
@@ -307,26 +309,50 @@ async fn m4_failure_after_committed_content_is_not_retried() {
                 message: "broke mid-stream".into(),
                 retry_after_ms: None,
             },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
         ],
         sleeper.clone(),
     );
-    let outcome = handle
+    let turn = handle
         .submit_turn(SubmitTurn::new("content then fail"))
         .await
-        .expect("turn accepted")
-        .wait()
+        .expect("turn accepted");
+    let mut state = handle.state_receiver();
+    let parked = state
+        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
         .await
-        .expect("outcome");
+        .expect("actor remains available")
+        .clone();
+    let RunState::InputRequired { menu } = parked.expect("input state") else {
+        panic!("expected partial-stream menu");
+    };
 
-    assert_eq!(outcome.state, RunState::Errored);
     assert_eq!(
         provider.requests().len(),
         1,
-        "a committed-content failure never re-issues"
+        "a committed-content failure does not re-issue before the user chooses"
     );
     assert!(
         retrying_states(&store.events(&SessionId::new(SESSION)).await).is_empty(),
         "no Retrying beat once content has streamed"
     );
     assert!(sleeper.recorded().is_empty());
+    handle
+        .answer_menu(MenuAnswer {
+            menu,
+            option_key: Some("retry_fresh".into()),
+            option_index: 1,
+            value: None,
+            via: AnswerVia::Rpc,
+        })
+        .await
+        .expect("retry-fresh answer");
+    assert_eq!(turn.wait().await.expect("outcome").state, RunState::Done);
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the second request follows the explicit user choice"
+    );
 }

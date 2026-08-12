@@ -50,6 +50,10 @@ pub enum EventPayload {
         code: error::ErrorCode,
         message: String,
         retryable: bool,
+        /// Safe structured presentation. Optional only so pre-E2 journals
+        /// remain readable; every new failure producer populates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<error::ErrorPresentation>,
     },
     IdleDecayed,
     // interaction

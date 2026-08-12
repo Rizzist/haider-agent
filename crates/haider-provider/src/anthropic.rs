@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
+use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{CapabilityDoc, FeatureResolve};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -65,6 +66,7 @@ pub const ANTHROPIC_FAST_BETA_VALUE: &str = "fast-mode-2026-02-01";
 const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
 const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
     retry_policy: AnthropicRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
@@ -457,7 +459,11 @@ impl AnthropicProvider {
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let body = response.bytes().await.map_err(transport_error)?.to_vec();
+        let body = if response.status().is_success() {
+            response.bytes().await.map_err(transport_error)?.to_vec()
+        } else {
+            read_error_body_bounded(response).await?
+        };
         Ok(AnthropicCapture {
             status,
             retry_after,
@@ -636,17 +642,22 @@ impl Provider for AnthropicProvider {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let request_id = response
+                .headers()
+                .get("request-id")
+                .or_else(|| response.headers().get("x-request-id"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            let body = response.bytes().await.map_err(transport_error)?;
-            return Err(replay_anthropic_http_error(
-                status,
-                retry_after.as_deref(),
-                &body,
-            ));
+            let body = read_error_body_bounded(response).await?;
+            return Err(
+                replay_anthropic_http_error(status, retry_after.as_deref(), &body)
+                    .with_http_metadata(status, request_id.as_deref()),
+            );
         }
 
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
@@ -657,6 +668,26 @@ impl Provider for AnthropicProvider {
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
+}
+
+/// Anthropic error bodies obey the same 64 KiB ceiling as the OpenAI and
+/// Gemini adapters. Bytes beyond the bound are never parsed or logged.
+async fn read_error_body_bounded(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        let remaining = ERROR_BODY_LIMIT.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -946,7 +977,27 @@ pub fn replay_anthropic_http_error(
     )
     .then(|| parse_retry_after(retry_after))
     .flatten();
-    ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+    let mut error = ProviderError::new(kind, message);
+    error.presentation = match body_kind {
+        Some("account_not_found_error" | "account_deleted_error") => ErrorPresentation::new(
+            "account-deleted",
+            "Provider account unavailable",
+            "The provider no longer recognizes this account.",
+            ErrorScope::Account,
+            [ErrorAction::SwitchAccount],
+        ),
+        Some("account_deactivated_error" | "account_revoked_error") => ErrorPresentation::new(
+            "account-revoked",
+            "Provider account access revoked",
+            "This provider account can no longer be used.",
+            ErrorScope::Account,
+            [ErrorAction::SwitchAccount, ErrorAction::ContactAdmin],
+        ),
+        _ => error.presentation,
+    };
+    error
+        .with_retry_after_ms(retry_after_ms)
+        .with_http_metadata(status, None)
 }
 
 pub(crate) fn anthropic_billing_exhausted(kind: &str, message: &str) -> bool {

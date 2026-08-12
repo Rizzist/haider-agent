@@ -447,6 +447,15 @@ async fn run_inner(
                     )
                     .await
             }
+            RecoveredWork::PartialStream(recovered) => {
+                worker_handle
+                    .recover_partial_stream(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.committed_answer,
+                    )
+                    .await
+            }
             RecoveredWork::ChildWait(recovered) => {
                 worker_handle
                     .recover_child_wait(recovered.accepted, recovered.checkpoint)

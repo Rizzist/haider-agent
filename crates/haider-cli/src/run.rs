@@ -458,12 +458,25 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
     let usage = serde_json::to_string(&result.usage).map_err(io::Error::other)?;
     let denials = serde_json::to_string(&result.permission_denials).map_err(io::Error::other)?;
     let error = match &result.failure {
-        Some(failure) => format!(
-            "{{\"code\":{},\"message\":{},\"retryable\":{}}}",
-            serde_json::to_string(failure.code.as_str()).map_err(io::Error::other)?,
-            serde_json::to_string(&failure.message).map_err(io::Error::other)?,
-            failure.retryable,
-        ),
+        Some(failure) => {
+            let presentation = failure
+                .presentation
+                .as_ref()
+                .map(|presentation| {
+                    serde_json::to_string(presentation)
+                        .map(|value| format!(",\"presentation\":{value}"))
+                })
+                .transpose()
+                .map_err(io::Error::other)?
+                .unwrap_or_default();
+            format!(
+                "{{\"code\":{},\"message\":{},\"retryable\":{}{}}}",
+                serde_json::to_string(failure.code.as_str()).map_err(io::Error::other)?,
+                serde_json::to_string(&failure.message).map_err(io::Error::other)?,
+                failure.retryable,
+                presentation,
+            )
+        }
         None => "null".into(),
     };
     // W-A decision 8 (additive to the v1 object): tasks the daemon still

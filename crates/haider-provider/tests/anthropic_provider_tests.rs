@@ -107,17 +107,16 @@ fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
                 assert_eq!(actual, expected, "fixture `{}`", fixture.name);
             }
             "http" => {
-                let expected: ProviderError = read_json(&directory.join(&fixture.golden));
-                assert_eq!(
-                    replay_anthropic_http_error(
-                        fixture.status,
-                        fixture.retry_after.as_deref(),
-                        &wire,
-                    ),
-                    expected,
-                    "fixture `{}`",
-                    fixture.name
+                let mut expected: ProviderError = read_json(&directory.join(&fixture.golden));
+                let actual = replay_anthropic_http_error(
+                    fixture.status,
+                    fixture.retry_after.as_deref(),
+                    &wire,
                 );
+                // Absolute reset time is intentionally wall-clock derived;
+                // the golden pins every stable field and relative delay.
+                expected.presentation.reset_at_ms = actual.presentation.reset_at_ms;
+                assert_eq!(actual, expected, "fixture `{}`", fixture.name);
             }
             other => panic!("unknown fixture transport `{other}`"),
         }

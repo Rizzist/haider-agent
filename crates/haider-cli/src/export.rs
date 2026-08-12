@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::ErrorPresentation;
 use haider_protocol::history::NodeKind;
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_tui::notify::mask_text;
 use serde_json::{Value, json};
 
@@ -51,6 +53,15 @@ pub enum Turn {
         text: String,
         at_ms: u64,
     },
+    AssistantIncomplete {
+        text: String,
+        interruption: ErrorPresentation,
+        at_ms: u64,
+    },
+    Error {
+        presentation: ErrorPresentation,
+        at_ms: u64,
+    },
     Tool {
         name: String,
         summary: String,
@@ -61,9 +72,11 @@ pub enum Turn {
 impl Turn {
     fn at_ms(&self) -> u64 {
         match self {
-            Self::User { at_ms, .. } | Self::Assistant { at_ms, .. } | Self::Tool { at_ms, .. } => {
-                *at_ms
-            }
+            Self::User { at_ms, .. }
+            | Self::Assistant { at_ms, .. }
+            | Self::AssistantIncomplete { at_ms, .. }
+            | Self::Error { at_ms, .. }
+            | Self::Tool { at_ms, .. } => *at_ms,
         }
     }
 }
@@ -158,22 +171,37 @@ impl SessionExport {
             else {
                 continue;
             };
-            let EventPayload::NodeCommitted(node) = payload else {
-                continue;
-            };
             let at_ms = envelope.committed_at_ms;
-            match node.kind {
-                NodeKind::UserTurn { text, .. } => turns.push(Turn::User { text, at_ms }),
-                NodeKind::AssistantCommit { text, .. } => {
-                    turns.push(Turn::Assistant { text, at_ms });
-                }
-                NodeKind::ToolExchange { tool, summary, .. } => {
-                    turns.push(Turn::Tool {
-                        name: tool,
-                        summary,
-                        at_ms,
-                    });
-                }
+            match payload {
+                EventPayload::NodeCommitted(node) => match node.kind {
+                    NodeKind::UserTurn { text, .. } => turns.push(Turn::User { text, at_ms }),
+                    NodeKind::AssistantCommit { text, .. } => {
+                        turns.push(Turn::Assistant { text, at_ms });
+                    }
+                    NodeKind::ToolExchange { tool, summary, .. } => {
+                        turns.push(Turn::Tool {
+                            name: tool,
+                            summary,
+                            at_ms,
+                        });
+                    }
+                    _ => {}
+                },
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::IncompleteAgentMessage { text, interruption },
+                    ..
+                }) => turns.push(Turn::AssistantIncomplete {
+                    text,
+                    interruption,
+                    at_ms,
+                }),
+                EventPayload::RunFailed {
+                    presentation: Some(presentation),
+                    ..
+                } => turns.push(Turn::Error {
+                    presentation,
+                    at_ms,
+                }),
                 _ => {}
             }
         }
@@ -189,6 +217,26 @@ impl SessionExport {
 
     fn text(&self, raw: &str, masked: bool) -> String {
         apply_mask(raw, masked)
+    }
+
+    fn foreign_assistant_text(&self, turn: &Turn, masked: bool) -> Option<String> {
+        match turn {
+            Turn::Assistant { text, .. } => Some(self.text(text, masked)),
+            Turn::AssistantIncomplete {
+                text, interruption, ..
+            } => Some(format!(
+                "{}\n\n[Incomplete: stream interrupted ({})]",
+                self.text(text, masked),
+                interruption.subcode.as_str()
+            )),
+            Turn::Error { presentation, .. } => Some(format!(
+                "[Error: {} — {} ({})]",
+                self.text(&presentation.title, masked),
+                self.text(&presentation.detail, masked),
+                presentation.subcode.as_str()
+            )),
+            Turn::User { .. } | Turn::Tool { .. } => None,
+        }
     }
 
     /// The last user prompt (for foreign picker rows), masked as requested.
@@ -231,6 +279,30 @@ impl SessionExport {
                     out.push_str(&self.text(text, masked));
                     out.push_str("\n\n");
                 }
+                Turn::AssistantIncomplete {
+                    text,
+                    interruption,
+                    at_ms,
+                } => {
+                    out.push_str(&format!("## Assistant · {}\n\n", iso8601_ms(*at_ms)));
+                    out.push_str(&self.text(text, masked));
+                    out.push_str(&format!(
+                        "\n\n> ⚠ incomplete — stream interrupted (`{}`)\n\n",
+                        interruption.subcode.as_str()
+                    ));
+                }
+                Turn::Error {
+                    presentation,
+                    at_ms,
+                } => out.push_str(&format!(
+                    "## Error · {}\n\n**{}** — {} (`{}`)\n\nActions: {}\n\n",
+                    iso8601_ms(*at_ms),
+                    self.text(&presentation.title, masked),
+                    self.text(&presentation.detail, masked),
+                    presentation.subcode.as_str(),
+                    serde_json::to_string(&presentation.allowed_actions)
+                        .unwrap_or_else(|_| "[]".into())
+                )),
                 Turn::Tool { name, summary, .. } => {
                     out.push_str(&format!(
                         "> tool `{}` — {}\n\n",
@@ -259,6 +331,25 @@ impl SessionExport {
                 Turn::Assistant { text, at_ms } => json!({
                     "role": "assistant",
                     "text": self.text(text, masked),
+                    "at_ms": at_ms,
+                }),
+                Turn::AssistantIncomplete {
+                    text,
+                    interruption,
+                    at_ms,
+                } => json!({
+                    "role": "assistant",
+                    "text": self.text(text, masked),
+                    "incomplete": true,
+                    "interruption": interruption,
+                    "at_ms": at_ms,
+                }),
+                Turn::Error {
+                    presentation,
+                    at_ms,
+                } => json!({
+                    "role": "error",
+                    "presentation": presentation,
                     "at_ms": at_ms,
                 }),
                 Turn::Tool {
@@ -368,8 +459,10 @@ impl SessionExport {
                         .to_string(),
                     );
                 }
-                Turn::Assistant { text, .. } => {
-                    let text = self.text(text, masked);
+                Turn::Assistant { .. } | Turn::AssistantIncomplete { .. } | Turn::Error { .. } => {
+                    let text = self
+                        .foreign_assistant_text(turn, masked)
+                        .expect("assistant-like export turn");
                     lines.push(
                         json!({
                             "timestamp": iso,
@@ -455,14 +548,14 @@ impl SessionExport {
                     "user",
                     json!({ "role": "user", "content": self.text(text, masked) }),
                 ),
-                Turn::Assistant { text, .. } => (
+                Turn::Assistant { .. } | Turn::AssistantIncomplete { .. } | Turn::Error { .. } => (
                     "assistant",
                     json!({
                         "role": "assistant",
                         "model": self.meta.model,
                         "id": format!("msg_{}", short_hash(&uuid)),
                         "type": "message",
-                        "content": [{ "type": "text", "text": self.text(text, masked) }],
+                        "content": [{ "type": "text", "text": self.foreign_assistant_text(turn, masked).expect("assistant-like export turn") }],
                         "stop_reason": "end_turn",
                     }),
                 ),
@@ -530,7 +623,11 @@ impl SessionExport {
             let part_id = format!("prt_{}", short_hash(&format!("{seed}:part")));
             let (role, text) = match turn {
                 Turn::User { text, .. } => ("user", self.text(text, masked)),
-                Turn::Assistant { text, .. } => ("assistant", self.text(text, masked)),
+                Turn::Assistant { .. } | Turn::AssistantIncomplete { .. } | Turn::Error { .. } => (
+                    "assistant",
+                    self.foreign_assistant_text(turn, masked)
+                        .expect("assistant-like export turn"),
+                ),
                 Turn::Tool { name, summary, .. } => (
                     "assistant",
                     format!("[tool {}] {}", name, self.text(summary, masked)),

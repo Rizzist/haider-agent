@@ -728,6 +728,7 @@ async fn vision_unsupported_provider_refuses_locally_with_typed_error() {
                 code: ErrorCode::VisionUnsupported,
                 message,
                 retryable: false,
+                ..
             } if message.contains("provider `fake`")
         )
     }));
@@ -4262,6 +4263,7 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
                 code,
                 message,
                 retryable,
+                ..
             } => Some((code, message, retryable)),
             _ => None,
         })

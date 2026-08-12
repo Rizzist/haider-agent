@@ -5,7 +5,8 @@
 //! Freeze decision (ADR-1): `input_required` is unified with Menu — a run
 //! blocked on input carries a `MenuId`; there is no separate input-request type.
 
-use crate::ids::{AgentId, MenuId};
+use crate::error::ErrorPresentation;
+use crate::ids::{AgentId, CredentialAlias, ItemId, MenuId, RunId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +42,26 @@ pub enum MenuKind {
     Recovery {
         effect: crate::ids::EffectId,
     },
+    /// First-class provider/account/stream recovery card. The presentation
+    /// supplies safe copy and typed actions; target coordinates let clients
+    /// dispatch existing account flows without parsing labels.
+    ErrorRecovery {
+        card: ErrorRecoveryCardKind,
+        presentation: ErrorPresentation,
+        /// Index-aligned typed semantics for `Menu::options`. This avoids
+        /// clients parsing option keys/labels and remains additive for older
+        /// persisted cards.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        option_actions: Vec<crate::error::ErrorAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<CredentialAlias>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_run: Option<RunId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_item: Option<ItemId>,
+    },
     /// All provider accounts rate-limited (wait-with-auto-resume / stop).
     Exhausted,
     TrustHook,
@@ -55,6 +76,23 @@ pub enum MenuKind {
     File,
     /// Workspace conflict (e.g. editing a component under active repair).
     Conflict,
+}
+
+/// Visual/behavioral class for [`MenuKind::ErrorRecovery`]. New classes are
+/// additive; `KeychainRelink` reserves the A2 integration point without
+/// implementing keychain-denial plumbing in this wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorRecoveryCardKind {
+    OauthExpired,
+    InvalidApiKey,
+    AccountRevoked,
+    AccountDeleted,
+    RateLimit,
+    QuotaExhausted,
+    PartialStream,
+    KeychainRelink,
+    Generic,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

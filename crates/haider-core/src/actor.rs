@@ -43,7 +43,7 @@ use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CONTINUATION_CHECKPOINT_EXTENSION_KIND, CompactionIntent,
     CompactionResume, ContinuationCheckpoint, NodeKind, TodoState, TreeNode,
@@ -52,7 +52,9 @@ use haider_protocol::ids::{
     AgentId, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason};
+use haider_protocol::menu::{
+    ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
+};
 use haider_protocol::provider::{
     AccountUsage, Block, CacheCostEstimate, CacheStatAvailability, FinishReason, NormalizedUsage,
     PROVIDER_OPAQUE_EXTENSION_KIND, PrefixDigests, StreamEvent, Usage, UsageRequestKind,
@@ -289,6 +291,23 @@ pub struct SubmitCheckpointTurn {
     pub run_id: RunId,
     pub messages: Vec<Message>,
     pub checkpoint: RequestInputCheckpoint,
+}
+
+/// Durable post-content stream interruption reconstructed after restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartialStreamCheckpoint {
+    pub menu: Menu,
+    pub request_seq: u64,
+    pub opening_generation: u64,
+    pub item_id: ItemId,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubmitPartialStreamTurn {
+    pub run_id: RunId,
+    pub messages: Vec<Message>,
+    pub checkpoint: PartialStreamCheckpoint,
 }
 
 /// Durable coordinates for one deferred spawn tool reconstructed after a
@@ -613,6 +632,14 @@ impl HarnessHandle {
             .await
     }
 
+    pub async fn submit_partial_stream_turn(
+        &self,
+        request: SubmitPartialStreamTurn,
+    ) -> Result<TurnHandle, HaiderError> {
+        self.submit(TurnSubmission::PartialStream(Box::new(request)))
+            .await
+    }
+
     pub async fn submit_child_wait_turn(
         &self,
         request: SubmitChildWaitTurn,
@@ -765,6 +792,7 @@ enum TurnSubmission {
     Local(SubmitTurn),
     Committed(SubmitCommittedTurn),
     Checkpoint(Box<SubmitCheckpointTurn>),
+    PartialStream(Box<SubmitPartialStreamTurn>),
     ChildWait(Box<SubmitChildWaitTurn>),
 }
 
@@ -927,7 +955,7 @@ impl HarnessActor {
         // failure may end that turn before a boundary; never leak its input
         // into a later queued turn.
         self.pending_subturns.clear();
-        let (run_id, mut messages, checkpoint, child_wait) = match submit {
+        let (run_id, mut messages, checkpoint, partial_stream, child_wait) = match submit {
             TurnSubmission::Local(submit) => {
                 let run_id = self.next_run_id();
                 if let Err(error) = self.commit_state(&run_id, RunState::Queued).await {
@@ -951,14 +979,31 @@ impl HarnessActor {
                 {
                     return self.errored_state_outcome(&run_id, error).await;
                 }
-                (run_id, vec![Message::user_text(submit.text)], None, None)
+                (
+                    run_id,
+                    vec![Message::user_text(submit.text)],
+                    None,
+                    None,
+                    None,
+                )
             }
-            TurnSubmission::Committed(submit) => (submit.run_id, submit.messages, None, None),
+            TurnSubmission::Committed(submit) => (submit.run_id, submit.messages, None, None, None),
             TurnSubmission::Checkpoint(submit) => {
                 let submit = *submit;
                 (
                     submit.run_id,
                     submit.messages,
+                    Some(submit.checkpoint),
+                    None,
+                    None,
+                )
+            }
+            TurnSubmission::PartialStream(submit) => {
+                let submit = *submit;
+                (
+                    submit.run_id,
+                    submit.messages,
+                    None,
                     Some(submit.checkpoint),
                     None,
                 )
@@ -968,6 +1013,7 @@ impl HarnessActor {
                 (
                     submit.run_id,
                     submit.messages,
+                    None,
                     None,
                     Some(submit.checkpoint),
                 )
@@ -1050,6 +1096,59 @@ impl HarnessActor {
                         )
                         .await;
                 }
+            }
+        }
+        if let Some(checkpoint) = partial_stream {
+            match self
+                .wait_for_error_recovery_answer(&run_id, &cancel, &checkpoint.menu)
+                .await
+            {
+                Ok(ErrorAction::ContinuePartial) => {
+                    messages.push(Message::assistant(vec![Block::Text {
+                        text: checkpoint.text,
+                    }]));
+                    messages.push(Message::user_text(
+                        "The previous response was interrupted. Continue exactly where it stopped without repeating any completed text.",
+                    ));
+                }
+                Ok(ErrorAction::RetryFresh) => {}
+                Ok(_) => {
+                    return self
+                        .provider_failure_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            provider_protocol_error(
+                                "recovered partial-stream menu resolved to an unsupported action",
+                            ),
+                        )
+                        .await;
+                }
+                Err(DriveError::Cancelled) => {
+                    return self
+                        .cancelled_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    return self
+                        .drive_error_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            error,
+                        )
+                        .await;
+                }
+            }
+            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await {
+                return self.errored_state_outcome(&run_id, error).await;
             }
         }
         if let Some(checkpoint) = child_wait {
@@ -1517,6 +1616,149 @@ impl HarnessActor {
                         continue 'requests;
                     }
                     Err(error) => {
+                        if message
+                            .as_ref()
+                            .is_some_and(|partial| !partial.text.is_empty())
+                        {
+                            let presentation = stream_interruption_presentation(&error);
+                            let (source_item, partial) = match self
+                                .complete_incomplete_message(
+                                    &run_id,
+                                    &mut message,
+                                    presentation.clone(),
+                                )
+                                .await
+                            {
+                                Ok(completed) => completed,
+                                Err(error) => {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                            };
+                            if let Err(error) =
+                                self.complete_text(&run_id, &mut reasoning, true).await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                            if let Err(error) = self
+                                .complete_all_tools(&run_id, &mut tools, ToolStatus::Failed)
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                            let menu = recovery_menu(
+                                self.next_menu_id(),
+                                &run_id,
+                                Some(source_item),
+                                ErrorRecoveryCardKind::PartialStream,
+                                presentation,
+                                Some(self.config.usage_scope.provider.clone()),
+                                usage_account.clone(),
+                                true,
+                            );
+                            if let Err(error) = self
+                                .commit_payload(
+                                    &run_id,
+                                    EventPayload::MenuOpened(menu.clone()),
+                                    prompt_omit_render(),
+                                )
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            if let Err(error) = self
+                                .commit_state(
+                                    &run_id,
+                                    RunState::InputRequired {
+                                        menu: menu.id.clone(),
+                                    },
+                                )
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            let action = match self
+                                .wait_for_error_recovery_answer(&run_id, &cancel, &menu)
+                                .await
+                            {
+                                Ok(action) => action,
+                                Err(DriveError::Cancelled) => {
+                                    return self
+                                        .cancelled_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                        )
+                                        .await;
+                                }
+                                Err(error) => {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                            };
+                            match action {
+                                ErrorAction::ContinuePartial => {
+                                    messages.push(Message::assistant(vec![Block::Text {
+                                        text: partial,
+                                    }]));
+                                    messages.push(Message::user_text(
+                                        "The previous response was interrupted. Continue exactly where it stopped without repeating any completed text.",
+                                    ));
+                                }
+                                ErrorAction::RetryFresh => {}
+                                _ => {
+                                    let error = provider_protocol_error(
+                                        "partial-stream menu resolved to an unsupported action",
+                                    );
+                                    return self
+                                        .provider_failure_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                            }
+                            provider_attempt = 0;
+                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            continue 'requests;
+                        }
                         return self
                             .provider_failure_outcome_with_items(
                                 &run_id,
@@ -1721,6 +1963,13 @@ impl HarnessActor {
                                         },
                                         reason: is_error
                                             .then(|| "server tool reported an error".into()),
+                                        presentation: is_error.then(|| {
+                                            tool_error_presentation(
+                                                "server-tool-failed",
+                                                "Provider tool failed",
+                                                "The provider-hosted tool reported an error.",
+                                            )
+                                        }),
                                     },
                                 },
                                 prompt_omit_render(),
@@ -2452,16 +2701,18 @@ impl HarnessActor {
             .retry_after_ms
             .is_some_and(|delay| delay > MAX_PROVIDER_RETRY_AFTER_MS)
         {
-            return Err(DriveError::Provider(ProviderError {
-                kind: error.kind,
-                message: format!(
+            let mut capped = ProviderError::new(
+                error.kind,
+                format!(
                     "provider retry-after {}ms exceeds the {}ms respect cap",
                     error.retry_after_ms.unwrap_or_default(),
                     MAX_PROVIDER_RETRY_AFTER_MS
                 ),
-                retryable: true,
-                retry_after_ms: error.retry_after_ms,
-            }));
+            )
+            .with_retry_after_ms(error.retry_after_ms)
+            .with_presentation(error.presentation.clone());
+            capped.retryable = true;
+            return Err(DriveError::Provider(capped));
         }
         let reason = if error.kind == ProviderErrorKind::RateLimited {
             WaitReason::RateLimit
@@ -2554,6 +2805,38 @@ impl HarnessActor {
         .map_err(DriveError::Store)?;
         *accumulator = None;
         Ok(())
+    }
+
+    /// Closes the currently streamed assistant item without pretending the
+    /// provider completed it. The text remains visible and durable, while
+    /// prompt replay decides whether it belongs in history from the paired
+    /// recovery-menu answer.
+    async fn complete_incomplete_message(
+        &mut self,
+        run_id: &RunId,
+        accumulator: &mut Option<TextAccumulator>,
+        interruption: ErrorPresentation,
+    ) -> Result<(ItemId, String), DriveError> {
+        let active = accumulator.take().ok_or_else(|| {
+            DriveError::Provider(provider_protocol_error(
+                "partial-stream recovery had no active assistant item",
+            ))
+        })?;
+        let item_id = active.item_id.clone();
+        let text = active.text;
+        self.commit_item(
+            run_id,
+            ItemEvent::Completed {
+                item_id: item_id.clone(),
+                item: TurnItem::IncompleteAgentMessage {
+                    text: text.clone(),
+                    interruption,
+                },
+            },
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        Ok((item_id, text))
     }
 
     async fn start_tool(
@@ -2661,6 +2944,11 @@ impl HarnessActor {
                 cursor: None,
                 status: ToolResultStatus::Rejected,
                 reason: Some(reason),
+                presentation: Some(tool_error_presentation(
+                    "grant-ceiling-violation",
+                    "Tool grant denied",
+                    "This child is not allowed to use the requested tool.",
+                )),
             };
             let call_id = tools[index].call_id.clone();
             self.commit_payload(
@@ -2969,6 +3257,7 @@ impl HarnessActor {
                     cursor: None,
                     status: ToolResultStatus::Completed,
                     reason: None,
+                    presentation: None,
                 }
             }
             Err(error @ haider_tools::ToolError::InvalidArgument { .. }) => BoundedResult {
@@ -2985,6 +3274,11 @@ impl HarnessActor {
                 cursor: None,
                 status: ToolResultStatus::Rejected,
                 reason: Some(sanitized_failure_message(&error.to_string())),
+                presentation: Some(tool_error_presentation(
+                    "invalid-tool-argument",
+                    "Tool arguments were rejected",
+                    "The tool could not accept the supplied arguments.",
+                )),
             },
             Err(error) => return Err(tool_error_to_drive(error)),
         };
@@ -3179,6 +3473,149 @@ impl HarnessActor {
         ))
     }
 
+    async fn wait_for_error_recovery_answer(
+        &mut self,
+        run_id: &RunId,
+        cancel: &CancelToken,
+        menu: &Menu,
+    ) -> Result<ErrorAction, DriveError> {
+        loop {
+            let wake = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuClosed {
+                            menu: menu.id.clone(),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    return Err(DriveError::Cancelled);
+                },
+                changed = self.committed_menus.changed(),
+                    if self.committed_menus.has_changed().is_ok() =>
+                {
+                    match changed {
+                        Ok(()) => self
+                            .committed_menus
+                            .borrow_and_update()
+                            .clone()
+                            .map(MenuWake::Committed),
+                        Err(_) => None,
+                    }
+                },
+                command = self.commands.recv() => command.map(MenuWake::Command),
+            };
+            let Some(wake) = wake else {
+                self.commit_payload(
+                    run_id,
+                    EventPayload::MenuClosed {
+                        menu: menu.id.clone(),
+                        reason: MenuCloseReason::Dismissed,
+                    },
+                    prompt_omit_render(),
+                )
+                .await
+                .map_err(DriveError::Store)?;
+                return Err(DriveError::Provider(provider_protocol_error(
+                    "session actor command channel closed with recovery unanswered",
+                )));
+            };
+            let (answer, completed, already_committed) = match wake {
+                MenuWake::Command(command @ ActorCommand::Submit { .. }) => {
+                    self.defer_submit_or_reject(command);
+                    continue;
+                }
+                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                    self.service_command_without_menu(command);
+                    continue;
+                }
+                MenuWake::Command(ActorCommand::AnswerMenu { answer, completed }) => {
+                    (answer, Some(completed), false)
+                }
+                MenuWake::Command(ActorCommand::Stop { completed }) => {
+                    cancel.cancel();
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuClosed {
+                            menu: menu.id.clone(),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    let _ = completed.send(());
+                    return Err(DriveError::Cancelled);
+                }
+                MenuWake::Committed(envelope) => {
+                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
+                        .map_err(|error| {
+                            DriveError::Store(HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                format!("committed recovery wake could not decode: {error}"),
+                                false,
+                            ))
+                        })?;
+                    let EventPayload::MenuAnswered(answer) = payload else {
+                        return Err(DriveError::Store(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "committed recovery wake did not contain MenuAnswered",
+                            false,
+                        )));
+                    };
+                    (answer, None, true)
+                }
+            };
+            if answer.menu != menu.id {
+                let error = HaiderError::new(
+                    ErrorCode::MenuNotFound,
+                    format!(
+                        "menu {} is not open; recovery is waiting on {}",
+                        answer.menu, menu.id
+                    ),
+                    false,
+                );
+                if let Some(completed) = completed {
+                    let _ = completed.send(Err(error));
+                    continue;
+                }
+                return Err(DriveError::Store(error));
+            }
+            let action = match selected_error_action(menu, &answer) {
+                Ok(action) => action,
+                Err(error) => {
+                    if let Some(completed) = completed {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                    return Err(DriveError::Store(error));
+                }
+            };
+            if !already_committed
+                && let Err(error) = self
+                    .commit_payload(
+                        run_id,
+                        EventPayload::MenuAnswered(answer),
+                        prompt_omit_render(),
+                    )
+                    .await
+            {
+                if let Some(completed) = completed {
+                    let _ = completed.send(Err(error.clone()));
+                }
+                return Err(DriveError::Store(error));
+            }
+            if let Some(completed) = completed {
+                let _ = completed.send(Ok(()));
+            }
+            return Ok(action);
+        }
+    }
+
     async fn wait_for_request_input(
         &mut self,
         run_id: &RunId,
@@ -3352,6 +3789,7 @@ impl HarnessActor {
                             cursor: None,
                             status: ToolResultStatus::Completed,
                             reason: None,
+                            presentation: None,
                         },
                     },
                     prompt_verbatim_render(),
@@ -3451,6 +3889,13 @@ impl HarnessActor {
                 },
                 reason: (completion.chip == ChipState::Error)
                     .then(|| sanitized_failure_message(&completion.report.summary)),
+                presentation: (completion.chip == ChipState::Error).then(|| {
+                    tool_error_presentation(
+                        "child-agent-failed",
+                        "Child agent failed",
+                        "The delegated child ended without a successful result.",
+                    )
+                }),
             };
             if !pending.report_emitted {
                 self.commit_payload(
@@ -3752,8 +4197,28 @@ impl HarnessActor {
         message: &mut Option<TextAccumulator>,
         reasoning: &mut Option<TextAccumulator>,
         tools: &mut Vec<ToolAccumulator>,
-        provider_error: ProviderError,
+        mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        provider_error.presentation =
+            specialized_provider_presentation(&self.config.usage_scope.auth_scope, &provider_error);
+        if let Some(card) = recovery_card_kind(&provider_error.presentation) {
+            let menu = recovery_menu(
+                self.next_menu_id(),
+                run_id,
+                None,
+                card,
+                provider_error.presentation.clone(),
+                Some(self.config.usage_scope.provider.clone()),
+                self.config.usage_account.clone(),
+                false,
+            );
+            if let Err(error) = self
+                .commit_payload(run_id, EventPayload::MenuOpened(menu), prompt_omit_render())
+                .await
+            {
+                return errored_outcome(error);
+            }
+        }
         self.errored_outcome_with_items(
             run_id,
             message,
@@ -3772,14 +4237,22 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         error: DriveError,
     ) -> TurnOutcome {
-        self.errored_outcome_with_items(
-            run_id,
-            message,
-            reasoning,
-            tools,
-            drive_error_to_haider(error),
-        )
-        .await
+        match error {
+            DriveError::Provider(error) => {
+                self.provider_failure_outcome_with_items(run_id, message, reasoning, tools, error)
+                    .await
+            }
+            other => {
+                self.errored_outcome_with_items(
+                    run_id,
+                    message,
+                    reasoning,
+                    tools,
+                    drive_error_to_haider(other),
+                )
+                .await
+            }
+        }
     }
 
     async fn errored_outcome_with_items(
@@ -3847,6 +4320,7 @@ impl HarnessActor {
                     code: error.code,
                     message: sanitized_failure_message(&error.message),
                     retryable: error.retryable,
+                    presentation: Some(presentation_for_haider_error(error)),
                 },
                 prompt_omit_render(),
             )?,
@@ -4188,9 +4662,12 @@ impl HarnessActor {
     fn uncommitted_envelope(
         &self,
         run_id: &RunId,
-        payload: EventPayload,
+        mut payload: EventPayload,
         render: RenderTargets,
     ) -> Result<RawEnvelope, HaiderError> {
+        if let EventPayload::ToolResult { result, .. } = &mut payload {
+            ensure_tool_result_presentation(result);
+        }
         let payload = serde_json::to_value(payload).map_err(|error| {
             HaiderError::new(
                 ErrorCode::Internal,
@@ -4516,7 +4993,259 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
         "provider_error_kind": format!("{:?}", provider_error.kind),
         "retry_after_ms": provider_error.retry_after_ms,
     }));
+    error.presentation = Some(provider_error.presentation);
     error
+}
+
+fn specialized_provider_presentation(auth_scope: &str, error: &ProviderError) -> ErrorPresentation {
+    if error.kind != ProviderErrorKind::Authentication {
+        return error.presentation.clone();
+    }
+    if matches!(
+        error.presentation.subcode.as_str(),
+        "account-revoked" | "account-deleted"
+    ) {
+        return error.presentation.clone();
+    }
+    let mut specialized = match auth_scope {
+        "api_key" => ErrorPresentation::new(
+            "invalid-api-key",
+            "API key rejected",
+            "The provider rejected the active API key.",
+            ErrorScope::Account,
+            [ErrorAction::EditKey, ErrorAction::SwitchAccount],
+        ),
+        "oauth_subscription" | "cloud_bearer" => ErrorPresentation::new(
+            "oauth-expired",
+            "Sign-in expired",
+            "The active OAuth credential could not be refreshed.",
+            ErrorScope::Account,
+            [
+                ErrorAction::Relogin,
+                ErrorAction::Reimport,
+                ErrorAction::SwitchAccount,
+            ],
+        ),
+        _ => return error.presentation.clone(),
+    };
+    copy_provider_metadata(&mut specialized, &error.presentation);
+    specialized
+}
+
+fn stream_interruption_presentation(error: &ProviderError) -> ErrorPresentation {
+    let mut presentation = ErrorPresentation::new(
+        "stream-interrupted",
+        "Response stream interrupted",
+        "The provider connection ended after part of the response was received.",
+        ErrorScope::Turn,
+        [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+    );
+    copy_provider_metadata(&mut presentation, &error.presentation);
+    presentation
+}
+
+fn selected_error_action(menu: &Menu, answer: &MenuAnswer) -> Result<ErrorAction, HaiderError> {
+    let MenuKind::ErrorRecovery { option_actions, .. } = &menu.kind else {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "recovery answer targeted a non-recovery menu",
+            false,
+        ));
+    };
+    let selected = if let Some(key) = answer.option_key.as_deref() {
+        menu.options
+            .iter()
+            .enumerate()
+            .find(|(_, option)| option.key == key)
+    } else {
+        usize::try_from(answer.option_index)
+            .ok()
+            .and_then(|index| menu.options.get(index).map(|option| (index, option)))
+    }
+    .ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "recovery answer does not select a server-enumerated option",
+            false,
+        )
+    })?;
+    let action = option_actions.get(selected.0).copied().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "recovery menu action metadata does not match its options",
+            false,
+        )
+    })?;
+    if selected.1.key != error_action_key(action) {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "recovery option key does not match its typed action",
+            false,
+        ));
+    }
+    Ok(action)
+}
+
+fn copy_provider_metadata(target: &mut ErrorPresentation, source: &ErrorPresentation) {
+    target.provider_http_status = source.provider_http_status;
+    target
+        .provider_request_id
+        .clone_from(&source.provider_request_id);
+    target.retry_after_ms = source.retry_after_ms;
+    target.reset_at_ms = source.reset_at_ms;
+}
+
+fn recovery_card_kind(presentation: &ErrorPresentation) -> Option<ErrorRecoveryCardKind> {
+    match presentation.subcode.as_str() {
+        "oauth-expired" | "reimport-required" => Some(ErrorRecoveryCardKind::OauthExpired),
+        "invalid-api-key" => Some(ErrorRecoveryCardKind::InvalidApiKey),
+        "account-revoked" => Some(ErrorRecoveryCardKind::AccountRevoked),
+        "account-deleted" | "account-unavailable" => Some(ErrorRecoveryCardKind::AccountDeleted),
+        "rate-limited" => Some(ErrorRecoveryCardKind::RateLimit),
+        "quota-exhausted" => Some(ErrorRecoveryCardKind::QuotaExhausted),
+        "keychain-relink-required" => Some(ErrorRecoveryCardKind::KeychainRelink),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_menu(
+    id: MenuId,
+    source_run: &RunId,
+    source_item: Option<ItemId>,
+    card: ErrorRecoveryCardKind,
+    presentation: ErrorPresentation,
+    provider: Option<String>,
+    account: Option<CredentialAlias>,
+    blocking: bool,
+) -> Menu {
+    let mut body = vec![presentation.detail.clone()];
+    if let Some(status) = presentation.provider_http_status {
+        body.push(format!("Provider HTTP status: {status}"));
+    }
+    if let Some(request_id) = &presentation.provider_request_id {
+        body.push(format!("Request ID: {request_id}"));
+    }
+    if let Some(retry_after_ms) = presentation.retry_after_ms {
+        let seconds = retry_after_ms.div_ceil(1_000);
+        body.push(presentation.reset_at_ms.map_or_else(
+            || format!("Retry countdown: {seconds}s."),
+            |reset| format!("Retry countdown: {seconds}s (reset at Unix time {reset} ms)."),
+        ));
+    } else if let Some(reset_at_ms) = presentation.reset_at_ms {
+        body.push(format!("Available again after Unix time {reset_at_ms} ms."));
+    }
+    let option_actions = presentation
+        .allowed_actions
+        .iter()
+        .copied()
+        .filter(|action| *action != ErrorAction::None)
+        .collect::<Vec<_>>();
+    let options = option_actions
+        .iter()
+        .map(|action| MenuOption {
+            key: error_action_key(*action).to_owned(),
+            label: error_action_label(*action).to_owned(),
+            detail: error_action_detail(*action).map(str::to_owned),
+            decision: None,
+        })
+        .collect();
+    Menu {
+        id,
+        kind: MenuKind::ErrorRecovery {
+            card,
+            presentation: presentation.clone(),
+            option_actions,
+            provider,
+            account,
+            source_run: Some(source_run.clone()),
+            source_item,
+        },
+        title: presentation.title,
+        body,
+        options,
+        blocking,
+        scope: MenuScope::Session,
+        origin: "error-recovery".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
+
+fn error_action_key(action: ErrorAction) -> &'static str {
+    match action {
+        ErrorAction::Retry => "retry",
+        ErrorAction::Relogin => "relogin",
+        ErrorAction::Reimport => "reimport",
+        ErrorAction::EditKey => "edit_key",
+        ErrorAction::SwitchAccount => "switch_account",
+        ErrorAction::TopUp => "top_up",
+        ErrorAction::Wait => "wait",
+        ErrorAction::ChooseModel => "choose_model",
+        ErrorAction::ContactAdmin => "contact_admin",
+        ErrorAction::ContinuePartial => "continue_partial",
+        ErrorAction::RetryFresh => "retry_fresh",
+        ErrorAction::None => "none",
+    }
+}
+
+fn error_action_label(action: ErrorAction) -> &'static str {
+    match action {
+        ErrorAction::Retry => "Retry",
+        ErrorAction::Relogin => "Re-login",
+        ErrorAction::Reimport => "Re-import",
+        ErrorAction::EditKey => "Edit key",
+        ErrorAction::SwitchAccount => "Switch account",
+        ErrorAction::TopUp => "Top up",
+        ErrorAction::Wait => "Wait",
+        ErrorAction::ChooseModel => "Choose model",
+        ErrorAction::ContactAdmin => "Contact admin",
+        ErrorAction::ContinuePartial => "Continue from partial",
+        ErrorAction::RetryFresh => "Retry from scratch",
+        ErrorAction::None => "Dismiss",
+    }
+}
+
+fn error_action_detail(action: ErrorAction) -> Option<&'static str> {
+    match action {
+        ErrorAction::TopUp => Some("Add credits in the provider billing portal, then retry."),
+        ErrorAction::SwitchAccount => Some("Open accounts and choose another usable account."),
+        ErrorAction::Relogin => Some("Start the provider sign-in flow again."),
+        ErrorAction::Reimport => Some("Re-adopt the provider credential from its local source."),
+        ErrorAction::EditKey => Some("Enter and validate a replacement API key."),
+        ErrorAction::Wait => Some("Wait until the displayed reset time before retrying."),
+        ErrorAction::ContinuePartial => Some("Continue without repeating the partial response."),
+        ErrorAction::RetryFresh => Some("Start over; keep the partial response only as history."),
+        ErrorAction::Retry
+        | ErrorAction::ChooseModel
+        | ErrorAction::ContactAdmin
+        | ErrorAction::None => None,
+    }
+}
+
+/// Safe fallback for non-provider failures and pre-E2 `HaiderError`
+/// producers. New provider errors carry their richer presentation directly.
+#[must_use]
+pub fn presentation_for_haider_error(error: &HaiderError) -> ErrorPresentation {
+    if let Some(presentation) = &error.presentation {
+        return presentation.clone();
+    }
+    let subcode = serde_json::to_value(error.code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "internal".into())
+        .replace('_', "-");
+    ErrorPresentation::new(
+        subcode,
+        "Haider could not complete the turn",
+        sanitized_failure_message(&error.message),
+        ErrorScope::Turn,
+        if error.retryable {
+            vec![ErrorAction::Retry]
+        } else {
+            vec![ErrorAction::None]
+        },
+    )
 }
 
 fn provider_error_allows_retry(error: &ProviderError) -> bool {
@@ -5058,6 +5787,65 @@ pub fn sanitized_failure_message(message: &str) -> String {
         });
     }
     sanitized
+}
+
+fn tool_error_presentation(subcode: &str, title: &str, detail: &str) -> ErrorPresentation {
+    ErrorPresentation::new(
+        subcode,
+        title,
+        detail,
+        ErrorScope::Tool,
+        [ErrorAction::None],
+    )
+}
+
+/// E2 normalization point: every tool result passes through the actor before
+/// it is journaled, so legacy dispatchers cannot accidentally omit the typed
+/// presentation on a non-success result.
+fn ensure_tool_result_presentation(result: &mut BoundedResult) {
+    if result.status.is_completed() || result.presentation.is_some() {
+        return;
+    }
+    let (subcode, title, detail, actions) = match result.status {
+        ToolResultStatus::Completed => return,
+        ToolResultStatus::Rejected => (
+            "tool-rejected",
+            "Tool request rejected",
+            "The tool request was not authorized.",
+            vec![ErrorAction::None],
+        ),
+        ToolResultStatus::Conflict => (
+            "tool-conflict",
+            "Tool request conflicted",
+            "The tool could not safely apply because the target changed.",
+            vec![ErrorAction::Retry],
+        ),
+        ToolResultStatus::Failed => (
+            "tool-failed",
+            "Tool execution failed",
+            "The tool did not complete successfully.",
+            vec![ErrorAction::Retry],
+        ),
+        ToolResultStatus::Cancelled => (
+            "tool-cancelled",
+            "Tool execution cancelled",
+            "The tool stopped before it completed.",
+            vec![ErrorAction::Retry],
+        ),
+        ToolResultStatus::Unknown => (
+            "tool-outcome-unknown",
+            "Tool outcome unknown",
+            "Haider could not confirm whether the tool completed.",
+            vec![ErrorAction::None],
+        ),
+    };
+    result.presentation = Some(ErrorPresentation::new(
+        subcode,
+        title,
+        detail,
+        ErrorScope::Tool,
+        actions,
+    ));
 }
 
 fn drive_error_to_haider(error: DriveError) -> HaiderError {

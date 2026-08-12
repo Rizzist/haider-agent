@@ -4,7 +4,14 @@
     "value": {
       "kind": "malformed_frame",
       "message": "Gemini SSE data is not valid JSON: EOF while parsing a list at line 1 column 15",
-      "retryable": false
+      "retryable": false,
+      "presentation": {
+        "subcode": "malformed-provider-response",
+        "title": "Provider response was malformed",
+        "detail": "The provider returned a response Haider could not safely decode.",
+        "scope": "turn",
+        "allowed_actions": ["retry_fresh"]
+      }
     }
   }
 ]

@@ -126,6 +126,7 @@ fn run_failed_reason_is_a_visible_error_line() {
             code: haider_protocol::error::ErrorCode::ProviderError,
             message: "upstream 529 — overloaded".to_owned(),
             retryable: true,
+            presentation: None,
         },
     ));
     let errors = error_texts(&model);
@@ -169,6 +170,7 @@ fn a_paired_reason_is_never_doubled() {
             code: haider_protocol::error::ErrorCode::Unauthorized,
             message: "oauth refresh failed".to_owned(),
             retryable: false,
+            presentation: None,
         },
     ));
     model.route_raw(&raw(3, &EventPayload::RunState(RunState::Errored)));

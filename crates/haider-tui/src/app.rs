@@ -10,6 +10,7 @@ use crate::sanctum::SanctumTier;
 use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHRASE};
 use crate::theme::{ThemeChoice, ThemeKey};
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::ErrorAction;
 use haider_protocol::ids::{MenuId, SessionId};
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
@@ -7176,6 +7177,42 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// Starts the existing OAuth adoption flow against the active alias.
+    /// Unlike ordinary add, recovery must preserve the daemon-owned account
+    /// identity so a successful flow replaces that descriptor.
+    fn open_oauth_relogin(&mut self, provider: &str, alias: String) {
+        if self.oauth_add.is_some() || self.custom_add.is_some() {
+            return;
+        }
+        let title = match provider {
+            "openai-oauth" => "OpenAI — ChatGPT",
+            "anthropic-oauth" => "Anthropic — Claude",
+            "kimi-oauth" => "Kimi — Moonshot",
+            _ => {
+                self.accounts.message = Some(format!(
+                    "· re-login is not available for {provider}; add it again"
+                ));
+                return;
+            }
+        };
+        self.oauth_attempt_seq += 1;
+        let attempt = self.oauth_attempt_seq;
+        self.accounts.message = None;
+        self.oauth_add = Some(OAuthAddCard {
+            provider: provider.to_owned(),
+            title,
+            alias: alias.clone(),
+            attempt,
+            phase: OAuthAddPhase::Starting,
+        });
+        self.requests.push(AppRequest::OAuthAddStart {
+            provider: provider.to_owned(),
+            alias,
+            attempt,
+        });
+        self.dirty = true;
+    }
+
     /// Closes the card and cancels its flow (esc / `[2]` — sim cancelAuth).
     fn cancel_oauth_add(&mut self) {
         if let Some(card) = self.oauth_add.take() {
@@ -9621,6 +9658,40 @@ impl AppModel {
     }
 
     fn handle_envelope(&mut self, payload: &EventPayload) {
+        // Recovery consequences are derived from the still-open typed card,
+        // but dispatched only after this committed MenuAnswered fact applies.
+        // A stale/rejected local click therefore cannot start an account op.
+        let committed_recovery = if let EventPayload::MenuAnswered(answer) = payload {
+            self.projection.open_menu().and_then(|menu| {
+                if menu.id != answer.menu {
+                    return None;
+                }
+                let MenuKind::ErrorRecovery {
+                    option_actions,
+                    provider,
+                    account,
+                    presentation,
+                    ..
+                } = &menu.kind
+                else {
+                    return None;
+                };
+                let index = answer.option_key.as_deref().map_or_else(
+                    || usize::try_from(answer.option_index).ok(),
+                    |key| menu.options.iter().position(|option| option.key == key),
+                )?;
+                option_actions.get(index).copied().map(|action| {
+                    (
+                        action,
+                        provider.clone(),
+                        account.as_ref().map(|alias| alias.as_str().to_owned()),
+                        presentation.reset_at_ms,
+                    )
+                })
+            })
+        } else {
+            None
+        };
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
         }
@@ -9679,6 +9750,64 @@ impl AppModel {
                 self.tools_card_answered(index);
             }
         }
+        if let Some((action, provider, account, reset_at_ms)) = committed_recovery {
+            self.recovery_card_answered(action, provider, account, reset_at_ms);
+        }
+    }
+
+    fn recovery_card_answered(
+        &mut self,
+        action: ErrorAction,
+        provider: Option<String>,
+        account: Option<String>,
+        reset_at_ms: Option<u64>,
+    ) {
+        match action {
+            ErrorAction::Relogin => {
+                if let (Some(provider), Some(alias)) = (provider, account) {
+                    self.enter_accounts();
+                    self.open_oauth_relogin(&provider, alias);
+                } else {
+                    self.projection
+                        .push_note("· open Accounts and sign in again".into());
+                }
+            }
+            ErrorAction::Reimport => {
+                self.enter_accounts();
+                self.requests.push(AppRequest::DeviceCandidatesRefresh);
+                self.accounts.message = Some("· looking for credentials to re-adopt…".into());
+            }
+            ErrorAction::SwitchAccount => {
+                self.enter_accounts();
+                self.accounts.message = Some("· choose another usable account".into());
+            }
+            ErrorAction::EditKey => {
+                self.enter_accounts();
+                self.accounts.message = Some(
+                    "· replace this key by removing the rejected account, then add it again".into(),
+                );
+            }
+            ErrorAction::TopUp => self.projection.push_note(format!(
+                "· add credits in the {} billing portal, then retry",
+                provider.as_deref().unwrap_or("provider")
+            )),
+            ErrorAction::Wait => self.projection.push_note(reset_at_ms.map_or_else(
+                || "· wait for the provider limit to reset, then retry".into(),
+                |reset| format!("· wait until Unix time {reset} ms, then retry"),
+            )),
+            ErrorAction::Retry => self
+                .projection
+                .push_note("· submit the prompt again to retry".into()),
+            ErrorAction::ChooseModel => {
+                self.projection
+                    .push_note("· open Models and choose a compatible model".into());
+            }
+            ErrorAction::ContactAdmin => self
+                .projection
+                .push_note("· contact the account administrator for access".into()),
+            ErrorAction::ContinuePartial | ErrorAction::RetryFresh | ErrorAction::None => {}
+        }
+        self.dirty = true;
     }
 
     /// `/voice` card consequences (sim tui.js:1824-1864).
@@ -11615,5 +11744,75 @@ pub fn tools_card(seq: u64) -> Menu {
         origin: "tools".to_owned(),
         ttl_ms: None,
         timeout_option: None,
+    }
+}
+
+#[cfg(test)]
+mod e3_recovery_tests {
+    use super::*;
+    use haider_protocol::error::{ErrorPresentation, ErrorScope};
+    use haider_protocol::ids::CredentialAlias;
+    use haider_protocol::menu::ErrorRecoveryCardKind;
+
+    /// LAW E3b: only the committed menu answer dispatches the existing OAuth
+    /// start operation. MUTATION: removing `recovery_card_answered` from the
+    /// committed-event seam leaves the request queue empty.
+    #[test]
+    fn e3b_oauth_expired_committed_action_dispatches_oauth_start() {
+        let mut model = AppModel::default();
+        let menu = Menu {
+            id: MenuId::new("oauth-recovery-law"),
+            kind: MenuKind::ErrorRecovery {
+                card: ErrorRecoveryCardKind::OauthExpired,
+                presentation: ErrorPresentation::new(
+                    "oauth-expired",
+                    "Sign-in expired",
+                    "Sign in again.",
+                    ErrorScope::Account,
+                    [ErrorAction::Relogin],
+                ),
+                option_actions: vec![ErrorAction::Relogin],
+                provider: Some("openai-oauth".into()),
+                account: Some(CredentialAlias::new("openai-oauth")),
+                source_run: None,
+                source_item: None,
+            },
+            title: "Sign-in expired".into(),
+            body: vec!["Sign in again.".into()],
+            options: vec![MenuOption {
+                key: "relogin".into(),
+                label: "Re-login".into(),
+                detail: None,
+                decision: None,
+            }],
+            blocking: false,
+            scope: MenuScope::Session,
+            origin: "error-recovery".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        };
+        model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+            menu.clone(),
+        ))));
+        assert!(
+            !model
+                .requests
+                .iter()
+                .any(|request| matches!(request, AppRequest::OAuthAddStart { .. }))
+        );
+        model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuAnswered(
+            MenuAnswer {
+                menu: menu.id,
+                option_key: Some("relogin".into()),
+                option_index: 0,
+                value: None,
+                via: AnswerVia::Tui,
+            },
+        ))));
+        assert!(model.requests.iter().any(|request| matches!(
+            request,
+            AppRequest::OAuthAddStart { provider, alias, .. }
+                if provider == "openai-oauth" && alias == "openai-oauth"
+        )));
     }
 }

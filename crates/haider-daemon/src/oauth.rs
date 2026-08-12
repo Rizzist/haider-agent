@@ -20,7 +20,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::{OAuthIdentityV1, OAuthTokenBundleV1};
 use haider_accounts::{SecretHandle, Vault, VaultRefreshLock};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::Provider as _;
 use haider_provider::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
@@ -5937,6 +5937,13 @@ fn kimi_relogin_required(descriptor: &CredentialDescriptor) -> HaiderError {
         );
         details.insert("relogin_required".to_owned(), serde_json::Value::Bool(true));
     }
+    error.presentation = Some(ErrorPresentation::new(
+        "oauth-expired",
+        "Sign-in expired",
+        "The OAuth credential could not be refreshed.",
+        ErrorScope::Account,
+        [ErrorAction::Relogin, ErrorAction::SwitchAccount],
+    ));
     error
 }
 
@@ -5977,6 +5984,17 @@ fn imported_credential_expired(descriptor: &CredentialDescriptor, source: &str) 
             serde_json::Value::String(source.to_owned()),
         );
     }
+    error.presentation = Some(ErrorPresentation::new(
+        "reimport-required",
+        "Imported sign-in expired",
+        "Re-import the local credential or sign in again.",
+        ErrorScope::Account,
+        [
+            ErrorAction::Reimport,
+            ErrorAction::Relogin,
+            ErrorAction::SwitchAccount,
+        ],
+    ));
     error
 }
 

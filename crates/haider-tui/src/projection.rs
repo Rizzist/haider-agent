@@ -19,6 +19,7 @@
 use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::{ErrorAction, ErrorPresentation};
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{ItemId, NodeId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
@@ -428,14 +429,24 @@ impl SessionProjection {
             EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
             // The failed run's PUBLIC reason joins the transcript (W5g-6):
             // the envelope always carried it; only the badge ever showed.
-            EventPayload::RunFailed { code, message, .. } => {
-                let code = serde_json::to_value(code)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| format!("{code:?}"));
+            EventPayload::RunFailed {
+                code,
+                message,
+                presentation,
+                ..
+            } => {
                 self.run_failure_reported = true;
                 self.entries.push(TranscriptEntry::Error {
-                    text: format!("{code} — {message}"),
+                    text: presentation.as_ref().map_or_else(
+                        || {
+                            let code = serde_json::to_value(code)
+                                .ok()
+                                .and_then(|value| value.as_str().map(str::to_owned))
+                                .unwrap_or_else(|| format!("{code:?}"));
+                            format!("{code} — {message}")
+                        },
+                        format_error_presentation,
+                    ),
                 });
             }
             // B2b-m3: a committed node ANCHORS its display entry — never a
@@ -1151,9 +1162,44 @@ fn bounded_tool_reason(result: &haider_protocol::tool::BoundedResult) -> Option<
     if result.status.is_completed() {
         return None;
     }
+    if let Some(presentation) = &result.presentation {
+        return Some(format_error_presentation(presentation));
+    }
     let reason = result.reason.as_deref().unwrap_or("tool did not complete");
     let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     Some(normalized.chars().take(240).collect())
+}
+
+/// The single baseline text formatter for typed failures. Fable can restyle
+/// this presentation without changing projection or action semantics.
+#[must_use]
+pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
+    let actions = presentation
+        .allowed_actions
+        .iter()
+        .map(|action| match action {
+            ErrorAction::Retry => "retry",
+            ErrorAction::Relogin => "re-login",
+            ErrorAction::Reimport => "re-import",
+            ErrorAction::EditKey => "edit key",
+            ErrorAction::SwitchAccount => "switch account",
+            ErrorAction::TopUp => "top up",
+            ErrorAction::Wait => "wait",
+            ErrorAction::ChooseModel => "choose model",
+            ErrorAction::ContactAdmin => "contact admin",
+            ErrorAction::ContinuePartial => "continue partial",
+            ErrorAction::RetryFresh => "retry fresh",
+            ErrorAction::None => "none",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{} — {} [{}] · actions: {}",
+        presentation.title,
+        presentation.detail,
+        presentation.subcode.as_str(),
+        actions
+    )
 }
 
 /// The sim's badge PULSE set, verbatim (tui.js:5558-5563:

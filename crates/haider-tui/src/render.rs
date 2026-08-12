@@ -5530,6 +5530,7 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
     use haider_protocol::menu::MenuKind;
     match &menu.kind {
         MenuKind::Recovery { .. } => "⌁",
+        MenuKind::ErrorRecovery { .. } => "⚠",
         MenuKind::Exhausted => "⟳",
         MenuKind::Choice if menu.origin == "voice" => "◉",
         MenuKind::Choice if menu.origin == "tools" => "⚒",
@@ -7122,6 +7123,37 @@ fn item_lines<'a>(
                     idx += 1;
                 }
             }
+        }
+        TurnItem::IncompleteAgentMessage { text, interruption } => {
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("■ haider", theme.gold_style()),
+            ]));
+            let budget = (width as usize).saturating_sub(3);
+            if budget > 0 {
+                for markdown_line in crate::md::render_markdown(text) {
+                    for row in crate::md::wrap_spans(&markdown_line.spans, budget) {
+                        let mut spans =
+                            vec![Span::raw(" "), Span::styled("▏ ", theme.rail_style())];
+                        spans.extend(
+                            row.into_iter()
+                                .map(|span| Span::styled(span.text, theme.md_style(span.kind))),
+                        );
+                        lines.push(Line::from(spans));
+                    }
+                }
+            }
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!(
+                        "⚠ incomplete — stream interrupted ({})",
+                        interruption.subcode.as_str()
+                    ),
+                    theme.warn_style(),
+                ),
+            ]));
         }
         TurnItem::Reasoning { summary } => {
             lines.push(Line::from(vec![

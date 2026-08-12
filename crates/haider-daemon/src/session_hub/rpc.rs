@@ -250,12 +250,17 @@ impl ObserveProjection {
                     MenuKind::Permission { effect_summary } => Some(effect_summary.clone()),
                     _ => None,
                 };
+                let presentation = match &menu.kind {
+                    MenuKind::ErrorRecovery { presentation, .. } => Some(presentation.clone()),
+                    _ => None,
+                };
                 self.menus.insert(
                     menu.id.as_str().to_owned(),
                     haider_rpc::ObserveMenuWire {
                         kind: observe_menu_kind(&menu.kind).into(),
                         title: menu.title,
                         permission_description,
+                        presentation,
                     },
                 );
             }
@@ -410,6 +415,7 @@ fn observe_menu_kind(kind: &MenuKind) -> &'static str {
     match kind {
         MenuKind::Permission { .. } => "permission",
         MenuKind::Recovery { .. } => "recovery",
+        MenuKind::ErrorRecovery { .. } => "error_recovery",
         MenuKind::Exhausted => "exhausted",
         MenuKind::TrustHook => "trust_hook",
         MenuKind::Update => "update",

@@ -32,6 +32,7 @@ fn a_failed_run_writes_its_reason_into_the_transcript() {
         code: ErrorCode::ProviderError,
         message: "InvalidRequest: OpenAI HTTP 400 returned an invalid-request error".to_owned(),
         retryable: false,
+        presentation: None,
     });
     projection.apply(&EventPayload::RunState(RunState::Errored));
     assert!(

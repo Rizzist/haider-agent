@@ -408,6 +408,14 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             }
             out.push('\n');
         }
+        TurnItem::IncompleteAgentMessage { text, interruption } => {
+            out.push_str(text);
+            out.push('\n');
+            out.push_str(&format!(
+                "⚠ incomplete — stream interrupted ({})\n",
+                interruption.subcode.as_str()
+            ));
+        }
         TurnItem::Reasoning { summary } => {
             out.push_str("· ");
             out.push_str(summary);

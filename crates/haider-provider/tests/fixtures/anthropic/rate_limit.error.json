@@ -2,5 +2,14 @@
   "kind": "rate_limited",
   "message": "Anthropic HTTP 429 returned a rate-limit error",
   "retryable": true,
-  "retry_after_ms": 3000
+  "retry_after_ms": 3000,
+  "presentation": {
+    "subcode": "rate-limited",
+    "title": "Rate limit reached",
+    "detail": "The provider asked Haider to wait before trying again.",
+    "provider_http_status": 429,
+    "retry_after_ms": 3000,
+    "scope": "account",
+    "allowed_actions": ["wait", "retry", "switch_account"]
+  }
 }

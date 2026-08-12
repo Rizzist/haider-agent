@@ -894,6 +894,8 @@ pub struct ObserveMenuWire {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<haider_protocol::error::ErrorPresentation>,
 }
 
 /// Daemon-persisted subagent identity and chip state.

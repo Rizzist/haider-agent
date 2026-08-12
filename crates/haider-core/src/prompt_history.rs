@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
-use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, MenuId, NodeId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
 use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState};
@@ -793,6 +794,8 @@ fn render_journal(
     require_current_user: bool,
 ) -> Result<RenderedJournal, HaiderError> {
     let mut terminal = HashMap::<RunId, RunState>::new();
+    let mut partial_menus = HashMap::<MenuId, (haider_protocol::ids::ItemId, String, u32)>::new();
+    let mut continued_partial_items = HashSet::new();
     for envelope in all_envelopes {
         if !scoped(envelope, branch_id, agent_id) {
             continue;
@@ -800,10 +803,48 @@ fn render_journal(
         let Some(run_id) = envelope.run_id.clone() else {
             continue;
         };
-        if let Ok(EventPayload::RunState(state)) =
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
-        {
-            terminal.insert(run_id, state);
+        if let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+            match payload {
+                EventPayload::RunState(state) => {
+                    terminal.insert(run_id, state);
+                }
+                EventPayload::MenuOpened(menu) => {
+                    if let MenuKind::ErrorRecovery {
+                        card: ErrorRecoveryCardKind::PartialStream,
+                        option_actions,
+                        source_item: Some(item_id),
+                        ..
+                    } = &menu.kind
+                        && let Some(action_index) = option_actions
+                            .iter()
+                            .position(|action| *action == ErrorAction::ContinuePartial)
+                        && let Some(option) = menu.options.get(action_index)
+                    {
+                        partial_menus.insert(
+                            menu.id,
+                            (
+                                item_id.clone(),
+                                option.key.clone(),
+                                u32::try_from(action_index).unwrap_or(u32::MAX),
+                            ),
+                        );
+                    }
+                }
+                EventPayload::MenuAnswered(answer) => {
+                    if let Some((item_id, continue_key, continue_index)) =
+                        partial_menus.get(&answer.menu)
+                        && answer
+                            .option_key
+                            .as_deref()
+                            .map_or(answer.option_index == *continue_index, |key| {
+                                key == continue_key
+                            })
+                    {
+                        continued_partial_items.insert(item_id.clone());
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -859,8 +900,14 @@ fn render_journal(
                     current_user_start.get_or_insert(messages.len().saturating_sub(1));
                 }
             }
-            EventPayload::Item(ItemEvent::Completed { item, .. }) if !is_current => match item {
+            EventPayload::Item(ItemEvent::Completed { item_id, item }) if !is_current => match item
+            {
                 TurnItem::AgentMessage { text } => {
+                    messages.push(Message::assistant(vec![Block::Text { text }]));
+                }
+                TurnItem::IncompleteAgentMessage { text, .. }
+                    if continued_partial_items.contains(&item_id) =>
+                {
                     messages.push(Message::assistant(vec![Block::Text { text }]));
                 }
                 TurnItem::ToolCall {
