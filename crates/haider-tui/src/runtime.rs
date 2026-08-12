@@ -1409,6 +1409,9 @@ impl DemoDriver {
             // empty state (usage is daemon truth, never fabricated) and
             // the reducer's demo gate never pushes the read.
             | AppRequest::UsageRefresh
+            // Fleet live-only vocabulary: demo synthesizes its snapshot
+            // from the local chips at open and never pushes the read.
+            | AppRequest::FleetRefresh
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }

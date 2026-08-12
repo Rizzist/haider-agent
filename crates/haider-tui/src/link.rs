@@ -569,6 +569,9 @@ pub struct CommandContext {
     /// This request was a `usage.report` read (U2). Same identity pattern
     /// as `hooks_list`: the error reply lands on the usage screen.
     usage_report: bool,
+    /// This request was a `session.fleet` read (fleet view). Same identity
+    /// pattern: the error reply lands on the fleet screen.
+    fleet: bool,
     /// This request was a transcription-secret RPC (T2). Same identity
     /// pattern: neither carries a durable command id, so the error reply
     /// is tagged with WHICH operation failed and lands on the talk flow.
@@ -623,6 +626,7 @@ impl CommandContext {
             },
             hooks_list: matches!(command, LiveCommand::HooksList { .. }),
             usage_report: matches!(command, LiveCommand::UsageReport),
+            fleet: matches!(command, LiveCommand::SessionFleet { .. }),
             transcription: match command {
                 LiveCommand::TranscriptionSecretGet => Some(crate::live::TranscriptionOp::Get),
                 LiveCommand::TranscriptionSecretSet { .. } => {
@@ -811,6 +815,9 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
         // U2: parameterless read (U1's wire) — CONSUMED, never redefined.
         LiveCommand::UsageReport => RequestBody::UsageReport,
+        LiveCommand::SessionFleet { session } => RequestBody::SessionFleet {
+            session_id: session,
+        },
         // The trusted flag is COMMAND SELECTION, not wire data: `true` is
         // the `hooks.trust` method, `false` `hooks.revoke` — both carry
         // only the receipt id and the digest (H3's wire shapes).
@@ -1174,6 +1181,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::UsageReport { report } => vec![LiveReply::UsageReport {
             report: Box::new(report),
         }],
+        ResponseBody::SessionFleet { snapshot } => vec![LiveReply::Fleet {
+            snapshot: Box::new(snapshot),
+        }],
         // Both trust receipts carry the same driver fact — which METHOD
         // answered is already encoded in the committed `trusted` flag.
         ResponseBody::HooksTrust { digest, trusted }
@@ -1460,6 +1470,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // the same identity pattern.
                 if context.usage_report {
                     return vec![LiveReply::UsageReportFailed {
+                        message: message.clone(),
+                    }];
+                }
+                // A `session.fleet` error lands on the fleet screen — the
+                // same identity pattern.
+                if context.fleet {
+                    return vec![LiveReply::FleetFailed {
                         message: message.clone(),
                     }];
                 }
