@@ -194,6 +194,10 @@ impl TodoPanel {
 /// Session display state, reduced from the envelope stream.
 #[derive(Debug, Default)]
 pub struct SessionProjection {
+    /// Monotonic view-cache invalidation token. The durable/display reducer
+    /// remains the authority; render caches only use this to avoid comparing
+    /// an unchanged transcript on every animation frame.
+    render_revision: u64,
     last_seq: Option<u64>,
     harness: Option<HarnessStatus>,
     run: Option<RunState>,
@@ -372,6 +376,7 @@ impl SessionProjection {
 
     /// Consume one typed payload (used by tests and the mock client).
     pub fn apply(&mut self, payload: &EventPayload) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         match payload {
             EventPayload::HarnessStatus(status) => self.harness = Some(status.clone()),
             EventPayload::SessionState(state) => {
@@ -582,6 +587,7 @@ impl SessionProjection {
     /// selection refusal landing after its picker closed) — never a
     /// silent IDLE. Local display truth only: nothing durable claims it.
     pub fn record_local_error(&mut self, text: String) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         self.entries.push(TranscriptEntry::Error {
             text,
             presentation: None,
@@ -597,6 +603,7 @@ impl SessionProjection {
         &mut self,
         presentation: haider_protocol::error::ErrorPresentation,
     ) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         self.entries.push(TranscriptEntry::Error {
             text: format_error_presentation(&presentation),
             presentation: Some(presentation),
@@ -871,12 +878,14 @@ impl SessionProjection {
     /// Append a display-only note row (sim `NoteRow`): auto-title,
     /// interrupt, mid-turn input echoes. Never sourced from envelopes.
     pub fn push_note(&mut self, text: String) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         self.entries.push(TranscriptEntry::Note { text });
     }
 
     /// Append a voice user row (sim /say + talk: ◉ sigil, ` · spoken`).
     /// Demo-local like notes — the protocol has no voice surface yet.
     pub fn push_user_voice(&mut self, text: String) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         self.entries.push(TranscriptEntry::User {
             text,
             attachments: 0,
@@ -891,6 +900,7 @@ impl SessionProjection {
     /// only writer of such envelopes, so the marking is stream truth —
     /// see [`crate::session::chip_apply`].
     pub fn push_user_from_main(&mut self, text: String, attachments: usize) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         self.entries.push(TranscriptEntry::User {
             text,
             attachments,
@@ -936,6 +946,7 @@ impl SessionProjection {
     }
 
     pub fn push_shell(&mut self, cmd: String, out: String) {
+        self.render_revision = self.render_revision.wrapping_add(1);
         self.entries.push(TranscriptEntry::Shell { cmd, out });
     }
 
@@ -1144,6 +1155,12 @@ impl SessionProjection {
     #[must_use]
     pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
+    }
+
+    /// View-cache invalidation token; no semantic state is derived from it.
+    #[must_use]
+    pub const fn render_revision(&self) -> u64 {
+        self.render_revision
     }
 
     /// User prompt rows — the launcher row's turn count (sim tui.js:3248:

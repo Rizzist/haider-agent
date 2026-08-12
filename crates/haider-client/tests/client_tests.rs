@@ -634,6 +634,18 @@ async fn request_after_observed_disconnect_resolves_with_the_typed_reason() {
     }
 }
 
+/// Launcher wait law: the retained child that authenticated as the endpoint
+/// winner must not enter the 40 x 25 ms race-loser reap grace. A different or
+/// unavailable peer PID remains conservatively eligible for that grace.
+#[test]
+fn authenticated_daemon_candidate_is_not_treated_as_a_race_loser() {
+    use haider_client::spawn::authenticated_peer_is_candidate;
+
+    assert!(authenticated_peer_is_candidate(Some(41), 41));
+    assert!(!authenticated_peer_is_candidate(Some(42), 41));
+    assert!(!authenticated_peer_is_candidate(None, 41));
+}
+
 /// MUTATION CHECK: remove the `pre_exec` descriptor sweep from
 /// `spawn_daemon`. Expected RUNTIME failure: a non-CLOEXEC socket end
 /// planted at a high descriptor (the macOS `pipe()`+`fcntl` race shape)

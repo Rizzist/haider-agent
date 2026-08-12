@@ -102,12 +102,12 @@ use async_trait::async_trait;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn,
     CreatedBranch, CreatedSession, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    ProfileStoreFault, RenamedSession, SelectedEffort, SelectedFast, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast,
+    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
@@ -562,6 +562,9 @@ struct HubInner {
     /// the client search). Deliberately IN-MEMORY: "for the session" is a
     /// runtime scope — a daemon restart retries the capability once.
     web_degrade: Mutex<HashMap<SessionId, crate::worker::WebCapabilityDegrade>>,
+    /// Ephemeral compiled-prompt acceleration. Journal bytes remain the
+    /// authority; the cache is discarded with this daemon generation.
+    prompt_history: PromptHistoryCache,
 }
 
 #[derive(Default)]
@@ -964,6 +967,7 @@ impl SessionHub {
             usage_report: Mutex::new(None),
             tasks: crate::tasks::TaskRegistry::default(),
             web_degrade: Mutex::new(HashMap::new()),
+            prompt_history: PromptHistoryCache::default(),
         });
         let hub = Self { inner };
         hub.spawn_profile_fault_watcher();
@@ -2757,6 +2761,24 @@ impl HubStoreHandle {
     /// (background tasks) without widening the lease surface.
     pub(crate) fn hub(&self) -> &SessionHub {
         &self.hub
+    }
+
+    pub(crate) async fn compile_prompt_projection(
+        &self,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&haider_protocol::ids::AgentId>,
+        current_run: &RunId,
+    ) -> Result<haider_core::CompiledPromptProjection, HaiderError> {
+        haider_core::PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &self.hub.inner.prompt_history,
+            self,
+            self,
+            &self.session_id,
+            branch_id,
+            agent_id,
+            current_run,
+        )
+        .await
     }
 
     pub fn worker_generation(&self) -> u64 {

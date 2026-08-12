@@ -14,14 +14,34 @@ use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent
 use haider_protocol::tool::AttachmentBlock;
 use haider_provider::{
     GeminiProvider, GeminiRetryPolicy, Message, MessageRole, Provider, ProviderError,
-    ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest, replay_gemini_http_error,
-    replay_gemini_sse,
+    ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
+    gemini_model_http_client_build_count, replay_gemini_http_error, replay_gemini_sse,
 };
 
 use provider_manifest::Manifest;
 use support::{ExpectedItem, read_json, reanchor_events};
 
 const FIXTURE_DIR: &str = "tests/fixtures/gemini";
+
+#[test]
+fn same_model_adapters_reuse_the_guarded_http_client() {
+    let vault = MemoryVault::new();
+    let first = CredentialAlias::new("shared-gemini-first");
+    let second = CredentialAlias::new("shared-gemini-second");
+    vault.put(&first, b"key-first").expect("store first key");
+    vault.put(&second, b"key-second").expect("store second key");
+
+    let model = "gemini-3-pro-speed-opt-client-pool-law";
+    let before = gemini_model_http_client_build_count(model);
+    let _first = GeminiProvider::new(vault.resolve(&first).expect("resolve first key"), model)
+        .expect("construct first adapter");
+    let after_first = gemini_model_http_client_build_count(model);
+    let _second = GeminiProvider::new(vault.resolve(&second).expect("resolve second key"), model)
+        .expect("construct second adapter");
+
+    assert_eq!(after_first, before + 1);
+    assert_eq!(gemini_model_http_client_build_count(model), after_first);
+}
 
 #[test]
 fn manifest_replays_every_declared_gemini_fixture_in_either_promotion_state() {

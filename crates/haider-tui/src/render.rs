@@ -9,9 +9,9 @@ use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_TEXT, PALETTE_MAX_ROWS};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
 use crate::plain::status_glyph;
-use crate::projection::{ItemBlock, TranscriptEntry};
+use crate::projection::{ItemBlock, SessionProjection, TranscriptEntry};
 use crate::sanctum::SanctumLine;
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeKey};
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::item::TurnItem;
 use ratatui::Frame;
@@ -19,6 +19,231 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
+
+const TRANSCRIPT_OVERSCAN_ROWS: u16 = 2;
+
+/// Pure view cache for transcript entry formatting and wrapped geometry.
+/// The projection remains authoritative; this cache is discarded whenever
+/// its exact revision/width/theme key stops matching.
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptLayoutCache {
+    initialized: bool,
+    width: u16,
+    theme: Option<ThemeKey>,
+    revision: u64,
+    source_ptr: usize,
+    source_len: usize,
+    phase: u8,
+    entries: Vec<CachedTranscriptEntry>,
+    dynamic_entries: Vec<usize>,
+    entry_rows: Vec<u16>,
+    user_rows: Vec<(u16, usize)>,
+    total_rows: u16,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTranscriptEntry {
+    source: TranscriptEntry,
+    lines: Vec<Line<'static>>,
+    row_start: u16,
+    height: u16,
+    dynamic: bool,
+}
+
+impl TranscriptLayoutCache {
+    fn reconcile(
+        &mut self,
+        projection: &SessionProjection,
+        theme_key: ThemeKey,
+        theme: &Theme,
+        width: u16,
+        phase: u8,
+    ) {
+        let layout_changed =
+            !self.initialized || self.width != width || self.theme != Some(theme_key);
+        let source = projection.entries();
+        let projection_changed = self.revision != projection.render_revision()
+            || self.source_ptr != source.as_ptr() as usize
+            || self.source_len != source.len();
+        let phase_changed = self.phase != phase;
+        if !layout_changed && !projection_changed && !phase_changed {
+            return;
+        }
+
+        if !layout_changed && !projection_changed {
+            for &index in &self.dynamic_entries {
+                self.entries[index] =
+                    cache_transcript_entry(&projection.entries()[index], theme, width, phase);
+            }
+            self.recompute_geometry();
+            self.phase = phase;
+            return;
+        }
+
+        if layout_changed {
+            self.entries.clear();
+        }
+        for (index, entry) in source.iter().enumerate() {
+            let refresh = layout_changed
+                || self
+                    .entries
+                    .get(index)
+                    .is_none_or(|cached| cached.source != *entry)
+                || (phase_changed && self.entries.get(index).is_some_and(|cached| cached.dynamic));
+            if refresh {
+                let replacement = cache_transcript_entry(entry, theme, width, phase);
+                if let Some(cached) = self.entries.get_mut(index) {
+                    *cached = replacement;
+                } else {
+                    self.entries.push(replacement);
+                }
+            }
+        }
+        self.entries.truncate(source.len());
+        self.recompute_geometry();
+        self.initialized = true;
+        self.width = width;
+        self.theme = Some(theme_key);
+        self.revision = projection.render_revision();
+        self.source_ptr = source.as_ptr() as usize;
+        self.source_len = source.len();
+        self.phase = phase;
+    }
+
+    fn recompute_geometry(&mut self) {
+        self.entry_rows.clear();
+        self.user_rows.clear();
+        self.dynamic_entries.clear();
+        let mut row = 0u16;
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            entry.row_start = row;
+            let anchor = if matches!(entry.source, TranscriptEntry::User { .. }) {
+                row.saturating_add(1)
+            } else {
+                row
+            };
+            self.entry_rows.push(anchor);
+            if matches!(entry.source, TranscriptEntry::User { .. }) {
+                self.user_rows.push((anchor, index));
+            }
+            if entry.dynamic {
+                self.dynamic_entries.push(index);
+            }
+            row = row.saturating_add(entry.height);
+        }
+        self.total_rows = row;
+    }
+}
+
+fn cache_transcript_entry(
+    entry: &TranscriptEntry,
+    theme: &Theme,
+    width: u16,
+    phase: u8,
+) -> CachedTranscriptEntry {
+    let mut lines = Vec::new();
+    transcript_lines(&mut lines, entry, theme, width, phase);
+    let lines = lines.into_iter().map(owned_line).collect::<Vec<_>>();
+    let height = wrapped_lines_height(&lines, width);
+    let dynamic = matches!(
+        entry,
+        TranscriptEntry::Item(ItemBlock {
+            item: TurnItem::ToolCall {
+                status: haider_protocol::item::ToolStatus::Pending
+                    | haider_protocol::item::ToolStatus::InProgress,
+                ..
+            },
+            ..
+        })
+    );
+    CachedTranscriptEntry {
+        source: entry.clone(),
+        lines,
+        row_start: 0,
+        height,
+        dynamic,
+    }
+}
+
+fn owned_line(line: Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span {
+                style: span.style,
+                content: std::borrow::Cow::Owned(span.content.into_owned()),
+            })
+            .collect(),
+    }
+}
+
+fn wrapped_lines_height(lines: &[Line<'_>], width: u16) -> u16 {
+    lines.iter().fold(0u16, |total, line| {
+        let height = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        total.saturating_add(u16::try_from(height).unwrap_or(1))
+    })
+}
+
+/// Select only the contiguous transcript slice intersecting the viewport
+/// plus a two-row overscan. Returned scroll coordinates remain global.
+fn virtualized_transcript_lines(
+    cache: &TranscriptLayoutCache,
+    prefix: &[Line<'static>],
+    suffix: &[Line<'static>],
+    scroll: u16,
+    viewport_height: u16,
+    width: u16,
+) -> (Vec<Line<'static>>, u16, u16) {
+    let prefix_rows = wrapped_lines_height(prefix, width);
+    let suffix_rows = wrapped_lines_height(suffix, width);
+    let entries_base = prefix_rows;
+    let suffix_base = entries_base.saturating_add(cache.total_rows);
+    let total = suffix_base.saturating_add(suffix_rows);
+    let wanted_start = scroll.saturating_sub(TRANSCRIPT_OVERSCAN_ROWS);
+    let wanted_end = scroll
+        .saturating_add(viewport_height)
+        .saturating_add(TRANSCRIPT_OVERSCAN_ROWS);
+    let prefix_visible = !prefix.is_empty() && wanted_start < prefix_rows;
+    let suffix_visible = !suffix.is_empty() && wanted_end > suffix_base && wanted_start < total;
+
+    let first = cache.entries.partition_point(|entry| {
+        entries_base
+            .saturating_add(entry.row_start)
+            .saturating_add(entry.height)
+            <= wanted_start
+    });
+    let mut end = first;
+    while let Some(entry) = cache.entries.get(end) {
+        if entries_base.saturating_add(entry.row_start) >= wanted_end {
+            break;
+        }
+        end += 1;
+    }
+
+    let base = if prefix_visible {
+        0
+    } else if let Some(entry) = cache.entries.get(first).filter(|_| first < end) {
+        entries_base.saturating_add(entry.row_start)
+    } else {
+        suffix_base
+    };
+    let mut lines = Vec::new();
+    if prefix_visible {
+        lines.extend_from_slice(prefix);
+    }
+    for entry in &cache.entries[first..end] {
+        lines.extend_from_slice(&entry.lines);
+    }
+    if suffix_visible {
+        lines.extend_from_slice(suffix);
+    }
+    (lines, base, total)
+}
 
 /// Workspace version shown on boot/launcher (single source: the crate).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3197,62 +3422,48 @@ fn render_session(
     }
 
     // Transcript: bottom-anchored; wheel scroll-back offsets follow-bottom.
-    let mut lines: Vec<Line<'_>> = Vec::new();
-    // Remember where each user prompt row lands (sticky origin line).
-    let mut user_rows: Vec<(usize, &str)> = Vec::new();
-    // B2b-m3: every entry's starting LOGICAL line, for the render-resolved
-    // jump. A user row anchors its actual prompt line, not the preceding
-    // spacer — the sticky map's convention (research §Q3).
-    let mut entry_lines: Vec<usize> = Vec::with_capacity(model.projection.entries().len());
-    for entry in model.projection.entries() {
-        if let TranscriptEntry::User { text, .. } = entry {
-            // transcript_lines pushes a spacer, then the prompt row.
-            user_rows.push((lines.len() + 1, text.as_str()));
-            entry_lines.push(lines.len() + 1);
-        } else {
-            entry_lines.push(lines.len());
-        }
-        transcript_lines(
-            &mut lines,
-            entry,
-            theme,
-            transcript_area.width,
-            model.anim_phase,
-        );
-    }
+    // Entry formatting/wrap geometry is cached under the exact projection
+    // revision, width, and theme. The frame below receives only the viewport
+    // window plus bounded overscan, while every scroll/jump coordinate stays
+    // in the same global wrapped-row space as before.
+    let mut transcript_cache = model.transcript_layout.borrow_mut();
+    transcript_cache.reconcile(
+        &model.projection,
+        model.theme,
+        theme,
+        transcript_area.width,
+        model.anim_phase,
+    );
+    let mut tail: Vec<Line<'static>> = Vec::new();
     // Sim `.thinking` (tui.js:4458-4462): a transient gold tail while
     // thinking, pulsing (1.4s). The port also breathes the dot ● ↔ ◌ on
     // the shared clock — the owner's marquee "alive" element.
     if model.projection.is_thinking() {
         // S2 item 5: one breathing row above the badge — it must never
         // sit flush against the last output line.
-        lines.push(Line::default());
-        lines.push(thinking_line(theme, model.anim_phase, model.truecolor));
+        tail.push(Line::default());
+        tail.push(owned_line(thinking_line(
+            theme,
+            model.anim_phase,
+            model.truecolor,
+        )));
     }
     // M4: a retryable provider failure backs off with a visible attempt
     // counter, on the same transcript-tail surface as the thinking line.
     if let Some((attempt, max, delay_ms)) = model.projection.retrying() {
-        lines.push(Line::default());
-        lines.push(retrying_line(theme, attempt, max, delay_ms));
+        tail.push(Line::default());
+        tail.push(owned_line(retrying_line(theme, attempt, max, delay_ms)));
     }
     // S2 item 5: exactly ONE blank line between the transcript's last
     // output and the composer band. The breathing row rides the STREAM
     // (the pad row died with S2 item 4), so at the bottom-anchored tail
     // it separates output from the band and it scrolls with history.
-    if !lines.is_empty() {
-        lines.push(Line::default());
+    if !transcript_cache.entries.is_empty() || !tail.is_empty() {
+        tail.push(Line::default());
     }
-    // Wrapped-row prefix sums — the sticky line and the wheel clamp need
-    // real row math, not logical line counts.
-    let mut row_of_line: Vec<u16> = Vec::with_capacity(lines.len());
-    let mut total: u16 = 0;
-    for line in &lines {
-        row_of_line.push(total);
-        let height = Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(transcript_area.width);
-        total = total.saturating_add(u16::try_from(height).unwrap_or(1));
-    }
+    let total = transcript_cache
+        .total_rows
+        .saturating_add(wrapped_lines_height(&tail, transcript_area.width));
     let max_scroll = total.saturating_sub(transcript_area.height);
     // RENDER is the single scroll authority (review r3 P2-2): the frame
     // writes the true max AND reconciles the model's offset against it, so
@@ -3262,10 +3473,9 @@ fn render_session(
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
     // B2b-m3: resolve an armed tree jump IN THIS FRAME — node → display
-    // entry → logical line → wrapped row, every step through the
-    // renderer's OWN width and prefix sums (research §Q3: wrapped-row
-    // offsets are never cached, so a resize simply resolves against the
-    // new geometry). The anchor clears only when it LANDS.
+    // entry → wrapped row, every step through the renderer's width-keyed
+    // geometry. A resize invalidates the cache before this lookup, so the
+    // anchor clears only when it LANDS.
     // (A taken jump whose branch is no longer displayed stays dropped: it
     // is never resolved against another branch's rows.)
     if let Some(jump) = model.pending_jump.take()
@@ -3273,8 +3483,7 @@ fn render_session(
     {
         match model.projection.entry_of_node(&jump.node) {
             Some(entry) => {
-                let line = entry_lines.get(entry).copied().unwrap_or(0);
-                let row = row_of_line.get(line).copied().unwrap_or(0);
+                let row = transcript_cache.entry_rows.get(entry).copied().unwrap_or(0);
                 // A near-tail target cannot be top-aligned without fake
                 // padding: clamp honestly and let it sit where the real
                 // rows put it.
@@ -3291,8 +3500,20 @@ fn render_session(
     }
     let scroll_back = model.scroll_back.get();
     let scroll = max_scroll - scroll_back;
-    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph.scroll((scroll, 0)), transcript_area);
+    let (visible_lines, visible_base, visible_total) = virtualized_transcript_lines(
+        &transcript_cache,
+        &[],
+        &tail,
+        scroll,
+        transcript_area.height,
+        transcript_area.width,
+    );
+    debug_assert_eq!(visible_total, total);
+    let paragraph = Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false });
+    frame.render_widget(
+        paragraph.scroll((scroll.saturating_sub(visible_base), 0)),
+        transcript_area,
+    );
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
     // top-visible content. Chrome per the sim's ACTUAL CSS (owner item 11 —
@@ -3307,14 +3528,16 @@ fn render_session(
     // real wheel so it never covers the row it just revealed.
     if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 && !model.sticky_suppressed.get()
     {
-        let sticky = user_rows.iter().rev().find(|(line_index, _)| {
-            row_of_line
-                .get(*line_index)
-                .is_some_and(|row| *row < scroll)
-        });
-        if let Some((line_index, text)) = sticky {
-            let jump = max_scroll
-                .saturating_sub(row_of_line.get(*line_index).copied().unwrap_or(max_scroll));
+        let sticky = transcript_cache
+            .user_rows
+            .iter()
+            .rev()
+            .find(|(row, _)| *row < scroll);
+        if let Some((row, entry_index)) = sticky
+            && let Some(TranscriptEntry::User { text, .. }) =
+                model.projection.entries().get(*entry_index)
+        {
+            let jump = max_scroll.saturating_sub(*row);
             let sticky_rect = Rect {
                 x: transcript_area.x,
                 y: transcript_area.y,
@@ -5100,30 +5323,34 @@ fn render_subagent(
     );
 
     // ---- The chip's transcript (same Entry renderer) + tail lines ----
-    let mut lines: Vec<Line<'_>> = Vec::new();
+    let mut prefix: Vec<Line<'static>> = Vec::new();
     if let Some(metrics) = model.chip_metrics(chip) {
         for line in crate::agent_metrics::detail_lines(metrics) {
-            lines.push(Line::styled(format!(" {line}"), theme.dim_style()));
+            prefix.push(Line::styled(format!(" {line}"), theme.dim_style()));
         }
-        lines.push(Line::default());
+        prefix.push(Line::default());
     }
-    for entry in chip.transcript.entries() {
-        transcript_lines(
-            &mut lines,
-            entry,
-            theme,
-            transcript_area.width,
-            model.anim_phase,
-        );
-    }
+    let mut transcript_cache = chip.transcript_layout.borrow_mut();
+    transcript_cache.reconcile(
+        &chip.transcript,
+        model.theme,
+        theme,
+        transcript_area.width,
+        model.anim_phase,
+    );
+    let mut tail: Vec<Line<'static>> = Vec::new();
     if chip.state == crate::script::ChipDisplayState::Thinking {
         // S2 item 5: the chip view keeps the session's rhythm — one
         // breathing row above the thinking badge.
-        lines.push(Line::default());
-        lines.push(thinking_line(theme, model.anim_phase, model.truecolor));
+        tail.push(Line::default());
+        tail.push(owned_line(thinking_line(
+            theme,
+            model.anim_phase,
+            model.truecolor,
+        )));
     }
     if display == crate::script::ChipDisplayState::Waiting && live_children > 0 {
-        lines.push(Line::from(vec![
+        tail.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
                 format!("◔ waiting on {live_children} child subagent — this session waits too"),
@@ -5133,26 +5360,31 @@ fn render_subagent(
     }
     // S2 item 5, session parity: one blank line between the chip
     // transcript's tail and the band.
-    if !lines.is_empty() {
-        lines.push(Line::default());
+    if !prefix.is_empty() || !transcript_cache.entries.is_empty() || !tail.is_empty() {
+        tail.push(Line::default());
     }
-    let mut total: u16 = 0;
-    for line in &lines {
-        let height = Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(transcript_area.width);
-        total = total.saturating_add(u16::try_from(height).unwrap_or(1));
-    }
+    let total = wrapped_lines_height(&prefix, transcript_area.width)
+        .saturating_add(transcript_cache.total_rows)
+        .saturating_add(wrapped_lines_height(&tail, transcript_area.width));
     let max_scroll = total.saturating_sub(transcript_area.height);
     model.scroll_max.set(max_scroll);
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
     let scroll = max_scroll - model.scroll_back.get();
+    let (visible_lines, visible_base, visible_total) = virtualized_transcript_lines(
+        &transcript_cache,
+        &prefix,
+        &tail,
+        scroll,
+        transcript_area.height,
+        transcript_area.width,
+    );
+    debug_assert_eq!(visible_total, total);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
+        Paragraph::new(Text::from(visible_lines))
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .scroll((scroll.saturating_sub(visible_base), 0)),
         transcript_area,
     );
 

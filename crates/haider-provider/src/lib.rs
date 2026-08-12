@@ -116,9 +116,10 @@ pub use anthropic::{
     ANTHROPIC_OAUTH_SYSTEM_IDENTITY, ANTHROPIC_PROVIDER_NAME, AnthropicCacheTtl, AnthropicCapture,
     AnthropicProvider, AnthropicRetryPolicy, AnthropicTransportConfig,
     BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME, BEDROCK_SEED_MODELS,
-    VERTEX_ANTHROPIC_VERSION, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS, bedrock_mantle_base_url,
-    replay_anthropic_http_error, replay_anthropic_sse, select_anthropic_cache_ttl,
-    validate_bedrock_mantle_base_url, validate_vertex_models_base_url, vertex_models_base_url,
+    VERTEX_ANTHROPIC_VERSION, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS,
+    anthropic_http_client_build_count, bedrock_mantle_base_url, replay_anthropic_http_error,
+    replay_anthropic_sse, select_anthropic_cache_ttl, validate_bedrock_mantle_base_url,
+    validate_vertex_models_base_url, vertex_models_base_url,
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
@@ -133,8 +134,8 @@ pub use effort::{
 pub use gemini::{
     GEMINI_API_BASE_URL, GEMINI_CACHED_CONTENTS_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME,
     GeminiCacheBackend, GeminiCacheRegistry, GeminiCapture, GeminiProvider, GeminiRetryPolicy,
-    GeminiTransportConfig, replay_gemini_http_error, replay_gemini_sse,
-    replay_gemini_sse_for_request,
+    GeminiTransportConfig, gemini_http_client_build_count, gemini_model_http_client_build_count,
+    replay_gemini_http_error, replay_gemini_sse, replay_gemini_sse_for_request,
 };
 pub use openai::{
     CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
@@ -144,10 +145,11 @@ pub use openai::{
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
     OpenAiTransportConfig, azure_openai_origin, codex_alpha_search_request_body,
-    codex_alpha_search_response_text, codex_alpha_search_url, replay_deepseek_chat_sse,
-    replay_deepseek_models_response, replay_kimi_chat_sse, replay_kimi_models_response,
-    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
-    replay_openai_responses_sse, validate_openai_compatible_endpoint,
+    codex_alpha_search_response_text, codex_alpha_search_url, openai_http_client_build_count,
+    replay_deepseek_chat_sse, replay_deepseek_models_response, replay_kimi_chat_sse,
+    replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
+    replay_openai_models_response, replay_openai_responses_sse,
+    validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{
