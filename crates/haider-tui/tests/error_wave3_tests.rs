@@ -66,6 +66,18 @@ fn busy_same_command_id_retries_visibly_and_stops_after_three_issues() {
             .is_some_and(|text| text.contains("2/3"))
     );
 
+    // Deadline pin: a pass BEFORE the 250ms retry deadline must reissue
+    // nothing — dropping the deadline filter fires the retry on the very
+    // next pass, which the original sequence (passes only AT the deadline)
+    // could not observe (mutation survived unpinned).
+    let premature = live_pass(
+        &mut driver,
+        &mut model,
+        None,
+        base + std::time::Duration::from_millis(100),
+    );
+    assert!(premature.commands.is_empty());
+
     let second = live_pass(
         &mut driver,
         &mut model,
