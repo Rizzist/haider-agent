@@ -211,6 +211,14 @@ pub enum LiveCommand {
     /// a socket loss simply leaves the screen on its honest fetching /
     /// stale state and `r` re-reads.
     UsageReport,
+    /// `session.fleet` — a READ of the daemon's bounded descendant-tree
+    /// snapshot (the fleet view, `session_fleet_v1`). Receipt-free, never
+    /// outboxed: the open issues one, the event-cadence chase re-reads
+    /// while the screen stays open, and a socket loss leaves the honest
+    /// fetching/stale state (the reconnect resume re-reads).
+    SessionFleet {
+        session: SessionId,
+    },
     /// `hooks.trust` / `hooks.revoke` — a receipted digest pin or
     /// revocation (H3's R2 pattern). DURABLE: a lost response retries under
     /// the same command id and replays the same committed change. The
@@ -476,6 +484,8 @@ impl LiveCommand {
             | Self::HooksList { .. }
             // U2: the usage snapshot is a read (see above).
             | Self::UsageReport
+            // The fleet snapshot is a read (see above).
+            | Self::SessionFleet { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. }
             // T2: reads + the deliberately receipt-free secret set (no
@@ -633,6 +643,17 @@ pub enum LiveReply {
     /// precedent): the typed message lands on the usage screen, never a
     /// bare flash.
     UsageReportFailed {
+        message: String,
+    },
+    /// One committed `session.fleet` snapshot (the fleet view). Boxed —
+    /// a 512-node tree is a large read.
+    Fleet {
+        snapshot: Box<haider_rpc::SessionFleetSnapshot>,
+    },
+    /// `session.fleet` FAILED. Identity-tagged from the link's request
+    /// context (the read has no durable command id — the usage.report
+    /// precedent): the typed message lands on the fleet screen.
+    FleetFailed {
         message: String,
     },
     /// `hooks.trust` / `hooks.revoke` committed: the daemon's receipt. It
@@ -1065,6 +1086,11 @@ pub struct LiveDriver {
     /// one recoverable gap remains tolerated; sustained mismatch escalates.
     mismatch_streaks: HashMap<SessionId, u8>,
     incompatible_sessions: std::collections::HashSet<SessionId>,
+    /// One `session.fleet` read outstanding at most (single-flight): the
+    /// fleet screen's event-cadence refresh folds bursts into `chase` and
+    /// re-reads once when the outstanding reply lands. No timer anywhere.
+    fleet_inflight: bool,
+    fleet_chase: bool,
 }
 
 /// How long the login card may sit in `Submitting` before it says so —
@@ -1136,6 +1162,8 @@ impl LiveDriver {
             now: std::time::Instant::now(),
             mismatch_streaks: HashMap::new(),
             incompatible_sessions: std::collections::HashSet::new(),
+            fleet_inflight: false,
+            fleet_chase: false,
         }
     }
 
@@ -1571,6 +1599,24 @@ impl LiveDriver {
             LiveReply::UsageReportFailed { message } => {
                 model.usage.read_failed(&message);
                 model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::Fleet { snapshot } => {
+                self.fleet_inflight = false;
+                model.apply_fleet_snapshot(*snapshot);
+                // Events applied while the read flew folded into ONE chase:
+                // re-read now, only while the screen is still open.
+                if std::mem::take(&mut self.fleet_chase)
+                    && model.screen == crate::app::Screen::Fleet
+                {
+                    return self.fleet_refresh(model);
+                }
+                Vec::new()
+            }
+            LiveReply::FleetFailed { message } => {
+                self.fleet_inflight = false;
+                self.fleet_chase = false;
+                model.fleet_failed(&message);
                 Vec::new()
             }
             LiveReply::HookTrustChanged {
@@ -2681,6 +2727,13 @@ impl LiveDriver {
                 // No reply crosses a socket: retired ids awaiting silent
                 // consumption die with the connection (TUI6.4).
                 self.retired_logins.clear();
+                // The fleet read is receipt-free too: an in-flight one can
+                // never answer across a socket, so the single-flight gate
+                // opens here and the screen's honest fetching note settles
+                // (the reconnect resume re-reads if the screen is open).
+                self.fleet_inflight = false;
+                self.fleet_chase = false;
+                model.fleet_note_disconnect();
                 // B4b: `artifact.put` is receipt-free — an in-flight
                 // upload's reply can never arrive and nothing resends it,
                 // so its chip dies HERE, named, instead of spinning
@@ -2701,7 +2754,13 @@ impl LiveDriver {
                 model.flash = None;
                 model.supervisor_diagnostic = None;
                 model.dirty = true;
-                self.resume(model)
+                let mut commands = self.resume(model);
+                // A fleet screen left open across the redial re-reads its
+                // snapshot on the fresh socket — the same one-emitter seam.
+                if model.screen == crate::app::Screen::Fleet {
+                    commands.extend(self.fleet_refresh(model));
+                }
+                commands
             }
             LiveReply::Draining { reason } => {
                 model.flash = Some(format!("· daemon draining — {reason}"));
@@ -2901,6 +2960,38 @@ impl LiveDriver {
 
     /// One committed envelope: route it, record menu coordinates, and honor
     /// the reducer's strict gap law.
+    /// Issue the single-flight `session.fleet` read for the ACTIVE session,
+    /// folding concurrent asks into one chase (re-read when the outstanding
+    /// reply lands). The ONE emitter — open, event cadence and the
+    /// reconnect resume all come through here, so single-flight holds by
+    /// construction.
+    fn fleet_refresh(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        let Some(session) = model.active_session.clone() else {
+            return Vec::new();
+        };
+        if self.fleet_inflight {
+            self.fleet_chase = true;
+            return Vec::new();
+        }
+        self.fleet_inflight = true;
+        vec![LiveCommand::SessionFleet { session }]
+    }
+
+    /// The fleet screen's refresh cadence IS the event stream (the same
+    /// cadence that keeps the subagents panel current): one APPLIED
+    /// envelope for the attached session while the screen is open chases
+    /// one bounded re-read; bursts fold through the single-flight gate.
+    /// No new polling loop — a quiet (terminal) session renders its
+    /// durable snapshot once and never re-reads.
+    fn fleet_event_chase(&mut self, model: &AppModel, session: &SessionId) -> Vec<LiveCommand> {
+        if model.screen != crate::app::Screen::Fleet
+            || model.active_session.as_ref() != Some(session)
+        {
+            return Vec::new();
+        }
+        self.fleet_refresh(model)
+    }
+
     fn on_event(
         &mut self,
         model: &mut AppModel,
@@ -2933,6 +3024,7 @@ impl LiveDriver {
         // envelope for that session (review P1-3).
         let recognized = recognized_payload(&envelope.payload);
         let outcome = model.route_raw(envelope);
+        let applied = matches!(outcome, RawOutcome::Applied);
         match outcome {
             RawOutcome::Applied if recognized => {
                 self.mismatch_streaks.remove(session);
@@ -2970,6 +3062,11 @@ impl LiveDriver {
                 }
             }
             RawOutcome::Duplicate | RawOutcome::WrongSession => {}
+        }
+        // The fleet screen's event-cadence chase (see `fleet_event_chase`):
+        // only an APPLIED envelope can have moved the tree.
+        if applied {
+            return self.fleet_event_chase(model, session);
         }
         Vec::new()
     }
@@ -3537,6 +3634,9 @@ impl LiveDriver {
                 LiveCommand::List { cursor: None },
                 LiveCommand::UsageReport,
             ],
+            // Fleet: a read — never outboxed, single-flight (the chase
+            // fold lives in `fleet_refresh`).
+            AppRequest::FleetRefresh => self.fleet_refresh(model),
             AppRequest::HooksTrust { digest, trusted } => {
                 let command_id = self.mint();
                 self.pending_hook_trust = Some((command_id.clone(), digest.clone()));

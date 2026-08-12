@@ -1462,16 +1462,17 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
         .expect("D1 welcome frame in the golden transcript");
     // D1's six frames stay contiguous at their original offset; T1 then
     // appended seven transcription-secret frames, U1 three usage-report
-    // frames, and G2 three session-rename frames AFTER them — each append
-    // pinned by its own additive law — so D1 ends at the NEXT appended
+    // frames, G2 three session-rename frames, G3 four tuning frames, and F1
+    // three fleet frames AFTER them — each append pinned by its own additive
+    // law — so D1 ends at the NEXT appended
     // welcome (whichever wave owns it) and nothing before `d1_start` can
     // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4,
+        6 + 7 + 3 + 3 + 4 + 3,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
-         G3's four session-tuning frames — the \
+         G3's four session-tuning frames, then F1's three fleet frames — the \
          accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
@@ -1723,7 +1724,8 @@ fn session_rename_frames_are_additive_and_golden() {
 
     // The G2 frames were appended at the then-END of the transcript: three
     // frames, append-only; G3 later appended its four session-tuning frames
-    // strictly AFTER them (pinned by G3's own law).
+    // and F1 its three fleet frames strictly AFTER them (each pinned by its
+    // own law).
     let frames = transcript();
     let g2_start = frames
         .iter()
@@ -1737,8 +1739,8 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4,
-        "G2's three frames, then G3's four session-tuning frames"
+        3 + 4 + 3,
+        "G2's three frames, then G3's four tuning frames, then F1's three fleet frames"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -1849,11 +1851,11 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     assert_eq!(haider_rpc::FEATURE_TRANSCRIPTION_V1, "transcription_v1");
 
     // The seven T1 frames sit directly before U1's three usage frames,
-    // G2's three session-rename frames, and G3's four session-tuning
-    // frames at the transcript tail (each later wave's own law pins its
-    // append).
+    // G2's three session-rename frames, G3's four session-tuning frames, and
+    // F1's three fleet frames at the transcript tail (each later wave's own
+    // law pins its append).
     let frames = transcript();
-    let tail = &frames[frames.len() - 17..frames.len() - 10];
+    let tail = &frames[frames.len() - 20..frames.len() - 13];
     let methods: Vec<String> = tail
         .iter()
         .map(|frame| {
@@ -1964,8 +1966,8 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
     assert_eq!(FEATURE_USAGE_REPORT_V1, "usage_report_v1");
 
     // The U1 frames were appended at the then-END of the transcript: three
-    // frames, append-only; G2 later appended three session-rename frames
-    // strictly AFTER them (pinned by G2's own law).
+    // frames, append-only; G2 later appended three session-rename frames, G3
+    // four tuning frames, and F1 three fleet frames strictly AFTER them.
     let frames = transcript();
     let u1_start = frames
         .iter()
@@ -1979,10 +1981,10 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4,
+        3 + 3 + 4 + 3,
         "three U1 frames, then G2's three session-rename frames, then G3's \
-         four session-tuning frames (each later wave's own law pins its \
-         append)"
+         four session-tuning frames, then F1's three fleet frames (each later \
+         wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode U1 frame");
@@ -2232,4 +2234,63 @@ fn model_detail_tuning_fields_are_additive_and_skip_empty() {
     assert_eq!(tuned.default_effort.as_deref(), Some("high"));
     assert_eq!(tuned.supported_speeds, ["fast"]);
     assert_eq!(tuned.supports_thinking_type, Some(false));
+}
+
+/// FLEET WIRE LAW: the new feature/request/response trio is the exact
+/// transcript tail, keeps protocol v1, and retains the open-enum tolerance
+/// used throughout the existing read surfaces.
+#[test]
+fn session_fleet_frames_are_additive_and_unknown_tolerant() {
+    assert_eq!(haider_rpc::FEATURE_SESSION_FLEET_V1, "session_fleet_v1");
+    assert_eq!(haider_rpc::FLEET_MAX_NODES, 512);
+    let frames = transcript();
+    let fleet_start = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                WireFrame::Welcome(welcome)
+                    if welcome.features.contains(haider_rpc::FEATURE_SESSION_FLEET_V1)
+            )
+        })
+        .expect("fleet feature welcome");
+    assert_eq!(frames.len() - fleet_start, 3);
+    assert!(matches!(
+        &frames[fleet_start],
+        WireFrame::Welcome(welcome)
+            if welcome.features.contains(haider_rpc::FEATURE_SESSION_FLEET_V1)
+    ));
+    assert!(matches!(
+        &frames[fleet_start + 1],
+        WireFrame::Request {
+            body: RequestBody::SessionFleet { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &frames[fleet_start + 2],
+        WireFrame::Response {
+            body: ResponseBody::SessionFleet { .. },
+            ..
+        }
+    ));
+
+    let request = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("fleet-read"),
+        body: RequestBody::SessionFleet {
+            session_id: haider_protocol::ids::SessionId::new("root-session"),
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&request).expect("encode fleet request"),
+        r#"{"v":1,"kind":"request","request_id":"fleet-read","body":{"method":"session.fleet","session_id":"root-session"}}"#
+    );
+
+    let unknown_state: haider_rpc::FleetAgentStateWire =
+        serde_json::from_str(r#""hibernating""#).expect("future fleet state");
+    assert_eq!(unknown_state, haider_rpc::FleetAgentStateWire::Unknown);
+    let future_method: RequestBody =
+        serde_json::from_str(r#"{"method":"session.fleet_v2","session_id":"root"}"#)
+            .expect("future fleet method");
+    assert!(matches!(future_method, RequestBody::Unknown));
 }

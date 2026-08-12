@@ -90,7 +90,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Tree
         | Screen::Tools
         | Screen::Hooks
-        | Screen::Usage => 1,
+        | Screen::Usage
+        | Screen::Fleet => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -111,6 +112,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Providers => render_providers(model, theme, frame, body, &mut hits),
             Screen::Hooks => render_hooks(model, theme, frame, body, &mut hits),
             Screen::Usage => render_usage(model, theme, frame, body, &mut hits),
+            Screen::Fleet => render_fleet(model, theme, frame, body, &mut hits),
         }
     }
     if model.help_open {
@@ -4103,7 +4105,15 @@ fn subtree_needed(model: &AppModel, on_subagent: bool) -> u16 {
     // it always costs a row while the panel is open.
     let _ = on_subagent;
     let summary = usize::from(subtree_metrics_summary(model).is_some());
-    let rows = crate::app::flatten_chips(&model.chips).len() + 1 + summary;
+    let chip_rows = crate::app::flatten_chips(&model.chips).len();
+    // Fleet entry law: at ≥ ENTRY_COLLAPSE tree nodes the per-chip rows
+    // collapse into ONE summary row (`⣿ … · ⌥F fleet`).
+    let tree_rows = if chip_rows >= crate::fleet::ENTRY_COLLAPSE {
+        1
+    } else {
+        chip_rows
+    };
+    let rows = tree_rows + 1 + summary;
     u16::try_from(rows + 1).unwrap_or(u16::MAX)
 }
 
@@ -4321,6 +4331,40 @@ fn render_subtree(
         lines.push(home);
         let rows = crate::app::flatten_chips(&model.chips);
         let total = rows.len();
+        // Fleet entry law (slice 1): at ≥ ENTRY_COLLAPSE tree nodes the
+        // per-chip rows collapse into ONE summary row — the fleet view's
+        // session-born door (⌥F's clickable twin, mockup tui.js:4562-4565).
+        if total >= crate::fleet::ENTRY_COLLAPSE {
+            let roll = crate::fleet::entry_rollup(&model.chips);
+            let mut line = Line::from(vec![
+                Span::styled(" ⣿ ", theme.gold_style()),
+                Span::styled(crate::fleet::entry_summary(&roll), theme.dim_style()),
+            ]);
+            line = hover_band(
+                line,
+                model.hovered == Some(Hit::FleetSummary),
+                area.width,
+                theme,
+            );
+            row_hits.push((lines.len(), Hit::FleetSummary));
+            lines.push(line);
+            frame.render_widget(Paragraph::new(Text::from(lines)), area);
+            for (offset, hit) in row_hits {
+                let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
+                if y < area.y + area.height {
+                    hits.push((
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: area.width,
+                            height: 1,
+                        },
+                        hit,
+                    ));
+                }
+            }
+            return;
+        }
         for (index, (depth, chip)) in rows.iter().enumerate() {
             let connector = if chip.closed {
                 "⊘"
@@ -4433,6 +4477,377 @@ fn render_subtree(
                     y,
                     width: area.width,
                     height: 1,
+                },
+                hit,
+            ));
+        }
+    }
+}
+
+/// One fleet list row's glyph ink — the mockup's `.fg` vocabulary: live
+/// pulses maroon on the shared clock, done/failed wear the status inks,
+/// waiting is calm dim, queued/cancelled barely-there. Theme tokens only.
+fn fleet_glyph_style(
+    theme: &Theme,
+    state: haider_rpc::FleetAgentStateWire,
+    anim_phase: u8,
+) -> ratatui::style::Style {
+    use haider_rpc::FleetAgentStateWire as S;
+    match state {
+        S::Live => theme.pulse_ink(theme.maroon, anim_phase),
+        S::Done => theme.ok_style(),
+        S::Failed => theme.err_style(),
+        S::Waiting => theme.dim_style(),
+        S::Queued | S::Cancelled => theme.faint_style(),
+        _ => theme.dim_style(),
+    }
+}
+
+/// Grid cell geometry: inner width and the gap between cells.
+const FLEET_CELL_W: usize = 10;
+const FLEET_CELL_GAP: usize = 2;
+
+/// The fleet view (slice 1 — [`crate::fleet`]): rollup header with the
+/// drill path, two AUTOMATIC densities (tree list ≤20 nodes, max-density
+/// matrix grid above), ⏎ re-roots on a subtree, esc walks up/out. The
+/// mockup's `FleetStage` grammar; slice 1 ships no agent-detail frame and
+/// no manual density toggle.
+#[allow(clippy::too_many_lines)]
+fn render_fleet(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    use crate::fleet;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let view = &model.fleet;
+    let width = area.width as usize;
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    // (line offset, x offset, width, hit) — resolved to rects after layout.
+    let mut cell_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
+
+    // -- crumb path (mockup .fcrumbs): session › fleet [› callsign…] ----
+    let mut crumbs = vec![
+        Span::styled(model.display_name().to_owned(), theme.dim_style()),
+        Span::styled(" › ", theme.faint_style()),
+    ];
+    let snapshot = view.snapshot.as_ref();
+    let resolved = snapshot.map(|snapshot| fleet::resolve(snapshot, &view.stack));
+    let path_len = resolved.as_ref().map_or(0, |(_, path)| path.len());
+    if path_len == 0 {
+        crumbs.push(Span::styled(
+            "fleet",
+            theme.bright_style().add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        crumbs.push(Span::styled("fleet", theme.dim_style()));
+    }
+    if let Some((_, path)) = &resolved {
+        for (index, node) in path.iter().enumerate() {
+            crumbs.push(Span::styled(" › ", theme.faint_style()));
+            crumbs.push(Span::styled(
+                fleet::callsign(node).to_owned(),
+                if index + 1 == path.len() {
+                    theme.bright_style().add_modifier(Modifier::BOLD)
+                } else {
+                    theme.dim_style()
+                },
+            ));
+        }
+    }
+
+    let Some(snapshot) = snapshot else {
+        // No snapshot yet: the honest fetching / failed / empty line —
+        // never a fabricated tree.
+        lines.push(Line::from(crumbs));
+        lines.push(Line::raw(""));
+        if let Some(error) = &view.error {
+            lines.push(Line::styled(
+                format!("✗ fleet read failed — {error}"),
+                theme.err_style(),
+            ));
+        } else if view.fetching {
+            lines.push(Line::styled("fetching fleet…", theme.dim_style()));
+        } else {
+            lines.push(Line::styled(
+                "no fleet — this session has no subagents",
+                theme.dim_style(),
+            ));
+        }
+        lines.push(Line::styled("esc back to session", theme.dim_style()));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    };
+    let (level, _path) = resolved.unwrap_or((&[], Vec::new()));
+    let roll = fleet::rollup(level);
+    let density = fleet::density(roll.total);
+
+    // -- rollup header (frozen grammar): colored counts, right-aligned
+    //    beside the crumbs when they fit on one row, else on its own row.
+    let header_text = fleet::header_line(&roll);
+    let rollup_spans = |theme: &Theme| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(format!("fleet of {}", roll.total), theme.bright_style()),
+            Span::styled(" · ", theme.faint_style()),
+            Span::styled(format!("✓{}", roll.done), theme.ok_style()),
+            Span::styled(format!(" ◉{}", roll.live), theme.gold_style()),
+            Span::styled(format!(" ✗{}", roll.failed), theme.err_style()),
+            Span::styled(format!(" ◌{}", roll.queued), theme.faint_style()),
+            Span::styled(
+                {
+                    let mut extras = String::new();
+                    if roll.waiting > 0 {
+                        extras.push_str(&format!(" · ◔{}", roll.waiting));
+                    }
+                    if roll.cancelled > 0 {
+                        extras.push_str(&format!(" · ⊘{}", roll.cancelled));
+                    }
+                    if roll.unknown > 0 {
+                        extras.push_str(&format!(" · ?{}", roll.unknown));
+                    }
+                    extras
+                },
+                theme.dim_style(),
+            ),
+            Span::styled(format!(" · depth {}", roll.max_depth), theme.dim_style()),
+        ]
+    };
+    let crumb_width = Line::from(crumbs.clone()).width();
+    if crumb_width + header_text.chars().count() + 3 <= width {
+        let pad = width
+            .saturating_sub(crumb_width)
+            .saturating_sub(header_text.chars().count());
+        let mut spans = crumbs;
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.extend(rollup_spans(theme));
+        lines.push(Line::from(spans));
+    } else {
+        lines.push(Line::from(crumbs));
+        lines.push(Line::from(rollup_spans(theme)));
+    }
+    lines.push(Line::raw(""));
+    let header_rows = lines.len();
+
+    // -- footers: an error over a stale snapshot, the truncation witness,
+    //    and the key hints — all honest, all budgeted before the body.
+    let mut footer: Vec<Line<'_>> = Vec::new();
+    if let Some(error) = &view.error {
+        footer.push(Line::styled(
+            format!("✗ fleet refresh failed — showing the last snapshot · {error}"),
+            theme.err_style(),
+        ));
+    }
+    if let Some(witness) = fleet::truncation_footer(snapshot) {
+        footer.push(Line::styled(witness, theme.warn_style()));
+    }
+    let esc_label = if view.stack.is_empty() {
+        "esc back to session"
+    } else {
+        "esc up one level"
+    };
+    footer.push(Line::styled(
+        match density {
+            fleet::Density::List => format!("↑↓ move · ⏎ drill into a subtree · {esc_label}"),
+            fleet::Density::Grid => format!("arrows move · ⏎ drill in · {esc_label}"),
+        },
+        theme.dim_style(),
+    ));
+
+    let body_rows = (area.height as usize)
+        .saturating_sub(header_rows)
+        .saturating_sub(footer.len());
+
+    match density {
+        fleet::Density::List => {
+            let rows = fleet::flatten(level);
+            view.page_rows.set(body_rows.max(1));
+            view.grid_cols.set(1);
+            let sel = view.sel.min(rows.len().saturating_sub(1));
+            // Selection-follow scroll (top-follow: the selected row stays
+            // visible; slice 1 has no free scroll offset).
+            let scroll = if body_rows == 0 {
+                0
+            } else {
+                sel.saturating_sub(body_rows.saturating_sub(1))
+            };
+            for (index, row) in rows.iter().enumerate().skip(scroll).take(body_rows) {
+                let node = row.node;
+                let selected = index == sel;
+                let queued = node.state == haider_rpc::FleetAgentStateWire::Queued;
+                let glyph = fleet::state_glyph(node.state);
+                let indent = " │ ".repeat(row.rel_depth);
+                let callsign = fleet::callsign(node);
+                let name_style = if queued {
+                    theme.faint_style()
+                } else if selected {
+                    theme.bright_style().add_modifier(Modifier::BOLD)
+                } else {
+                    theme.bright_style()
+                };
+                let mut spans = vec![
+                    Span::styled(format!(" {indent}"), theme.faint_style()),
+                    Span::styled(
+                        glyph.to_owned(),
+                        fleet_glyph_style(theme, node.state, model.anim_phase),
+                    ),
+                    Span::styled(format!(" {callsign}"), name_style),
+                ];
+                if !node.children.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" ▸{}", node.children.len()),
+                        theme.faint_style(),
+                    ));
+                }
+                let metric = fleet::node_metric(node);
+                let left = Line::from(spans.clone()).width();
+                // The task fragment fills what the right-aligned metric
+                // leaves; it truncates before the metric ever drops.
+                let task_budget = width
+                    .saturating_sub(left)
+                    .saturating_sub(metric.chars().count())
+                    .saturating_sub(5);
+                if !node.task.is_empty() && task_budget >= 4 {
+                    let task: String = if node.task.chars().count() > task_budget {
+                        let mut cut: String = node
+                            .task
+                            .chars()
+                            .take(task_budget.saturating_sub(1))
+                            .collect();
+                        cut.push('…');
+                        cut
+                    } else {
+                        node.task.clone()
+                    };
+                    spans.push(Span::styled(format!(" — {task}"), theme.dim_style()));
+                }
+                let left = Line::from(spans.clone()).width();
+                if !metric.is_empty() {
+                    let budget = width.saturating_sub(left).saturating_sub(2);
+                    if metric.chars().count() <= budget {
+                        let pad = width
+                            .saturating_sub(left)
+                            .saturating_sub(metric.chars().count());
+                        spans.push(Span::raw(" ".repeat(pad)));
+                        spans.push(Span::styled(metric, theme.dim_style()));
+                    }
+                }
+                let line = hover_band(Line::from(spans), selected, area.width, theme);
+                cell_hits.push((
+                    lines.len(),
+                    0,
+                    area.width,
+                    Hit::FleetNode(node.agent_id.as_str().to_owned()),
+                ));
+                lines.push(line);
+            }
+        }
+        fleet::Density::Grid => {
+            let cells = level;
+            let step = FLEET_CELL_W + FLEET_CELL_GAP;
+            let cols = ((width.saturating_sub(1)) / step).max(1);
+            view.grid_cols.set(cols);
+            // One band = matrix (2 rows) + callsign + a spacer row.
+            let band_rows = 4;
+            let visible_bands = (body_rows / band_rows).max(1);
+            view.page_rows.set(visible_bands);
+            let sel = view.sel.min(cells.len().saturating_sub(1));
+            let sel_band = sel / cols;
+            let first_band = sel_band.saturating_sub(visible_bands.saturating_sub(1));
+            let bands = cells
+                .chunks(cols)
+                .enumerate()
+                .skip(first_band)
+                .take(visible_bands);
+            for (band_index, band) in bands {
+                let mut matrix_a: Vec<Span<'_>> = vec![Span::raw(" ")];
+                let mut matrix_b: Vec<Span<'_>> = vec![Span::raw(" ")];
+                let mut names: Vec<Span<'_>> = vec![Span::raw(" ")];
+                for (col, node) in band.iter().enumerate() {
+                    let index = band_index * cols + col;
+                    let selected = index == sel;
+                    let bits = fleet::matrix_bits(node.agent_id.as_str());
+                    let [row_a, row_b] = fleet::matrix_rows(bits);
+                    let tint = fleet_glyph_style(theme, node.state, model.anim_phase);
+                    let dot_span = |row: &str| -> Vec<Span<'static>> {
+                        row.chars()
+                            .map(|dot| {
+                                Span::styled(
+                                    dot.to_string(),
+                                    if dot == '●' {
+                                        tint
+                                    } else {
+                                        theme.faint_style()
+                                    },
+                                )
+                            })
+                            .collect()
+                    };
+                    let pad_l = (FLEET_CELL_W - 4) / 2;
+                    let pad_r = FLEET_CELL_W - 4 - pad_l;
+                    for (target, row) in [(&mut matrix_a, &row_a), (&mut matrix_b, &row_b)] {
+                        target.push(Span::raw(" ".repeat(pad_l)));
+                        target.extend(dot_span(row));
+                        target.push(Span::raw(" ".repeat(pad_r)));
+                        target.push(Span::raw(" ".repeat(FLEET_CELL_GAP)));
+                    }
+                    // Callsign under the cell — the selected cell wears the
+                    // selection band (ground shifts, ink stays legible).
+                    let mut name: String =
+                        fleet::callsign(node).chars().take(FLEET_CELL_W).collect();
+                    let name_width = name.chars().count();
+                    name.push_str(&" ".repeat(FLEET_CELL_W - name_width));
+                    names.push(Span::styled(
+                        name,
+                        if selected {
+                            theme.selection_style().add_modifier(Modifier::BOLD)
+                        } else if node.state == haider_rpc::FleetAgentStateWire::Queued {
+                            theme.faint_style()
+                        } else {
+                            theme.dim_style()
+                        },
+                    ));
+                    names.push(Span::raw(" ".repeat(FLEET_CELL_GAP)));
+                    cell_hits.push((
+                        lines.len(),
+                        u16::try_from(1 + col * step).unwrap_or(u16::MAX),
+                        u16::try_from(FLEET_CELL_W).unwrap_or(u16::MAX),
+                        Hit::FleetNode(node.agent_id.as_str().to_owned()),
+                    ));
+                }
+                lines.push(Line::from(matrix_a));
+                lines.push(Line::from(matrix_b));
+                lines.push(Line::from(names));
+                lines.push(Line::raw(""));
+            }
+        }
+    }
+
+    // Pin the footer to the bottom of the area.
+    let used = lines.len();
+    let footer_start = (area.height as usize).saturating_sub(footer.len());
+    for _ in used..footer_start {
+        lines.push(Line::raw(""));
+    }
+    lines.extend(footer);
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    for (offset, x, hit_width, hit) in cell_hits {
+        let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
+        // Grid hits cover the matrix rows AND the callsign row.
+        let height = match hit {
+            Hit::FleetNode(_) if matches!(density, fleet::Density::Grid) => 3,
+            _ => 1,
+        };
+        if y < area.y + area.height {
+            hits.push((
+                Rect {
+                    x: area.x + x,
+                    y,
+                    width: hit_width.min(area.width.saturating_sub(x)),
+                    height,
                 },
                 hit,
             ));

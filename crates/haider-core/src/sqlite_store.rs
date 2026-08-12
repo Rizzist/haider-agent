@@ -358,6 +358,20 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn delegation_descendants(
+        &self,
+        session_id: SessionId,
+        max_nodes: usize,
+        max_depth: u32,
+    ) -> Result<haider_store::DelegationDescendants, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner
+                .with_store(|store| store.delegation_descendants(&session_id, max_nodes, max_depth))
+        })
+        .await
+    }
+
     pub async fn mark_delegation_running(
         &self,
         agent: AgentId,

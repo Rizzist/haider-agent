@@ -226,6 +226,11 @@ pub enum Screen {
     /// U1's `usage.report` read in live mode; demo renders an honest
     /// empty state (usage is daemon truth, never fabricated).
     Usage,
+    /// The fleet view (slice 1, mockup `FleetStage`) — SESSION-BORN, never
+    /// a menu destination: ⌥F / the collapsed subagents summary row opens
+    /// it for the current session. Backed by `session.fleet` in live mode
+    /// ([`crate::fleet`]); demo synthesizes from the local chip tree.
+    Fleet,
 }
 
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
@@ -2155,6 +2160,12 @@ pub enum AppRequest {
     /// pushed on screen entry and by `r`, live-only vocabulary: the demo
     /// opens an honest empty state and never fabricates a meter.
     UsageRefresh,
+    /// Fetch/refresh the fleet snapshot (`session.fleet`) for the ACTIVE
+    /// session. A READ — never outboxed; pushed at fleet-view open, then
+    /// chased by the driver on the existing event cadence while the screen
+    /// stays open (single-flight — no new polling loop). Live-only
+    /// vocabulary: the demo synthesizes from its own chips at open.
+    FleetRefresh,
     /// `account.set_default_model` under the expected-revision CAS. The
     /// default marker moves only on the correlated reply.
     SetDefaultModel {
@@ -2368,6 +2379,13 @@ pub enum Hit {
     TodoRow(u32),
     /// `⌂ {session} — back to the main transcript` (subagent screen).
     SessionHome,
+    /// The collapsed subagents-panel summary row (`⣿ N subagents · … · ⌥F
+    /// fleet`) — opens the fleet view for the current session.
+    FleetSummary,
+    /// One fleet row/cell, VALUE-CARRYING (the stale-hit-map law): the
+    /// agent id it was rendered for, so a refreshed snapshot can never
+    /// drill a different agent than the one clicked.
+    FleetNode(String),
     /// The chip view's `✕ close`.
     ChipCloseBtn(String),
     /// A breadcrumb hop in the chip view (session root = empty path).
@@ -2929,6 +2947,10 @@ pub struct AppModel {
     pub view_path: Vec<String>,
     /// The SubTree header collapse toggle (`▾`/`▸ subagents`).
     pub subtree_collapsed: bool,
+    /// The fleet view's state (snapshot, drill stack, selection) — see
+    /// [`crate::fleet`]. Session-scoped display state; the snapshot is
+    /// daemon truth in live mode and never fabricated there.
+    pub fleet: crate::fleet::FleetView,
     /// The pinned-todos header collapse toggle (sim tui.js:2863-2888 — the
     /// header is a button and the collapsed form summarises the current
     /// item; owner item 7 promotes it from the deferred ledger).
@@ -3222,6 +3244,7 @@ impl Default for AppModel {
             branch_state: crate::branch::BranchState::default(),
             view_path: Vec::new(),
             subtree_collapsed: false,
+            fleet: crate::fleet::FleetView::default(),
             todos_collapsed: false,
             auto_resuming: false,
             aura: AuraModel::seed(),
@@ -3714,6 +3737,7 @@ impl AppModel {
             Screen::Providers => "haider — providers".to_owned(),
             Screen::Hooks => "haider — hooks".to_owned(),
             Screen::Usage => "haider — usage".to_owned(),
+            Screen::Fleet => "haider — fleet".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
@@ -3809,6 +3833,14 @@ impl AppModel {
             // Usage: a static snapshot — nothing animates (the fetching
             // note is a plain line, never a pulse).
             Screen::Usage => false,
+            // Fleet: live agents pulse their ◉ glyph / matrix dots on the
+            // shared clock (mockup `.fg.live`); a settled or terminal
+            // snapshot keeps the gate closed.
+            Screen::Fleet => self
+                .fleet
+                .snapshot
+                .as_ref()
+                .is_some_and(crate::fleet::has_live),
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
                 // glyph (tui.js:4524-4530) · the processing todo's box
@@ -4408,6 +4440,238 @@ impl AppModel {
         self.dirty = true;
     }
 
+    // ---- The fleet view (slice 1 — see `crate::fleet`) ----
+
+    /// Whether ⌥F / the summary row can open the fleet view: the session
+    /// has a subagent tree to show, or a snapshot already held for it.
+    #[must_use]
+    pub fn fleet_available(&self) -> bool {
+        !self.chips.is_empty() || self.fleet.snapshot.is_some()
+    }
+
+    /// Open the fleet view for the CURRENT session (session-born — never a
+    /// menu destination). Demo synthesizes the snapshot from the local
+    /// chip tree at open and renders it once (the terminal-session shape);
+    /// live mode keeps a same-session snapshot warm under the refresh and
+    /// issues the `session.fleet` read.
+    pub fn open_fleet(&mut self) {
+        if !self.fleet_available() {
+            self.flash = Some("· no subagents to fleet".to_owned());
+            self.dirty = true;
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            let session = self
+                .active_session
+                .clone()
+                .unwrap_or_else(|| SessionId::new("demo-session"));
+            self.fleet.snapshot = Some(crate::fleet::snapshot_from_chips(
+                &self.chips,
+                &session,
+                self.clock_ms,
+            ));
+            self.fleet.fetching = false;
+        } else {
+            if !self.daemon_serves(haider_rpc::FEATURE_SESSION_FLEET_V1) {
+                self.flash = Some("· fleet needs a newer daemon (session_fleet_v1)".to_owned());
+                self.dirty = true;
+                return;
+            }
+            let Some(active) = self.active_session.clone() else {
+                self.flash = Some("· fleet — session only".to_owned());
+                self.dirty = true;
+                return;
+            };
+            // A warm snapshot for ANOTHER session must never flash on
+            // screen while this session's read is in flight.
+            if self
+                .fleet
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.session_id != active)
+            {
+                self.fleet.snapshot = None;
+            }
+            self.fleet.fetching = true;
+            self.requests.push(AppRequest::FleetRefresh);
+        }
+        self.fleet.stack.clear();
+        self.fleet.sel = 0;
+        self.fleet.error = None;
+        self.switch_surface(Screen::Fleet);
+        self.dirty = true;
+    }
+
+    /// The current level's navigable count and density — ONE derivation
+    /// for keys, clicks and render (the density is a pure function of the
+    /// re-rooted subtree size; slice 1 has no manual toggle).
+    #[must_use]
+    pub fn fleet_nav(&self) -> Option<(usize, crate::fleet::Density)> {
+        let snapshot = self.fleet.snapshot.as_ref()?;
+        let (level, _) = crate::fleet::resolve(snapshot, &self.fleet.stack);
+        let total = crate::fleet::rollup(level).total;
+        let density = crate::fleet::density(total);
+        let count = match density {
+            crate::fleet::Density::List => total,
+            crate::fleet::Density::Grid => level.len(),
+        };
+        Some((count, density))
+    }
+
+    /// The agent at the current selection, in the current density's order.
+    fn fleet_selected_agent(&self) -> Option<(haider_protocol::ids::AgentId, bool)> {
+        let snapshot = self.fleet.snapshot.as_ref()?;
+        let (level, _) = crate::fleet::resolve(snapshot, &self.fleet.stack);
+        let (_, density) = self.fleet_nav()?;
+        let node = match density {
+            crate::fleet::Density::List => crate::fleet::flatten(level).get(self.fleet.sel)?.node,
+            crate::fleet::Density::Grid => level.get(self.fleet.sel)?,
+        };
+        Some((node.agent_id.clone(), !node.children.is_empty()))
+    }
+
+    /// ⏎ — re-root on the selected subtree. A leaf drills nowhere (slice 1
+    /// has no agent-detail frame); the refusal is honest and quiet.
+    fn fleet_drill(&mut self) {
+        let Some((agent, has_children)) = self.fleet_selected_agent() else {
+            return;
+        };
+        if !has_children {
+            self.flash = Some("· no children — nothing to drill into".to_owned());
+            return;
+        }
+        self.fleet.stack.push(agent);
+        self.fleet.sel = 0;
+    }
+
+    fn fleet_move(&mut self, delta: isize) {
+        let Some((count, _)) = self.fleet_nav() else {
+            return;
+        };
+        if count == 0 {
+            self.fleet.sel = 0;
+            return;
+        }
+        let current = self.fleet.sel.min(count - 1) as isize;
+        self.fleet.sel =
+            usize::try_from((current + delta).clamp(0, count as isize - 1)).unwrap_or(0);
+    }
+
+    /// Fleet-screen keys (the F2a full-screen ownership law — every other
+    /// key is swallowed, no composer beneath). Esc is drill-scoped: up one
+    /// level, and out to the session only from the root.
+    fn handle_fleet_key(&mut self, code: KeyCode) {
+        self.dirty = true;
+        let grid = matches!(self.fleet_nav(), Some((_, crate::fleet::Density::Grid)));
+        let stride = if grid {
+            isize::try_from(self.fleet.grid_cols.get().max(1)).unwrap_or(1)
+        } else {
+            1
+        };
+        let page = isize::try_from(self.fleet.page_rows.get().max(1)).unwrap_or(1);
+        match code {
+            KeyCode::Esc => {
+                if self.fleet.stack.pop().is_none() {
+                    self.switch_surface(Screen::Session);
+                }
+                self.fleet.sel = 0;
+            }
+            KeyCode::Enter => self.fleet_drill(),
+            KeyCode::Up | KeyCode::Char('k') => self.fleet_move(-stride),
+            KeyCode::Down | KeyCode::Char('j') => self.fleet_move(stride),
+            KeyCode::Left if grid => self.fleet_move(-1),
+            KeyCode::Right if grid => self.fleet_move(1),
+            KeyCode::PageUp => self.fleet_move(-(page * stride)),
+            KeyCode::PageDown => self.fleet_move(page * stride),
+            KeyCode::Home => self.fleet.sel = 0,
+            KeyCode::End => {
+                if let Some((count, _)) = self.fleet_nav() {
+                    self.fleet.sel = count.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A clicked row/cell's index in the current density's order — `None`
+    /// when the refreshed snapshot no longer holds the agent the stale
+    /// rect was measured on (the hit then does nothing, honestly).
+    fn fleet_index_of(&self, agent: &str) -> Option<usize> {
+        let snapshot = self.fleet.snapshot.as_ref()?;
+        let (level, _) = crate::fleet::resolve(snapshot, &self.fleet.stack);
+        let (_, density) = self.fleet_nav()?;
+        match density {
+            crate::fleet::Density::List => crate::fleet::flatten(level)
+                .iter()
+                .position(|row| row.node.agent_id.as_str() == agent),
+            crate::fleet::Density::Grid => level
+                .iter()
+                .position(|node| node.agent_id.as_str() == agent),
+        }
+    }
+
+    /// A click drills only a node WITH children — a leaf click is a plain
+    /// selection, no refusal flash (⏎ keeps its honest one).
+    fn fleet_drill_hit(&mut self, agent: &str) {
+        let Some(snapshot) = self.fleet.snapshot.as_ref() else {
+            return;
+        };
+        let (level, _) = crate::fleet::resolve(snapshot, &self.fleet.stack);
+        let has_children = crate::fleet::flatten(level)
+            .iter()
+            .find(|row| row.node.agent_id.as_str() == agent)
+            .is_some_and(|row| !row.node.children.is_empty());
+        if has_children {
+            self.fleet
+                .stack
+                .push(haider_protocol::ids::AgentId::new(agent.to_owned()));
+            self.fleet.sel = 0;
+        }
+        self.dirty = true;
+    }
+
+    /// A committed `session.fleet` snapshot landed. Guarded by session
+    /// identity — a stale reply for a session no longer attached installs
+    /// nothing.
+    pub fn apply_fleet_snapshot(&mut self, snapshot: haider_rpc::SessionFleetSnapshot) {
+        if self
+            .active_session
+            .as_ref()
+            .is_some_and(|active| active != &snapshot.session_id)
+        {
+            return;
+        }
+        self.fleet.snapshot = Some(snapshot);
+        self.fleet.fetching = false;
+        self.fleet.error = None;
+        // Clamp the selection into the refreshed level; a drill hop that
+        // vanished resolves to the nearest surviving ancestor at render.
+        if let Some((count, _)) = self.fleet_nav() {
+            self.fleet.sel = self.fleet.sel.min(count.saturating_sub(1));
+        } else {
+            self.fleet.sel = 0;
+        }
+        self.dirty = true;
+    }
+
+    /// The `session.fleet` read failed — rendered honestly on the screen,
+    /// never a silent stale view.
+    pub fn fleet_failed(&mut self, message: &str) {
+        self.fleet.fetching = false;
+        self.fleet.error = Some(message.to_owned());
+        self.dirty = true;
+    }
+
+    /// The socket died: nothing is in flight any more (receipt-free read —
+    /// nothing resends it). A held snapshot stays; the reconnect resume
+    /// re-reads if the screen is still open.
+    pub fn fleet_note_disconnect(&mut self) {
+        if self.fleet.fetching {
+            self.fleet.fetching = false;
+            self.dirty = true;
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
         if self.screen == Screen::Tools {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
@@ -4622,6 +4886,13 @@ impl AppModel {
             self.handle_usage_key(key.code);
             return;
         }
+        // The fleet view owns its keys entirely (the same full-screen
+        // ownership law); esc is drill-scoped — up one level, out to the
+        // session only from the root.
+        if self.screen == Screen::Fleet {
+            self.handle_fleet_key(key.code);
+            return;
+        }
         // A SELECT menu replaces the composer (sim §3 law); a zero-option
         // free-text ask leaves the keys to the composer.
         if self.screen == Screen::Session
@@ -4644,6 +4915,18 @@ impl AppModel {
                 self.handle_backtrack_key(key.code, now);
                 return;
             }
+        }
+        // ⌥F — the fleet view for the CURRENT session (session-born entry,
+        // mockup tui.js:3979). Gated on a fleet actually existing so ⌥f
+        // keeps its readline word-right meaning everywhere else; the
+        // daemon-menu and picker gates above already outranked this.
+        if self.screen == Screen::Session
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+            && self.fleet_available()
+        {
+            self.open_fleet();
+            return;
         }
         // ⇧⏎ (kitty-protocol terminals report SHIFT) / ⌥⏎ (the universal
         // path) insert a newline (sim Shift+Enter, tui.js:2792-2796). Must
@@ -10777,6 +11060,23 @@ impl AppModel {
             }
             // Hover-only affordance (see the variant's doc comment).
             Hit::TodoRow(_) => {}
+            // The collapsed subagents summary row — the fleet's clickable
+            // door (⌥F's twin), on the panel's two host screens.
+            Hit::FleetSummary
+                if matches!(self.screen, Screen::Session | Screen::Subagent)
+                    && !self.subtree_collapsed =>
+            {
+                self.open_fleet();
+            }
+            // A fleet row/cell: select it, and drill when it has children
+            // — the hit carries the agent id it was RENDERED for, so a
+            // refreshed snapshot can never drill a different agent.
+            Hit::FleetNode(agent) if self.screen == Screen::Fleet => {
+                if let Some(index) = self.fleet_index_of(&agent) {
+                    self.fleet.sel = index;
+                    self.fleet_drill_hit(&agent);
+                }
+            }
             // The ⌂ home row and the ✕ close button belong to the subagent
             // screen; ✕ closes only the chip actually being VIEWED.
             Hit::SessionHome if self.screen == Screen::Subagent => {
@@ -10916,6 +11216,13 @@ impl AppModel {
                 current.saturating_add(3).min(max)
             };
             self.usage.scroll.set(next);
+            self.dirty = true;
+            return;
+        }
+        // Fleet: the wheel walks the selection (selection-follow is the
+        // view's only scroll authority in slice 1).
+        if self.screen == Screen::Fleet {
+            self.fleet_move(if up { -3 } else { 3 });
             self.dirty = true;
             return;
         }

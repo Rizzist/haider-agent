@@ -12,8 +12,9 @@ use haider_rpc::haider_protocol::credential::CredentialDescriptor;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{
-    AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, FEATURE_SESSION_OBSERVE_V1,
-    LifecyclePhase, RequestBody, ResponseBody, SessionObserveDigest, Welcome, WireFrame,
+    AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, FEATURE_SESSION_FLEET_V1,
+    FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody, ResponseBody, SessionFleetSnapshot,
+    SessionObserveDigest, Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -214,6 +215,34 @@ impl ObserveClient {
             }),
             _ => Err(ObserveError::Protocol(
                 "session.observe response method mismatch",
+            )),
+        }
+    }
+
+    /// Reads the bounded durable descendant tree and daemon-side rollup for
+    /// one live or terminal session.
+    pub async fn fleet(&self, session_id: SessionId) -> Result<SessionFleetSnapshot, ObserveError> {
+        if !self.welcome.features.contains(FEATURE_SESSION_FLEET_V1) {
+            return Err(ObserveError::MissingFeature(FEATURE_SESSION_FLEET_V1));
+        }
+        match self
+            .client
+            .request(RequestBody::SessionFleet { session_id })
+            .await?
+        {
+            ResponseBody::SessionFleet { snapshot } => Ok(snapshot),
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => Err(ObserveError::Rpc {
+                code,
+                message,
+                retryable,
+            }),
+            _ => Err(ObserveError::Protocol(
+                "session.fleet response method mismatch",
             )),
         }
     }

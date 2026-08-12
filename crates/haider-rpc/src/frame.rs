@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
-use haider_protocol::agent::{AgentMessageReceipt, AgentMetricsSnapshot};
+use haider_protocol::agent::{AgentMessageReceipt, AgentMetricsSnapshot, AgentUsageMetrics};
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
@@ -41,6 +41,12 @@ pub const DEFAULT_FRAME_LIMIT: usize = 48 * 1024 * 1024;
 /// above the PDF lane's 32 MiB cap so the daemon can identify an uploaded
 /// over-cap PDF with the PDF-specific typed rejection at turn admission.
 pub const ARTIFACT_PUT_MAX_BYTES: usize = 33 * 1024 * 1024;
+
+/// Maximum number of descendant nodes returned by one `session.fleet` read.
+pub const FLEET_MAX_NODES: u32 = 512;
+/// Defensive response-depth ceiling. Execution currently admits only three
+/// delegation levels, but the read contract remains independently bounded.
+pub const FLEET_MAX_DEPTH: u32 = 32;
 
 const fn default_frame_limit_u32() -> u32 {
     DEFAULT_FRAME_LIMIT as u32
@@ -242,6 +248,8 @@ pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
 /// Daemon implements the read-only, journal-derived session observation digest.
 pub const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
+/// Daemon implements the bounded, durable descendant-tree fleet snapshot.
+pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
 pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 /// The daemon accepts receipt-free, content-addressed `artifact.put` uploads.
@@ -948,6 +956,97 @@ pub struct SessionObserveDigest {
     pub last_event_kinds: Vec<String>,
 }
 
+/// Stable display state for one descendant in a fleet snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FleetAgentStateWire {
+    Queued,
+    Live,
+    Waiting,
+    Done,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One recursively nested durable descendant. Metrics are direct/exclusive
+/// for this child; consumers must not add snapshots from different heads for
+/// the same agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetNodeWire {
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    /// Persisted display identity only; clients may choose their own fallback
+    /// when a callsign has not yet been assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callsign: Option<String>,
+    pub task: String,
+    /// Absolute delegation depth from durable relation truth.
+    pub depth: u32,
+    pub parent_session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<AgentId>,
+    pub state: FleetAgentStateWire,
+    /// The v0.0.902 direct-agent snapshot. Elapsed time is
+    /// `(terminal_at_ms | snapshot.generated_at_ms) - started_at_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<AgentMetricsSnapshot>,
+    #[serde(default)]
+    pub children: Vec<FleetNodeWire>,
+}
+
+/// Per-state counts over the nodes actually returned in a fleet snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetStateCountsWire {
+    pub queued: u32,
+    pub live: u32,
+    pub waiting: u32,
+    pub done: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+}
+
+/// Saturating totals over direct metrics for the returned nodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetMetricsTotalsWire {
+    /// Sum of every returned node's direct elapsed duration at the snapshot's
+    /// single `generated_at_ms` instant.
+    pub elapsed_ms: u64,
+    pub tool_attempts: u64,
+    /// Absent when any returned node lacks durable usage truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentUsageMetrics>,
+}
+
+/// Daemon-side rollup. `complete` is false when the tree was bounded; all
+/// values still describe exactly the nodes present in `roots`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetRollupWire {
+    pub node_count: u32,
+    pub states: FleetStateCountsWire,
+    pub max_depth: u32,
+    pub metrics: FleetMetricsTotalsWire,
+    /// False when one or more returned nodes had no reducible direct metrics
+    /// or no durable usage truth for its token/cost totals.
+    pub metrics_complete: bool,
+    pub complete: bool,
+}
+
+/// Bounded, receipt-free descendant-tree snapshot for one durable session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionFleetSnapshot {
+    pub session_id: SessionId,
+    pub generated_at_ms: u64,
+    pub node_limit: u32,
+    pub depth_limit: u32,
+    #[serde(default)]
+    pub roots: Vec<FleetNodeWire>,
+    pub rollup: FleetRollupWire,
+    pub truncated: bool,
+}
+
 /// Secret-free projection of one effective hook definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookSummaryWire {
@@ -1035,6 +1134,10 @@ pub enum RequestBody {
         #[serde(default)]
         last_event_limit: u32,
     },
+    /// Returns the bounded full descendant tree and daemon-side rollup from
+    /// durable delegation and child-journal truth. Read-only and receipt-free.
+    #[serde(rename = "session.fleet")]
+    SessionFleet { session_id: SessionId },
     /// Persists a client-detected compatibility fault in the session journal.
     #[serde(rename = "session.diagnostic")]
     SessionDiagnostic {
@@ -1450,6 +1553,8 @@ pub enum ResponseBody {
     SessionRead { result: SessionReadResult },
     #[serde(rename = "session.observe")]
     SessionObserve { digest: SessionObserveDigest },
+    #[serde(rename = "session.fleet")]
+    SessionFleet { snapshot: SessionFleetSnapshot },
     #[serde(rename = "session.diagnostic")]
     SessionDiagnostic { recorded_seq: u64 },
     #[serde(rename = "hooks.list")]

@@ -16,6 +16,7 @@ pub mod commands;
 pub mod composer;
 pub mod custom_commands;
 pub mod demo_store;
+pub mod fleet;
 pub mod format;
 pub mod hooks;
 pub mod identity;
