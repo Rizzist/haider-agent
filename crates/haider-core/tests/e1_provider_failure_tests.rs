@@ -497,7 +497,20 @@ async fn e4a_midstream_failure_journals_incomplete_item_and_choice_card() {
         turn.wait().await.expect("turn outcome").state,
         RunState::Done
     );
-    assert_eq!(provider.requests().len(), 2);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    // LAW extension (orchestrator): retry-fresh OMITS the partial from the
+    // fresh provider prompt — the transcript keeps the incomplete item, the
+    // model never sees it. Pinned after the leak-the-partial mutation
+    // SURVIVED this suite unpinned.
+    assert!(
+        !requests[1].messages.iter().any(|message| {
+            message.blocks.iter().any(
+                |block| matches!(block, Block::Text { text } if text.contains("partial response")),
+            )
+        }),
+        "retry-fresh prompt must not carry the interrupted partial"
+    );
 }
 
 /// LAW E4b: ContinuePartial primes the new request with the exact partial and
