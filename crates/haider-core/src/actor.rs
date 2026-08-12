@@ -1940,7 +1940,7 @@ impl HarnessActor {
                                 tool_json_repair_used = true;
                                 let repair = match self
                                     .close_malformed_tool_for_repair(
-                                        &run_id, &mut tools, &call_id, &error,
+                                        &run_id, &mut tools, &call_id, error,
                                     )
                                     .await
                                 {
@@ -2573,7 +2573,8 @@ impl HarnessActor {
                     .map_err(DriveError::Store)?;
                     *provider = fallback;
                     *account = Some(fallback_account);
-                    self.config.tools = self.config.provider_tool_fallback_tools.clone();
+                    self.config.tools =
+                        std::mem::take(&mut self.config.provider_tool_fallback_tools);
                     *capability_fallback_consumed = true;
                     return Ok(());
                 }
@@ -3007,7 +3008,7 @@ impl HarnessActor {
         run_id: &RunId,
         tools: &mut Vec<ToolAccumulator>,
         call_id: &str,
-        error: &ProviderError,
+        error: ProviderError,
     ) -> Result<(Block, Message), DriveError> {
         let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
             return Err(DriveError::Provider(provider_protocol_error(format!(
@@ -3026,7 +3027,7 @@ impl HarnessActor {
             cursor: None,
             status: ToolResultStatus::Failed,
             reason: Some("malformed JSON — repair attempt 1/1".into()),
-            presentation: Some(error.presentation.clone()),
+            presentation: Some(error.presentation),
         };
         self.commit_payload(
             run_id,
@@ -3052,15 +3053,15 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
+        let tool = tools.remove(index);
+        let message = Message::tool_result(tool.call_id.clone(), safe_detail, false);
         let block = Block::ToolCall {
-            call_id: tool.call_id.clone(),
-            name: tool.name.clone(),
+            call_id: tool.call_id,
+            name: tool.name,
             // Keep the provider protocol pair valid without pretending the
             // malformed fragment was a successfully parsed argument object.
             args: serde_json::json!({ "_malformed_json": tool.args }),
         };
-        let message = Message::tool_result(tool.call_id.clone(), safe_detail, false);
-        tools.remove(index);
         Ok((block, message))
     }
 

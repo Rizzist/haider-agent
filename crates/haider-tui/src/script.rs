@@ -396,7 +396,7 @@ pub const AUTO_RESUME_DEFER_MS: u64 = 120;
 /// The aura talk hold (tui.js:2128-2132).
 pub const AURA_TALK_MS: u64 = 1100;
 /// The aura talk canned phrase, pinned to Haider's local-only placement.
-pub const AURA_TALK_PHRASE: &str = "spin up the auth service locally and run its tests";
+pub(crate) const AURA_TALK_PHRASE: &str = "spin up the auth service locally and run its tests";
 pub const AUTO_TITLE_MS: u64 = 1500;
 pub const ERRORED_HOLD_MS: u64 = 1800;
 pub const DEFERRED_CALLBACK_MS: u64 = 2600;

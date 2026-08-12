@@ -19,12 +19,27 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId};
-use haider_protocol::menu::{MenuKind, effect_recovery_menu};
+use haider_protocol::ids::{
+    AgentId, BranchId, DeviceId, EffectId, EventId, MenuId, RunId, SessionId,
+};
+use haider_protocol::menu::{MenuAnswer, MenuKind, effect_recovery_menu};
 use haider_protocol::state::RunState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const RECOVERY_PAGE_SIZE: usize = 1_024;
+
+/// The dispatch coordinates needed to synthesize recovery envelopes.
+///
+/// Keeping only these fields avoids retaining (and cloning) the dispatched
+/// event's raw JSON payload for the remainder of a session scan.
+struct RecoveryDispatch {
+    event_id: EventId,
+    session_id: SessionId,
+    branch_id: Option<BranchId>,
+    run_id: Option<RunId>,
+    agent_id: Option<AgentId>,
+    authority_epoch: u64,
+}
 
 /// Durable effects terminalized during one startup recovery pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,10 +60,11 @@ pub async fn reconcile_dispatched_effects(
     device_id: &DeviceId,
 ) -> Result<RecoveryReport, HaiderError> {
     let mut report = RecoveryReport::default();
+    let worker_generation = store.worker_generation();
     for session_id in store.session_ids().await? {
         let mut cursor = 0;
-        let mut dispatched = HashMap::<EffectId, RawEnvelope>::new();
-        let mut outcomes = HashMap::<EffectId, EffectOutcome>::new();
+        let mut dispatched = HashMap::<EffectId, RecoveryDispatch>::new();
+        let mut outcomes = HashMap::<EffectId, bool>::new();
         let mut recovery_menus = HashMap::<MenuId, EffectId>::new();
         loop {
             let page = store.read(&session_id, cursor, RECOVERY_PAGE_SIZE).await?;
@@ -56,17 +72,21 @@ pub async fn reconcile_dispatched_effects(
                 break;
             }
             cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-            reduce_page(&page, &mut dispatched, &mut outcomes, &mut recovery_menus)?;
+            reduce_page(page, &mut dispatched, &mut outcomes, &mut recovery_menus)?;
         }
 
+        let open_recovery_effects = recovery_menus
+            .values()
+            .map(EffectId::as_str)
+            .collect::<HashSet<_>>();
         let mut pending = dispatched
             .into_iter()
             .filter(|(effect, dispatch)| match outcomes.get(effect) {
                 None => true,
-                Some(EffectOutcome::Unknown) => {
-                    dispatch.run_id.is_some() && !recovery_menus.values().any(|open| open == effect)
+                Some(true) => {
+                    dispatch.run_id.is_some() && !open_recovery_effects.contains(effect.as_str())
                 }
-                Some(_) => false,
+                Some(false) => false,
             })
             .collect::<Vec<_>>();
         pending.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
@@ -78,14 +98,10 @@ pub async fn reconcile_dispatched_effects(
         for (effect, dispatch) in pending {
             if !outcomes.contains_key(&effect) {
                 recovery.push(recovery_envelope(
-                    store,
+                    worker_generation,
                     device_id,
                     &dispatch,
-                    recovery_event_id(
-                        session_id.as_str(),
-                        store.worker_generation(),
-                        effect.as_str(),
-                    ),
+                    recovery_event_id(session_id.as_str(), worker_generation, effect.as_str()),
                     EventPayload::Effect(EffectPhase::Outcome {
                         effect: effect.clone(),
                         outcome: EffectOutcome::Unknown,
@@ -105,24 +121,24 @@ pub async fn reconcile_dispatched_effects(
                 format!("effect {}", effect.as_str()),
             );
             recovery.push(recovery_envelope(
-                store,
+                worker_generation,
                 device_id,
                 &dispatch,
                 recovery_event_id_for(
                     session_id.as_str(),
-                    store.worker_generation(),
+                    worker_generation,
                     effect.as_str(),
                     "menu",
                 ),
                 EventPayload::MenuOpened(menu),
             )?);
             recovery.push(recovery_envelope(
-                store,
+                worker_generation,
                 device_id,
                 &dispatch,
                 recovery_event_id_for(
                     session_id.as_str(),
-                    store.worker_generation(),
+                    worker_generation,
                     effect.as_str(),
                     "state",
                 ),
@@ -136,9 +152,9 @@ pub async fn reconcile_dispatched_effects(
 }
 
 fn reduce_page(
-    page: &[RawEnvelope],
-    dispatched: &mut HashMap<EffectId, RawEnvelope>,
-    outcomes: &mut HashMap<EffectId, EffectOutcome>,
+    page: Vec<RawEnvelope>,
+    dispatched: &mut HashMap<EffectId, RecoveryDispatch>,
+    outcomes: &mut HashMap<EffectId, bool>,
     recovery_menus: &mut HashMap<MenuId, EffectId>,
 ) -> Result<(), HaiderError> {
     for envelope in page {
@@ -151,35 +167,42 @@ fn reduce_page(
         ) {
             continue;
         }
-        let payload: EventPayload =
-            serde_json::from_value(envelope.payload.clone()).map_err(|error| {
-                HaiderError::new(
-                    ErrorCode::StoreCorrupt,
-                    format!(
-                        "invalid effect payload in session {}, seq {}: {error}",
-                        envelope.session_id, envelope.seq
-                    ),
-                    false,
-                )
-            })?;
+        let payload: EventPayload = serde_json::from_value(envelope.payload).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "invalid effect payload in session {}, seq {}: {error}",
+                    envelope.session_id, envelope.seq
+                ),
+                false,
+            )
+        })?;
         match payload {
             EventPayload::Effect(EffectPhase::Dispatched { effect }) => {
-                dispatched.insert(effect, envelope.clone());
+                dispatched.insert(
+                    effect,
+                    RecoveryDispatch {
+                        event_id: envelope.event_id,
+                        session_id: envelope.session_id,
+                        branch_id: envelope.branch_id,
+                        run_id: envelope.run_id,
+                        agent_id: envelope.agent_id,
+                        authority_epoch: envelope.authority_epoch,
+                    },
+                );
             }
             EventPayload::Effect(EffectPhase::Outcome {
                 effect, outcome, ..
             }) => {
-                outcomes.insert(effect, outcome);
+                outcomes.insert(effect, matches!(outcome, EffectOutcome::Unknown));
             }
             EventPayload::MenuOpened(menu) => {
                 if let MenuKind::Recovery { effect, .. } = menu.kind {
                     recovery_menus.insert(menu.id, effect);
                 }
             }
-            EventPayload::MenuAnswered(answer) => {
-                recovery_menus.remove(&answer.menu);
-            }
-            EventPayload::MenuClosed { menu, .. } => {
+            EventPayload::MenuAnswered(MenuAnswer { menu, .. })
+            | EventPayload::MenuClosed { menu, .. } => {
                 recovery_menus.remove(&menu);
             }
             _ => {}
@@ -189,9 +212,9 @@ fn reduce_page(
 }
 
 fn recovery_envelope(
-    store: &SqliteStoreHandle,
+    worker_generation: u64,
     device_id: &DeviceId,
-    dispatch: &RawEnvelope,
+    dispatch: &RecoveryDispatch,
     event_id: EventId,
     payload: EventPayload,
 ) -> Result<RawEnvelope, HaiderError> {
@@ -212,7 +235,7 @@ fn recovery_envelope(
         agent_id: dispatch.agent_id.clone(),
         device_id: device_id.clone(),
         authority_epoch: dispatch.authority_epoch,
-        worker_generation: store.worker_generation(),
+        worker_generation,
         causation_id: Some(dispatch.event_id.clone()),
         correlation_id: None,
         committed_at_ms: 0,

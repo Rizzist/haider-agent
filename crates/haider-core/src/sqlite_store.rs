@@ -1142,39 +1142,42 @@ impl StoreOwner {
             ErrorCode::StoreUnavailable => "profile storage is unavailable",
             _ => unreachable!(),
         };
-        let mut fault = self.fault.borrow().clone().unwrap_or(ProfileStoreFault {
-            presentation: ErrorPresentation::new(
-                error.code.as_subcode(),
-                "Store unwritable",
+        self.fault.send_modify(move |current| {
+            let fault = current.get_or_insert_with(|| ProfileStoreFault {
+                presentation: ErrorPresentation::new(
+                    error.code.as_subcode(),
+                    "Store unwritable",
+                    format!(
+                        "Store unwritable — {reason}. Free space or restore write access, then retry."
+                    ),
+                    ErrorScope::Profile,
+                    [ErrorAction::Retry],
+                ),
+                failed_write_ids: Vec::new(),
+            });
+            for id in failed_write_ids {
+                if fault.failed_write_ids.len() < 32 && !fault.failed_write_ids.contains(&id) {
+                    fault.failed_write_ids.push(id);
+                }
+            }
+            let detail = if fault.failed_write_ids.is_empty() {
                 format!(
                     "Store unwritable — {reason}. Free space or restore write access, then retry."
-                ),
+                )
+            } else {
+                format!(
+                    "Store unwritable — {reason}. Not committed: {}. Free space or restore write access, then retry.",
+                    fault.failed_write_ids.join(", ")
+                )
+            };
+            fault.presentation = ErrorPresentation::new(
+                error.code.as_subcode(),
+                "Store unwritable",
+                detail,
                 ErrorScope::Profile,
                 [ErrorAction::Retry],
-            ),
-            failed_write_ids: Vec::new(),
+            );
         });
-        for id in failed_write_ids {
-            if fault.failed_write_ids.len() < 32 && !fault.failed_write_ids.contains(&id) {
-                fault.failed_write_ids.push(id);
-            }
-        }
-        let detail = if fault.failed_write_ids.is_empty() {
-            format!("Store unwritable — {reason}. Free space or restore write access, then retry.")
-        } else {
-            format!(
-                "Store unwritable — {reason}. Not committed: {}. Free space or restore write access, then retry.",
-                fault.failed_write_ids.join(", ")
-            )
-        };
-        fault.presentation = ErrorPresentation::new(
-            error.code.as_subcode(),
-            "Store unwritable",
-            detail,
-            ErrorScope::Profile,
-            [ErrorAction::Retry],
-        );
-        self.fault.send_replace(Some(fault));
     }
 
     fn take_store(&self) -> Result<Option<Store>, HaiderError> {

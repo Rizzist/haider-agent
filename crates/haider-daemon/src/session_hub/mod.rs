@@ -972,20 +972,23 @@ impl SessionHub {
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
             while faults.changed().await.is_ok() {
-                let fault = faults.borrow().clone();
                 let Some(inner) = weak.upgrade() else {
                     break;
                 };
-                let frame = if let Some(fault) = fault {
-                    profile_store_fault_frame(&fault)
-                } else {
-                    WireFrame::ProtocolError(ProtocolError {
-                        code: "store_healthy".into(),
-                        message: "profile store is writable again".into(),
-                        fatal: false,
-                        presentation: None,
-                        failed_write_ids: Vec::new(),
-                    })
+                let (frame, fault_latched) = {
+                    let fault = faults.borrow_and_update();
+                    let frame = if let Some(fault) = fault.as_ref() {
+                        profile_store_fault_frame(fault)
+                    } else {
+                        WireFrame::ProtocolError(ProtocolError {
+                            code: "store_healthy".into(),
+                            message: "profile store is writable again".into(),
+                            fatal: false,
+                            presentation: None,
+                            failed_write_ids: Vec::new(),
+                        })
+                    };
+                    (frame, fault.is_some())
                 };
                 let sinks = inner
                     .diagnostic_sinks
@@ -994,10 +997,13 @@ impl SessionHub {
                     .values()
                     .cloned()
                     .collect::<Vec<_>>();
-                for sink in sinks {
-                    let _ = sink.try_send(frame.clone());
+                if let Some((last, sinks)) = sinks.split_last() {
+                    for sink in sinks {
+                        let _ = sink.try_send(frame.clone());
+                    }
+                    let _ = last.try_send(frame);
                 }
-                if faults.borrow().is_none() {
+                if !fault_latched {
                     continue;
                 }
                 // A bounded health probe keeps the banner latched until the

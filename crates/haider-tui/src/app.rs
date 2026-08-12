@@ -11324,7 +11324,7 @@ impl AppModel {
     /// (E8 visual pass): the transcript row gets the card-shaped err
     /// treatment — bold title, railed dim detail, muted fact line — instead
     /// of the baseline one-line ✗.
-    pub fn record_session_error_card(
+    pub(crate) fn record_session_error_card(
         &mut self,
         session: &SessionId,
         presentation: haider_protocol::error::ErrorPresentation,

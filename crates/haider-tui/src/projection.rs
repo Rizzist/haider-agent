@@ -593,7 +593,7 @@ impl SessionProjection {
     /// flattened text stays the plain/greppable authority while the styled
     /// renderer gives the row the same card-shaped err treatment a typed
     /// run failure gets.
-    pub fn record_local_error_card(
+    pub(crate) fn record_local_error_card(
         &mut self,
         presentation: haider_protocol::error::ErrorPresentation,
     ) {
@@ -1332,7 +1332,7 @@ pub(crate) fn join_error_fact_segments(segments: &[(String, u8)]) -> String {
 /// retry fact (dim ⟳ row — recovery in progress, never alarming);
 /// unknown kinds return `None` and keep the generic `⋯` treatment.
 #[must_use]
-pub fn retry_marker_label(kind: &str, data: &serde_json::Value) -> Option<String> {
+pub(crate) fn retry_marker_label(kind: &str, data: &serde_json::Value) -> Option<String> {
     let label = data.get("label").and_then(serde_json::Value::as_str);
     match kind {
         // The daemon's fallback marker carries its own sentence
