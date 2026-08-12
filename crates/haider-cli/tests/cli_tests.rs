@@ -776,42 +776,56 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
 /// envelopes are no longer RunFailed(StoreCorrupt) then Errored.
 #[test]
 fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
-    let mut command = haider();
-    let mut child = command
-        .args(["run", "--provider", "fake", "store failure", "--jsonl"])
-        .env("HAIDER_TEST_FAIL_NEXT_DONE_APPEND", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("binary starts");
-    // Cold daemon spawn + turn + fault handling regularly exceeds 5s on a
-    // loaded box — the LAW is termination + the typed trail, not latency.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll child") {
-            break status;
+    // Exit-69 boot-retry family (5th sibling, gate119): a cold daemon under
+    // full-gate load can miss the startup deadline (exit 69 = unavailable)
+    // before the injected fault is ever reachable. The law under test is the
+    // 70/StoreCorrupt trail, not spawn latency — retry the unavailable case
+    // once, exactly like the flagless-run credential law above.
+    let mut outcome = None;
+    for _ in 0..2 {
+        let mut command = haider();
+        let mut child = command
+            .args(["run", "--provider", "fake", "store failure", "--jsonl"])
+            .env("HAIDER_TEST_FAIL_NEXT_DONE_APPEND", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("binary starts");
+        // Cold daemon spawn + turn + fault handling regularly exceeds 5s on a
+        // loaded box — the LAW is termination + the typed trail, not latency.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill timed-out child");
+                let _ = child.wait();
+                panic!("store-failure run did not terminate");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_end(&mut stdout)
+            .expect("read stdout");
+        let mut stderr = Vec::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_end(&mut stderr)
+            .expect("read stderr");
+        let unavailable = status.code() == Some(i32::from(EX_UNAVAILABLE));
+        outcome = Some((status, stdout, stderr));
+        if !unavailable {
+            break;
         }
-        if Instant::now() >= deadline {
-            child.kill().expect("kill timed-out child");
-            let _ = child.wait();
-            panic!("store-failure run did not terminate");
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let mut stdout = Vec::new();
-    child
-        .stdout
-        .take()
-        .expect("stdout")
-        .read_to_end(&mut stdout)
-        .expect("read stdout");
-    let mut stderr = Vec::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr")
-        .read_to_end(&mut stderr)
-        .expect("read stderr");
+    }
+    let (status, stdout, stderr) = outcome.expect("at least one attempt ran");
 
     assert_eq!(status.code(), Some(i32::from(EX_SOFTWARE)));
     let envelopes = parse_jsonl(&stdout);
