@@ -41,12 +41,12 @@ use base64::Engine;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, CompiledPromptProjection,
     ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
-    DeferredToolResult, EventIdGenerator, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
-    PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn,
-    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
-    ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
-    estimate_provider_request_input_tokens, presentation_for_haider_error,
-    sanitized_failure_message,
+    DeferredToolResult, EventIdGenerator, GraphEvidenceCommand, GraphEvidenceOutcome, HarnessActor,
+    HarnessConfig, PartialStreamCheckpoint, PromptHistoryCompiler, RequestInputCheckpoint,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
+    presentation_for_haider_error, sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
@@ -84,7 +84,7 @@ use haider_provider::{
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsCaseMode, FsEdit, FsGlob, FsList,
-    FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, JournalSink, MessageSubagent,
+    FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink, MessageSubagent,
     PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds, SessionGrant,
     SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
     WebFetch,
@@ -3855,6 +3855,19 @@ async fn start_turn(
     let attachments =
         resolve_prompt_attachments(lease, &mut messages, provider_capabilities.pdf_documents)
             .await?;
+    // Dynamic graph state is deliberately outside durable prompt history and
+    // the stable system/tool prefix. Root sessions receive one bounded,
+    // turn-scoped user-role tail; delegated children receive no parent graph.
+    let graph_brief = if agent_id.is_none() {
+        lease
+            .hub()
+            .graph_status(lease.session_id())
+            .await
+            .map_err(hub_error)?
+            .and_then(|status| status.graph_brief())
+    } else {
+        None
+    };
     let dispatcher = dependencies
         .tool_factory
         .create(WorkerToolContext {
@@ -3906,6 +3919,7 @@ async fn start_turn(
         &instruction_entries,
         handoff_dir.as_deref(),
     ));
+    config.volatile_user_tail = graph_brief;
     config.tools = advertised_tool_definitions(
         &dependencies.tool_factory,
         grant.as_ref(),
@@ -5219,6 +5233,7 @@ pub(crate) struct BrokerToolFactory;
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
     TodoWrite,
+    GraphEvidence,
     FsRead,
     FsList,
     FsSearch,
@@ -5282,6 +5297,14 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 manifest,
                 default: ToolPermissionDefault::NotApplicable,
                 route: RegisteredToolRoute::TodoWrite,
+            }
+        },
+        {
+            let manifest = haider_tools::graph_evidence_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::NotApplicable,
+                route: RegisteredToolRoute::GraphEvidence,
             }
         },
         registered_tool(
@@ -5413,12 +5436,22 @@ pub(crate) fn default_child_grant() -> Grant {
     Grant {
         tools: entries
             .iter()
-            .filter(|entry| entry.route != RegisteredToolRoute::TodoWrite)
+            .filter(|entry| {
+                !matches!(
+                    entry.route,
+                    RegisteredToolRoute::TodoWrite | RegisteredToolRoute::GraphEvidence
+                )
+            })
             .map(|entry| entry.manifest.name.clone())
             .collect(),
         effect_ceiling: entries
             .iter()
-            .filter(|entry| entry.route != RegisteredToolRoute::TodoWrite)
+            .filter(|entry| {
+                !matches!(
+                    entry.route,
+                    RegisteredToolRoute::TodoWrite | RegisteredToolRoute::GraphEvidence
+                )
+            })
             .flat_map(|entry| entry.manifest.effects.iter().cloned())
             .fold(Vec::new(), |mut effects, effect| {
                 if !effects.contains(&effect) {
@@ -5706,6 +5739,24 @@ struct BrokerToolDispatcher {
 
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
+    async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
+        if self.parent_agent_id.is_some() {
+            return Ok(None);
+        }
+        let brief = self
+            .output
+            .store
+            .hub()
+            .graph_status(&self.session_id)
+            .await
+            .map_err(hub_error)?
+            .and_then(|status| status.graph_brief())
+            .unwrap_or_default();
+        // An empty managed tail explicitly clears a brief after completion or
+        // abandonment in the middle of the same provider tool loop.
+        Ok(Some(brief))
+    }
+
     async fn execute(
         &self,
         run_id: &RunId,
@@ -5738,6 +5789,93 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
             }
         }
+        let route = registered_tool_route(name).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("unsupported tool `{name}`"),
+                false,
+            )
+        })?;
+        if route == RegisteredToolRoute::GraphEvidence {
+            let request = match GraphEvidence::from_tool_args(args) {
+                Ok(request) => request,
+                Err(error) => {
+                    return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
+                        ErrorCode::InvalidArgument,
+                        &error.to_string(),
+                    )));
+                }
+            };
+            let request_json = serde_json::to_string(&request).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot encode graph evidence request: {error}"),
+                    false,
+                )
+            })?;
+            let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+            let mut identity = blake3::Hasher::new();
+            for part in [self.session_id.as_str(), run_id.as_str(), call_id] {
+                identity.update(&(part.len() as u64).to_be_bytes());
+                identity.update(part.as_bytes());
+            }
+            let command = GraphEvidenceCommand {
+                command_id: format!("graph-evidence-{}", identity.finalize().to_hex()),
+                request_digest,
+                request_json,
+                session_id: self.session_id.clone(),
+                worker_generation: self.output.store.worker_generation(),
+                run_id: run_id.clone(),
+                call_id: call_id.to_owned(),
+                node: request.node,
+                verdict: request.verdict,
+                detail: request.detail,
+                device_id: self.output.device_id.clone(),
+            };
+            let recorded = match self.output.store.hub().record_graph_evidence(command).await {
+                Ok(GraphEvidenceOutcome::Committed { recorded, .. })
+                | Ok(GraphEvidenceOutcome::IdempotentReplay { recorded }) => recorded,
+                Err(SessionHubError::Store(error))
+                    if matches!(
+                        error.code,
+                        ErrorCode::GraphNotActive
+                            | ErrorCode::GraphWrongNode
+                            | ErrorCode::InvalidArgument
+                    ) =>
+                {
+                    return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
+                        error.code,
+                        &error.message,
+                    )));
+                }
+                Err(SessionHubError::Store(error)) => return Err(error),
+                Err(error) => {
+                    return Err(HaiderError::new(
+                        ErrorCode::Internal,
+                        error.to_string(),
+                        false,
+                    ));
+                }
+            };
+            let preview = serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "graph_id": recorded.graph_id,
+                "node": recorded.node,
+                "attempt": recorded.attempt,
+                "fingerprint": recorded.fingerprint,
+                "through_seq": recorded.through_seq,
+            }))
+            .unwrap_or_else(|_| "{\"ok\":true}".into());
+            return Ok(ToolDispatchResult::Completed(BoundedResult {
+                preview,
+                truncated: false,
+                artifact: None,
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            }));
+        }
         let mut broker_guard = self.broker.lock().await;
         let broker = broker_guard.as_mut().ok_or_else(|| {
             HaiderError::new(
@@ -5747,13 +5885,6 @@ impl ToolDispatcher for BrokerToolDispatcher {
             )
         })?;
         let policy = self.policy.lock().await;
-        let route = registered_tool_route(name).ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!("unsupported tool `{name}`"),
-                false,
-            )
-        })?;
         if route == RegisteredToolRoute::SpawnSubagent {
             if let Err(error) = self
                 .delegation
@@ -6262,6 +6393,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::TodoWrite
+            | RegisteredToolRoute::GraphEvidence
             | RegisteredToolRoute::SpawnSubagent
             | RegisteredToolRoute::MessageSubagent => {
                 return Err(HaiderError::new(
@@ -6660,6 +6792,30 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(reason),
         presentation: None,
+    }
+}
+
+fn graph_evidence_rejection(code: ErrorCode, message: &str) -> BoundedResult {
+    let reason = bounded_failure_reason(message);
+    BoundedResult {
+        preview: serde_json::json!({
+            "ok": false,
+            "code": code.as_str(),
+            "message": reason,
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(reason.clone()),
+        presentation: Some(ErrorPresentation::new(
+            code.as_subcode(),
+            "Graph evidence rejected",
+            reason,
+            ErrorScope::Tool,
+            [ErrorAction::Retry],
+        )),
     }
 }
 

@@ -11,15 +11,16 @@ use crate::worker::{
     registered_tool_route, registered_tools,
 };
 use haider_core::{
-    SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
+    GraphPinCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
     TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::PromptRender;
 use haider_protocol::error::HaiderError;
+use haider_protocol::graph::SHIP_LOOP_TEMPLATE;
 use haider_protocol::history::{NodeKind, TodoState};
-use haider_protocol::ids::{DeviceId, EventId, ItemId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, GraphId, ItemId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::session::SessionMetadataV1;
@@ -224,6 +225,207 @@ fn plan_facts(payloads: &[(EventPayload, PromptRender)]) -> Vec<&ItemEvent> {
         .collect()
 }
 
+/// CG-M1 LAW: the daemon reduces graph journal truth at worker startup and
+/// injects the bounded brief into the provider-only tail. The same text is
+/// absent from durable event payloads.
+#[tokio::test]
+async fn active_graph_brief_reaches_the_provider_but_not_durable_history() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let world = World::boot("graph-brief-runtime", provider.clone()).await;
+    world
+        .hub
+        .pin_graph(GraphPinCommand {
+            command_id: "pin-graph-brief-runtime".into(),
+            request_digest: "pin-graph-brief-runtime-digest".into(),
+            request_json: r#"{"template":"ship-loop"}"#.into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            graph_id: GraphId::new("graph-brief-runtime"),
+            template: SHIP_LOOP_TEMPLATE.into(),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("pin graph");
+    world
+        .run_turn("graph-brief-runtime", "continue the work")
+        .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().any(|message| {
+        matches!(
+            message.blocks.as_slice(),
+            [Block::Text { text }]
+                if text.starts_with("GraphBrief: BUILD attempt 1/8;")
+        )
+    }));
+    let events = world
+        .store
+        .read(&world.session_id, 0, 2048)
+        .await
+        .expect("journal");
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.payload.to_string().contains("GraphBrief:"))
+    );
+}
+
+/// CG-M1 runtime law: the advertised model tool can only testify. The
+/// dispatcher stamps durable evidence and the daemon-generated gate facts
+/// move BUILD to VERIFY; no successor or attempt is accepted from tool args.
+#[tokio::test]
+async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "graph-build-green".into(),
+            name: "graph_evidence".into(),
+            args: serde_json::json!({
+                "node": "BUILD",
+                "verdict": "green",
+                "detail": "cargo build passed"
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "graph-build-green".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let world = World::boot("graph-evidence-runtime", provider.clone()).await;
+    world
+        .hub
+        .pin_graph(GraphPinCommand {
+            command_id: "pin-graph-evidence-runtime".into(),
+            request_digest: "pin-graph-evidence-runtime-digest".into(),
+            request_json: r#"{"template":"ship-loop"}"#.into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            graph_id: GraphId::new("graph-evidence-runtime"),
+            template: SHIP_LOOP_TEMPLATE.into(),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("pin graph");
+    let run_id = world
+        .run_turn("graph-evidence-runtime", "build and record evidence")
+        .await;
+    let status = world
+        .hub
+        .graph_status(&world.session_id)
+        .await
+        .expect("status")
+        .expect("graph");
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::GraphNodeName::Verify)
+    );
+    assert_eq!(status.attempt, 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].messages.last().is_some_and(|message| {
+        matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("GraphBrief: BUILD attempt 1/8;"))
+    }));
+    assert!(requests[1].messages.last().is_some_and(|message| {
+        matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("GraphBrief: VERIFY attempt 1/8;"))
+    }));
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .filter(|message| matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("GraphBrief:")))
+            .count()
+            == 1,
+        "same-turn continuation replaces the volatile graph tail"
+    );
+    let payloads = world.typed_payloads().await;
+    assert!(payloads.iter().any(|(payload, _)| {
+        matches!(
+            payload,
+            EventPayload::EvidenceRecorded(recorded)
+                if recorded.node == haider_protocol::graph::GraphNodeName::Build
+                    && matches!(
+                        &recorded.source,
+                        haider_protocol::graph::GraphEvidenceSource::Model {
+                            run_id: source_run,
+                            call_id
+                        } if source_run == &run_id && call_id == "graph-build-green"
+                    )
+        )
+    }));
+}
+
+/// CG-M1 LAW: outstanding VERIFY testimony is graph-local. It neither parks
+/// the session nor changes the ordinary provider/run-state lifecycle.
+#[tokio::test]
+async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let world = World::boot("graph-verify-nonblocking", provider).await;
+    world
+        .hub
+        .pin_graph(GraphPinCommand {
+            command_id: "pin-graph-verify-nonblocking".into(),
+            request_digest: "pin-graph-verify-nonblocking-digest".into(),
+            request_json: r#"{"template":"ship-loop"}"#.into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            graph_id: GraphId::new("graph-verify-nonblocking"),
+            template: SHIP_LOOP_TEMPLATE.into(),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("pin graph");
+    world
+        .hub
+        .record_graph_evidence(haider_core::GraphEvidenceCommand {
+            command_id: "graph-verify-nonblocking-build".into(),
+            request_digest: "graph-verify-nonblocking-build-digest".into(),
+            request_json: r#"{"node":"BUILD","verdict":"green"}"#.into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            run_id: RunId::new("prior-build-run"),
+            call_id: "prior-build-call".into(),
+            node: haider_protocol::graph::GraphNodeName::Build,
+            verdict: haider_protocol::graph::EvidenceVerdict::Green,
+            detail: "build passed".into(),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("BUILD advances to VERIFY");
+    let run_id = world
+        .run_turn("graph-verify-nonblocking", "ordinary interactive followup")
+        .await;
+    let payloads = world.typed_payloads().await;
+    assert!(
+        payloads
+            .iter()
+            .any(|(payload, _)| { matches!(payload, EventPayload::RunState(RunState::Done)) })
+    );
+    assert!(!payloads.iter().any(|(payload, _)| {
+        matches!(payload, EventPayload::RunState(RunState::Waiting { .. }))
+    }));
+    let events = world
+        .store
+        .read(&world.session_id, 0, 2048)
+        .await
+        .expect("journal");
+    assert!(events.iter().any(|event| {
+        event.run_id.as_ref() == Some(&run_id)
+            && matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::RunState(RunState::Done))
+            )
+    }));
+}
+
 /// L1 registry: `todo_write` is one canonical registry entry — advertised in
 /// provider definitions, resolvable by name to its typed route, and policy
 /// `NotApplicable` (no brokered effect), awaited like `request_input`.
@@ -256,13 +458,14 @@ fn todo_write_is_registered_advertised_and_routable() {
     );
 }
 
-/// L5 (advertisement seam): the root pack keeps `todo_write`; a delegated
-/// child's pack removes EXACTLY that one tool.
+/// L5/CG-M1 (advertisement seam): the root pack keeps `todo_write` and
+/// `graph_evidence`; a delegated child's pack removes exactly those two
+/// root-authority tools.
 /// MUTATION CHECK: stop filtering (or filter the wrong name) in
 /// `advertised_tool_definitions`. Expected RUNTIME failure: the child pack
 /// below still advertises todo_write, or loses a second tool.
 #[test]
-fn child_tool_pack_excludes_exactly_todo_write() {
+fn child_tool_pack_excludes_root_authority_tools() {
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let root = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
     let child = advertised_tool_definitions(
@@ -280,7 +483,12 @@ fn child_tool_pack_excludes_exactly_todo_write() {
             .iter()
             .any(|definition| definition.name == "todo_write")
     );
-    assert_eq!(root.len(), child.len() + 1, "exactly one tool removed");
+    assert!(
+        !child
+            .iter()
+            .any(|definition| definition.name == "graph_evidence")
+    );
+    assert_eq!(root.len(), child.len() + 2, "exactly two tools removed");
     for definition in &child {
         assert!(
             root.iter().any(|other| other.name == definition.name),

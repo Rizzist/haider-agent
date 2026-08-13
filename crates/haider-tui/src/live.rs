@@ -221,6 +221,32 @@ pub enum LiveCommand {
     SessionFleet {
         session: SessionId,
     },
+    /// `graph.status` — a READ of the daemon's Convergence Graph reduction
+    /// for the active session (`convergence_graph_v1`). Receipt-free, never
+    /// outboxed: the strip and `/graph` view open one, the event-cadence
+    /// chase re-reads while a graph is pinned, and a socket loss leaves the
+    /// held reduction (the reconnect resume re-reads).
+    GraphStatus {
+        session: SessionId,
+    },
+    /// `graph.pin` — receipt-backed pin of the built-in ship-loop template
+    /// (CG-M1). DURABLE: a lost response retries under the same command id
+    /// and replays the same committed pin. Installs NOTHING locally — the
+    /// daemon's `GraphPinned` fact (and the chased `graph.status`) move the
+    /// strip.
+    GraphPin {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+    },
+    /// `graph.abandon` — receipt-backed abandonment of the active graph.
+    /// Same durable discipline as [`Self::GraphPin`].
+    GraphAbandon {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        why: String,
+    },
     /// `hooks.trust` / `hooks.revoke` — a receipted digest pin or
     /// revocation (H3's R2 pattern). DURABLE: a lost response retries under
     /// the same command id and replays the same committed change. The
@@ -462,6 +488,9 @@ impl LiveCommand {
             | Self::ProviderRemove { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
             Self::HooksTrust { command_id, .. } => Some(command_id),
+            Self::GraphPin { command_id, .. } | Self::GraphAbandon { command_id, .. } => {
+                Some(command_id)
+            }
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::DeviceImport { command_id, .. } => Some(command_id),
@@ -488,6 +517,8 @@ impl LiveCommand {
             | Self::UsageReport
             // The fleet snapshot is a read (see above).
             | Self::SessionFleet { .. }
+            // The graph reduction is a read (see above).
+            | Self::GraphStatus { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. }
             // T2: reads + the deliberately receipt-free secret set (no
@@ -658,6 +689,24 @@ pub enum LiveReply {
     /// precedent): the typed message lands on the fleet screen.
     FleetFailed {
         message: String,
+    },
+    /// One committed `graph.status` reduction for a session. `status: None`
+    /// means the session never pinned a graph (clears the strip). The
+    /// session id lets a stale reply for a since-switched session install
+    /// nothing (the fleet precedent).
+    Graph {
+        session: SessionId,
+        status: Box<Option<haider_protocol::graph::GraphStatus>>,
+    },
+    /// `graph.status` FAILED. A background strip read: it just clears the
+    /// in-flight gate and leaves the held reduction untouched (the feature
+    /// gate lives at the emitter, so this is never a feature-absent case).
+    GraphFailed,
+    /// `graph.pin` / `graph.abandon` committed: the daemon's receipt. It
+    /// retires the outbox entry and chains a fresh `graph.status` — the
+    /// strip itself moves only on daemon truth (the branch discipline).
+    GraphMutated {
+        command_id: CommandId,
     },
     /// `hooks.trust` / `hooks.revoke` committed: the daemon's receipt. It
     /// retires the outbox entry and chains a fresh `hooks.list` — the rows
@@ -1094,6 +1143,10 @@ pub struct LiveDriver {
     /// re-reads once when the outstanding reply lands. No timer anywhere.
     fleet_inflight: bool,
     fleet_chase: bool,
+    /// Single-flight gate for the receipt-free `graph.status` read: one in
+    /// flight at a time; concurrent asks fold into one chase re-read.
+    graph_inflight: bool,
+    graph_chase: bool,
 }
 
 /// How long the login card may sit in `Submitting` before it says so —
@@ -1167,6 +1220,8 @@ impl LiveDriver {
             incompatible_sessions: std::collections::HashSet::new(),
             fleet_inflight: false,
             fleet_chase: false,
+            graph_inflight: false,
+            graph_chase: false,
         }
     }
 
@@ -1626,6 +1681,28 @@ impl LiveDriver {
                 self.fleet_chase = false;
                 model.fleet_failed(&message);
                 Vec::new()
+            }
+            LiveReply::Graph { session, status } => {
+                self.graph_inflight = false;
+                model.apply_graph_status(&session, *status);
+                // Facts applied while the read flew folded into ONE chase:
+                // re-read now, only while a graph is still pinned.
+                if std::mem::take(&mut self.graph_chase) {
+                    return self.graph_refresh(model);
+                }
+                Vec::new()
+            }
+            LiveReply::GraphFailed => {
+                self.graph_inflight = false;
+                self.graph_chase = false;
+                Vec::new()
+            }
+            LiveReply::GraphMutated { command_id } => {
+                // The receipt retires the gate and INSTALLS NOTHING — the
+                // chained `graph.status` (and the daemon's own facts) move
+                // the strip. Same branch discipline as `hooks.trust`.
+                self.retire(&command_id);
+                self.graph_refresh(model)
             }
             LiveReply::HookTrustChanged {
                 command_id,
@@ -2742,6 +2819,10 @@ impl LiveDriver {
                 self.fleet_inflight = false;
                 self.fleet_chase = false;
                 model.fleet_note_disconnect();
+                // The graph read is receipt-free too: the gate opens here so
+                // the held reduction stays and the reconnect resume re-reads.
+                self.graph_inflight = false;
+                self.graph_chase = false;
                 // B4b: `artifact.put` is receipt-free — an in-flight
                 // upload's reply can never arrive and nothing resends it,
                 // so its chip dies HERE, named, instead of spinning
@@ -2767,6 +2848,12 @@ impl LiveDriver {
                 // snapshot on the fresh socket — the same one-emitter seam.
                 if model.screen == crate::app::Screen::Fleet {
                     commands.extend(self.fleet_refresh(model));
+                }
+                // A pinned graph re-reads its reduction on the fresh socket:
+                // the strip lives on the session screen, so the resume is
+                // unconditional whenever we still hold graph state.
+                if model.graph.is_some() {
+                    commands.extend(self.graph_refresh(model));
                 }
                 commands
             }
@@ -3000,6 +3087,41 @@ impl LiveDriver {
         self.fleet_refresh(model)
     }
 
+    /// Issue the single-flight `graph.status` read for the ACTIVE session,
+    /// folding concurrent asks into one chase. The ONE emitter — the `/graph`
+    /// open, the graph-fact event chase and the reconnect resume all route
+    /// here, so single-flight holds by construction.
+    fn graph_refresh(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        // The feature gate lives HERE, so every emitter — open, `/graph`,
+        // the event chase and the reconnect resume — is covered by
+        // construction: an old daemon never receives a `graph.status`.
+        if !model.daemon_serves(haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1) {
+            return Vec::new();
+        }
+        let Some(session) = model.active_session.clone() else {
+            return Vec::new();
+        };
+        if self.graph_inflight {
+            self.graph_chase = true;
+            return Vec::new();
+        }
+        self.graph_inflight = true;
+        vec![LiveCommand::GraphStatus { session }]
+    }
+
+    /// The graph strip lives on the SESSION screen, always visible while a
+    /// graph is pinned — so its refresh cadence is the event stream itself:
+    /// one applied graph-fact envelope for the attached session (any screen)
+    /// chases one bounded re-read, folded through the single-flight gate.
+    /// Once no graph state is held AND the fact is not itself a pin, there is
+    /// nothing to keep current, so a quiet session never re-reads.
+    fn graph_event_chase(&mut self, model: &AppModel, session: &SessionId) -> Vec<LiveCommand> {
+        if model.active_session.as_ref() != Some(session) {
+            return Vec::new();
+        }
+        self.graph_refresh(model)
+    }
+
     fn on_event(
         &mut self,
         model: &mut AppModel,
@@ -3075,6 +3197,21 @@ impl LiveDriver {
         // only an APPLIED envelope can have moved the tree.
         if applied {
             let mut commands = self.fleet_event_chase(model, session);
+            // The graph strip's event-cadence chase: keep the reduction
+            // current while a graph is unfinished, and catch every graph
+            // fact (pin/completion/abandon flips the strip's presence).
+            let payload_is_graph = envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|tag| tag.starts_with("graph_") || tag == "evidence_recorded");
+            let graph_live = model
+                .graph
+                .as_ref()
+                .is_some_and(haider_protocol::graph::GraphStatus::is_unfinished);
+            if model.active_session.as_ref() == Some(session) && (graph_live || payload_is_graph) {
+                commands.extend(self.graph_event_chase(model, session));
+            }
             if model.screen == crate::app::Screen::Hooks
                 && model.active_session.as_ref() == Some(session)
                 && let Ok(haider_protocol::hook::HookEventPayload::HookTrustChanged {
@@ -3659,6 +3796,35 @@ impl LiveDriver {
             // Fleet: a read — never outboxed, single-flight (the chase
             // fold lives in `fleet_refresh`).
             AppRequest::FleetRefresh => self.fleet_refresh(model),
+            AppRequest::GraphRefresh => self.graph_refresh(model),
+            AppRequest::GraphPin => {
+                // Receipt-backed pin of the built-in ship-loop. Installs
+                // NOTHING locally — the daemon's `GraphPinned` fact and the
+                // chained `graph.status` move the strip (the branch law).
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::GraphPin {
+                    command_id,
+                    session,
+                    worker_generation,
+                })]
+            }
+            AppRequest::GraphAbandon { why } => {
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::GraphAbandon {
+                    command_id,
+                    session,
+                    worker_generation,
+                    why,
+                })]
+            }
             AppRequest::HooksTrust { digest, trusted } => {
                 let command_id = self.mint();
                 self.pending_hook_trust = Some((command_id.clone(), digest.clone()));

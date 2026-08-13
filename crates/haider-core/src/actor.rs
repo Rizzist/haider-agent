@@ -119,6 +119,10 @@ pub struct HarnessConfig {
     pub context_compaction_v1: bool,
     /// Deterministic daemon-owned policy bound to every request in this actor.
     pub system_prompt: Option<String>,
+    /// Ephemeral daemon-authored user-role context appended after compiler
+    /// cache boundaries are frozen. It is never journaled or hashed into the
+    /// stable prefix. Convergence Graph M1 uses this for `GraphBrief`.
+    pub volatile_user_tail: Option<String>,
     /// General tools the paired dispatcher can execute.
     pub tools: Vec<ToolDefinition>,
     /// Local equivalents advertised after one exact provider-hosted-tool
@@ -197,6 +201,7 @@ impl HarnessConfig {
             cached_input_is_subset: true,
             context_compaction_v1: false,
             system_prompt: None,
+            volatile_user_tail: None,
             tools: Vec::new(),
             provider_tool_fallback_tools: Vec::new(),
             attachments: Vec::new(),
@@ -483,6 +488,14 @@ pub trait ToolDispatcher: Send + Sync {
         args: serde_json::Value,
         cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError>;
+
+    /// Returns a freshly reduced provider-only context tail. `None` means
+    /// this dispatcher does not manage volatile context; `Some("")` clears a
+    /// previously supplied tail. Daemon dispatchers use this to refresh a
+    /// GraphBrief before every provider continuation after gate evidence.
+    async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
+        Ok(None)
+    }
 
     /// Applies a permission answer only after the actor has observed the
     /// daemon CAS's committed `MenuAnswered` envelope.
@@ -1047,6 +1060,11 @@ impl HarnessActor {
             .config
             .cache_compaction_summary_end
             .filter(|boundary| *boundary <= stable_history_end);
+        // Provider-only context remains separate from the reconstructed
+        // conversation. It is appended to each request only after cache
+        // boundaries and context policy have been computed, then refreshed
+        // through the dispatcher before a same-turn continuation.
+        let mut volatile_user_tail = self.config.volatile_user_tail.take();
 
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
@@ -1271,13 +1289,35 @@ impl HarnessActor {
         let mut tool_json_repair_used = false;
 
         'requests: loop {
+            if let Some(dispatcher) = self.dispatcher.as_ref() {
+                match dispatcher.refresh_volatile_context_tail().await {
+                    Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
+                    Ok(None) => {}
+                    Err(error) => {
+                        return self
+                            .errored_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                error,
+                            )
+                            .await;
+                    }
+                }
+            }
             messages.extend(
                 std::mem::take(&mut self.pending_nudges)
                     .into_iter()
                     .map(Message::user_text),
             );
             let request_projection_compacted = match self
-                .enforce_context_policy(&run_id, &mut messages, current_turn_start)
+                .enforce_context_policy(
+                    &run_id,
+                    &mut messages,
+                    current_turn_start,
+                    volatile_user_tail.as_deref(),
+                )
                 .await
             {
                 Ok(compacted) => compacted,
@@ -1332,8 +1372,12 @@ impl HarnessActor {
                 prefix_digests.clone(),
                 usage_account.as_ref(),
             );
+            let mut request_messages = messages.clone();
+            if let Some(tail) = &volatile_user_tail {
+                request_messages.push(Message::user_text(tail.clone()));
+            }
             let mut provider_request = TurnRequest {
-                messages: messages.clone(),
+                messages: request_messages,
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
                 system_prompt: self.config.system_prompt.clone(),
@@ -2727,8 +2771,19 @@ impl HarnessActor {
         run_id: &RunId,
         messages: &mut Vec<Message>,
         current_turn_start: usize,
+        volatile_user_tail: Option<&str>,
     ) -> Result<bool, DriveError> {
-        let before = estimated_context_footprint(&self.config, messages);
+        // Volatile context is excluded from durable cache boundaries, but it
+        // still consumes real provider input capacity. Measure a request-only
+        // projection so the hard-fit policy remains honest without allowing
+        // the tail into compaction or journal history.
+        let before = if let Some(tail) = volatile_user_tail {
+            let mut measured = messages.clone();
+            measured.push(Message::user_text(tail));
+            estimated_context_footprint(&self.config, &measured)
+        } else {
+            estimated_context_footprint(&self.config, messages)
+        };
         if self.config.context_compaction_v1 {
             self.commit_context_footprint(run_id, &before)
                 .await

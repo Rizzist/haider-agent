@@ -1412,6 +1412,12 @@ impl DemoDriver {
             // Fleet live-only vocabulary: demo synthesizes its snapshot
             // from the local chips at open and never pushes the read.
             | AppRequest::FleetRefresh
+            // CG-M1 live-only vocabulary: graph reduction is daemon truth,
+            // never fabricated in demo; the feature gate drops the read,
+            // and the mutations refuse honestly upstream.
+            | AppRequest::GraphRefresh
+            | AppRequest::GraphPin
+            | AppRequest::GraphAbandon { .. }
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }

@@ -100,21 +100,23 @@ use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
 use haider_core::{
-    AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn,
-    CreatedBranch, CreatedSession, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast,
-    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
-    SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    AbandonedGraph, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
+    CancelledTurn, CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, HarnessHandle,
+    MenuResolutionCommand, MenuResolutionOutcome, PinnedGraph, ProfileStoreFault,
+    PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast, SelectedModel,
+    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{BranchId, DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, GraphId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{
     AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind,
     effect_recovery_menu,
@@ -126,6 +128,7 @@ use haider_rpc::{
     ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED, ERROR_CODE_ATTACHMENT_NOT_FOUND,
     ERROR_CODE_ATTACHMENT_TOO_LARGE, ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY,
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
+    ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE, ERROR_CODE_GRAPH_WRONG_NODE,
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
     ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
     ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
@@ -784,6 +787,18 @@ enum ActorCommand {
     Rename {
         command: SessionRenameCommand,
         completed: oneshot::Sender<Result<SessionRenameOutcome, HaiderError>>,
+    },
+    PinGraph {
+        command: GraphPinCommand,
+        completed: oneshot::Sender<Result<GraphPinOutcome, HaiderError>>,
+    },
+    AbandonGraph {
+        command: GraphAbandonCommand,
+        completed: oneshot::Sender<Result<GraphAbandonOutcome, HaiderError>>,
+    },
+    RecordGraphEvidence {
+        command: GraphEvidenceCommand,
+        completed: oneshot::Sender<Result<GraphEvidenceOutcome, HaiderError>>,
     },
     SelectEffort {
         command: SessionSelectEffortCommand,
@@ -1656,6 +1671,102 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::Rename { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn graph_status(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<haider_protocol::graph::GraphStatus>, SessionHubError> {
+        self.inner
+            .store
+            .graph_status(session_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn graph_pin_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<PinnedGraph>, SessionHubError> {
+        self.inner
+            .store
+            .graph_pin_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn pin_graph(
+        &self,
+        command: GraphPinCommand,
+    ) -> Result<GraphPinOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::PinGraph { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn graph_abandon_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<AbandonedGraph>, SessionHubError> {
+        self.inner
+            .store
+            .graph_abandon_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn abandon_graph(
+        &self,
+        command: GraphAbandonCommand,
+    ) -> Result<GraphAbandonOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AbandonGraph { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn record_graph_evidence(
+        &self,
+        command: GraphEvidenceCommand,
+    ) -> Result<GraphEvidenceOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RecordGraphEvidence { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

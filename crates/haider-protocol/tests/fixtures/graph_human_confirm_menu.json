@@ -1,0 +1,31 @@
+{
+  "type": "menu_opened",
+  "id": "graph-confirm-graph-ship-loop-1-2",
+  "kind": {
+    "kind": "graph_human_confirm",
+    "graph_id": "graph-ship-loop-1",
+    "node": "SHIP",
+    "attempt": 2
+  },
+  "title": "Ship this graph?",
+  "body": [
+    "BUILD and VERIFY are green for the current attempt epoch."
+  ],
+  "options": [
+    {
+      "key": "confirm",
+      "label": "Confirm ship",
+      "detail": "Satisfy SHIP and complete the graph."
+    },
+    {
+      "key": "hold",
+      "label": "Hold",
+      "detail": "Park the graph for explicit re-pin or abandon."
+    }
+  ],
+  "blocking": false,
+  "scope": {
+    "scope": "session"
+  },
+  "origin": "convergence-graph"
+}

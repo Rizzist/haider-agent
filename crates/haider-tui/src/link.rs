@@ -572,6 +572,10 @@ pub struct CommandContext {
     /// This request was a `session.fleet` read (fleet view). Same identity
     /// pattern: the error reply lands on the fleet screen.
     fleet: bool,
+    /// The session a `graph.status` read was for (CG-M1). The response carries
+    /// no session id, so this is the ONLY thing that tags the reduction back
+    /// to its session (the stale-reply guard) and lands an error on the strip.
+    graph: Option<haider_protocol::ids::SessionId>,
     /// This request was a transcription-secret RPC (T2). Same identity
     /// pattern: neither carries a durable command id, so the error reply
     /// is tagged with WHICH operation failed and lands on the talk flow.
@@ -627,6 +631,10 @@ impl CommandContext {
             hooks_list: matches!(command, LiveCommand::HooksList { .. }),
             usage_report: matches!(command, LiveCommand::UsageReport),
             fleet: matches!(command, LiveCommand::SessionFleet { .. }),
+            graph: match command {
+                LiveCommand::GraphStatus { session } => Some(session.clone()),
+                _ => None,
+            },
             transcription: match command {
                 LiveCommand::TranscriptionSecretGet => Some(crate::live::TranscriptionOp::Get),
                 LiveCommand::TranscriptionSecretSet { .. } => {
@@ -817,6 +825,30 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::UsageReport => RequestBody::UsageReport,
         LiveCommand::SessionFleet { session } => RequestBody::SessionFleet {
             session_id: session,
+        },
+        LiveCommand::GraphStatus { session } => RequestBody::GraphStatus {
+            session_id: session,
+        },
+        LiveCommand::GraphPin {
+            command_id,
+            session,
+            worker_generation,
+        } => RequestBody::GraphPin {
+            command_id,
+            session_id: session,
+            worker_generation,
+            template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.to_owned(),
+        },
+        LiveCommand::GraphAbandon {
+            command_id,
+            session,
+            worker_generation,
+            why,
+        } => RequestBody::GraphAbandon {
+            command_id,
+            session_id: session,
+            worker_generation,
+            why,
         },
         // The trusted flag is COMMAND SELECTION, not wire data: `true` is
         // the `hooks.trust` method, `false` `hooks.revoke` — both carry
@@ -1192,6 +1224,24 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionFleet { snapshot } => vec![LiveReply::Fleet {
             snapshot: Box::new(snapshot),
         }],
+        // The reduction carries no session id — tag it from the request
+        // context so a stale reply for a since-switched session installs
+        // nothing. A read with no context session cannot be routed; drop it.
+        ResponseBody::GraphStatus { status } => match context.graph.clone() {
+            Some(session) => vec![LiveReply::Graph {
+                session,
+                status: Box::new(status),
+            }],
+            None => Vec::new(),
+        },
+        // Both graph mutations carry the same driver fact: the receipt id
+        // retires the outbox and chains a `graph.status`. The strip moves
+        // on daemon truth, never on this reply (the branch discipline).
+        ResponseBody::GraphPin { .. } | ResponseBody::GraphAbandon { .. } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::GraphMutated { command_id: id }]
+            })
+        }
         // Both trust receipts carry the same driver fact — which METHOD
         // answered is already encoded in the committed `trusted` flag.
         ResponseBody::HooksTrust { digest, trusted }
@@ -1487,6 +1537,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     return vec![LiveReply::FleetFailed {
                         message: message.clone(),
                     }];
+                }
+                // A `graph.status` error just clears the strip's in-flight
+                // gate (background read — the held reduction stays).
+                if context.graph.is_some() {
+                    return vec![LiveReply::GraphFailed];
                 }
                 // T2: a transcription-secret error is identity-tagged with
                 // its OPERATION — the failure lands on the talk flow (the

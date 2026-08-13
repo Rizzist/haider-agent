@@ -15,9 +15,10 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn, Cas,
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
-    DelegationRecord, EventStore, HookTrustChange, HookTrustCommand, MenuResolutionCommand,
-    MenuResolutionOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome,
-    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
+    DelegationRecord, EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
+    GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, HookTrustChange, HookTrustCommand,
+    MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, SessionCreateCommand,
+    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
     TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
@@ -169,6 +170,69 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.session_metadata(&session_id))).await
+    }
+
+    pub async fn graph_status(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<haider_protocol::graph::GraphStatus>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || owner.with_store(|store| store.graph_status(&session_id))).await
+    }
+
+    pub async fn graph_pin_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::PinnedGraph>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.graph_pin_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn pin_graph(
+        &self,
+        command: GraphPinCommand,
+    ) -> Result<GraphPinOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.pin_graph(&command))).await
+    }
+
+    pub async fn graph_abandon_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::AbandonedGraph>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.graph_abandon_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn abandon_graph(
+        &self,
+        command: GraphAbandonCommand,
+    ) -> Result<GraphAbandonOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.abandon_graph(&command))).await
+    }
+
+    pub async fn record_graph_evidence(
+        &self,
+        command: GraphEvidenceCommand,
+    ) -> Result<GraphEvidenceOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.record_graph_evidence(&command))).await
     }
 
     /// Preflights a durable session-create receipt before workspace I/O.

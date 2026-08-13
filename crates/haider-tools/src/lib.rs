@@ -8,6 +8,7 @@
 mod broker;
 mod error;
 mod filesystem;
+mod graph_evidence;
 mod ledger;
 mod message_subagent;
 mod process;
@@ -28,6 +29,7 @@ pub use filesystem::{
     CasSink, FsCaseMode, FsEdit, FsGlob, FsList, FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite,
     ResultBounds, TurnAttribution,
 };
+pub use graph_evidence::{GraphEvidence, graph_evidence_manifest};
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 pub use message_subagent::{MessageSubagent, message_subagent_manifest};
 pub use process::{

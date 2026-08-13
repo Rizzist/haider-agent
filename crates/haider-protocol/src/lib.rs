@@ -18,6 +18,7 @@ pub mod credential;
 pub mod effect;
 pub mod envelope;
 pub mod error;
+pub mod graph;
 pub mod history;
 pub mod hook;
 pub mod ids;
@@ -97,6 +98,15 @@ pub enum EventPayload {
     },
     // verification
     GateReport(verify::GateReport),
+    // convergence graph (M1: daemon authority, model-authored evidence only)
+    GraphPinned(graph::GraphPinned),
+    GraphAttemptOpened(graph::GraphAttemptOpened),
+    EvidenceRecorded(graph::EvidenceRecorded),
+    GraphGateSatisfied(graph::GraphGateSatisfied),
+    GraphAdvanced(graph::GraphAdvanced),
+    GraphBlocked(graph::GraphBlocked),
+    GraphCompleted(graph::GraphCompleted),
+    GraphAbandoned(graph::GraphAbandoned),
     // accounts
     Rotation(credential::RotationEvent),
     // token accounting

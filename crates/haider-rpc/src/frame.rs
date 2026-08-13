@@ -7,8 +7,9 @@ use haider_protocol::agent::{AgentMessageReceipt, AgentMetricsSnapshot, AgentUsa
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::graph::GraphStatus as ConvergenceGraphStatus;
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, GraphId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
@@ -211,6 +212,9 @@ pub const ERROR_CODE_FAST_UNSUPPORTED: &str = "fast_unsupported";
 /// A cache-sensitive live-session change needs an explicit second-step
 /// confirmation to create a fresh epoch.
 pub const ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED: &str = "cache_epoch_confirmation_required";
+pub const ERROR_CODE_GRAPH_ALREADY_ACTIVE: &str = "graph_already_active";
+pub const ERROR_CODE_GRAPH_NOT_ACTIVE: &str = "graph_not_active";
+pub const ERROR_CODE_GRAPH_WRONG_NODE: &str = "graph_wrong_node";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -288,6 +292,8 @@ pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
 /// per-account OAuth meters (normalized 0–1 utilization) plus journal-derived
 /// local counters. Never carries secret material.
 pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+/// Daemon implements Convergence Graph M1 pin/evidence/status/abandon.
+pub const FEATURE_CONVERGENCE_GRAPH_V1: &str = "convergence_graph_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1163,6 +1169,22 @@ pub enum RequestBody {
     /// durable delegation and child-journal truth. Read-only and receipt-free.
     #[serde(rename = "session.fleet")]
     SessionFleet { session_id: SessionId },
+    #[serde(rename = "graph.pin")]
+    GraphPin {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        template: String,
+    },
+    #[serde(rename = "graph.abandon")]
+    GraphAbandon {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        why: String,
+    },
+    #[serde(rename = "graph.status")]
+    GraphStatus { session_id: SessionId },
     /// Persists a client-detected compatibility fault in the session journal.
     #[serde(rename = "session.diagnostic")]
     SessionDiagnostic {
@@ -1580,6 +1602,28 @@ pub enum ResponseBody {
     SessionObserve { digest: SessionObserveDigest },
     #[serde(rename = "session.fleet")]
     SessionFleet { snapshot: SessionFleetSnapshot },
+    #[serde(rename = "graph.pin")]
+    GraphPin {
+        session_id: SessionId,
+        graph_id: GraphId,
+        template: String,
+        digest: String,
+        pinned_seq: u64,
+        opened_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "graph.abandon")]
+    GraphAbandon {
+        session_id: SessionId,
+        graph_id: GraphId,
+        abandoned_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "graph.status")]
+    GraphStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ConvergenceGraphStatus>,
+    },
     #[serde(rename = "session.diagnostic")]
     SessionDiagnostic { recorded_seq: u64 },
     #[serde(rename = "hooks.list")]

@@ -8,12 +8,14 @@ use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectOutcome, EffectPhase,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::ids::{AgentId, BranchId, EventId, ItemId, MenuId, RunId};
+use haider_protocol::graph::{EvidenceVerdict, GraphNodeName, GraphPhase, SHIP_LOOP_TEMPLATE};
+use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
 use haider_store::{
-    SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
+    GraphEvidenceCommand, GraphPinCommand, SessionCreateCommand, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, TurnAcceptCommand,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +35,116 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         default_model: None,
         enabled: true,
     }
+}
+
+/// CG-M1 LAW: an open VERIFY obligation is graph-local state, not a session
+/// park. An ordinary turn acceptance still commits its normal queued/user
+/// facts and never synthesizes a graph-specific run wait state.
+#[tokio::test]
+async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("graph-node-scoped-wait");
+    let generation = store.worker_generation();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-graph-node-scoped-wait".into(),
+        request_digest: "create-graph-node-scoped-wait-digest".into(),
+        request_json: r#"{"session":"graph-node-scoped-wait"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+            .expect("canonical cwd")
+            .to_string_lossy()
+            .into_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-graph-node-scoped-wait"),
+        device_id: DeviceId::new("graph-test"),
+    })
+    .await
+    .expect("create session");
+    hub.pin_graph(GraphPinCommand {
+        command_id: "pin-node-scoped".into(),
+        request_digest: "pin-node-scoped-digest".into(),
+        request_json: r#"{"template":"ship-loop"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        graph_id: GraphId::new("graph-node-scoped"),
+        template: SHIP_LOOP_TEMPLATE.into(),
+        device_id: DeviceId::new("graph-test"),
+    })
+    .await
+    .expect("pin graph");
+    hub.record_graph_evidence(GraphEvidenceCommand {
+        command_id: "evidence-node-scoped-build".into(),
+        request_digest: "evidence-node-scoped-build-digest".into(),
+        request_json: r#"{"node":"BUILD","verdict":"green"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        run_id: RunId::new("build-evidence-run"),
+        call_id: "build-evidence-call".into(),
+        node: GraphNodeName::Build,
+        verdict: EvidenceVerdict::Green,
+        detail: "build passed".into(),
+        device_id: DeviceId::new("graph-test"),
+    })
+    .await
+    .expect("BUILD evidence");
+    let status = hub
+        .graph_status(&session_id)
+        .await
+        .expect("graph status")
+        .expect("graph");
+    assert_eq!(status.phase, GraphPhase::Active);
+    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(status.nodes[1].evidence.green, 0);
+
+    let accepted = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "turn-during-verify".into(),
+            request_digest: "turn-during-verify-digest".into(),
+            request_json: r#"{"text":"ordinary interactive followup"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: RunId::new("turn-during-verify-run"),
+            agent_id: None,
+            branch_id: None,
+            text: "ordinary interactive followup".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Queue,
+            queued_event_id: EventId::new("turn-during-verify-queued"),
+            user_event_id: EventId::new("turn-during-verify-user"),
+            active_event_id: EventId::new("turn-during-verify-active"),
+            device_id: DeviceId::new("graph-test"),
+        })
+        .await
+        .expect("interactive turn remains admissible");
+    assert_eq!(accepted.run_id, RunId::new("turn-during-verify-run"));
+    let events = store.read(&session_id, 0, 128).await.expect("history");
+    assert!(events.iter().any(|event| {
+        matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::UserMessage { ref text, .. })
+                if text == "ordinary interactive followup"
+        )
+    }));
+    let status = hub
+        .graph_status(&session_id)
+        .await
+        .expect("graph status")
+        .expect("graph");
+    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(status.phase, GraphPhase::Active);
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+    drop(root);
 }
 
 /// MUTATION CHECK: make `StopIfQuiescent` stop first and let the deleter
@@ -919,6 +1031,100 @@ async fn worker_head_cas_tolerates_a_rename_fact_delta() {
             .iter()
             .any(|event| event.event_id == EventId::new("rename-cas-batch")),
         "the tolerated batch is durably committed"
+    );
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// CG-M1 LAW: graph lifecycle facts advance only the session journal, never
+/// the conversation tree. A pin interleaving a planned compaction therefore
+/// preserves the compaction parent just like a session-config fact does.
+#[tokio::test]
+async fn worker_head_cas_tolerates_a_graph_fact_delta() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("compaction-head-cas-graph");
+    let run_id = RunId::new("compaction-head-cas-graph-run");
+    let generation = store.worker_generation();
+    let mut queued = [run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "graph-cas-queued",
+        RunState::Queued,
+    )];
+    hub.append(&mut queued).await.expect("queued prefix");
+    let expected_head = store.latest_seq(&session_id).await.expect("head");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("lease");
+    let actor = hub
+        .existing_actor(&session_id)
+        .expect("actor lookup")
+        .expect("actor exists");
+
+    let mut graph_fact = run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "graph-cas-pinned",
+        RunState::Queued,
+    );
+    graph_fact.run_id = None;
+    graph_fact.payload = serde_json::to_value(EventPayload::GraphPinned(
+        haider_protocol::graph::GraphPinned {
+            graph_id: GraphId::new("graph-cas-instance"),
+            template: SHIP_LOOP_TEMPLATE.into(),
+            digest: haider_protocol::graph::ship_loop_digest(),
+            nodes: haider_protocol::graph::ship_loop_nodes(),
+        },
+    ))
+    .expect("graph fact serializes");
+    let (advance_completed, advance_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::Append {
+            envelopes: vec![graph_fact],
+            completed: advance_completed,
+        })
+        .await
+        .expect("advance queues");
+    let (cas_completed, cas_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::WorkerAppend {
+            lease_id: lease.lease_id.clone(),
+            expected_head: Some(expected_head),
+            envelopes: vec![run_state_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "graph-cas-batch",
+                RunState::Streaming,
+            )],
+            completed: cas_completed,
+        })
+        .await
+        .expect("CAS queues behind graph fact");
+
+    advance_response
+        .await
+        .expect("advance response")
+        .expect("graph fact commits");
+    cas_response
+        .await
+        .expect("CAS response")
+        .expect("a graph-fact-only delta must not reject the batch");
+    let history = store.read(&session_id, 0, 16).await.expect("history");
+    assert!(
+        history
+            .iter()
+            .any(|event| event.event_id == EventId::new("graph-cas-batch"))
     );
 
     hub.shutdown().await.expect("hub shutdown");
