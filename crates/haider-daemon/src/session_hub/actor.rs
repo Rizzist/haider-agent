@@ -343,6 +343,81 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::PinGraph { command, completed } => {
+                let result = store.pin_graph(command).await;
+                if let Ok(GraphPinOutcome::Committed { envelopes, .. }) = &result {
+                    if let Some(last) = envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
+            ActorCommand::AbandonGraph { command, completed } => {
+                let result = store.abandon_graph(command).await;
+                if let Ok(GraphAbandonOutcome::Committed { envelopes, .. }) = &result {
+                    if let Some(last) = envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
+            ActorCommand::RecordGraphEvidence { command, completed } => {
+                let result = store.record_graph_evidence(command).await;
+                if let Ok(GraphEvidenceOutcome::Committed { envelopes, .. }) = &result {
+                    if let Some(last) = envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::SelectEffort { command, completed } => {
                 // G3 clone of the SelectModel arm: metadata update,
                 // effort_selected fact, and R2 receipt are one transaction;
@@ -510,15 +585,14 @@ pub(super) async fn run_session_actor(
                     && head != expected_head
                 {
                     // A compaction batch forks its node from the tree head
-                    // captured at plan time. Session-config FACTS (e.g.
-                    // model_selected) advance the journal without moving the
-                    // conversation tree, so a delta made ONLY of such facts
-                    // keeps the planned parent valid — a pair switch commits
-                    // during compaction and the compaction still lands (F3).
+                    // captured at plan time. Session-config and Convergence
+                    // Graph FACTS advance the journal without moving the
+                    // conversation tree, so a delta made ONLY of those facts
+                    // keeps the planned parent valid.
                     // Any other payload in the delta (run states, items,
                     // nodes, unknown kinds) still rejects: committing the
                     // summary would fork an obsolete tree parent.
-                    if !session_config_only_delta(&store, &session_id, expected_head, head).await {
+                    if !non_tree_fact_only_delta(&store, &session_id, expected_head, head).await {
                         let _ = completed.send(Err(HaiderError::new(
                             ErrorCode::Busy,
                             format!(
@@ -688,16 +762,26 @@ pub(super) async fn run_session_actor(
                 });
                 let answer = command.answer.clone();
                 let mut outcome = store.resolve_menu(command).await;
-                if let Ok(MenuResolutionOutcome::Committed { ref envelope, .. }) = outcome {
-                    head = envelope.seq;
-                    authority_epoch = envelope.authority_epoch;
+                if let Ok(MenuResolutionOutcome::Committed {
+                    ref envelope,
+                    ref follow_up,
+                    ref menu,
+                }) = outcome
+                {
+                    head = follow_up.last().map_or(envelope.seq, |fact| fact.seq);
+                    authority_epoch = follow_up
+                        .last()
+                        .map_or(envelope.authority_epoch, |fact| fact.authority_epoch);
                     observer.observe(HubObservation::Persisted {
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
+                    let mut published = Vec::with_capacity(1 + follow_up.len());
+                    published.push(envelope.as_ref().clone());
+                    published.extend(follow_up.iter().cloned());
                     publish(
                         &mut attachments,
-                        std::slice::from_ref(envelope.as_ref()),
+                        &published,
                         catch_up_byte_budget,
                         &metrics,
                         &hooks,
@@ -706,8 +790,9 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    if let Some(harness) =
-                        worker.as_ref().and_then(|worker| worker.harness.as_ref())
+                    if !matches!(menu.kind, MenuKind::GraphHumanConfirm { .. })
+                        && let Some(harness) =
+                            worker.as_ref().and_then(|worker| worker.harness.as_ref())
                         && let Err(error) =
                             harness.apply_committed_menu_event(envelope.as_ref().clone())
                     {
@@ -718,7 +803,7 @@ pub(super) async fn run_session_actor(
                         );
                     }
                 }
-                if let Ok(MenuResolutionOutcome::Committed { envelope, menu }) = &outcome
+                if let Ok(MenuResolutionOutcome::Committed { envelope, menu, .. }) = &outcome
                     && let MenuKind::Recovery { effect, .. } = &menu.kind
                     && let Some(action) = selected_effect_recovery_action(menu, &answer)
                     && action != EffectRecoveryAction::Probe
@@ -940,13 +1025,12 @@ fn publish(
     }
 }
 
-/// True when every envelope in `(expected_head, head]` is a session-config
-/// fact (`SessionConfigEventPayload`, e.g. `model_selected`) — journal
-/// movement with NO conversation-tree movement, so a compaction batch's
-/// planned parent node is still the tree head (F3). Bounded scan; any read
-/// failure, coverage gap, or unrecognized payload keeps the honest Busy
-/// rejection. The one await is a store call (§5.5 actor charter).
-async fn session_config_only_delta(
+/// True when every envelope in `(expected_head, head]` is a recognized fact
+/// that cannot move the conversation tree. This includes session config and
+/// Convergence Graph lifecycle/evidence/menu facts. Bounded scan; any read
+/// failure, coverage gap, run/item/tree payload, or unknown kind keeps the
+/// honest Busy rejection. The one await is a store call (§5.5 actor charter).
+async fn non_tree_fact_only_delta(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
     expected_head: u64,
@@ -976,12 +1060,36 @@ async fn session_config_only_delta(
             .first()
             .is_some_and(|envelope| envelope.seq > expected_head)
         && delta.last().is_some_and(|envelope| envelope.seq == head)
-        && delta.iter().all(|envelope| {
-            serde_json::from_value::<haider_protocol::session::SessionConfigEventPayload>(
-                envelope.payload.clone(),
-            )
-            .is_ok()
-        })
+        && delta
+            .iter()
+            .all(|envelope| payload_preserves_conversation_tree(&envelope.payload))
+}
+
+fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
+    if serde_json::from_value::<haider_protocol::session::SessionConfigEventPayload>(
+        payload.clone(),
+    )
+    .is_ok()
+    {
+        return true;
+    }
+    matches!(
+        serde_json::from_value::<EventPayload>(payload.clone()),
+        Ok(EventPayload::GraphPinned(_)
+            | EventPayload::GraphAttemptOpened(_)
+            | EventPayload::EvidenceRecorded(_)
+            | EventPayload::GraphGateSatisfied(_)
+            | EventPayload::GraphAdvanced(_)
+            | EventPayload::GraphBlocked(_)
+            | EventPayload::GraphCompleted(_)
+            | EventPayload::GraphAbandoned(_)
+            | EventPayload::MenuOpened(Menu {
+                kind: MenuKind::GraphHumanConfirm { .. },
+                ..
+            })
+            | EventPayload::MenuAnswered(_)
+            | EventPayload::MenuClosed { .. })
+    )
 }
 
 #[cfg(test)]

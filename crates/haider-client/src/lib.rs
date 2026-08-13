@@ -19,6 +19,7 @@
 //! This crate owns no TUI, daemon lifecycle, or persistence.
 
 pub mod client;
+pub mod graph;
 pub mod headless;
 pub mod observe;
 pub mod profile;
@@ -28,6 +29,9 @@ pub mod transcription;
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
     PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient, connect,
+};
+pub use graph::{
+    GraphAbandonResult, GraphClientError, GraphPinResult, graph_abandon, graph_pin, graph_status,
 };
 pub use headless::{
     DEFAULT_TERMINAL_GRACE, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,

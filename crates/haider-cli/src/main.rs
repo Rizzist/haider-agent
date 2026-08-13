@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 pub(crate) mod export;
+pub(crate) mod graph;
 pub(crate) mod hooks;
 pub(crate) mod observe;
 pub(crate) mod run;
@@ -59,6 +60,7 @@ async fn main() -> ExitCode {
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
         [command, rest @ ..] if command == "fleet" => observe::fleet_command(rest).await,
         [command, rest @ ..] if command == "events" => observe::events_command(rest).await,
+        [command, rest @ ..] if command == "graph" => graph::graph_command(rest).await,
         [command, rest @ ..] if command == "export" => export::export_command(rest).await,
         [command, rest @ ..] if command == "hooks" => hooks::hooks_command(rest).await,
         [command, rest @ ..] if command == "update" => update::update_command(rest).await,
@@ -74,6 +76,8 @@ async fn main() -> ExitCode {
                  session <id> [--json|--watch] [--no-spawn], \
                  fleet [<session-id>] [--json] [--no-spawn], \
                  events [--follow] [--no-spawn], \
+                 graph status <session-id> [--json], graph pin <session-id>, \
+                 graph abandon <session-id> [why], \
                  export <session-id> [--format markdown|json|codex|claude-code|opencode] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \

@@ -720,6 +720,7 @@ fn observe_menu_kind(kind: &MenuKind) -> &'static str {
         MenuKind::Secret => "secret",
         MenuKind::File => "file",
         MenuKind::Conflict => "conflict",
+        MenuKind::GraphHumanConfirm { .. } => "graph_human_confirm",
     }
 }
 
@@ -1224,6 +1225,18 @@ impl HubConnection {
                 }
                 self.session_fleet(request_id, session_id).await
             }
+            RequestBody::GraphStatus { session_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.graph_status(request_id, session_id).await
+            }
             RequestBody::SessionDiagnostic {
                 command_id,
                 session_id,
@@ -1700,6 +1713,48 @@ impl HubConnection {
                     );
                 }
                 self.session_rename(request_id, command_id, session_id, worker_generation, title)
+                    .await
+            }
+            RequestBody::GraphPin {
+                command_id,
+                session_id,
+                worker_generation,
+                template,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.graph_pin(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    template,
+                )
+                .await
+            }
+            RequestBody::GraphAbandon {
+                command_id,
+                session_id,
+                worker_generation,
+                why,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.graph_abandon(request_id, command_id, session_id, worker_generation, why)
                     .await
             }
             RequestBody::SessionSelectEffort {
@@ -3669,6 +3724,216 @@ impl HubConnection {
         })
     }
 
+    async fn graph_status(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        let status = match self.hub.graph_status(&session_id).await {
+            Ok(status) => status,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::GraphStatus { status },
+        })
+    }
+
+    async fn graph_pin(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        template: String,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "graph pin needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "template": &template,
+        }))
+        .map_err(|error| SessionHubError::Task(format!("cannot encode graph pin: {error}")))?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .graph_pin_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(pinned)) => return self.respond_graph_pinned(request_id, pinned),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        // Lost-response replay above is deliberately unfenced. A genuinely
+        // new mutation still requires this connection's live control lease.
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "graph pin requires a control attachment to this session",
+                false,
+                None,
+            );
+        }
+        let command = GraphPinCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            graph_id: GraphId::new(random_id("graph")?),
+            template,
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let pinned = match self.hub.pin_graph(command).await {
+            Ok(GraphPinOutcome::Committed { pinned, .. })
+            | Ok(GraphPinOutcome::IdempotentReplay { pinned }) => pinned,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_graph_pinned(request_id, pinned)
+    }
+
+    fn respond_graph_pinned(
+        &self,
+        request_id: RequestId,
+        pinned: PinnedGraph,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::GraphPin {
+                session_id: pinned.session_id,
+                graph_id: pinned.graph_id,
+                template: pinned.template,
+                digest: pinned.digest,
+                pinned_seq: pinned.pinned_seq,
+                opened_seq: pinned.opened_seq,
+                worker_generation: pinned.worker_generation,
+            },
+        })
+    }
+
+    async fn graph_abandon(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        why: String,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "graph abandon needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "why": &why,
+        }))
+        .map_err(|error| SessionHubError::Task(format!("cannot encode graph abandon: {error}")))?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .graph_abandon_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(abandoned)) => return self.respond_graph_abandoned(request_id, abandoned),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        // Same receipt-first ordering as graph.pin: recovery is unfenced;
+        // only a fresh mutation must still hold the session control lease.
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "graph abandon requires a control attachment to this session",
+                false,
+                None,
+            );
+        }
+        let command = GraphAbandonCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            why,
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let abandoned = match self.hub.abandon_graph(command).await {
+            Ok(GraphAbandonOutcome::Committed { abandoned, .. })
+            | Ok(GraphAbandonOutcome::IdempotentReplay { abandoned }) => abandoned,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_graph_abandoned(request_id, abandoned)
+    }
+
+    fn respond_graph_abandoned(
+        &self,
+        request_id: RequestId,
+        abandoned: AbandonedGraph,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::GraphAbandon {
+                session_id: abandoned.session_id,
+                graph_id: abandoned.graph_id,
+                abandoned_seq: abandoned.abandoned_seq,
+                worker_generation: abandoned.worker_generation,
+            },
+        })
+    }
+
+    fn respond_graph_error(
+        &self,
+        request_id: RequestId,
+        error: HaiderError,
+    ) -> Result<(), SessionHubError> {
+        let code = match error.code {
+            ErrorCode::SingleWriterViolation => ERROR_CODE_STALE_GENERATION,
+            ErrorCode::SessionNotFound => ERROR_CODE_NOT_FOUND,
+            ErrorCode::GraphAlreadyActive => ERROR_CODE_GRAPH_ALREADY_ACTIVE,
+            ErrorCode::GraphNotActive => ERROR_CODE_GRAPH_NOT_ACTIVE,
+            ErrorCode::GraphWrongNode => ERROR_CODE_GRAPH_WRONG_NODE,
+            _ => ERROR_CODE_INVALID_ARGUMENT,
+        };
+        self.respond_error(request_id, code, &error.message, error.retryable, None)
+    }
+
     /// G2 auto-title: on the FIRST main-timeline accept of an untitled
     /// session, journal the same `session_renamed` fact through the same
     /// actor/store lane with an INTERNAL per-session command id — the
@@ -5500,6 +5765,7 @@ impl HubConnection {
             Ok(MenuResolutionOutcome::Committed {
                 ref envelope,
                 ref menu,
+                ..
             }) => {
                 if let MenuKind::Recovery { effect, .. } = &menu.kind {
                     let action =

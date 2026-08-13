@@ -14,6 +14,12 @@ use haider_protocol::agent::{
 use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
+use haider_protocol::graph::{
+    EvidenceRecorded, EvidenceVerdict, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
+    GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceSource, GraphGateKind,
+    GraphGateSatisfied, GraphNodeName, GraphNodeSpec, GraphPinned, GraphStatus,
+    evidence_fingerprint, ship_loop_digest, ship_loop_nodes,
+};
 use haider_protocol::hook::{
     HookAttachmentMetadata, HookAttachmentSet, HookEventPayload, HookFired, HookInput, HookOutput,
     HookRuntimeKind,
@@ -1683,4 +1689,179 @@ fn golden_user_message_hook_event_projection() {
             },
         },
     );
+}
+
+/// CG-M1 LAW: all eight durable fact discriminants and fields are frozen in
+/// one append-only fixture. A pre-graph typed reader may reject the new union
+/// variants, but its RawEnvelope journal path must retain their JSON exactly.
+#[test]
+fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
+    let graph_id = GraphId::new("graph-ship-loop-1");
+    let facts = vec![
+        EventPayload::GraphPinned(GraphPinned {
+            graph_id: graph_id.clone(),
+            template: "ship-loop".into(),
+            digest: ship_loop_digest(),
+            nodes: ship_loop_nodes(),
+        }),
+        EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+            graph_id: graph_id.clone(),
+            node: GraphNodeName::Build,
+            attempt: 2,
+        }),
+        EventPayload::EvidenceRecorded(EvidenceRecorded {
+            graph_id: graph_id.clone(),
+            node: GraphNodeName::Verify,
+            attempt: 2,
+            verdict: EvidenceVerdict::Red,
+            detail: "cargo test failed".into(),
+            fingerprint: evidence_fingerprint("cargo test failed"),
+            source: GraphEvidenceSource::Model {
+                run_id: RunId::new("run-graph-2"),
+                call_id: "call-evidence-2".into(),
+            },
+        }),
+        EventPayload::GraphGateSatisfied(GraphGateSatisfied {
+            graph_id: graph_id.clone(),
+            node: GraphNodeName::Verify,
+            attempt: 2,
+        }),
+        EventPayload::GraphAdvanced(GraphAdvanced {
+            graph_id: graph_id.clone(),
+            from_node: GraphNodeName::Verify,
+            to_node: GraphNodeName::Ship,
+        }),
+        EventPayload::GraphBlocked(GraphBlocked {
+            graph_id: graph_id.clone(),
+            node: GraphNodeName::Verify,
+            reason: GraphBlockReason::NoProgress,
+        }),
+        EventPayload::GraphCompleted(GraphCompleted {
+            graph_id: graph_id.clone(),
+        }),
+        EventPayload::GraphAbandoned(GraphAbandoned {
+            graph_id,
+            why: "operator chose a different release".into(),
+        }),
+    ];
+    golden("convergence_graph_facts", &facts);
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum PreGraphPayload {
+        IdleDecayed,
+    }
+
+    for fact in facts {
+        let raw = serde_json::to_value(&fact).expect("graph fact JSON");
+        assert!(
+            serde_json::from_value::<PreGraphPayload>(raw.clone()).is_err(),
+            "an old closed union rejects an additive typed variant"
+        );
+        let mut value = serde_json::to_value(envelope(EventPayload::IdleDecayed))
+            .expect("raw envelope template");
+        value["payload"] = raw.clone();
+        let decoded: haider_protocol::envelope::RawEnvelope =
+            serde_json::from_value(value).expect("RawEnvelope tolerates the new fact");
+        assert_eq!(decoded.payload, raw);
+    }
+}
+
+/// CG-M1 LAW: the SHIP confirmation is an ordinary durable, session-scoped,
+/// nonblocking menu. Its new MenuKind and both semantic answer keys are
+/// frozen independently from the eight graph fact discriminants above.
+#[test]
+fn golden_graph_human_confirm_menu() {
+    golden(
+        "graph_human_confirm_menu",
+        &EventPayload::MenuOpened(Menu {
+            id: MenuId::new("graph-confirm-graph-ship-loop-1-2"),
+            kind: MenuKind::GraphHumanConfirm {
+                graph_id: GraphId::new("graph-ship-loop-1"),
+                node: GraphNodeName::Ship,
+                attempt: 2,
+            },
+            title: "Ship this graph?".into(),
+            body: vec!["BUILD and VERIFY are green for the current attempt epoch.".into()],
+            options: vec![
+                MenuOption {
+                    key: "confirm".into(),
+                    label: "Confirm ship".into(),
+                    detail: Some("Satisfy SHIP and complete the graph.".into()),
+                    decision: None,
+                },
+                MenuOption {
+                    key: "hold".into(),
+                    label: "Hold".into(),
+                    detail: Some("Park the graph for explicit re-pin or abandon.".into()),
+                    decision: None,
+                },
+            ],
+            blocking: false,
+            scope: MenuScope::Session,
+            origin: "convergence-graph".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        }),
+    );
+}
+
+#[test]
+fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
+    assert_eq!(
+        ship_loop_nodes(),
+        vec![
+            GraphNodeSpec {
+                name: GraphNodeName::Build,
+                gate: GraphGateKind::CommandGreen,
+                executor: haider_protocol::graph::GraphExecutorShape::Inline,
+                max_attempts: 8,
+                max_evidence_per_attempt: Some(8),
+                depends_on: Vec::new(),
+            },
+            GraphNodeSpec {
+                name: GraphNodeName::Verify,
+                gate: GraphGateKind::AllOfN { n: 3 },
+                executor: haider_protocol::graph::GraphExecutorShape::FanOut,
+                max_attempts: 8,
+                max_evidence_per_attempt: Some(8),
+                depends_on: vec![GraphNodeName::Build],
+            },
+            GraphNodeSpec {
+                name: GraphNodeName::Ship,
+                gate: GraphGateKind::HumanConfirm,
+                executor: haider_protocol::graph::GraphExecutorShape::Human,
+                max_attempts: 8,
+                max_evidence_per_attempt: None,
+                depends_on: vec![GraphNodeName::Verify],
+            },
+        ]
+    );
+    let graph_id = GraphId::new("graph-brief");
+    let facts = vec![
+        EventPayload::GraphPinned(GraphPinned {
+            graph_id: graph_id.clone(),
+            template: "ship-loop".into(),
+            digest: ship_loop_digest(),
+            nodes: ship_loop_nodes(),
+        }),
+        EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+            graph_id,
+            node: GraphNodeName::Build,
+            attempt: 2,
+        }),
+    ];
+    let envelopes = facts
+        .into_iter()
+        .take(2)
+        .map(|fact| {
+            serde_json::from_value(serde_json::to_value(envelope(fact)).expect("envelope JSON"))
+                .expect("raw envelope")
+        })
+        .collect::<Vec<haider_protocol::envelope::RawEnvelope>>();
+    let status: GraphStatus = haider_protocol::graph::reduce_graph(&envelopes)
+        .status
+        .expect("pinned graph reduces");
+    let brief = status.graph_brief().expect("active graph brief");
+    assert!(brief.len() <= haider_protocol::graph::GRAPH_BRIEF_MAX_BYTES);
 }

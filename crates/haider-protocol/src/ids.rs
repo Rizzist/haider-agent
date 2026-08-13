@@ -87,3 +87,7 @@ string_id!(
     #[doc = "A long-lived background shell task (session-scoped, durable)."]
     TaskId
 );
+string_id!(
+    #[doc = "One immutable Convergence Graph template instance."]
+    GraphId
+);

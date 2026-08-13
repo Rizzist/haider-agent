@@ -94,6 +94,35 @@ fn advertised_equals_dispatchable_for_all_three_c1_tools() {
     }
 }
 
+/// CG-M1 LAW: the root testimony tool is a canonical, effect-free Await tool
+/// and has the exact typed route used by the dispatcher. It is intentionally
+/// absent from delegated child grants (automatic child evidence is M2).
+#[test]
+fn graph_evidence_is_advertised_dispatchable_and_root_only() {
+    let registry = registered_tools();
+    let entry = registry
+        .iter()
+        .find(|entry| entry.manifest.name == "graph_evidence")
+        .expect("graph_evidence manifest");
+    assert_eq!(entry.route, RegisteredToolRoute::GraphEvidence);
+    assert_eq!(
+        entry.manifest.dispatch,
+        haider_protocol::tool::DispatchMode::Await
+    );
+    assert!(entry.manifest.effects.is_empty());
+    assert_eq!(entry.default, ToolPermissionDefault::NotApplicable);
+    assert_eq!(
+        registered_tool_route("graph_evidence"),
+        Some(RegisteredToolRoute::GraphEvidence)
+    );
+    assert!(
+        !crate::worker::default_child_grant()
+            .tools
+            .iter()
+            .any(|name| name == "graph_evidence")
+    );
+}
+
 /// MUTATION CHECK: apply overrides before registry defaults, map exec to the
 /// wrong class, or synthesize a user-typed preauthorization. Expected
 /// RUNTIME failure: flagged classes are not ordinary policy `Allow`, or the

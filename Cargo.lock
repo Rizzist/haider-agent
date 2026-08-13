@@ -1224,6 +1224,7 @@ version = "0.0.910"
 dependencies = [
  "blake3",
  "haider-pdf",
+ "haider-protocol",
  "haider-rpc",
  "rustix 1.1.4",
  "serde",
@@ -1328,6 +1329,7 @@ dependencies = [
 name = "haider-protocol"
 version = "0.0.910"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
 ]

@@ -555,7 +555,17 @@ impl SessionProjection {
             EventPayload::Effect(_)
             | EventPayload::AgentSpawned(_)
             | EventPayload::AgentReport(_)
-            | EventPayload::AgentChipState { .. } => {}
+            | EventPayload::AgentChipState { .. }
+            // Convergence-graph visuals belong to the separate Fable lane.
+            // M1 only keeps the projection decoder additive/tolerant.
+            | EventPayload::GraphPinned(_)
+            | EventPayload::GraphAttemptOpened(_)
+            | EventPayload::EvidenceRecorded(_)
+            | EventPayload::GraphGateSatisfied(_)
+            | EventPayload::GraphAdvanced(_)
+            | EventPayload::GraphBlocked(_)
+            | EventPayload::GraphCompleted(_)
+            | EventPayload::GraphAbandoned(_) => {}
         }
     }
 

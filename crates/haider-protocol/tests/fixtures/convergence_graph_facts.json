@@ -1,0 +1,90 @@
+[
+  {
+    "type": "graph_pinned",
+    "graph_id": "graph-ship-loop-1",
+    "template": "ship-loop",
+    "digest": "63cee264d2a430b21d32c5f8b71c390e0bb825e88073571d19e7dbf2084820eb",
+    "nodes": [
+      {
+        "name": "BUILD",
+        "gate": {
+          "kind": "command-green"
+        },
+        "executor": "inline",
+        "max_attempts": 8,
+        "max_evidence_per_attempt": 8
+      },
+      {
+        "name": "VERIFY",
+        "gate": {
+          "kind": "all-of-n",
+          "n": 3
+        },
+        "executor": "fan-out",
+        "max_attempts": 8,
+        "max_evidence_per_attempt": 8,
+        "depends_on": [
+          "BUILD"
+        ]
+      },
+      {
+        "name": "SHIP",
+        "gate": {
+          "kind": "human-confirm"
+        },
+        "executor": "human",
+        "max_attempts": 8,
+        "depends_on": [
+          "VERIFY"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "graph_attempt_opened",
+    "graph_id": "graph-ship-loop-1",
+    "node": "BUILD",
+    "attempt": 2
+  },
+  {
+    "type": "evidence_recorded",
+    "graph_id": "graph-ship-loop-1",
+    "node": "VERIFY",
+    "attempt": 2,
+    "verdict": "red",
+    "detail": "cargo test failed",
+    "fingerprint": "bb2e6a1878e32cf4207f271e0e89ac750be5704eb057cc47083c40b1a1903d09",
+    "source": {
+      "kind": "model",
+      "run_id": "run-graph-2",
+      "call_id": "call-evidence-2"
+    }
+  },
+  {
+    "type": "graph_gate_satisfied",
+    "graph_id": "graph-ship-loop-1",
+    "node": "VERIFY",
+    "attempt": 2
+  },
+  {
+    "type": "graph_advanced",
+    "graph_id": "graph-ship-loop-1",
+    "from_node": "VERIFY",
+    "to_node": "SHIP"
+  },
+  {
+    "type": "graph_blocked",
+    "graph_id": "graph-ship-loop-1",
+    "node": "VERIFY",
+    "reason": "no-progress"
+  },
+  {
+    "type": "graph_completed",
+    "graph_id": "graph-ship-loop-1"
+  },
+  {
+    "type": "graph_abandoned",
+    "graph_id": "graph-ship-loop-1",
+    "why": "operator chose a different release"
+  }
+]

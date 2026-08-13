@@ -23,20 +23,22 @@ mod profile_lock;
 pub use cas::FileCas;
 pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
-    AcceptedShellExec, AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse,
+    AbandonedGraph, AcceptedShellExec, AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse,
     AccountAddReceiptRow, AccountRemoveReceiptRow, BranchCreateCommand, BranchCreateOutcome,
     CachedModels, CancelledTurn, CommittedSeqRange, ContextCompactionClaim,
     ContextCompactionReceiptResponse, CreatedBranch, CreatedSession, DelegationCreateOutcome,
     DelegationDescendant, DelegationDescendants, DelegationRecord, DelegationState, EventStore,
-    HookTrustChange, HookTrustCommand, LoginClaim, LoginReceiptFailure, LoginReceiptResponse,
-    LoginReceiptRow, ManagementClaim, ManagementReceiptRow, MenuResolutionCommand,
-    MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, ProfileLease,
-    RenamedSession, SUBAGENT_LIVE_LIMIT, SelectedEffort, SelectedFast, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphPinCommand, GraphPinOutcome, HookTrustChange, HookTrustCommand, LoginClaim,
+    LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
+    ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,
+    PROVIDER_REMOVE_METHOD, PinnedGraph, ProfileLease, RecordedGraphEvidence, RenamedSession,
+    SUBAGENT_LIVE_LIMIT, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
+    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 

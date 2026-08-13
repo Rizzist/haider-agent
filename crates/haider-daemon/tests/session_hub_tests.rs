@@ -606,6 +606,150 @@ async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId,
         .expect("typed session creates");
 }
 
+/// CG-M1 receipt law: a lost graph.pin response is recoverable without a
+/// replacement control attachment. Only the first, genuinely new mutation is
+/// attachment-fenced, and replay appends no second graph instance.
+#[tokio::test]
+async fn graph_pin_rpc_replays_its_receipt_before_control_attachment_validation() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("graph-pin-rpc-receipt");
+    let first_sink = Arc::new(CollectSink::default());
+    let first = hub
+        .open_connection(
+            capabilities(),
+            first_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("first connection");
+    create_and_attach_typed_session(&store, &first, &first_sink, &session_id, "fake").await;
+    let request = RequestBody::GraphPin {
+        command_id: CommandId::new("graph-pin-rpc-command"),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+    };
+    first
+        .request(RequestId::new("graph-pin-first"), request.clone())
+        .await
+        .expect("pin routes");
+    let original = loop {
+        if let WireFrame::Response {
+            body: body @ ResponseBody::GraphPin { .. },
+            ..
+        } = first_sink.next().await
+        {
+            break body;
+        }
+    };
+    first.close().await.expect("first connection closes");
+    let head = store.latest_seq(&session_id).await.expect("head");
+
+    let replay_sink = Arc::new(CollectSink::default());
+    let replay = hub
+        .open_connection(
+            capabilities(),
+            replay_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("replay connection");
+    replay
+        .request(RequestId::new("graph-pin-replay"), request)
+        .await
+        .expect("receipt replay routes");
+    let WireFrame::Response { body, .. } = replay_sink.next().await else {
+        panic!("unattached replay must answer directly");
+    };
+    assert_eq!(body, original);
+    assert_eq!(store.latest_seq(&session_id).await.expect("head"), head);
+
+    replay.close().await.expect("replay connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// CG-M1 receipt law for the companion mutation: a lost graph.abandon
+/// response also replays before replacement control-attachment validation.
+#[tokio::test]
+async fn graph_abandon_rpc_replays_its_receipt_before_control_attachment_validation() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("graph-abandon-rpc-receipt");
+    let first_sink = Arc::new(CollectSink::default());
+    let first = hub
+        .open_connection(
+            capabilities(),
+            first_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("first connection");
+    create_and_attach_typed_session(&store, &first, &first_sink, &session_id, "fake").await;
+    first
+        .request(
+            RequestId::new("graph-abandon-pin"),
+            RequestBody::GraphPin {
+                command_id: CommandId::new("graph-abandon-pin-command"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+            },
+        )
+        .await
+        .expect("pin routes");
+    loop {
+        if matches!(
+            first_sink.next().await,
+            WireFrame::Response {
+                body: ResponseBody::GraphPin { .. },
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    let request = RequestBody::GraphAbandon {
+        command_id: CommandId::new("graph-abandon-rpc-command"),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        why: "operator stopped".into(),
+    };
+    first
+        .request(RequestId::new("graph-abandon-first"), request.clone())
+        .await
+        .expect("abandon routes");
+    let original = loop {
+        if let WireFrame::Response {
+            body: body @ ResponseBody::GraphAbandon { .. },
+            ..
+        } = first_sink.next().await
+        {
+            break body;
+        }
+    };
+    first.close().await.expect("first connection closes");
+    let head = store.latest_seq(&session_id).await.expect("head");
+
+    let replay_sink = Arc::new(CollectSink::default());
+    let replay = hub
+        .open_connection(
+            capabilities(),
+            replay_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("replay connection");
+    replay
+        .request(RequestId::new("graph-abandon-replay"), request)
+        .await
+        .expect("receipt replay routes");
+    let WireFrame::Response { body, .. } = replay_sink.next().await else {
+        panic!("unattached replay must answer directly");
+    };
+    assert_eq!(body, original);
+    assert_eq!(store.latest_seq(&session_id).await.expect("head"), head);
+
+    replay.close().await.expect("replay connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 fn fleet_delegation(
     root_session_id: &SessionId,
     parent_session_id: &SessionId,

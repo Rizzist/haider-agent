@@ -23,13 +23,21 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::graph::{
+    EvidenceRecorded, EvidenceVerdict, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
+    GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceSource, GraphGateKind,
+    GraphGateSatisfied, GraphNodeName, GraphPhase, GraphPinned, GraphReduction, GraphStatus,
+    SHIP_LOOP_TEMPLATE, evidence_fingerprint, normalize_evidence_detail, reduce_graph,
+    ship_loop_digest, ship_loop_nodes,
+};
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, DeviceId, EventId, GraphId, ItemId, MenuId, NodeId, RunId,
+    SessionId,
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
+use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
@@ -99,6 +107,9 @@ pub enum MenuResolutionOutcome {
     /// after the transaction has returned successfully.
     Committed {
         envelope: Box<RawEnvelope>,
+        /// Graph SHIP answers settle their gate in the same transaction.
+        /// Ordinary menus keep this empty.
+        follow_up: Vec<RawEnvelope>,
         /// The validated opening card, returned so the daemon actor can run
         /// typed post-CAS recovery handlers without parsing display text.
         menu: Menu,
@@ -107,6 +118,111 @@ pub enum MenuResolutionOutcome {
     IdempotentReplay { resolution_seq: u64 },
     /// A different command already resolved the menu.
     AlreadyResolved { resolution_seq: u64 },
+}
+
+/// Secret-free coordinates for one receipt-backed built-in graph pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphPinCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub graph_id: GraphId,
+    pub template: String,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PinnedGraph {
+    pub session_id: SessionId,
+    pub graph_id: GraphId,
+    pub template: String,
+    pub digest: String,
+    pub pinned_seq: u64,
+    pub opened_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphPinOutcome {
+    Committed {
+        pinned: PinnedGraph,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        pinned: PinnedGraph,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphAbandonCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub why: String,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AbandonedGraph {
+    pub session_id: SessionId,
+    pub graph_id: GraphId,
+    pub abandoned_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphAbandonOutcome {
+    Committed {
+        abandoned: AbandonedGraph,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        abandoned: AbandonedGraph,
+    },
+}
+
+/// Internal receipt-backed graph testimony. The identity derives from the
+/// provider tool-call coordinates, closing the crash window before the
+/// generic tool result is committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEvidenceCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub run_id: RunId,
+    pub call_id: String,
+    pub node: GraphNodeName,
+    pub verdict: EvidenceVerdict,
+    pub detail: String,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedGraphEvidence {
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    pub attempt: u32,
+    pub fingerprint: String,
+    pub evidence_seq: u64,
+    pub through_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphEvidenceOutcome {
+    Committed {
+        recorded: RecordedGraphEvidence,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        recorded: RecordedGraphEvidence,
+    },
 }
 
 /// Secret-free, stable coordinates for an atomic `session.create`.
@@ -1098,6 +1214,490 @@ impl Store {
             Some(json) => decode_session_metadata(session_id, &json),
             None => Ok(None),
         }
+    }
+
+    /// Pure read of the latest graph projection. Graph truth remains the
+    /// append-only event stream; there is intentionally no mutable graph row.
+    pub fn graph_status(&self, session_id: &SessionId) -> StoreResult<Option<GraphStatus>> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        Ok(load_graph_reduction(&connection, session_id)?.status)
+    }
+
+    /// Receipt lookup before current-state or generation validation.
+    pub fn graph_pin_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<PinnedGraph>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "graph.pin",
+            request_digest,
+            request_json,
+            "graph-pin",
+        )
+    }
+
+    /// Atomically pins ship-loop and opens BUILD attempt/epoch 1. A blocked
+    /// graph may be exited by re-pin; that transaction first abandons it.
+    pub fn pin_graph(&self, command: &GraphPinCommand) -> StoreResult<GraphPinOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(pinned) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "graph.pin",
+            &command.request_digest,
+            &command.request_json,
+            "graph-pin",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphPinOutcome::IdempotentReplay { pinned });
+        }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        if command.template != SHIP_LOOP_TEMPLATE {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("unknown graph template `{}`", command.template),
+                false,
+            ));
+        }
+        let current = load_graph_reduction(&transaction, &command.session_id)?.status;
+        if current
+            .as_ref()
+            .is_some_and(|status| status.phase == GraphPhase::Active)
+        {
+            return Err(store_error(
+                ErrorCode::GraphAlreadyActive,
+                "session already has an active Convergence Graph",
+                false,
+            ));
+        }
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "graph.pin",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let mut payloads = Vec::new();
+        if let Some(status) = current.filter(|status| status.phase == GraphPhase::Blocked) {
+            payloads.push(EventPayload::GraphAbandoned(GraphAbandoned {
+                graph_id: status.graph_id,
+                why: "re-pinned".into(),
+            }));
+        }
+        let pinned_index = payloads.len();
+        let digest = ship_loop_digest();
+        payloads.push(EventPayload::GraphPinned(GraphPinned {
+            graph_id: command.graph_id.clone(),
+            template: SHIP_LOOP_TEMPLATE.into(),
+            digest: digest.clone(),
+            nodes: ship_loop_nodes(),
+        }));
+        payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+            graph_id: command.graph_id.clone(),
+            node: GraphNodeName::Build,
+            attempt: 1,
+        }));
+        let mut envelopes = graph_command_envelopes(command, payloads)?;
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let pinned = PinnedGraph {
+            session_id: command.session_id.clone(),
+            graph_id: command.graph_id.clone(),
+            template: command.template.clone(),
+            digest,
+            pinned_seq: envelopes[pinned_index].seq,
+            opened_seq: envelopes[pinned_index + 1].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(pinned.pinned_seq),
+            &pinned,
+            now,
+            "graph-pin",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(GraphPinOutcome::Committed { pinned, envelopes })
+    }
+
+    pub fn graph_abandon_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<AbandonedGraph>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "graph.abandon",
+            request_digest,
+            request_json,
+            "graph-abandon",
+        )
+    }
+
+    pub fn abandon_graph(&self, command: &GraphAbandonCommand) -> StoreResult<GraphAbandonOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(abandoned) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "graph.abandon",
+            &command.request_digest,
+            &command.request_json,
+            "graph-abandon",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphAbandonOutcome::IdempotentReplay { abandoned });
+        }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let status = load_graph_reduction(&transaction, &command.session_id)?
+            .status
+            .filter(GraphStatus::is_unfinished)
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::GraphNotActive,
+                    "session has no unfinished Convergence Graph",
+                    false,
+                )
+            })?;
+        let why = normalize_graph_why(&command.why)?;
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "graph.abandon",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let mut payloads = vec![EventPayload::GraphAbandoned(GraphAbandoned {
+            graph_id: status.graph_id.clone(),
+            why,
+        })];
+        if let Some(menu) = status.pending_menu {
+            // Leaving an active SHIP obligation retires its durable menu too;
+            // otherwise the answered-menu fallback scan would keep exposing
+            // a permanently stale, unanswerable card after abandonment.
+            payloads.push(EventPayload::MenuClosed {
+                menu,
+                reason: MenuCloseReason::Dismissed,
+            });
+        }
+        let mut envelopes = graph_command_envelopes(command, payloads)?;
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let abandoned = AbandonedGraph {
+            session_id: command.session_id.clone(),
+            graph_id: status.graph_id,
+            abandoned_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(abandoned.abandoned_seq),
+            &abandoned,
+            now,
+            "graph-abandon",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(GraphAbandonOutcome::Committed {
+            abandoned,
+            envelopes,
+        })
+    }
+
+    /// Stamps one evidence fact and performs the deterministic gate reduction
+    /// in the same receipt transaction. No model-authored value can directly
+    /// select a successor node or attempt number.
+    pub fn record_graph_evidence(
+        &self,
+        command: &GraphEvidenceCommand,
+    ) -> StoreResult<GraphEvidenceOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(recorded) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "graph.evidence",
+            &command.request_digest,
+            &command.request_json,
+            "graph-evidence",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphEvidenceOutcome::IdempotentReplay { recorded });
+        }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let reduction = load_graph_reduction(&transaction, &command.session_id)?;
+        let status = reduction.status.ok_or_else(|| {
+            store_error(
+                ErrorCode::GraphNotActive,
+                "session has no Convergence Graph",
+                false,
+            )
+        })?;
+        if status.phase != GraphPhase::Active {
+            return Err(store_error(
+                ErrorCode::GraphNotActive,
+                "Convergence Graph is not accepting evidence",
+                false,
+            ));
+        }
+        let current_node = status.current_node.ok_or_else(|| {
+            store_error(
+                ErrorCode::StoreCorrupt,
+                "active graph has no open obligation",
+                false,
+            )
+        })?;
+        if current_node != command.node || !status.accepts_evidence() {
+            return Err(store_error(
+                ErrorCode::GraphWrongNode,
+                format!(
+                    "graph_evidence named {}, but the open obligation is {}",
+                    command.node.label(),
+                    current_node.label()
+                ),
+                false,
+            ));
+        }
+        let detail = normalize_evidence_detail(&command.detail);
+        if detail.is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "graph evidence detail is empty after normalization",
+                false,
+            ));
+        }
+        let fingerprint = evidence_fingerprint(&detail);
+        let attempt = status.attempt;
+        let graph_id = status.graph_id.clone();
+        let node_spec = reduction
+            .template_nodes
+            .iter()
+            .find(|spec| spec.name == current_node)
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::StoreCorrupt,
+                    "open graph node is absent from its pinned template",
+                    false,
+                )
+            })?;
+        let evidence = EvidenceRecorded {
+            graph_id: graph_id.clone(),
+            node: current_node,
+            attempt,
+            verdict: command.verdict,
+            detail,
+            fingerprint: fingerprint.clone(),
+            source: GraphEvidenceSource::Model {
+                run_id: command.run_id.clone(),
+                call_id: command.call_id.clone(),
+            },
+        };
+        let previous_node_attempt = reduction
+            .evidence
+            .iter()
+            .filter(|prior| {
+                prior.graph_id == graph_id && prior.node == current_node && prior.attempt < attempt
+            })
+            .map(|prior| prior.attempt)
+            .max();
+        let no_progress = command.verdict == EvidenceVerdict::Red
+            && previous_node_attempt.is_some_and(|previous_attempt| {
+                reduction
+                    .evidence
+                    .iter()
+                    .rev()
+                    .find(|prior| {
+                        prior.graph_id == graph_id
+                            && prior.node == current_node
+                            && prior.attempt == previous_attempt
+                            && prior.verdict == EvidenceVerdict::Red
+                    })
+                    .is_some_and(|prior| prior.fingerprint == fingerprint)
+            });
+        let mut payloads = vec![EventPayload::EvidenceRecorded(evidence)];
+        if no_progress {
+            payloads.push(EventPayload::GraphBlocked(GraphBlocked {
+                graph_id: graph_id.clone(),
+                node: current_node,
+                reason: GraphBlockReason::NoProgress,
+            }));
+        } else {
+            let node_status = status
+                .nodes
+                .iter()
+                .find(|node| node.node == current_node)
+                .ok_or_else(|| {
+                    store_error(
+                        ErrorCode::StoreCorrupt,
+                        "open graph node is absent from its pinned template",
+                        false,
+                    )
+                })?;
+            let evidence_count = node_status
+                .evidence
+                .green
+                .saturating_add(node_status.evidence.red)
+                .saturating_add(1);
+            let effective_green = match command.verdict {
+                EvidenceVerdict::Green => node_status.evidence.effective_green.saturating_add(1),
+                EvidenceVerdict::Red => 0,
+            };
+            let satisfied = match node_spec.gate {
+                GraphGateKind::CommandGreen => command.verdict == EvidenceVerdict::Green,
+                GraphGateKind::AllOfN { n } => {
+                    command.verdict == EvidenceVerdict::Green && effective_green >= n
+                }
+                GraphGateKind::HumanConfirm => false,
+            };
+            if satisfied {
+                payloads.push(EventPayload::GraphGateSatisfied(GraphGateSatisfied {
+                    graph_id: graph_id.clone(),
+                    node: current_node,
+                    attempt,
+                }));
+                match current_node {
+                    GraphNodeName::Build => {
+                        payloads.push(EventPayload::GraphAdvanced(GraphAdvanced {
+                            graph_id: graph_id.clone(),
+                            from_node: GraphNodeName::Build,
+                            to_node: GraphNodeName::Verify,
+                        }));
+                        payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                            graph_id: graph_id.clone(),
+                            node: GraphNodeName::Verify,
+                            attempt,
+                        }));
+                    }
+                    GraphNodeName::Verify => {
+                        payloads.push(EventPayload::GraphAdvanced(GraphAdvanced {
+                            graph_id: graph_id.clone(),
+                            from_node: GraphNodeName::Verify,
+                            to_node: GraphNodeName::Ship,
+                        }));
+                        payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                            graph_id: graph_id.clone(),
+                            node: GraphNodeName::Ship,
+                            attempt,
+                        }));
+                        payloads.push(EventPayload::MenuOpened(graph_confirm_menu(
+                            &graph_id, attempt,
+                        )));
+                    }
+                    GraphNodeName::Ship => {}
+                }
+            } else if evidence_count >= graph_evidence_limit(node_spec)? {
+                if attempt >= node_spec.max_attempts {
+                    payloads.push(EventPayload::GraphBlocked(GraphBlocked {
+                        graph_id: graph_id.clone(),
+                        node: current_node,
+                        reason: GraphBlockReason::RoundsExhausted,
+                    }));
+                } else {
+                    // No back-edge: the new BUILD epoch is an immutable
+                    // attempt opening, never GraphAdvanced traversal.
+                    payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                        graph_id: graph_id.clone(),
+                        node: GraphNodeName::Build,
+                        attempt: attempt + 1,
+                    }));
+                }
+            }
+        }
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "graph.evidence",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let mut envelopes = graph_command_envelopes(command, payloads)?;
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let recorded = RecordedGraphEvidence {
+            graph_id,
+            node: current_node,
+            attempt,
+            fingerprint,
+            evidence_seq: envelopes[0].seq,
+            through_seq: envelopes.last().map_or(0, |envelope| envelope.seq),
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            Some(command.run_id.as_str()),
+            Some(recorded.evidence_seq),
+            &recorded,
+            now,
+            "graph-evidence",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(GraphEvidenceOutcome::Committed {
+            recorded,
+            envelopes,
+        })
     }
 
     /// Inserts the durable delegation link exactly once. Replays with the
@@ -4571,6 +5171,169 @@ fn require_typed_session(connection: &Connection, session_id: &SessionId) -> Sto
     Ok(())
 }
 
+fn load_graph_reduction(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<GraphReduction> {
+    let mut statement = connection
+        .prepare_cached("SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY seq ASC")
+        .map_err(map_sqlite_error)?;
+    let envelopes = statement
+        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?
+        .map(|json| {
+            let json = json.map_err(map_sqlite_error)?;
+            serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+                corrupt(format!(
+                    "invalid graph-reduction envelope in session {session_id}: {error}"
+                ))
+            })
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(reduce_graph(&envelopes))
+}
+
+trait GraphCommandCoordinates {
+    fn command_id(&self) -> &str;
+    fn session_id(&self) -> &SessionId;
+    fn worker_generation(&self) -> u64;
+    fn device_id(&self) -> &DeviceId;
+}
+
+impl GraphCommandCoordinates for GraphPinCommand {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+    fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+}
+
+impl GraphCommandCoordinates for GraphAbandonCommand {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+    fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+}
+
+impl GraphCommandCoordinates for GraphEvidenceCommand {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+    fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+}
+
+fn graph_command_envelopes(
+    command: &impl GraphCommandCoordinates,
+    payloads: Vec<EventPayload>,
+) -> StoreResult<Vec<RawEnvelope>> {
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(command.session_id().as_str().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(command.command_id().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&u64::try_from(index).unwrap_or(u64::MAX).to_be_bytes());
+            unstamped_command_envelope(
+                EventId::new(format!("graph-fact-{}", hasher.finalize().to_hex())),
+                command.session_id(),
+                None,
+                None,
+                command.device_id().clone(),
+                command.worker_generation(),
+                payload,
+                PromptRender::Omit,
+            )
+        })
+        .collect()
+}
+
+fn normalize_graph_why(why: &str) -> StoreResult<String> {
+    let why = why.split_whitespace().collect::<Vec<_>>().join(" ");
+    if why.is_empty() {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "graph abandon reason must not be empty",
+            false,
+        ));
+    }
+    let mut end = why.len().min(256);
+    while end > 0 && !why.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(why[..end].to_owned())
+}
+
+fn graph_evidence_limit(spec: &haider_protocol::graph::GraphNodeSpec) -> StoreResult<u32> {
+    spec.max_evidence_per_attempt.ok_or_else(|| {
+        store_error(
+            ErrorCode::StoreCorrupt,
+            format!(
+                "open graph node {} has no evidence-round bound",
+                spec.name.label()
+            ),
+            false,
+        )
+    })
+}
+
+fn graph_confirm_menu(graph_id: &GraphId, attempt: u32) -> Menu {
+    Menu {
+        id: MenuId::new(format!("graph-confirm-{graph_id}-{attempt}")),
+        kind: MenuKind::GraphHumanConfirm {
+            graph_id: graph_id.clone(),
+            node: GraphNodeName::Ship,
+            attempt,
+        },
+        title: "Ship this graph?".into(),
+        body: vec!["BUILD and VERIFY are green for the current attempt epoch.".into()],
+        options: vec![
+            haider_protocol::menu::MenuOption {
+                key: "confirm".into(),
+                label: "Confirm ship".into(),
+                detail: Some("Satisfy SHIP and complete the graph.".into()),
+                decision: None,
+            },
+            haider_protocol::menu::MenuOption {
+                key: "hold".into(),
+                label: "Hold".into(),
+                detail: Some("Park the graph for explicit re-pin or abandon.".into()),
+                decision: None,
+            },
+        ],
+        blocking: false,
+        scope: haider_protocol::menu::MenuScope::Session,
+        origin: "convergence-graph".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
+
 type DurableRunHead = (RunState, u64, Option<BranchId>);
 
 fn latest_run_states(
@@ -5054,12 +5817,6 @@ fn resolve_menu_transaction(
             false,
         ));
     }
-    if command.worker_generation != current_worker_generation && !command.allow_prior_generation {
-        return Err(stale_generation(
-            command.worker_generation,
-            current_worker_generation,
-        ));
-    }
     let opening = load_envelope(transaction, &command.session_id, command.request_seq)?
         .ok_or_else(|| {
             store_error(
@@ -5072,6 +5829,16 @@ fn resolve_menu_transaction(
             )
         })?;
     let menu = opened_menu(&opening, &command.answer.menu)?;
+    let graph_menu = matches!(menu.kind, MenuKind::GraphHumanConfirm { .. });
+    if command.worker_generation != current_worker_generation
+        && !command.allow_prior_generation
+        && !graph_menu
+    {
+        return Err(stale_generation(
+            command.worker_generation,
+            current_worker_generation,
+        ));
+    }
     if opening.worker_generation != command.worker_generation {
         return Err(store_error(
             ErrorCode::SingleWriterViolation,
@@ -5092,16 +5859,6 @@ fn resolve_menu_transaction(
         return Ok(MenuResolutionOutcome::AlreadyResolved { resolution_seq });
     }
 
-    let latest: i64 = transaction
-        .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
-        .and_then(|mut statement| {
-            statement.query_row([command.session_id.as_str()], |row| row.get(0))
-        })
-        .map_err(map_sqlite_error)?;
-    let resolution_seq = u64::try_from(latest)
-        .map_err(|_| corrupt("database contains a negative event sequence"))?
-        .checked_add(1)
-        .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
     let committed_at_ms = now_ms()?;
     let event_id = menu_resolution_event_id(command);
     let payload = serde_json::to_value(EventPayload::MenuAnswered(command.answer.clone()))
@@ -5115,7 +5872,7 @@ fn resolve_menu_transaction(
     let envelope = EventEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id: event_id.clone(),
-        seq: resolution_seq,
+        seq: 0,
         session_id: command.session_id.clone(),
         branch_id: opening.branch_id.clone(),
         run_id: opening.run_id.clone(),
@@ -5136,28 +5893,98 @@ fn resolve_menu_transaction(
         },
         payload,
     };
-    let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
-        store_error(
-            ErrorCode::InvalidArgument,
-            format!("cannot serialize menu resolution envelope: {error}"),
-            false,
-        )
-    })?;
-    transaction
-        .execute(
-            "INSERT INTO events(
-                session_id, seq, envelope_json, event_id, committed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                command.session_id.as_str(),
-                to_sqlite_integer(resolution_seq)?,
-                envelope_json,
-                event_id.as_str(),
-                to_sqlite_integer(committed_at_ms)?,
+    let mut envelopes = vec![envelope];
+    if let MenuKind::GraphHumanConfirm {
+        graph_id,
+        node,
+        attempt,
+    } = &menu.kind
+    {
+        let reduction = load_graph_reduction(transaction, &command.session_id)?;
+        let status = reduction.status.ok_or_else(|| {
+            store_error(
+                ErrorCode::GraphNotActive,
+                "graph confirmation has no graph instance",
+                false,
+            )
+        })?;
+        if status.graph_id != *graph_id
+            || status.phase != GraphPhase::Active
+            || status.current_node != Some(*node)
+            || status.attempt != *attempt
+            || status.pending_menu.as_ref() != Some(&menu.id)
+        {
+            return Err(store_error(
+                ErrorCode::GraphWrongNode,
+                "graph confirmation is stale for the current obligation",
+                false,
+            ));
+        }
+        let key =
+            command.answer.option_key.as_deref().ok_or_else(|| {
+                store_error(ErrorCode::InvalidArgument, "missing answer key", false)
+            })?;
+        let payloads = match key {
+            "confirm" => vec![
+                EventPayload::GraphGateSatisfied(GraphGateSatisfied {
+                    graph_id: graph_id.clone(),
+                    node: *node,
+                    attempt: *attempt,
+                }),
+                EventPayload::GraphCompleted(GraphCompleted {
+                    graph_id: graph_id.clone(),
+                }),
             ],
-        )
-        .map_err(map_sqlite_error)?;
-    enqueue_hook_dispatch(transaction, &envelope)?;
+            "hold" => vec![EventPayload::GraphBlocked(GraphBlocked {
+                graph_id: graph_id.clone(),
+                node: *node,
+                reason: GraphBlockReason::HumanHold,
+            })],
+            _ => {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "unsupported graph confirmation answer",
+                    false,
+                ));
+            }
+        };
+        for (index, payload) in payloads.into_iter().enumerate() {
+            envelopes.push(EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: EventId::new(format!("graph-menu-settle-{}-{}", event_id, index + 1)),
+                seq: 0,
+                session_id: command.session_id.clone(),
+                branch_id: None,
+                run_id: None,
+                agent_id: None,
+                device_id: command.device_id.clone(),
+                authority_epoch: opening.authority_epoch,
+                worker_generation: current_worker_generation,
+                causation_id: Some(event_id.clone()),
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: RenderTargets {
+                    ui: true,
+                    durable: true,
+                    prompt: PromptRender::Omit,
+                },
+                payload: serde_json::to_value(payload).map_err(|error| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        format!("cannot serialize graph menu settlement: {error}"),
+                        false,
+                    )
+                })?,
+            });
+        }
+    }
+    append_transaction_envelopes(
+        transaction,
+        &command.session_id,
+        committed_at_ms,
+        &mut envelopes,
+    )?;
+    let resolution_seq = envelopes[0].seq;
     transaction
         .execute(
             "INSERT INTO menu_resolutions(
@@ -5177,7 +6004,8 @@ fn resolve_menu_transaction(
         )
         .map_err(map_sqlite_error)?;
     Ok(MenuResolutionOutcome::Committed {
-        envelope: Box::new(envelope),
+        envelope: Box::new(envelopes.remove(0)),
+        follow_up: envelopes,
         menu,
     })
 }

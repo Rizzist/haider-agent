@@ -6,7 +6,8 @@
 //! blocked on input carries a `MenuId`; there is no separate input-request type.
 
 use crate::error::{ErrorAction, ErrorPresentation, ErrorScope};
-use crate::ids::{AgentId, CredentialAlias, ItemId, MenuId, RunId};
+use crate::graph::GraphNodeName;
+use crate::ids::{AgentId, CredentialAlias, GraphId, ItemId, MenuId, RunId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +83,13 @@ pub enum MenuKind {
     File,
     /// Workspace conflict (e.g. editing a component under active repair).
     Conflict,
+    /// Convergence Graph SHIP gate. The durable graph authority, rather than
+    /// a provider turn, consumes this nonblocking session-scoped answer.
+    GraphHumanConfirm {
+        graph_id: GraphId,
+        node: GraphNodeName,
+        attempt: u32,
+    },
 }
 
 /// Visual/behavioral class for [`MenuKind::ErrorRecovery`]. New classes are
