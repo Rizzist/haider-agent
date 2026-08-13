@@ -316,7 +316,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Tools
         | Screen::Hooks
         | Screen::Usage
-        | Screen::Fleet => 1,
+        | Screen::Fleet
+        | Screen::Graph => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -338,6 +339,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Hooks => render_hooks(model, theme, frame, body, &mut hits),
             Screen::Usage => render_usage(model, theme, frame, body, &mut hits),
             Screen::Fleet => render_fleet(model, theme, frame, body, &mut hits),
+            Screen::Graph => render_graph(model, theme, frame, body, &mut hits),
         }
     }
     if model.help_open {
@@ -3173,6 +3175,15 @@ fn render_session(
     // Lowest shed priority: an ephemeral gauge yields before the task band.
     let throughput_readout = model.throughput_readout();
     let mut throughput_height = u16::from(throughput_readout.is_some());
+    // CG-M1: the always-visible graph strip — one ambient line while a graph
+    // is pinned and not abandoned (an abandoned graph clears the strip). It
+    // is session state, so it outranks the ephemeral throughput gauge but
+    // still sheds before sacred rows on a tiny terminal.
+    let graph_strip = model
+        .graph
+        .as_ref()
+        .filter(|status| status.phase != haider_protocol::graph::GraphPhase::Abandoned);
+    let mut graph_height = u16::from(graph_strip.is_some());
     let mut todos_height = model
         .projection
         .todos()
@@ -3248,6 +3259,13 @@ fn render_session(
     } else {
         budget -= todos_height;
     }
+    // CG-M1: the graph strip outranks the throughput gauge (session state vs
+    // an ephemeral rate) but yields to todos and the task band.
+    if graph_height > budget {
+        graph_height = 0;
+    } else {
+        budget -= graph_height;
+    }
     // W-G: the throughput row sheds FIRST when space is tight (checked last =
     // lowest claim on the budget) — the task band and todos outrank it.
     if throughput_height > budget {
@@ -3268,7 +3286,7 @@ fn render_session(
     // last and given up first.
     // The waiting line and the task band share one breathing row (they are
     // the same "live background work" block when both are present).
-    let want_lead = u16::from(waiting_height + tasks_height + throughput_height > 0);
+    let want_lead = u16::from(waiting_height + tasks_height + throughput_height + graph_height > 0);
     let want_todos_lead = u16::from(todos_height > 0);
     let want_subtree_lead = u16::from(subtree_height > 0);
     let breathe = |want: u16, budget: &mut u16| -> u16 {
@@ -3290,6 +3308,7 @@ fn render_session(
         waiting_area,
         tasks_area,
         throughput_area,
+        graph_area,
         _lead_todos,
         todos_area,
         queue_area,
@@ -3308,6 +3327,7 @@ fn render_session(
         Constraint::Length(waiting_height),
         Constraint::Length(tasks_height),
         Constraint::Length(throughput_height),
+        Constraint::Length(graph_height),
         Constraint::Length(lead_todos),
         Constraint::Length(todos_height),
         Constraint::Length(queue_height),
@@ -3693,6 +3713,14 @@ fn render_session(
             Paragraph::new(throughput_line(theme, readout)),
             throughput_area,
         );
+    }
+
+    // CG-M1: the graph strip — the ship-loop's live position above the
+    // composer while a graph is pinned.
+    if let Some(status) = graph_strip
+        && graph_area.height > 0
+    {
+        frame.render_widget(Paragraph::new(graph_strip_line(theme, status)), graph_area);
     }
 
     if queue_height > 0 {
@@ -4787,6 +4815,188 @@ const FLEET_CELL_GAP: usize = 2;
 /// mockup's `FleetStage` grammar; slice 1 ships no agent-detail frame and
 /// no manual density toggle.
 #[allow(clippy::too_many_lines)]
+/// One node's styled span-group for the graph strip and status rows:
+/// `LABEL glyph↺N`, the glyph toned by node state (satisfied/current/blocked).
+fn graph_node_spans(
+    theme: &Theme,
+    status: &haider_protocol::graph::GraphStatus,
+    node: &haider_protocol::graph::GraphNodeStatus,
+) -> Vec<Span<'static>> {
+    use haider_protocol::graph::{GraphBlockReason, GraphPhase};
+    let glyph = crate::graph::node_glyph(status, node);
+    let glyph_style = if status.phase == GraphPhase::Completed || node.satisfied {
+        theme.ok_style()
+    } else if status.current_node == Some(node.node) {
+        match (status.phase, status.blocked_reason) {
+            (GraphPhase::Blocked, Some(GraphBlockReason::HumanHold)) => theme.warn_style(),
+            (GraphPhase::Blocked, _) => theme.err_style(),
+            _ => theme.gold_style(),
+        }
+    } else {
+        theme.faint_style()
+    };
+    let mut spans = vec![
+        Span::styled(format!("{} ", node.node.label()), theme.dim_style()),
+        Span::styled(glyph.to_owned(), glyph_style),
+    ];
+    let marker = crate::graph::attempt_marker(node);
+    if !marker.is_empty() {
+        spans.push(Span::styled(marker, theme.warn_style()));
+    }
+    spans
+}
+
+/// The always-visible graph strip line (a `Line` for the panel stack above
+/// the composer). `None` when no graph is held — the caller omits the row.
+fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus) -> Line<'static> {
+    use haider_protocol::graph::GraphPhase;
+    let mut spans = vec![Span::styled(
+        format!("⚑ {} ", status.template),
+        theme.gold_style(),
+    )];
+    for node in &status.nodes {
+        spans.push(Span::styled(" ", theme.faint_style()));
+        spans.extend(graph_node_spans(theme, status, node));
+    }
+    let badge = crate::graph::phase_badge(status);
+    if !badge.is_empty() {
+        let badge_style = match status.phase {
+            GraphPhase::Completed => theme.ok_style(),
+            GraphPhase::Blocked | GraphPhase::Abandoned => theme.err_style(),
+            GraphPhase::Active => theme.dim_style(),
+        };
+        spans.push(Span::styled(format!("  {badge}"), badge_style));
+    }
+    Line::from(spans)
+}
+
+fn render_graph(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    _hits: &mut [(Rect, Hit)],
+) {
+    use haider_protocol::graph::{GraphNodeName, GraphPhase};
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(model.display_name().to_owned(), theme.dim_style()),
+        Span::styled(" › ", theme.faint_style()),
+        Span::styled("graph", theme.bright_style().add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::raw(""));
+
+    let Some(status) = model.graph.as_ref() else {
+        if model.graph_unsupported {
+            lines.push(Line::styled(
+                "graph needs a newer daemon (convergence_graph_v1)",
+                theme.err_style(),
+            ));
+        } else {
+            lines.push(Line::styled(
+                "no graph — /graph pin to start the ship loop",
+                theme.dim_style(),
+            ));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("esc back to session", theme.dim_style()));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    };
+
+    // Header: template · digest · epoch.
+    lines.push(Line::from(vec![
+        Span::styled(status.template.clone(), theme.bright_style()),
+        Span::styled(
+            format!(" · {}", crate::graph::digest_short(&status.digest)),
+            theme.faint_style(),
+        ),
+        Span::styled(format!(" · epoch {}", status.attempt), theme.dim_style()),
+    ]));
+    lines.push(Line::raw(""));
+
+    // One row per node: glyph · gate · attempt · evidence tally.
+    for node in &status.nodes {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(graph_node_spans(theme, status, node));
+        spans.push(Span::styled(
+            format!(" · {}", crate::graph::gate_label(node.node)),
+            theme.faint_style(),
+        ));
+        spans.push(Span::styled(
+            format!(" · attempt {}/8", node.current_attempt.unwrap_or(0)),
+            theme.dim_style(),
+        ));
+        if !matches!(node.node, GraphNodeName::Ship) {
+            spans.push(Span::styled(
+                format!(" · {}g", node.evidence.green),
+                theme.ok_style(),
+            ));
+            spans.push(Span::styled(
+                format!("/{}r", node.evidence.red),
+                if node.evidence.red > 0 {
+                    theme.err_style()
+                } else {
+                    theme.faint_style()
+                },
+            ));
+            spans.push(Span::styled(
+                format!(" ({} eff)", node.evidence.effective_green),
+                theme.faint_style(),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::raw(""));
+
+    // Footer: the current expectation, or the terminal/blocked line.
+    match status.phase {
+        GraphPhase::Completed => lines.push(Line::styled(
+            "✓ complete — every gate satisfied",
+            theme.ok_style(),
+        )),
+        GraphPhase::Abandoned => {
+            lines.push(Line::styled("✗ abandoned", theme.err_style()));
+        }
+        GraphPhase::Blocked => {
+            let reason = status
+                .blocked_reason
+                .map_or("held", crate::graph::block_reason_label);
+            lines.push(Line::styled(
+                format!("✗ blocked — {reason}"),
+                theme.err_style(),
+            ));
+            lines.push(Line::styled(
+                "/graph abandon then re-pin to retry",
+                theme.dim_style(),
+            ));
+        }
+        GraphPhase::Active => {
+            if let Some(node) = status.current_node {
+                let expectation = match node {
+                    GraphNodeName::Build => "record BUILD evidence (command green)",
+                    GraphNodeName::Verify => "record 3 green VERIFY results",
+                    GraphNodeName::Ship => "confirm the SHIP gate below",
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("→ current: ", theme.faint_style()),
+                    Span::styled(node.label().to_owned(), theme.gold_style()),
+                    Span::styled(format!(" · {expectation}"), theme.dim_style()),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "/graph pin · /graph abandon · esc back to session",
+        theme.dim_style(),
+    ));
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
 fn render_fleet(
     model: &AppModel,
     theme: &Theme,
@@ -6528,6 +6738,8 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
         } => "⟳",
         MenuKind::ErrorRecovery { .. } => "⚠",
         MenuKind::Exhausted => "⟳",
+        // CG-M1 SHIP gate: the graph flag, matching the strip and note rows.
+        MenuKind::GraphHumanConfirm { .. } => "⚑",
         MenuKind::Choice if menu.origin == "voice" => "◉",
         MenuKind::Choice if menu.origin == "tools" => "⚒",
         MenuKind::Choice if menu.origin == "theme" => "◑",

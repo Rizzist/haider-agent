@@ -555,17 +555,61 @@ impl SessionProjection {
             EventPayload::Effect(_)
             | EventPayload::AgentSpawned(_)
             | EventPayload::AgentReport(_)
-            | EventPayload::AgentChipState { .. }
-            // Convergence-graph visuals belong to the separate Fable lane.
-            // M1 only keeps the projection decoder additive/tolerant.
-            | EventPayload::GraphPinned(_)
-            | EventPayload::GraphAttemptOpened(_)
-            | EventPayload::EvidenceRecorded(_)
-            | EventPayload::GraphGateSatisfied(_)
-            | EventPayload::GraphAdvanced(_)
-            | EventPayload::GraphBlocked(_)
-            | EventPayload::GraphCompleted(_)
-            | EventPayload::GraphAbandoned(_) => {}
+            | EventPayload::AgentChipState { .. } => {}
+            // Convergence Graph M1: the live strip and status view render the
+            // daemon's reduction; the transcript keeps quiet `·` note rows so
+            // the durable convergence story reads in scrollback too. State
+            // changes only — forward advancement and first-attempt opens are
+            // the strip's job, so we skip them here to keep scrollback calm.
+            EventPayload::GraphPinned(pinned) => {
+                self.push_note(format!(
+                    "⚑ {} pinned · {}",
+                    pinned.template,
+                    graph_digest_short(&pinned.digest)
+                ));
+            }
+            EventPayload::GraphAttemptOpened(opened) => {
+                if opened.node == haider_protocol::graph::GraphNodeName::Build && opened.attempt > 1
+                {
+                    self.push_note(format!(
+                        "BUILD attempt {}/{} — earlier VERIFY greens are stale",
+                        opened.attempt,
+                        haider_protocol::graph::GRAPH_MAX_ATTEMPTS
+                    ));
+                }
+            }
+            EventPayload::EvidenceRecorded(evidence) => {
+                use haider_protocol::graph::EvidenceVerdict;
+                let verdict = match evidence.verdict {
+                    EvidenceVerdict::Green => "green",
+                    EvidenceVerdict::Red => "red",
+                };
+                self.push_note(format!(
+                    "evidence · {} {verdict} — {}",
+                    evidence.node.label(),
+                    graph_detail_fragment(&evidence.detail)
+                ));
+            }
+            EventPayload::GraphGateSatisfied(satisfied) => {
+                self.push_note(format!("{} gate satisfied", satisfied.node.label()));
+            }
+            EventPayload::GraphBlocked(blocked) => {
+                self.push_note(format!(
+                    "ship-loop blocked — {} at {}",
+                    graph_block_reason(blocked.reason),
+                    blocked.node.label()
+                ));
+            }
+            EventPayload::GraphCompleted(_) => {
+                self.push_note("✓ ship-loop complete · every gate satisfied".to_owned());
+            }
+            EventPayload::GraphAbandoned(abandoned) => {
+                self.push_note(format!(
+                    "ship-loop abandoned — {}",
+                    graph_detail_fragment(&abandoned.why)
+                ));
+            }
+            EventPayload::GraphAdvanced(_) => {}
         }
     }
 
@@ -1507,5 +1551,39 @@ fn verify_step_label(step: VerifyStep) -> &'static str {
         VerifyStep::Check => "check",
         VerifyStep::Format => "format",
         VerifyStep::Test => "test",
+    }
+}
+
+/// The first 8 hex of a graph template digest — enough to read in scrollback,
+/// short enough for a note row.
+fn graph_digest_short(digest: &str) -> &str {
+    &digest[..digest.len().min(8)]
+}
+
+/// A bounded, single-line fragment of graph evidence/abandon detail for a note
+/// row: newlines collapse to spaces and the tail is elided past 80 chars.
+fn graph_detail_fragment(detail: &str) -> String {
+    let flat = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for ch in flat.chars() {
+        if out.chars().count() >= 80 {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        "(no detail)".to_owned()
+    } else {
+        out
+    }
+}
+
+fn graph_block_reason(reason: haider_protocol::graph::GraphBlockReason) -> &'static str {
+    use haider_protocol::graph::GraphBlockReason;
+    match reason {
+        GraphBlockReason::RoundsExhausted => "attempts exhausted",
+        GraphBlockReason::NoProgress => "no progress (repeated failure)",
+        GraphBlockReason::HumanHold => "held for review",
     }
 }

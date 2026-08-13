@@ -231,6 +231,10 @@ pub enum Screen {
     /// it for the current session. Backed by `session.fleet` in live mode
     /// ([`crate::fleet`]); demo synthesizes from the local chip tree.
     Fleet,
+    /// The Convergence Graph status view (CG-M1) — SESSION-SCOPED, opened by
+    /// `/graph`. Backed by `graph.status` in live mode; demo has no graph
+    /// truth and `/graph` refuses honestly there.
+    Graph,
 }
 
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
@@ -2179,6 +2183,17 @@ pub enum AppRequest {
     /// stays open (single-flight — no new polling loop). Live-only
     /// vocabulary: the demo synthesizes from its own chips at open.
     FleetRefresh,
+    /// CG-M1: read the daemon's `graph.status` reduction for the active
+    /// session (single-flight in the driver). Emitted on session open and
+    /// on `/graph`; ongoing freshness rides the event-cadence chase.
+    GraphRefresh,
+    /// CG-M1: receipt-backed pin of the built-in ship-loop for the active
+    /// session (`/graph pin`). The driver mints the command id + worker
+    /// generation; nothing is installed until the daemon's fact arrives.
+    GraphPin,
+    /// CG-M1: receipt-backed abandonment of the active graph (`/graph
+    /// abandon`). Carries a public reason string.
+    GraphAbandon { why: String },
     /// `account.set_default_model` under the expected-revision CAS. The
     /// default marker moves only on the correlated reply.
     SetDefaultModel {
@@ -2972,6 +2987,14 @@ pub struct AppModel {
     /// [`crate::fleet`]. Session-scoped display state; the snapshot is
     /// daemon truth in live mode and never fabricated there.
     pub fleet: crate::fleet::FleetView,
+    /// Convergence Graph M1: the daemon's `graph.status` reduction for the
+    /// active session, or `None` when no graph was ever pinned. Drives the
+    /// always-visible strip above the composer and the `/graph` status view;
+    /// never fabricated — it is a read of durable daemon truth.
+    pub graph: Option<haider_protocol::graph::GraphStatus>,
+    /// An honest one-line refusal when the attached daemon predates
+    /// `convergence_graph_v1` (set on a feature-absent `/graph`).
+    pub graph_unsupported: bool,
     /// The pinned-todos header collapse toggle (sim tui.js:2863-2888 — the
     /// header is a button and the collapsed form summarises the current
     /// item; owner item 7 promotes it from the deferred ledger).
@@ -3268,6 +3291,8 @@ impl Default for AppModel {
             view_path: Vec::new(),
             subtree_collapsed: false,
             fleet: crate::fleet::FleetView::default(),
+            graph: None,
+            graph_unsupported: false,
             todos_collapsed: false,
             auto_resuming: false,
             aura: AuraModel::seed(),
@@ -3761,6 +3786,7 @@ impl AppModel {
             Screen::Hooks => "haider — hooks".to_owned(),
             Screen::Usage => "haider — usage".to_owned(),
             Screen::Fleet => "haider — fleet".to_owned(),
+            Screen::Graph => "haider — graph".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
@@ -3864,6 +3890,12 @@ impl AppModel {
                 .snapshot
                 .as_ref()
                 .is_some_and(crate::fleet::has_live),
+            // Graph: the current node's `…` beat pulses only while the graph
+            // is unfinished; a completed/abandoned reduction is static.
+            Screen::Graph => self
+                .graph
+                .as_ref()
+                .is_some_and(haider_protocol::graph::GraphStatus::is_unfinished),
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
                 // glyph (tui.js:4524-4530) · the processing todo's box
@@ -4695,6 +4727,34 @@ impl AppModel {
         }
     }
 
+    /// Install a fresh `graph.status` reduction for the active session.
+    /// `None` (never pinned, or abandoned into oblivion) clears the strip.
+    /// Stale replies for a since-switched session install nothing.
+    pub fn apply_graph_status(
+        &mut self,
+        session_id: &haider_protocol::ids::SessionId,
+        status: Option<haider_protocol::graph::GraphStatus>,
+    ) {
+        if self
+            .active_session
+            .as_ref()
+            .is_some_and(|active| active != session_id)
+        {
+            return;
+        }
+        self.graph = status;
+        self.graph_unsupported = false;
+        self.dirty = true;
+    }
+
+    /// The attached daemon predates `convergence_graph_v1`: `/graph` refuses
+    /// honestly rather than pretending the subsystem exists.
+    pub fn graph_unsupported(&mut self) {
+        self.graph = None;
+        self.graph_unsupported = true;
+        self.dirty = true;
+    }
+
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
         if self.screen == Screen::Tools {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
@@ -4914,6 +4974,16 @@ impl AppModel {
         // session only from the root.
         if self.screen == Screen::Fleet {
             self.handle_fleet_key(key.code);
+            return;
+        }
+        // CG-M1: the graph status view is a read-only full screen (the usage
+        // precedent). Esc walks back to the session; every other key is
+        // swallowed — pin/abandon are `/graph` commands, not hotkeys.
+        if self.screen == Screen::Graph {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.screen = Screen::Session;
+                self.dirty = true;
+            }
             return;
         }
         // A SELECT menu replaces the composer (sim §3 law); a zero-option
@@ -8462,6 +8532,63 @@ impl AppModel {
     /// an ungated daemon fabricates nothing, the honest stale-daemon note
     /// names the fix), and the demo path opens a sim-honest EMPTY state
     /// that refuses trust actions.
+    /// `/graph [pin|abandon|status]`. Bare (or `status`) opens the graph
+    /// status view; `pin`/`abandon` are receipt-backed mutations. Session
+    /// only; live only (graph state is daemon truth, never fabricated).
+    fn enter_graph(&mut self, arg: Option<&str>) {
+        self.dirty = true;
+        if self.screen != Screen::Session && self.screen != Screen::Graph {
+            self.flash = Some("· /graph — session only".to_owned());
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· /graph — live only; convergence graphs are daemon truth".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1) {
+            self.graph_unsupported();
+            self.flash = Some(self.stale_daemon_note("graph"));
+            return;
+        }
+        match arg {
+            Some("pin") => {
+                if self.graph.as_ref().is_some_and(|status| {
+                    matches!(
+                        status.phase,
+                        haider_protocol::graph::GraphPhase::Active
+                            | haider_protocol::graph::GraphPhase::Blocked
+                    )
+                }) {
+                    self.flash = Some(
+                        "· a graph is already active — /graph abandon first, then re-pin"
+                            .to_owned(),
+                    );
+                } else {
+                    self.requests.push(AppRequest::GraphPin);
+                    self.flash = Some("· pinning ship-loop…".to_owned());
+                }
+            }
+            Some("abandon") => {
+                if self.graph.is_some() {
+                    self.requests.push(AppRequest::GraphAbandon {
+                        why: "abandoned from /graph".to_owned(),
+                    });
+                    self.flash = Some("· abandoning graph…".to_owned());
+                } else {
+                    self.flash = Some("· no graph pinned".to_owned());
+                }
+            }
+            // Bare `/graph`, `/graph status`, or an unknown sub-token all
+            // open the read-only status view and refresh it.
+            _ => {
+                self.graph_unsupported = false;
+                self.requests.push(AppRequest::GraphRefresh);
+                self.screen = Screen::Graph;
+            }
+        }
+    }
+
     fn enter_hooks(&mut self) {
         self.dirty = true;
         if self.screen != Screen::Session {
@@ -9139,6 +9266,8 @@ impl AppModel {
             "peers" => self.reject_remote_placement(),
             "providers" => self.enter_providers(),
             "hooks" => self.enter_hooks(),
+            // CG-M1: `/graph [pin|abandon|status]`.
+            "graph" => self.enter_graph(arg.as_deref()),
             // U2: `/usage [provider]` — the cross-provider usage report;
             // the optional first token is a provider prefix filter.
             "usage" => self.enter_usage(arg.as_deref()),
@@ -10504,6 +10633,10 @@ impl AppModel {
         // H4: the journaled hook facts + decision-chip state travel the
         // same way.
         self.hook_facts = std::mem::take(&mut slot.hook_facts);
+        // CG-M1: the graph reduction travels whole with the session so the
+        // strip reflects the session it belongs to, never the last one seen.
+        self.graph = slot.graph.take();
+        self.graph_unsupported = false;
         // W-A: the background task rows travel whole with the session.
         self.tasks = std::mem::take(&mut slot.tasks);
         self.msg_queue = std::mem::take(&mut slot.msg_queue);
@@ -10522,6 +10655,15 @@ impl AppModel {
         self.active_session = Some(id.clone());
         self.menu_selection = 0;
         self.view_path.clear();
+        // CG-M1: read this session's graph reduction so the strip reflects a
+        // graph pinned earlier (single-flight in the driver). Live only and
+        // feature-gated: demo has no graph truth, and an old daemon has no
+        // `graph.status` — so neither pollutes the request stream.
+        if !self.mode.fabricates_locally()
+            && self.daemon_serves(haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1)
+        {
+            self.requests.push(AppRequest::GraphRefresh);
+        }
         // IDENTITY-FLIP SPLIT SEAM (TUI6.2 fix 3's named exception 2 of
         // 3): the departing surface's draft was stashed at open_session's
         // entry, BEFORE `active_session` flipped — switch_surface cannot
@@ -10558,6 +10700,7 @@ impl AppModel {
             slot.chips = std::mem::take(&mut self.chips);
             slot.branch_state = std::mem::take(&mut self.branch_state);
             slot.hook_facts = std::mem::take(&mut self.hook_facts);
+            slot.graph = self.graph.take();
             slot.tasks = std::mem::take(&mut self.tasks);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);

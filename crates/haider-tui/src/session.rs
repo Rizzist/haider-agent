@@ -71,6 +71,10 @@ pub struct SessionState {
     /// This session's journaled hook facts + decision-chip state (H4) —
     /// checked in/out with the session exactly like [`Self::branch_state`].
     pub hook_facts: crate::hooks::HookFactsLog,
+    /// Convergence Graph M1: the daemon's `graph.status` reduction for this
+    /// session (or `None`). Checked in/out with the session so the strip
+    /// never leaks one session's graph onto another.
+    pub graph: Option<haider_protocol::graph::GraphStatus>,
     /// W-A: the session-scoped background task rows (journal projection) —
     /// checked in/out whole with the session; never split per branch.
     pub tasks: crate::taskrows::TaskPanel,
@@ -145,6 +149,7 @@ impl SessionState {
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
+            graph: None,
             tasks: crate::taskrows::TaskPanel::default(),
             msg_queue: Vec::new(),
             queue_mode: false,
