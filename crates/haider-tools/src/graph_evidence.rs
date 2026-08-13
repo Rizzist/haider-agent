@@ -10,6 +10,8 @@ use haider_protocol::tool::{DispatchMode, ToolManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const GRAPH_EVIDENCE_INPUT_MAX_BYTES: usize = GRAPH_EVIDENCE_DETAIL_MAX_BYTES * 4;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphEvidence {
     pub node: GraphNodeName,
@@ -29,10 +31,10 @@ impl GraphEvidence {
         }
         // The daemon performs Unicode-safe normalization and bounding. Keep a
         // generous input ceiling here so pathological payloads never reach it.
-        if request.detail.len() > GRAPH_EVIDENCE_DETAIL_MAX_BYTES.saturating_mul(4) {
+        if request.detail.len() > GRAPH_EVIDENCE_INPUT_MAX_BYTES {
             return Err(ToolError::invalid_argument(format!(
                 "graph_evidence detail exceeds the {} byte input limit",
-                GRAPH_EVIDENCE_DETAIL_MAX_BYTES.saturating_mul(4)
+                GRAPH_EVIDENCE_INPUT_MAX_BYTES
             )));
         }
         Ok(request)
@@ -62,7 +64,7 @@ pub fn graph_evidence_manifest() -> ToolManifest {
                 "detail": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": GRAPH_EVIDENCE_DETAIL_MAX_BYTES * 4,
+                    "maxLength": GRAPH_EVIDENCE_INPUT_MAX_BYTES,
                     "description": "Bounded evidence summary; normalized and fingerprinted by the daemon"
                 }
             },

@@ -942,8 +942,17 @@ pub struct Store {
     database_path: PathBuf,
     worker_generation: u64,
     connection: Mutex<Connection>,
+    graph_reductions: Mutex<HashMap<SessionId, CachedGraphReduction>>,
     cas: FileCas,
     _lock: ProfileLock,
+}
+
+struct CachedGraphReduction {
+    // Volatile latest-instance projection. The connection lock serializes
+    // cache extension after commit with every reader; journal facts remain
+    // the authority and a restart simply rebuilds this value.
+    envelopes: Vec<RawEnvelope>,
+    reduction: GraphReduction,
 }
 
 impl Store {
@@ -979,6 +988,7 @@ impl Store {
             database_path,
             worker_generation,
             connection: Mutex::new(connection),
+            graph_reductions: Mutex::new(HashMap::new()),
             cas,
             _lock: profile_lock,
         })
@@ -1193,7 +1203,9 @@ impl Store {
                 .execute(statement, [session_id.as_str()])
                 .map_err(map_sqlite_error)?;
         }
-        transaction.commit().map_err(map_sqlite_error)
+        transaction.commit().map_err(map_sqlite_error)?;
+        self.invalidate_graph_reduction(session_id);
+        Ok(())
     }
 
     /// Loads typed session configuration. Legacy `{}` rows return `None`.
@@ -1221,7 +1233,7 @@ impl Store {
     pub fn graph_status(&self, session_id: &SessionId) -> StoreResult<Option<GraphStatus>> {
         let connection = self.connection()?;
         require_session(&connection, session_id)?;
-        Ok(load_graph_reduction(&connection, session_id)?.status)
+        Ok(self.graph_reduction(&connection, session_id)?.status)
     }
 
     /// Receipt lookup before current-state or generation validation.
@@ -1280,7 +1292,9 @@ impl Store {
                 false,
             ));
         }
-        let current = load_graph_reduction(&transaction, &command.session_id)?.status;
+        let current = self
+            .graph_reduction(&transaction, &command.session_id)?
+            .status;
         if current
             .as_ref()
             .is_some_and(|status| status.phase == GraphPhase::Active)
@@ -1343,6 +1357,7 @@ impl Store {
             "graph-pin",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
+        self.extend_graph_reduction(&command.session_id, &envelopes);
         Ok(GraphPinOutcome::Committed { pinned, envelopes })
     }
 
@@ -1392,7 +1407,8 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let status = load_graph_reduction(&transaction, &command.session_id)?
+        let status = self
+            .graph_reduction(&transaction, &command.session_id)?
             .status
             .filter(GraphStatus::is_unfinished)
             .ok_or_else(|| {
@@ -1444,6 +1460,7 @@ impl Store {
             "graph-abandon",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
+        self.extend_graph_reduction(&command.session_id, &envelopes);
         Ok(GraphAbandonOutcome::Committed {
             abandoned,
             envelopes,
@@ -1484,7 +1501,7 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let reduction = load_graph_reduction(&transaction, &command.session_id)?;
+        let reduction = self.graph_reduction(&transaction, &command.session_id)?;
         let status = reduction.status.ok_or_else(|| {
             store_error(
                 ErrorCode::GraphNotActive,
@@ -1551,28 +1568,24 @@ impl Store {
                 call_id: command.call_id.clone(),
             },
         };
-        let previous_node_attempt = reduction
-            .evidence
-            .iter()
-            .filter(|prior| {
-                prior.graph_id == graph_id && prior.node == current_node && prior.attempt < attempt
-            })
-            .map(|prior| prior.attempt)
-            .max();
+        let mut previous_node_attempt = None;
+        let mut previous_red_fingerprint = None;
+        for prior in &reduction.evidence {
+            if prior.graph_id != graph_id || prior.node != current_node || prior.attempt >= attempt
+            {
+                continue;
+            }
+            if previous_node_attempt.is_none_or(|previous| prior.attempt > previous) {
+                previous_node_attempt = Some(prior.attempt);
+                previous_red_fingerprint = None;
+            }
+            if previous_node_attempt == Some(prior.attempt) && prior.verdict == EvidenceVerdict::Red
+            {
+                previous_red_fingerprint = Some(prior.fingerprint.as_str());
+            }
+        }
         let no_progress = command.verdict == EvidenceVerdict::Red
-            && previous_node_attempt.is_some_and(|previous_attempt| {
-                reduction
-                    .evidence
-                    .iter()
-                    .rev()
-                    .find(|prior| {
-                        prior.graph_id == graph_id
-                            && prior.node == current_node
-                            && prior.attempt == previous_attempt
-                            && prior.verdict == EvidenceVerdict::Red
-                    })
-                    .is_some_and(|prior| prior.fingerprint == fingerprint)
-            });
+            && previous_red_fingerprint.is_some_and(|previous| previous == fingerprint);
         let mut payloads = vec![EventPayload::EvidenceRecorded(evidence)];
         if no_progress {
             payloads.push(EventPayload::GraphBlocked(GraphBlocked {
@@ -1694,6 +1707,7 @@ impl Store {
             "graph-evidence",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
+        self.extend_graph_reduction(&command.session_id, &envelopes);
         Ok(GraphEvidenceOutcome::Committed {
             recorded,
             envelopes,
@@ -4720,6 +4734,18 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let outcome = resolve_menu_transaction(&transaction, command, self.worker_generation)?;
         transaction.commit().map_err(map_sqlite_error)?;
+        if let MenuResolutionOutcome::Committed {
+            envelope,
+            follow_up,
+            ..
+        } = &outcome
+        {
+            self.extend_graph_reduction(
+                &command.session_id,
+                std::slice::from_ref(envelope.as_ref()),
+            );
+            self.extend_graph_reduction(&command.session_id, follow_up);
+        }
         Ok(outcome)
     }
 
@@ -4819,6 +4845,61 @@ impl Store {
                 false,
             )
         })
+    }
+
+    fn graph_reduction(
+        &self,
+        connection: &Connection,
+        session_id: &SessionId,
+    ) -> StoreResult<GraphReduction> {
+        if let Some(reduction) = self
+            .graph_reductions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|cached| cached.reduction.clone())
+        {
+            return Ok(reduction);
+        }
+        let mut envelopes = load_graph_reduction_envelopes(connection, session_id)?;
+        retain_latest_graph(&mut envelopes);
+        let reduction = reduce_graph(&envelopes);
+        self.graph_reductions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.clone(),
+                CachedGraphReduction {
+                    envelopes,
+                    reduction: reduction.clone(),
+                },
+            );
+        Ok(reduction)
+    }
+
+    fn extend_graph_reduction(&self, session_id: &SessionId, envelopes: &[RawEnvelope]) {
+        let mut graph_reductions = self
+            .graph_reductions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cached) = graph_reductions.get_mut(session_id) else {
+            return;
+        };
+        cached.envelopes.extend(
+            envelopes
+                .iter()
+                .filter(|envelope| graph_reduction_event(&envelope.payload))
+                .cloned(),
+        );
+        retain_latest_graph(&mut cached.envelopes);
+        cached.reduction = reduce_graph(&cached.envelopes);
+    }
+
+    fn invalidate_graph_reduction(&self, session_id: &SessionId) {
+        self.graph_reductions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
     }
 }
 
@@ -5175,8 +5256,30 @@ fn load_graph_reduction(
     connection: &Connection,
     session_id: &SessionId,
 ) -> StoreResult<GraphReduction> {
+    Ok(reduce_graph(&load_graph_reduction_envelopes(
+        connection, session_id,
+    )?))
+}
+
+fn load_graph_reduction_envelopes(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Vec<RawEnvelope>> {
+    // Event rows are always persisted through serde_json::to_string, so the
+    // compact outer payload tag is a stable marker. Prefix matching may
+    // over-select a future graph/menu variant, which the tolerant reducer
+    // ignores, but it cannot omit a current graph-reduction input.
     let mut statement = connection
-        .prepare_cached("SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY seq ASC")
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND (
+                   instr(envelope_json, '\"type\":\"graph_') > 0
+                   OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
+                   OR instr(envelope_json, '\"type\":\"menu_') > 0
+               )
+             ORDER BY seq ASC",
+        )
         .map_err(map_sqlite_error)?;
     let envelopes = statement
         .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
@@ -5190,7 +5293,7 @@ fn load_graph_reduction(
             })
         })
         .collect::<StoreResult<Vec<_>>>()?;
-    Ok(reduce_graph(&envelopes))
+    Ok(envelopes)
 }
 
 trait GraphCommandCoordinates {
@@ -6364,6 +6467,9 @@ fn append_envelopes(
     validate_worker_transitions: bool,
 ) -> StoreResult<CommittedSeqRange> {
     let (session, batch_len) = same_session_batch(envelopes)?;
+    let changes_graph_reduction = envelopes
+        .iter()
+        .any(|envelope| graph_reduction_event(&envelope.payload));
     let mut connection = store.connection()?;
     // IMMEDIATE makes durable-head validation, sequence allocation, and the
     // batch insert one indivisible write critical section.
@@ -6432,11 +6538,40 @@ fn append_envelopes(
     for (envelope, stamped) in envelopes.iter_mut().zip(stamped) {
         *envelope = stamped;
     }
+    if changes_graph_reduction {
+        store.extend_graph_reduction(&session, envelopes);
+    }
     Ok(CommittedSeqRange {
         session_id: session,
         first_seq,
         last_seq,
     })
+}
+
+fn graph_reduction_event(payload: &serde_json::Value) -> bool {
+    payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| {
+            kind.starts_with("graph_") || kind == "evidence_recorded" || kind.starts_with("menu_")
+        })
+}
+
+fn graph_pinned_event(payload: &serde_json::Value) -> bool {
+    matches!(
+        serde_json::from_value::<EventPayload>(payload.clone()),
+        Ok(EventPayload::GraphPinned(_))
+    )
+}
+
+fn retain_latest_graph(envelopes: &mut Vec<RawEnvelope>) {
+    if let Some(index) = envelopes
+        .iter()
+        .rposition(|envelope| graph_pinned_event(&envelope.payload))
+        && index > 0
+    {
+        envelopes.drain(..index);
+    }
 }
 
 fn validate_worker_run_transitions(

@@ -345,77 +345,63 @@ pub(super) async fn run_session_actor(
             }
             ActorCommand::PinGraph { command, completed } => {
                 let result = store.pin_graph(command).await;
-                if let Ok(GraphPinOutcome::Committed { envelopes, .. }) = &result {
-                    if let Some(last) = envelopes.last() {
-                        head = last.seq;
-                        authority_epoch = last.authority_epoch;
-                    }
-                    observer.observe(HubObservation::Persisted {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    publish(
-                        &mut attachments,
-                        envelopes,
-                        catch_up_byte_budget,
-                        &metrics,
-                        &hooks,
-                    );
-                    observer.observe(HubObservation::Published {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                }
+                let envelopes = match &result {
+                    Ok(GraphPinOutcome::Committed { envelopes, .. }) => Some(envelopes.as_slice()),
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
                 let _ = completed.send(result);
             }
             ActorCommand::AbandonGraph { command, completed } => {
                 let result = store.abandon_graph(command).await;
-                if let Ok(GraphAbandonOutcome::Committed { envelopes, .. }) = &result {
-                    if let Some(last) = envelopes.last() {
-                        head = last.seq;
-                        authority_epoch = last.authority_epoch;
+                let envelopes = match &result {
+                    Ok(GraphAbandonOutcome::Committed { envelopes, .. }) => {
+                        Some(envelopes.as_slice())
                     }
-                    observer.observe(HubObservation::Persisted {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    publish(
-                        &mut attachments,
-                        envelopes,
-                        catch_up_byte_budget,
-                        &metrics,
-                        &hooks,
-                    );
-                    observer.observe(HubObservation::Published {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                }
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
                 let _ = completed.send(result);
             }
             ActorCommand::RecordGraphEvidence { command, completed } => {
                 let result = store.record_graph_evidence(command).await;
-                if let Ok(GraphEvidenceOutcome::Committed { envelopes, .. }) = &result {
-                    if let Some(last) = envelopes.last() {
-                        head = last.seq;
-                        authority_epoch = last.authority_epoch;
+                let envelopes = match &result {
+                    Ok(GraphEvidenceOutcome::Committed { envelopes, .. }) => {
+                        Some(envelopes.as_slice())
                     }
-                    observer.observe(HubObservation::Persisted {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    publish(
-                        &mut attachments,
-                        envelopes,
-                        catch_up_byte_budget,
-                        &metrics,
-                        &hooks,
-                    );
-                    observer.observe(HubObservation::Published {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                }
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
                 let _ = completed.send(result);
             }
             ActorCommand::SelectEffort { command, completed } => {
@@ -924,6 +910,36 @@ pub(super) async fn run_session_actor(
             ActorCommand::Stop => break,
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_graph_commit(
+    envelopes: Option<&[RawEnvelope]>,
+    session_id: &SessionId,
+    head: &mut u64,
+    authority_epoch: &mut u64,
+    attachments: &mut HashMap<AttachmentId, ActorAttachment>,
+    catch_up_byte_budget: usize,
+    observer: &Arc<dyn SessionHubObserver>,
+    metrics: &HubMetrics,
+    hooks: &Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
+) {
+    let Some(envelopes) = envelopes else {
+        return;
+    };
+    if let Some(last) = envelopes.last() {
+        *head = last.seq;
+        *authority_epoch = last.authority_epoch;
+    }
+    observer.observe(HubObservation::Persisted {
+        session_id: session_id.clone(),
+        through_seq: *head,
+    });
+    publish(attachments, envelopes, catch_up_byte_budget, metrics, hooks);
+    observer.observe(HubObservation::Published {
+        session_id: session_id.clone(),
+        through_seq: *head,
+    });
 }
 
 async fn session_is_quiescent(

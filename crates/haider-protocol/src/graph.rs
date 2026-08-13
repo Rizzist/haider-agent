@@ -231,7 +231,7 @@ impl GraphStatus {
             (_, GraphNodeName::Verify) => "record 3 green VERIFY results",
             (_, GraphNodeName::Ship) => "await explicit human confirm",
         };
-        let line = format!(
+        let mut line = format!(
             "GraphBrief: {} attempt {}/{}; gate {}; evidence {} green/{} red ({} effective); next: {}.",
             node.label(),
             self.attempt,
@@ -242,7 +242,12 @@ impl GraphStatus {
             node_status.evidence.effective_green,
             expectation,
         );
-        Some(bound_utf8(&line, GRAPH_BRIEF_MAX_BYTES))
+        truncate_utf8(&mut line, GRAPH_BRIEF_MAX_BYTES);
+        Some(line)
+    }
+
+    fn node_mut(&mut self, node: GraphNodeName) -> Option<&mut GraphNodeStatus> {
+        self.nodes.iter_mut().find(|status| status.node == node)
     }
 }
 
@@ -256,29 +261,41 @@ pub struct GraphReduction {
     pub template_nodes: Vec<GraphNodeSpec>,
 }
 
+impl GraphReduction {
+    fn status_for_graph_mut(&mut self, graph_id: &GraphId) -> Option<&mut GraphStatus> {
+        self.status
+            .as_mut()
+            .filter(|status| status.graph_id == *graph_id)
+    }
+}
+
 /// Reduces the latest graph instance from session journal truth. Unknown
 /// payloads and graph facts for older instances remain tolerated.
 #[must_use]
 pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
     let mut reduction = GraphReduction::default();
     for envelope in envelopes {
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Some(payload) = graph_reduction_payload(&envelope.payload) else {
             continue;
         };
         match payload {
             EventPayload::GraphPinned(pinned) => {
+                let GraphPinned {
+                    graph_id,
+                    template,
+                    digest,
+                    nodes: template_nodes,
+                } = pinned;
                 reduction.evidence.clear();
-                reduction.template_nodes = pinned.nodes.clone();
                 reduction.status = Some(GraphStatus {
-                    graph_id: pinned.graph_id,
-                    template: pinned.template,
-                    digest: pinned.digest,
+                    graph_id,
+                    template,
+                    digest,
                     phase: GraphPhase::Active,
                     current_node: None,
                     attempt: 0,
-                    nodes: pinned
-                        .nodes
-                        .into_iter()
+                    nodes: template_nodes
+                        .iter()
                         .map(|spec| GraphNodeStatus {
                             node: spec.name,
                             attempts_opened: 0,
@@ -290,13 +307,15 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                     blocked_reason: None,
                     pending_menu: None,
                 });
+                reduction.template_nodes = template_nodes;
             }
             EventPayload::GraphAttemptOpened(opened) => {
-                let Some(status) = reduction.status.as_mut().filter(|status| {
-                    status.graph_id == opened.graph_id && status.phase == GraphPhase::Active
-                }) else {
+                let Some(status) = reduction.status_for_graph_mut(&opened.graph_id) else {
                     continue;
                 };
+                if status.phase != GraphPhase::Active {
+                    continue;
+                }
                 status.current_node = Some(opened.node);
                 status.attempt = opened.attempt;
                 if opened.node == GraphNodeName::Build {
@@ -309,11 +328,7 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                         node.satisfied = false;
                     }
                 }
-                if let Some(node) = status
-                    .nodes
-                    .iter_mut()
-                    .find(|item| item.node == opened.node)
-                {
+                if let Some(node) = status.node_mut(opened.node) {
                     node.attempts_opened = node.attempts_opened.saturating_add(1);
                     node.current_attempt = Some(opened.attempt);
                     node.evidence = GraphEvidenceTally::default();
@@ -321,19 +336,16 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                 }
             }
             EventPayload::EvidenceRecorded(recorded) => {
-                let Some(status) = reduction.status.as_mut().filter(|status| {
-                    status.graph_id == recorded.graph_id
-                        && status.phase == GraphPhase::Active
-                        && status.current_node == Some(recorded.node)
-                        && status.attempt == recorded.attempt
-                }) else {
+                let Some(status) = reduction.status_for_graph_mut(&recorded.graph_id) else {
                     continue;
                 };
-                if let Some(node) = status
-                    .nodes
-                    .iter_mut()
-                    .find(|item| item.node == recorded.node)
+                if status.phase != GraphPhase::Active
+                    || status.current_node != Some(recorded.node)
+                    || status.attempt != recorded.attempt
                 {
+                    continue;
+                }
+                if let Some(node) = status.node_mut(recorded.node) {
                     match recorded.verdict {
                         EvidenceVerdict::Green => {
                             node.evidence.green = node.evidence.green.saturating_add(1);
@@ -351,36 +363,20 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                 reduction.evidence.push(recorded);
             }
             EventPayload::GraphGateSatisfied(satisfied) => {
-                let Some(status) = reduction
-                    .status
-                    .as_mut()
-                    .filter(|status| status.graph_id == satisfied.graph_id)
-                else {
+                let Some(status) = reduction.status_for_graph_mut(&satisfied.graph_id) else {
                     continue;
                 };
-                if let Some(node) = status
-                    .nodes
-                    .iter_mut()
-                    .find(|item| item.node == satisfied.node)
-                {
+                if let Some(node) = status.node_mut(satisfied.node) {
                     node.satisfied = true;
                 }
             }
             EventPayload::GraphAdvanced(advanced) => {
-                if let Some(status) = reduction
-                    .status
-                    .as_mut()
-                    .filter(|status| status.graph_id == advanced.graph_id)
-                {
+                if let Some(status) = reduction.status_for_graph_mut(&advanced.graph_id) {
                     status.current_node = Some(advanced.to_node);
                 }
             }
             EventPayload::GraphBlocked(blocked) => {
-                if let Some(status) = reduction
-                    .status
-                    .as_mut()
-                    .filter(|status| status.graph_id == blocked.graph_id)
-                {
+                if let Some(status) = reduction.status_for_graph_mut(&blocked.graph_id) {
                     status.phase = GraphPhase::Blocked;
                     status.current_node = Some(blocked.node);
                     status.blocked_reason = Some(blocked.reason);
@@ -388,43 +384,26 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                 }
             }
             EventPayload::GraphCompleted(completed) => {
-                if let Some(status) = reduction
-                    .status
-                    .as_mut()
-                    .filter(|status| status.graph_id == completed.graph_id)
-                {
+                if let Some(status) = reduction.status_for_graph_mut(&completed.graph_id) {
                     status.phase = GraphPhase::Completed;
                     status.pending_menu = None;
                 }
             }
             EventPayload::GraphAbandoned(abandoned) => {
-                if let Some(status) = reduction
-                    .status
-                    .as_mut()
-                    .filter(|status| status.graph_id == abandoned.graph_id)
-                {
+                if let Some(status) = reduction.status_for_graph_mut(&abandoned.graph_id) {
                     status.phase = GraphPhase::Abandoned;
                     status.pending_menu = None;
                 }
             }
             EventPayload::MenuOpened(menu) => {
                 if let crate::menu::MenuKind::GraphHumanConfirm { graph_id, .. } = &menu.kind
-                    && let Some(status) = reduction
-                        .status
-                        .as_mut()
-                        .filter(|status| &status.graph_id == graph_id)
+                    && let Some(status) = reduction.status_for_graph_mut(graph_id)
                 {
                     status.pending_menu = Some(menu.id);
                 }
             }
-            EventPayload::MenuAnswered(answer) => {
-                if let Some(status) = reduction.status.as_mut()
-                    && status.pending_menu.as_ref() == Some(&answer.menu)
-                {
-                    status.pending_menu = None;
-                }
-            }
-            EventPayload::MenuClosed { menu, .. } => {
+            EventPayload::MenuAnswered(crate::menu::MenuAnswer { menu, .. })
+            | EventPayload::MenuClosed { menu, .. } => {
                 if let Some(status) = reduction.status.as_mut()
                     && status.pending_menu.as_ref() == Some(&menu)
                 {
@@ -435,6 +414,14 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
         }
     }
     reduction
+}
+
+fn graph_reduction_payload(payload: &serde_json::Value) -> Option<EventPayload> {
+    let kind = payload.get("type")?.as_str()?;
+    if !kind.starts_with("graph_") && kind != "evidence_recorded" && !kind.starts_with("menu_") {
+        return None;
+    }
+    serde_json::from_value(payload.clone()).ok()
 }
 
 #[must_use]
@@ -490,15 +477,21 @@ pub fn evidence_fingerprint(normalized_detail: &str) -> String {
 }
 
 #[must_use]
-pub fn bound_utf8(value: &str, max_bytes: usize) -> String {
+fn bound_utf8(value: &str, max_bytes: usize) -> String {
+    let mut bounded = value.to_owned();
+    truncate_utf8(&mut bounded, max_bytes);
+    bounded
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
     if value.len() <= max_bytes {
-        return value.to_owned();
+        return;
     }
     let mut end = max_bytes;
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    value[..end].to_owned()
+    value.truncate(end);
 }
 
 #[cfg(test)]
