@@ -396,6 +396,9 @@ async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
             node: haider_protocol::graph::GraphNodeName::Build,
             verdict: haider_protocol::graph::EvidenceVerdict::Green,
             detail: "build passed".into(),
+            slot: None,
+            subject_digest: None,
+            signal: None,
             device_id: world.device_id.clone(),
         })
         .await

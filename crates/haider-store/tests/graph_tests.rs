@@ -3,17 +3,20 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use haider_protocol::EventPayload;
+use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPhase};
+use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::graph::{
-    EvidenceVerdict, GraphBlockReason, GraphNodeName, GraphPhase, SHIP_LOOP_TEMPLATE,
-    evidence_fingerprint,
+    EvidenceAuthority, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphNodeName,
+    GraphPhase, GraphPinned, ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE,
+    SubjectSelector, evidence_fingerprint, process_signal_subject_digest, ship_loop_nodes,
 };
-use haider_protocol::ids::{DeviceId, EventId, GraphId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, GraphId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_store::{
     EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
     GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, MenuResolutionCommand,
-    MenuResolutionOutcome, SessionCreateCommand, Store,
+    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, SessionCreateCommand, Store,
 };
 
 fn create_session(store: &Store, name: &str) -> SessionId {
@@ -82,8 +85,159 @@ fn evidence_command(
         node,
         verdict,
         detail: detail.into(),
+        slot: None,
+        subject_digest: None,
+        signal: None,
         device_id: DeviceId::new("graph-test"),
     }
+}
+
+fn raw_envelope(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &RunId,
+    event_id: impl Into<String>,
+    payload: EventPayload,
+) -> haider_protocol::envelope::RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("graph-test"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(payload).expect("serialize test payload"),
+    }
+}
+
+fn process_signal_command(
+    store: &Store,
+    session_id: &SessionId,
+    serial: usize,
+    exit_code: i32,
+    transcript: &str,
+) -> (ProcessSignalCommand, ProcessSignalRef, String) {
+    process_signal_command_for_args(
+        store,
+        session_id,
+        serial,
+        exit_code,
+        transcript,
+        &format!("command-{serial}"),
+    )
+}
+
+fn process_signal_command_for_args(
+    store: &Store,
+    session_id: &SessionId,
+    serial: usize,
+    exit_code: i32,
+    transcript: &str,
+    command_args: &str,
+) -> (ProcessSignalCommand, ProcessSignalRef, String) {
+    let run_id = RunId::new(format!("run-{serial}"));
+    let call_id = format!("process-{serial}");
+    let effect_id = EffectId::new(format!("effect-{serial}"));
+    let command_arg_digest = format!("blake3:{}", blake3::hash(command_args.as_bytes()).to_hex());
+    let transcript_digest = format!("blake3:{}", blake3::hash(transcript.as_bytes()).to_hex());
+    let subject_digest =
+        process_signal_subject_digest(&command_arg_digest, &transcript_digest, None);
+    let intent = EffectIntent {
+        effect: effect_id.clone(),
+        class: EffectClass::ProcessExec,
+        summary: format!("run test command {serial}"),
+        args_digest: command_arg_digest.clone(),
+        workspace_revision: None,
+    };
+    let outcome = if exit_code == 0 {
+        EffectOutcome::Ok
+    } else {
+        EffectOutcome::Failed {
+            error: format!("exit {exit_code}"),
+        }
+    };
+    let mut provenance = vec![
+        raw_envelope(
+            store,
+            session_id,
+            &run_id,
+            format!("intent-{serial}"),
+            EventPayload::Effect(EffectPhase::Intent(intent)),
+        ),
+        raw_envelope(
+            store,
+            session_id,
+            &run_id,
+            format!("outcome-{serial}"),
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: effect_id.clone(),
+                outcome,
+                freshness: None,
+            }),
+        ),
+    ];
+    store
+        .append(&mut provenance)
+        .expect("append process effect provenance");
+    let signal_ref = ProcessSignalRef {
+        run_id: run_id.clone(),
+        call_id: call_id.clone(),
+        effect_id: effect_id.clone(),
+    };
+    (
+        ProcessSignalCommand {
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            branch_id: None,
+            signal: ProcessSignalRecorded {
+                run_id,
+                call_id,
+                effect_id,
+                command_arg_digest,
+                exit_code: Some(exit_code),
+                transcript_digest,
+                workspace_revision: None,
+                subject_digest: subject_digest.clone(),
+                artifact: None,
+            },
+            device_id: DeviceId::new("graph-test"),
+        },
+        signal_ref,
+        subject_digest,
+    )
+}
+
+fn attach_verify_signal(
+    store: &Store,
+    session_id: &SessionId,
+    serial: usize,
+    verdict: EvidenceVerdict,
+    detail: &str,
+    command: &mut GraphEvidenceCommand,
+) -> ProcessSignalCommand {
+    let exit_code = i32::from(verdict == EvidenceVerdict::Red);
+    let (signal_command, signal_ref, subject_digest) =
+        process_signal_command(store, session_id, serial, exit_code, detail);
+    let outcome = store
+        .record_process_signal(&signal_command)
+        .expect("record process signal");
+    assert!(matches!(outcome, ProcessSignalOutcome::Committed { .. }));
+    command.slot = Some(["tests", "lint", "typecheck"][(serial + 1) % 3].into());
+    command.subject_digest = Some(subject_digest);
+    command.signal = Some(signal_ref);
+    signal_command
 }
 
 fn record(
@@ -94,11 +248,36 @@ fn record(
     verdict: EvidenceVerdict,
     detail: &str,
 ) -> GraphEvidenceOutcome {
+    let mut command = evidence_command(store, session_id, serial, node, verdict, detail);
+    if node == GraphNodeName::Verify {
+        attach_verify_signal(store, session_id, serial, verdict, detail, &mut command);
+    }
     store
-        .record_graph_evidence(&evidence_command(
-            store, session_id, serial, node, verdict, detail,
-        ))
+        .record_graph_evidence(&command)
         .expect("record evidence")
+}
+
+fn record_verify_slot(
+    store: &Store,
+    session_id: &SessionId,
+    serial: usize,
+    slot: &str,
+    verdict: EvidenceVerdict,
+    detail: &str,
+) -> GraphEvidenceOutcome {
+    let mut command = evidence_command(
+        store,
+        session_id,
+        serial,
+        GraphNodeName::Verify,
+        verdict,
+        detail,
+    );
+    attach_verify_signal(store, session_id, serial, verdict, detail, &mut command);
+    command.slot = Some(slot.into());
+    store
+        .record_graph_evidence(&command)
+        .expect("record slotted verify evidence")
 }
 
 fn advance_to_verify(store: &Store, session_id: &SessionId, serial: usize) {
@@ -285,7 +464,7 @@ fn command_green_advances_build_without_any_model_selected_successor() {
 }
 
 #[test]
-fn all_of_three_requires_three_greens_after_the_latest_red() {
+fn all_of_three_requires_each_declared_slot_green() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let session_id = create_session(&store, "all-of-three");
@@ -338,7 +517,7 @@ fn all_of_three_requires_three_greens_after_the_latest_red() {
     assert_eq!(verify.evidence.green, 4);
     assert_eq!(verify.evidence.red, 1);
     assert_eq!(verify.evidence.effective_green, 2);
-    assert_eq!(verify.evidence.standing_red, 0);
+    assert_eq!(verify.evidence.standing_red, 1);
     record(
         &store,
         &session_id,
@@ -353,6 +532,583 @@ fn all_of_three_requires_three_greens_after_the_latest_red() {
         .expect("graph");
     assert_eq!(ship.current_node, Some(GraphNodeName::Ship));
     assert!(ship.pending_menu.is_some());
+}
+
+/// M2a LAW 1 — MUTATION CHECK: count raw Green calls instead of replacing a
+/// slot frontier. Expected failure: the third `tests` submission advances.
+#[test]
+fn duplicate_green_attestations_never_fill_distinct_slots() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "distinct-slot-law");
+    pin(&store, &session_id, "distinct-slot-law");
+    advance_to_verify(&store, &session_id, 1);
+    for serial in 2..=4 {
+        record_verify_slot(
+            &store,
+            &session_id,
+            serial,
+            "tests",
+            EvidenceVerdict::Green,
+            "tests passed",
+        );
+    }
+    let status = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    let verify = status
+        .nodes
+        .iter()
+        .find(|node| node.node == GraphNodeName::Verify)
+        .expect("verify");
+    assert_eq!(verify.evidence.green, 3, "raw audit count remains visible");
+    assert_eq!(verify.evidence.effective_green, 1, "one distinct frontier");
+
+    record_verify_slot(
+        &store,
+        &session_id,
+        5,
+        "lint",
+        EvidenceVerdict::Green,
+        "lint passed",
+    );
+    record_verify_slot(
+        &store,
+        &session_id,
+        6,
+        "typecheck",
+        EvidenceVerdict::Green,
+        "typecheck passed",
+    );
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .current_node,
+        Some(GraphNodeName::Ship),
+        "three distinct declared slots satisfy the gate"
+    );
+}
+
+/// M2a LAW 2 — MUTATION CHECK: append votes instead of replacing the named
+/// frontier. Expected failure: Green→Red does not lower effective_green or
+/// Red→Green leaves a standing red/second vote.
+#[test]
+fn resubmitting_a_slot_replaces_its_verdict_both_directions() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "slot-replacement-law");
+    pin(&store, &session_id, "slot-replacement-law");
+    advance_to_verify(&store, &session_id, 1);
+    record_verify_slot(
+        &store,
+        &session_id,
+        2,
+        "tests",
+        EvidenceVerdict::Green,
+        "tests passed",
+    );
+    record_verify_slot(
+        &store,
+        &session_id,
+        3,
+        "tests",
+        EvidenceVerdict::Red,
+        "tests failed",
+    );
+    let red = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let verify = red
+        .nodes
+        .iter()
+        .find(|node| node.node == GraphNodeName::Verify)
+        .expect("verify");
+    assert_eq!(verify.evidence.effective_green, 0);
+    assert_eq!(verify.evidence.standing_red, 1);
+    assert_eq!(
+        verify
+            .slot_statuses()
+            .iter()
+            .find(|slot| slot.id == "tests")
+            .and_then(|slot| slot.verdict),
+        Some(EvidenceVerdict::Red)
+    );
+
+    record_verify_slot(
+        &store,
+        &session_id,
+        4,
+        "tests",
+        EvidenceVerdict::Green,
+        "tests passed again",
+    );
+    let green = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let verify = green
+        .nodes
+        .iter()
+        .find(|node| node.node == GraphNodeName::Verify)
+        .expect("verify");
+    assert_eq!(verify.evidence.effective_green, 1);
+    assert_eq!(verify.evidence.standing_red, 0);
+    assert_eq!(verify.evidence.green, 2);
+    assert_eq!(verify.evidence.red, 1);
+}
+
+/// M2a LAW 3 — MUTATION CHECK: trust the model's Green verdict without
+/// checking daemon exit truth. Expected failure: evidence commits/advances.
+#[test]
+fn non_zero_process_exit_claimed_green_is_typed_rejection() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "nonzero-green-law");
+    pin(&store, &session_id, "nonzero-green-law");
+    advance_to_verify(&store, &session_id, 1);
+    let (signal_command, signal_ref, subject_digest) =
+        process_signal_command(&store, &session_id, 2, 7, "tests failed");
+    store
+        .record_process_signal(&signal_command)
+        .expect("record failed process signal");
+    let head = store.latest_seq(&session_id).expect("head");
+    let mut command = evidence_command(
+        &store,
+        &session_id,
+        2,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "claim tests passed",
+    );
+    command.slot = Some("tests".into());
+    command.subject_digest = Some(subject_digest);
+    command.signal = Some(signal_ref);
+    let error = store
+        .record_graph_evidence(&command)
+        .expect_err("non-zero exit cannot prove Green");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("non_zero_exit_claimed_green")
+    );
+    assert_eq!(store.latest_seq(&session_id).expect("head"), head);
+}
+
+/// M2a LAW 4 — MUTATION CHECK: accept an older signal after a later execution
+/// of the same command changed its transcript subject. Expected failure: the
+/// old, otherwise self-consistent signal appends evidence.
+#[test]
+fn stale_process_subject_is_typed_rejection() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "stale-subject-law");
+    pin(&store, &session_id, "stale-subject-law");
+    advance_to_verify(&store, &session_id, 1);
+    let (signal_command, signal_ref, subject_digest) = process_signal_command_for_args(
+        &store,
+        &session_id,
+        2,
+        0,
+        "tests passed before workspace changed",
+        "cargo test",
+    );
+    store
+        .record_process_signal(&signal_command)
+        .expect("record process signal");
+    let (current_signal, _, _) = process_signal_command_for_args(
+        &store,
+        &session_id,
+        3,
+        0,
+        "tests passed after workspace changed",
+        "cargo test",
+    );
+    store
+        .record_process_signal(&current_signal)
+        .expect("record current process subject");
+    let mut command = evidence_command(
+        &store,
+        &session_id,
+        2,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "tests passed",
+    );
+    command.slot = Some("tests".into());
+    command.subject_digest = Some(subject_digest);
+    command.signal = Some(signal_ref);
+    let error = store
+        .record_graph_evidence(&command)
+        .expect_err("stale subject must reject");
+    assert_eq!(error.code, ErrorCode::RevisionConflict);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("stale_evidence_subject")
+    );
+}
+
+/// M2a authority contract — MUTATION CHECK: collapse slot/authority/
+/// provenance failures into accepted testimony or an untyped daemon error.
+#[test]
+fn slot_authority_and_signal_provenance_fail_through_typed_errors() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "typed-authority-law");
+    pin(&store, &session_id, "typed-authority-law");
+    advance_to_verify(&store, &session_id, 1);
+
+    let mut bare = evidence_command(
+        &store,
+        &session_id,
+        2,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "model says green",
+    );
+    bare.slot = Some("tests".into());
+    let wrong_authority = store
+        .record_graph_evidence(&bare)
+        .expect_err("daemon slot rejects bare testimony");
+    assert_eq!(
+        wrong_authority
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("wrong_evidence_authority")
+    );
+
+    let (signal_command, signal_ref, subject_digest) =
+        process_signal_command(&store, &session_id, 3, 0, "lint passed");
+    store
+        .record_process_signal(&signal_command)
+        .expect("record signal");
+    let mut unknown = evidence_command(
+        &store,
+        &session_id,
+        3,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "lint passed",
+    );
+    unknown.slot = Some("security".into());
+    unknown.subject_digest = Some(subject_digest.clone());
+    unknown.signal = Some(signal_ref.clone());
+    let unknown_slot = store
+        .record_graph_evidence(&unknown)
+        .expect_err("undeclared slot rejects");
+    assert_eq!(
+        unknown_slot
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("unknown_evidence_slot")
+    );
+
+    let mut mismatched = unknown;
+    mismatched.command_id = "evidence-mismatched-provenance".into();
+    mismatched.request_digest = "evidence-mismatched-provenance-digest".into();
+    mismatched.request_json = r#"{"case":"mismatched-provenance"}"#.into();
+    mismatched.slot = Some("lint".into());
+    mismatched.signal = Some(ProcessSignalRef {
+        call_id: "different-process-call".into(),
+        ..signal_ref.clone()
+    });
+    let provenance = store
+        .record_graph_evidence(&mismatched)
+        .expect_err("mismatched signal provenance rejects");
+    assert_eq!(
+        provenance
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("mismatched_signal_provenance")
+    );
+
+    let (mut altered_signal, _, _) =
+        process_signal_command_for_args(&store, &session_id, 4, 0, "tests passed", "cargo test");
+    altered_signal.signal.command_arg_digest =
+        format!("blake3:{}", blake3::hash(b"different command").to_hex());
+    altered_signal.signal.subject_digest = process_signal_subject_digest(
+        &altered_signal.signal.command_arg_digest,
+        &altered_signal.signal.transcript_digest,
+        None,
+    );
+    let altered = store
+        .record_process_signal(&altered_signal)
+        .expect_err("signal argument digest must match its durable effect intent");
+    assert_eq!(
+        altered
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("mismatched_signal_provenance")
+    );
+
+    let mut valid = evidence_command(
+        &store,
+        &session_id,
+        30,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "tests passed",
+    );
+    valid.run_id = signal_ref.run_id.clone();
+    valid.slot = Some("tests".into());
+    valid.subject_digest = Some(subject_digest.clone());
+    valid.signal = Some(signal_ref.clone());
+    store
+        .record_graph_evidence(&valid)
+        .expect("first slot may use process signal");
+    let mut relabeled = valid;
+    relabeled.command_id = "evidence-relabeled-signal".into();
+    relabeled.request_digest = "evidence-relabeled-signal-digest".into();
+    relabeled.request_json = r#"{"case":"relabeled-signal"}"#.into();
+    relabeled.slot = Some("lint".into());
+    let relabeled = store
+        .record_graph_evidence(&relabeled)
+        .expect_err("one process signal cannot prove two slots");
+    assert_eq!(
+        relabeled
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("mismatched_signal_provenance")
+    );
+
+    let (same_command_rerun, rerun_ref, rerun_subject) = process_signal_command_for_args(
+        &store,
+        &session_id,
+        5,
+        0,
+        "same command passed again",
+        "command-3",
+    );
+    store
+        .record_process_signal(&same_command_rerun)
+        .expect("record same-command rerun");
+    let head = store.latest_seq(&session_id).expect("head");
+    let mut duplicate_subject = evidence_command(
+        &store,
+        &session_id,
+        31,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "same command relabeled as lint",
+    );
+    duplicate_subject.run_id = rerun_ref.run_id.clone();
+    duplicate_subject.slot = Some("lint".into());
+    duplicate_subject.subject_digest = Some(rerun_subject);
+    duplicate_subject.signal = Some(rerun_ref);
+    let duplicate_subject = store
+        .record_graph_evidence(&duplicate_subject)
+        .expect_err("one command subject cannot prove two slots through distinct effects");
+    assert_eq!(
+        duplicate_subject
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("mismatched_signal_provenance")
+    );
+    assert_eq!(store.latest_seq(&session_id).expect("head"), head);
+}
+
+#[test]
+fn model_attested_slots_remain_explicit_testimony_in_status() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "model-attested-authority");
+    let graph_id = GraphId::new("model-attested-graph");
+    let mut nodes = ship_loop_nodes();
+    let verify = nodes
+        .iter_mut()
+        .find(|node| node.name == GraphNodeName::Verify)
+        .expect("verify spec");
+    for slot in &mut verify.verify_slots {
+        slot.authority = EvidenceAuthority::ModelAttested;
+        slot.subject_selector = SubjectSelector::Freeform;
+    }
+    let run_id = RunId::new("model-attested-run");
+    let mut opening = vec![
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "model-attested-pin",
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_id.clone(),
+                template: "model-attested-test".into(),
+                digest: "model-attested-digest".into(),
+                nodes,
+            }),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "model-attested-open",
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id,
+                node: GraphNodeName::Verify,
+                attempt: 1,
+            }),
+        ),
+    ];
+    store.append(&mut opening).expect("append graph");
+    let mut command = evidence_command(
+        &store,
+        &session_id,
+        1,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "qualitative review passed",
+    );
+    command.slot = Some("tests".into());
+    command.subject_digest = Some("review:current-intent".into());
+    let mut wrong_authority = command.clone();
+    wrong_authority.command_id = "evidence-model-slot-process-proof".into();
+    wrong_authority.request_digest = "evidence-model-slot-process-proof-digest".into();
+    wrong_authority.request_json = r#"{"case":"model-slot-process-proof"}"#.into();
+    wrong_authority.signal = Some(ProcessSignalRef {
+        run_id: RunId::new("unused-process-run"),
+        call_id: "unused-process-call".into(),
+        effect_id: EffectId::new("unused-process-effect"),
+    });
+    let error = store
+        .record_graph_evidence(&wrong_authority)
+        .expect_err("model-attested slot rejects a process proof");
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|value| value["kind"].as_str()),
+        Some("wrong_evidence_authority")
+    );
+    store
+        .record_graph_evidence(&command)
+        .expect("model-attested evidence");
+    let status = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let slot = status
+        .nodes
+        .iter()
+        .find(|node| node.node == GraphNodeName::Verify)
+        .expect("verify")
+        .slot_statuses()
+        .iter()
+        .find(|slot| slot.id == "tests")
+        .expect("tests slot");
+    assert_eq!(slot.authority, EvidenceAuthority::ModelAttested);
+    assert!(matches!(
+        &slot.source,
+        Some(haider_protocol::graph::GraphEvidenceSource::Model { .. })
+    ));
+}
+
+/// M2a LAW 7 — MUTATION CHECK: apply slot semantics from current binary
+/// defaults to an old pinned AllOfN node. Expected failure: unkeyed legacy
+/// Greens are ignored instead of using the exact M1 flat frontier.
+#[test]
+fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "legacy-flat-law");
+    let graph_id = GraphId::new("legacy-flat-graph");
+    let mut nodes = ship_loop_nodes();
+    for node in &mut nodes {
+        node.verify_slots.clear();
+    }
+    let legacy_run = RunId::new("legacy-journal-run");
+    let mut opening = vec![
+        raw_envelope(
+            &store,
+            &session_id,
+            &legacy_run,
+            "legacy-graph-pinned",
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_id.clone(),
+                template: SHIP_LOOP_TEMPLATE.into(),
+                digest: "legacy-empty-slot-digest".into(),
+                nodes,
+            }),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &legacy_run,
+            "legacy-verify-opened",
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id,
+                node: GraphNodeName::Verify,
+                attempt: 1,
+            }),
+        ),
+    ];
+    store.append(&mut opening).expect("append legacy graph");
+    for (serial, verdict) in [
+        (1, EvidenceVerdict::Green),
+        (2, EvidenceVerdict::Green),
+        (3, EvidenceVerdict::Red),
+        (4, EvidenceVerdict::Green),
+        (5, EvidenceVerdict::Green),
+    ] {
+        store
+            .record_graph_evidence(&evidence_command(
+                &store,
+                &session_id,
+                serial,
+                GraphNodeName::Verify,
+                verdict,
+                "legacy testimony",
+            ))
+            .expect("legacy evidence");
+    }
+    let open = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let verify = open
+        .nodes
+        .iter()
+        .find(|node| node.node == GraphNodeName::Verify)
+        .expect("verify");
+    assert_eq!(verify.evidence.effective_green, 2);
+    assert_eq!(open.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        serde_json::to_string(&open).expect("serialize legacy reduction"),
+        r#"{"graph_id":"legacy-flat-graph","template":"ship-loop","digest":"legacy-empty-slot-digest","phase":"active","current_node":"VERIFY","attempt":1,"nodes":[{"node":"BUILD","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false},{"node":"VERIFY","attempts_opened":1,"current_attempt":1,"evidence":{"green":4,"red":1,"effective_green":2,"standing_red":0},"satisfied":false},{"node":"SHIP","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false}]}"#,
+        "legacy no-slot reduction must retain its pre-M2a serialized bytes"
+    );
+    store
+        .record_graph_evidence(&evidence_command(
+            &store,
+            &session_id,
+            6,
+            GraphNodeName::Verify,
+            EvidenceVerdict::Green,
+            "legacy testimony",
+        ))
+        .expect("third post-red legacy Green");
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .current_node,
+        Some(GraphNodeName::Ship)
+    );
 }
 
 #[test]
@@ -393,6 +1149,8 @@ fn eighth_unsatisfied_epoch_blocks_rounds_exhausted_without_back_edge_facts() {
 }
 
 #[test]
+/// M2a LAW 6 — MUTATION CHECK: scope no-progress only to one epoch or clear
+/// historical Red fingerprints on retry. Expected failure: graph stays active.
 fn repeated_red_fingerprint_in_the_next_epoch_blocks_no_progress() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
@@ -493,34 +1251,36 @@ fn no_progress_uses_the_previous_opening_of_the_same_node_when_epochs_skip_it() 
 }
 
 #[test]
+/// M2a LAW 5 — MUTATION CHECK: retain slot frontiers when BUILD opens a new
+/// epoch. Expected failure: epoch-one Greens leak into attempt two.
 fn stale_verify_greens_from_an_older_build_epoch_never_satisfy() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let session_id = create_session(&store, "stale-green");
     pin(&store, &session_id, "stale-green");
     advance_to_verify(&store, &session_id, 1);
-    record(
+    record_verify_slot(
         &store,
         &session_id,
         2,
-        GraphNodeName::Verify,
+        "tests",
         EvidenceVerdict::Green,
         "old green a",
     );
-    record(
+    record_verify_slot(
         &store,
         &session_id,
         3,
-        GraphNodeName::Verify,
+        "lint",
         EvidenceVerdict::Green,
         "old green b",
     );
     for serial in 4..10 {
-        record(
+        record_verify_slot(
             &store,
             &session_id,
             serial,
-            GraphNodeName::Verify,
+            "typecheck",
             EvidenceVerdict::Red,
             &format!("epoch one failure {serial}"),
         );
@@ -537,6 +1297,13 @@ fn stale_verify_greens_from_an_older_build_epoch_never_satisfy() {
         .expect("verify");
     assert_eq!(stale_verify.evidence.green, 0);
     assert_eq!(stale_verify.evidence.red, 0);
+    assert!(
+        stale_verify
+            .slot_statuses()
+            .iter()
+            .all(|slot| slot.verdict.is_none()),
+        "opening BUILD epoch two must clear every old slot frontier"
+    );
     assert!(!stale_verify.satisfied);
     advance_to_verify(&store, &session_id, 10);
     record(
@@ -564,6 +1331,88 @@ fn stale_verify_greens_from_an_older_build_epoch_never_satisfy() {
         !verify.satisfied,
         "epoch-one greens are stale by construction"
     );
+}
+
+/// M2a LAW 8 — MUTATION CHECK: append a fresh signal/evidence fact when the
+/// caller replays a lost response. Expected failure: either count is two.
+#[test]
+fn replaying_the_same_signal_and_evidence_is_exactly_once() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "signal-replay-law");
+    pin(&store, &session_id, "signal-replay-law");
+    advance_to_verify(&store, &session_id, 1);
+    let (signal_command, signal_ref, subject_digest) =
+        process_signal_command(&store, &session_id, 2, 0, "tests passed");
+    let ProcessSignalOutcome::Committed { recorded, .. } = store
+        .record_process_signal(&signal_command)
+        .expect("record signal")
+    else {
+        panic!("first signal must commit");
+    };
+    drop(store);
+    let store = Store::open(root.path()).expect("reopen after lost signal response");
+    assert_eq!(
+        store
+            .record_process_signal(&signal_command)
+            .expect("signal lost-response replay"),
+        ProcessSignalOutcome::IdempotentReplay {
+            recorded: recorded.clone()
+        }
+    );
+
+    let mut command = evidence_command(
+        &store,
+        &session_id,
+        2,
+        GraphNodeName::Verify,
+        EvidenceVerdict::Green,
+        "tests passed",
+    );
+    command.slot = Some("tests".into());
+    command.subject_digest = Some(subject_digest);
+    command.signal = Some(signal_ref);
+    let GraphEvidenceOutcome::Committed { recorded, .. } = store
+        .record_graph_evidence(&command)
+        .expect("record evidence")
+    else {
+        panic!("first evidence must commit");
+    };
+    drop(store);
+    let store = Store::open(root.path()).expect("reopen after lost evidence response");
+    assert_eq!(
+        store
+            .record_graph_evidence(&command)
+            .expect("evidence lost-response replay"),
+        GraphEvidenceOutcome::IdempotentReplay {
+            recorded: recorded.clone()
+        }
+    );
+
+    let mut signals = 0;
+    let mut evidence = 0;
+    for envelope in store.journal_replay(&session_id).expect("journal") {
+        match serde_json::from_value::<EventPayload>(envelope.payload) {
+            Ok(EventPayload::ProcessSignalRecorded(signal))
+                if signal.effect_id == signal_command.signal.effect_id =>
+            {
+                signals += 1;
+            }
+            Ok(EventPayload::EvidenceRecorded(fact))
+                if fact.source
+                    == haider_protocol::graph::GraphEvidenceSource::ProcessSignal {
+                        run_id: signal_command.signal.run_id.clone(),
+                        call_id: signal_command.signal.call_id.clone(),
+                        effect_id: signal_command.signal.effect_id.clone(),
+                    } =>
+            {
+                evidence += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(signals, 1);
+    assert_eq!(evidence, 1);
 }
 
 fn reach_ship(

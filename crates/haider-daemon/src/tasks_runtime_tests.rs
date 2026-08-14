@@ -509,10 +509,38 @@ async fn foreground_process_exec_is_unchanged_and_journals_no_task_facts() {
     .await;
     assert_eq!(result["exit_code"], 0, "foreground blocks to completion");
     assert_eq!(result["status"], "completed");
+    assert_eq!(
+        result["transcript_digest"],
+        format!("blake3:{}", blake3::hash(b"foreground-done").to_hex())
+    );
+    assert!(result["process_signal"]["effect_id"].is_string());
+    assert!(result["subject_digest"].is_string());
     let envelopes = read_all(&store, &session_id).await;
     assert!(
         task_facts(&envelopes).is_empty(),
         "a foreground command must never journal task facts"
+    );
+    let signals = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .ok()
+                .and_then(|payload| match payload {
+                    EventPayload::ProcessSignalRecorded(signal) => Some(signal),
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        signals.len(),
+        1,
+        "foreground exec records one trusted signal"
+    );
+    assert_eq!(signals[0].run_id, run_id);
+    assert_eq!(signals[0].exit_code, Some(0));
+    assert_eq!(
+        Some(signals[0].subject_digest.as_str()),
+        result["subject_digest"].as_str()
     );
 
     dispatcher.close().await.expect("dispatcher close");

@@ -5,7 +5,9 @@
 //! attempt epoch and fingerprint, and derives every follow-up gate fact.
 
 use crate::{ToolError, ToolResult};
-use haider_protocol::graph::{EvidenceVerdict, GRAPH_EVIDENCE_DETAIL_MAX_BYTES, GraphNodeName};
+use haider_protocol::graph::{
+    EvidenceVerdict, GRAPH_EVIDENCE_DETAIL_MAX_BYTES, GraphNodeName, ProcessSignalRef,
+};
 use haider_protocol::tool::{DispatchMode, ToolManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +19,12 @@ pub struct GraphEvidence {
     pub node: GraphNodeName,
     pub verdict: EvidenceVerdict,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<ProcessSignalRef>,
 }
 
 impl GraphEvidence {
@@ -37,6 +45,33 @@ impl GraphEvidence {
                 GRAPH_EVIDENCE_INPUT_MAX_BYTES
             )));
         }
+        if request
+            .slot
+            .as_deref()
+            .is_some_and(|slot| slot.trim().is_empty() || slot.len() > 64)
+        {
+            return Err(ToolError::invalid_argument(
+                "graph_evidence slot must contain 1..=64 UTF-8 bytes",
+            ));
+        }
+        if request
+            .subject_digest
+            .as_deref()
+            .is_some_and(|subject| subject.trim().is_empty() || subject.len() > 128)
+        {
+            return Err(ToolError::invalid_argument(
+                "graph_evidence subject_digest must contain 1..=128 UTF-8 bytes",
+            ));
+        }
+        if request.signal.as_ref().is_some_and(|signal| {
+            signal.run_id.as_str().trim().is_empty()
+                || signal.call_id.trim().is_empty()
+                || signal.effect_id.as_str().trim().is_empty()
+        }) {
+            return Err(ToolError::invalid_argument(
+                "graph_evidence signal coordinates must not be empty",
+            ));
+        }
         Ok(request)
     }
 }
@@ -45,7 +80,7 @@ impl GraphEvidence {
 pub fn graph_evidence_manifest() -> ToolManifest {
     ToolManifest {
         name: "graph_evidence".into(),
-        description: "Record bounded green or red evidence for the CURRENT open Convergence Graph obligation. The daemon validates the node, stamps the current attempt epoch and fingerprint, and alone decides whether the gate advances. Child reports are not harvested automatically in M1: read them, then testify here."
+        description: "Record bounded green or red evidence for the CURRENT open Convergence Graph obligation. Declared slots replace their own frontier. Daemon-verified slots require a durable process signal reference and matching subject digest; model-attested slots remain explicit testimony. The daemon alone decides whether the gate advances."
             .into(),
         effects: vec![],
         dispatch: DispatchMode::Await,
@@ -66,6 +101,29 @@ pub fn graph_evidence_manifest() -> ToolManifest {
                     "minLength": 1,
                     "maxLength": GRAPH_EVIDENCE_INPUT_MAX_BYTES,
                     "description": "Bounded evidence summary; normalized and fingerprinted by the daemon"
+                },
+                "slot": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Required when the pinned all-of-N node declares evidence slots"
+                },
+                "subject_digest": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Subject digest emitted by the referenced daemon signal, or the attested subject"
+                },
+                "signal": {
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 },
+                        "call_id": { "type": "string", "minLength": 1 },
+                        "effect_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["run_id", "call_id", "effect_id"],
+                    "additionalProperties": false,
+                    "description": "Required for daemon-verified slots; must reference a durable process signal"
                 }
             },
             "required": ["node", "verdict", "detail"],

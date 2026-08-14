@@ -118,10 +118,13 @@ fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
     let failed = crate::worker::process_result(ProcessResult {
         call_id: "exit-1".into(),
         effect: EffectId::new("effect-exit-1"),
+        command_arg_digest: "blake3:args".into(),
+        workspace_revision: None,
         status: ToolStatus::Failed,
         exit_code: Some(1),
         signal: None,
         output_bytes: 0,
+        transcript_digest: format!("blake3:{}", blake3::hash(&[]).to_hex()),
         inline_output: Vec::new(),
         artifact: None,
         escalation_note: None,

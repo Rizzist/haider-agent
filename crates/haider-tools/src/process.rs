@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::effect::{EffectClass, EffectOutcome};
-use haider_protocol::ids::{ArtifactRef, EffectId};
+use haider_protocol::ids::{ArtifactRef, EffectId, WorkspaceRevision};
 use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
@@ -286,11 +286,16 @@ pub struct ProcessOutputChunk {
 pub struct ProcessResult {
     pub call_id: String,
     pub effect: EffectId,
+    pub command_arg_digest: String,
+    pub workspace_revision: Option<WorkspaceRevision>,
     pub status: ToolStatus,
     pub exit_code: Option<i32>,
     /// Terminating signal when no conventional exit code exists.
     pub signal: Option<i32>,
     pub output_bytes: usize,
+    /// BLAKE3 of the exact bounded stdout/stderr bytes accepted by the
+    /// supervisor, in capture order.
+    pub transcript_digest: String,
     pub inline_output: Vec<ProcessOutputChunk>,
     pub artifact: Option<ArtifactRef>,
     pub escalation_note: Option<String>,
@@ -755,6 +760,8 @@ impl EffectBroker {
 
         let call_id = operation.call_id.clone();
         let effect = intent.effect.clone();
+        let command_arg_digest = intent.args_digest.clone();
+        let workspace_revision = intent.workspace_revision.clone();
         let registry = self.processes.clone();
         let finish = self.effect_finish(&intent);
         let (result_sender, result) = oneshot::channel();
@@ -767,6 +774,8 @@ impl EffectBroker {
                 pid,
                 call_id: call_id.clone(),
                 effect: effect.clone(),
+                command_arg_digest,
+                workspace_revision,
                 cancel: cancel_receiver,
                 live,
                 leaked,
@@ -853,6 +862,8 @@ struct Supervisor {
     pid: Pid,
     call_id: String,
     effect: EffectId,
+    command_arg_digest: String,
+    workspace_revision: Option<WorkspaceRevision>,
     cancel: watch::Receiver<bool>,
     live: Arc<AtomicBool>,
     leaked: Arc<AtomicBool>,
@@ -934,6 +945,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         pid,
         call_id,
         effect,
+        command_arg_digest,
+        workspace_revision,
         mut cancel,
         live,
         leaked,
@@ -960,6 +973,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     let mut spill = None;
     let mut transcript_failed = false;
     let mut output_bytes = 0usize;
+    let mut transcript_hasher = blake3::Hasher::new();
     let mut fatal = None;
     let mut cancelled = *cancel.borrow();
     let mut cancel_open = true;
@@ -1047,6 +1061,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         let remaining = bounds.max_output_bytes.saturating_sub(output_bytes);
                         let reached_cap = bytes.len() >= remaining;
                         bytes.truncate(remaining);
+                        transcript_hasher.update(&bytes);
                         transcript_high_water_bytes = transcript_high_water_bytes.max(
                             transcript_payload_bytes.saturating_add(bytes.len())
                         );
@@ -1315,6 +1330,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     let process_result = ProcessResult {
         call_id,
         effect,
+        command_arg_digest,
+        workspace_revision,
         status: if cancelled {
             ToolStatus::Cancelled
         } else if limit_reached.is_some() {
@@ -1334,6 +1351,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
             .as_ref()
             .and_then(std::os::unix::process::ExitStatusExt::signal),
         output_bytes,
+        transcript_digest: format!("blake3:{}", transcript_hasher.finalize().to_hex()),
         inline_output,
         artifact,
         escalation_note: escalation_note.clone(),

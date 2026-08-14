@@ -98,7 +98,7 @@ pub enum EventPayload {
     },
     // verification
     GateReport(verify::GateReport),
-    // convergence graph (M1: daemon authority, model-authored evidence only)
+    // convergence graph (daemon authority; M2a adds trusted process signals)
     GraphPinned(graph::GraphPinned),
     GraphAttemptOpened(graph::GraphAttemptOpened),
     EvidenceRecorded(graph::EvidenceRecorded),
@@ -107,6 +107,7 @@ pub enum EventPayload {
     GraphBlocked(graph::GraphBlocked),
     GraphCompleted(graph::GraphCompleted),
     GraphAbandoned(graph::GraphAbandoned),
+    ProcessSignalRecorded(graph::ProcessSignalRecorded),
     // accounts
     Rotation(credential::RotationEvent),
     // token accounting

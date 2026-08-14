@@ -252,6 +252,13 @@ async fn process_exec_streams_exact_bytes_freezes_overflow_and_journals_four_pha
     assert_eq!(result.status, ToolStatus::Completed);
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.output_bytes, 4);
+    assert_eq!(
+        result.transcript_digest,
+        format!(
+            "blake3:{}",
+            blake3::hash(&[0xff, b'a', b'b', b'c']).to_hex()
+        )
+    );
     assert!(result.inline_output.is_empty());
     assert!(result.artifact.is_some());
     assert_eq!(
@@ -318,6 +325,10 @@ async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
         .expect("flood completes");
     assert_eq!(result.status, ToolStatus::Completed);
     assert_eq!(result.output_bytes, 1_048_576);
+    assert_eq!(
+        result.transcript_digest,
+        format!("blake3:{}", blake3::hash(&vec![0_u8; 1_048_576]).to_hex())
+    );
     assert!(result.inline_output.is_empty());
     assert!(result.artifact.is_some());
     assert!(
@@ -375,6 +386,10 @@ async fn hard_output_cap_terminates_the_process_group_and_reports_the_ledgered_l
         Some(haider_tools::ProcessLimit::OutputCap)
     );
     assert_eq!(result.output_bytes, 4096);
+    assert_eq!(
+        result.transcript_digest,
+        format!("blake3:{}", blake3::hash(&vec![0_u8; 4096]).to_hex())
+    );
     assert_eq!(result.max_output_bytes, 4096);
     assert_eq!(
         output_bytes(&output_observer.lock().expect("output observer")).len(),

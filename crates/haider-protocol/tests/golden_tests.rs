@@ -15,10 +15,11 @@ use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayloa
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
 use haider_protocol::graph::{
-    EvidenceRecorded, EvidenceVerdict, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
-    GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceSource, GraphGateKind,
-    GraphGateSatisfied, GraphNodeName, GraphNodeSpec, GraphPinned, GraphStatus,
-    evidence_fingerprint, ship_loop_digest, ship_loop_nodes,
+    EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GraphAbandoned,
+    GraphAdvanced, GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted,
+    GraphEvidenceSource, GraphGateKind, GraphGateSatisfied, GraphNodeName, GraphNodeSpec,
+    GraphPinned, GraphStatus, ProcessSignalRecorded, SubjectSelector, evidence_fingerprint,
+    process_signal_subject_digest, ship_loop_digest, ship_loop_nodes,
 };
 use haider_protocol::hook::{
     HookAttachmentMetadata, HookAttachmentSet, HookEventPayload, HookFired, HookInput, HookOutput,
@@ -1697,12 +1698,41 @@ fn golden_user_message_hook_event_projection() {
 #[test]
 fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
     let graph_id = GraphId::new("graph-ship-loop-1");
+    let legacy_nodes = vec![
+        GraphNodeSpec {
+            name: GraphNodeName::Build,
+            gate: GraphGateKind::CommandGreen,
+            executor: haider_protocol::graph::GraphExecutorShape::Inline,
+            max_attempts: 8,
+            max_evidence_per_attempt: Some(8),
+            depends_on: Vec::new(),
+            verify_slots: Vec::new(),
+        },
+        GraphNodeSpec {
+            name: GraphNodeName::Verify,
+            gate: GraphGateKind::AllOfN { n: 3 },
+            executor: haider_protocol::graph::GraphExecutorShape::FanOut,
+            max_attempts: 8,
+            max_evidence_per_attempt: Some(8),
+            depends_on: vec![GraphNodeName::Build],
+            verify_slots: Vec::new(),
+        },
+        GraphNodeSpec {
+            name: GraphNodeName::Ship,
+            gate: GraphGateKind::HumanConfirm,
+            executor: haider_protocol::graph::GraphExecutorShape::Human,
+            max_attempts: 8,
+            max_evidence_per_attempt: None,
+            depends_on: vec![GraphNodeName::Verify],
+            verify_slots: Vec::new(),
+        },
+    ];
     let facts = vec![
         EventPayload::GraphPinned(GraphPinned {
             graph_id: graph_id.clone(),
             template: "ship-loop".into(),
-            digest: ship_loop_digest(),
-            nodes: ship_loop_nodes(),
+            digest: "63cee264d2a430b21d32c5f8b71c390e0bb825e88073571d19e7dbf2084820eb".into(),
+            nodes: legacy_nodes,
         }),
         EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id: graph_id.clone(),
@@ -1716,6 +1746,8 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
             verdict: EvidenceVerdict::Red,
             detail: "cargo test failed".into(),
             fingerprint: evidence_fingerprint("cargo test failed"),
+            slot: None,
+            subject_digest: None,
             source: GraphEvidenceSource::Model {
                 run_id: RunId::new("run-graph-2"),
                 call_id: "call-evidence-2".into(),
@@ -1765,6 +1797,56 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
             serde_json::from_value(value).expect("RawEnvelope tolerates the new fact");
         assert_eq!(decoded.payload, raw);
     }
+}
+
+/// CG-M2a additive wire: the new template identity, trusted process fact,
+/// slotted subject, and signal provenance are frozen separately so the M1
+/// fixture above remains byte-for-byte legacy truth.
+#[test]
+fn additive_golden_convergence_graph_m2a_authority() {
+    let graph_id = GraphId::new("graph-ship-loop-m2a");
+    let command_arg_digest = "blake3:command-args".to_owned();
+    let transcript_digest = "blake3:captured-output".to_owned();
+    let subject_digest =
+        process_signal_subject_digest(&command_arg_digest, &transcript_digest, None);
+    let signal = ProcessSignalRecorded {
+        run_id: RunId::new("run-m2a"),
+        call_id: "call-process-tests".into(),
+        effect_id: EffectId::new("effect-process-tests"),
+        command_arg_digest,
+        exit_code: Some(0),
+        transcript_digest,
+        workspace_revision: None,
+        subject_digest: subject_digest.clone(),
+        artifact: Some(ArtifactRef::new("blake3:transcript-artifact")),
+    };
+    additive_golden(
+        "convergence_graph_m2a_authority",
+        &vec![
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_id.clone(),
+                template: "ship-loop".into(),
+                digest: ship_loop_digest(),
+                nodes: ship_loop_nodes(),
+            }),
+            EventPayload::ProcessSignalRecorded(signal.clone()),
+            EventPayload::EvidenceRecorded(EvidenceRecorded {
+                graph_id,
+                node: GraphNodeName::Verify,
+                attempt: 1,
+                verdict: EvidenceVerdict::Green,
+                detail: "cargo test passed".into(),
+                fingerprint: evidence_fingerprint("cargo test passed"),
+                slot: Some("tests".into()),
+                subject_digest: Some(subject_digest),
+                source: GraphEvidenceSource::ProcessSignal {
+                    run_id: signal.run_id,
+                    call_id: signal.call_id,
+                    effect_id: signal.effect_id,
+                },
+            }),
+        ],
+    );
 }
 
 /// CG-M1 LAW: the SHIP confirmation is an ordinary durable, session-scoped,
@@ -1818,6 +1900,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 max_attempts: 8,
                 max_evidence_per_attempt: Some(8),
                 depends_on: Vec::new(),
+                verify_slots: Vec::new(),
             },
             GraphNodeSpec {
                 name: GraphNodeName::Verify,
@@ -1826,6 +1909,14 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 max_attempts: 8,
                 max_evidence_per_attempt: Some(8),
                 depends_on: vec![GraphNodeName::Build],
+                verify_slots: ["tests", "lint", "typecheck"]
+                    .into_iter()
+                    .map(|id| EvidenceSlotSpec {
+                        id: id.into(),
+                        authority: EvidenceAuthority::DaemonVerified,
+                        subject_selector: SubjectSelector::Command,
+                    })
+                    .collect(),
             },
             GraphNodeSpec {
                 name: GraphNodeName::Ship,
@@ -1834,6 +1925,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 max_attempts: 8,
                 max_evidence_per_attempt: None,
                 depends_on: vec![GraphNodeName::Verify],
+                verify_slots: Vec::new(),
             },
         ]
     );

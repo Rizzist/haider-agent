@@ -103,13 +103,13 @@ use haider_core::{
     AbandonedGraph, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
     CancelledTurn, CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome,
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, HarnessHandle,
-    MenuResolutionCommand, MenuResolutionOutcome, PinnedGraph, ProfileStoreFault,
-    PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    MenuResolutionCommand, MenuResolutionOutcome, PinnedGraph, ProcessSignalCommand,
+    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort,
+    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
@@ -799,6 +799,10 @@ enum ActorCommand {
     RecordGraphEvidence {
         command: GraphEvidenceCommand,
         completed: oneshot::Sender<Result<GraphEvidenceOutcome, HaiderError>>,
+    },
+    RecordProcessSignal {
+        command: ProcessSignalCommand,
+        completed: oneshot::Sender<Result<ProcessSignalOutcome, HaiderError>>,
     },
     SelectEffort {
         command: SessionSelectEffortCommand,
@@ -1767,6 +1771,23 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::RecordGraphEvidence { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn record_process_signal(
+        &self,
+        command: ProcessSignalCommand,
+    ) -> Result<ProcessSignalOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RecordProcessSignal { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

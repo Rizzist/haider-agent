@@ -17,10 +17,11 @@ use haider_store::{
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
     DelegationRecord, EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
     GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, HookTrustChange, HookTrustCommand,
-    MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, SessionCreateCommand,
-    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome,
+    ProfileLease, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    SessionRenameOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -233,6 +234,14 @@ impl SqliteStoreHandle {
     ) -> Result<GraphEvidenceOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.record_graph_evidence(&command))).await
+    }
+
+    pub async fn record_process_signal(
+        &self,
+        command: ProcessSignalCommand,
+    ) -> Result<ProcessSignalOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.record_process_signal(&command))).await
     }
 
     /// Preflights a durable session-create receipt before workspace I/O.

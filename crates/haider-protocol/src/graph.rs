@@ -2,14 +2,13 @@
 //!
 //! A graph is an immutable template instance. Executors never advance it:
 //! they append [`EvidenceRecorded`] facts and the daemon alone appends gate,
-//! advancement, retry, blocking, and completion facts. M1 deliberately has
-//! no child-graph attachment and does not harvest child reports; the root
-//! model reads ordinary child results and explicitly testifies through the
-//! `graph_evidence` tool.
+//! advancement, retry, blocking, and completion facts. M2a adds declared
+//! replacement slots and daemon-recorded process signals while retaining the
+//! exact flat-counter branch for legacy pinned instances.
 
 use crate::EventPayload;
 use crate::envelope::RawEnvelope;
-use crate::ids::{GraphId, MenuId, RunId};
+use crate::ids::{ArtifactRef, EffectId, GraphId, MenuId, RunId, WorkspaceRevision};
 use serde::{Deserialize, Serialize};
 
 pub const SHIP_LOOP_TEMPLATE: &str = "ship-loop";
@@ -53,6 +52,30 @@ pub enum GraphExecutorShape {
     Human,
 }
 
+/// Who is allowed to establish the truth represented by one evidence slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAuthority {
+    DaemonVerified,
+    ModelAttested,
+}
+
+/// The subject a slot's evidence must remain bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectSelector {
+    WorkspaceRevision,
+    Command,
+    Freeform,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EvidenceSlotSpec {
+    pub id: String,
+    pub authority: EvidenceAuthority,
+    pub subject_selector: SubjectSelector,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphNodeSpec {
     pub name: GraphNodeName,
@@ -67,6 +90,10 @@ pub struct GraphNodeSpec {
     /// linear DAG, but the dependency shape is stamped rather than inferred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<GraphNodeName>,
+    /// Declared evidence frontiers for slot-aware `AllOfN` gates. Empty is
+    /// the durable M1 discriminator and retains the legacy flat-counter law.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_slots: Vec<EvidenceSlotSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +123,40 @@ pub enum EvidenceVerdict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GraphEvidenceSource {
-    Model { run_id: RunId, call_id: String },
+    Model {
+        run_id: RunId,
+        call_id: String,
+    },
+    ProcessSignal {
+        run_id: RunId,
+        call_id: String,
+        effect_id: EffectId,
+    },
+}
+
+/// Stable coordinates submitted by `graph_evidence` for daemon-verified
+/// process truth. The daemon resolves all three fields against the journal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProcessSignalRef {
+    pub run_id: RunId,
+    pub call_id: String,
+    pub effect_id: EffectId,
+}
+
+/// Daemon-observed terminal truth for one process execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessSignalRecorded {
+    pub run_id: RunId,
+    pub call_id: String,
+    pub effect_id: EffectId,
+    pub command_arg_digest: String,
+    pub exit_code: Option<i32>,
+    pub transcript_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<WorkspaceRevision>,
+    pub subject_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +169,10 @@ pub struct EvidenceRecorded {
     pub verdict: EvidenceVerdict,
     pub detail: String,
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_digest: Option<String>,
     pub source: GraphEvidenceSource,
 }
 
@@ -173,13 +237,48 @@ pub struct GraphEvidenceTally {
     pub standing_red: u32,
 }
 
+/// Current replacement frontier for one declared evidence slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphEvidenceSlotStatus {
+    pub id: String,
+    pub authority: EvidenceAuthority,
+    pub subject_selector: SubjectSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<EvidenceVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<GraphEvidenceSource>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphNodeStatus {
     pub node: GraphNodeName,
     pub attempts_opened: u32,
     pub current_attempt: Option<u32>,
     pub evidence: GraphEvidenceTally,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_slots: Vec<GraphEvidenceSlotStatus>,
     pub satisfied: bool,
+}
+
+impl GraphNodeStatus {
+    #[must_use]
+    pub fn slot_statuses(&self) -> &[GraphEvidenceSlotStatus] {
+        &self.evidence_slots
+    }
+
+    fn clear_evidence_frontier(&mut self) {
+        self.evidence = GraphEvidenceTally::default();
+        for slot in &mut self.evidence_slots {
+            slot.verdict = None;
+            slot.fingerprint = None;
+            slot.subject_digest = None;
+            slot.source = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +400,19 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                             attempts_opened: 0,
                             current_attempt: None,
                             evidence: GraphEvidenceTally::default(),
+                            evidence_slots: spec
+                                .verify_slots
+                                .iter()
+                                .map(|slot| GraphEvidenceSlotStatus {
+                                    id: slot.id.clone(),
+                                    authority: slot.authority,
+                                    subject_selector: slot.subject_selector,
+                                    verdict: None,
+                                    fingerprint: None,
+                                    subject_digest: None,
+                                    source: None,
+                                })
+                                .collect(),
                             satisfied: false,
                         })
                         .collect(),
@@ -324,14 +436,14 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                     // immutable attempt counts remain historical truth.
                     for node in &mut status.nodes {
                         node.current_attempt = None;
-                        node.evidence = GraphEvidenceTally::default();
+                        node.clear_evidence_frontier();
                         node.satisfied = false;
                     }
                 }
                 if let Some(node) = status.node_mut(opened.node) {
                     node.attempts_opened = node.attempts_opened.saturating_add(1);
                     node.current_attempt = Some(opened.attempt);
-                    node.evidence = GraphEvidenceTally::default();
+                    node.clear_evidence_frontier();
                     node.satisfied = false;
                 }
             }
@@ -346,18 +458,53 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
                     continue;
                 }
                 if let Some(node) = status.node_mut(recorded.node) {
-                    match recorded.verdict {
-                        EvidenceVerdict::Green => {
-                            node.evidence.green = node.evidence.green.saturating_add(1);
-                            node.evidence.effective_green =
-                                node.evidence.effective_green.saturating_add(1);
-                            node.evidence.standing_red = 0;
+                    if node.evidence_slots.is_empty() {
+                        // Exact M1 compatibility branch for legacy pinned
+                        // instances that predate evidence slot declarations.
+                        match recorded.verdict {
+                            EvidenceVerdict::Green => {
+                                node.evidence.green = node.evidence.green.saturating_add(1);
+                                node.evidence.effective_green =
+                                    node.evidence.effective_green.saturating_add(1);
+                                node.evidence.standing_red = 0;
+                            }
+                            EvidenceVerdict::Red => {
+                                node.evidence.red = node.evidence.red.saturating_add(1);
+                                node.evidence.effective_green = 0;
+                                node.evidence.standing_red = 1;
+                            }
                         }
-                        EvidenceVerdict::Red => {
-                            node.evidence.red = node.evidence.red.saturating_add(1);
-                            node.evidence.effective_green = 0;
-                            node.evidence.standing_red = 1;
+                    } else if let Some(slot) = recorded.slot.as_deref().and_then(|slot_id| {
+                        node.evidence_slots
+                            .iter_mut()
+                            .find(|slot| slot.id == slot_id)
+                    }) {
+                        match recorded.verdict {
+                            EvidenceVerdict::Green => {
+                                node.evidence.green = node.evidence.green.saturating_add(1);
+                            }
+                            EvidenceVerdict::Red => {
+                                node.evidence.red = node.evidence.red.saturating_add(1);
+                            }
                         }
+                        slot.verdict = Some(recorded.verdict);
+                        slot.fingerprint = Some(recorded.fingerprint.clone());
+                        slot.subject_digest = recorded.subject_digest.clone();
+                        slot.source = Some(recorded.source.clone());
+                        node.evidence.effective_green = u32::try_from(
+                            node.evidence_slots
+                                .iter()
+                                .filter(|slot| slot.verdict == Some(EvidenceVerdict::Green))
+                                .count(),
+                        )
+                        .unwrap_or(u32::MAX);
+                        node.evidence.standing_red = u32::try_from(
+                            node.evidence_slots
+                                .iter()
+                                .filter(|slot| slot.verdict == Some(EvidenceVerdict::Red))
+                                .count(),
+                        )
+                        .unwrap_or(u32::MAX);
                     }
                 }
                 reduction.evidence.push(recorded);
@@ -434,6 +581,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             max_attempts: GRAPH_MAX_ATTEMPTS,
             max_evidence_per_attempt: Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
             depends_on: Vec::new(),
+            verify_slots: Vec::new(),
         },
         GraphNodeSpec {
             name: GraphNodeName::Verify,
@@ -442,6 +590,14 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             max_attempts: GRAPH_MAX_ATTEMPTS,
             max_evidence_per_attempt: Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
             depends_on: vec![GraphNodeName::Build],
+            verify_slots: ["tests", "lint", "typecheck"]
+                .into_iter()
+                .map(|id| EvidenceSlotSpec {
+                    id: id.into(),
+                    authority: EvidenceAuthority::DaemonVerified,
+                    subject_selector: SubjectSelector::Command,
+                })
+                .collect(),
         },
         GraphNodeSpec {
             name: GraphNodeName::Ship,
@@ -450,6 +606,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             max_attempts: GRAPH_MAX_ATTEMPTS,
             max_evidence_per_attempt: None,
             depends_on: vec![GraphNodeName::Verify],
+            verify_slots: Vec::new(),
         },
     ]
 }
@@ -474,6 +631,27 @@ pub fn evidence_fingerprint(normalized_detail: &str) -> String {
     blake3::hash(normalized_detail.as_bytes())
         .to_hex()
         .to_string()
+}
+
+/// Derives the bounded subject proxy used until a sealed workspace revision
+/// producer exists. Length-prefixing prevents ambiguous concatenations.
+#[must_use]
+pub fn process_signal_subject_digest(
+    command_arg_digest: &str,
+    transcript_digest: &str,
+    workspace_revision: Option<&WorkspaceRevision>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.process-signal.subject.v1");
+    for value in [
+        command_arg_digest,
+        transcript_digest,
+        workspace_revision.map_or("", WorkspaceRevision::as_str),
+    ] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 #[must_use]
@@ -515,6 +693,19 @@ mod tests {
                     attempts_opened: 1,
                     current_attempt: Some(2),
                     evidence: GraphEvidenceTally::default(),
+                    evidence_slots: node
+                        .verify_slots
+                        .iter()
+                        .map(|slot| GraphEvidenceSlotStatus {
+                            id: slot.id.clone(),
+                            authority: slot.authority,
+                            subject_selector: slot.subject_selector,
+                            verdict: None,
+                            fingerprint: None,
+                            subject_digest: None,
+                            source: None,
+                        })
+                        .collect(),
                     satisfied: false,
                 })
                 .collect(),

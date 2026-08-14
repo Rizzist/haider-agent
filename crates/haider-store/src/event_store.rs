@@ -19,22 +19,24 @@ use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::agent::{AgentManifest, ChildReport};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::credential::CredentialDescriptor;
+use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
-    EvidenceRecorded, EvidenceVerdict, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
-    GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceSource, GraphGateKind,
-    GraphGateSatisfied, GraphNodeName, GraphPhase, GraphPinned, GraphReduction, GraphStatus,
-    SHIP_LOOP_TEMPLATE, evidence_fingerprint, normalize_evidence_detail, reduce_graph,
-    ship_loop_digest, ship_loop_nodes,
+    EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GraphAbandoned,
+    GraphAdvanced, GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted,
+    GraphEvidenceSource, GraphGateKind, GraphGateSatisfied, GraphNodeName, GraphPhase, GraphPinned,
+    GraphReduction, GraphStatus, ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE,
+    SubjectSelector, evidence_fingerprint, normalize_evidence_detail,
+    process_signal_subject_digest, reduce_graph, ship_loop_digest, ship_loop_nodes,
 };
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, DeviceId, EventId, GraphId, ItemId, MenuId, NodeId, RunId,
-    SessionId,
+    AgentId, ArtifactRef, BranchId, DeviceId, EffectId, EventId, GraphId, ItemId, MenuId, NodeId,
+    RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
@@ -200,7 +202,37 @@ pub struct GraphEvidenceCommand {
     pub node: GraphNodeName,
     pub verdict: EvidenceVerdict,
     pub detail: String,
+    pub slot: Option<String>,
+    pub subject_digest: Option<String>,
+    pub signal: Option<ProcessSignalRef>,
     pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSignalCommand {
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub branch_id: Option<BranchId>,
+    pub signal: ProcessSignalRecorded,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedProcessSignal {
+    pub effect_id: EffectId,
+    pub signal_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProcessSignalOutcome {
+    Committed {
+        recorded: RecordedProcessSignal,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        recorded: RecordedProcessSignal,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1236,6 +1268,77 @@ impl Store {
         Ok(self.graph_reduction(&connection, session_id)?.status)
     }
 
+    /// Appends one daemon-observed process signal, or returns the exact
+    /// already-committed signal when a lost response is replayed.
+    #[allow(clippy::result_large_err)]
+    pub fn record_process_signal(
+        &self,
+        command: &ProcessSignalCommand,
+    ) -> StoreResult<ProcessSignalOutcome> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let event_id = process_signal_event_id(&command.session_id, &command.signal.effect_id);
+        if let Some(envelope) = load_envelope_by_event_id(&transaction, &event_id)? {
+            let existing = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .map_err(|error| {
+                    corrupt(format!(
+                        "process signal event {} does not decode: {error}",
+                        envelope.event_id
+                    ))
+                })?;
+            if envelope.session_id != command.session_id
+                || envelope.branch_id != command.branch_id
+                || envelope.run_id.as_ref() != Some(&command.signal.run_id)
+                || existing != EventPayload::ProcessSignalRecorded(command.signal.clone())
+            {
+                return Err(graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "mismatched_signal_provenance",
+                    "process signal replay does not match the committed signal provenance",
+                ));
+            }
+            let recorded = RecordedProcessSignal {
+                effect_id: command.signal.effect_id.clone(),
+                signal_seq: envelope.seq,
+                worker_generation: envelope.worker_generation,
+            };
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ProcessSignalOutcome::IdempotentReplay { recorded });
+        }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        validate_process_signal_provenance(&transaction, &command.session_id, &command.signal)?;
+        let now = now_ms()?;
+        let mut envelopes = vec![unstamped_command_envelope(
+            event_id,
+            &command.session_id,
+            command.branch_id.clone(),
+            Some(command.signal.run_id.clone()),
+            command.device_id.clone(),
+            command.worker_generation,
+            EventPayload::ProcessSignalRecorded(command.signal.clone()),
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let recorded = RecordedProcessSignal {
+            effect_id: command.signal.effect_id.clone(),
+            signal_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(ProcessSignalOutcome::Committed {
+            recorded,
+            envelopes,
+        })
+    }
+
     /// Receipt lookup before current-state or generation validation.
     pub fn graph_pin_receipt(
         &self,
@@ -1324,11 +1427,13 @@ impl Store {
         }
         let pinned_index = payloads.len();
         let digest = ship_loop_digest();
+        let nodes = ship_loop_nodes();
+        validate_pinned_graph_nodes(&nodes)?;
         payloads.push(EventPayload::GraphPinned(GraphPinned {
             graph_id: command.graph_id.clone(),
             template: SHIP_LOOP_TEMPLATE.into(),
             digest: digest.clone(),
-            nodes: ship_loop_nodes(),
+            nodes,
         }));
         payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id: command.graph_id.clone(),
@@ -1556,6 +1661,84 @@ impl Store {
                     false,
                 )
             })?;
+        let slot_spec = if node_spec.verify_slots.is_empty() {
+            if command.slot.is_some() {
+                return Err(graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "unknown_evidence_slot",
+                    "the pinned graph node does not declare evidence slots",
+                ));
+            }
+            None
+        } else {
+            let slot_id = command.slot.as_deref().ok_or_else(|| {
+                graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "unknown_evidence_slot",
+                    "graph evidence must name one declared slot",
+                )
+            })?;
+            Some(
+                node_spec
+                    .verify_slots
+                    .iter()
+                    .find(|slot| slot.id == slot_id)
+                    .ok_or_else(|| {
+                        graph_evidence_error(
+                            ErrorCode::InvalidArgument,
+                            "unknown_evidence_slot",
+                            format!("evidence slot `{slot_id}` is not declared by the pinned node"),
+                        )
+                    })?,
+            )
+        };
+        if let (Some(signal_ref), Some(slot_id)) =
+            (command.signal.as_ref(), command.slot.as_deref())
+        {
+            let other_process_sources = status
+                .nodes
+                .iter()
+                .find(|node| node.node == current_node)
+                .into_iter()
+                .flat_map(|node| node.evidence_slots.iter())
+                .filter(|slot| slot.id != slot_id)
+                .filter_map(|slot| match slot.source.as_ref() {
+                    Some(GraphEvidenceSource::ProcessSignal {
+                        run_id,
+                        call_id,
+                        effect_id,
+                    }) => Some(ProcessSignalRef {
+                        run_id: run_id.clone(),
+                        call_id: call_id.clone(),
+                        effect_id: effect_id.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !other_process_sources.is_empty() {
+                let incoming = load_process_signal(&transaction, &command.session_id, signal_ref)?;
+                for prior_ref in other_process_sources {
+                    let prior = load_process_signal(&transaction, &command.session_id, &prior_ref)?;
+                    if prior_ref == *signal_ref
+                        || prior.signal.command_arg_digest == incoming.signal.command_arg_digest
+                    {
+                        return Err(graph_evidence_error(
+                            ErrorCode::InvalidArgument,
+                            "mismatched_signal_provenance",
+                            "one process command subject cannot prove multiple evidence slots in the same graph epoch",
+                        ));
+                    }
+                }
+            }
+        }
+        let source = validate_graph_evidence_authority(
+            &transaction,
+            &command.session_id,
+            command,
+            slot_spec,
+            &graph_id,
+            attempt,
+        )?;
         let evidence = EvidenceRecorded {
             graph_id: graph_id.clone(),
             node: current_node,
@@ -1563,10 +1746,9 @@ impl Store {
             verdict: command.verdict,
             detail,
             fingerprint: fingerprint.clone(),
-            source: GraphEvidenceSource::Model {
-                run_id: command.run_id.clone(),
-                call_id: command.call_id.clone(),
-            },
+            slot: command.slot.clone(),
+            subject_digest: command.subject_digest.clone(),
+            source,
         };
         let mut previous_node_attempt = None;
         let mut previous_red_fingerprint = None;
@@ -1616,9 +1798,16 @@ impl Store {
             };
             let satisfied = match node_spec.gate {
                 GraphGateKind::CommandGreen => command.verdict == EvidenceVerdict::Green,
-                GraphGateKind::AllOfN { n } => {
+                GraphGateKind::AllOfN { n } if node_spec.verify_slots.is_empty() => {
                     command.verdict == EvidenceVerdict::Green && effective_green >= n
                 }
+                GraphGateKind::AllOfN { .. } => node_status.evidence_slots.iter().all(|slot| {
+                    if command.slot.as_deref() == Some(slot.id.as_str()) {
+                        command.verdict == EvidenceVerdict::Green
+                    } else {
+                        slot.verdict == Some(EvidenceVerdict::Green)
+                    }
+                }),
                 GraphGateKind::HumanConfirm => false,
             };
             if satisfied {
@@ -5405,6 +5594,506 @@ fn graph_evidence_limit(spec: &haider_protocol::graph::GraphNodeSpec) -> StoreRe
     })
 }
 
+#[allow(clippy::result_large_err)]
+fn validate_pinned_graph_nodes(nodes: &[haider_protocol::graph::GraphNodeSpec]) -> StoreResult<()> {
+    for node in nodes {
+        if node.verify_slots.is_empty() {
+            continue;
+        }
+        let GraphGateKind::AllOfN { n } = node.gate else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "graph node {} declares evidence slots without an all-of-n gate",
+                    node.name.label()
+                ),
+                false,
+            ));
+        };
+        let slot_count = u32::try_from(node.verify_slots.len()).map_err(|_| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                "graph evidence slot count does not fit u32",
+                false,
+            )
+        })?;
+        if n != slot_count {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "graph node {} declares {slot_count} slots but its all-of-n gate requires {n}",
+                    node.name.label()
+                ),
+                false,
+            ));
+        }
+        let mut ids = HashSet::new();
+        for slot in &node.verify_slots {
+            if slot.id.trim().is_empty() || !ids.insert(slot.id.as_str()) {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "graph node {} has an empty or duplicate evidence slot id",
+                        node.name.label()
+                    ),
+                    false,
+                ));
+            }
+            if slot.authority == EvidenceAuthority::DaemonVerified
+                && slot.subject_selector == SubjectSelector::Freeform
+            {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "daemon-verified evidence slot `{}` cannot use a freeform subject",
+                        slot.id
+                    ),
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_graph_evidence_authority(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    command: &GraphEvidenceCommand,
+    slot: Option<&EvidenceSlotSpec>,
+    graph_id: &GraphId,
+    attempt: u32,
+) -> StoreResult<GraphEvidenceSource> {
+    let Some(slot) = slot else {
+        if command.signal.is_some() || command.subject_digest.is_some() {
+            return Err(graph_evidence_error(
+                ErrorCode::InvalidArgument,
+                "wrong_evidence_authority",
+                "legacy un-slotted evidence must use model testimony",
+            ));
+        }
+        return Ok(GraphEvidenceSource::Model {
+            run_id: command.run_id.clone(),
+            call_id: command.call_id.clone(),
+        });
+    };
+    match slot.authority {
+        EvidenceAuthority::ModelAttested => {
+            if command.signal.is_some() {
+                return Err(graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "wrong_evidence_authority",
+                    format!(
+                        "evidence slot `{}` accepts model testimony, not a process signal",
+                        slot.id
+                    ),
+                ));
+            }
+            command
+                .subject_digest
+                .as_deref()
+                .filter(|subject| !subject.trim().is_empty())
+                .ok_or_else(|| {
+                    graph_evidence_error(
+                        ErrorCode::InvalidArgument,
+                        "stale_evidence_subject",
+                        format!("evidence slot `{}` requires a subject digest", slot.id),
+                    )
+                })?;
+            Ok(GraphEvidenceSource::Model {
+                run_id: command.run_id.clone(),
+                call_id: command.call_id.clone(),
+            })
+        }
+        EvidenceAuthority::DaemonVerified => {
+            let signal_ref = command.signal.as_ref().ok_or_else(|| {
+                graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "wrong_evidence_authority",
+                    format!(
+                        "evidence slot `{}` requires a daemon process signal",
+                        slot.id
+                    ),
+                )
+            })?;
+            let subject_digest = command
+                .subject_digest
+                .as_deref()
+                .filter(|subject| !subject.trim().is_empty())
+                .ok_or_else(|| {
+                    graph_evidence_error(
+                        ErrorCode::InvalidArgument,
+                        "stale_evidence_subject",
+                        format!("evidence slot `{}` requires a subject digest", slot.id),
+                    )
+                })?;
+            if signal_ref.run_id != command.run_id {
+                return Err(graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "mismatched_signal_provenance",
+                    "process signal belongs to a different provider run",
+                ));
+            }
+            let loaded = load_process_signal(transaction, session_id, signal_ref)?;
+            let signal = &loaded.signal;
+            validate_process_signal_provenance(transaction, session_id, signal)?;
+            if signal.subject_digest != subject_digest {
+                return Err(graph_evidence_error(
+                    ErrorCode::RevisionConflict,
+                    "stale_evidence_subject",
+                    format!(
+                        "evidence slot `{}` references a stale process subject",
+                        slot.id
+                    ),
+                ));
+            }
+            validate_process_signal_freshness(
+                transaction,
+                session_id,
+                graph_id,
+                command.node,
+                attempt,
+                slot,
+                &loaded,
+            )?;
+            if command.verdict == EvidenceVerdict::Green && signal.exit_code != Some(0) {
+                return Err(graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "non_zero_exit_claimed_green",
+                    format!(
+                        "evidence slot `{}` claimed green from process exit {:?}",
+                        slot.id, signal.exit_code
+                    ),
+                ));
+            }
+            Ok(GraphEvidenceSource::ProcessSignal {
+                run_id: signal.run_id.clone(),
+                call_id: signal.call_id.clone(),
+                effect_id: signal.effect_id.clone(),
+            })
+        }
+    }
+}
+
+fn graph_evidence_error(
+    code: ErrorCode,
+    kind: &'static str,
+    message: impl Into<String>,
+) -> HaiderError {
+    let mut error = store_error(code, message, false);
+    error.details = Some(serde_json::json!({ "kind": kind }));
+    error
+}
+
+fn process_signal_event_id(session_id: &SessionId, effect_id: &EffectId) -> EventId {
+    let mut hasher = blake3::Hasher::new();
+    for value in [session_id.as_str(), effect_id.as_str()] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    EventId::new(format!("process-signal-{}", hasher.finalize().to_hex()))
+}
+
+struct LoadedProcessSignal {
+    signal: ProcessSignalRecorded,
+    seq: u64,
+    branch_id: Option<BranchId>,
+}
+
+#[allow(clippy::result_large_err)]
+fn load_process_signal(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    signal_ref: &ProcessSignalRef,
+) -> StoreResult<LoadedProcessSignal> {
+    let event_id = process_signal_event_id(session_id, &signal_ref.effect_id);
+    let envelope = load_envelope_by_event_id(transaction, &event_id)?.ok_or_else(|| {
+        graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_signal_provenance",
+            "referenced process signal is not recorded in this session",
+        )
+    })?;
+    let signal = match serde_json::from_value::<EventPayload>(envelope.payload) {
+        Ok(EventPayload::ProcessSignalRecorded(signal)) => signal,
+        _ => {
+            return Err(corrupt(format!("event {event_id} is not a process signal")));
+        }
+    };
+    if envelope.session_id != *session_id
+        || envelope.run_id.as_ref() != Some(&signal.run_id)
+        || signal.run_id != signal_ref.run_id
+        || signal.call_id != signal_ref.call_id
+        || signal.effect_id != signal_ref.effect_id
+    {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_signal_provenance",
+            "process signal reference does not match its durable run/call/effect provenance",
+        ));
+    }
+    Ok(LoadedProcessSignal {
+        signal,
+        seq: envelope.seq,
+        branch_id: envelope.branch_id,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_process_signal_freshness(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    graph_id: &GraphId,
+    node: GraphNodeName,
+    attempt: u32,
+    slot: &EvidenceSlotSpec,
+    loaded: &LoadedProcessSignal,
+) -> StoreResult<()> {
+    let epoch_seq = graph_attempt_opened_seq(transaction, session_id, graph_id, node, attempt)?;
+    if loaded.seq < epoch_seq {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            format!(
+                "evidence slot `{}` references a process signal from an older graph epoch",
+                slot.id
+            ),
+        ));
+    }
+
+    let signals = process_signals_since(
+        transaction,
+        session_id,
+        epoch_seq,
+        loaded.branch_id.as_ref(),
+    )?;
+    let current = match slot.subject_selector {
+        SubjectSelector::Command => signals.iter().find(|candidate| {
+            candidate.signal.command_arg_digest == loaded.signal.command_arg_digest
+        }),
+        SubjectSelector::WorkspaceRevision => {
+            let revision = loaded.signal.workspace_revision.as_ref().ok_or_else(|| {
+                graph_evidence_error(
+                    ErrorCode::RevisionConflict,
+                    "stale_evidence_subject",
+                    format!(
+                        "evidence slot `{}` requires a daemon-observed workspace revision",
+                        slot.id
+                    ),
+                )
+            })?;
+            signals
+                .iter()
+                .find(|candidate| candidate.signal.workspace_revision.is_some())
+                .filter(|candidate| candidate.signal.workspace_revision.as_ref() == Some(revision))
+        }
+        SubjectSelector::Freeform => None,
+    };
+    match slot.subject_selector {
+        SubjectSelector::Command
+            if current.is_none_or(|candidate| {
+                candidate.signal.effect_id != loaded.signal.effect_id
+                    || candidate.signal.subject_digest != loaded.signal.subject_digest
+            }) =>
+        {
+            Err(graph_evidence_error(
+                ErrorCode::RevisionConflict,
+                "stale_evidence_subject",
+                format!(
+                    "evidence slot `{}` does not reference the newest daemon-observed command subject",
+                    slot.id
+                ),
+            ))
+        }
+        SubjectSelector::WorkspaceRevision if current.is_none() => Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            format!(
+                "evidence slot `{}` does not match the current daemon-observed workspace revision",
+                slot.id
+            ),
+        )),
+        SubjectSelector::Freeform => Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "wrong_evidence_authority",
+            format!(
+                "daemon-verified evidence slot `{}` cannot use a freeform subject",
+                slot.id
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn graph_attempt_opened_seq(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    graph_id: &GraphId,
+    node: GraphNodeName,
+    attempt: u32,
+) -> StoreResult<u64> {
+    for envelope in load_graph_reduction_envelopes(transaction, session_id)?
+        .into_iter()
+        .rev()
+    {
+        let Ok(EventPayload::GraphAttemptOpened(opened)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        else {
+            continue;
+        };
+        if opened.graph_id == *graph_id && opened.node == node && opened.attempt == attempt {
+            return Ok(envelope.seq);
+        }
+    }
+    Err(corrupt(format!(
+        "active graph {graph_id} has no opening fact for {} attempt {attempt}",
+        node.label()
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn process_signals_since(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    first_seq: u64,
+    branch_id: Option<&BranchId>,
+) -> StoreResult<Vec<LoadedProcessSignal>> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1 AND seq >= ?2
+               AND instr(envelope_json, '\"type\":\"process_signal_recorded\"') > 0
+             ORDER BY seq DESC",
+        )
+        .map_err(map_sqlite_error)?;
+    let first_seq = to_sqlite_integer(first_seq)?;
+    let rows = statement
+        .query_map(params![session_id.as_str(), first_seq], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(map_sqlite_error)?;
+    let mut signals = Vec::new();
+    for json in rows {
+        let json = json.map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid process-signal envelope in session {session_id}: {error}"
+            ))
+        })?;
+        if envelope.branch_id.as_ref() != branch_id {
+            continue;
+        }
+        let Ok(EventPayload::ProcessSignalRecorded(signal)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        else {
+            continue;
+        };
+        signals.push(LoadedProcessSignal {
+            signal,
+            seq: envelope.seq,
+            branch_id: envelope.branch_id,
+        });
+    }
+    Ok(signals)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_process_signal_provenance(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    signal: &ProcessSignalRecorded,
+) -> StoreResult<()> {
+    if signal.call_id.trim().is_empty()
+        || signal.command_arg_digest.trim().is_empty()
+        || signal.transcript_digest.trim().is_empty()
+        || signal.subject_digest.trim().is_empty()
+    {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_signal_provenance",
+            "process signal contains empty provenance fields",
+        ));
+    }
+    let expected_subject = process_signal_subject_digest(
+        &signal.command_arg_digest,
+        &signal.transcript_digest,
+        signal.workspace_revision.as_ref(),
+    );
+    if expected_subject != signal.subject_digest {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            "process signal subject digest does not match its recorded command and transcript",
+        ));
+    }
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1 AND instr(envelope_json, '\"type\":\"effect\"') > 0
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut matched_intent = false;
+    let mut matched_terminal = false;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let json: String = row.get(0).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid effect envelope in session {session_id}: {error}"
+            ))
+        })?;
+        let Ok(EventPayload::Effect(phase)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        else {
+            continue;
+        };
+        match phase {
+            EffectPhase::Intent(intent) if intent.effect == signal.effect_id => {
+                if envelope.run_id.as_ref() != Some(&signal.run_id)
+                    || intent.class != EffectClass::ProcessExec
+                    || intent.args_digest != signal.command_arg_digest
+                    || intent.workspace_revision != signal.workspace_revision
+                {
+                    return Err(graph_evidence_error(
+                        ErrorCode::InvalidArgument,
+                        "mismatched_signal_provenance",
+                        "process signal does not match its durable effect intent",
+                    ));
+                }
+                matched_intent = true;
+            }
+            EffectPhase::Outcome {
+                effect, outcome, ..
+            } if effect == signal.effect_id => {
+                if envelope.run_id.as_ref() != Some(&signal.run_id)
+                    || outcome == EffectOutcome::Unknown
+                {
+                    return Err(graph_evidence_error(
+                        ErrorCode::InvalidArgument,
+                        "mismatched_signal_provenance",
+                        "process signal does not match a known terminal effect outcome",
+                    ));
+                }
+                matched_terminal = true;
+            }
+            _ => {}
+        }
+    }
+    if !matched_intent || !matched_terminal {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_signal_provenance",
+            "process signal is missing its durable process intent or terminal outcome",
+        ));
+    }
+    Ok(())
+}
+
 fn graph_confirm_menu(graph_id: &GraphId, attempt: u32) -> Menu {
     Menu {
         id: MenuId::new(format!("graph-confirm-{graph_id}-{attempt}")),
@@ -6194,6 +6883,29 @@ fn load_envelope(
             serde_json::from_str(&json).map_err(|error| {
                 corrupt(format!(
                     "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn load_envelope_by_event_id(
+    transaction: &Transaction<'_>,
+    event_id: &EventId,
+) -> StoreResult<Option<RawEnvelope>> {
+    let envelope_json = transaction
+        .query_row(
+            "SELECT envelope_json FROM events WHERE event_id = ?1",
+            [event_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    envelope_json
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                corrupt(format!(
+                    "invalid envelope JSON for event {event_id}: {error}"
                 ))
             })
         })

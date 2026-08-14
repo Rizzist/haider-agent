@@ -610,6 +610,12 @@ impl SessionProjection {
                 ));
             }
             EventPayload::GraphAdvanced(_) => {}
+            // M2a: a daemon-observed process signal is evidence PLUMBING — the
+            // durable exit/arg/transcript provenance that a DaemonVerified slot
+            // references. The convergence story surfaces through the
+            // `EvidenceRecorded` note it backs (and the inspect screen), so the
+            // transcript stays quiet here, like `GraphAdvanced`.
+            EventPayload::ProcessSignalRecorded(_) => {}
         }
     }
 

@@ -404,6 +404,27 @@ pub(super) async fn run_session_actor(
                 );
                 let _ = completed.send(result);
             }
+            ActorCommand::RecordProcessSignal { command, completed } => {
+                let result = store.record_process_signal(command).await;
+                let envelopes = match &result {
+                    Ok(ProcessSignalOutcome::Committed { envelopes, .. }) => {
+                        Some(envelopes.as_slice())
+                    }
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
+                let _ = completed.send(result);
+            }
             ActorCommand::SelectEffort { command, completed } => {
                 // G3 clone of the SelectModel arm: metadata update,
                 // effort_selected fact, and R2 receipt are one transaction;
@@ -1099,6 +1120,7 @@ fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
             | EventPayload::GraphBlocked(_)
             | EventPayload::GraphCompleted(_)
             | EventPayload::GraphAbandoned(_)
+            | EventPayload::ProcessSignalRecorded(_)
             | EventPayload::MenuOpened(Menu {
                 kind: MenuKind::GraphHumanConfirm { .. },
                 ..

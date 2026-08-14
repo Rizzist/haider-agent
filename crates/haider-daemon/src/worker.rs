@@ -42,11 +42,12 @@ use haider_core::{
     AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, CompiledPromptProjection,
     ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
     DeferredToolResult, EventIdGenerator, GraphEvidenceCommand, GraphEvidenceOutcome, HarnessActor,
-    HarnessConfig, PartialStreamCheckpoint, PromptHistoryCompiler, RequestInputCheckpoint,
-    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
-    presentation_for_haider_error, sanitized_failure_message,
+    HarnessConfig, PartialStreamCheckpoint, ProcessSignalCommand, ProcessSignalOutcome,
+    PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn,
+    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
+    estimate_provider_request_input_tokens, presentation_for_haider_error,
+    sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
@@ -56,6 +57,9 @@ use haider_protocol::effect::{
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::graph::{
+    ProcessSignalRecorded, ProcessSignalRef, process_signal_subject_digest,
+};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
@@ -3405,13 +3409,13 @@ async fn perform_shell_exec(
             return fail_shell_exec(lease, device_id, &event_ids, &run_id, tool_error(error)).await;
         }
     };
-    let output = HubCommandOutputContext {
+    let output_context = HubCommandOutputContext {
         store: lease.clone(),
         branch_id: None,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
-    }
-    .sink(
+    };
+    let output = output_context.sink(
         run_id.clone(),
         pending.accepted.item_id.clone(),
         pending.command_id,
@@ -3513,6 +3517,9 @@ async fn perform_shell_exec(
     if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
         return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
     }
+    output_context
+        .record_process_signal(&run_id, &result)
+        .await?;
     let completed = append_payloads(
         lease,
         device_id,
@@ -5803,6 +5810,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
                         ErrorCode::InvalidArgument,
                         &error.to_string(),
+                        None,
                     )));
                 }
             };
@@ -5830,6 +5838,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 node: request.node,
                 verdict: request.verdict,
                 detail: request.detail,
+                slot: request.slot,
+                subject_digest: request.subject_digest,
+                signal: request.signal,
                 device_id: self.output.device_id.clone(),
             };
             let recorded = match self.output.store.hub().record_graph_evidence(command).await {
@@ -5841,11 +5852,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         ErrorCode::GraphNotActive
                             | ErrorCode::GraphWrongNode
                             | ErrorCode::InvalidArgument
+                            | ErrorCode::RevisionConflict
                     ) =>
                 {
                     return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
                         error.code,
                         &error.message,
+                        error
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("kind"))
+                            .and_then(serde_json::Value::as_str),
                     )));
                 }
                 Err(SessionHubError::Store(error)) => return Err(error),
@@ -6175,7 +6192,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         .process_exec(&operation, &policy, cas, output, ProcessBounds::default())
                         .await
                     {
-                        Ok(execution) => execution.wait().await.map(process_result),
+                        Ok(execution) => match execution.wait().await {
+                            Ok(result) => {
+                                match self.output.record_process_signal(run_id, &result).await {
+                                    Ok(signal) => {
+                                        Ok(process_result_with_signal(result, Some(&signal)))
+                                    }
+                                    Err(error) => Err(ToolError::Runtime {
+                                        message: error.message,
+                                    }),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        },
                         Err(error) => Err(error),
                     }
                 }
@@ -6795,12 +6824,18 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
     }
 }
 
-fn graph_evidence_rejection(code: ErrorCode, message: &str) -> BoundedResult {
+fn graph_evidence_rejection(
+    code: ErrorCode,
+    message: &str,
+    rejection_kind: Option<&str>,
+) -> BoundedResult {
     let reason = bounded_failure_reason(message);
+    let subcode = rejection_kind.unwrap_or_else(|| code.as_subcode());
     BoundedResult {
         preview: serde_json::json!({
             "ok": false,
             "code": code.as_str(),
+            "kind": rejection_kind,
             "message": reason,
         })
         .to_string(),
@@ -6810,7 +6845,7 @@ fn graph_evidence_rejection(code: ErrorCode, message: &str) -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(reason.clone()),
         presentation: Some(ErrorPresentation::new(
-            code.as_subcode(),
+            subcode,
             "Graph evidence rejected",
             reason,
             ErrorScope::Tool,
@@ -7097,16 +7132,33 @@ fn optional_u64(args: &serde_json::Value, field: &str) -> Result<Option<u64>, Ha
     })
 }
 
+#[cfg(test)]
 pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
+    process_result_with_signal(result, None)
+}
+
+fn process_result_with_signal(
+    result: ProcessResult,
+    signal: Option<&ProcessSignalRecorded>,
+) -> BoundedResult {
     let artifact = result.artifact.clone();
     let truncated = artifact.is_some() || result.limit_reached.is_some();
     let reason = process_failure_reason(&result);
     BoundedResult {
         preview: serde_json::json!({
             "status": result.status,
+            "effect_id": result.effect,
             "exit_code": result.exit_code,
             "signal": result.signal,
             "output_bytes": result.output_bytes,
+            "command_arg_digest": result.command_arg_digest,
+            "transcript_digest": result.transcript_digest,
+            "subject_digest": signal.map(|signal| signal.subject_digest.as_str()),
+            "process_signal": signal.map(|signal| ProcessSignalRef {
+                run_id: signal.run_id.clone(),
+                call_id: signal.call_id.clone(),
+                effect_id: signal.effect_id.clone(),
+            }),
             "inline_output": result.inline_output,
             "artifact": artifact,
             "limit_reached": result.limit_reached,
@@ -7209,6 +7261,50 @@ impl HubCommandOutputContext {
             device_id: self.device_id.clone(),
             event_ids: Arc::clone(&self.event_ids),
         }
+    }
+
+    async fn record_process_signal(
+        &self,
+        run_id: &RunId,
+        result: &ProcessResult,
+    ) -> Result<ProcessSignalRecorded, HaiderError> {
+        let signal = process_signal_from_result(run_id, result);
+        let command = ProcessSignalCommand {
+            session_id: self.store.session_id().clone(),
+            worker_generation: self.store.worker_generation(),
+            branch_id: self.branch_id.clone(),
+            signal: signal.clone(),
+            device_id: self.device_id.clone(),
+        };
+        match self.store.hub().record_process_signal(command).await {
+            Ok(ProcessSignalOutcome::Committed { .. })
+            | Ok(ProcessSignalOutcome::IdempotentReplay { .. }) => Ok(signal),
+            Err(SessionHubError::Store(error)) => Err(error),
+            Err(error) => Err(HaiderError::new(
+                ErrorCode::Internal,
+                error.to_string(),
+                false,
+            )),
+        }
+    }
+}
+
+fn process_signal_from_result(run_id: &RunId, result: &ProcessResult) -> ProcessSignalRecorded {
+    let subject_digest = process_signal_subject_digest(
+        &result.command_arg_digest,
+        &result.transcript_digest,
+        result.workspace_revision.as_ref(),
+    );
+    ProcessSignalRecorded {
+        run_id: run_id.clone(),
+        call_id: result.call_id.clone(),
+        effect_id: result.effect.clone(),
+        command_arg_digest: result.command_arg_digest.clone(),
+        exit_code: result.exit_code,
+        transcript_digest: result.transcript_digest.clone(),
+        workspace_revision: result.workspace_revision.clone(),
+        subject_digest,
+        artifact: result.artifact.clone(),
     }
 }
 

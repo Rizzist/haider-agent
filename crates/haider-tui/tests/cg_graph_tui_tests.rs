@@ -35,6 +35,7 @@ fn node(
         attempts_opened,
         current_attempt,
         evidence,
+        evidence_slots: Vec::new(),
         satisfied,
     }
 }
@@ -157,6 +158,8 @@ fn graph_facts_render_quiet_transcript_notes() {
         verdict: EvidenceVerdict::Green,
         detail: "cargo test green\n\n  446 passed".into(),
         fingerprint: "fp".into(),
+        slot: None,
+        subject_digest: None,
         source: haider_protocol::graph::GraphEvidenceSource::Model {
             run_id: haider_protocol::ids::RunId::new("r1"),
             call_id: "c1".into(),

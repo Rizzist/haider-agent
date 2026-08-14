@@ -1,0 +1,88 @@
+[
+  {
+    "type": "graph_pinned",
+    "graph_id": "graph-ship-loop-m2a",
+    "template": "ship-loop",
+    "digest": "1c30a48bdb255309f5b69ce5497d99a41b7182b263e55f8bfb5864fdaf4147b9",
+    "nodes": [
+      {
+        "name": "BUILD",
+        "gate": {
+          "kind": "command-green"
+        },
+        "executor": "inline",
+        "max_attempts": 8,
+        "max_evidence_per_attempt": 8
+      },
+      {
+        "name": "VERIFY",
+        "gate": {
+          "kind": "all-of-n",
+          "n": 3
+        },
+        "executor": "fan-out",
+        "max_attempts": 8,
+        "max_evidence_per_attempt": 8,
+        "depends_on": [
+          "BUILD"
+        ],
+        "verify_slots": [
+          {
+            "id": "tests",
+            "authority": "daemon_verified",
+            "subject_selector": "command"
+          },
+          {
+            "id": "lint",
+            "authority": "daemon_verified",
+            "subject_selector": "command"
+          },
+          {
+            "id": "typecheck",
+            "authority": "daemon_verified",
+            "subject_selector": "command"
+          }
+        ]
+      },
+      {
+        "name": "SHIP",
+        "gate": {
+          "kind": "human-confirm"
+        },
+        "executor": "human",
+        "max_attempts": 8,
+        "depends_on": [
+          "VERIFY"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "process_signal_recorded",
+    "run_id": "run-m2a",
+    "call_id": "call-process-tests",
+    "effect_id": "effect-process-tests",
+    "command_arg_digest": "blake3:command-args",
+    "exit_code": 0,
+    "transcript_digest": "blake3:captured-output",
+    "subject_digest": "blake3:903055e2f2fa28f2ca9774bbb4389c5f0e8884161152af378bfb9c3317e462f1",
+    "artifact": "blake3:transcript-artifact"
+  },
+  {
+    "type": "evidence_recorded",
+    "graph_id": "graph-ship-loop-m2a",
+    "node": "VERIFY",
+    "attempt": 1,
+    "verdict": "green",
+    "detail": "cargo test passed",
+    "fingerprint": "7fd263f18be95d26f9891bb41ea5fbb22488bb6be4164c13e64863d4851118d8",
+    "slot": "tests",
+    "subject_digest": "blake3:903055e2f2fa28f2ca9774bbb4389c5f0e8884161152af378bfb9c3317e462f1",
+    "source": {
+      "kind": "process_signal",
+      "run_id": "run-m2a",
+      "call_id": "call-process-tests",
+      "effect_id": "effect-process-tests"
+    }
+  }
+]

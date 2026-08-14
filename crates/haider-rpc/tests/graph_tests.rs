@@ -111,6 +111,7 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                             effective_green: 1,
                             standing_red: 0,
                         },
+                        evidence_slots: Vec::new(),
                         satisfied: false,
                     }],
                     blocked_reason: None,
