@@ -17,9 +17,9 @@ use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorSco
 use haider_protocol::graph::{
     EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GraphAbandoned,
     GraphAdvanced, GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted,
-    GraphEvidenceSource, GraphGateKind, GraphGateSatisfied, GraphNodeName, GraphNodeSpec,
-    GraphPinned, GraphStatus, ProcessSignalRecorded, SubjectSelector, evidence_fingerprint,
-    process_signal_subject_digest, ship_loop_digest, ship_loop_nodes,
+    GraphEvidenceSource, GraphGateKind, GraphGateSatisfied, GraphNodeSpec, GraphPinned,
+    GraphStatus, ProcessSignalRecorded, SubjectSelector, evidence_fingerprint,
+    process_signal_subject_digest, reduce_graph, ship_loop_digest, ship_loop_nodes,
 };
 use haider_protocol::hook::{
     HookAttachmentMetadata, HookAttachmentSet, HookEventPayload, HookFired, HookInput, HookOutput,
@@ -1700,7 +1700,7 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
     let graph_id = GraphId::new("graph-ship-loop-1");
     let legacy_nodes = vec![
         GraphNodeSpec {
-            name: GraphNodeName::Build,
+            name: haider_protocol::graph::build_node(),
             gate: GraphGateKind::CommandGreen,
             executor: haider_protocol::graph::GraphExecutorShape::Inline,
             max_attempts: 8,
@@ -1709,21 +1709,21 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
             verify_slots: Vec::new(),
         },
         GraphNodeSpec {
-            name: GraphNodeName::Verify,
+            name: haider_protocol::graph::verify_node(),
             gate: GraphGateKind::AllOfN { n: 3 },
             executor: haider_protocol::graph::GraphExecutorShape::FanOut,
             max_attempts: 8,
             max_evidence_per_attempt: Some(8),
-            depends_on: vec![GraphNodeName::Build],
+            depends_on: vec![haider_protocol::graph::build_node()],
             verify_slots: Vec::new(),
         },
         GraphNodeSpec {
-            name: GraphNodeName::Ship,
+            name: haider_protocol::graph::ship_node(),
             gate: GraphGateKind::HumanConfirm,
             executor: haider_protocol::graph::GraphExecutorShape::Human,
             max_attempts: 8,
             max_evidence_per_attempt: None,
-            depends_on: vec![GraphNodeName::Verify],
+            depends_on: vec![haider_protocol::graph::verify_node()],
             verify_slots: Vec::new(),
         },
     ];
@@ -1732,16 +1732,18 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
             graph_id: graph_id.clone(),
             template: "ship-loop".into(),
             digest: "63cee264d2a430b21d32c5f8b71c390e0bb825e88073571d19e7dbf2084820eb".into(),
+            template_version: 0,
+            start_node: None,
             nodes: legacy_nodes,
         }),
         EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id: graph_id.clone(),
-            node: GraphNodeName::Build,
+            node: haider_protocol::graph::build_node(),
             attempt: 2,
         }),
         EventPayload::EvidenceRecorded(EvidenceRecorded {
             graph_id: graph_id.clone(),
-            node: GraphNodeName::Verify,
+            node: haider_protocol::graph::verify_node(),
             attempt: 2,
             verdict: EvidenceVerdict::Red,
             detail: "cargo test failed".into(),
@@ -1755,17 +1757,17 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
         }),
         EventPayload::GraphGateSatisfied(GraphGateSatisfied {
             graph_id: graph_id.clone(),
-            node: GraphNodeName::Verify,
+            node: haider_protocol::graph::verify_node(),
             attempt: 2,
         }),
         EventPayload::GraphAdvanced(GraphAdvanced {
             graph_id: graph_id.clone(),
-            from_node: GraphNodeName::Verify,
-            to_node: GraphNodeName::Ship,
+            from_node: haider_protocol::graph::verify_node(),
+            to_node: haider_protocol::graph::ship_node(),
         }),
         EventPayload::GraphBlocked(GraphBlocked {
             graph_id: graph_id.clone(),
-            node: GraphNodeName::Verify,
+            node: haider_protocol::graph::verify_node(),
             reason: GraphBlockReason::NoProgress,
         }),
         EventPayload::GraphCompleted(GraphCompleted {
@@ -1777,6 +1779,23 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
         }),
     ];
     golden("convergence_graph_facts", &facts);
+
+    // M2b mutation guard: populating any defaulted M2b status field for this
+    // legacy journal, or changing legacy START/current-node semantics, changes
+    // these exact pre-M2b reducer bytes.
+    let raw = facts
+        .iter()
+        .cloned()
+        .map(|fact| {
+            serde_json::from_value(serde_json::to_value(envelope(fact)).expect("envelope value"))
+                .expect("raw envelope")
+        })
+        .collect::<Vec<_>>();
+    let status = reduce_graph(&raw).status.expect("legacy status");
+    assert_eq!(
+        serde_json::to_string(&status).expect("legacy status JSON"),
+        r#"{"graph_id":"graph-ship-loop-1","template":"ship-loop","digest":"63cee264d2a430b21d32c5f8b71c390e0bb825e88073571d19e7dbf2084820eb","phase":"abandoned","current_node":"VERIFY","attempt":2,"nodes":[{"node":"BUILD","attempts_opened":1,"current_attempt":2,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false},{"node":"VERIFY","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":true},{"node":"SHIP","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false}],"blocked_reason":"no-progress"}"#
+    );
 
     #[derive(Debug, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
@@ -1827,12 +1846,14 @@ fn additive_golden_convergence_graph_m2a_authority() {
                 graph_id: graph_id.clone(),
                 template: "ship-loop".into(),
                 digest: ship_loop_digest(),
+                template_version: 0,
+                start_node: None,
                 nodes: ship_loop_nodes(),
             }),
             EventPayload::ProcessSignalRecorded(signal.clone()),
             EventPayload::EvidenceRecorded(EvidenceRecorded {
                 graph_id,
-                node: GraphNodeName::Verify,
+                node: haider_protocol::graph::verify_node(),
                 attempt: 1,
                 verdict: EvidenceVerdict::Green,
                 detail: "cargo test passed".into(),
@@ -1860,7 +1881,7 @@ fn golden_graph_human_confirm_menu() {
             id: MenuId::new("graph-confirm-graph-ship-loop-1-2"),
             kind: MenuKind::GraphHumanConfirm {
                 graph_id: GraphId::new("graph-ship-loop-1"),
-                node: GraphNodeName::Ship,
+                node: haider_protocol::graph::ship_node(),
                 attempt: 2,
             },
             title: "Ship this graph?".into(),
@@ -1894,7 +1915,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
         ship_loop_nodes(),
         vec![
             GraphNodeSpec {
-                name: GraphNodeName::Build,
+                name: haider_protocol::graph::build_node(),
                 gate: GraphGateKind::CommandGreen,
                 executor: haider_protocol::graph::GraphExecutorShape::Inline,
                 max_attempts: 8,
@@ -1903,12 +1924,12 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 verify_slots: Vec::new(),
             },
             GraphNodeSpec {
-                name: GraphNodeName::Verify,
+                name: haider_protocol::graph::verify_node(),
                 gate: GraphGateKind::AllOfN { n: 3 },
                 executor: haider_protocol::graph::GraphExecutorShape::FanOut,
                 max_attempts: 8,
                 max_evidence_per_attempt: Some(8),
-                depends_on: vec![GraphNodeName::Build],
+                depends_on: vec![haider_protocol::graph::build_node()],
                 verify_slots: ["tests", "lint", "typecheck"]
                     .into_iter()
                     .map(|id| EvidenceSlotSpec {
@@ -1919,12 +1940,12 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                     .collect(),
             },
             GraphNodeSpec {
-                name: GraphNodeName::Ship,
+                name: haider_protocol::graph::ship_node(),
                 gate: GraphGateKind::HumanConfirm,
                 executor: haider_protocol::graph::GraphExecutorShape::Human,
                 max_attempts: 8,
                 max_evidence_per_attempt: None,
-                depends_on: vec![GraphNodeName::Verify],
+                depends_on: vec![haider_protocol::graph::verify_node()],
                 verify_slots: Vec::new(),
             },
         ]
@@ -1935,11 +1956,13 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
             graph_id: graph_id.clone(),
             template: "ship-loop".into(),
             digest: ship_loop_digest(),
+            template_version: 0,
+            start_node: None,
             nodes: ship_loop_nodes(),
         }),
         EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id,
-            node: GraphNodeName::Build,
+            node: haider_protocol::graph::build_node(),
             attempt: 2,
         }),
     ];

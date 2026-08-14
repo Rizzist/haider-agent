@@ -102,15 +102,16 @@ use async_trait::async_trait;
 use haider_core::{
     AbandonedGraph, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
     CancelledTurn, CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome,
-    GraphEvidenceCommand, GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, HarnessHandle,
-    MenuResolutionCommand, MenuResolutionOutcome, PinnedGraph, ProcessSignalCommand,
-    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort,
-    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome,
+    GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand,
+    MenuResolutionOutcome, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome,
+    ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast,
+    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
     SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
     SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
-    TurnCancelOutcome, TurnCancellationStatus,
+    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -791,6 +792,10 @@ enum ActorCommand {
     PinGraph {
         command: GraphPinCommand,
         completed: oneshot::Sender<Result<GraphPinOutcome, HaiderError>>,
+    },
+    SwitchGraph {
+        command: GraphSwitchCommand,
+        completed: oneshot::Sender<Result<GraphSwitchOutcome, HaiderError>>,
     },
     AbandonGraph {
         command: GraphAbandonCommand,
@@ -1720,6 +1725,40 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::PinGraph { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn graph_switch_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SwitchedGraph>, SessionHubError> {
+        self.inner
+            .store
+            .graph_switch_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn switch_graph(
+        &self,
+        command: GraphSwitchCommand,
+    ) -> Result<GraphSwitchOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SwitchGraph { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

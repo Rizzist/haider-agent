@@ -104,9 +104,11 @@ pub enum EventPayload {
     EvidenceRecorded(graph::EvidenceRecorded),
     GraphGateSatisfied(graph::GraphGateSatisfied),
     GraphAdvanced(graph::GraphAdvanced),
+    GraphNodeReadied(graph::GraphNodeReadied),
     GraphBlocked(graph::GraphBlocked),
     GraphCompleted(graph::GraphCompleted),
     GraphAbandoned(graph::GraphAbandoned),
+    GraphSuperseded(graph::GraphSuperseded),
     ProcessSignalRecorded(graph::ProcessSignalRecorded),
     // accounts
     Rotation(credential::RotationEvent),

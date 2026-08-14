@@ -8,6 +8,7 @@ use crate::{ToolError, ToolResult};
 use haider_protocol::graph::{
     EvidenceVerdict, GRAPH_EVIDENCE_DETAIL_MAX_BYTES, GraphNodeName, ProcessSignalRef,
 };
+use haider_protocol::ids::GraphId;
 use haider_protocol::tool::{DispatchMode, ToolManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,8 @@ const GRAPH_EVIDENCE_INPUT_MAX_BYTES: usize = GRAPH_EVIDENCE_DETAIL_MAX_BYTES * 
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_id: Option<GraphId>,
     pub node: GraphNodeName,
     pub verdict: EvidenceVerdict,
     pub detail: String,
@@ -89,8 +92,13 @@ pub fn graph_evidence_manifest() -> ToolManifest {
             "properties": {
                 "node": {
                     "type": "string",
-                    "enum": ["BUILD", "VERIFY", "SHIP"],
-                    "description": "Must equal the current open obligation"
+                    "pattern": "^[A-Z][A-Z0-9_-]{0,63}$",
+                    "description": "Must equal one of the current open obligations"
+                },
+                "graph_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Active graph id from GraphBrief; binds evidence across graph.switch races"
                 },
                 "verdict": {
                     "type": "string",
@@ -126,7 +134,7 @@ pub fn graph_evidence_manifest() -> ToolManifest {
                     "description": "Required for daemon-verified slots; must reference a durable process signal"
                 }
             },
-            "required": ["node", "verdict", "detail"],
+            "required": ["graph_id", "node", "verdict", "detail"],
             "additionalProperties": false
         }),
     }
@@ -137,14 +145,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_and_parser_share_the_frozen_vocabulary() {
+    fn manifest_and_parser_accept_a_bounded_general_node() {
         let request = GraphEvidence::from_tool_args(serde_json::json!({
             "node": "VERIFY",
             "verdict": "green",
             "detail": "haider-core passed"
         }))
         .expect("valid evidence");
-        assert_eq!(request.node, GraphNodeName::Verify);
+        assert_eq!(
+            request.node,
+            GraphNodeName::new("VERIFY").expect("bounded node")
+        );
         assert_eq!(request.verdict, EvidenceVerdict::Green);
         assert_eq!(graph_evidence_manifest().name, "graph_evidence");
     }

@@ -362,6 +362,27 @@ pub(super) async fn run_session_actor(
                 );
                 let _ = completed.send(result);
             }
+            ActorCommand::SwitchGraph { command, completed } => {
+                let result = store.switch_graph(command).await;
+                let envelopes = match &result {
+                    Ok(GraphSwitchOutcome::Committed { envelopes, .. }) => {
+                        Some(envelopes.as_slice())
+                    }
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
+                let _ = completed.send(result);
+            }
             ActorCommand::AbandonGraph { command, completed } => {
                 let result = store.abandon_graph(command).await;
                 let envelopes = match &result {
@@ -1117,9 +1138,11 @@ fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
             | EventPayload::EvidenceRecorded(_)
             | EventPayload::GraphGateSatisfied(_)
             | EventPayload::GraphAdvanced(_)
+            | EventPayload::GraphNodeReadied(_)
             | EventPayload::GraphBlocked(_)
             | EventPayload::GraphCompleted(_)
             | EventPayload::GraphAbandoned(_)
+            | EventPayload::GraphSuperseded(_)
             | EventPayload::ProcessSignalRecorded(_)
             | EventPayload::MenuOpened(Menu {
                 kind: MenuKind::GraphHumanConfirm { .. },

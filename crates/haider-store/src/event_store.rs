@@ -27,10 +27,11 @@ use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorSco
 use haider_protocol::graph::{
     EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GraphAbandoned,
     GraphAdvanced, GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted,
-    GraphEvidenceSource, GraphGateKind, GraphGateSatisfied, GraphNodeName, GraphPhase, GraphPinned,
-    GraphReduction, GraphStatus, ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE,
-    SubjectSelector, evidence_fingerprint, normalize_evidence_detail,
-    process_signal_subject_digest, reduce_graph, ship_loop_digest, ship_loop_nodes,
+    GraphEvidenceSource, GraphGateKind, GraphGateSatisfied, GraphNodeName, GraphNodeReadied,
+    GraphPhase, GraphPinned, GraphReduction, GraphReductions, GraphStatus, GraphSuperseded,
+    GraphTemplateRejection, ProcessSignalRecorded, ProcessSignalRef, SubjectSelector, build_node,
+    evidence_fingerprint, graph_template, graph_template_digest, normalize_evidence_detail,
+    process_signal_subject_digest, reduce_graphs, validate_graph_template,
 };
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
 use haider_protocol::hook::HookEventPayload;
@@ -199,6 +200,9 @@ pub struct GraphEvidenceCommand {
     pub worker_generation: u64,
     pub run_id: RunId,
     pub call_id: String,
+    /// Active-root snapshot taken before this evidence command entered the
+    /// session actor queue. It prevents a late call from crossing a switch.
+    pub graph_id: GraphId,
     pub node: GraphNodeName,
     pub verdict: EvidenceVerdict,
     pub detail: String,
@@ -254,6 +258,43 @@ pub enum GraphEvidenceOutcome {
     },
     IdempotentReplay {
         recorded: RecordedGraphEvidence,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphSwitchCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub old_graph_id: GraphId,
+    pub new_graph_id: GraphId,
+    pub template: String,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SwitchedGraph {
+    pub session_id: SessionId,
+    pub old_graph_id: GraphId,
+    pub new_graph_id: GraphId,
+    pub template: String,
+    pub digest: String,
+    pub superseded_seq: u64,
+    pub pinned_seq: u64,
+    pub opened_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphSwitchOutcome {
+    Committed {
+        switched: SwitchedGraph,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        switched: SwitchedGraph,
     },
 }
 
@@ -980,11 +1021,11 @@ pub struct Store {
 }
 
 struct CachedGraphReduction {
-    // Volatile latest-instance projection. The connection lock serializes
+    // Volatile graph-forest projection. The connection lock serializes
     // cache extension after commit with every reader; journal facts remain
     // the authority and a restart simply rebuilds this value.
     envelopes: Vec<RawEnvelope>,
-    reduction: GraphReduction,
+    reductions: GraphReductions,
 }
 
 impl Store {
@@ -1265,7 +1306,41 @@ impl Store {
     pub fn graph_status(&self, session_id: &SessionId) -> StoreResult<Option<GraphStatus>> {
         let connection = self.connection()?;
         require_session(&connection, session_id)?;
-        Ok(self.graph_reduction(&connection, session_id)?.status)
+        Ok(self
+            .graph_reductions(&connection, session_id)?
+            .active()
+            .and_then(|reduction| reduction.status.clone()))
+    }
+
+    /// Queries any retained graph instance, including superseded roots.
+    #[allow(clippy::result_large_err)]
+    pub fn graph_status_by_id(
+        &self,
+        session_id: &SessionId,
+        graph_id: &GraphId,
+    ) -> StoreResult<Option<GraphStatus>> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        Ok(self
+            .graph_reductions(&connection, session_id)?
+            .graph(graph_id)
+            .and_then(|reduction| reduction.status.clone()))
+    }
+
+    /// Full retained reduction for inspection, including immutable specs and
+    /// evidence history from superseded graph instances.
+    #[allow(clippy::result_large_err)]
+    pub fn graph_reduction_by_id(
+        &self,
+        session_id: &SessionId,
+        graph_id: &GraphId,
+    ) -> StoreResult<Option<GraphReduction>> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        Ok(self
+            .graph_reductions(&connection, session_id)?
+            .graph(graph_id)
+            .cloned())
     }
 
     /// Appends one daemon-observed process signal, or returns the exact
@@ -1388,16 +1463,18 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        if command.template != SHIP_LOOP_TEMPLATE {
-            return Err(store_error(
+        let template = graph_template(&command.template).ok_or_else(|| {
+            store_error(
                 ErrorCode::InvalidArgument,
                 format!("unknown graph template `{}`", command.template),
                 false,
-            ));
-        }
+            )
+        })?;
+        validate_pinned_graph_template(&template)?;
         let current = self
-            .graph_reduction(&transaction, &command.session_id)?
-            .status;
+            .graph_reductions(&transaction, &command.session_id)?
+            .active()
+            .and_then(|reduction| reduction.status.clone());
         if current
             .as_ref()
             .is_some_and(|status| status.phase == GraphPhase::Active)
@@ -1426,18 +1503,25 @@ impl Store {
             }));
         }
         let pinned_index = payloads.len();
-        let digest = ship_loop_digest();
-        let nodes = ship_loop_nodes();
-        validate_pinned_graph_nodes(&nodes)?;
+        let digest = graph_template_digest(&template);
+        let start_node = template.start_node.clone().ok_or_else(|| {
+            store_error(
+                ErrorCode::StoreCorrupt,
+                "validated graph template lost its start node",
+                false,
+            )
+        })?;
         payloads.push(EventPayload::GraphPinned(GraphPinned {
             graph_id: command.graph_id.clone(),
-            template: SHIP_LOOP_TEMPLATE.into(),
+            template: template.name,
             digest: digest.clone(),
-            nodes,
+            template_version: template.version,
+            start_node: Some(start_node.clone()),
+            nodes: template.nodes,
         }));
         payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id: command.graph_id.clone(),
-            node: GraphNodeName::Build,
+            node: start_node,
             attempt: 1,
         }));
         let mut envelopes = graph_command_envelopes(command, payloads)?;
@@ -1464,6 +1548,166 @@ impl Store {
         transaction.commit().map_err(map_sqlite_error)?;
         self.extend_graph_reduction(&command.session_id, &envelopes);
         Ok(GraphPinOutcome::Committed { pinned, envelopes })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn graph_switch_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SwitchedGraph>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "graph.switch",
+            request_digest,
+            request_json,
+            "graph-switch",
+        )
+    }
+
+    /// Atomically supersedes one active root, retires all of its human menus,
+    /// pins an immutable replacement, and opens the replacement START.
+    #[allow(clippy::result_large_err)]
+    pub fn switch_graph(&self, command: &GraphSwitchCommand) -> StoreResult<GraphSwitchOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(switched) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "graph.switch",
+            &command.request_digest,
+            &command.request_json,
+            "graph-switch",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphSwitchOutcome::IdempotentReplay { switched });
+        }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let template = graph_template(&command.template).ok_or_else(|| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("unknown graph template `{}`", command.template),
+                false,
+            )
+        })?;
+        validate_pinned_graph_template(&template)?;
+        let reductions = self.graph_reductions(&transaction, &command.session_id)?;
+        if reductions.active_root.as_ref() != Some(&command.old_graph_id) {
+            return Err(store_error(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "graph switch expected active root {}, found {}",
+                    command.old_graph_id,
+                    reductions.active_root.as_ref().map_or("-", GraphId::as_str)
+                ),
+                false,
+            ));
+        }
+        if reductions.by_graph.contains_key(&command.new_graph_id) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("replacement graph {} already exists", command.new_graph_id),
+                false,
+            ));
+        }
+        let old_status = reductions
+            .graph(&command.old_graph_id)
+            .and_then(|reduction| reduction.status.clone())
+            .filter(GraphStatus::is_unfinished)
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::GraphNotActive,
+                    "expected graph is not an unfinished active root",
+                    false,
+                )
+            })?;
+        let start_node = template.start_node.clone().ok_or_else(|| {
+            store_error(
+                ErrorCode::StoreCorrupt,
+                "validated graph template lost its start node",
+                false,
+            )
+        })?;
+        let digest = graph_template_digest(&template);
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "graph.switch",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let mut payloads = vec![EventPayload::GraphSuperseded(GraphSuperseded {
+            old: command.old_graph_id.clone(),
+            new: command.new_graph_id.clone(),
+        })];
+        for menu in graph_pending_menus(&old_status) {
+            payloads.push(EventPayload::MenuClosed {
+                menu,
+                reason: MenuCloseReason::Dismissed,
+            });
+        }
+        let pinned_index = payloads.len();
+        payloads.push(EventPayload::GraphPinned(GraphPinned {
+            graph_id: command.new_graph_id.clone(),
+            template: template.name,
+            digest: digest.clone(),
+            template_version: template.version,
+            start_node: Some(start_node.clone()),
+            nodes: template.nodes,
+        }));
+        payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+            graph_id: command.new_graph_id.clone(),
+            node: start_node,
+            attempt: 1,
+        }));
+        let mut envelopes = graph_command_envelopes(command, payloads)?;
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let switched = SwitchedGraph {
+            session_id: command.session_id.clone(),
+            old_graph_id: command.old_graph_id.clone(),
+            new_graph_id: command.new_graph_id.clone(),
+            template: command.template.clone(),
+            digest,
+            superseded_seq: envelopes[0].seq,
+            pinned_seq: envelopes[pinned_index].seq,
+            opened_seq: envelopes[pinned_index + 1].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(switched.superseded_seq),
+            &switched,
+            now,
+            "graph-switch",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        self.extend_graph_reduction(&command.session_id, &envelopes);
+        Ok(GraphSwitchOutcome::Committed {
+            switched,
+            envelopes,
+        })
     }
 
     pub fn graph_abandon_receipt(
@@ -1513,8 +1757,9 @@ impl Store {
         }
         require_typed_session(&transaction, &command.session_id)?;
         let status = self
-            .graph_reduction(&transaction, &command.session_id)?
-            .status
+            .graph_reductions(&transaction, &command.session_id)?
+            .active()
+            .and_then(|reduction| reduction.status.clone())
             .filter(GraphStatus::is_unfinished)
             .ok_or_else(|| {
                 store_error(
@@ -1537,7 +1782,8 @@ impl Store {
             graph_id: status.graph_id.clone(),
             why,
         })];
-        if let Some(menu) = status.pending_menu {
+        let pending_menus = graph_pending_menus(&status);
+        for menu in pending_menus {
             // Leaving an active SHIP obligation retires its durable menu too;
             // otherwise the answered-menu fallback scan would keep exposing
             // a permanently stale, unanswerable card after abandonment.
@@ -1606,8 +1852,36 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let reduction = self.graph_reduction(&transaction, &command.session_id)?;
-        let status = reduction.status.ok_or_else(|| {
+        let reductions = self.graph_reductions(&transaction, &command.session_id)?;
+        if reductions.active_root.as_ref() != Some(&command.graph_id) {
+            let superseded = reductions
+                .graph(&command.graph_id)
+                .and_then(|reduction| reduction.status.as_ref())
+                .is_some_and(|status| status.phase == GraphPhase::Superseded);
+            if superseded {
+                return Err(graph_evidence_error(
+                    ErrorCode::GraphNotActive,
+                    "superseded",
+                    format!("graph {} has been superseded", command.graph_id),
+                ));
+            }
+            return Err(store_error(
+                ErrorCode::GraphNotActive,
+                format!("graph {} is not the active root", command.graph_id),
+                false,
+            ));
+        }
+        let reduction = reductions
+            .graph(&command.graph_id)
+            .cloned()
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::GraphNotActive,
+                    "session has no Convergence Graph",
+                    false,
+                )
+            })?;
+        let status = reduction.status.clone().ok_or_else(|| {
             store_error(
                 ErrorCode::GraphNotActive,
                 "session has no Convergence Graph",
@@ -1621,20 +1895,33 @@ impl Store {
                 false,
             ));
         }
-        let current_node = status.current_node.ok_or_else(|| {
-            store_error(
-                ErrorCode::StoreCorrupt,
-                "active graph has no open obligation",
-                false,
-            )
-        })?;
-        if current_node != command.node || !status.accepts_evidence() {
+        let current_node = command.node.clone();
+        let node_spec = reduction
+            .template_nodes
+            .iter()
+            .find(|spec| spec.name == current_node)
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::GraphWrongNode,
+                    format!(
+                        "graph node {} is absent from the pinned template",
+                        current_node
+                    ),
+                    false,
+                )
+            })?;
+        if !status.node_is_ready(&current_node)
+            || matches!(node_spec.gate, GraphGateKind::HumanConfirm)
+        {
             return Err(store_error(
                 ErrorCode::GraphWrongNode,
                 format!(
-                    "graph_evidence named {}, but the open obligation is {}",
+                    "graph_evidence named {}, but the first open obligation is {}",
                     command.node.label(),
-                    current_node.label()
+                    status
+                        .current_node
+                        .as_ref()
+                        .map_or("-", GraphNodeName::label)
                 ),
                 false,
             ));
@@ -1650,17 +1937,6 @@ impl Store {
         let fingerprint = evidence_fingerprint(&detail);
         let attempt = status.attempt;
         let graph_id = status.graph_id.clone();
-        let node_spec = reduction
-            .template_nodes
-            .iter()
-            .find(|spec| spec.name == current_node)
-            .ok_or_else(|| {
-                store_error(
-                    ErrorCode::StoreCorrupt,
-                    "open graph node is absent from its pinned template",
-                    false,
-                )
-            })?;
         let slot_spec = if node_spec.verify_slots.is_empty() {
             if command.slot.is_some() {
                 return Err(graph_evidence_error(
@@ -1741,7 +2017,7 @@ impl Store {
         )?;
         let evidence = EvidenceRecorded {
             graph_id: graph_id.clone(),
-            node: current_node,
+            node: current_node.clone(),
             attempt,
             verdict: command.verdict,
             detail,
@@ -1772,7 +2048,7 @@ impl Store {
         if no_progress {
             payloads.push(EventPayload::GraphBlocked(GraphBlocked {
                 graph_id: graph_id.clone(),
-                node: current_node,
+                node: current_node.clone(),
                 reason: GraphBlockReason::NoProgress,
             }));
         } else {
@@ -1796,10 +2072,10 @@ impl Store {
                 EvidenceVerdict::Green => node_status.evidence.effective_green.saturating_add(1),
                 EvidenceVerdict::Red => 0,
             };
-            let satisfied = match node_spec.gate {
+            let satisfied = match &node_spec.gate {
                 GraphGateKind::CommandGreen => command.verdict == EvidenceVerdict::Green,
                 GraphGateKind::AllOfN { n } if node_spec.verify_slots.is_empty() => {
-                    command.verdict == EvidenceVerdict::Green && effective_green >= n
+                    command.verdict == EvidenceVerdict::Green && effective_green >= *n
                 }
                 GraphGateKind::AllOfN { .. } => node_status.evidence_slots.iter().all(|slot| {
                     if command.slot.as_deref() == Some(slot.id.as_str()) {
@@ -1813,52 +2089,35 @@ impl Store {
             if satisfied {
                 payloads.push(EventPayload::GraphGateSatisfied(GraphGateSatisfied {
                     graph_id: graph_id.clone(),
-                    node: current_node,
+                    node: current_node.clone(),
                     attempt,
                 }));
-                match current_node {
-                    GraphNodeName::Build => {
-                        payloads.push(EventPayload::GraphAdvanced(GraphAdvanced {
-                            graph_id: graph_id.clone(),
-                            from_node: GraphNodeName::Build,
-                            to_node: GraphNodeName::Verify,
-                        }));
-                        payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
-                            graph_id: graph_id.clone(),
-                            node: GraphNodeName::Verify,
-                            attempt,
-                        }));
-                    }
-                    GraphNodeName::Verify => {
-                        payloads.push(EventPayload::GraphAdvanced(GraphAdvanced {
-                            graph_id: graph_id.clone(),
-                            from_node: GraphNodeName::Verify,
-                            to_node: GraphNodeName::Ship,
-                        }));
-                        payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
-                            graph_id: graph_id.clone(),
-                            node: GraphNodeName::Ship,
-                            attempt,
-                        }));
-                        payloads.push(EventPayload::MenuOpened(graph_confirm_menu(
-                            &graph_id, attempt,
-                        )));
-                    }
-                    GraphNodeName::Ship => {}
-                }
+                payloads.extend(dependency_followups(
+                    &reduction,
+                    &status,
+                    &current_node,
+                    attempt,
+                )?);
             } else if evidence_count >= graph_evidence_limit(node_spec)? {
                 if attempt >= node_spec.max_attempts {
                     payloads.push(EventPayload::GraphBlocked(GraphBlocked {
                         graph_id: graph_id.clone(),
-                        node: current_node,
+                        node: current_node.clone(),
                         reason: GraphBlockReason::RoundsExhausted,
                     }));
                 } else {
-                    // No back-edge: the new BUILD epoch is an immutable
+                    // No back-edge: the new START epoch is an immutable
                     // attempt opening, never GraphAdvanced traversal.
+                    for menu in graph_pending_menus(&status) {
+                        payloads.push(EventPayload::MenuClosed {
+                            menu,
+                            reason: MenuCloseReason::Dismissed,
+                        });
+                    }
+                    let start_node = status.start_node.clone().unwrap_or_else(build_node);
                     payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
                         graph_id: graph_id.clone(),
-                        node: GraphNodeName::Build,
+                        node: start_node,
                         attempt: attempt + 1,
                     }));
                 }
@@ -5036,23 +5295,23 @@ impl Store {
         })
     }
 
-    fn graph_reduction(
+    #[allow(clippy::result_large_err)]
+    fn graph_reductions(
         &self,
         connection: &Connection,
         session_id: &SessionId,
-    ) -> StoreResult<GraphReduction> {
-        if let Some(reduction) = self
+    ) -> StoreResult<GraphReductions> {
+        if let Some(reductions) = self
             .graph_reductions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(session_id)
-            .map(|cached| cached.reduction.clone())
+            .map(|cached| cached.reductions.clone())
         {
-            return Ok(reduction);
+            return Ok(reductions);
         }
-        let mut envelopes = load_graph_reduction_envelopes(connection, session_id)?;
-        retain_latest_graph(&mut envelopes);
-        let reduction = reduce_graph(&envelopes);
+        let envelopes = load_graph_reduction_envelopes(connection, session_id)?;
+        let reductions = reduce_graphs(&envelopes);
         self.graph_reductions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5060,10 +5319,10 @@ impl Store {
                 session_id.clone(),
                 CachedGraphReduction {
                     envelopes,
-                    reduction: reduction.clone(),
+                    reductions: reductions.clone(),
                 },
             );
-        Ok(reduction)
+        Ok(reductions)
     }
 
     fn extend_graph_reduction(&self, session_id: &SessionId, envelopes: &[RawEnvelope]) {
@@ -5080,8 +5339,7 @@ impl Store {
                 .filter(|envelope| graph_reduction_event(&envelope.payload))
                 .cloned(),
         );
-        retain_latest_graph(&mut cached.envelopes);
-        cached.reduction = reduce_graph(&cached.envelopes);
+        cached.reductions = reduce_graphs(&cached.envelopes);
     }
 
     fn invalidate_graph_reduction(&self, session_id: &SessionId) {
@@ -5445,9 +5703,12 @@ fn load_graph_reduction(
     connection: &Connection,
     session_id: &SessionId,
 ) -> StoreResult<GraphReduction> {
-    Ok(reduce_graph(&load_graph_reduction_envelopes(
-        connection, session_id,
-    )?))
+    Ok(
+        reduce_graphs(&load_graph_reduction_envelopes(connection, session_id)?)
+            .active()
+            .cloned()
+            .unwrap_or_default(),
+    )
 }
 
 fn load_graph_reduction_envelopes(
@@ -5493,6 +5754,21 @@ trait GraphCommandCoordinates {
 }
 
 impl GraphCommandCoordinates for GraphPinCommand {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+    fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+}
+
+impl GraphCommandCoordinates for GraphSwitchCommand {
     fn command_id(&self) -> &str {
         &self.command_id
     }
@@ -5581,6 +5857,93 @@ fn normalize_graph_why(why: &str) -> StoreResult<String> {
     Ok(why[..end].to_owned())
 }
 
+fn graph_pending_menus(status: &GraphStatus) -> Vec<MenuId> {
+    if status.pending_menus.is_empty() {
+        status.pending_menu.iter().cloned().collect()
+    } else {
+        status.pending_menus.clone()
+    }
+}
+
+fn linear_template(reduction: &GraphReduction, status: &GraphStatus) -> bool {
+    let Some(first) = reduction.template_nodes.first() else {
+        return false;
+    };
+    let start = status.start_node.as_ref().unwrap_or(&first.name);
+    &first.name == start
+        && first.depends_on.is_empty()
+        && reduction
+            .template_nodes
+            .windows(2)
+            .all(|pair| pair[1].depends_on.as_slice() == std::slice::from_ref(&pair[0].name))
+}
+
+#[allow(clippy::result_large_err)]
+fn dependency_followups(
+    reduction: &GraphReduction,
+    status: &GraphStatus,
+    satisfied_node: &GraphNodeName,
+    attempt: u32,
+) -> StoreResult<Vec<EventPayload>> {
+    let satisfied = |name: &GraphNodeName| {
+        name == satisfied_node
+            || status
+                .nodes
+                .iter()
+                .find(|node| &node.node == name)
+                .is_some_and(|node| node.satisfied)
+    };
+    let unsatisfied = reduction
+        .template_nodes
+        .iter()
+        .filter(|spec| !satisfied(&spec.name))
+        .collect::<Vec<_>>();
+    if unsatisfied.is_empty() {
+        return Ok(vec![EventPayload::GraphCompleted(GraphCompleted {
+            graph_id: status.graph_id.clone(),
+        })]);
+    }
+    let ready = unsatisfied
+        .into_iter()
+        .filter(|spec| spec.depends_on.iter().all(&satisfied))
+        .filter(|spec| {
+            status
+                .nodes
+                .iter()
+                .find(|node| node.node == spec.name)
+                .is_none_or(|node| node.current_attempt != Some(attempt))
+        })
+        .collect::<Vec<_>>();
+    let linear = linear_template(reduction, status);
+    let mut payloads = Vec::new();
+    for spec in ready {
+        if linear {
+            payloads.push(EventPayload::GraphAdvanced(GraphAdvanced {
+                graph_id: status.graph_id.clone(),
+                from_node: satisfied_node.clone(),
+                to_node: spec.name.clone(),
+            }));
+        } else {
+            payloads.push(EventPayload::GraphNodeReadied(GraphNodeReadied {
+                graph_id: status.graph_id.clone(),
+                node: spec.name.clone(),
+                attempt,
+            }));
+        }
+        payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+            graph_id: status.graph_id.clone(),
+            node: spec.name.clone(),
+            attempt,
+        }));
+        if matches!(spec.gate, GraphGateKind::HumanConfirm) {
+            payloads.push(EventPayload::MenuOpened(graph_confirm_menu(
+                status, &spec.name, attempt,
+            )));
+        }
+    }
+    Ok(payloads)
+}
+
 fn graph_evidence_limit(spec: &haider_protocol::graph::GraphNodeSpec) -> StoreResult<u32> {
     spec.max_evidence_per_attempt.ok_or_else(|| {
         store_error(
@@ -5595,61 +5958,35 @@ fn graph_evidence_limit(spec: &haider_protocol::graph::GraphNodeSpec) -> StoreRe
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_pinned_graph_nodes(nodes: &[haider_protocol::graph::GraphNodeSpec]) -> StoreResult<()> {
-    for node in nodes {
-        if node.verify_slots.is_empty() {
-            continue;
-        }
-        let GraphGateKind::AllOfN { n } = node.gate else {
-            return Err(store_error(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "graph node {} declares evidence slots without an all-of-n gate",
-                    node.name.label()
-                ),
-                false,
-            ));
-        };
-        let slot_count = u32::try_from(node.verify_slots.len()).map_err(|_| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                "graph evidence slot count does not fit u32",
-                false,
-            )
-        })?;
-        if n != slot_count {
-            return Err(store_error(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "graph node {} declares {slot_count} slots but its all-of-n gate requires {n}",
-                    node.name.label()
-                ),
-                false,
-            ));
-        }
-        let mut ids = HashSet::new();
+fn validate_pinned_graph_template(
+    template: &haider_protocol::graph::GraphTemplateSpec,
+) -> StoreResult<()> {
+    if let Err(error) = validate_graph_template(template) {
+        let mut typed = store_error(ErrorCode::InvalidArgument, error.message, false);
+        typed.details = Some(serde_json::json!({
+            "kind": "malformed_graph_template",
+            "rejection": error.kind,
+        }));
+        return Err(typed);
+    }
+    for node in &template.nodes {
         for slot in &node.verify_slots {
-            if slot.id.trim().is_empty() || !ids.insert(slot.id.as_str()) {
-                return Err(store_error(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "graph node {} has an empty or duplicate evidence slot id",
-                        node.name.label()
-                    ),
-                    false,
-                ));
-            }
             if slot.authority == EvidenceAuthority::DaemonVerified
                 && slot.subject_selector == SubjectSelector::Freeform
             {
-                return Err(store_error(
+                let mut typed = store_error(
                     ErrorCode::InvalidArgument,
                     format!(
                         "daemon-verified evidence slot `{}` cannot use a freeform subject",
                         slot.id
                     ),
                     false,
-                ));
+                );
+                typed.details = Some(serde_json::json!({
+                    "kind": "malformed_graph_template",
+                    "rejection": GraphTemplateRejection::InvalidGate,
+                }));
+                return Err(typed);
             }
         }
     }
@@ -5752,7 +6089,7 @@ fn validate_graph_evidence_authority(
                 transaction,
                 session_id,
                 graph_id,
-                command.node,
+                command.node.clone(),
                 attempt,
                 slot,
                 &loaded,
@@ -6094,21 +6431,35 @@ fn validate_process_signal_provenance(
     Ok(())
 }
 
-fn graph_confirm_menu(graph_id: &GraphId, attempt: u32) -> Menu {
+fn graph_confirm_menu(status: &GraphStatus, node: &GraphNodeName, attempt: u32) -> Menu {
+    let legacy_ship_loop_id =
+        status.template == haider_protocol::graph::SHIP_LOOP_TEMPLATE && node.as_str() == "SHIP";
+    let id = if legacy_ship_loop_id {
+        format!("graph-confirm-{}-{attempt}", status.graph_id)
+    } else {
+        format!(
+            "graph-confirm-{}-{}-{attempt}",
+            status.graph_id,
+            node.as_str()
+        )
+    };
     Menu {
-        id: MenuId::new(format!("graph-confirm-{graph_id}-{attempt}")),
+        id: MenuId::new(id),
         kind: MenuKind::GraphHumanConfirm {
-            graph_id: graph_id.clone(),
-            node: GraphNodeName::Ship,
+            graph_id: status.graph_id.clone(),
+            node: node.clone(),
             attempt,
         },
-        title: "Ship this graph?".into(),
-        body: vec!["BUILD and VERIFY are green for the current attempt epoch.".into()],
+        title: format!("Confirm {}?", node.label()),
+        body: vec![format!(
+            "All dependencies for {} are green in attempt {attempt}.",
+            node.label()
+        )],
         options: vec![
             haider_protocol::menu::MenuOption {
                 key: "confirm".into(),
-                label: "Confirm ship".into(),
-                detail: Some("Satisfy SHIP and complete the graph.".into()),
+                label: "Confirm".into(),
+                detail: Some(format!("Satisfy the {} gate.", node.label())),
                 decision: None,
             },
             haider_protocol::menu::MenuOption {
@@ -6693,7 +7044,7 @@ fn resolve_menu_transaction(
     } = &menu.kind
     {
         let reduction = load_graph_reduction(transaction, &command.session_id)?;
-        let status = reduction.status.ok_or_else(|| {
+        let status = reduction.status.clone().ok_or_else(|| {
             store_error(
                 ErrorCode::GraphNotActive,
                 "graph confirmation has no graph instance",
@@ -6702,9 +7053,13 @@ fn resolve_menu_transaction(
         })?;
         if status.graph_id != *graph_id
             || status.phase != GraphPhase::Active
-            || status.current_node != Some(*node)
+            || !status.node_is_ready(node)
             || status.attempt != *attempt
-            || status.pending_menu.as_ref() != Some(&menu.id)
+            || !graph_pending_menus(&status).iter().any(|id| id == &menu.id)
+            || !reduction
+                .template_nodes
+                .iter()
+                .any(|spec| &spec.name == node && matches!(spec.gate, GraphGateKind::HumanConfirm))
         {
             return Err(store_error(
                 ErrorCode::GraphWrongNode,
@@ -6717,21 +7072,32 @@ fn resolve_menu_transaction(
                 store_error(ErrorCode::InvalidArgument, "missing answer key", false)
             })?;
         let payloads = match key {
-            "confirm" => vec![
-                EventPayload::GraphGateSatisfied(GraphGateSatisfied {
+            "confirm" => {
+                let mut payloads = vec![EventPayload::GraphGateSatisfied(GraphGateSatisfied {
                     graph_id: graph_id.clone(),
-                    node: *node,
+                    node: node.clone(),
                     attempt: *attempt,
-                }),
-                EventPayload::GraphCompleted(GraphCompleted {
+                })];
+                payloads.extend(dependency_followups(&reduction, &status, node, *attempt)?);
+                payloads
+            }
+            "hold" => {
+                let mut payloads = vec![EventPayload::GraphBlocked(GraphBlocked {
                     graph_id: graph_id.clone(),
-                }),
-            ],
-            "hold" => vec![EventPayload::GraphBlocked(GraphBlocked {
-                graph_id: graph_id.clone(),
-                node: *node,
-                reason: GraphBlockReason::HumanHold,
-            })],
+                    node: node.clone(),
+                    reason: GraphBlockReason::HumanHold,
+                })];
+                payloads.extend(
+                    graph_pending_menus(&status)
+                        .into_iter()
+                        .filter(|pending| pending != &menu.id)
+                        .map(|menu| EventPayload::MenuClosed {
+                            menu,
+                            reason: MenuCloseReason::Dismissed,
+                        }),
+                );
+                payloads
+            }
             _ => {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
@@ -7267,23 +7633,6 @@ fn graph_reduction_event(payload: &serde_json::Value) -> bool {
         .is_some_and(|kind| {
             kind.starts_with("graph_") || kind == "evidence_recorded" || kind.starts_with("menu_")
         })
-}
-
-fn graph_pinned_event(payload: &serde_json::Value) -> bool {
-    matches!(
-        serde_json::from_value::<EventPayload>(payload.clone()),
-        Ok(EventPayload::GraphPinned(_))
-    )
-}
-
-fn retain_latest_graph(envelopes: &mut Vec<RawEnvelope>) {
-    if let Some(index) = envelopes
-        .iter()
-        .rposition(|envelope| graph_pinned_event(&envelope.payload))
-        && index > 0
-    {
-        envelopes.drain(..index);
-    }
 }
 
 fn validate_worker_run_transitions(

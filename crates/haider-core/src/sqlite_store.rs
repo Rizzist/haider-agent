@@ -16,12 +16,12 @@ use haider_store::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn, Cas,
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
     DelegationRecord, EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, HookTrustChange, HookTrustCommand,
-    MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome,
-    ProfileLease, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
-    SessionRenameOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome,
+    GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome,
+    HookTrustChange, HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome,
+    ProcessSignalCommand, ProcessSignalOutcome, ProfileLease, SessionCreateCommand,
+    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -182,6 +182,34 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.graph_status(&session_id))).await
     }
 
+    pub async fn graph_status_by_id(
+        &self,
+        session_id: &SessionId,
+        graph_id: &haider_protocol::ids::GraphId,
+    ) -> Result<Option<haider_protocol::graph::GraphStatus>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        let graph_id = graph_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.graph_status_by_id(&session_id, &graph_id))
+        })
+        .await
+    }
+
+    pub async fn graph_reduction_by_id(
+        &self,
+        session_id: &SessionId,
+        graph_id: &haider_protocol::ids::GraphId,
+    ) -> Result<Option<haider_protocol::graph::GraphReduction>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        let graph_id = graph_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.graph_reduction_by_id(&session_id, &graph_id))
+        })
+        .await
+    }
+
     pub async fn graph_pin_receipt(
         &self,
         command_id: String,
@@ -203,6 +231,29 @@ impl SqliteStoreHandle {
     ) -> Result<GraphPinOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.pin_graph(&command))).await
+    }
+
+    pub async fn graph_switch_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::SwitchedGraph>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.graph_switch_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn switch_graph(
+        &self,
+        command: GraphSwitchCommand,
+    ) -> Result<GraphSwitchOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.switch_graph(&command))).await
     }
 
     pub async fn graph_abandon_receipt(

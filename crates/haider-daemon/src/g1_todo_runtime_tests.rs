@@ -324,7 +324,7 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
         .expect("graph");
     assert_eq!(
         status.current_node,
-        Some(haider_protocol::graph::GraphNodeName::Verify)
+        Some(haider_protocol::graph::verify_node())
     );
     assert_eq!(status.attempt, 1);
     let requests = provider.requests();
@@ -349,7 +349,7 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
         matches!(
             payload,
             EventPayload::EvidenceRecorded(recorded)
-                if recorded.node == haider_protocol::graph::GraphNodeName::Build
+                if recorded.node == haider_protocol::graph::build_node()
                     && matches!(
                         &recorded.source,
                         haider_protocol::graph::GraphEvidenceSource::Model {
@@ -393,7 +393,8 @@ async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
             worker_generation: world.store.worker_generation(),
             run_id: RunId::new("prior-build-run"),
             call_id: "prior-build-call".into(),
-            node: haider_protocol::graph::GraphNodeName::Build,
+            graph_id: GraphId::new("graph-verify-nonblocking"),
+            node: haider_protocol::graph::build_node(),
             verdict: haider_protocol::graph::EvidenceVerdict::Green,
             detail: "build passed".into(),
             slot: None,

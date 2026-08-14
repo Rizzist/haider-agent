@@ -31,6 +31,19 @@ pub struct GraphAbandonResult {
     pub worker_generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphSwitchResult {
+    pub session_id: SessionId,
+    pub old_graph_id: GraphId,
+    pub new_graph_id: GraphId,
+    pub template: String,
+    pub digest: String,
+    pub superseded_seq: u64,
+    pub pinned_seq: u64,
+    pub opened_seq: u64,
+    pub worker_generation: u64,
+}
+
 /// A transport failure, daemon rejection, or mismatched response method.
 #[derive(Debug)]
 pub enum GraphClientError {
@@ -102,13 +115,30 @@ pub async fn graph_pin(
     session_id: SessionId,
     worker_generation: u64,
 ) -> Result<GraphPinResult, GraphClientError> {
+    graph_pin_template(
+        client,
+        command_id,
+        session_id,
+        worker_generation,
+        haider_protocol::graph::SHIP_LOOP_TEMPLATE.to_owned(),
+    )
+    .await
+}
+
+pub async fn graph_pin_template(
+    client: &RpcClient,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    template: String,
+) -> Result<GraphPinResult, GraphClientError> {
     match rpc_error(
         client
             .request(RequestBody::GraphPin {
                 command_id,
                 session_id,
                 worker_generation,
-                template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.to_owned(),
+                template,
             })
             .await?,
     )? {
@@ -131,6 +161,52 @@ pub async fn graph_pin(
         }),
         _ => Err(GraphClientError::Protocol(
             "graph.pin response method mismatch",
+        )),
+    }
+}
+
+pub async fn graph_switch(
+    client: &RpcClient,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    old_graph_id: GraphId,
+    template: String,
+) -> Result<GraphSwitchResult, GraphClientError> {
+    match rpc_error(
+        client
+            .request(RequestBody::GraphSwitch {
+                command_id,
+                session_id,
+                worker_generation,
+                old_graph_id,
+                template,
+            })
+            .await?,
+    )? {
+        ResponseBody::GraphSwitch {
+            session_id,
+            old_graph_id,
+            new_graph_id,
+            template,
+            digest,
+            superseded_seq,
+            pinned_seq,
+            opened_seq,
+            worker_generation,
+        } => Ok(GraphSwitchResult {
+            session_id,
+            old_graph_id,
+            new_graph_id,
+            template,
+            digest,
+            superseded_seq,
+            pinned_seq,
+            opened_seq,
+            worker_generation,
+        }),
+        _ => Err(GraphClientError::Protocol(
+            "graph.switch response method mismatch",
         )),
     }
 }

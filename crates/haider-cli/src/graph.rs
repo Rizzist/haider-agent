@@ -93,8 +93,12 @@ pub(crate) async fn graph_command(rest: &[String]) -> ExitCode {
                         GraphPhase::Blocked => "blocked",
                         GraphPhase::Completed => "completed",
                         GraphPhase::Abandoned => "abandoned",
+                        GraphPhase::Superseded => "superseded",
                     };
-                    let node = status.current_node.map_or("-", GraphNodeName::label);
+                    let node = status
+                        .current_node
+                        .as_ref()
+                        .map_or("-", GraphNodeName::label);
                     println!(
                         "{} {} node={} attempt={}/{}",
                         status.graph_id,

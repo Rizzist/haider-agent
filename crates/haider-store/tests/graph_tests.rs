@@ -7,16 +7,19 @@ use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPh
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::graph::{
-    EvidenceAuthority, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphNodeName,
-    GraphPhase, GraphPinned, ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE,
-    SubjectSelector, evidence_fingerprint, process_signal_subject_digest, ship_loop_nodes,
+    EvidenceAuthority, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphGateKind,
+    GraphNodeName, GraphPhase, GraphPinned, ProcessSignalRecorded, ProcessSignalRef,
+    SHIP_LOOP_TEMPLATE, STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector,
+    evidence_fingerprint, graph_template, graph_template_catalog, process_signal_subject_digest,
+    ship_loop_nodes,
 };
 use haider_protocol::ids::{DeviceId, EffectId, EventId, GraphId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_store::{
     EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, MenuResolutionCommand,
-    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, SessionCreateCommand, Store,
+    GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome,
+    MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome,
+    SessionCreateCommand, Store,
 };
 
 fn create_session(store: &Store, name: &str) -> SessionId {
@@ -82,6 +85,11 @@ fn evidence_command(
         worker_generation: store.worker_generation(),
         run_id: RunId::new(format!("run-{serial}")),
         call_id: format!("call-{serial}"),
+        graph_id: store
+            .graph_status(session_id)
+            .expect("graph status")
+            .expect("active graph")
+            .graph_id,
         node,
         verdict,
         detail: detail.into(),
@@ -248,8 +256,8 @@ fn record(
     verdict: EvidenceVerdict,
     detail: &str,
 ) -> GraphEvidenceOutcome {
-    let mut command = evidence_command(store, session_id, serial, node, verdict, detail);
-    if node == GraphNodeName::Verify {
+    let mut command = evidence_command(store, session_id, serial, node.clone(), verdict, detail);
+    if node == haider_protocol::graph::verify_node() {
         attach_verify_signal(store, session_id, serial, verdict, detail, &mut command);
     }
     store
@@ -269,7 +277,7 @@ fn record_verify_slot(
         store,
         session_id,
         serial,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         verdict,
         detail,
     );
@@ -285,7 +293,7 @@ fn advance_to_verify(store: &Store, session_id: &SessionId, serial: usize) {
         store,
         session_id,
         serial,
-        GraphNodeName::Build,
+        haider_protocol::graph::build_node(),
         EvidenceVerdict::Green,
         "build command passed",
     );
@@ -293,7 +301,10 @@ fn advance_to_verify(store: &Store, session_id: &SessionId, serial: usize) {
         .graph_status(session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
 }
 
 fn exhaust_verify_epoch(store: &Store, session_id: &SessionId, serial: &mut usize, epoch: u32) {
@@ -302,7 +313,7 @@ fn exhaust_verify_epoch(store: &Store, session_id: &SessionId, serial: &mut usiz
             store,
             session_id,
             *serial,
-            GraphNodeName::Verify,
+            haider_protocol::graph::verify_node(),
             EvidenceVerdict::Red,
             &format!("verify failure epoch {epoch} round {round}"),
         );
@@ -396,7 +407,7 @@ fn evidence_validates_open_node_normalizes_detail_and_stamps_fingerprint() {
             &store,
             &session_id,
             1,
-            GraphNodeName::Verify,
+            haider_protocol::graph::verify_node(),
             EvidenceVerdict::Green,
             "wrong node",
         ))
@@ -410,7 +421,7 @@ fn evidence_validates_open_node_normalizes_detail_and_stamps_fingerprint() {
         &store,
         &session_id,
         2,
-        GraphNodeName::Build,
+        haider_protocol::graph::build_node(),
         EvidenceVerdict::Red,
         "  cargo   test\n failed  ",
     )
@@ -441,7 +452,7 @@ fn command_green_advances_build_without_any_model_selected_successor() {
         &store,
         &session_id,
         1,
-        GraphNodeName::Build,
+        haider_protocol::graph::build_node(),
         EvidenceVerdict::Green,
         "cargo build passed",
     ) else {
@@ -459,7 +470,10 @@ fn command_green_advances_build_without_any_model_selected_successor() {
         .graph_status(&session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
     assert_eq!(status.attempt, 1);
 }
 
@@ -474,7 +488,7 @@ fn all_of_three_requires_each_declared_slot_green() {
         &store,
         &session_id,
         2,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "test a green",
     );
@@ -482,7 +496,7 @@ fn all_of_three_requires_each_declared_slot_green() {
         &store,
         &session_id,
         3,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "test b green",
     );
@@ -490,7 +504,7 @@ fn all_of_three_requires_each_declared_slot_green() {
         &store,
         &session_id,
         4,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Red,
         "test c red",
     );
@@ -499,7 +513,7 @@ fn all_of_three_requires_each_declared_slot_green() {
             &store,
             &session_id,
             serial,
-            GraphNodeName::Verify,
+            haider_protocol::graph::verify_node(),
             EvidenceVerdict::Green,
             "retest green",
         );
@@ -508,11 +522,14 @@ fn all_of_three_requires_each_declared_slot_green() {
         .graph_status(&session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(open.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        open.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
     let verify = open
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify");
     assert_eq!(verify.evidence.green, 4);
     assert_eq!(verify.evidence.red, 1);
@@ -522,7 +539,7 @@ fn all_of_three_requires_each_declared_slot_green() {
         &store,
         &session_id,
         7,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "third retest green",
     );
@@ -530,7 +547,7 @@ fn all_of_three_requires_each_declared_slot_green() {
         .graph_status(&session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(ship.current_node, Some(GraphNodeName::Ship));
+    assert_eq!(ship.current_node, Some(haider_protocol::graph::ship_node()));
     assert!(ship.pending_menu.is_some());
 }
 
@@ -557,11 +574,14 @@ fn duplicate_green_attestations_never_fill_distinct_slots() {
         .graph_status(&session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
     let verify = status
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify");
     assert_eq!(verify.evidence.green, 3, "raw audit count remains visible");
     assert_eq!(verify.evidence.effective_green, 1, "one distinct frontier");
@@ -588,7 +608,7 @@ fn duplicate_green_attestations_never_fill_distinct_slots() {
             .expect("status")
             .expect("graph")
             .current_node,
-        Some(GraphNodeName::Ship),
+        Some(haider_protocol::graph::ship_node()),
         "three distinct declared slots satisfy the gate"
     );
 }
@@ -626,7 +646,7 @@ fn resubmitting_a_slot_replaces_its_verdict_both_directions() {
     let verify = red
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify");
     assert_eq!(verify.evidence.effective_green, 0);
     assert_eq!(verify.evidence.standing_red, 1);
@@ -654,7 +674,7 @@ fn resubmitting_a_slot_replaces_its_verdict_both_directions() {
     let verify = green
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify");
     assert_eq!(verify.evidence.effective_green, 1);
     assert_eq!(verify.evidence.standing_red, 0);
@@ -681,7 +701,7 @@ fn non_zero_process_exit_claimed_green_is_typed_rejection() {
         &store,
         &session_id,
         2,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "claim tests passed",
     );
@@ -738,7 +758,7 @@ fn stale_process_subject_is_typed_rejection() {
         &store,
         &session_id,
         2,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "tests passed",
     );
@@ -772,7 +792,7 @@ fn slot_authority_and_signal_provenance_fail_through_typed_errors() {
         &store,
         &session_id,
         2,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "model says green",
     );
@@ -797,7 +817,7 @@ fn slot_authority_and_signal_provenance_fail_through_typed_errors() {
         &store,
         &session_id,
         3,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "lint passed",
     );
@@ -859,7 +879,7 @@ fn slot_authority_and_signal_provenance_fail_through_typed_errors() {
         &store,
         &session_id,
         30,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "tests passed",
     );
@@ -902,7 +922,7 @@ fn slot_authority_and_signal_provenance_fail_through_typed_errors() {
         &store,
         &session_id,
         31,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "same command relabeled as lint",
     );
@@ -932,7 +952,7 @@ fn model_attested_slots_remain_explicit_testimony_in_status() {
     let mut nodes = ship_loop_nodes();
     let verify = nodes
         .iter_mut()
-        .find(|node| node.name == GraphNodeName::Verify)
+        .find(|node| node.name == haider_protocol::graph::verify_node())
         .expect("verify spec");
     for slot in &mut verify.verify_slots {
         slot.authority = EvidenceAuthority::ModelAttested;
@@ -949,6 +969,8 @@ fn model_attested_slots_remain_explicit_testimony_in_status() {
                 graph_id: graph_id.clone(),
                 template: "model-attested-test".into(),
                 digest: "model-attested-digest".into(),
+                template_version: 0,
+                start_node: None,
                 nodes,
             }),
         ),
@@ -959,7 +981,7 @@ fn model_attested_slots_remain_explicit_testimony_in_status() {
             "model-attested-open",
             EventPayload::GraphAttemptOpened(GraphAttemptOpened {
                 graph_id,
-                node: GraphNodeName::Verify,
+                node: haider_protocol::graph::verify_node(),
                 attempt: 1,
             }),
         ),
@@ -969,7 +991,7 @@ fn model_attested_slots_remain_explicit_testimony_in_status() {
         &store,
         &session_id,
         1,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "qualitative review passed",
     );
@@ -1004,7 +1026,7 @@ fn model_attested_slots_remain_explicit_testimony_in_status() {
     let slot = status
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify")
         .slot_statuses()
         .iter()
@@ -1041,6 +1063,8 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
                 graph_id: graph_id.clone(),
                 template: SHIP_LOOP_TEMPLATE.into(),
                 digest: "legacy-empty-slot-digest".into(),
+                template_version: 0,
+                start_node: None,
                 nodes,
             }),
         ),
@@ -1051,7 +1075,7 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
             "legacy-verify-opened",
             EventPayload::GraphAttemptOpened(GraphAttemptOpened {
                 graph_id,
-                node: GraphNodeName::Verify,
+                node: haider_protocol::graph::verify_node(),
                 attempt: 1,
             }),
         ),
@@ -1069,7 +1093,7 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
                 &store,
                 &session_id,
                 serial,
-                GraphNodeName::Verify,
+                haider_protocol::graph::verify_node(),
                 verdict,
                 "legacy testimony",
             ))
@@ -1082,10 +1106,13 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
     let verify = open
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify");
     assert_eq!(verify.evidence.effective_green, 2);
-    assert_eq!(open.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        open.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
     assert_eq!(
         serde_json::to_string(&open).expect("serialize legacy reduction"),
         r#"{"graph_id":"legacy-flat-graph","template":"ship-loop","digest":"legacy-empty-slot-digest","phase":"active","current_node":"VERIFY","attempt":1,"nodes":[{"node":"BUILD","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false},{"node":"VERIFY","attempts_opened":1,"current_attempt":1,"evidence":{"green":4,"red":1,"effective_green":2,"standing_red":0},"satisfied":false},{"node":"SHIP","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false}]}"#,
@@ -1096,7 +1123,7 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
             &store,
             &session_id,
             6,
-            GraphNodeName::Verify,
+            haider_protocol::graph::verify_node(),
             EvidenceVerdict::Green,
             "legacy testimony",
         ))
@@ -1107,7 +1134,7 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
             .expect("status")
             .expect("graph")
             .current_node,
-        Some(GraphNodeName::Ship)
+        Some(haider_protocol::graph::ship_node())
     );
 }
 
@@ -1138,8 +1165,8 @@ fn eighth_unsatisfied_epoch_blocks_rounds_exhausted_without_back_edge_facts() {
         matches!(
             serde_json::from_value::<EventPayload>(envelope.payload.clone()),
             Ok(EventPayload::GraphAdvanced(advanced))
-                if advanced.from_node == GraphNodeName::Verify
-                    && advanced.to_node == GraphNodeName::Build
+                if advanced.from_node == haider_protocol::graph::verify_node()
+                    && advanced.to_node == haider_protocol::graph::build_node()
         )
     });
     assert!(
@@ -1162,7 +1189,7 @@ fn repeated_red_fingerprint_in_the_next_epoch_blocks_no_progress() {
             &store,
             &session_id,
             serial,
-            GraphNodeName::Verify,
+            haider_protocol::graph::verify_node(),
             EvidenceVerdict::Red,
             &format!("other failure {serial}"),
         );
@@ -1171,7 +1198,7 @@ fn repeated_red_fingerprint_in_the_next_epoch_blocks_no_progress() {
         &store,
         &session_id,
         9,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Red,
         "same persistent failure",
     );
@@ -1180,7 +1207,7 @@ fn repeated_red_fingerprint_in_the_next_epoch_blocks_no_progress() {
         &store,
         &session_id,
         11,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Red,
         "  same   persistent\n failure ",
     );
@@ -1206,7 +1233,7 @@ fn no_progress_uses_the_previous_opening_of_the_same_node_when_epochs_skip_it() 
             &store,
             &session_id,
             serial,
-            GraphNodeName::Verify,
+            haider_protocol::graph::verify_node(),
             EvidenceVerdict::Red,
             &format!("verify epoch one failure {serial}"),
         );
@@ -1215,7 +1242,7 @@ fn no_progress_uses_the_previous_opening_of_the_same_node_when_epochs_skip_it() 
         &store,
         &session_id,
         9,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Red,
         "same verify failure",
     );
@@ -1227,7 +1254,7 @@ fn no_progress_uses_the_previous_opening_of_the_same_node_when_epochs_skip_it() 
             &store,
             &session_id,
             serial,
-            GraphNodeName::Build,
+            haider_protocol::graph::build_node(),
             EvidenceVerdict::Red,
             &format!("build epoch two failure {serial}"),
         );
@@ -1237,7 +1264,7 @@ fn no_progress_uses_the_previous_opening_of_the_same_node_when_epochs_skip_it() 
         &store,
         &session_id,
         19,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Red,
         " same   verify\n failure ",
     );
@@ -1289,11 +1316,14 @@ fn stale_verify_greens_from_an_older_build_epoch_never_satisfy() {
         .graph_status(&session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(reopened.current_node, Some(GraphNodeName::Build));
+    assert_eq!(
+        reopened.current_node,
+        Some(haider_protocol::graph::build_node())
+    );
     let stale_verify = reopened
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify");
     assert_eq!(stale_verify.evidence.green, 0);
     assert_eq!(stale_verify.evidence.red, 0);
@@ -1310,7 +1340,7 @@ fn stale_verify_greens_from_an_older_build_epoch_never_satisfy() {
         &store,
         &session_id,
         11,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "new green only",
     );
@@ -1319,11 +1349,14 @@ fn stale_verify_greens_from_an_older_build_epoch_never_satisfy() {
         .expect("status")
         .expect("graph");
     assert_eq!(status.attempt, 2);
-    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
     let verify = status
         .nodes
         .iter()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == haider_protocol::graph::verify_node())
         .expect("verify");
     assert_eq!(verify.evidence.green, 1);
     assert_eq!(verify.evidence.effective_green, 1);
@@ -1365,7 +1398,7 @@ fn replaying_the_same_signal_and_evidence_is_exactly_once() {
         &store,
         &session_id,
         2,
-        GraphNodeName::Verify,
+        haider_protocol::graph::verify_node(),
         EvidenceVerdict::Green,
         "tests passed",
     );
@@ -1426,7 +1459,7 @@ fn reach_ship(
             store,
             session_id,
             serial + offset,
-            GraphNodeName::Verify,
+            haider_protocol::graph::verify_node(),
             EvidenceVerdict::Green,
             &format!("verify shard {offset}"),
         );
@@ -1608,4 +1641,693 @@ fn abandoning_ship_closes_its_unanswered_confirmation_menu() {
         ))
         .expect_err("abandoned graph menu is durably closed");
     assert_eq!(error.code, ErrorCode::MenuNotFound);
+}
+
+fn pin_named_template(
+    store: &Store,
+    session_id: &SessionId,
+    suffix: &str,
+    template: &str,
+) -> GraphId {
+    let mut command = pin_command(store, session_id, suffix);
+    command.template = template.into();
+    command.request_json = format!(r#"{{"template":"{template}"}}"#);
+    let GraphPinOutcome::Committed { pinned, .. } =
+        store.pin_graph(&command).expect("catalog template pins")
+    else {
+        panic!("fresh catalog pin must commit");
+    };
+    pinned.graph_id
+}
+
+fn switch_command(
+    store: &Store,
+    session_id: &SessionId,
+    old_graph_id: GraphId,
+    new_graph_id: GraphId,
+    template: &str,
+    suffix: &str,
+) -> GraphSwitchCommand {
+    GraphSwitchCommand {
+        command_id: format!("switch-{suffix}"),
+        request_digest: format!("switch-digest-{suffix}"),
+        request_json: format!(r#"{{"template":"{template}","suffix":"{suffix}"}}"#),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        old_graph_id,
+        new_graph_id,
+        template: template.into(),
+        device_id: DeviceId::new("graph-test"),
+    }
+}
+
+#[test]
+fn m2b_non_linear_ready_set_is_declaration_ordered() {
+    // Mutation guard: iterating a HashMap or opening only one successor would
+    // change TESTS,REVIEW into a nondeterministic or incomplete ready set.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2b-ready-order");
+    pin_named_template(
+        &store,
+        &session_id,
+        "m2b-ready-order",
+        SUPER_SHIP_LOOP_TEMPLATE,
+    );
+    let GraphEvidenceOutcome::Committed { envelopes, .. } = record(
+        &store,
+        &session_id,
+        10_000,
+        GraphNodeName::new("START").expect("node"),
+        EvidenceVerdict::Green,
+        "start is green",
+    ) else {
+        panic!("fresh evidence commits");
+    };
+    let kinds = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+        })
+        .filter_map(|payload| match payload {
+            EventPayload::GraphNodeReadied(readied) => Some(readied.node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            GraphNodeName::new("TESTS").expect("node"),
+            GraphNodeName::new("REVIEW").expect("node"),
+        ]
+    );
+    let status = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(status.ready_nodes, kinds);
+}
+
+#[test]
+fn m2b_ship_loop_keeps_legacy_gate_and_advance_facts() {
+    // Mutation guard: suppressing GraphAdvanced, swapping either edge, or
+    // stamping a wrong graph/attempt breaks these exact legacy payloads.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2b-linear-equivalence");
+    let graph_id = pin(&store, &session_id, "m2b-linear-equivalence");
+    let GraphEvidenceOutcome::Committed { envelopes, .. } = record(
+        &store,
+        &session_id,
+        10_010,
+        haider_protocol::graph::build_node(),
+        EvidenceVerdict::Green,
+        "build green",
+    ) else {
+        panic!("fresh evidence commits");
+    };
+    let payloads = envelopes
+        .iter()
+        .map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads[1..],
+        [
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: graph_id.clone(),
+                node: haider_protocol::graph::build_node(),
+                attempt: 1,
+            }),
+            EventPayload::GraphAdvanced(haider_protocol::graph::GraphAdvanced {
+                graph_id: graph_id.clone(),
+                from_node: haider_protocol::graph::build_node(),
+                to_node: haider_protocol::graph::verify_node(),
+            }),
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: graph_id.clone(),
+                node: haider_protocol::graph::verify_node(),
+                attempt: 1,
+            }),
+        ]
+    );
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::GraphNodeReadied(_)))
+    );
+
+    record(
+        &store,
+        &session_id,
+        10_011,
+        haider_protocol::graph::verify_node(),
+        EvidenceVerdict::Green,
+        "tests green",
+    );
+    record(
+        &store,
+        &session_id,
+        10_012,
+        haider_protocol::graph::verify_node(),
+        EvidenceVerdict::Green,
+        "lint green",
+    );
+    let GraphEvidenceOutcome::Committed { envelopes, .. } = record(
+        &store,
+        &session_id,
+        10_013,
+        haider_protocol::graph::verify_node(),
+        EvidenceVerdict::Green,
+        "typecheck green",
+    ) else {
+        panic!("third VERIFY slot commits");
+    };
+    let payloads = envelopes
+        .iter()
+        .map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads[1..4],
+        [
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: graph_id.clone(),
+                node: haider_protocol::graph::verify_node(),
+                attempt: 1,
+            }),
+            EventPayload::GraphAdvanced(haider_protocol::graph::GraphAdvanced {
+                graph_id: graph_id.clone(),
+                from_node: haider_protocol::graph::verify_node(),
+                to_node: haider_protocol::graph::ship_node(),
+            }),
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: graph_id.clone(),
+                node: haider_protocol::graph::ship_node(),
+                attempt: 1,
+            }),
+        ]
+    );
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::GraphNodeReadied(_)))
+    );
+
+    let status = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let menu_id = status.pending_menu.expect("SHIP menu");
+    let request_seq = store
+        .journal_replay(&session_id)
+        .expect("history")
+        .into_iter()
+        .find_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload)
+                .ok()
+                .and_then(|payload| match payload {
+                    EventPayload::MenuOpened(menu) if menu.id == menu_id => Some(envelope.seq),
+                    _ => None,
+                })
+        })
+        .expect("menu opening sequence");
+    let MenuResolutionOutcome::Committed { follow_up, .. } = store
+        .resolve_menu(&answer_graph_menu(
+            &store,
+            &session_id,
+            &menu_id,
+            request_seq,
+            "m2b-linear-confirm",
+            0,
+            "confirm",
+        ))
+        .expect("confirm")
+    else {
+        panic!("fresh confirmation commits");
+    };
+    let payloads = follow_up
+        .iter()
+        .map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads,
+        vec![
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: graph_id.clone(),
+                node: haider_protocol::graph::ship_node(),
+                attempt: 1,
+            }),
+            EventPayload::GraphCompleted(haider_protocol::graph::GraphCompleted { graph_id }),
+        ]
+    );
+}
+
+#[test]
+fn m2b_retry_reopens_declared_start_and_clears_parallel_greens() {
+    // Mutation guard: resetting only the failing node would leave BACKEND
+    // falsely green in the next START epoch.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2b-general-retry");
+    pin_named_template(&store, &session_id, "m2b-general-retry", STAGGERED_TEMPLATE);
+    record(
+        &store,
+        &session_id,
+        10_020,
+        GraphNodeName::new("START").expect("node"),
+        EvidenceVerdict::Green,
+        "start green",
+    );
+    record(
+        &store,
+        &session_id,
+        10_021,
+        GraphNodeName::new("BACKEND").expect("node"),
+        EvidenceVerdict::Green,
+        "backend green",
+    );
+    for offset in 0..8 {
+        record(
+            &store,
+            &session_id,
+            10_030 + offset,
+            GraphNodeName::new("FRONTEND").expect("node"),
+            EvidenceVerdict::Red,
+            &format!("frontend red {offset}"),
+        );
+    }
+    let status = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(status.attempt, 2);
+    assert_eq!(
+        status.current_node,
+        Some(GraphNodeName::new("START").expect("node"))
+    );
+    assert!(status.nodes.iter().all(|node| !node.satisfied));
+}
+
+#[test]
+fn m2b_switch_is_one_batch_closes_menu_and_retains_both_roots() {
+    // Mutation guard: committing supersession, menu closure, pin, or START in
+    // separate transactions would produce non-contiguous facts or a half root.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2b-switch-atomic");
+    let old_graph_id = pin(&store, &session_id, "m2b-switch-old");
+    let (menu_id, _) = reach_ship(&store, &session_id, 10_100);
+    let new_graph_id = GraphId::new("graph-m2b-switch-new");
+    let command = switch_command(
+        &store,
+        &session_id,
+        old_graph_id.clone(),
+        new_graph_id.clone(),
+        STAGGERED_TEMPLATE,
+        "atomic",
+    );
+    let GraphSwitchOutcome::Committed {
+        switched,
+        envelopes,
+    } = store.switch_graph(&command).expect("switch commits")
+    else {
+        panic!("fresh switch commits");
+    };
+    assert_eq!(envelopes.len(), 4);
+    assert!(
+        envelopes
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+    assert!(
+        envelopes
+            .iter()
+            .all(|envelope| envelope.committed_at_ms == envelopes[0].committed_at_ms)
+    );
+    let payloads = envelopes
+        .iter()
+        .map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(payloads[0], EventPayload::GraphSuperseded(_)));
+    assert!(matches!(payloads[1], EventPayload::MenuClosed { ref menu, .. } if menu == &menu_id));
+    assert!(matches!(payloads[2], EventPayload::GraphPinned(_)));
+    assert!(matches!(payloads[3], EventPayload::GraphAttemptOpened(_)));
+    assert_eq!(switched.superseded_seq, envelopes[0].seq);
+    let active = store
+        .graph_status(&session_id)
+        .expect("active status")
+        .expect("active graph");
+    assert_eq!(active.graph_id, new_graph_id);
+    assert_eq!(
+        active.current_node,
+        Some(GraphNodeName::new("START").expect("node"))
+    );
+    let old = store
+        .graph_status_by_id(&session_id, &old_graph_id)
+        .expect("old status")
+        .expect("old graph retained");
+    assert_eq!(old.phase, GraphPhase::Superseded);
+    assert!(
+        !store
+            .graph_reduction_by_id(&session_id, &old_graph_id)
+            .expect("old reduction")
+            .expect("old graph retained")
+            .evidence
+            .is_empty()
+    );
+    assert!(
+        store
+            .graph_status_by_id(&session_id, &new_graph_id)
+            .expect("new status")
+            .is_some()
+    );
+    let head = store.latest_seq(&session_id).expect("head after switch");
+    let GraphSwitchOutcome::IdempotentReplay { switched: replayed } = store
+        .switch_graph(&command)
+        .expect("lost switch response replay")
+    else {
+        panic!("a committed switch must replay from its receipt");
+    };
+    assert_eq!(replayed, switched);
+    assert_eq!(
+        store.latest_seq(&session_id).expect("head after replay"),
+        head,
+        "mutation guard: replaying graph.switch must append no second batch"
+    );
+}
+
+#[test]
+fn m2b_late_superseded_evidence_is_typed() {
+    // Mutation guard: resolving evidence against latest-only state would
+    // silently stamp this old BUILD call onto the replacement graph.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2b-late-evidence");
+    let old_graph_id = pin(&store, &session_id, "m2b-late-old");
+    let late = evidence_command(
+        &store,
+        &session_id,
+        10_200,
+        haider_protocol::graph::build_node(),
+        EvidenceVerdict::Green,
+        "old build green",
+    );
+    store
+        .switch_graph(&switch_command(
+            &store,
+            &session_id,
+            old_graph_id,
+            GraphId::new("graph-m2b-late-new"),
+            SUPER_SHIP_LOOP_TEMPLATE,
+            "late",
+        ))
+        .expect("switch");
+    let error = store
+        .record_graph_evidence(&late)
+        .expect_err("old graph evidence rejects");
+    assert_eq!(error.code, ErrorCode::GraphNotActive);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("superseded")
+    );
+}
+
+#[test]
+fn m2b_switch_racing_evidence_has_only_total_ordered_outcomes() {
+    // Mutation guard: removing actor/store serialization permits evidence to
+    // land on the replacement or leaves active_root pointing at no pin.
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(Store::open(root.path()).expect("open store"));
+    let session_id = create_session(&store, "m2b-switch-race");
+    let old_graph_id = pin(&store, &session_id, "m2b-race-old");
+    let evidence = evidence_command(
+        &store,
+        &session_id,
+        10_300,
+        haider_protocol::graph::build_node(),
+        EvidenceVerdict::Green,
+        "racing old evidence",
+    );
+    let new_graph_id = GraphId::new("graph-m2b-race-new");
+    let switch = switch_command(
+        &store,
+        &session_id,
+        old_graph_id.clone(),
+        new_graph_id.clone(),
+        STAGGERED_TEMPLATE,
+        "race",
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let evidence_store = Arc::clone(&store);
+    let evidence_barrier = Arc::clone(&barrier);
+    let evidence_thread = thread::spawn(move || {
+        evidence_barrier.wait();
+        evidence_store.record_graph_evidence(&evidence)
+    });
+    let switch_store = Arc::clone(&store);
+    let switch_barrier = Arc::clone(&barrier);
+    let switch_thread = thread::spawn(move || {
+        switch_barrier.wait();
+        switch_store.switch_graph(&switch)
+    });
+    barrier.wait();
+    let evidence_result = evidence_thread.join().expect("evidence thread");
+    let switch_result = switch_thread
+        .join()
+        .expect("switch thread")
+        .expect("switch always commits");
+    assert!(matches!(
+        switch_result,
+        GraphSwitchOutcome::Committed { .. }
+    ));
+    match evidence_result {
+        Ok(GraphEvidenceOutcome::Committed { recorded, .. }) => {
+            assert_eq!(recorded.graph_id, old_graph_id);
+        }
+        Err(error) => {
+            assert_eq!(error.code, ErrorCode::GraphNotActive);
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("kind"))
+                    .and_then(serde_json::Value::as_str),
+                Some("superseded")
+            );
+        }
+        Ok(GraphEvidenceOutcome::IdempotentReplay { .. }) => {
+            panic!("fresh racing evidence cannot be a replay");
+        }
+    }
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("active")
+            .graph_id,
+        new_graph_id
+    );
+    assert_eq!(
+        store
+            .graph_status_by_id(&session_id, &old_graph_id)
+            .expect("old query")
+            .expect("old retained")
+            .phase,
+        GraphPhase::Superseded
+    );
+}
+
+fn record_catalog_green(
+    store: &Store,
+    session_id: &SessionId,
+    node: &GraphNodeName,
+    serial: &mut usize,
+) {
+    let status = store
+        .graph_status(session_id)
+        .expect("status")
+        .expect("graph");
+    let template = graph_template(&status.template).expect("catalog template");
+    let spec = template
+        .nodes
+        .iter()
+        .find(|spec| &spec.name == node)
+        .expect("node spec");
+    match &spec.gate {
+        GraphGateKind::CommandGreen => {
+            record(
+                store,
+                session_id,
+                *serial,
+                node.clone(),
+                EvidenceVerdict::Green,
+                "catalog command green",
+            );
+            *serial += 1;
+        }
+        GraphGateKind::AllOfN { .. } => {
+            for slot in &spec.verify_slots {
+                let mut command = evidence_command(
+                    store,
+                    session_id,
+                    *serial,
+                    node.clone(),
+                    EvidenceVerdict::Green,
+                    "catalog slot green",
+                );
+                command.slot = Some(slot.id.clone());
+                match slot.authority {
+                    EvidenceAuthority::DaemonVerified => {
+                        let (signal, signal_ref, subject_digest) = process_signal_command(
+                            store,
+                            session_id,
+                            *serial,
+                            0,
+                            &format!("catalog slot {}", slot.id),
+                        );
+                        store.record_process_signal(&signal).expect("signal");
+                        command.subject_digest = Some(subject_digest);
+                        command.signal = Some(signal_ref);
+                    }
+                    EvidenceAuthority::ModelAttested => {
+                        command.subject_digest = Some(format!("attested:{}:{}", node, slot.id));
+                    }
+                }
+                store
+                    .record_graph_evidence(&command)
+                    .expect("catalog slot evidence");
+                *serial += 1;
+            }
+        }
+        GraphGateKind::HumanConfirm => {
+            let menu_id = graph_pending_menu_for_node(store, session_id, node);
+            let request_seq = store
+                .journal_replay(session_id)
+                .expect("history")
+                .into_iter()
+                .find_map(|envelope| {
+                    serde_json::from_value::<EventPayload>(envelope.payload)
+                        .ok()
+                        .and_then(|payload| match payload {
+                            EventPayload::MenuOpened(menu) if menu.id == menu_id => {
+                                Some(envelope.seq)
+                            }
+                            _ => None,
+                        })
+                })
+                .expect("menu opening");
+            store
+                .resolve_menu(&answer_graph_menu(
+                    store,
+                    session_id,
+                    &menu_id,
+                    request_seq,
+                    &format!("catalog-confirm-{serial}"),
+                    0,
+                    "confirm",
+                ))
+                .expect("catalog human confirm");
+            *serial += 1;
+        }
+    }
+}
+
+fn graph_pending_menu_for_node(
+    store: &Store,
+    session_id: &SessionId,
+    node: &GraphNodeName,
+) -> haider_protocol::ids::MenuId {
+    let status = store
+        .graph_status(session_id)
+        .expect("status")
+        .expect("graph");
+    store
+        .journal_replay(session_id)
+        .expect("history")
+        .into_iter()
+        .rev()
+        .find_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload)
+                .ok()
+                .and_then(|payload| match payload {
+                    EventPayload::MenuOpened(menu)
+                        if status.pending_menus.iter().any(|id| id == &menu.id)
+                            && matches!(
+                                menu.kind,
+                                haider_protocol::menu::MenuKind::GraphHumanConfirm {
+                                    node: ref menu_node,
+                                    ..
+                                } if menu_node == node
+                            ) =>
+                    {
+                        Some(menu.id)
+                    }
+                    _ => None,
+                })
+        })
+        .expect("pending human menu")
+}
+
+#[test]
+fn m2b_all_catalog_templates_reach_completion_on_green_paths() {
+    // Mutation guard: hardcoded name traversal or incomplete catalog wiring
+    // leaves at least one validated template unable to finish.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    for (index, template) in graph_template_catalog().into_iter().enumerate() {
+        let session_id = create_session(&store, &format!("m2b-catalog-{index}"));
+        pin_named_template(
+            &store,
+            &session_id,
+            &format!("m2b-catalog-{index}"),
+            &template.name,
+        );
+        let mut serial = 20_000 + index * 1_000;
+        for _ in 0..64 {
+            let status = store
+                .graph_status(&session_id)
+                .expect("status")
+                .expect("graph");
+            if status.phase == GraphPhase::Completed {
+                break;
+            }
+            let ready = if status.ready_nodes.is_empty() {
+                status.current_node.into_iter().collect::<Vec<_>>()
+            } else {
+                status.ready_nodes
+            };
+            assert!(
+                !ready.is_empty(),
+                "{} has no ready obligation",
+                template.name
+            );
+            for node in ready {
+                record_catalog_green(&store, &session_id, &node, &mut serial);
+            }
+        }
+        assert_eq!(
+            store
+                .graph_status(&session_id)
+                .expect("status")
+                .expect("graph")
+                .phase,
+            GraphPhase::Completed,
+            "{} did not complete",
+            template.name
+        );
+    }
 }

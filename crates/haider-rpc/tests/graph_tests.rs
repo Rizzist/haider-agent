@@ -1,14 +1,16 @@
 #![allow(clippy::expect_used)]
 
-use haider_protocol::graph::{
-    GraphEvidenceTally, GraphNodeName, GraphNodeStatus, GraphPhase, GraphStatus,
-};
+use haider_protocol::graph::{GraphEvidenceTally, GraphNodeStatus, GraphPhase, GraphStatus};
 use haider_protocol::ids::{GraphId, MenuId, SessionId};
-use haider_rpc::{CommandId, FEATURE_CONVERGENCE_GRAPH_V1, RequestBody, ResponseBody};
+use haider_rpc::{
+    CommandId, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2, RequestBody,
+    ResponseBody,
+};
 
 #[test]
 fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V1, "convergence_graph_v1");
+    assert_eq!(FEATURE_CONVERGENCE_GRAPH_V2, "convergence_graph_v2");
     let session_id = SessionId::new("session-graph");
     let graph_id = GraphId::new("graph-1");
     let cases = vec![
@@ -26,6 +28,24 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                 "session_id": "session-graph",
                 "worker_generation": 7,
                 "template": "ship-loop"
+            }),
+        ),
+        (
+            serde_json::to_value(RequestBody::GraphSwitch {
+                command_id: CommandId::new("switch-command"),
+                session_id: session_id.clone(),
+                worker_generation: 7,
+                old_graph_id: graph_id.clone(),
+                template: "staggered".into(),
+            })
+            .expect("switch request"),
+            serde_json::json!({
+                "method": "graph.switch",
+                "command_id": "switch-command",
+                "session_id": "session-graph",
+                "worker_generation": 7,
+                "old_graph_id": "graph-1",
+                "template": "staggered"
             }),
         ),
         (
@@ -77,6 +97,32 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
             }),
         ),
         (
+            serde_json::to_value(ResponseBody::GraphSwitch {
+                session_id: session_id.clone(),
+                old_graph_id: graph_id.clone(),
+                new_graph_id: GraphId::new("graph-2"),
+                template: "staggered".into(),
+                digest: "blake3:replacement".into(),
+                superseded_seq: 20,
+                pinned_seq: 21,
+                opened_seq: 22,
+                worker_generation: 7,
+            })
+            .expect("switch response"),
+            serde_json::json!({
+                "method": "graph.switch",
+                "session_id": "session-graph",
+                "old_graph_id": "graph-1",
+                "new_graph_id": "graph-2",
+                "template": "staggered",
+                "digest": "blake3:replacement",
+                "superseded_seq": 20,
+                "pinned_seq": 21,
+                "opened_seq": 22,
+                "worker_generation": 7
+            }),
+        ),
+        (
             serde_json::to_value(ResponseBody::GraphAbandon {
                 session_id: session_id.clone(),
                 graph_id: graph_id.clone(),
@@ -98,11 +144,16 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                     graph_id,
                     template: "ship-loop".into(),
                     digest: "blake3:template".into(),
+                    template_version: 0,
+                    start_node: None,
                     phase: GraphPhase::Active,
-                    current_node: Some(GraphNodeName::Verify),
+                    current_node: Some(haider_protocol::graph::verify_node()),
+                    ready_nodes: Vec::new(),
                     attempt: 2,
                     nodes: vec![GraphNodeStatus {
-                        node: GraphNodeName::Verify,
+                        node: haider_protocol::graph::verify_node(),
+                        gate: None,
+                        executor: None,
                         attempts_opened: 2,
                         current_attempt: Some(2),
                         evidence: GraphEvidenceTally {
@@ -116,6 +167,7 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                     }],
                     blocked_reason: None,
                     pending_menu: Some(MenuId::new("ship-confirm-2")),
+                    pending_menus: Vec::new(),
                 }),
             })
             .expect("status response"),
@@ -156,12 +208,16 @@ fn graph_status_terminal_variants_have_stable_typed_shapes() {
         graph_id: GraphId::new("graph-terminal"),
         template: "ship-loop".into(),
         digest: "template-digest".into(),
+        template_version: 0,
+        start_node: None,
         phase,
-        current_node: Some(GraphNodeName::Verify),
+        current_node: Some(haider_protocol::graph::verify_node()),
+        ready_nodes: Vec::new(),
         attempt: 8,
         nodes: Vec::new(),
         blocked_reason,
         pending_menu: None,
+        pending_menus: Vec::new(),
     };
     let blocked = serde_json::to_value(ResponseBody::GraphStatus {
         status: Some(base(

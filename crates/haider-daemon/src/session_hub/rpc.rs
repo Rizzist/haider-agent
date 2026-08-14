@@ -1739,6 +1739,32 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::GraphSwitch {
+                command_id,
+                session_id,
+                worker_generation,
+                old_graph_id,
+                template,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.graph_switch(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    old_graph_id,
+                    template,
+                )
+                .await
+            }
             RequestBody::GraphAbandon {
                 command_id,
                 session_id,
@@ -3828,6 +3854,99 @@ impl HubConnection {
                 pinned_seq: pinned.pinned_seq,
                 opened_seq: pinned.opened_seq,
                 worker_generation: pinned.worker_generation,
+            },
+        })
+    }
+
+    async fn graph_switch(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        old_graph_id: GraphId,
+        template: String,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "graph switch needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "old_graph_id": &old_graph_id,
+            "template": &template,
+        }))
+        .map_err(|error| SessionHubError::Task(format!("cannot encode graph switch: {error}")))?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .graph_switch_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(switched)) => return self.respond_graph_switched(request_id, switched),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "graph switch requires a control attachment to this session",
+                false,
+                None,
+            );
+        }
+        let command = GraphSwitchCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            old_graph_id,
+            new_graph_id: GraphId::new(random_id("graph")?),
+            template,
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let switched = match self.hub.switch_graph(command).await {
+            Ok(GraphSwitchOutcome::Committed { switched, .. })
+            | Ok(GraphSwitchOutcome::IdempotentReplay { switched }) => switched,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_graph_switched(request_id, switched)
+    }
+
+    fn respond_graph_switched(
+        &self,
+        request_id: RequestId,
+        switched: SwitchedGraph,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::GraphSwitch {
+                session_id: switched.session_id,
+                old_graph_id: switched.old_graph_id,
+                new_graph_id: switched.new_graph_id,
+                template: switched.template,
+                digest: switched.digest,
+                superseded_seq: switched.superseded_seq,
+                pinned_seq: switched.pinned_seq,
+                opened_seq: switched.opened_seq,
+                worker_generation: switched.worker_generation,
             },
         })
     }

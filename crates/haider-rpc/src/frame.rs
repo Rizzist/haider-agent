@@ -294,6 +294,9 @@ pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
 pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 /// Daemon implements Convergence Graph M1 pin/evidence/status/abandon.
 pub const FEATURE_CONVERGENCE_GRAPH_V1: &str = "convergence_graph_v1";
+/// Daemon implements M2b general templates, dependency-ready sets, retained
+/// graph instances, and receipted atomic `graph.switch`.
+pub const FEATURE_CONVERGENCE_GRAPH_V2: &str = "convergence_graph_v2";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1176,6 +1179,14 @@ pub enum RequestBody {
         worker_generation: u64,
         template: String,
     },
+    #[serde(rename = "graph.switch")]
+    GraphSwitch {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        old_graph_id: GraphId,
+        template: String,
+    },
     #[serde(rename = "graph.abandon")]
     GraphAbandon {
         command_id: CommandId,
@@ -1608,6 +1619,18 @@ pub enum ResponseBody {
         graph_id: GraphId,
         template: String,
         digest: String,
+        pinned_seq: u64,
+        opened_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "graph.switch")]
+    GraphSwitch {
+        session_id: SessionId,
+        old_graph_id: GraphId,
+        new_graph_id: GraphId,
+        template: String,
+        digest: String,
+        superseded_seq: u64,
         pinned_seq: u64,
         opened_seq: u64,
         worker_generation: u64,

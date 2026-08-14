@@ -8,7 +8,7 @@ use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectOutcome, EffectPhase,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::graph::{EvidenceVerdict, GraphNodeName, GraphPhase, SHIP_LOOP_TEMPLATE};
+use haider_protocol::graph::{EvidenceVerdict, GraphPhase, SHIP_LOOP_TEMPLATE};
 use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, MenuOption, MenuScope};
@@ -89,7 +89,8 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
         worker_generation: generation,
         run_id: RunId::new("build-evidence-run"),
         call_id: "build-evidence-call".into(),
-        node: GraphNodeName::Build,
+        graph_id: GraphId::new("graph-node-scoped"),
+        node: haider_protocol::graph::build_node(),
         verdict: EvidenceVerdict::Green,
         detail: "build passed".into(),
         slot: None,
@@ -105,7 +106,10 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
         .expect("graph status")
         .expect("graph");
     assert_eq!(status.phase, GraphPhase::Active);
-    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
     assert_eq!(status.nodes[1].evidence.green, 0);
 
     let accepted = hub
@@ -142,7 +146,10 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
         .await
         .expect("graph status")
         .expect("graph");
-    assert_eq!(status.current_node, Some(GraphNodeName::Verify));
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::verify_node())
+    );
     assert_eq!(status.phase, GraphPhase::Active);
 
     hub.shutdown().await.expect("hub shutdown");
@@ -1084,6 +1091,8 @@ async fn worker_head_cas_tolerates_a_graph_fact_delta() {
             graph_id: GraphId::new("graph-cas-instance"),
             template: SHIP_LOOP_TEMPLATE.into(),
             digest: haider_protocol::graph::ship_loop_digest(),
+            template_version: 0,
+            start_node: None,
             nodes: haider_protocol::graph::ship_loop_nodes(),
         },
     ))

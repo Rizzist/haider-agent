@@ -5804,7 +5804,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             )
         })?;
         if route == RegisteredToolRoute::GraphEvidence {
-            let request = match GraphEvidence::from_tool_args(args) {
+            let mut request = match GraphEvidence::from_tool_args(args) {
                 Ok(request) => request,
                 Err(error) => {
                     return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
@@ -5814,6 +5814,27 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )));
                 }
             };
+            if request.graph_id.is_none() {
+                let status = match self.output.store.hub().graph_status(&self.session_id).await {
+                    Ok(Some(status)) => status,
+                    Ok(None) => {
+                        return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
+                            ErrorCode::GraphNotActive,
+                            "session has no Convergence Graph",
+                            None,
+                        )));
+                    }
+                    Err(SessionHubError::Store(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::Internal,
+                            error.to_string(),
+                            false,
+                        ));
+                    }
+                };
+                request.graph_id = Some(status.graph_id);
+            }
             let request_json = serde_json::to_string(&request).map_err(|error| {
                 HaiderError::new(
                     ErrorCode::Internal,
@@ -5835,6 +5856,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 worker_generation: self.output.store.worker_generation(),
                 run_id: run_id.clone(),
                 call_id: call_id.to_owned(),
+                graph_id: request
+                    .graph_id
+                    .clone()
+                    .expect("graph evidence target is resolved above"),
                 node: request.node,
                 verdict: request.verdict,
                 detail: request.detail,
