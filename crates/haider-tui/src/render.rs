@@ -465,6 +465,54 @@ fn chip_two_tone<'a>(
     ]
 }
 
+/// The voice/dictation chip, moved from the status bar to the header's
+/// TOP-RIGHT (owner request): `[ ◉ voice · <route> ]` while voice is on, `None`
+/// otherwise. This is the PERSISTENT route indicator — the live `listening…`
+/// state stays on the composer's talk chip and its wave, so this chip never
+/// collides with the wave-row heuristics. Rendered right-aligned over the
+/// header's top row on both the launcher and session.
+fn voice_header_chip<'a>(model: &AppModel, theme: &Theme) -> Option<Vec<Span<'a>>> {
+    if !model.voice.enabled {
+        return None;
+    }
+    Some(chip_two_tone(
+        format!("◉ voice · {}", model.voice.bar_label()),
+        theme.frame_style(),
+        theme.gold_style(),
+    ))
+}
+
+/// Paint the voice chip at the RIGHT end of the header's top row — over a
+/// rect exactly the chip's width, so the left-aligned product line on the
+/// same row is never cleared. `left_used` is the display width the product
+/// line already occupies; the chip is dropped (narrow terminal) when it would
+/// overlap that content, and hidden entirely when voice is off.
+fn render_header_voice_chip(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    header_area: Rect,
+    left_used: u16,
+) {
+    if header_area.height == 0 {
+        return;
+    }
+    if let Some(spans) = voice_header_chip(model, theme) {
+        let chip_w = u16::try_from(Line::from(spans.clone()).width()).unwrap_or(0);
+        if chip_w > 0 && left_used.saturating_add(2).saturating_add(chip_w) <= header_area.width {
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: header_area.x + header_area.width - chip_w,
+                    y: header_area.y,
+                    width: chip_w,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
 /// Pad a span row to a fixed display width — the launcher's `.recent`
 /// column trick: uniform-width lines center to one shared left edge, and
 /// hover bands span the whole column.
@@ -887,6 +935,7 @@ fn render_launcher(
     let band_cap = area.width as usize;
     let header_top = ellipsize_spans(header_top, band_cap, theme);
     let header_bottom = ellipsize_spans(header_bottom, band_cap, theme);
+    let header_top_used = u16::try_from(Line::from(header_top.clone()).width()).unwrap_or(0);
     // Shed chrome renders nothing: a 1-row header keeps only the product
     // line (the area clips line 2), a 0-row header/rule disappears whole.
     frame.render_widget(
@@ -897,6 +946,9 @@ fn render_launcher(
         .style(theme.text_style()),
         header_area,
     );
+    // The voice/dictation chip in the TOP-RIGHT of the launcher header (owner:
+    // moved off the status bar).
+    render_header_voice_chip(model, theme, frame, header_area, header_top_used);
     // Replace the half-block header mark with the crisp حيدر image on a
     // graphics terminal — same 24×2 footprint at the band's lead cell.
     if header_art && header_area.height >= crate::mark::HEADER_ROWS {
@@ -3364,6 +3416,7 @@ fn render_session(
     ]);
     // Shed chrome renders nothing: a 1-row header keeps only the product
     // line (the area clips line 2), a 0-row header/rule disappears whole.
+    let header_top_used = u16::try_from(Line::from(header_top.clone()).width()).unwrap_or(0);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from(header_top),
@@ -3372,6 +3425,9 @@ fn render_session(
         .style(theme.text_style()),
         header_area,
     );
+    // The voice/dictation chip in the TOP-RIGHT of the header (owner: moved off
+    // the status bar), opposite the left-aligned wordmark/product line.
+    render_header_voice_chip(model, theme, frame, header_area, header_top_used);
     // Replace the half-block header mark with the crisp حيدر image on a graphics
     // terminal — same 24×2 footprint, at the fixed slot after the back chip and
     // its two-space gap. No-op (half-block art stays) when header_fits chose the
@@ -7858,22 +7914,8 @@ fn render_status_bar(
             theme.text_style(),
         ));
     }
-    // Sim `.voice` (tui.js:5511-5520): FRAME border, gold label —
-    // `◉ listening…` during a talk hold, the pipeline label otherwise
-    // (tui.js:2846-2850); hidden entirely while voice is off.
-    if model.listening {
-        left.extend(chip_two_tone(
-            "◉ listening…".to_owned(),
-            theme.frame_style(),
-            theme.gold_style(),
-        ));
-    } else if model.voice.enabled {
-        left.extend(chip_two_tone(
-            format!("◉ voice · {}", model.voice.bar_label()),
-            theme.frame_style(),
-            theme.gold_style(),
-        ));
-    }
+    // The voice/dictation chip moved to the TOP-RIGHT header (see
+    // `voice_header_pill`), so the status bar no longer carries it.
     // H4: the decision-hook chip — visible exactly while the CURRENT run's
     // permission was answered by a decision hook (journaled fact → chip;
     // a proposal the menu CAS did not apply never lights it). Session

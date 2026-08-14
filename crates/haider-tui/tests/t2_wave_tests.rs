@@ -212,8 +212,10 @@ fn wave_renders_on_the_composer_band_next_to_the_chip() {
         });
     }
     let screen = draw(&model, 100, 14);
-    // The status bar shows `◉ listening…` too — the BAND row is the one
-    // carrying wave glyphs beside the chip.
+    // The header wears the persistent `◉ voice · <route>` chip (never
+    // `◉ listening…`), and the wordmark mark-art uses block glyphs — so the
+    // one row carrying BOTH the talk chip text and wave glyphs is the
+    // composer band itself.
     let band_row = screen
         .lines()
         .filter(|line| line.contains("◉ listening…"))
@@ -261,7 +263,12 @@ fn wave_yields_before_the_chip_on_a_narrow_band() {
             level: 1.0,
         });
     }
-    let screen = draw(&model, 38, 12);
+    // Wide enough that the talk chip fits ALONE (needs >53 cols), narrow
+    // enough that the wave + chip together do not (needs >76): the composer
+    // band keeps its chip while the wave yields. (`◉ listening…` now lives
+    // ONLY on the composer talk chip — the header carries `◉ voice`, the
+    // status bar carries neither — so the found row is unambiguously the band.)
+    let screen = draw(&model, 64, 12);
     let band_row = screen
         .lines()
         .find(|line| line.contains("◉ listening…"))
