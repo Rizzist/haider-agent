@@ -71,6 +71,19 @@ impl ThroughputReadout {
         }
         line
     }
+
+    /// Compact form for the composer identity line — no verbose label, just
+    /// the sparkline, rate, and mean (p95 is dropped; the line is shared with
+    /// the model identity). The `tps` token anchors it for parity greps.
+    #[must_use]
+    pub fn pill_text(&self) -> String {
+        let tilde = if self.approx { "~" } else { "" };
+        let mut line = format!("{} {tilde}{} tps", self.spark, self.tps);
+        if let Some(mean) = self.mean {
+            line.push_str(&format!(" · μ{mean}"));
+        }
+        line
+    }
 }
 
 /// The per-turn sampler. Fed cumulative output-token counts on the frame clock;

@@ -511,30 +511,6 @@ fn thinking_line(theme: &Theme, phase: u8, truecolor: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// W-G: the live token-throughput row shown above the composer while a turn
-/// streams — `Throughput ▁▂▃▄▅ 126 tps · μ 119 · p95 154`. The label, sparkline
-/// and current rate wear the gold accent; μ/p95 are dim, and the `~` (present
-/// on `readout.approx`) rides the rate so an estimated figure never reads as a
-/// measured one. Built from the pure [`crate::throughput::ThroughputReadout`],
-/// the same data the plain renderer prints — WG6 parity by construction.
-fn throughput_line(theme: &Theme, readout: &crate::throughput::ThroughputReadout) -> Line<'static> {
-    let tilde = if readout.approx { "~" } else { "" };
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled("Throughput ", theme.dim_style()),
-        Span::styled(readout.spark.clone(), theme.gold_style()),
-        Span::raw(" "),
-        Span::styled(format!("{tilde}{} tps", readout.tps), theme.gold_style()),
-    ];
-    if let Some(mean) = readout.mean {
-        spans.push(Span::styled(format!(" · μ {mean}"), theme.dim_style()));
-    }
-    if let Some(p95) = readout.p95 {
-        spans.push(Span::styled(format!(" · p95 {p95}"), theme.dim_style()));
-    }
-    Line::from(spans)
-}
-
 /// M4: the transcript-tail retry line, the warn/ember-toned neighbor of
 /// `thinking_line`. `✻ API error · Retrying in <N>s · attempt <K>/<max>` while
 /// the actor backs off after a retryable provider failure. The countdown shows
@@ -2900,13 +2876,14 @@ fn render_model_picker(
         .unwrap_or(8)
         .clamp(8, 22);
     let window_len = list_area.height as usize;
-    // The menu viewport law: the selection rides inside the window.
+    // The menu viewport law (the `/` palette's follow rule): the selection
+    // moves INSIDE a stable window; the window scrolls only when the
+    // selection would leave it — never a list scrolling under a pinned
+    // highlight. `scroll` is the remembered top; render owns the math since
+    // only render knows `window_len`.
     let selection = picker.selection.min(rows.len().saturating_sub(1));
-    let start = if rows.len() <= window_len {
-        0
-    } else {
-        selection.min(rows.len() - window_len)
-    };
+    let start = crate::app::follow_viewport(picker.scroll.get(), selection, rows.len(), window_len);
+    picker.scroll.set(start);
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -3170,15 +3147,13 @@ fn render_session(
     // like the SubTree, but one row).
     let tasks_line = crate::taskrows::tasks_line(&model.tasks, model.clock_ms);
     let mut tasks_height = u16::from(tasks_line.is_some());
-    // W-G: the live token-throughput row — one ambient line in the live-work
-    // block, present only while the turn streams and a rate is established.
-    // Lowest shed priority: an ephemeral gauge yields before the task band.
-    let throughput_readout = model.throughput_readout();
-    let mut throughput_height = u16::from(throughput_readout.is_some());
+    // W-G: the throughput readout no longer rides the band — it is now the
+    // left segment of the composer identity line (always visible, even at
+    // rest). See `render_composer`.
     // CG-M1: the always-visible graph strip — one ambient line while a graph
     // is pinned and not abandoned (an abandoned graph clears the strip). It
-    // is session state, so it outranks the ephemeral throughput gauge but
-    // still sheds before sacred rows on a tiny terminal.
+    // is session state and the lowest-priority ambient row; it sheds before
+    // sacred rows on a tiny terminal.
     let graph_strip = model
         .graph
         .as_ref()
@@ -3259,19 +3234,12 @@ fn render_session(
     } else {
         budget -= todos_height;
     }
-    // CG-M1: the graph strip outranks the throughput gauge (session state vs
-    // an ephemeral rate) but yields to todos and the task band.
+    // CG-M1: the graph strip is the lowest-priority ambient row (checked last
+    // = lowest claim on the budget) — the task band and todos outrank it.
     if graph_height > budget {
         graph_height = 0;
     } else {
         budget -= graph_height;
-    }
-    // W-G: the throughput row sheds FIRST when space is tight (checked last =
-    // lowest claim on the budget) — the task band and todos outrank it.
-    if throughput_height > budget {
-        throughput_height = 0;
-    } else {
-        budget -= throughput_height;
     }
     // The closing rule was reserved ABOVE, before the panels (TUI6.1
     // fix 2 — sim anatomy: the border-top of whatever follows the
@@ -3286,7 +3254,7 @@ fn render_session(
     // last and given up first.
     // The waiting line and the task band share one breathing row (they are
     // the same "live background work" block when both are present).
-    let want_lead = u16::from(waiting_height + tasks_height + throughput_height + graph_height > 0);
+    let want_lead = u16::from(waiting_height + tasks_height + graph_height > 0);
     let want_todos_lead = u16::from(todos_height > 0);
     let want_subtree_lead = u16::from(subtree_height > 0);
     let breathe = |want: u16, budget: &mut u16| -> u16 {
@@ -3307,7 +3275,6 @@ fn render_session(
         _lead_waiting,
         waiting_area,
         tasks_area,
-        throughput_area,
         graph_area,
         _lead_todos,
         todos_area,
@@ -3326,7 +3293,6 @@ fn render_session(
         Constraint::Length(lead_waiting),
         Constraint::Length(waiting_height),
         Constraint::Length(tasks_height),
-        Constraint::Length(throughput_height),
         Constraint::Length(graph_height),
         Constraint::Length(lead_todos),
         Constraint::Length(todos_height),
@@ -3700,18 +3666,6 @@ fn render_session(
                 ),
             ])),
             tasks_area,
-        );
-    }
-
-    // W-G: the live throughput row — gold label/spark/rate, dim aggregates —
-    // in the same ambient voice as the task band. Only painted while the turn
-    // streams (the height is zero otherwise), so idle frames never carry it.
-    if let Some(readout) = &throughput_readout
-        && throughput_area.height > 0
-    {
-        frame.render_widget(
-            Paragraph::new(throughput_line(theme, readout)),
-            throughput_area,
         );
     }
 
@@ -6867,12 +6821,39 @@ fn render_composer(
     let identity_text = model
         .composer_identity(rule_width.saturating_sub(6))
         .map(|identity| format!(" {identity} "));
-    let rule_line = match identity_text {
-        Some(text) if rule_width > text.chars().count() + 2 => {
+    // W-G: the throughput readout is the LEFT segment of this identity line,
+    // always visible (the last measured rate persists at rest). Session-
+    // scoped, and only alongside the identity — it degrades away first when
+    // the line can't hold both.
+    let throughput_text = matches!(model.screen, Screen::Session | Screen::Subagent)
+        .then(|| model.throughput_pill())
+        .flatten()
+        .map(|readout| format!(" {} ", readout.pill_text()));
+    let rule_line = match (&identity_text, &throughput_text) {
+        (Some(id), Some(tp)) if rule_width >= id.chars().count() + tp.chars().count() + 5 => {
+            let fill = rule_width - tp.chars().count() - id.chars().count() - 4;
+            Line::from(vec![
+                Span::styled("──", theme.gold_style()),
+                Span::styled(tp.clone(), theme.dim_style()),
+                Span::styled("─".repeat(fill), theme.gold_style()),
+                Span::styled(id.clone(), theme.dim_style()),
+                Span::styled("──", theme.gold_style()),
+            ])
+        }
+        // Throughput alone (no model identity yet) still rides the left.
+        (None, Some(tp)) if rule_width >= tp.chars().count() + 4 => {
+            let fill = rule_width - tp.chars().count() - 4;
+            Line::from(vec![
+                Span::styled("──", theme.gold_style()),
+                Span::styled(tp.clone(), theme.dim_style()),
+                Span::styled("─".repeat(fill + 2), theme.gold_style()),
+            ])
+        }
+        (Some(text), _) if rule_width > text.chars().count() + 2 => {
             let fill = rule_width - text.chars().count() - 2;
             Line::from(vec![
                 Span::styled("─".repeat(fill), theme.gold_style()),
-                Span::styled(text, theme.dim_style()),
+                Span::styled(text.clone(), theme.dim_style()),
                 Span::styled("──", theme.gold_style()),
             ])
         }
@@ -7010,10 +6991,17 @@ fn talk_ghost_line(model: &AppModel, theme: &Theme, width: u16) -> Line<'static>
 /// faint slot — theme tokens only (the mechanical no-raw-color law covers
 /// this seam like every other).
 fn talk_wave_spans(model: &AppModel, theme: &Theme) -> Vec<Span<'static>> {
-    model
-        .talk
-        .wave
-        .cells()
+    // Prefer real captured amplitude; when the ring carries no signal (a
+    // capture path that never fed levels, or true silence), show the
+    // synthesized listening sweep so the state animates instead of sitting
+    // as a dead flat line (owner: "have the animation for audio working").
+    let real_peak = model.talk.wave.levels().into_iter().fold(0.0_f32, f32::max);
+    let cells = if real_peak >= crate::talk::LISTENING_SIGNAL_MIN {
+        model.talk.wave.cells()
+    } else {
+        crate::talk::listening_pulse_cells(model.clock_ms)
+    };
+    cells
         .into_iter()
         .map(|cell| {
             let glyph = crate::talk::wave_glyph(cell, model.talk.wave_plain);

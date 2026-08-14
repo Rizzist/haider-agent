@@ -1,0 +1,94 @@
+//! UI-polish wave pins: the `/model` picker's viewport-follow scroll (the `/`
+//! palette rule), the synthesized listening wave animation, and the compact
+//! throughput pill form.
+#![allow(clippy::expect_used)]
+
+use haider_tui::app::follow_viewport;
+use haider_tui::talk::{LISTENING_SIGNAL_MIN, listening_pulse_cells};
+use haider_tui::throughput::ThroughputReadout;
+
+#[test]
+fn viewport_follows_selection_without_scrolling_under_a_pinned_top() {
+    // window of 5 over 20 rows. Moving the selection down the first window
+    // does NOT scroll (top stays 0) — the highlight moves inside the window,
+    // exactly the `/` palette behaviour, not a list scrolling on every key.
+    let window = 5;
+    let len = 20;
+    let mut top = 0;
+    for selection in 0..window {
+        top = follow_viewport(top, selection, len, window);
+        assert_eq!(top, 0, "no scroll while the selection is inside the window");
+    }
+    // Crossing the bottom edge advances the top by exactly one per step.
+    top = follow_viewport(top, 5, len, window);
+    assert_eq!(
+        top, 1,
+        "top follows only when the selection leaves the window"
+    );
+    top = follow_viewport(top, 6, len, window);
+    assert_eq!(top, 2);
+    // Moving back up above the top pulls it back minimally.
+    top = follow_viewport(top, 1, len, window);
+    assert_eq!(top, 1, "scrolling up follows the selection up, minimally");
+    // The last page fills the window (top clamps at len - window).
+    let bottom = follow_viewport(0, len - 1, len, window);
+    assert_eq!(bottom, len - window, "the final page fills the window");
+}
+
+#[test]
+fn viewport_is_a_noop_when_everything_fits() {
+    assert_eq!(follow_viewport(0, 4, 5, 10), 0, "no scroll when list fits");
+    assert_eq!(follow_viewport(3, 0, 0, 10), 0, "empty list clamps to zero");
+}
+
+#[test]
+fn listening_pulse_animates_across_the_clock_and_is_deterministic() {
+    // The synthesized sweep is a pure function of the wall clock: identical
+    // input → identical cells (no randomness), but DIFFERENT clocks move the
+    // crest, so the wave is visibly alive while listening.
+    let a = listening_pulse_cells(0);
+    let a_again = listening_pulse_cells(0);
+    assert_eq!(a, a_again, "deterministic for a fixed clock");
+    let b = listening_pulse_cells(400);
+    let c = listening_pulse_cells(800);
+    assert!(
+        a != b || b != c,
+        "the crest travels as the clock advances (the animation is alive)"
+    );
+    // Exactly one wave-width of cells, and the crest is HOT (gold) somewhere.
+    assert_eq!(a.len(), haider_tui::talk::WAVE_WIDTH);
+    assert!(
+        b.iter().any(|cell| cell.hot),
+        "the travelling crest lights a gold column"
+    );
+    // The threshold that routes real-vs-synthesized is a sane small value.
+    assert!(LISTENING_SIGNAL_MIN > 0.0 && LISTENING_SIGNAL_MIN < 0.2);
+}
+
+#[test]
+fn throughput_pill_is_compact_and_carries_the_rate() {
+    let readout = ThroughputReadout {
+        spark: "▁▂▃▄▅".into(),
+        tps: 126,
+        approx: false,
+        mean: Some(119),
+        p95: Some(154),
+    };
+    let pill = readout.pill_text();
+    // Compact: the rate + sparkline + mean, but NOT the verbose "Throughput"
+    // label or p95 (the identity line is tight).
+    assert!(pill.contains("126 tps"), "{pill}");
+    assert!(pill.contains("▁▂▃▄▅"), "{pill}");
+    assert!(pill.contains("μ119"), "{pill}");
+    assert!(!pill.contains("Throughput"), "no verbose label: {pill}");
+    assert!(
+        !pill.contains("p95"),
+        "p95 dropped on the tight line: {pill}"
+    );
+    // The approx `~` still rides an estimated rate.
+    let approx = ThroughputReadout {
+        approx: true,
+        ..readout
+    };
+    assert!(approx.pill_text().contains("~126 tps"));
+}

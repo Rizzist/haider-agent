@@ -67,6 +67,34 @@ pub struct WaveCell {
     pub hot: bool,
 }
 
+/// A real ring whose peak sits below this reads as "no audio signal" (the
+/// capture path never fed a level, or true silence) — the render then shows
+/// the synthesized listening sweep so the state never looks dead.
+pub const LISTENING_SIGNAL_MIN: f32 = 0.03;
+
+/// The synthesized "I'm listening" sweep: a gold crest travelling left→right
+/// over a faint baseline, keyed to the shared wall clock so it animates
+/// without any real audio. Deterministic (a pure function of `clock_ms`) —
+/// it is a liveness indicator, NOT a claim about your voice amplitude, so it
+/// only shows when the real ring carries no signal.
+#[must_use]
+pub fn listening_pulse_cells(clock_ms: u64) -> Vec<WaveCell> {
+    const PERIOD_MS: u64 = 1_600;
+    let phase = (clock_ms % PERIOD_MS) as f32 / PERIOD_MS as f32;
+    let center = phase * (WAVE_WIDTH as f32 - 1.0);
+    (0..WAVE_WIDTH)
+        .map(|i| {
+            let distance = (i as f32 - center).abs();
+            let bump = (1.0 - distance / 5.0).max(0.0);
+            let level = 0.06 + 0.7 * bump * bump;
+            WaveCell {
+                glyph: wave_glyph_index(level),
+                hot: level >= WAVE_HOT_LEVEL,
+            }
+        })
+        .collect()
+}
+
 /// Fixed ring of smoothed envelope levels. Newest sample enters at the
 /// RIGHT edge; history flows LEFT over time (`levels()[0]` is the oldest
 /// visible column, `levels()[WAVE_WIDTH-1]` the newest).

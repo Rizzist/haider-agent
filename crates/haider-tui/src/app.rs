@@ -2724,11 +2724,37 @@ pub struct ModelPicker {
     pub query: String,
     /// Index into the FILTERED row list.
     pub selection: usize,
+    /// The list viewport's top-row index. Interior-mutable because the
+    /// viewport height is a RENDER-time fact: render follows the selection
+    /// with minimal scroll (only when it would leave the window), exactly
+    /// like the `/` command palette — the selection moves inside a stable
+    /// window instead of the list scrolling under a pinned highlight.
+    pub scroll: std::cell::Cell<usize>,
     /// In-flight `session.select_model`: the REQUESTED pair. The picker
     /// renders it pulsing; the identity moves only on the resolved reply.
     pub pending: Option<(String, String)>,
     /// Honest inline error — a typed refusal or an unavailability reason.
     pub error: Option<String>,
+}
+
+/// The `/` palette's viewport-follow rule, shared by the `/model` picker: the
+/// selection moves inside a STABLE window, and the window's top advances only
+/// when the selection would leave it (never a list scrolling under a pinned
+/// highlight). `top` is the remembered scroll; the result is the new top,
+/// clamped so the last page fills the window.
+#[must_use]
+pub fn follow_viewport(top: usize, selection: usize, len: usize, window: usize) -> usize {
+    if window == 0 || len <= window {
+        return 0;
+    }
+    let max_start = len - window;
+    let mut top = top.min(max_start);
+    if selection < top {
+        top = selection;
+    } else if selection >= top + window {
+        top = selection + 1 - window;
+    }
+    top.min(max_start)
 }
 
 /// One `/model` picker row: a model × provider pair (or an honest
@@ -9673,6 +9699,15 @@ impl AppModel {
         self.throughput.readout()
     }
 
+    /// The ALWAYS-VISIBLE throughput readout for the composer identity line —
+    /// the last measured rate persists at rest (owner: keep it visible even
+    /// when not streaming). `None` only before any rate has been established.
+    /// Idle frames stay byte-identical because a rest readout is static.
+    #[must_use]
+    pub fn throughput_pill(&self) -> Option<crate::throughput::ThroughputReadout> {
+        self.throughput.readout()
+    }
+
     /// Route one RAW envelope to whichever session owns it (W3c3, report
     /// R11 cut 2) — the single live entry point for the event stream.
     ///
@@ -11737,6 +11772,7 @@ impl AppModel {
                 if let Some(picker) = self.model_picker.as_mut() {
                     picker.query.pop();
                     picker.selection = 0;
+                    picker.scroll.set(0);
                     picker.error = None;
                 }
             }
@@ -11744,6 +11780,7 @@ impl AppModel {
                 if let Some(picker) = self.model_picker.as_mut() {
                     picker.query.push(c);
                     picker.selection = 0;
+                    picker.scroll.set(0);
                     picker.error = None;
                 }
             }
