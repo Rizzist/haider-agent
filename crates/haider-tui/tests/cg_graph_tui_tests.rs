@@ -7,8 +7,9 @@
 use haider_protocol::EventPayload;
 use haider_protocol::graph::{
     EvidenceRecorded, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphBlocked,
-    GraphCompleted, GraphEvidenceTally, GraphGateSatisfied, GraphNodeName, GraphNodeStatus,
-    GraphPhase, GraphPinned, GraphStatus,
+    GraphCompleted, GraphEvidenceTally, GraphExecutorShape, GraphGateKind, GraphGateSatisfied,
+    GraphNodeName, GraphNodeStatus, GraphPhase, GraphPinned, GraphStatus, build_node, ship_node,
+    verify_node,
 };
 use haider_protocol::ids::GraphId;
 use haider_tui::graph;
@@ -30,8 +31,15 @@ fn node(
     evidence: GraphEvidenceTally,
     satisfied: bool,
 ) -> GraphNodeStatus {
+    let (gate, executor) = match name.as_str() {
+        "BUILD" => (GraphGateKind::CommandGreen, GraphExecutorShape::Inline),
+        "VERIFY" => (GraphGateKind::AllOfN { n: 3 }, GraphExecutorShape::FanOut),
+        _ => (GraphGateKind::HumanConfirm, GraphExecutorShape::Human),
+    };
     GraphNodeStatus {
         node: name,
+        gate: Some(gate),
+        executor: Some(executor),
         attempts_opened,
         current_attempt,
         evidence,
@@ -47,16 +55,20 @@ fn mid_run() -> GraphStatus {
         graph_id: GraphId::new("g1"),
         template: "ship-loop".into(),
         digest: "abcdef0123456789".into(),
+        template_version: 1,
+        start_node: Some(build_node()),
         phase: GraphPhase::Active,
-        current_node: Some(GraphNodeName::Verify),
+        current_node: Some(verify_node()),
+        ready_nodes: vec![verify_node()],
         attempt: 2,
         nodes: vec![
-            node(GraphNodeName::Build, 2, Some(2), tally(1, 0, 1), true),
-            node(GraphNodeName::Verify, 1, Some(2), tally(2, 1, 2), false),
-            node(GraphNodeName::Ship, 0, None, tally(0, 0, 0), false),
+            node(build_node(), 2, Some(2), tally(1, 0, 1), true),
+            node(verify_node(), 1, Some(2), tally(2, 1, 2), false),
+            node(ship_node(), 0, None, tally(0, 0, 0), false),
         ],
         blocked_reason: None,
         pending_menu: None,
+        pending_menus: Vec::new(),
     }
 }
 
@@ -99,7 +111,7 @@ fn blocked_and_hold_glyphs_differ_from_active() {
     let mut hold = mid_run();
     hold.phase = GraphPhase::Blocked;
     hold.blocked_reason = Some(GraphBlockReason::HumanHold);
-    hold.current_node = Some(GraphNodeName::Ship);
+    hold.current_node = Some(ship_node());
     // The SHIP node is current under a human hold → ⏸, not ✗.
     assert_eq!(graph::node_glyph(&hold, &hold.nodes[2]), "⏸");
 }
@@ -149,7 +161,7 @@ fn slotted_verify_never_labels_an_attested_slot_verified() {
     let verify = status
         .nodes
         .iter_mut()
-        .find(|node| node.node == GraphNodeName::Verify)
+        .find(|node| node.node == verify_node())
         .expect("verify node");
     verify.evidence.effective_green = 2;
     verify.evidence_slots = vec![
@@ -188,6 +200,69 @@ fn abandoned_graph_status_is_terminal() {
     assert!(graph::plain_status(&status).contains("abandoned"));
 }
 
+/// M2b: the `/graph` surface is PROPERTY-based — an arbitrary template with
+/// non-ship-loop node names renders off gate kind, never a BUILD/VERIFY/SHIP
+/// name match, and `Superseded` reads terminal.
+#[test]
+fn m2b_status_is_property_based_not_name_based() {
+    let mk = |name: &str, gate: GraphGateKind, executor: GraphExecutorShape, satisfied: bool| {
+        GraphNodeStatus {
+            node: GraphNodeName::new(name).expect("valid node name"),
+            gate: Some(gate),
+            executor: Some(executor),
+            attempts_opened: 1,
+            current_attempt: Some(1),
+            evidence: tally(0, 0, 0),
+            evidence_slots: Vec::new(),
+            satisfied,
+        }
+    };
+    let status = GraphStatus {
+        graph_id: GraphId::new("g2"),
+        template: "sec-audit".into(),
+        digest: "0011223344556677".into(),
+        template_version: 1,
+        start_node: Some(GraphNodeName::new("SCAN").expect("name")),
+        phase: GraphPhase::Active,
+        current_node: Some(GraphNodeName::new("REVIEW").expect("name")),
+        ready_nodes: vec![GraphNodeName::new("REVIEW").expect("name")],
+        attempt: 1,
+        nodes: vec![
+            mk("SCAN", GraphGateKind::CommandGreen, GraphExecutorShape::Inline, true),
+            mk("REVIEW", GraphGateKind::AllOfN { n: 5 }, GraphExecutorShape::FanOut, false),
+            mk("APPROVE", GraphGateKind::HumanConfirm, GraphExecutorShape::Human, false),
+        ],
+        blocked_reason: None,
+        pending_menu: None,
+        pending_menus: Vec::new(),
+    };
+    let body = graph::plain_status(&status);
+    // Gate labels derive from the gate KIND, not a hardcoded node name.
+    assert!(body.contains("SCAN · command-green"), "{body}");
+    assert!(body.contains("REVIEW · all-of-5"), "{body}");
+    assert!(body.contains("APPROVE · human-confirm"), "{body}");
+    // The HumanConfirm node — named APPROVE, not SHIP — suppresses the tally
+    // purely by its gate property.
+    let approve = body.lines().find(|l| l.contains("APPROVE")).expect("row");
+    assert!(
+        !approve.contains("eff") && !approve.contains("slots"),
+        "human gate carries no tally: {approve}"
+    );
+    // The current expectation is derived from the gate too.
+    assert!(
+        body.contains("→ current: REVIEW · record 5 green evidence slots"),
+        "{body}"
+    );
+    // A superseded graph reads terminal.
+    let mut superseded = status;
+    superseded.phase = GraphPhase::Superseded;
+    assert_eq!(graph::phase_badge(&superseded), "⊘ superseded");
+    assert!(
+        graph::plain_status(&superseded).contains("⊘ superseded — replaced by a newer workflow"),
+        "superseded footer"
+    );
+}
+
 #[test]
 fn graph_facts_render_quiet_transcript_notes() {
     let mut projection = SessionProjection::new();
@@ -196,16 +271,18 @@ fn graph_facts_render_quiet_transcript_notes() {
         graph_id: gid.clone(),
         template: "ship-loop".into(),
         digest: "abcdef0123456789".into(),
+        template_version: 1,
+        start_node: Some(build_node()),
         nodes: Vec::new(),
     }));
     projection.apply(&EventPayload::GraphAttemptOpened(GraphAttemptOpened {
         graph_id: gid.clone(),
-        node: GraphNodeName::Build,
+        node: build_node(),
         attempt: 2,
     }));
     projection.apply(&EventPayload::EvidenceRecorded(EvidenceRecorded {
         graph_id: gid.clone(),
-        node: GraphNodeName::Verify,
+        node: verify_node(),
         attempt: 2,
         verdict: EvidenceVerdict::Green,
         detail: "cargo test green\n\n  446 passed".into(),
@@ -219,12 +296,12 @@ fn graph_facts_render_quiet_transcript_notes() {
     }));
     projection.apply(&EventPayload::GraphGateSatisfied(GraphGateSatisfied {
         graph_id: gid.clone(),
-        node: GraphNodeName::Verify,
+        node: verify_node(),
         attempt: 2,
     }));
     projection.apply(&EventPayload::GraphBlocked(GraphBlocked {
         graph_id: gid.clone(),
-        node: GraphNodeName::Build,
+        node: build_node(),
         reason: GraphBlockReason::NoProgress,
     }));
     projection.apply(&EventPayload::GraphCompleted(GraphCompleted {
@@ -285,14 +362,14 @@ fn first_build_attempt_and_advances_are_not_noise_rows() {
     let gid = GraphId::new("g1");
     projection.apply(&EventPayload::GraphAttemptOpened(GraphAttemptOpened {
         graph_id: gid.clone(),
-        node: GraphNodeName::Build,
+        node: build_node(),
         attempt: 1,
     }));
     projection.apply(&EventPayload::GraphAdvanced(
         haider_protocol::graph::GraphAdvanced {
             graph_id: gid,
-            from_node: GraphNodeName::Build,
-            to_node: GraphNodeName::Verify,
+            from_node: build_node(),
+            to_node: verify_node(),
         },
     ));
     assert!(

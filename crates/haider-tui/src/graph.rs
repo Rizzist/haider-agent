@@ -7,9 +7,21 @@
 //! and the `⚑ ship-loop · ✓a ◉b …` rollup line.
 
 use haider_protocol::graph::{
-    EvidenceAuthority, EvidenceVerdict, GraphBlockReason, GraphEvidenceSlotStatus, GraphNodeName,
+    EvidenceAuthority, EvidenceVerdict, GraphBlockReason, GraphEvidenceSlotStatus, GraphGateKind,
     GraphNodeStatus, GraphPhase, GraphStatus,
 };
+
+/// A node whose gate is a human confirmation — the M2b PROPERTY-based
+/// replacement for the old `node == SHIP` name check, with a canonical-name
+/// fallback for legacy reductions that predate populated `gate` fields.
+#[must_use]
+pub fn is_human_gate(node: &GraphNodeStatus) -> bool {
+    match node.gate {
+        Some(GraphGateKind::HumanConfirm) => true,
+        Some(_) => false,
+        None => node.node.as_str() == "SHIP",
+    }
+}
 
 /// Per-node glyph. A satisfied obligation is `✓`; the current node is `◉`
 /// while active and `✗`/`⏸` while blocked; an obligation not yet reached is
@@ -22,7 +34,7 @@ pub fn node_glyph(status: &GraphStatus, node: &GraphNodeStatus) -> &'static str 
     if node.satisfied {
         return "✓";
     }
-    if status.current_node == Some(node.node) {
+    if status.current_node.as_ref() == Some(&node.node) {
         return match (status.phase, status.blocked_reason) {
             (GraphPhase::Blocked, Some(GraphBlockReason::HumanHold)) => "⏸",
             (GraphPhase::Blocked, _) => "✗",
@@ -52,13 +64,22 @@ pub fn block_reason_label(reason: GraphBlockReason) -> &'static str {
     }
 }
 
-/// The gate label for a node — pinned to the template, not re-derived.
+/// The gate label for a node — derived from its PINNED gate kind (M2b),
+/// with a canonical-name fallback for legacy reductions without a gate field.
 #[must_use]
-pub fn gate_label(node: GraphNodeName) -> &'static str {
-    match node {
-        GraphNodeName::Build => "command-green",
-        GraphNodeName::Verify => "all-of-3",
-        GraphNodeName::Ship => "human-confirm",
+pub fn gate_label(node: &GraphNodeStatus) -> String {
+    if let Some(gate) = &node.gate {
+        return match gate {
+            GraphGateKind::CommandGreen => "command-green".to_owned(),
+            GraphGateKind::AllOfN { n } => format!("all-of-{n}"),
+            GraphGateKind::HumanConfirm => "human-confirm".to_owned(),
+        };
+    }
+    match node.node.as_str() {
+        "BUILD" => "command-green".to_owned(),
+        "VERIFY" => "all-of-3".to_owned(),
+        "SHIP" => "human-confirm".to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -68,6 +89,7 @@ pub fn phase_badge(status: &GraphStatus) -> String {
     match status.phase {
         GraphPhase::Completed => "✓ complete".to_owned(),
         GraphPhase::Abandoned => "✗ abandoned".to_owned(),
+        GraphPhase::Superseded => "⊘ superseded".to_owned(),
         GraphPhase::Blocked => format!(
             "✗ blocked · {}",
             status.blocked_reason.map_or("held", block_reason_label)
@@ -115,7 +137,7 @@ pub fn plain_status(status: &GraphStatus) -> String {
         lines.push(format!(
             "  {glyph}{marker} {} · {} · attempt {}/8{evidence}",
             node.node.label(),
-            gate_label(node.node),
+            gate_label(node),
             node.current_attempt.unwrap_or(0),
         ));
         // M2a: one indented provenance row per declared evidence slot.
@@ -126,28 +148,41 @@ pub fn plain_status(status: &GraphStatus) -> String {
     match status.phase {
         GraphPhase::Completed => lines.push("✓ complete — every gate satisfied".to_owned()),
         GraphPhase::Abandoned => lines.push("✗ abandoned".to_owned()),
+        GraphPhase::Superseded => {
+            lines.push("⊘ superseded — replaced by a newer workflow".to_owned());
+        }
         GraphPhase::Blocked => lines.push(format!(
             "✗ blocked — {} · /graph abandon then re-pin to retry",
             status.blocked_reason.map_or("held", block_reason_label)
         )),
         GraphPhase::Active => {
-            if let Some(node) = status.current_node {
-                lines.push(format!(
-                    "→ current: {} · {}",
-                    node.label(),
-                    expectation(node)
-                ));
+            if let Some(current) = status.current_node.as_ref() {
+                let expect = status
+                    .nodes
+                    .iter()
+                    .find(|status_node| &status_node.node == current)
+                    .map_or_else(|| format!("advance {current}"), expectation);
+                lines.push(format!("→ current: {} · {expect}", current.label()));
             }
         }
     }
     lines.join("\n")
 }
 
-fn expectation(node: GraphNodeName) -> &'static str {
-    match node {
-        GraphNodeName::Build => "record BUILD evidence (command green)",
-        GraphNodeName::Verify => "record 3 green VERIFY results",
-        GraphNodeName::Ship => "confirm the SHIP gate",
+/// The current-node expectation — derived from its PINNED gate kind (M2b),
+/// with a canonical-name fallback for legacy reductions without a gate field.
+#[must_use]
+pub fn expectation(node: &GraphNodeStatus) -> String {
+    match node.gate.as_ref() {
+        Some(GraphGateKind::CommandGreen) => "record command-green evidence".to_owned(),
+        Some(GraphGateKind::AllOfN { n }) => format!("record {n} green evidence slots"),
+        Some(GraphGateKind::HumanConfirm) => "confirm the human gate".to_owned(),
+        None => match node.node.as_str() {
+            "BUILD" => "record BUILD evidence (command green)".to_owned(),
+            "VERIFY" => "record 3 green VERIFY results".to_owned(),
+            "SHIP" => "confirm the SHIP gate".to_owned(),
+            other => format!("advance {other}"),
+        },
     }
 }
 
@@ -156,7 +191,7 @@ fn expectation(node: GraphNodeName) -> &'static str {
 /// legacy slot-less nodes keep the exact M1 `Ng/Nr (N eff)` tally.
 #[must_use]
 pub fn node_evidence_fragment(node: &GraphNodeStatus) -> String {
-    if matches!(node.node, GraphNodeName::Ship) {
+    if is_human_gate(node) {
         String::new()
     } else if node.evidence_slots.is_empty() {
         format!(

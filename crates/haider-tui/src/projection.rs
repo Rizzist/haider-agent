@@ -244,6 +244,11 @@ pub struct SessionProjection {
     /// Per-projection counter minting unique ids for SEEDED rows, so two
     /// sample sessions replayed in a row never collide on a closed item id.
     seed_seq: u64,
+    /// M2b: the highest graph attempt-epoch seen so far. A new epoch — the
+    /// declared START node reopening graph-wide at a higher attempt — is the
+    /// retry-note trigger, generalized from the M1 `node == BUILD` name check.
+    /// Reset to 0 on every `GraphPinned` (a fresh instance, incl. a switch).
+    graph_epoch: u32,
     // Honesty counters — surfaced, never fatal.
     gap_seen: bool,
     orphan_deltas: u64,
@@ -562,6 +567,9 @@ impl SessionProjection {
             // changes only — forward advancement and first-attempt opens are
             // the strip's job, so we skip them here to keep scrollback calm.
             EventPayload::GraphPinned(pinned) => {
+                // A fresh instance (initial pin or a switch): reset the epoch
+                // watermark so the new graph's first retry notes correctly.
+                self.graph_epoch = 0;
                 self.push_note(format!(
                     "⚑ {} pinned · {}",
                     pinned.template,
@@ -569,13 +577,20 @@ impl SessionProjection {
                 ));
             }
             EventPayload::GraphAttemptOpened(opened) => {
-                if opened.node == haider_protocol::graph::GraphNodeName::Build && opened.attempt > 1
-                {
-                    self.push_note(format!(
-                        "BUILD attempt {}/{} — earlier VERIFY greens are stale",
-                        opened.attempt,
-                        haider_protocol::graph::GRAPH_MAX_ATTEMPTS
-                    ));
+                // M2b: the START node opens first at each new epoch, so the
+                // first attempt above the watermark is the graph-wide retry.
+                // Note it once (never on the first epoch); downstream opens at
+                // the same epoch stay quiet.
+                if opened.attempt > self.graph_epoch {
+                    self.graph_epoch = opened.attempt;
+                    if opened.attempt > 1 {
+                        self.push_note(format!(
+                            "{} attempt {}/{} — earlier greens are stale",
+                            opened.node.label(),
+                            opened.attempt,
+                            haider_protocol::graph::GRAPH_MAX_ATTEMPTS
+                        ));
+                    }
                 }
             }
             EventPayload::EvidenceRecorded(evidence) => {
@@ -616,6 +631,15 @@ impl SessionProjection {
             // `EvidenceRecorded` note it backs (and the inspect screen), so the
             // transcript stays quiet here, like `GraphAdvanced`.
             EventPayload::ProcessSignalRecorded(_) => {}
+            // M2b: a node became ready (its deps are satisfied) in the
+            // dependency-driven engine — forward position is the strip's job,
+            // so the transcript stays quiet, like `GraphAdvanced`.
+            EventPayload::GraphNodeReadied(_) => {}
+            // M2b: the pinned workflow was replaced by a mid-run switch. A new
+            // `GraphPinned` note follows; this records the supersession itself.
+            EventPayload::GraphSuperseded(_) => {
+                self.push_note("⇄ workflow switched — the previous graph was superseded".to_owned());
+            }
         }
     }
 

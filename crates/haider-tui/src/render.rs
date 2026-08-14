@@ -4836,7 +4836,7 @@ fn graph_node_spans(
     let glyph = crate::graph::node_glyph(status, node);
     let glyph_style = if status.phase == GraphPhase::Completed || node.satisfied {
         theme.ok_style()
-    } else if status.current_node == Some(node.node) {
+    } else if status.current_node.as_ref() == Some(&node.node) {
         match (status.phase, status.blocked_reason) {
             (GraphPhase::Blocked, Some(GraphBlockReason::HumanHold)) => theme.warn_style(),
             (GraphPhase::Blocked, _) => theme.err_style(),
@@ -4903,6 +4903,7 @@ fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus)
         let badge_style = match status.phase {
             GraphPhase::Completed => theme.ok_style(),
             GraphPhase::Blocked | GraphPhase::Abandoned => theme.err_style(),
+            GraphPhase::Superseded => theme.faint_style(),
             GraphPhase::Active => theme.dim_style(),
         };
         spans.push(Span::styled(format!("  {badge}"), badge_style));
@@ -4917,7 +4918,7 @@ fn render_graph(
     area: Rect,
     _hits: &mut [(Rect, Hit)],
 ) {
-    use haider_protocol::graph::{GraphNodeName, GraphPhase};
+    use haider_protocol::graph::GraphPhase;
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -4963,14 +4964,14 @@ fn render_graph(
         let mut spans = vec![Span::raw("  ")];
         spans.extend(graph_node_spans(theme, status, node));
         spans.push(Span::styled(
-            format!(" · {}", crate::graph::gate_label(node.node)),
+            format!(" · {}", crate::graph::gate_label(node)),
             theme.faint_style(),
         ));
         spans.push(Span::styled(
             format!(" · attempt {}/8", node.current_attempt.unwrap_or(0)),
             theme.dim_style(),
         ));
-        if matches!(node.node, GraphNodeName::Ship) {
+        if crate::graph::is_human_gate(node) {
             // Human gate — no evidence tally.
         } else if node.evidence_slots.is_empty() {
             spans.push(Span::styled(
@@ -5030,16 +5031,22 @@ fn render_graph(
                 theme.dim_style(),
             ));
         }
+        GraphPhase::Superseded => {
+            lines.push(Line::styled(
+                "⊘ superseded — replaced by a newer workflow",
+                theme.faint_style(),
+            ));
+        }
         GraphPhase::Active => {
-            if let Some(node) = status.current_node {
-                let expectation = match node {
-                    GraphNodeName::Build => "record BUILD evidence (command green)",
-                    GraphNodeName::Verify => "record 3 green VERIFY results",
-                    GraphNodeName::Ship => "confirm the SHIP gate below",
-                };
+            if let Some(current) = status.current_node.as_ref() {
+                let expectation = status
+                    .nodes
+                    .iter()
+                    .find(|status_node| &status_node.node == current)
+                    .map_or_else(|| format!("advance {current}"), crate::graph::expectation);
                 lines.push(Line::from(vec![
                     Span::styled("→ current: ", theme.faint_style()),
-                    Span::styled(node.label().to_owned(), theme.gold_style()),
+                    Span::styled(current.label().to_owned(), theme.gold_style()),
                     Span::styled(format!(" · {expectation}"), theme.dim_style()),
                 ]));
             }
