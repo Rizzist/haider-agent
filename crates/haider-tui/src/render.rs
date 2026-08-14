@@ -4856,6 +4856,36 @@ fn graph_node_spans(
     spans
 }
 
+/// One evidence slot's styled provenance row (M2a): `glyph id  word · digest`,
+/// toned by state — verified GREEN, attested GOLD (never green: attested is
+/// model testimony, not daemon-verified proof), pending faint, failed red.
+fn graph_slot_line(
+    theme: &Theme,
+    slot: &haider_protocol::graph::GraphEvidenceSlotStatus,
+) -> Line<'static> {
+    use haider_protocol::graph::{EvidenceAuthority, EvidenceVerdict};
+    let (glyph, word) = crate::graph::slot_state(slot);
+    let word_style = match slot.verdict {
+        Some(EvidenceVerdict::Green) => match slot.authority {
+            EvidenceAuthority::DaemonVerified => theme.ok_style(),
+            EvidenceAuthority::ModelAttested => theme.warn_style(),
+        },
+        Some(EvidenceVerdict::Red) => theme.err_style(),
+        None => theme.faint_style(),
+    };
+    let mut spans = vec![
+        Span::raw("      "),
+        Span::styled(format!("{glyph} "), word_style),
+        Span::styled(format!("{:<10}", slot.id), theme.dim_style()),
+        Span::styled(word.to_owned(), word_style),
+    ];
+    let provenance = crate::graph::slot_provenance(slot);
+    if !provenance.is_empty() {
+        spans.push(Span::styled(provenance, theme.faint_style()));
+    }
+    Line::from(spans)
+}
+
 /// The always-visible graph strip line (a `Line` for the panel stack above
 /// the composer). `None` when no graph is held — the caller omits the row.
 fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus) -> Line<'static> {
@@ -4940,7 +4970,9 @@ fn render_graph(
             format!(" · attempt {}/8", node.current_attempt.unwrap_or(0)),
             theme.dim_style(),
         ));
-        if !matches!(node.node, GraphNodeName::Ship) {
+        if matches!(node.node, GraphNodeName::Ship) {
+            // Human gate — no evidence tally.
+        } else if node.evidence_slots.is_empty() {
             spans.push(Span::styled(
                 format!(" · {}g", node.evidence.green),
                 theme.ok_style(),
@@ -4957,8 +4989,22 @@ fn render_graph(
                 format!(" ({} eff)", node.evidence.effective_green),
                 theme.faint_style(),
             ));
+        } else {
+            // M2a: slotted gate — the distinct green frontier over declared slots.
+            spans.push(Span::styled(
+                format!(
+                    " · {}/{} slots",
+                    node.evidence.effective_green,
+                    node.evidence_slots.len()
+                ),
+                theme.faint_style(),
+            ));
         }
         lines.push(Line::from(spans));
+        // M2a: one styled provenance row per declared slot.
+        for slot in &node.evidence_slots {
+            lines.push(graph_slot_line(theme, slot));
+        }
     }
     lines.push(Line::raw(""));
 

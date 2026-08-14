@@ -7,7 +7,8 @@
 //! and the `⚑ ship-loop · ✓a ◉b …` rollup line.
 
 use haider_protocol::graph::{
-    GraphBlockReason, GraphNodeName, GraphNodeStatus, GraphPhase, GraphStatus,
+    EvidenceAuthority, EvidenceVerdict, GraphBlockReason, GraphEvidenceSlotStatus, GraphNodeName,
+    GraphNodeStatus, GraphPhase, GraphStatus,
 };
 
 /// Per-node glyph. A satisfied obligation is `✓`; the current node is `◉`
@@ -110,20 +111,17 @@ pub fn plain_status(status: &GraphStatus) -> String {
     for node in &status.nodes {
         let glyph = node_glyph(status, node);
         let marker = attempt_marker(node);
-        let evidence = if matches!(node.node, GraphNodeName::Ship) {
-            String::new()
-        } else {
-            format!(
-                " · {}g/{}r ({} eff)",
-                node.evidence.green, node.evidence.red, node.evidence.effective_green
-            )
-        };
+        let evidence = node_evidence_fragment(node);
         lines.push(format!(
             "  {glyph}{marker} {} · {} · attempt {}/8{evidence}",
             node.node.label(),
             gate_label(node.node),
             node.current_attempt.unwrap_or(0),
         ));
+        // M2a: one indented provenance row per declared evidence slot.
+        for slot in &node.evidence_slots {
+            lines.push(format!("      {}", slot_row(slot)));
+        }
     }
     match status.phase {
         GraphPhase::Completed => lines.push("✓ complete — every gate satisfied".to_owned()),
@@ -151,6 +149,69 @@ fn expectation(node: GraphNodeName) -> &'static str {
         GraphNodeName::Verify => "record 3 green VERIFY results",
         GraphNodeName::Ship => "confirm the SHIP gate",
     }
+}
+
+/// The per-node evidence summary fragment. Human gates carry none; slot-aware
+/// nodes (M2a) report the distinct green frontier over their declared slots;
+/// legacy slot-less nodes keep the exact M1 `Ng/Nr (N eff)` tally.
+#[must_use]
+pub fn node_evidence_fragment(node: &GraphNodeStatus) -> String {
+    if matches!(node.node, GraphNodeName::Ship) {
+        String::new()
+    } else if node.evidence_slots.is_empty() {
+        format!(
+            " · {}g/{}r ({} eff)",
+            node.evidence.green, node.evidence.red, node.evidence.effective_green
+        )
+    } else {
+        format!(
+            " · {}/{} slots",
+            node.evidence.effective_green,
+            node.evidence_slots.len()
+        )
+    }
+}
+
+/// A slot's state glyph + word. A GREEN slot reports its AUTHORITY —
+/// `verified` (daemon-observed process truth) vs `attested` (model testimony);
+/// the UI must NEVER call an attested slot verified. Pending and failed slots
+/// carry no authority word (there is nothing yet to trust).
+#[must_use]
+pub fn slot_state(slot: &GraphEvidenceSlotStatus) -> (&'static str, &'static str) {
+    match slot.verdict {
+        None => ("○", "pending"),
+        Some(EvidenceVerdict::Green) => match slot.authority {
+            EvidenceAuthority::DaemonVerified => ("✓", "verified"),
+            EvidenceAuthority::ModelAttested => ("✓", "attested"),
+        },
+        Some(EvidenceVerdict::Red) => ("✗", "failed"),
+    }
+}
+
+/// A bounded provenance fragment for a satisfied slot — a short subject or
+/// fingerprint digest, never raw unbounded output. Empty until the slot greens.
+#[must_use]
+pub fn slot_provenance(slot: &GraphEvidenceSlotStatus) -> String {
+    if slot.verdict != Some(EvidenceVerdict::Green) {
+        return String::new();
+    }
+    slot.subject_digest
+        .as_deref()
+        .or(slot.fingerprint.as_deref())
+        .map(|digest| format!(" · {}", provenance_short(digest)))
+        .unwrap_or_default()
+}
+
+/// A bounded digest head for display (keeps any `algo:` prefix); never raw.
+#[must_use]
+pub fn provenance_short(digest: &str) -> String {
+    digest.chars().take(14).collect()
+}
+
+/// One slot's plain provenance row: `glyph id  word[ · digest]`.
+fn slot_row(slot: &GraphEvidenceSlotStatus) -> String {
+    let (glyph, word) = slot_state(slot);
+    format!("{glyph} {}  {word}{}", slot.id, slot_provenance(slot))
 }
 
 /// The first 8 hex of a template digest.

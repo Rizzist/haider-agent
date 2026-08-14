@@ -129,6 +129,58 @@ fn status_body_carries_gate_epoch_and_evidence() {
 }
 
 #[test]
+fn slotted_verify_never_labels_an_attested_slot_verified() {
+    use haider_protocol::graph::{
+        EvidenceAuthority, EvidenceVerdict, GraphEvidenceSlotStatus, SubjectSelector,
+    };
+    let slot = |id: &str,
+                authority: EvidenceAuthority,
+                verdict: Option<EvidenceVerdict>,
+                digest: Option<&str>| GraphEvidenceSlotStatus {
+        id: id.into(),
+        authority,
+        subject_selector: SubjectSelector::Command,
+        verdict,
+        fingerprint: None,
+        subject_digest: digest.map(Into::into),
+        source: None,
+    };
+    let mut status = mid_run();
+    let verify = status
+        .nodes
+        .iter_mut()
+        .find(|node| node.node == GraphNodeName::Verify)
+        .expect("verify node");
+    verify.evidence.effective_green = 2;
+    verify.evidence_slots = vec![
+        slot(
+            "tests",
+            EvidenceAuthority::DaemonVerified,
+            Some(EvidenceVerdict::Green),
+            Some("blake3:aabbccddeeff"),
+        ),
+        slot("lint", EvidenceAuthority::DaemonVerified, None, None),
+        slot(
+            "review",
+            EvidenceAuthority::ModelAttested,
+            Some(EvidenceVerdict::Green),
+            None,
+        ),
+    ];
+    let body = graph::plain_status(&status);
+    // Slotted nodes report the distinct green frontier, not the flat tally.
+    assert!(body.contains("2/3 slots"), "{body}");
+    // A daemon-verified slot reads `verified`, with a BOUNDED digest.
+    assert!(body.contains("tests  verified · blake3:aabbcc"), "{body}");
+    assert!(!body.contains("aabbccddeeff"), "digest stays bounded: {body}");
+    // A model-attested slot reads `attested` and is NEVER labelled verified.
+    assert!(body.contains("review  attested"), "{body}");
+    assert!(!body.contains("review  verified"), "{body}");
+    // An unfilled slot is pending.
+    assert!(body.contains("lint  pending"), "{body}");
+}
+
+#[test]
 fn abandoned_graph_status_is_terminal() {
     let mut status = mid_run();
     status.phase = GraphPhase::Abandoned;
