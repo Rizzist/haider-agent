@@ -68,26 +68,30 @@ fn streaming_model() -> AppModel {
 // ---- WG3: idle no-op (the row is absent and idle frames are byte-identical) ----
 
 #[test]
-fn wg3_off_stream_hides_the_row_even_with_a_populated_tracker() {
+fn wg3_off_stream_keeps_the_pill_visible() {
     let mut model = streaming_model();
     assert!(
-        model.throughput_readout().is_some(),
-        "precondition: streaming shows a readout"
+        model.throughput_pill().is_some(),
+        "precondition: streaming establishes a rate"
     );
-    // The turn ends. The tracker still holds its samples (the live runtime
-    // resets it on the next idle tick), but the render GATE must hide the row
-    // the instant the run leaves a streaming state.
+    // The turn ends. The always-visible identity-line pill KEEPS the last
+    // measured rate (owner: visible even when not streaming) — only the old
+    // streaming-gated `throughput_readout` goes dark.
     model.handle(AppEvent::Envelope(Box::new(EventPayload::RunState(
         RunState::Done,
     ))));
     assert!(
         model.throughput_readout().is_none(),
-        "off-stream: the gate hides the row regardless of tracker contents"
+        "the streaming gate goes dark off-stream"
+    );
+    assert!(
+        model.throughput_pill().is_some(),
+        "the pill holds the last measured rate at rest"
     );
     let rows = draw(&model, 100, 30);
     assert!(
-        !rows.iter().any(|row| row.contains("Throughput")),
-        "no throughput row when the turn is not streaming"
+        rows.iter().any(|row| row.contains("tps")),
+        "the throughput pill is still on the identity line at rest"
     );
 }
 
@@ -108,39 +112,41 @@ fn wg3_idle_frames_are_byte_identical_across_ticks() {
 }
 
 #[test]
-fn wg3_streaming_shows_the_row() {
-    // The both-directions half of the gate: while streaming, the row IS drawn.
+fn wg3_streaming_shows_the_pill_on_the_identity_line() {
+    // While streaming, the pill carries the live rate + sparkline on the
+    // composer identity line (the band row is retired).
     let model = streaming_model();
     let rows = draw(&model, 100, 30);
     assert!(
-        rows.iter().any(|row| row.contains("Throughput")),
-        "the throughput row is drawn while the turn streams"
+        rows.iter().any(|row| row.contains("tps")),
+        "the identity-line pill carries the rate unit while streaming"
     );
     assert!(
-        rows.iter().any(|row| row.contains("tps")),
-        "the row carries the rate unit"
+        rows.iter()
+            .any(|row| row.chars().any(|c| "▁▂▃▄▅▆▇█".contains(c))),
+        "the sparkline renders while streaming"
     );
 }
 
 // ---- WG6: plain-mode parity + theme sweep ----
 
 #[test]
-fn wg6_styled_row_matches_the_plain_readout_text() {
+fn wg6_styled_pill_and_plain_share_the_rate() {
     let model = streaming_model();
-    let readout = model.throughput_readout().expect("streaming readout");
-    // The styled render row, stripped of padding, equals the plain-mode line
-    // built from the SAME readout — the two surfaces cannot drift.
+    let readout = model.throughput_pill().expect("streaming rate");
+    // The two surfaces render throughput in different SHAPES (a compact pill
+    // on the identity line vs the verbose plain row) but the SAME numbers —
+    // the rate figure appears on both, so they cannot drift on the data.
+    let rate = format!("{} tps", readout.tps);
     let rows = draw(&model, 100, 30);
-    let styled = rows
-        .iter()
-        .find(|row| row.contains("Throughput"))
-        .expect("styled throughput row present");
-    assert_eq!(styled.trim(), readout.plain_text());
-    // And the plain renderer emits exactly that line when a readout is present.
+    assert!(
+        rows.iter().any(|row| row.contains(&rate)),
+        "the styled identity-line pill carries the rate `{rate}`"
+    );
     let plain = render_plain(&model.projection, 200_000, Some(&readout));
     assert!(
-        plain.contains(&readout.plain_text()),
-        "plain mode prints the equivalent line:\n{plain}"
+        plain.contains(&readout.plain_text()) && plain.contains(&rate),
+        "plain mode prints the same rate:\n{plain}"
     );
 }
 
@@ -160,10 +166,9 @@ fn wg6_row_renders_legibly_in_every_theme() {
         let rows = draw(&model, 100, 30);
         let row = rows
             .iter()
-            .find(|row| row.contains("Throughput"))
-            .unwrap_or_else(|| panic!("throughput row missing in {key:?}"));
-        // The label, a sparkline glyph and the rate all survive the theme.
-        assert!(row.contains("Throughput"), "{key:?}");
+            .find(|row| row.contains("tps"))
+            .unwrap_or_else(|| panic!("throughput pill missing in {key:?}"));
+        // The rate and a sparkline glyph both survive the theme.
         assert!(row.contains("tps"), "{key:?}");
         assert!(
             row.chars().any(|c| "▁▂▃▄▅▆▇█".contains(c)),
