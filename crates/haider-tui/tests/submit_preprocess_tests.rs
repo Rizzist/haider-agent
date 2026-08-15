@@ -492,7 +492,7 @@ fn tools_card_is_verbatim_and_registers_with_dispatch_notes() {
     assert_eq!(menu.title, "tools — core surface + custom tools");
     assert_eq!(
         menu.body[0],
-        "core     fs_read fs_patch process_exec agent_spawn request_input … (13, always on)"
+        "core     fs_read fs_edit process_exec agent_spawn request_input … (13, always on)"
     );
     assert_eq!(
         menu.body[1],

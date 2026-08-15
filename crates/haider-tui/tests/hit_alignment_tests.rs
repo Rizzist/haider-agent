@@ -253,7 +253,7 @@ fn menu_option_hits_align_with_their_rows() {
     );
     assert_eq!(deny.y, row_of(&rows, "2. Deny"));
     // Body context lines render dim between title and options (P2-8).
-    let body_y = row_of(&rows, "fs_patch wants to modify");
+    let body_y = row_of(&rows, "fs_edit wants to modify");
     assert!(body_y < allow.y, "body sits above the options");
     // The bottom hint names the menu id and the RPC answer contract.
     let hint_y = row_of(&rows, "menu.answer");

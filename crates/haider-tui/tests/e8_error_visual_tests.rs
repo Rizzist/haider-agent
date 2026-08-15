@@ -418,7 +418,7 @@ fn e8d_retry_markers_read_as_quiet_dim_fact_lines() {
             "attempt": 1,
             "max_attempts": 1,
             "call_id": "c-1",
-            "tool": "fs_patch",
+            "tool": "fs_edit",
         }),
     };
     let fallback = TurnItem::Extension {
@@ -454,7 +454,7 @@ fn e8d_retry_markers_read_as_quiet_dim_fact_lines() {
     let theme = model.theme.theme();
     let (rows, terminal) = draw(&model, 130, 32);
     let buffer = terminal.backend().buffer();
-    let repair_line = "⟳ malformed fs_patch arguments — model asked to reissue (attempt 1/1)";
+    let repair_line = "⟳ malformed fs_edit arguments — model asked to reissue (attempt 1/1)";
     let fallback_line = "⟳ provider hosted web tool rejected — using local web_fetch";
     for needle in [repair_line, fallback_line] {
         let y = row_of(&rows, needle);
@@ -498,7 +498,7 @@ fn e8d_retry_markers_read_as_quiet_dim_fact_lines() {
     }
     let rendered = render_plain(&projection, 0, None);
     assert!(
-        rendered.contains("⟳ malformed fs_patch arguments — model asked to reissue (attempt 1/1)"),
+        rendered.contains("⟳ malformed fs_edit arguments — model asked to reissue (attempt 1/1)"),
         "{rendered}"
     );
     assert!(

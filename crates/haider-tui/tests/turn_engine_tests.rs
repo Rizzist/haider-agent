@@ -741,7 +741,7 @@ async fn generic_turn_plays_end_to_end_with_the_delayed_title_note() {
         .collect();
     assert_eq!(
         tools,
-        vec!["fs_search", "fs_read", "fs_patch", "process_exec"]
+        vec!["fs_search", "fs_read", "fs_edit", "process_exec"]
     );
     // The 1.5 s auto-title note landed with the sim's FULL text.
     assert!(model.projection.entries().iter().any(|entry| matches!(

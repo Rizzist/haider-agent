@@ -12382,7 +12382,7 @@ pub fn tools_card(seq: u64) -> Menu {
         kind: MenuKind::Choice,
         title: "tools — core surface + custom tools".to_owned(),
         body: vec![
-            "core     fs_read fs_patch process_exec agent_spawn request_input … (13, always on)"
+            "core     fs_read fs_edit process_exec agent_spawn request_input … (13, always on)"
                 .to_owned(),
             "custom   notify_slack (fire-and-forget) · preview_deploy (await) · preview_smoke (deferred)"
                 .to_owned(),

@@ -967,7 +967,7 @@ fn login_card_outranks_an_arriving_menu_on_the_band() {
         haider_protocol::menu::Menu {
             id: haider_protocol::ids::MenuId::new("perm-1"),
             kind: haider_protocol::menu::MenuKind::Choice,
-            title: "Allow fs_patch — main.rs?".to_owned(),
+            title: "Allow fs_edit — main.rs?".to_owned(),
             body: vec![],
             options: [("allow", "Allow once"), ("deny", "Deny")]
                 .iter()
@@ -1071,7 +1071,7 @@ fn modals_own_hover_and_wheel_too() {
         haider_protocol::menu::Menu {
             id: haider_protocol::ids::MenuId::new("perm-1"),
             kind: haider_protocol::menu::MenuKind::Choice,
-            title: "Allow fs_patch — main.rs?".to_owned(),
+            title: "Allow fs_edit — main.rs?".to_owned(),
             body: vec![],
             options: [("allow", "Allow once"), ("deny", "Deny")]
                 .iter()
@@ -1850,7 +1850,7 @@ fn reserved_rule_holds_on_the_session_menu() {
     // the card's first shed under pressure, and the options are the
     // sacred floor the rule must close beneath.
     let (rows, _, _) = draw(&model, 90, 10);
-    assert_two_rules(&rows, "Allow fs_patch", "2. Deny", "session-menu@90x10");
+    assert_two_rules(&rows, "Allow fs_edit", "2. Deny", "session-menu@90x10");
     // And across 8..=16 the same law holds wherever ANY row exists
     // between the last option and the status row — a lower row (pad,
     // gap, panel) must never outlive the closing rule. At the

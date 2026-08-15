@@ -997,7 +997,7 @@ fn branch_subagent(b: &mut B, low: &str, roster_counter: &std::sync::atomic::Ato
     b.stream(
         "While they work I'm wiring the harness entrypoints here. The tests subagent will pause on a question — its chip flips to an amber ? when it does.",
     );
-    b.tool("fs_patch", "src/core/harness.rs", 900, "+24 −6", true);
+    b.tool("fs_edit", "src/core/harness.rs", 900, "+24 −6", true);
     b.streaming();
     b.stream(
         "My side is done. Chip glyphs: ○ idle · ◐ running · ⚒ tool · ? input required · ✓ done.",
@@ -1176,7 +1176,7 @@ fn branch_auth(b: &mut B, roster_counter: &std::sync::atomic::AtomicU64) {
                 "Patching the service core locally; result returns as a fenced patch.".to_owned(),
             ),
             ChipPrefill::ToolOk {
-                name: "fs_patch".to_owned(),
+                name: "fs_edit".to_owned(),
                 desc: "svc/src/auth/core.rs".to_owned(),
                 meta: "+88 −17".to_owned(),
             },
@@ -1193,7 +1193,7 @@ fn branch_auth(b: &mut B, roster_counter: &std::sync::atomic::AtomicU64) {
         agent: auth_agent.clone(),
         state: ChipDisplayState::Tool,
     });
-    b.tool("fs_patch", "web/src/lib/session.ts", 800, "+41 −7", true);
+    b.tool("fs_edit", "web/src/lib/session.ts", 800, "+41 −7", true);
     b.tool(
         "process_exec",
         "pnpm test --filter web",
@@ -1289,7 +1289,7 @@ fn branch_test(b: &mut B, generic_counter: u64) {
     b.stream(
         "Two failures, same root: the fixture clock is frozen before the lease renewal path. Patching the fixture, not the code.",
     );
-    b.tool("fs_patch", "tests/fixtures/clock.rs", 700, "+9 −3", true);
+    b.tool("fs_edit", "tests/fixtures/clock.rs", 700, "+9 −3", true);
     b.tool(
         "process_exec",
         "cargo test --workspace",
@@ -1420,8 +1420,8 @@ fn branch_plan_todo(b: &mut B) {
     );
     let work: [(&str, &str, u64, &str); 4] = [
         ("fs_search", "entrypoints src/**", 700, "6 matches"),
-        ("fs_patch", "src/core/run_loop.rs", 900, "+42 −9"),
-        ("fs_patch", "src/core/waiting.rs", 800, "+18 −3"),
+        ("fs_edit", "src/core/run_loop.rs", 900, "+42 −9"),
+        ("fs_edit", "src/core/waiting.rs", 800, "+18 −3"),
         ("process_exec", "cargo test --workspace", 1200, "218 passed"),
     ];
     let states_at = |i: usize, processing: bool| -> [TodoState; 4] {
@@ -1497,7 +1497,7 @@ fn branch_generic(b: &mut B, user_text: &str, low: &str, index: u64) {
         true,
     );
     b.tool("fs_read", "src/core/harness.rs", 500, "388 lines", true);
-    b.tool("fs_patch", "src/core/harness.rs", 850, "+37 −11", true);
+    b.tool("fs_edit", "src/core/harness.rs", 850, "+37 −11", true);
     b.tool("process_exec", "cargo check", 950, "clean", true);
     b.streaming();
     b.stream(GENERIC_OUTROS[i]);
@@ -1772,7 +1772,7 @@ pub fn child_run_tests(agent: &str, turn: u64) -> Vec<Beat> {
         agent,
         &ns,
         "t2",
-        "fs_patch",
+        "fs_edit",
         "cloud/tests/billing/webhooks.rs",
         900,
         "+96 −4",
@@ -1880,7 +1880,7 @@ pub fn child_run_docs(agent: &str, turn: u64) -> Vec<Beat> {
         agent,
         &ns,
         "t2",
-        "fs_patch",
+        "fs_edit",
         "docs/api/billing-webhooks.md",
         1100,
         "+140 −0",
@@ -2051,7 +2051,7 @@ pub fn respond_chip_beats(
         // For the record, the beats the sim WOULD have run had `cTool`
         // returned true are: parent → waiting; child thinking → 500 ms →
         // streaming → "On it — scoped the subtask, patching now." → tool →
-        // fs_patch src/subtask.rs 1100 ms +40 −6 → child done; parent →
+        // fs_edit src/subtask.rs 1100 ms +40 −6 → child done; parent →
         // streaming → "{callsign} {hon} finished — folded its patch into my
         // work. Done." → parent done → autoResumeParent. That flow is NOT
         // implemented here and must not be: tui.js is the authority.

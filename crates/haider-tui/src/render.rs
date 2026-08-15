@@ -8663,12 +8663,12 @@ fn item_lines<'a>(
             added,
             removed,
         } => {
-            // Sim shape (seed rows, tui.js:480): a completed fs_patch tool
+            // Sim shape (seed rows, tui.js:480): a completed fs_edit tool
             // row — ✓ glyph · maroon name · dim path · dim +a −r meta.
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("✓ ", theme.ok_style()),
-                Span::styled("fs_patch", theme.maroon_style()),
+                Span::styled("fs_edit", theme.maroon_style()),
                 Span::styled(format!(" {path}"), theme.dim_style()),
                 Span::styled(format!(" +{added} −{removed}"), theme.dim_style()),
             ]));

@@ -571,13 +571,13 @@ fn menu_body_renders_dim_on_the_menu_ground() {
     let theme = model.theme.theme();
     let (rows, _, terminal) = draw(&model, 118, 34);
     let buffer = terminal.backend().buffer();
-    let body_y = row_of(&rows, "fs_patch wants to modify");
-    let body_x = col_of(&rows[body_y as usize], "fs_patch wants");
+    let body_y = row_of(&rows, "fs_edit wants to modify");
+    let body_x = col_of(&rows[body_y as usize], "fs_edit wants");
     let cell = &buffer[(body_x, body_y)];
     assert_eq!(cell.fg, Color::from(theme.dim), "body line dim");
     assert_eq!(cell.bg, Color::from(theme.gold_soft), "menu ground");
     // Both body lines sit between title and first option.
-    let title_y = row_of(&rows, "? Allow fs_patch — event_store.rs?");
+    let title_y = row_of(&rows, "? Allow fs_edit — event_store.rs?");
     let option_y = row_of(&rows, "1. Allow once");
     let second_body_y = row_of(&rows, "effect class: workspace write");
     assert!(title_y < body_y && body_y < second_body_y && second_body_y < option_y);

@@ -386,7 +386,7 @@ fn user_messages_and_menus_project() {
         kind: MenuKind::Permission {
             effect_summary: "write src/lib.rs".to_owned(),
         },
-        title: "Allow fs_patch?".to_owned(),
+        title: "Allow fs_edit?".to_owned(),
         body: vec![],
         options: vec![MenuOption {
             key: "allow".to_owned(),
@@ -396,7 +396,7 @@ fn user_messages_and_menus_project() {
         }],
         blocking: true,
         scope: MenuScope::Session,
-        origin: "fs_patch".to_owned(),
+        origin: "fs_edit".to_owned(),
         ttl_ms: None,
         timeout_option: None,
     };
@@ -597,7 +597,7 @@ fn completed_tool_call_releases_the_fragment_accumulation() {
         31,
         TurnItem::ToolCall {
             call_id: "frag".to_owned(),
-            name: "fs_patch".to_owned(),
+            name: "fs_edit".to_owned(),
             args: serde_json::Value::Null,
             status: ToolStatus::InProgress,
         },
@@ -612,7 +612,7 @@ fn completed_tool_call_releases_the_fragment_accumulation() {
         31,
         TurnItem::ToolCall {
             call_id: "frag".to_owned(),
-            name: "fs_patch".to_owned(),
+            name: "fs_edit".to_owned(),
             args: serde_json::json!({"big": "payload"}),
             status: ToolStatus::Completed,
         },

@@ -138,7 +138,7 @@ fn menu_options_stay_visible_and_clickable_at_ninety_by_ten() {
         "hint sheds first under pressure"
     );
     assert!(
-        !rows.iter().any(|row| row.contains("fs_patch wants")),
+        !rows.iter().any(|row| row.contains("fs_edit wants")),
         "body sheds before options"
     );
     // Hit rows come from the RENDERED positions and stay clickable.
@@ -162,7 +162,7 @@ fn menu_body_wraps_in_narrow_frames_and_options_follow() {
     // option hit rows must follow the wrapped body down.
     let model = menu_model();
     let (rows, hits, _) = draw(&model, 60, 26);
-    let body_start = row_of(&rows, "fs_patch wants to modify");
+    let body_start = row_of(&rows, "fs_edit wants to modify");
     // The wrapped remainder — the full path — lands on its own row BELOW
     // the first body row (the transcript's tool row also carries the path,
     // so search after the body start).

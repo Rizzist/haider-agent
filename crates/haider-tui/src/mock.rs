@@ -167,9 +167,9 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
         kind: MenuKind::Permission {
             effect_summary: "patch crates/haider-store/src/event_store.rs".to_owned(),
         },
-        title: "Allow fs_patch — event_store.rs?".to_owned(),
+        title: "Allow fs_edit — event_store.rs?".to_owned(),
         body: vec![
-            "fs_patch wants to modify crates/haider-store/src/event_store.rs".to_owned(),
+            "fs_edit wants to modify crates/haider-store/src/event_store.rs".to_owned(),
             "effect class: workspace write · reversible via /tree".to_owned(),
         ],
         options: vec![
@@ -188,7 +188,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
         ],
         blocking: true,
         scope: MenuScope::Session,
-        origin: "fs_patch".to_owned(),
+        origin: "fs_edit".to_owned(),
         ttl_ms: None,
         timeout_option: None,
     }));
@@ -581,7 +581,7 @@ pub fn sample_seed(index: usize) -> &'static [SeedRow] {
             meta: "14 matches",
         },
         Tool {
-            name: "fs_patch",
+            name: "fs_edit",
             desc: "cloud/src/billing/webhooks.rs",
             meta: "+128 −12",
         },
@@ -599,7 +599,7 @@ pub fn sample_seed(index: usize) -> &'static [SeedRow] {
             "Wrapping the charge client in a retry budget keyed by an idempotency header — replays can never double-charge.",
         ),
         Tool {
-            name: "fs_patch",
+            name: "fs_edit",
             desc: "cloud/src/billing/charge.rs",
             meta: "+64 −9",
         },

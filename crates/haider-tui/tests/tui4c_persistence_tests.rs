@@ -522,7 +522,7 @@ async fn answering_a_hydrated_card_lands_the_stale_menu_note() {
         kind: MenuKind::Permission {
             effect_summary: "patch src/lib.rs".to_owned(),
         },
-        title: "Allow fs_patch — lib.rs?".to_owned(),
+        title: "Allow fs_edit — lib.rs?".to_owned(),
         body: vec!["persisted across a restart".to_owned()],
         options: vec![
             MenuOption {
@@ -540,7 +540,7 @@ async fn answering_a_hydrated_card_lands_the_stale_menu_note() {
         ],
         blocking: true,
         scope: MenuScope::Session,
-        origin: "fs_patch".to_owned(),
+        origin: "fs_edit".to_owned(),
         ttl_ms: None,
         timeout_option: None,
     };

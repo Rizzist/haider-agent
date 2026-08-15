@@ -148,8 +148,8 @@ fn session_screen_shows_transcript_and_meter() {
     let (text, _) = draw(&model, 100, 30);
     assert!(text.contains("❯ fix the failing boundary test"));
     assert!(text.contains("✓ fs_read"), "tool row: status glyph + name");
-    // File changes render as the sim's fs_patch tool-row shape (G30).
-    assert!(text.contains("✓ fs_patch crates/haider-store/src/event_store.rs +4 −1"));
+    // File changes render as the sim's fs_edit tool-row shape (G30).
+    assert!(text.contains("✓ fs_edit crates/haider-store/src/event_store.rs +4 −1"));
     assert!(text.contains("IDLE"));
     assert!(text.contains("17% of 200k"));
     // F2c: the identity lives on the composer's TOP RULE (right end),
@@ -259,7 +259,7 @@ fn open_menu_replaces_the_composer_and_answers_through_the_outbox() {
     }
     assert!(model.projection.open_menu().is_some());
     let (text, _) = draw(&model, 90, 26);
-    assert!(text.contains("Allow fs_patch — event_store.rs?"));
+    assert!(text.contains("Allow fs_edit — event_store.rs?"));
     assert!(text.contains("1. Allow once"));
     assert!(text.contains("2. Deny"));
     assert!(text.contains("? PERMISSION_REQUIRED"));

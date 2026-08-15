@@ -383,7 +383,7 @@ fn failed_tool_rows_wear_the_error_glyph() {
         &EventPayload::Item(ItemEvent::Started {
             item_id: ItemId::new("tool-1"),
             item: TurnItem::ToolCall {
-                name: "fs_patch".to_owned(),
+                name: "fs_edit".to_owned(),
                 args: serde_json::json!({"path": "x.rs"}),
                 status: ToolStatus::Failed,
                 call_id: String::new(),
@@ -391,7 +391,7 @@ fn failed_tool_rows_wear_the_error_glyph() {
         }),
     ));
     assert!(
-        draw_text(&model).contains("✗ fs_patch"),
+        draw_text(&model).contains("✗ fs_edit"),
         "the failed tool is marked in the view"
     );
 }

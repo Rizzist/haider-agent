@@ -369,7 +369,7 @@ fn main() {
                     .to_owned(),
             ),
             ChipPrefill::ToolOk {
-                name: "fs_patch".to_owned(),
+                name: "fs_edit".to_owned(),
                 desc: "cloud/tests/billing/webhooks.rs".to_owned(),
                 meta: "+96 −4".to_owned(),
             },
@@ -405,7 +405,7 @@ fn main() {
                     .to_owned(),
             ),
             ChipPrefill::ToolOk {
-                name: "fs_patch".to_owned(),
+                name: "fs_edit".to_owned(),
                 desc: "docs/api/billing-webhooks.md".to_owned(),
                 meta: "+140 −0".to_owned(),
             },
