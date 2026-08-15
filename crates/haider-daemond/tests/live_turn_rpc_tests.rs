@@ -4411,6 +4411,9 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             footprint_truth: Some(ContextFootprintTruth::Exact),
             title: None,
             agent_metrics: None,
+            // Model truth: no model_selected fact yet, so the fold falls
+            // back to the create-time metadata model.
+            last_model: Some(metadata.model.clone()),
         }
     );
 
