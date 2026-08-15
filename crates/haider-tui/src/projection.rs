@@ -673,6 +673,14 @@ impl SessionProjection {
             // M2d: one child graph bound to a todo — quiet (the run-set note +
             // the aggregate render carry the story), like `GraphNodeReadied`.
             EventPayload::TodoGraphAttached(_) => {}
+            // M2e: a subagent was granted its own workflow (SPARSE by design —
+            // the decision gate defaults to a bare attempt), worth one note.
+            EventPayload::ChildGraphAttached(_) => {
+                self.push_note("⚑ subagent workflow attached".to_owned());
+            }
+            // M2e: child-template cache bookkeeping (observation → promotion) is
+            // internal — quiet until a render surfaces the reusable badge.
+            EventPayload::ChildTemplateObserved(_) | EventPayload::ChildTemplatePromoted(_) => {}
         }
     }
 
