@@ -313,6 +313,10 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         prompt: "report after branch switch".into(),
         model: None,
         provider: None,
+        workflow: None,
+        workflow_trigger: None,
+        parent_slot: None,
+        workflow_author: false,
     };
     let delegation = DelegationHandle::new(hub.clone());
     let first = delegation
@@ -588,6 +592,10 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 prompt: "inspect the parser state machine".into(),
                 model: None,
                 provider: None,
+                workflow: None,
+                workflow_trigger: None,
+                parent_slot: None,
+                workflow_author: false,
             },
         )
         .await
@@ -816,6 +824,10 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 prompt: "finish once".into(),
                 model: None,
                 provider: None,
+                workflow: None,
+                workflow_trigger: None,
+                parent_slot: None,
+                workflow_author: false,
             },
         )
         .await
@@ -1003,6 +1015,10 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 prompt: "do not cross parents".into(),
                 model: None,
                 provider: None,
+                workflow: None,
+                workflow_trigger: None,
+                parent_slot: None,
+                workflow_author: false,
             },
         )
         .await

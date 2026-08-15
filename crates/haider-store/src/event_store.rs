@@ -16,7 +16,7 @@ use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
-use haider_protocol::agent::{AgentManifest, ChildReport};
+use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
@@ -25,16 +25,18 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
-    EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GRAPH_INSPECT_MAX_RUNS,
-    GRAPH_MAX_TODO_CHILDREN, GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS, GRAPH_TELEMETRY_MAX_RUN_ROWS,
-    GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
-    GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
+    ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
+    ChildTemplatePromoted, EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict,
+    GRAPH_INSPECT_MAX_RUNS, GRAPH_MAX_TODO_CHILDREN, GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS,
+    GRAPH_TELEMETRY_MAX_RUN_ROWS, GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced,
+    GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
     GraphEvidenceSource, GraphFinalizationDeferred, GraphGateKind, GraphGateSatisfied,
     GraphInspectSnapshot, GraphNodeAttemptRow, GraphNodeName, GraphNodeReadied, GraphPhase,
     GraphPinned, GraphReduction, GraphReductions, GraphRunRow, GraphRunScope, GraphRunSetOpened,
     GraphSignalProvenance, GraphStatus, GraphSuperseded, GraphTelemetryProjection,
-    GraphTemplateRejection, GraphTemplateRollup, ProcessSignalRecorded, ProcessSignalRef,
-    SubjectSelector, TodoGraphAttached, build_node, evidence_fingerprint, graph_template,
+    GraphTemplateRejection, GraphTemplateRollup, GraphTemplateSpec, ProcessSignalRecorded,
+    ProcessSignalRef, SubjectSelector, TodoGraphAttached, build_node,
+    child_contract_subject_digest, child_gate_structure, evidence_fingerprint, graph_template,
     graph_template_digest, graph_template_rollups, normalize_evidence_detail,
     process_signal_subject_digest, reduce_graph_telemetry, reduce_graphs, todo_child_graph_id,
     todo_run_set_id, validate_graph_template,
@@ -162,6 +164,67 @@ pub enum GraphPinOutcome {
     IdempotentReplay {
         pinned: PinnedGraph,
     },
+}
+
+/// Receipt-backed cross-session attachment. The child graph has already been
+/// pinned; this transaction proves the parent attempt/slot is still exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildGraphAttachCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub parent_branch_id: Option<BranchId>,
+    pub worker_generation: u64,
+    pub attachment: ChildGraphAttached,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachedChildGraph {
+    pub parent_session_id: SessionId,
+    pub child_session_id: SessionId,
+    pub child_graph_id: GraphId,
+    pub attached_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChildGraphAttachOutcome {
+    Committed {
+        attached: AttachedChildGraph,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        attached: AttachedChildGraph,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildTemplateObservationCommand {
+    pub key: ChildTemplateCacheKey,
+    pub parent_session_id: SessionId,
+    pub parent_attempt: haider_protocol::graph::ParentGraphAttempt,
+    pub collapse_evidence_seq: u64,
+    pub child_contract: ChildContractRef,
+    pub template: GraphTemplateSpec,
+    pub worker_generation: u64,
+    pub device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildTemplateCacheEntry {
+    pub key: ChildTemplateCacheKey,
+    pub template: GraphTemplateSpec,
+    pub digest: String,
+    pub distinct_attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildTemplateObservation {
+    pub distinct_attempts: u32,
+    pub promoted: bool,
+    pub envelopes: Vec<RawEnvelope>,
 }
 
 /// Receipt-backed request to instantiate the selected template once per todo
@@ -308,6 +371,7 @@ pub struct GraphEvidenceCommand {
     pub slot: Option<String>,
     pub subject_digest: Option<String>,
     pub signal: Option<ProcessSignalRef>,
+    pub child_contract: Option<ChildContractRef>,
     pub device_id: DeviceId,
 }
 
@@ -370,6 +434,9 @@ pub struct GraphSwitchCommand {
     pub old_graph_id: GraphId,
     pub new_graph_id: GraphId,
     pub template: String,
+    /// Daemon-internal authored replacement. Ordinary RPC callers leave this
+    /// absent and continue selecting the immutable catalog by name.
+    pub template_spec: Option<GraphTemplateSpec>,
     pub device_id: DeviceId,
 }
 
@@ -2294,6 +2361,445 @@ impl Store {
         Ok(GraphPinOutcome::Committed { pinned, envelopes })
     }
 
+    /// Attaches one already-pinned child graph to the exact parent graph
+    /// attempt which admitted its spawn. This reference never enters either
+    /// graph's dependency set.
+    #[allow(clippy::result_large_err)]
+    pub fn attach_child_graph(
+        &self,
+        command: &ChildGraphAttachCommand,
+    ) -> StoreResult<ChildGraphAttachOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(attached) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "child.graph.attach",
+            &command.request_digest,
+            &command.request_json,
+            "child-graph-attach",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ChildGraphAttachOutcome::IdempotentReplay { attached });
+        }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        require_typed_session(&transaction, &command.attachment.child_session_id)?;
+        let attachment = &command.attachment;
+        let parent_reductions = self.graph_reductions(&transaction, &command.session_id)?;
+        let parent_reduction = parent_reductions
+            .graph(&attachment.parent_attempt.graph_id)
+            .ok_or_else(|| {
+                graph_evidence_error(
+                    ErrorCode::RevisionConflict,
+                    "stale_child_attachment",
+                    "parent graph attempt no longer exists",
+                )
+            })?;
+        let parent = parent_reduction.status.as_ref().ok_or_else(|| {
+            graph_evidence_error(
+                ErrorCode::RevisionConflict,
+                "stale_child_attachment",
+                "parent graph attempt has no reducible status",
+            )
+        })?;
+        if parent.graph_id != attachment.parent_attempt.graph_id
+            || parent.attempt != attachment.parent_attempt.attempt
+            || !parent.node_is_ready(&attachment.parent_attempt.node)
+        {
+            return Err(graph_evidence_error(
+                ErrorCode::RevisionConflict,
+                "stale_child_attachment",
+                "child graph does not attach to the current exact parent attempt",
+            ));
+        }
+        let parent_node = parent_reduction
+            .template_nodes
+            .iter()
+            .find(|node| node.name == attachment.parent_attempt.node)
+            .ok_or_else(|| {
+                graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "unknown_child_parent_slot",
+                    "child workflow named no declared parent graph node",
+                )
+            })?;
+        let slot = parent_node
+            .verify_slots
+            .iter()
+            .find(|slot| slot.id == attachment.parent_slot)
+            .ok_or_else(|| {
+                graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "unknown_child_parent_slot",
+                    "child workflow named no declared parent evidence slot",
+                )
+            })?;
+        if slot.authority != attachment.parent_authority {
+            return Err(graph_evidence_error(
+                ErrorCode::InvalidArgument,
+                "child_authority_growth",
+                "child workflow attachment authority differs from its parent slot grant",
+            ));
+        }
+        let attached_slot_is_required = match parent_node.gate {
+            GraphGateKind::AllOfN { n } => usize::try_from(n).ok().is_some_and(|required| {
+                required > parent_node.verify_slots.len().saturating_sub(1)
+            }),
+            GraphGateKind::CommandGreen | GraphGateKind::HumanConfirm => false,
+        };
+        if !attached_slot_is_required {
+            return Err(graph_evidence_error(
+                ErrorCode::InvalidArgument,
+                "non_reservable_parent_slot",
+                "workflow attachment slot is not required to settle its parent attempt",
+            ));
+        }
+        let logical_attachments = load_child_graph_attachments(&transaction, &command.session_id)?
+            .into_iter()
+            .filter(|existing| {
+                existing.parent_attempt == attachment.parent_attempt
+                    && existing.parent_slot == attachment.parent_slot
+            })
+            .collect::<Vec<_>>();
+        if !logical_attachments.is_empty() {
+            let kind = if logical_attachments.len() == 1 && logical_attachments[0] == *attachment {
+                "duplicate_child_attachment"
+            } else {
+                "colliding_child_attachment"
+            };
+            return Err(graph_evidence_error(
+                ErrorCode::RevisionConflict,
+                kind,
+                "parent attempt slot already owns a child graph attachment",
+            ));
+        }
+        let delegation = lookup_delegation_by_parent_call(
+            &transaction,
+            &command.session_id,
+            &attachment.parent_run_id,
+            &attachment.parent_call_id,
+        )?
+        .ok_or_else(|| {
+            graph_evidence_error(
+                ErrorCode::InvalidArgument,
+                "mismatched_child_provenance",
+                "child workflow has no durable delegation coordinates",
+            )
+        })?;
+        if delegation.tool_item_id != attachment.parent_tool_item_id
+            || delegation.child_session_id != attachment.child_session_id
+            || delegation.child_run_id != attachment.child_run_id
+        {
+            return Err(graph_evidence_error(
+                ErrorCode::InvalidArgument,
+                "mismatched_child_provenance",
+                "child workflow attachment differs from its delegation record",
+            ));
+        }
+        let child_reductions = self.graph_reductions(&transaction, &attachment.child_session_id)?;
+        let child = child_reductions
+            .graph(&attachment.child_graph_id)
+            .and_then(|reduction| reduction.status.as_ref())
+            .ok_or_else(|| {
+                graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "mismatched_child_provenance",
+                    "attached child graph is not pinned in the child session",
+                )
+            })?;
+        if child.template != attachment.template || child.digest != attachment.digest {
+            return Err(graph_evidence_error(
+                ErrorCode::RevisionConflict,
+                "mismatched_child_provenance",
+                "attached child graph does not match its pinned template",
+            ));
+        }
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "child.graph.attach",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let mut envelopes = graph_command_envelopes(
+            command,
+            vec![EventPayload::ChildGraphAttached(attachment.clone())],
+        )?;
+        envelopes[0].branch_id = command.parent_branch_id.clone();
+        envelopes[0].run_id = Some(attachment.parent_run_id.clone());
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let attached = AttachedChildGraph {
+            parent_session_id: command.session_id.clone(),
+            child_session_id: attachment.child_session_id.clone(),
+            child_graph_id: attachment.child_graph_id.clone(),
+            attached_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            Some(attachment.parent_run_id.as_str()),
+            Some(attached.attached_seq),
+            &attached,
+            now,
+            "child-graph-attach",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(ChildGraphAttachOutcome::Committed {
+            attached,
+            envelopes,
+        })
+    }
+
+    /// Records one successful equivalent child workflow observation. Journal
+    /// facts are the cache authority; no mutable cache table can outrun them.
+    #[allow(clippy::result_large_err)]
+    pub fn observe_child_template_success(
+        &self,
+        command: &ChildTemplateObservationCommand,
+    ) -> StoreResult<ChildTemplateObservation> {
+        validate_child_cache_key(&command.key)?;
+        validate_pinned_graph_template(&command.template)?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if child_gate_structure(&command.template) != command.key.gate_structure {
+            return Err(child_cache_error(
+                "colliding_child_template_cache",
+                "template gate structure differs from its simple cache key",
+            ));
+        }
+        let digest = graph_template_digest(&command.template);
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_typed_session(&transaction, &command.parent_session_id)?;
+        graph_attempt_opened_seq(
+            &transaction,
+            &command.parent_session_id,
+            &command.parent_attempt.graph_id,
+            command.parent_attempt.node.clone(),
+            command.parent_attempt.attempt,
+        )?;
+        let collapse = load_envelope(
+            &transaction,
+            &command.parent_session_id,
+            command.collapse_evidence_seq,
+        )?
+        .ok_or_else(|| {
+            child_cache_error(
+                "unsuccessful_child_template_observation",
+                "cache observation names no durable collapsed child evidence",
+            )
+        })?;
+        let evidence = match serde_json::from_value::<EventPayload>(collapse.payload) {
+            Ok(EventPayload::EvidenceRecorded(evidence)) => evidence,
+            _ => {
+                return Err(child_cache_error(
+                    "unsuccessful_child_template_observation",
+                    "cache observation sequence is not graph evidence",
+                ));
+            }
+        };
+        let source_matches = matches!(
+            &evidence.source,
+            GraphEvidenceSource::ChildContract {
+                child_session_id,
+                child_run_id,
+                child_graph_id,
+                report_digest,
+                workspace_revision,
+            } if child_session_id == &command.child_contract.child_session_id
+                && child_run_id == &command.child_contract.child_run_id
+                && child_graph_id == &command.child_contract.child_graph_id
+                && report_digest == &command.child_contract.report_digest
+                && workspace_revision == &command.child_contract.workspace_revision
+        );
+        if evidence.graph_id != command.parent_attempt.graph_id
+            || evidence.node != command.parent_attempt.node
+            || evidence.attempt != command.parent_attempt.attempt
+            || evidence.verdict != EvidenceVerdict::Green
+            || !source_matches
+        {
+            return Err(child_cache_error(
+                "unsuccessful_child_template_observation",
+                "cache promotion requires exact green collapsed child evidence",
+            ));
+        }
+        let attachments = load_child_graph_attachments(&transaction, &command.parent_session_id)?
+            .into_iter()
+            .filter(|attached| {
+                attached.parent_attempt == command.parent_attempt
+                    && attached.child_session_id == command.child_contract.child_session_id
+                    && attached.child_run_id == command.child_contract.child_run_id
+                    && attached.child_graph_id == command.child_contract.child_graph_id
+            })
+            .collect::<Vec<_>>();
+        let [attached] = attachments.as_slice() else {
+            return Err(child_cache_error(
+                "unsuccessful_child_template_observation",
+                "cache observation has no single exact unchanged child attachment",
+            ));
+        };
+        if evidence.slot.as_deref() != Some(attached.parent_slot.as_str())
+            || evidence.subject_digest.as_deref()
+                != Some(child_contract_subject_digest(&command.child_contract).as_str())
+        {
+            return Err(child_cache_error(
+                "unsuccessful_child_template_observation",
+                "collapsed evidence slot or subject differs from its child attachment",
+            ));
+        }
+        if attached.cache_key != command.key
+            || attached.template != command.template.name
+            || attached.digest != digest
+        {
+            return Err(child_cache_error(
+                "colliding_child_template_cache",
+                "successful child attachment differs from the cache observation",
+            ));
+        }
+        let mut observations = load_child_template_observations(&transaction)?;
+        validate_child_cache_bucket(&transaction, &command.key, &observations)?;
+        let exact = observations.iter().any(|(session_id, observed)| {
+            session_id == &command.parent_session_id
+                && observed.cache_key == command.key
+                && observed.parent_attempt == command.parent_attempt
+        });
+        if exact {
+            let distinct_attempts = child_cache_distinct_attempts(&command.key, &observations);
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ChildTemplateObservation {
+                distinct_attempts,
+                promoted: distinct_attempts >= 3,
+                envelopes: Vec::new(),
+            });
+        }
+        let observed = ChildTemplateObserved {
+            cache_key: command.key.clone(),
+            parent_attempt: command.parent_attempt.clone(),
+            collapse_evidence_seq: command.collapse_evidence_seq,
+            child_contract: command.child_contract.clone(),
+            template: command.template.clone(),
+            digest: digest.clone(),
+        };
+        observations.push((command.parent_session_id.clone(), observed.clone()));
+        validate_child_cache_bucket(&transaction, &command.key, &observations)?;
+        let distinct_attempts = child_cache_distinct_attempts(&command.key, &observations);
+        let bucket_digest = command.key.digest();
+        let attempt_string = command.parent_attempt.attempt.to_string();
+        let event_id = EventId::new(format!(
+            "child-template-observed-{}",
+            stable_digest(&[
+                &bucket_digest,
+                command.parent_session_id.as_str(),
+                command.parent_attempt.graph_id.as_str(),
+                command.parent_attempt.node.as_str(),
+                &attempt_string,
+            ])
+        ));
+        let mut envelopes = vec![unstamped_command_envelope(
+            event_id,
+            &command.parent_session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            command.worker_generation,
+            EventPayload::ChildTemplateObserved(observed),
+            PromptRender::Omit,
+        )?];
+        if distinct_attempts == 3 {
+            envelopes.push(unstamped_command_envelope(
+                EventId::new(format!("child-template-promoted-{}", command.key.digest())),
+                &command.parent_session_id,
+                None,
+                None,
+                command.device_id.clone(),
+                command.worker_generation,
+                EventPayload::ChildTemplatePromoted(ChildTemplatePromoted {
+                    cache_key: command.key.clone(),
+                    template: command.template.name.clone(),
+                    digest,
+                    distinct_parent_attempts: distinct_attempts,
+                }),
+                PromptRender::Omit,
+            )?);
+        }
+        append_transaction_envelopes(
+            &transaction,
+            &command.parent_session_id,
+            now_ms()?,
+            &mut envelopes,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(ChildTemplateObservation {
+            distinct_attempts,
+            promoted: distinct_attempts >= 3,
+            envelopes,
+        })
+    }
+
+    /// Loads a promoted child template and revalidates current bounds,
+    /// authority policy, key payload, digest, and gate structure every time.
+    #[allow(clippy::result_large_err)]
+    pub fn child_template_cache_lookup(
+        &self,
+        key: &ChildTemplateCacheKey,
+    ) -> StoreResult<Option<ChildTemplateCacheEntry>> {
+        validate_child_cache_key(key)?;
+        let connection = self.connection()?;
+        let observations = load_child_template_observations(&connection)?;
+        validate_child_cache_bucket(&connection, key, &observations)?;
+        let distinct_attempts = child_cache_distinct_attempts(key, &observations);
+        if distinct_attempts < 3 {
+            return Ok(None);
+        }
+        let observed = observations
+            .iter()
+            .find_map(|(_, observed)| (observed.cache_key == *key).then_some(observed))
+            .ok_or_else(|| corrupt("promoted child cache bucket has no observation"))?;
+        validate_pinned_graph_template(&observed.template).map_err(|_| {
+            child_cache_error(
+                "poisoned_child_template_cache",
+                "cached child template failed bounds, authority, or policy revalidation",
+            )
+        })?;
+        if graph_template_digest(&observed.template) != observed.digest
+            || child_gate_structure(&observed.template) != key.gate_structure
+        {
+            return Err(child_cache_error(
+                "poisoned_child_template_cache",
+                "cached child template failed digest or gate-structure revalidation",
+            ));
+        }
+        Ok(Some(ChildTemplateCacheEntry {
+            key: key.clone(),
+            template: observed.template.clone(),
+            digest: observed.digest.clone(),
+            distinct_attempts,
+        }))
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn graph_switch_receipt(
         &self,
@@ -2344,13 +2850,23 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let template = graph_template(&command.template).ok_or_else(|| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("unknown graph template `{}`", command.template),
-                false,
-            )
-        })?;
+        let template = match command.template_spec.clone() {
+            Some(template) if template.name == command.template => template,
+            Some(_) => {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "authored workflow name differs from its switch selector",
+                    false,
+                ));
+            }
+            None => graph_template(&command.template).ok_or_else(|| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown graph template `{}`", command.template),
+                    false,
+                )
+            })?,
+        };
         validate_pinned_graph_template(&template)?;
         let reductions = self.graph_reductions(&transaction, &command.session_id)?;
         if reductions.active_root.as_ref() != Some(&command.old_graph_id) {
@@ -2731,6 +3247,25 @@ impl Store {
                     })?,
             )
         };
+        if command.child_contract.is_none()
+            && let Some(slot_id) = command.slot.as_deref()
+        {
+            let reserved = load_child_graph_attachments(&transaction, &command.session_id)?
+                .into_iter()
+                .any(|attached| {
+                    attached.parent_attempt.graph_id == graph_id
+                        && attached.parent_attempt.node == current_node
+                        && attached.parent_attempt.attempt == attempt
+                        && attached.parent_slot == slot_id
+                });
+            if reserved {
+                return Err(graph_evidence_error(
+                    ErrorCode::RevisionConflict,
+                    "child_slot_reserved",
+                    "parent evidence slot is reserved for its attached child contract",
+                ));
+            }
+        }
         if let (Some(signal_ref), Some(slot_id)) =
             (command.signal.as_ref(), command.slot.as_deref())
         {
@@ -6578,7 +7113,7 @@ fn graph_evidence_provenance(
                 call_id,
                 effect_id,
             } => Some((run_id.clone(), call_id.clone(), effect_id.clone())),
-            GraphEvidenceSource::Model { .. } => None,
+            GraphEvidenceSource::Model { .. } | GraphEvidenceSource::ChildContract { .. } => None,
         })
         .collect::<HashSet<_>>();
     let mut signals = HashMap::<(RunId, String, EffectId), ProcessSignalRecorded>::new();
@@ -6649,7 +7184,9 @@ fn graph_evidence_provenance(
                         subject_digest: signal.subject_digest.clone(),
                         artifact: signal.artifact.clone(),
                     }),
-                GraphEvidenceSource::Model { .. } => None,
+                GraphEvidenceSource::Model { .. } | GraphEvidenceSource::ChildContract { .. } => {
+                    None
+                }
             };
             Ok(GraphEvidenceProvenanceRow {
                 seq: envelope.seq,
@@ -6780,6 +7317,21 @@ trait GraphCommandCoordinates {
 }
 
 impl GraphCommandCoordinates for GraphPinCommand {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+    fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+}
+
+impl GraphCommandCoordinates for ChildGraphAttachCommand {
     fn command_id(&self) -> &str {
         &self.command_id
     }
@@ -7222,6 +7774,17 @@ fn validate_graph_evidence_authority(
     graph_id: &GraphId,
     attempt: u32,
 ) -> StoreResult<GraphEvidenceSource> {
+    if let Some(contract) = command.child_contract.as_ref() {
+        return validate_child_contract_authority(
+            transaction,
+            session_id,
+            command,
+            slot,
+            graph_id,
+            attempt,
+            contract,
+        );
+    }
     let Some(slot) = slot else {
         if command.signal.is_some() || command.subject_digest.is_some() {
             return Err(graph_evidence_error(
@@ -7333,6 +7896,242 @@ fn validate_graph_evidence_authority(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+fn validate_child_contract_authority(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    command: &GraphEvidenceCommand,
+    slot: Option<&EvidenceSlotSpec>,
+    graph_id: &GraphId,
+    attempt: u32,
+    contract: &ChildContractRef,
+) -> StoreResult<GraphEvidenceSource> {
+    if command.signal.is_some() {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "wrong_evidence_authority",
+            "a child contract cannot also claim process-signal provenance",
+        ));
+    }
+    let slot = slot.ok_or_else(|| {
+        graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "unknown_evidence_slot",
+            "a child contract requires one declared parent slot",
+        )
+    })?;
+    let expected_subject = child_contract_subject_digest(contract);
+    if command.subject_digest.as_deref() != Some(expected_subject.as_str()) {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            "collapsed child subject does not match its revision/report provenance",
+        ));
+    }
+    if slot.subject_selector == SubjectSelector::WorkspaceRevision
+        && contract.workspace_revision.is_none()
+    {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            "parent workspace-revision slot requires a child terminal revision",
+        ));
+    }
+    let attachments = load_child_graph_attachments(transaction, session_id)?
+        .into_iter()
+        .filter(|attached| {
+            attached.parent_run_id == command.run_id
+                && attached.parent_call_id == command.call_id
+                && attached.parent_attempt.graph_id == *graph_id
+                && attached.parent_attempt.node == command.node
+                && attached.parent_attempt.attempt == attempt
+                && attached.parent_slot == slot.id
+                && attached.child_session_id == contract.child_session_id
+                && attached.child_run_id == contract.child_run_id
+        })
+        .collect::<Vec<_>>();
+    let [attached] = attachments.as_slice() else {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_child_provenance",
+            "child contract has zero or multiple exact parent-attempt attachments",
+        ));
+    };
+    if attached.parent_authority != slot.authority {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "child_authority_growth",
+            "child contract attempted to exceed its attached parent authority grant",
+        ));
+    }
+    if !child_graph_is_descendant(
+        transaction,
+        &contract.child_session_id,
+        &attached.child_graph_id,
+        &contract.child_graph_id,
+    )? {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_child_provenance",
+            "terminal child graph is not the attached graph or its authored replacement",
+        ));
+    }
+    let delegation = lookup_delegation_by_parent_call(
+        transaction,
+        session_id,
+        &attached.parent_run_id,
+        &attached.parent_call_id,
+    )?
+    .ok_or_else(|| {
+        graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_child_provenance",
+            "child contract delegation no longer exists",
+        )
+    })?;
+    if delegation.tool_item_id != attached.parent_tool_item_id
+        || delegation.child_session_id != contract.child_session_id
+        || delegation.child_run_id != contract.child_run_id
+    {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_child_provenance",
+            "child contract differs from durable delegation coordinates",
+        ));
+    }
+    let report = delegation.report.as_ref().ok_or_else(|| {
+        graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_child_provenance",
+            "child contract has no durable terminal report",
+        )
+    })?;
+    let report_bytes = serde_json::to_vec(report)
+        .map_err(|error| corrupt(format!("cannot re-encode durable child report: {error}")))?;
+    if blake3::hash(&report_bytes).to_hex().as_str() != contract.report_digest
+        || report.workspace_revision != contract.workspace_revision
+    {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "mismatched_child_provenance",
+            "child report digest or revision differs from the collapsed contract",
+        ));
+    }
+    let child = load_graph_reductions(transaction, &contract.child_session_id)?
+        .graph(&contract.child_graph_id)
+        .and_then(|reduction| reduction.status.clone())
+        .ok_or_else(|| {
+            graph_evidence_error(
+                ErrorCode::InvalidArgument,
+                "mismatched_child_provenance",
+                "collapsed child graph does not exist in the child session",
+            )
+        })?;
+    let terminal_matches = match child.phase {
+        GraphPhase::Completed => {
+            command.verdict == EvidenceVerdict::Green && report.verified != ReportVerification::Red
+        }
+        GraphPhase::Abandoned => command.verdict == EvidenceVerdict::Red,
+        _ => false,
+    };
+    if !terminal_matches {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "non_terminal_child_contract",
+            "child evidence must match one completed or abandoned terminal graph",
+        ));
+    }
+    if child.phase == GraphPhase::Completed
+        && slot.authority == EvidenceAuthority::DaemonVerified
+        && !child.nodes.iter().any(|node| {
+            node.evidence_slots.iter().any(|evidence| {
+                evidence.authority == EvidenceAuthority::DaemonVerified
+                    && evidence.verdict == Some(EvidenceVerdict::Green)
+                    && matches!(
+                        evidence.source,
+                        Some(GraphEvidenceSource::ProcessSignal { .. })
+                    )
+            })
+        })
+    {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "child_authority_growth",
+            "completed child graph lacks daemon process proof required by its parent slot",
+        ));
+    }
+    Ok(GraphEvidenceSource::ChildContract {
+        child_session_id: contract.child_session_id.clone(),
+        child_run_id: contract.child_run_id.clone(),
+        child_graph_id: contract.child_graph_id.clone(),
+        report_digest: contract.report_digest.clone(),
+        workspace_revision: contract.workspace_revision.clone(),
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn load_child_graph_attachments(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Vec<ChildGraphAttached>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND instr(envelope_json, '\"type\":\"child_graph_attached\"') > 0
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    statement
+        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?
+        .filter_map(|json| match json {
+            Err(error) => Some(Err(map_sqlite_error(error))),
+            Ok(json) => match serde_json::from_str::<RawEnvelope>(&json) {
+                Err(error) => Some(Err(corrupt(format!(
+                    "invalid child attachment envelope in session {session_id}: {error}"
+                )))),
+                Ok(envelope) => match serde_json::from_value::<EventPayload>(envelope.payload) {
+                    Ok(EventPayload::ChildGraphAttached(attached)) => Some(Ok(attached)),
+                    _ => None,
+                },
+            },
+        })
+        .collect()
+}
+
+#[allow(clippy::result_large_err)]
+fn child_graph_is_descendant(
+    connection: &Connection,
+    session_id: &SessionId,
+    attached: &GraphId,
+    terminal: &GraphId,
+) -> StoreResult<bool> {
+    if attached == terminal {
+        return Ok(true);
+    }
+    let mut next = HashMap::<GraphId, GraphId>::new();
+    for envelope in load_graph_reduction_envelopes(connection, session_id)? {
+        if let Ok(EventPayload::GraphSuperseded(replaced)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            next.insert(replaced.old, replaced.new);
+        }
+    }
+    let mut cursor = attached.clone();
+    let mut visited = HashSet::new();
+    while visited.insert(cursor.clone()) {
+        let Some(replacement) = next.get(&cursor).cloned() else {
+            return Ok(false);
+        };
+        if &replacement == terminal {
+            return Ok(true);
+        }
+        cursor = replacement;
+    }
+    Ok(false)
+}
+
 fn graph_evidence_error(
     code: ErrorCode,
     kind: &'static str,
@@ -7341,6 +8140,199 @@ fn graph_evidence_error(
     let mut error = store_error(code, message, false);
     error.details = Some(serde_json::json!({ "kind": kind }));
     error
+}
+
+fn child_cache_error(kind: &'static str, message: impl Into<String>) -> HaiderError {
+    let mut error = store_error(ErrorCode::RevisionConflict, message, false);
+    error.details = Some(serde_json::json!({ "kind": kind }));
+    error
+}
+
+#[allow(clippy::result_large_err)]
+fn load_child_template_observations(
+    connection: &Connection,
+) -> StoreResult<Vec<(SessionId, ChildTemplateObserved)>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE instr(envelope_json, '\"type\":\"child_template_observed\"') > 0
+             ORDER BY session_id ASC, seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?
+        .filter_map(|json| match json {
+            Err(error) => Some(Err(map_sqlite_error(error))),
+            Ok(json) => match serde_json::from_str::<RawEnvelope>(&json) {
+                Err(error) => Some(Err(corrupt(format!(
+                    "invalid child cache observation envelope: {error}"
+                )))),
+                Ok(envelope) => match serde_json::from_value::<EventPayload>(envelope.payload) {
+                    Ok(EventPayload::ChildTemplateObserved(observed)) => {
+                        Some(Ok((envelope.session_id, observed)))
+                    }
+                    _ => None,
+                },
+            },
+        })
+        .collect()
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_child_cache_bucket(
+    connection: &Connection,
+    key: &ChildTemplateCacheKey,
+    observations: &[(SessionId, ChildTemplateObserved)],
+) -> StoreResult<()> {
+    let bucket = key.digest();
+    let mut template_digest = None::<&str>;
+    for (session_id, observed) in observations
+        .iter()
+        .filter(|(_, observed)| observed.cache_key.digest() == bucket)
+    {
+        if observed.cache_key != *key {
+            return Err(child_cache_error(
+                "colliding_child_template_cache",
+                "child template cache digest contains a different simple key payload",
+            ));
+        }
+        let recomputed = graph_template_digest(&observed.template);
+        if recomputed != observed.digest
+            || child_gate_structure(&observed.template) != key.gate_structure
+            || template_digest.is_some_and(|digest| digest != observed.digest)
+            || validate_pinned_graph_template(&observed.template).is_err()
+        {
+            return Err(child_cache_error(
+                "poisoned_child_template_cache",
+                "child template cache bucket contains a colliding or malformed template",
+            ));
+        }
+        validate_child_template_observation_provenance(
+            connection,
+            session_id,
+            observed,
+            "poisoned_child_template_cache",
+        )?;
+        template_digest = Some(&observed.digest);
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_child_template_observation_provenance(
+    connection: &Connection,
+    session_id: &SessionId,
+    observed: &ChildTemplateObserved,
+    error_kind: &'static str,
+) -> StoreResult<()> {
+    let reject = |message| child_cache_error(error_kind, message);
+    let collapse = load_envelope(connection, session_id, observed.collapse_evidence_seq)?
+        .ok_or_else(|| reject("cached observation names no collapsed evidence"))?;
+    let evidence = match serde_json::from_value::<EventPayload>(collapse.payload) {
+        Ok(EventPayload::EvidenceRecorded(evidence)) => evidence,
+        _ => return Err(reject("cached observation sequence is not graph evidence")),
+    };
+    let source_matches = matches!(
+        &evidence.source,
+        GraphEvidenceSource::ChildContract {
+            child_session_id,
+            child_run_id,
+            child_graph_id,
+            report_digest,
+            workspace_revision,
+        } if child_session_id == &observed.child_contract.child_session_id
+            && child_run_id == &observed.child_contract.child_run_id
+            && child_graph_id == &observed.child_contract.child_graph_id
+            && report_digest == &observed.child_contract.report_digest
+            && workspace_revision == &observed.child_contract.workspace_revision
+    );
+    if evidence.graph_id != observed.parent_attempt.graph_id
+        || evidence.node != observed.parent_attempt.node
+        || evidence.attempt != observed.parent_attempt.attempt
+        || evidence.verdict != EvidenceVerdict::Green
+        || !source_matches
+    {
+        return Err(reject(
+            "cached observation is not exact green collapsed child evidence",
+        ));
+    }
+    let attachments = load_child_graph_attachments(connection, session_id)?
+        .into_iter()
+        .filter(|attached| {
+            attached.parent_attempt == observed.parent_attempt
+                && attached.child_session_id == observed.child_contract.child_session_id
+                && attached.child_run_id == observed.child_contract.child_run_id
+                && attached.child_graph_id == observed.child_contract.child_graph_id
+        })
+        .collect::<Vec<_>>();
+    let [attached] = attachments.as_slice() else {
+        return Err(reject(
+            "cached observation has no single exact unchanged child attachment",
+        ));
+    };
+    if evidence.slot.as_deref() != Some(attached.parent_slot.as_str())
+        || evidence.subject_digest.as_deref()
+            != Some(child_contract_subject_digest(&observed.child_contract).as_str())
+        || attached.cache_key != observed.cache_key
+        || attached.template != observed.template.name
+        || attached.digest != observed.digest
+    {
+        return Err(reject(
+            "cached observation differs from its child attachment or contract subject",
+        ));
+    }
+    Ok(())
+}
+
+fn child_cache_distinct_attempts(
+    key: &ChildTemplateCacheKey,
+    observations: &[(SessionId, ChildTemplateObserved)],
+) -> u32 {
+    u32::try_from(
+        observations
+            .iter()
+            .filter(|(_, observed)| observed.cache_key == *key)
+            .map(|(session_id, observed)| {
+                (
+                    session_id.clone(),
+                    observed.parent_attempt.graph_id.clone(),
+                    observed.parent_attempt.node.clone(),
+                    observed.parent_attempt.attempt,
+                )
+            })
+            .collect::<HashSet<_>>()
+            .len(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+fn stable_digest(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_child_cache_key(key: &ChildTemplateCacheKey) -> StoreResult<()> {
+    let bounded = !key.task_shape.is_empty()
+        && key.task_shape.len() <= 128
+        && !key.effective_grant_digest.is_empty()
+        && key.effective_grant_digest.len() <= 128
+        && !key.gate_structure.is_empty()
+        && key.gate_structure.len() <= 8 * 1024;
+    if bounded {
+        Ok(())
+    } else {
+        Err(store_error(
+            ErrorCode::InvalidArgument,
+            "child template cache key exceeds its simple bounded shape",
+            false,
+        ))
+    }
 }
 
 fn process_signal_event_id(session_id: &SessionId, effect_id: &EffectId) -> EventId {
@@ -8675,11 +9667,11 @@ fn resolution_by_menu(
 }
 
 fn load_envelope(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     session_id: &SessionId,
     seq: u64,
 ) -> StoreResult<Option<RawEnvelope>> {
-    let envelope_json = transaction
+    let envelope_json = connection
         .query_row(
             "SELECT envelope_json FROM events WHERE session_id = ?1 AND seq = ?2",
             params![session_id.as_str(), to_sqlite_integer(seq)?],

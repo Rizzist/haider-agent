@@ -4091,6 +4091,7 @@ impl HubConnection {
             old_graph_id,
             new_graph_id: GraphId::new(random_id("graph")?),
             template,
+            template_spec: None,
             device_id: self.hub.inner.device_id.clone(),
         };
         let switched = match self.hub.switch_graph(command).await {

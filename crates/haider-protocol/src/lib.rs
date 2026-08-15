@@ -113,6 +113,9 @@ pub enum EventPayload {
     ProcessSignalRecorded(graph::ProcessSignalRecorded),
     GraphRunSetOpened(graph::GraphRunSetOpened),
     TodoGraphAttached(graph::TodoGraphAttached),
+    ChildGraphAttached(graph::ChildGraphAttached),
+    ChildTemplateObserved(graph::ChildTemplateObserved),
+    ChildTemplatePromoted(graph::ChildTemplatePromoted),
     // accounts
     Rotation(credential::RotationEvent),
     // token accounting

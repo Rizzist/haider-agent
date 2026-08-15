@@ -5,7 +5,7 @@ use haider_protocol::effect::EffectClass;
 use haider_protocol::effect::{EffectOutcome, EffectPhase};
 use haider_protocol::ids::SessionId;
 use haider_protocol::tool::DispatchMode;
-use haider_tools::{EffectBroker, JournalSink, PermissionPolicy, ToolResult};
+use haider_tools::{EffectBroker, EffectOperation, JournalSink, PermissionPolicy, ToolResult};
 use haider_tools::{SpawnSubagent, spawn_subagent_manifest};
 
 #[derive(Default)]
@@ -55,6 +55,25 @@ fn spawn_arguments_are_trimmed_and_bounded() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn m2e_legacy_spawn_arguments_remain_byte_for_byte_plain() {
+    // MUTATION CHECK: serialize any default workflow field. Expected failure:
+    // the frozen legacy argument value gains a key below.
+    let request = SpawnSubagent::from_tool_args(serde_json::json!({
+        "task": "tests",
+        "prompt": "run them"
+    }))
+    .expect("legacy request");
+    assert_eq!(
+        request.arguments().expect("arguments"),
+        serde_json::json!({"task":"tests","prompt":"run them"})
+    );
+    assert!(request.workflow.is_none());
+    assert!(request.workflow_trigger.is_none());
+    assert!(request.parent_slot.is_none());
+    assert!(!request.workflow_author);
 }
 
 /// MUTATION CHECK: keep the AgentSpawn effect dispatched until simulated

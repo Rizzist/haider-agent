@@ -496,6 +496,7 @@ async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
             slot: None,
             subject_digest: None,
             signal: None,
+            child_contract: None,
             device_id: world.device_id.clone(),
         })
         .await

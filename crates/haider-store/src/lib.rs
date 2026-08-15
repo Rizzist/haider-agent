@@ -24,8 +24,10 @@ pub use cas::FileCas;
 pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AbandonedGraph, AcceptedShellExec, AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse,
-    AccountAddReceiptRow, AccountRemoveReceiptRow, BranchCreateCommand, BranchCreateOutcome,
-    CachedModels, CancelledTurn, CommittedSeqRange, ContextCompactionClaim,
+    AccountAddReceiptRow, AccountRemoveReceiptRow, AttachedChildGraph, BranchCreateCommand,
+    BranchCreateOutcome, CachedModels, CancelledTurn, ChildGraphAttachCommand,
+    ChildGraphAttachOutcome, ChildTemplateCacheEntry, ChildTemplateObservation,
+    ChildTemplateObservationCommand, CommittedSeqRange, ContextCompactionClaim,
     ContextCompactionReceiptResponse, CreatedBranch, CreatedSession, DelegationCreateOutcome,
     DelegationDescendant, DelegationDescendants, DelegationRecord, DelegationState, EventStore,
     GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,

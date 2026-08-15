@@ -9,13 +9,16 @@ use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPh
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::graph::{
-    EvidenceAuthority, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphCompleted,
-    GraphExecutorShape, GraphFinalizationDeferred, GraphGateKind, GraphNodeName, GraphNodeSpec,
-    GraphPhase, GraphPinned, GraphRunScope, GraphRunSetOpened, GraphSuperseded, GraphTemplateSpec,
-    ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE, STAGGERED_TEMPLATE,
-    SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector, TodoGraphAttached, evidence_fingerprint,
-    graph_template, graph_template_catalog, graph_template_digest, process_signal_subject_digest,
-    reduce_graph_telemetry, ship_loop_nodes,
+    ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
+    ChildWorkflowSelector, EvidenceAuthority, EvidenceRecorded, EvidenceVerdict,
+    GraphAttemptOpened, GraphBlockReason, GraphCompleted, GraphEvidenceSource, GraphExecutorShape,
+    GraphFinalizationDeferred, GraphGateKind, GraphNodeName, GraphNodeSpec, GraphPhase,
+    GraphPinned, GraphRunScope, GraphRunSetOpened, GraphSuperseded, GraphTemplateSpec,
+    ParentGraphAttempt, ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE,
+    STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector, TodoGraphAttached, build_node,
+    child_contract_subject_digest, child_gate_structure, evidence_fingerprint, graph_template,
+    graph_template_catalog, graph_template_digest, implement_verify_child_template,
+    process_signal_subject_digest, reduce_graph_telemetry, ship_loop_nodes,
 };
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{
@@ -25,11 +28,11 @@ use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
 use haider_store::{
-    EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphPinCommand,
-    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
-    GraphSwitchOutcome, MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand,
-    ProcessSignalOutcome, SessionCreateCommand, Store,
+    ChildTemplateObservationCommand, EventStore, GraphAbandonCommand, GraphAbandonOutcome,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
+    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
+    GraphSwitchCommand, GraphSwitchOutcome, MenuResolutionCommand, MenuResolutionOutcome,
+    ProcessSignalCommand, ProcessSignalOutcome, SessionCreateCommand, Store,
 };
 
 fn create_session(store: &Store, name: &str) -> SessionId {
@@ -120,6 +123,7 @@ fn evidence_command(
         slot: None,
         subject_digest: None,
         signal: None,
+        child_contract: None,
         device_id: DeviceId::new("graph-test"),
     }
 }
@@ -1767,6 +1771,7 @@ fn switch_command(
         old_graph_id,
         new_graph_id,
         template: template.into(),
+        template_spec: None,
         device_id: DeviceId::new("graph-test"),
     }
 }
@@ -3558,5 +3563,277 @@ fn m2c_graph_inspect_is_bounded_paged_and_never_exposes_evidence_detail() {
     assert!(clamped.snapshot.runs.len() <= haider_protocol::graph::GRAPH_INSPECT_MAX_RUNS);
     assert!(
         clamped.snapshot.template_rollups.len() <= haider_protocol::graph::GRAPH_INSPECT_MAX_RUNS
+    );
+}
+
+#[test]
+fn m2e_child_template_cache_promotes_only_after_three_distinct_parent_attempts() {
+    // MUTATION CHECK: promote on first sight or count replay of one parent
+    // attempt twice. Expected failure: lookup succeeds before observation 3.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let template = implement_verify_child_template();
+    let key = ChildTemplateCacheKey {
+        task_shape: "mutation_verify".into(),
+        effective_grant_digest: "grant-v1".into(),
+        gate_structure: child_gate_structure(&template),
+    };
+    let mut commands = Vec::new();
+    for index in 1..=3 {
+        let session = create_session(&store, &format!("m2e-cache-parent-{index}"));
+        let graph_id = pin(&store, &session, &format!("m2e-cache-{index}"));
+        let parent_attempt = ParentGraphAttempt {
+            graph_id: graph_id.clone(),
+            node: build_node(),
+            attempt: 1,
+        };
+        let child_session_id = SessionId::new(format!("m2e-cache-child-{index}"));
+        let child_run_id = RunId::new(format!("m2e-cache-child-run-{index}"));
+        let child_graph_id = GraphId::new(format!("m2e-cache-child-graph-{index}"));
+        let contract = ChildContractRef {
+            child_session_id: child_session_id.clone(),
+            child_run_id: child_run_id.clone(),
+            child_graph_id: child_graph_id.clone(),
+            report_digest: format!("report-{index}"),
+            workspace_revision: None,
+        };
+        let contract_subject = child_contract_subject_digest(&contract);
+        let source = GraphEvidenceSource::ChildContract {
+            child_session_id: child_session_id.clone(),
+            child_run_id: child_run_id.clone(),
+            child_graph_id: child_graph_id.clone(),
+            report_digest: contract.report_digest.clone(),
+            workspace_revision: None,
+        };
+        let mut success_facts = [
+            raw_envelope(
+                &store,
+                &session,
+                &RunId::new(format!("m2e-cache-parent-run-{index}")),
+                format!("m2e-cache-attachment-{index}"),
+                EventPayload::ChildGraphAttached(ChildGraphAttached {
+                    parent_run_id: RunId::new(format!("m2e-cache-parent-run-{index}")),
+                    parent_call_id: format!("m2e-cache-call-{index}"),
+                    parent_tool_item_id: ItemId::new(format!("m2e-cache-tool-{index}")),
+                    parent_attempt: parent_attempt.clone(),
+                    parent_slot: "cache-slot".into(),
+                    parent_authority: EvidenceAuthority::ModelAttested,
+                    child_session_id,
+                    child_run_id,
+                    child_graph_id,
+                    workflow: ChildWorkflowSelector::ImplementVerify,
+                    template: template.name.clone(),
+                    digest: graph_template_digest(&template),
+                    gate_reason: "mutation_with_independent_verification".into(),
+                    cache_key: key.clone(),
+                    cache_hit: false,
+                    workflow_author: false,
+                }),
+            ),
+            raw_envelope(
+                &store,
+                &session,
+                &RunId::new(format!("m2e-cache-parent-run-{index}")),
+                format!("m2e-cache-collapse-{index}"),
+                EventPayload::EvidenceRecorded(EvidenceRecorded {
+                    graph_id: graph_id.clone(),
+                    node: build_node(),
+                    attempt: 1,
+                    verdict: EvidenceVerdict::Green,
+                    detail: "successful child contract".into(),
+                    fingerprint: format!("cache-fingerprint-{index}"),
+                    slot: Some("cache-slot".into()),
+                    subject_digest: Some(contract_subject),
+                    source,
+                }),
+            ),
+        ];
+        store
+            .append(&mut success_facts)
+            .expect("append successful child provenance");
+        commands.push(ChildTemplateObservationCommand {
+            key: key.clone(),
+            parent_session_id: session,
+            parent_attempt,
+            collapse_evidence_seq: success_facts[1].seq,
+            child_contract: contract,
+            template: template.clone(),
+            worker_generation: store.worker_generation(),
+            device_id: DeviceId::new("graph-test"),
+        });
+    }
+
+    let mut unsuccessful = commands[0].clone();
+    unsuccessful.collapse_evidence_seq -= 1;
+    let error = store
+        .observe_child_template_success(&unsuccessful)
+        .expect_err("an attachment without green collapsed evidence is not a success");
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("unsuccessful_child_template_observation")
+    );
+
+    let first = store
+        .observe_child_template_success(&commands[0])
+        .expect("first observation");
+    assert_eq!(first.distinct_attempts, 1);
+    assert!(!first.promoted);
+    assert!(
+        store
+            .child_template_cache_lookup(&key)
+            .expect("lookup")
+            .is_none()
+    );
+    let replay = store
+        .observe_child_template_success(&commands[0])
+        .expect("same attempt replay");
+    assert_eq!(replay.distinct_attempts, 1);
+    assert!(replay.envelopes.is_empty());
+
+    let second = store
+        .observe_child_template_success(&commands[1])
+        .expect("second observation");
+    assert_eq!(second.distinct_attempts, 2);
+    assert!(!second.promoted);
+    assert!(
+        store
+            .child_template_cache_lookup(&key)
+            .expect("lookup")
+            .is_none()
+    );
+
+    let third = store
+        .observe_child_template_success(&commands[2])
+        .expect("third observation");
+    assert_eq!(third.distinct_attempts, 3);
+    assert!(third.promoted);
+    assert_eq!(
+        third.envelopes.len(),
+        2,
+        "observation plus one promotion fact"
+    );
+    let cached = store
+        .child_template_cache_lookup(&key)
+        .expect("promoted lookup")
+        .expect("promoted template");
+    assert_eq!(cached.distinct_attempts, 3);
+    assert_eq!(cached.digest, graph_template_digest(&template));
+}
+
+#[test]
+fn m2e_cached_template_is_revalidated_and_poison_is_typed() {
+    // MUTATION CHECK: trust the cached template without recomputing its
+    // bounds/digest/policy. Expected failure: malformed injected facts load.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let mut malformed = implement_verify_child_template();
+    malformed.nodes[0].max_attempts = haider_protocol::graph::GRAPH_MAX_ATTEMPTS + 1;
+    let key = ChildTemplateCacheKey {
+        task_shape: "mutation_verify".into(),
+        effective_grant_digest: "grant-poison".into(),
+        gate_structure: child_gate_structure(&malformed),
+    };
+    for index in 1..=3 {
+        let session = create_session(&store, &format!("m2e-poison-parent-{index}"));
+        let observed = ChildTemplateObserved {
+            cache_key: key.clone(),
+            parent_attempt: ParentGraphAttempt {
+                graph_id: GraphId::new(format!("poison-graph-{index}")),
+                node: build_node(),
+                attempt: 1,
+            },
+            collapse_evidence_seq: 1,
+            child_contract: ChildContractRef {
+                child_session_id: SessionId::new(format!("poison-child-{index}")),
+                child_run_id: RunId::new(format!("poison-child-run-{index}")),
+                child_graph_id: GraphId::new(format!("poison-child-graph-{index}")),
+                report_digest: format!("poison-report-{index}"),
+                workspace_revision: None,
+            },
+            digest: graph_template_digest(&malformed),
+            template: malformed.clone(),
+        };
+        let mut envelope = [raw_envelope(
+            &store,
+            &session,
+            &RunId::new(format!("poison-run-{index}")),
+            format!("poison-observation-{index}"),
+            EventPayload::ChildTemplateObserved(observed),
+        )];
+        store
+            .append(&mut envelope)
+            .expect("inject poisoned cache fact");
+    }
+    let error = store
+        .child_template_cache_lookup(&key)
+        .expect_err("cached bounds are revalidated on every reuse");
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("poisoned_child_template_cache")
+    );
+}
+
+#[test]
+fn m2e_cached_success_provenance_is_revalidated_on_every_reuse() {
+    // MUTATION CHECK: trust append-injected observations solely because their
+    // template bytes validate. Expected failure: this fake-success bucket is
+    // promoted despite having no green collapse or child attachment.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let template = implement_verify_child_template();
+    let key = ChildTemplateCacheKey {
+        task_shape: "mutation_verify".into(),
+        effective_grant_digest: "grant-forged-success".into(),
+        gate_structure: child_gate_structure(&template),
+    };
+    for index in 1..=3 {
+        let session = create_session(&store, &format!("m2e-forged-parent-{index}"));
+        let observed = ChildTemplateObserved {
+            cache_key: key.clone(),
+            parent_attempt: ParentGraphAttempt {
+                graph_id: GraphId::new(format!("forged-graph-{index}")),
+                node: build_node(),
+                attempt: 1,
+            },
+            collapse_evidence_seq: 1,
+            child_contract: ChildContractRef {
+                child_session_id: SessionId::new(format!("forged-child-{index}")),
+                child_run_id: RunId::new(format!("forged-child-run-{index}")),
+                child_graph_id: GraphId::new(format!("forged-child-graph-{index}")),
+                report_digest: format!("forged-report-{index}"),
+                workspace_revision: None,
+            },
+            digest: graph_template_digest(&template),
+            template: template.clone(),
+        };
+        let mut envelope = [raw_envelope(
+            &store,
+            &session,
+            &RunId::new(format!("forged-run-{index}")),
+            format!("forged-observation-{index}"),
+            EventPayload::ChildTemplateObserved(observed),
+        )];
+        store
+            .append(&mut envelope)
+            .expect("inject forged observation");
+    }
+    let error = store
+        .child_template_cache_lookup(&key)
+        .expect_err("reuse revalidates successful collapse provenance");
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("poisoned_child_template_cache")
     );
 }

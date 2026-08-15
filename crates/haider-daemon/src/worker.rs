@@ -43,12 +43,12 @@ use haider_core::{
     ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
     DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
-    HarnessActor, HarnessConfig, PartialStreamCheckpoint, ProcessSignalCommand,
-    ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
-    estimate_provider_request_input_tokens, presentation_for_haider_error,
-    sanitized_failure_message,
+    GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
+    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
+    presentation_for_haider_error, sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
@@ -65,7 +65,8 @@ use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
 use haider_protocol::ids::{
-    AgentId, BranchId, DeviceId, EffectId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, BranchId, DeviceId, EffectId, EventId, GraphId, ItemId, MenuId, NodeId, RunId,
+    SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, effect_recovery_menu};
@@ -92,7 +93,7 @@ use haider_tools::{
     FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink, MessageSubagent,
     PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds, SessionGrant,
     SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
-    WebFetch,
+    WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -3916,7 +3917,10 @@ async fn start_turn(
     // Dynamic graph state is deliberately outside durable prompt history and
     // the stable system/tool prefix. Root sessions receive one bounded,
     // turn-scoped user-role tail; delegated children receive no parent graph.
-    let graph_brief = if agent_id.is_none() {
+    let workflow_child = grant
+        .as_ref()
+        .is_some_and(|grant| grant.tools.iter().any(|tool| tool == "graph_evidence"));
+    let graph_brief = if agent_id.is_none() || workflow_child {
         lease
             .hub()
             .graph_status(lease.session_id())
@@ -5305,6 +5309,7 @@ pub(crate) enum RegisteredToolRoute {
     FsEdit,
     FsPatch,
     ProcessExec,
+    WorkflowAuthor,
     SpawnSubagent,
     MessageSubagent,
     TaskOutput,
@@ -5368,6 +5373,14 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 manifest,
                 default: ToolPermissionDefault::NotApplicable,
                 route: RegisteredToolRoute::GraphEvidence,
+            }
+        },
+        {
+            let manifest = haider_tools::workflow_author_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::NotApplicable,
+                route: RegisteredToolRoute::WorkflowAuthor,
             }
         },
         registered_tool(
@@ -5502,7 +5515,9 @@ pub(crate) fn default_child_grant() -> Grant {
             .filter(|entry| {
                 !matches!(
                     entry.route,
-                    RegisteredToolRoute::TodoWrite | RegisteredToolRoute::GraphEvidence
+                    RegisteredToolRoute::TodoWrite
+                        | RegisteredToolRoute::GraphEvidence
+                        | RegisteredToolRoute::WorkflowAuthor
                 )
             })
             .map(|entry| entry.manifest.name.clone())
@@ -5512,7 +5527,9 @@ pub(crate) fn default_child_grant() -> Grant {
             .filter(|entry| {
                 !matches!(
                     entry.route,
-                    RegisteredToolRoute::TodoWrite | RegisteredToolRoute::GraphEvidence
+                    RegisteredToolRoute::TodoWrite
+                        | RegisteredToolRoute::GraphEvidence
+                        | RegisteredToolRoute::WorkflowAuthor
                 )
             })
             .flat_map(|entry| entry.manifest.effects.iter().cloned())
@@ -5666,6 +5683,8 @@ pub(crate) fn advertised_tool_definitions(
                             .all(|effect| effect_within_grant(grant, effect))
                     })
         });
+    } else {
+        definitions.retain(|definition| definition.name != "workflow_author");
     }
     // First-party Anthropic pairs carry the SERVER `web_fetch` tool, so the
     // local client tool is withheld — UNLESS the session's server tools
@@ -5803,7 +5822,12 @@ struct BrokerToolDispatcher {
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
     async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
-        if self.parent_agent_id.is_some() {
+        if self.parent_agent_id.is_some()
+            && self
+                .grant
+                .as_ref()
+                .is_none_or(|grant| !grant.tools.iter().any(|tool| tool == "graph_evidence"))
+        {
             return Ok(None);
         }
         let brief = self
@@ -5922,6 +5946,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 slot: request.slot,
                 subject_digest: request.subject_digest,
                 signal: request.signal,
+                child_contract: None,
                 device_id: self.output.device_id.clone(),
             };
             let recorded = match self.output.store.hub().record_graph_evidence(command).await {
@@ -5966,6 +5991,100 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .unwrap_or_else(|_| "{\"ok\":true}".into());
             return Ok(ToolDispatchResult::Completed(BoundedResult {
                 preview,
+                truncated: false,
+                artifact: None,
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            }));
+        }
+        if route == RegisteredToolRoute::WorkflowAuthor {
+            let authorized = self.parent_agent_id.is_some()
+                && self
+                    .grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.tools.iter().any(|tool| tool == "workflow_author"));
+            if !authorized {
+                return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
+            }
+            let request = WorkflowAuthor::from_tool_args(args).map_err(tool_error)?;
+            if request.template.nodes.iter().any(|node| {
+                matches!(
+                    node.gate,
+                    haider_protocol::graph::GraphGateKind::HumanConfirm
+                )
+            }) {
+                return Ok(ToolDispatchResult::Completed(BoundedResult {
+                    preview: serde_json::json!({
+                        "status": "rejected",
+                        "kind": "child_human_gate_forbidden",
+                    })
+                    .to_string(),
+                    truncated: false,
+                    artifact: None,
+                    cursor: None,
+                    status: ToolResultStatus::Rejected,
+                    reason: Some("delegated workflows cannot contain a human-confirm gate".into()),
+                    presentation: None,
+                }));
+            }
+            let current = self
+                .output
+                .store
+                .hub()
+                .graph_status(&self.session_id)
+                .await
+                .map_err(hub_error)?
+                .filter(haider_protocol::graph::GraphStatus::is_unfinished)
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::GraphNotActive,
+                        "workflow_author requires this child's active graph",
+                        false,
+                    )
+                })?;
+            let request_json = serde_json::to_string(&request)
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+            let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+            let new_graph_id = GraphId::new(format!(
+                "graph-authored-{}",
+                crate::delegation::stable_digest(&[
+                    self.session_id.as_str(),
+                    run_id.as_str(),
+                    call_id,
+                ])
+            ));
+            let switched = self
+                .output
+                .store
+                .hub()
+                .switch_graph(GraphSwitchCommand {
+                    command_id: format!("workflow-author-{new_graph_id}"),
+                    request_digest,
+                    request_json,
+                    session_id: self.session_id.clone(),
+                    worker_generation: self.output.store.worker_generation(),
+                    old_graph_id: current.graph_id,
+                    new_graph_id,
+                    template: request.template.name.clone(),
+                    template_spec: Some(request.template),
+                    device_id: self.output.device_id.clone(),
+                })
+                .await
+                .map_err(hub_error)?;
+            let switched = match switched {
+                GraphSwitchOutcome::Committed { switched, .. }
+                | GraphSwitchOutcome::IdempotentReplay { switched } => switched,
+            };
+            return Ok(ToolDispatchResult::Completed(BoundedResult {
+                preview: serde_json::json!({
+                    "ok": true,
+                    "graph_id": switched.new_graph_id,
+                    "template": switched.template,
+                    "digest": switched.digest,
+                })
+                .to_string(),
                 truncated: false,
                 artifact: None,
                 cursor: None,
@@ -6504,6 +6623,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::GraphEvidence
+            | RegisteredToolRoute::WorkflowAuthor
             | RegisteredToolRoute::SpawnSubagent
             | RegisteredToolRoute::MessageSubagent => {
                 return Err(HaiderError::new(

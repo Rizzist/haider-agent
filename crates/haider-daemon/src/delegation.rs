@@ -17,8 +17,10 @@
 use crate::session_hub::SessionHub;
 use crate::usage_report::SessionFolder;
 use haider_core::{
-    AcceptedTurn, CancelToken, DeferredTicket, DeferredToolResult, DelegationCreateOutcome,
-    DelegationRecord, DelegationState, SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand,
+    AcceptedTurn, CancelToken, ChildGraphAttachCommand, ChildTemplateObservationCommand,
+    DeferredTicket, DeferredToolResult, DelegationCreateOutcome, DelegationRecord, DelegationState,
+    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphPinCommand, GraphPinOutcome, SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::{
@@ -30,7 +32,15 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{AgentId, BranchId, EventId, ItemId, LeaseId, RunId, SessionId};
+use haider_protocol::graph::{
+    ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildWorkflowDecision,
+    ChildWorkflowTrigger, EvidenceAuthority, EvidenceVerdict, GraphPhase, ParentGraphAttempt,
+    child_contract_subject_digest, child_gate_structure, decide_child_workflow, graph_template,
+    graph_template_digest, validate_graph_template,
+};
+use haider_protocol::ids::{
+    AgentId, BranchId, EventId, GraphId, ItemId, LeaseId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -177,12 +187,104 @@ impl DelegationHandle {
         let child_session_id = SessionId::new(format!("session-child-{identity}"));
         let child_run_id = RunId::new(format!("run-child-{identity}"));
         let lease = LeaseId::new(format!("lease-child-{identity}"));
-        let requested_grant = crate::worker::default_child_grant();
+        let decision = decide_child_workflow(
+            request.workflow.as_ref(),
+            request.workflow_trigger,
+            request.workflow_author,
+        );
+        let mut requested_grant = crate::worker::default_child_grant();
+        let mut workflow = self
+            .prepare_child_workflow(
+                &coordinates,
+                &request,
+                &decision,
+                &child_session_id,
+                &child_run_id,
+                &identity,
+                &requested_grant,
+            )
+            .await?;
+        if workflow.is_some() {
+            if !requested_grant
+                .tools
+                .iter()
+                .any(|tool| tool == "graph_evidence")
+            {
+                requested_grant.tools.push("graph_evidence".into());
+            }
+            if decision.workflow_author
+                && !requested_grant
+                    .tools
+                    .iter()
+                    .any(|tool| tool == "workflow_author")
+            {
+                requested_grant.tools.push("workflow_author".into());
+            }
+        }
         let grant = match ancestry.parent_grant.as_ref() {
             Some(parent) => crate::worker::intersect_grant(requested_grant, parent),
             None => requested_grant,
         };
         crate::worker::validate_grant(&grant)?;
+        if let Some(attached) = workflow.as_mut() {
+            if !grant.tools.iter().any(|tool| tool == "graph_evidence") {
+                return Err(workflow_rejection(
+                    "insufficient_child_workflow_grant",
+                    "effective child grant withholds graph_evidence required by its workflow",
+                ));
+            }
+            if attached.parent_authority == EvidenceAuthority::DaemonVerified
+                && !grant
+                    .effect_ceiling
+                    .iter()
+                    .any(|effect| effect == &EffectClass::ProcessExec)
+            {
+                return Err(workflow_rejection(
+                    "child_authority_growth",
+                    "effective child grant withholds the daemon proof capability required by its parent slot",
+                ));
+            }
+            if decision.workflow_author && !grant.tools.iter().any(|tool| tool == "workflow_author")
+            {
+                return Err(workflow_rejection(
+                    "insufficient_child_workflow_grant",
+                    "effective child grant withholds the gated workflow_author capability",
+                ));
+            }
+            attached.cache_key.effective_grant_digest = child_grant_digest(&grant)?;
+            if let Some(cached) = self
+                .hub
+                .child_template_cache_lookup(attached.cache_key.clone())
+                .await?
+            {
+                if cached.template.name != attached.template || cached.digest != attached.digest {
+                    return Err(workflow_rejection(
+                        "colliding_child_template_cache",
+                        "promoted child template differs from the selected workflow",
+                    ));
+                }
+                attached.cache_hit = true;
+            }
+        }
+        let mut manifest_coordinates = serde_json::json!({
+            "parent_session_id": coordinates.parent_session_id,
+            "parent_run_id": coordinates.parent_run_id,
+            "call_id": coordinates.call_id,
+            "tool_item_id": coordinates.tool_item_id,
+            // W6d: the chip view attaches to the child directly.
+            "child_session_id": child_session_id,
+            // S3: this exact coordinate is also the child prompt's
+            // authority; clients never reproduce the private hash seam.
+            "handoff_dir": handoff_dir.to_string_lossy(),
+        });
+        if let Some(attached) = &workflow {
+            manifest_coordinates["child_graph"] =
+                serde_json::to_value(attached).map_err(internal_serialization)?;
+        }
+        if request.workflow.is_some() {
+            manifest_coordinates["workflow_decision"] =
+                serde_json::to_value(&decision).map_err(internal_serialization)?;
+        }
         let manifest = AgentManifest {
             agent: agent_id.clone(),
             role: AgentRole::Subagent,
@@ -199,17 +301,7 @@ impl DelegationHandle {
             fencing_epoch: self.hub.worker_generation(),
             attempt: 0,
             parent: coordinates.parent_agent_id.clone(),
-            coordinates: Some(serde_json::json!({
-                "parent_session_id": coordinates.parent_session_id,
-                "parent_run_id": coordinates.parent_run_id,
-                "call_id": coordinates.call_id,
-                "tool_item_id": coordinates.tool_item_id,
-                // W6d: the chip view attaches to the child directly.
-                "child_session_id": child_session_id,
-                // S3: this exact coordinate is also the child prompt's
-                // authority; clients never reproduce the private hash seam.
-                "handoff_dir": handoff_dir.to_string_lossy(),
-            })),
+            coordinates: Some(manifest_coordinates),
         };
         manifest.placement.ensure_local()?;
         // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — a child must
@@ -279,6 +371,46 @@ impl DelegationHandle {
             DelegationCreateOutcome::Committed(record)
             | DelegationCreateOutcome::IdempotentReplay(record) => record,
         };
+        if let Some(attached) = workflow {
+            let pin_request = serde_json::to_string(&serde_json::json!({
+                "session_id": attached.child_session_id,
+                "graph_id": attached.child_graph_id,
+                "template": attached.template,
+            }))
+            .map_err(internal_serialization)?;
+            match self
+                .hub
+                .pin_graph(GraphPinCommand {
+                    command_id: format!("delegation-graph-pin-{identity}"),
+                    request_digest: digest_bytes(pin_request.as_bytes()),
+                    request_json: pin_request,
+                    session_id: attached.child_session_id.clone(),
+                    worker_generation: self.hub.worker_generation(),
+                    graph_id: attached.child_graph_id.clone(),
+                    template: attached.template.clone(),
+                    device_id: self.hub.device_id(),
+                })
+                .await
+                .map_err(hub_graph_error)?
+            {
+                GraphPinOutcome::Committed { .. } | GraphPinOutcome::IdempotentReplay { .. } => {}
+            }
+            let attach_request =
+                serde_json::to_string(&attached).map_err(internal_serialization)?;
+            self.hub
+                .attach_child_graph(ChildGraphAttachCommand {
+                    command_id: format!("delegation-graph-attach-{identity}"),
+                    request_digest: digest_bytes(attach_request.as_bytes()),
+                    request_json: attach_request,
+                    session_id: record.parent_session_id.clone(),
+                    parent_branch_id: record.parent_branch_id.clone(),
+                    worker_generation: self.hub.worker_generation(),
+                    attachment: attached,
+                    device_id: self.hub.device_id(),
+                })
+                .await
+                .map_err(hub_graph_error)?;
+        }
         let turn_text = format!(
             "Delegated task: {}\n\n{}\n\nReturn a concise final report for the parent agent.",
             record.task, record.prompt
@@ -331,6 +463,132 @@ impl DelegationHandle {
             .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_child_workflow(
+        &self,
+        coordinates: &SpawnCoordinates,
+        request: &SpawnSubagent,
+        decision: &ChildWorkflowDecision,
+        child_session_id: &SessionId,
+        child_run_id: &RunId,
+        identity: &str,
+        requested_grant: &Grant,
+    ) -> Result<Option<ChildGraphAttached>, HaiderError> {
+        let Some(template_name) = decision.template.as_deref() else {
+            return Ok(None);
+        };
+        let parent = self
+            .hub
+            .graph_status(&coordinates.parent_session_id)
+            .await
+            .map_err(hub_graph_error)?
+            .filter(|status| status.phase == GraphPhase::Active)
+            .ok_or_else(|| {
+                workflow_rejection(
+                    "missing_parent_attempt",
+                    "a child workflow requires an active parent graph attempt",
+                )
+            })?;
+        let node = parent.current_node.clone().ok_or_else(|| {
+            workflow_rejection(
+                "missing_parent_attempt",
+                "active parent graph has no open workflow obligation",
+            )
+        })?;
+        if !parent.node_is_ready(&node) {
+            return Err(workflow_rejection(
+                "missing_parent_attempt",
+                "parent graph node is not ready for delegation",
+            ));
+        }
+        let parent_slot = request.parent_slot.as_deref().ok_or_else(|| {
+            workflow_rejection(
+                "missing_parent_slot",
+                "a workflow child must name its single parent evidence slot",
+            )
+        })?;
+        let slot = parent
+            .nodes
+            .iter()
+            .find(|candidate| candidate.node == node)
+            .and_then(|candidate| {
+                candidate
+                    .evidence_slots
+                    .iter()
+                    .find(|slot| slot.id == parent_slot)
+            })
+            .ok_or_else(|| {
+                workflow_rejection(
+                    "unknown_parent_slot",
+                    "workflow child named no declared slot on the parent obligation",
+                )
+            })?;
+        let template = graph_template(template_name).ok_or_else(|| {
+            workflow_rejection(
+                "unknown_child_workflow",
+                format!("unknown child workflow template `{template_name}`"),
+            )
+        })?;
+        validate_graph_template(&template)
+            .map_err(|error| workflow_rejection("malformed_child_workflow", error.to_string()))?;
+        if template.nodes.iter().any(|node| {
+            matches!(
+                node.gate,
+                haider_protocol::graph::GraphGateKind::HumanConfirm
+            )
+        }) {
+            return Err(workflow_rejection(
+                "child_human_gate_forbidden",
+                "delegated workflows cannot contain a human-confirm gate",
+            ));
+        }
+        if slot.authority == EvidenceAuthority::DaemonVerified {
+            let daemon_proof = template.nodes.iter().any(|node| {
+                node.verify_slots
+                    .iter()
+                    .any(|slot| slot.authority == EvidenceAuthority::DaemonVerified)
+            });
+            let process_granted = requested_grant
+                .effect_ceiling
+                .iter()
+                .any(|effect| effect == &EffectClass::ProcessExec);
+            if !daemon_proof || !process_granted {
+                return Err(workflow_rejection(
+                    "child_authority_growth",
+                    "child workflow was not granted the daemon proof capability required by its parent slot",
+                ));
+            }
+        }
+        let digest = graph_template_digest(&template);
+        let parent_attempt = ParentGraphAttempt {
+            graph_id: parent.graph_id,
+            node,
+            attempt: parent.attempt,
+        };
+        Ok(Some(ChildGraphAttached {
+            parent_run_id: coordinates.parent_run_id.clone(),
+            parent_call_id: coordinates.call_id.clone(),
+            parent_tool_item_id: coordinates.tool_item_id.clone(),
+            parent_attempt,
+            parent_slot: parent_slot.to_owned(),
+            parent_authority: slot.authority,
+            child_session_id: child_session_id.clone(),
+            child_run_id: child_run_id.clone(),
+            child_graph_id: GraphId::new(format!("graph-child-{identity}")),
+            workflow: decision.requested.clone(),
+            template: template.name.clone(),
+            digest,
+            gate_reason: decision.reason.clone(),
+            cache_key: ChildTemplateCacheKey {
+                task_shape: child_task_shape(decision.trigger),
+                effective_grant_digest: child_grant_digest(requested_grant)?,
+                gate_structure: child_gate_structure(&template),
+            },
+            cache_hit: false,
+            workflow_author: decision.workflow_author,
+        }))
+    }
+
     pub(crate) async fn launch(&self, established: &EstablishedSpawn) -> Result<(), HaiderError> {
         self.hub
             .mark_delegation_running(established.ticket.manifest.agent.clone())
@@ -345,6 +603,28 @@ impl DelegationHandle {
         ticket: &DeferredTicket,
         error: &HaiderError,
     ) -> Result<(), HaiderError> {
+        if let Some(record) = self.hub.delegation(ticket.manifest.agent.clone()).await?
+            && delegation_child_graph(&record)?.is_some()
+        {
+            let request_json = r#"{"why":"child launch failed"}"#.to_owned();
+            match self
+                .hub
+                .abandon_graph(GraphAbandonCommand {
+                    command_id: format!("delegation-launch-abandon-{}", record.agent_id),
+                    request_digest: digest_bytes(request_json.as_bytes()),
+                    request_json,
+                    session_id: record.child_session_id,
+                    worker_generation: self.hub.worker_generation(),
+                    why: "child launch failed".into(),
+                    device_id: self.hub.device_id(),
+                })
+                .await
+                .map_err(hub_graph_error)?
+            {
+                GraphAbandonOutcome::Committed { .. }
+                | GraphAbandonOutcome::IdempotentReplay { .. } => {}
+            }
+        }
         let report = ChildReport {
             agent: ticket.manifest.agent.clone(),
             summary: haider_core::sanitized_failure_message(&error.message),
@@ -380,6 +660,7 @@ impl DelegationHandle {
             if let Some(report) = record.report.clone() {
                 self.mirror_until_child_terminal(&record, &mut chip_mirror)
                     .await?;
+                self.collapse_child_contract(&record, &report).await?;
                 let chip = if report.verified == ReportVerification::Red {
                     ChipState::Error
                 } else {
@@ -398,13 +679,14 @@ impl DelegationHandle {
                     .hub
                     .record_delegation_report(record.agent_id.clone(), completion.report)
                     .await?;
-                let report = stored.report.ok_or_else(|| {
+                let report = stored.report.clone().ok_or_else(|| {
                     HaiderError::new(
                         ErrorCode::StoreCorrupt,
                         "reported delegation has no report body",
                         false,
                     )
                 })?;
+                self.collapse_child_contract(&stored, &report).await?;
                 return Ok(DeferredToolResult {
                     report,
                     chip: completion.chip,
@@ -440,6 +722,120 @@ impl DelegationHandle {
                     ));
                 }
                 () = tokio::time::sleep(CHILD_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    async fn collapse_child_contract(
+        &self,
+        record: &DelegationRecord,
+        report: &ChildReport,
+    ) -> Result<(), HaiderError> {
+        let Some(attached) = delegation_child_graph(record)? else {
+            return Ok(());
+        };
+        let child = self
+            .hub
+            .graph_status(&record.child_session_id)
+            .await
+            .map_err(hub_graph_error)?
+            .ok_or_else(|| {
+                workflow_rejection(
+                    "mismatched_child_provenance",
+                    "workflow child report has no attached graph status",
+                )
+            })?;
+        let verdict = match child.phase {
+            GraphPhase::Completed => EvidenceVerdict::Green,
+            GraphPhase::Abandoned => EvidenceVerdict::Red,
+            _ => {
+                return Err(workflow_rejection(
+                    "non_terminal_child_contract",
+                    "workflow child must complete or explicitly abandon its graph before report collapse",
+                ));
+            }
+        };
+        let report_bytes = serde_json::to_vec(report).map_err(internal_serialization)?;
+        let contract = ChildContractRef {
+            child_session_id: record.child_session_id.clone(),
+            child_run_id: record.child_run_id.clone(),
+            child_graph_id: child.graph_id.clone(),
+            report_digest: digest_bytes(&report_bytes),
+            workspace_revision: report.workspace_revision.clone(),
+        };
+        let subject_digest = child_contract_subject_digest(&contract);
+        let cache_equivalent = contract.child_graph_id == attached.child_graph_id;
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "attachment": attached,
+            "contract": contract,
+            "verdict": verdict,
+        }))
+        .map_err(internal_serialization)?;
+        let command_id = format!(
+            "child-contract-collapse-{}",
+            stable_digest(&[
+                record.parent_session_id.as_str(),
+                record.parent_run_id.as_str(),
+                &record.call_id,
+                contract.child_graph_id.as_str(),
+            ])
+        );
+        match self
+            .hub
+            .record_graph_evidence(GraphEvidenceCommand {
+                command_id,
+                request_digest: digest_bytes(request_json.as_bytes()),
+                request_json,
+                session_id: record.parent_session_id.clone(),
+                worker_generation: self.hub.worker_generation(),
+                run_id: record.parent_run_id.clone(),
+                call_id: record.call_id.clone(),
+                graph_id: attached.parent_attempt.graph_id.clone(),
+                node: attached.parent_attempt.node.clone(),
+                verdict,
+                detail: format!(
+                    "child workflow {} {}: {}",
+                    attached.child_graph_id,
+                    if verdict == EvidenceVerdict::Green {
+                        "completed"
+                    } else {
+                        "abandoned"
+                    },
+                    report.summary
+                ),
+                slot: Some(attached.parent_slot.clone()),
+                subject_digest: Some(subject_digest),
+                signal: None,
+                child_contract: Some(contract.clone()),
+                device_id: self.hub.device_id(),
+            })
+            .await
+            .map_err(hub_graph_error)?
+        {
+            GraphEvidenceOutcome::Committed { recorded, .. }
+            | GraphEvidenceOutcome::IdempotentReplay { recorded } => {
+                if verdict == EvidenceVerdict::Green && cache_equivalent {
+                    let template = graph_template(&attached.template).ok_or_else(|| {
+                        workflow_rejection(
+                            "unknown_child_workflow",
+                            "attached child template disappeared before cache observation",
+                        )
+                    })?;
+                    self.hub
+                        .observe_child_template_success(ChildTemplateObservationCommand {
+                            key: attached.cache_key.clone(),
+                            parent_session_id: record.parent_session_id.clone(),
+                            parent_attempt: attached.parent_attempt.clone(),
+                            collapse_evidence_seq: recorded.evidence_seq,
+                            child_contract: contract,
+                            template,
+                            worker_generation: self.hub.worker_generation(),
+                            device_id: self.hub.device_id(),
+                        })
+                        .await
+                        .map_err(hub_graph_error)?;
+                }
+                Ok(())
             }
         }
     }
@@ -998,6 +1394,7 @@ impl DelegationHandle {
         let mut terminal = None;
         let mut summary = None;
         let mut failure = None;
+        let mut latest_revision = None;
         loop {
             let page = self
                 .hub
@@ -1034,6 +1431,11 @@ impl DelegationHandle {
                         item: TurnItem::AgentMessage { text },
                         ..
                     }) if !text.trim().is_empty() => summary = Some(text),
+                    haider_protocol::EventPayload::ProcessSignalRecorded(signal) => {
+                        if signal.workspace_revision.is_some() {
+                            latest_revision = signal.workspace_revision;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1041,12 +1443,27 @@ impl DelegationHandle {
         let Some(state) = terminal else {
             return Ok(None);
         };
+        let workflow_graph = if delegation_child_graph(record)?.is_some() {
+            self.hub
+                .graph_status(&record.child_session_id)
+                .await
+                .map_err(hub_graph_error)?
+        } else {
+            None
+        };
         let (summary, verified, chip) = match state {
-            RunState::Done => (
-                summary.unwrap_or_else(|| "subagent completed without a text report".into()),
-                ReportVerification::Unverified,
-                ChipState::Done,
-            ),
+            RunState::Done => {
+                let verified = match workflow_graph.as_ref().map(|graph| graph.phase) {
+                    Some(GraphPhase::Completed) => ReportVerification::Verified,
+                    Some(GraphPhase::Abandoned) => ReportVerification::Red,
+                    _ => ReportVerification::Unverified,
+                };
+                (
+                    summary.unwrap_or_else(|| "subagent completed without a text report".into()),
+                    verified,
+                    ChipState::Done,
+                )
+            }
             RunState::Errored => (
                 failure.unwrap_or_else(|| "subagent failed without public failure detail".into()),
                 ReportVerification::Red,
@@ -1069,7 +1486,7 @@ impl DelegationHandle {
                 agent: record.agent_id.clone(),
                 summary,
                 verified,
-                workspace_revision: None,
+                workspace_revision: workflow_graph.and(latest_revision),
             },
             chip,
             truncated,
@@ -1797,6 +2214,69 @@ fn not_owned_child(agent: &AgentId) -> HaiderError {
         "agent": agent,
     }));
     error
+}
+
+fn workflow_rejection(kind: &'static str, message: impl Into<String>) -> HaiderError {
+    let mut error = HaiderError::new(ErrorCode::InvalidArgument, message, false);
+    error.details = Some(serde_json::json!({ "kind": kind }));
+    error
+}
+
+fn delegation_child_graph(
+    record: &DelegationRecord,
+) -> Result<Option<ChildGraphAttached>, HaiderError> {
+    let Some(value) = record
+        .manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("child_graph"))
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("delegation child graph marker is malformed: {error}"),
+                false,
+            )
+        })
+}
+
+fn hub_graph_error(error: crate::session_hub::SessionHubError) -> HaiderError {
+    match error {
+        crate::session_hub::SessionHubError::Store(error) => error,
+        other => HaiderError::new(ErrorCode::Internal, other.to_string(), false),
+    }
+}
+
+fn child_task_shape(trigger: Option<ChildWorkflowTrigger>) -> String {
+    match trigger {
+        Some(ChildWorkflowTrigger::MutationWithIndependentVerification) => "mutation_verify".into(),
+        Some(ChildWorkflowTrigger::DependentPhases) => "dependent_phases".into(),
+        Some(ChildWorkflowTrigger::FanOut) => "fan_out".into(),
+        Some(ChildWorkflowTrigger::DistinctReview) => "distinct_review".into(),
+        Some(ChildWorkflowTrigger::CrashRecovery) => "crash_recovery".into(),
+        None => "bare".into(),
+    }
+}
+
+fn child_grant_digest(grant: &Grant) -> Result<String, HaiderError> {
+    let mut tools = grant.tools.clone();
+    tools.sort();
+    tools.dedup();
+    let mut effects = grant
+        .effect_ceiling
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_serialization)?;
+    effects.sort();
+    effects.dedup();
+    serde_json::to_vec(&(tools, effects))
+        .map(|bytes| digest_bytes(&bytes))
+        .map_err(internal_serialization)
 }
 
 fn handoff_session_short(session_id: &SessionId) -> String {

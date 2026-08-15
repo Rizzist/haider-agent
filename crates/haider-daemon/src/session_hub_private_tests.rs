@@ -96,6 +96,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
         slot: None,
         subject_digest: None,
         signal: None,
+        child_contract: None,
         device_id: DeviceId::new("graph-test"),
     })
     .await

@@ -1,5 +1,6 @@
 use crate::{EffectOperation, ToolError, ToolResult};
 use haider_protocol::effect::EffectClass;
+use haider_protocol::graph::{ChildWorkflowSelector, ChildWorkflowTrigger};
 use haider_protocol::tool::{DispatchMode, ToolManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +26,18 @@ pub struct SpawnSubagent {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<ChildWorkflowSelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_trigger: Option<ChildWorkflowTrigger>,
+    /// Declared parent evidence slot which receives the single collapsed
+    /// terminal child contract. Ignored on the bare-attempt path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_slot: Option<String>,
+    /// A proposal to let a workflow child replace its initial pinned graph.
+    /// The daemon grants this only for a deeper-workflow trigger.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub workflow_author: bool,
 }
 
 impl SpawnSubagent {
@@ -62,11 +75,16 @@ impl SpawnSubagent {
                     .to_owned(),
             ));
         }
+        let parent_slot = selector(request.parent_slot, "parent_slot")?;
         Ok(Self {
             task: task.to_owned(),
             prompt: prompt.to_owned(),
             model,
             provider,
+            workflow: request.workflow,
+            workflow_trigger: request.workflow_trigger,
+            parent_slot,
+            workflow_author: request.workflow_author,
         })
     }
 }
@@ -120,10 +138,34 @@ pub fn spawn_subagent_manifest() -> ToolManifest {
                     "minLength": 1,
                     "maxLength": MAX_SELECTOR_BYTES,
                     "description": "Optional disambiguator when `model` is served by several providers; requires `model`"
+                },
+                "workflow": {
+                    "type": "string",
+                    "pattern": "^(plain|implement_verify|deeper|workflow_ref\\([A-Za-z0-9_-]{1,64}\\))$",
+                    "description": "Optional child workflow proposal; omitted defaults to one bare attempt"
+                },
+                "workflow_trigger": {
+                    "type": "string",
+                    "enum": ["mutation_with_independent_verification", "dependent_phases", "fan_out", "distinct_review", "crash_recovery"],
+                    "description": "Bounded reason the workflow earns its graph"
+                },
+                "parent_slot": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_SELECTOR_BYTES,
+                    "description": "Declared parent graph evidence slot for the single collapsed child contract"
+                },
+                "workflow_author": {
+                    "type": "boolean",
+                    "description": "Request graph-authoring capability; granted only for a deeper trigger"
                 }
             },
             "required": ["task", "prompt"],
             "additionalProperties": false
         }),
     }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }

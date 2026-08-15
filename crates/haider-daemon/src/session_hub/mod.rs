@@ -101,19 +101,20 @@ use actor::run_session_actor;
 use async_trait::async_trait;
 use haider_core::{
     AbandonedGraph, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
-    CancelledTurn, CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome,
-    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
-    GraphInspectResult, GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand,
-    GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle,
-    MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph,
-    ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache,
-    RenamedSession, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
-    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectEffortCommand,
-    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    CancelledTurn, ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
+    ChildTemplateObservation, ChildTemplateObservationCommand, CreatedBranch, CreatedSession,
+    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
+    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
+    GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
+    OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
+    PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast, SelectedModel,
+    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -797,6 +798,14 @@ enum ActorCommand {
     PinGraph {
         command: GraphPinCommand,
         completed: oneshot::Sender<Result<GraphPinOutcome, HaiderError>>,
+    },
+    AttachChildGraph {
+        command: ChildGraphAttachCommand,
+        completed: oneshot::Sender<Result<ChildGraphAttachOutcome, HaiderError>>,
+    },
+    ObserveChildTemplate {
+        command: ChildTemplateObservationCommand,
+        completed: oneshot::Sender<Result<ChildTemplateObservation, HaiderError>>,
     },
     OpenGraphRunSet {
         command: GraphRunSetOpenCommand,
@@ -1776,6 +1785,23 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    pub(crate) async fn attach_child_graph(
+        &self,
+        command: ChildGraphAttachCommand,
+    ) -> Result<ChildGraphAttachOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AttachChildGraph { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
     async fn graph_run_set_open_receipt(
         &self,
         command_id: &CommandId,
@@ -2129,6 +2155,30 @@ impl SessionHub {
     ) -> Result<HubStoreHandle, SessionHubError> {
         self.acquire_worker_lease_inner(session_id, Some(cancellation_wake))
             .await
+    }
+
+    pub(crate) async fn observe_child_template_success(
+        &self,
+        command: ChildTemplateObservationCommand,
+    ) -> Result<ChildTemplateObservation, SessionHubError> {
+        let actor = self.actor_for(command.parent_session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::ObserveChildTemplate { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn child_template_cache_lookup(
+        &self,
+        key: haider_protocol::graph::ChildTemplateCacheKey,
+    ) -> Result<Option<ChildTemplateCacheEntry>, HaiderError> {
+        self.inner.store.child_template_cache_lookup(key).await
     }
 
     /// Manager-only drain seam. External admission is already closed, but an

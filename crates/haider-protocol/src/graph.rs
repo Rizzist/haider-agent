@@ -21,6 +21,8 @@ pub const SUPER_SHIP_LOOP_TEMPLATE: &str = "super-ship-loop";
 pub const STAGGERED_TEMPLATE: &str = "staggered";
 pub const SEC_AUDIT_TEMPLATE: &str = "sec-audit";
 pub const DOCS_SWEEP_TEMPLATE: &str = "docs-sweep";
+pub const IMPLEMENT_VERIFY_CHILD_TEMPLATE: &str = "child-implement-verify";
+pub const DEEPER_CHILD_TEMPLATE: &str = "child-deeper";
 pub const GRAPH_TEMPLATE_VERSION: u32 = 1;
 pub const GRAPH_NODE_NAME_MAX_BYTES: usize = 64;
 pub const GRAPH_MAX_NODES: usize = 512;
@@ -262,6 +264,17 @@ pub enum GraphEvidenceSource {
         call_id: String,
         effect_id: EffectId,
     },
+    /// One terminal delegated workflow collapsed at the parent graph
+    /// boundary. The daemon validates these coordinates against both the
+    /// delegation record and [`ChildGraphAttached`] before accepting it.
+    ChildContract {
+        child_session_id: SessionId,
+        child_run_id: RunId,
+        child_graph_id: GraphId,
+        report_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_revision: Option<WorkspaceRevision>,
+    },
 }
 
 /// Stable coordinates submitted by `graph_evidence` for daemon-verified
@@ -271,6 +284,23 @@ pub struct ProcessSignalRef {
     pub run_id: RunId,
     pub call_id: String,
     pub effect_id: EffectId,
+}
+
+/// Daemon-internal reference used to collapse one terminal child workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildContractRef {
+    pub child_session_id: SessionId,
+    pub child_run_id: RunId,
+    pub child_graph_id: GraphId,
+    pub report_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<WorkspaceRevision>,
+}
+
+#[must_use]
+pub fn child_contract_subject_digest(contract: &ChildContractRef) -> String {
+    let bytes = serde_json::to_vec(contract).unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
 }
 
 /// Daemon-observed terminal truth for one process execution.
@@ -359,6 +389,274 @@ pub struct TodoGraphAttached {
     pub depends_on_todo_id: Option<u32>,
     pub child_graph_id: GraphId,
     pub ordinal: u32,
+}
+
+/// Optional workflow selector accepted by `spawn_subagent`. Its wire shape is
+/// deliberately one bounded string so adding it does not perturb legacy tool
+/// arguments or receipts when omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ChildWorkflowSelector {
+    Plain,
+    ImplementVerify,
+    Deeper,
+    WorkflowRef(String),
+}
+
+impl ChildWorkflowSelector {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "plain" => Ok(Self::Plain),
+            "implement_verify" => Ok(Self::ImplementVerify),
+            "deeper" => Ok(Self::Deeper),
+            _ => value
+                .strip_prefix("workflow_ref(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= GRAPH_NODE_NAME_MAX_BYTES
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+                .map(|name| Self::WorkflowRef(name.to_owned()))
+                .ok_or_else(|| {
+                    "workflow must be plain, implement_verify, deeper, or workflow_ref(<name>)"
+                        .to_owned()
+                }),
+        }
+    }
+
+    #[must_use]
+    pub fn template_name(&self) -> Option<&str> {
+        match self {
+            Self::Plain => None,
+            Self::ImplementVerify => Some(IMPLEMENT_VERIFY_CHILD_TEMPLATE),
+            Self::Deeper => Some(DEEPER_CHILD_TEMPLATE),
+            Self::WorkflowRef(name) => Some(name),
+        }
+    }
+}
+
+impl fmt::Display for ChildWorkflowSelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain => formatter.write_str("plain"),
+            Self::ImplementVerify => formatter.write_str("implement_verify"),
+            Self::Deeper => formatter.write_str("deeper"),
+            Self::WorkflowRef(name) => write!(formatter, "workflow_ref({name})"),
+        }
+    }
+}
+
+impl Serialize for ChildWorkflowSelector {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildWorkflowSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The bounded facts which can justify graph ceremony for one child. The
+/// model declares one; the daemon applies the deterministic gate below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkflowTrigger {
+    MutationWithIndependentVerification,
+    DependentPhases,
+    FanOut,
+    DistinctReview,
+    CrashRecovery,
+}
+
+impl ChildWorkflowTrigger {
+    #[must_use]
+    pub fn is_deeper(self) -> bool {
+        matches!(
+            self,
+            Self::DependentPhases | Self::FanOut | Self::DistinctReview | Self::CrashRecovery
+        )
+    }
+}
+
+/// Auditable result of the sparse daemon decision gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowDecision {
+    pub requested: ChildWorkflowSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<ChildWorkflowTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workflow_author: bool,
+}
+
+impl ChildWorkflowDecision {
+    #[must_use]
+    pub fn is_bare(&self) -> bool {
+        self.template.is_none()
+    }
+}
+
+/// The gate is intentionally biased toward no graph. An explicit selector is
+/// only a proposal: without the matching bounded trigger it collapses to one
+/// ordinary attempt.
+#[must_use]
+pub fn decide_child_workflow(
+    requested: Option<&ChildWorkflowSelector>,
+    trigger: Option<ChildWorkflowTrigger>,
+    workflow_author_requested: bool,
+) -> ChildWorkflowDecision {
+    let requested = requested.cloned().unwrap_or(ChildWorkflowSelector::Plain);
+    let (template, reason) = match (&requested, trigger) {
+        (ChildWorkflowSelector::Plain, _) => (None, "default_bare_attempt"),
+        (
+            ChildWorkflowSelector::ImplementVerify,
+            Some(ChildWorkflowTrigger::MutationWithIndependentVerification),
+        ) => (
+            requested.template_name().map(str::to_owned),
+            "mutation_with_independent_verification",
+        ),
+        (ChildWorkflowSelector::ImplementVerify, _) => {
+            (None, "missing_mutation_independent_verification")
+        }
+        (ChildWorkflowSelector::Deeper, Some(found)) if found.is_deeper() => (
+            requested.template_name().map(str::to_owned),
+            match found {
+                ChildWorkflowTrigger::DependentPhases => "dependent_phases",
+                ChildWorkflowTrigger::FanOut => "fan_out",
+                ChildWorkflowTrigger::DistinctReview => "distinct_review",
+                ChildWorkflowTrigger::CrashRecovery => "crash_recovery",
+                ChildWorkflowTrigger::MutationWithIndependentVerification => unreachable!(),
+            },
+        ),
+        (ChildWorkflowSelector::Deeper, _) => (None, "missing_deeper_workflow_trigger"),
+        (
+            ChildWorkflowSelector::WorkflowRef(name),
+            Some(ChildWorkflowTrigger::MutationWithIndependentVerification),
+        ) if name == IMPLEMENT_VERIFY_CHILD_TEMPLATE => (
+            Some(name.clone()),
+            "workflow_ref_mutation_with_independent_verification",
+        ),
+        (ChildWorkflowSelector::WorkflowRef(name), Some(found))
+            if name == DEEPER_CHILD_TEMPLATE && found.is_deeper() =>
+        {
+            (
+                Some(name.clone()),
+                match found {
+                    ChildWorkflowTrigger::DependentPhases => "workflow_ref_dependent_phases",
+                    ChildWorkflowTrigger::FanOut => "workflow_ref_fan_out",
+                    ChildWorkflowTrigger::DistinctReview => "workflow_ref_distinct_review",
+                    ChildWorkflowTrigger::CrashRecovery => "workflow_ref_crash_recovery",
+                    ChildWorkflowTrigger::MutationWithIndependentVerification => unreachable!(),
+                },
+            )
+        }
+        (ChildWorkflowSelector::WorkflowRef(name), Some(_))
+            if matches!(
+                name.as_str(),
+                IMPLEMENT_VERIFY_CHILD_TEMPLATE | DEEPER_CHILD_TEMPLATE
+            ) =>
+        {
+            (None, "workflow_ref_trigger_mismatch")
+        }
+        (ChildWorkflowSelector::WorkflowRef(_), Some(_)) => {
+            (None, "workflow_ref_not_registered_child_template")
+        }
+        (ChildWorkflowSelector::WorkflowRef(_), None) => (None, "missing_workflow_trigger"),
+    };
+    ChildWorkflowDecision {
+        requested,
+        trigger,
+        workflow_author: template.is_some()
+            && workflow_author_requested
+            && trigger.is_some_and(ChildWorkflowTrigger::is_deeper),
+        template,
+        reason: reason.to_owned(),
+    }
+}
+
+/// Exact parent graph obligation coordinates captured when the spawn tool is
+/// accepted. They are immutable even if that graph later retries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ParentGraphAttempt {
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    pub attempt: u32,
+}
+
+/// The simple cache identity. `gate_structure` describes gate/authority
+/// shape only; dependency edges and the full DAG are deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChildTemplateCacheKey {
+    pub task_shape: String,
+    pub effective_grant_digest: String,
+    pub gate_structure: String,
+}
+
+impl ChildTemplateCacheKey {
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        blake3::hash(&bytes).to_hex().to_string()
+    }
+}
+
+/// New parent-journal boundary fact. This is an attachment/contract, not an
+/// executable edge: child and parent DAGs continue to reduce independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildGraphAttached {
+    pub parent_run_id: RunId,
+    pub parent_call_id: String,
+    pub parent_tool_item_id: ItemId,
+    pub parent_attempt: ParentGraphAttempt,
+    pub parent_slot: String,
+    pub parent_authority: EvidenceAuthority,
+    pub child_session_id: SessionId,
+    pub child_run_id: RunId,
+    pub child_graph_id: GraphId,
+    pub workflow: ChildWorkflowSelector,
+    pub template: String,
+    pub digest: String,
+    pub gate_reason: String,
+    pub cache_key: ChildTemplateCacheKey,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_hit: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workflow_author: bool,
+}
+
+/// One successful equivalent child workflow, keyed by an exact distinct
+/// parent attempt. These append-only observations are the cache authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildTemplateObserved {
+    pub cache_key: ChildTemplateCacheKey,
+    pub parent_attempt: ParentGraphAttempt,
+    pub collapse_evidence_seq: u64,
+    pub child_contract: ChildContractRef,
+    pub template: GraphTemplateSpec,
+    pub digest: String,
+}
+
+/// Audit fact emitted exactly when an observation first reaches the
+/// three-distinct-attempt promotion threshold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildTemplatePromoted {
+    pub cache_key: ChildTemplateCacheKey,
+    pub template: String,
+    pub digest: String,
+    pub distinct_parent_attempts: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2020,9 +2318,111 @@ pub fn graph_template_catalog() -> Vec<GraphTemplateSpec> {
 
 #[must_use]
 pub fn graph_template(name: &str) -> Option<GraphTemplateSpec> {
-    graph_template_catalog()
-        .into_iter()
-        .find(|template| template.name == name)
+    match name {
+        IMPLEMENT_VERIFY_CHILD_TEMPLATE => Some(implement_verify_child_template()),
+        DEEPER_CHILD_TEMPLATE => Some(deeper_child_template()),
+        _ => graph_template_catalog()
+            .into_iter()
+            .find(|template| template.name == name),
+    }
+}
+
+/// Sparse two-phase child workflow: mutation testimony followed by a fresh
+/// daemon-observed verification command.
+#[must_use]
+pub fn implement_verify_child_template() -> GraphTemplateSpec {
+    template(
+        IMPLEMENT_VERIFY_CHILD_TEMPLATE,
+        "IMPLEMENT",
+        vec![
+            node_spec(
+                "IMPLEMENT",
+                GraphGateKind::AllOfN { n: 1 },
+                GraphExecutorShape::Inline,
+                &[],
+                vec![EvidenceSlotSpec {
+                    id: "mutation".into(),
+                    authority: EvidenceAuthority::ModelAttested,
+                    subject_selector: SubjectSelector::WorkspaceRevision,
+                }],
+            ),
+            node_spec(
+                "VERIFY",
+                GraphGateKind::AllOfN { n: 1 },
+                GraphExecutorShape::Inline,
+                &["IMPLEMENT"],
+                vec![daemon_slot("verification")],
+            ),
+        ],
+    )
+}
+
+/// Deeper child workflow reserved for genuine dependent phases, fan-out,
+/// distinct review, or crash recovery.
+#[must_use]
+pub fn deeper_child_template() -> GraphTemplateSpec {
+    template(
+        DEEPER_CHILD_TEMPLATE,
+        "PLAN",
+        vec![
+            node_spec(
+                "PLAN",
+                GraphGateKind::AllOfN { n: 1 },
+                GraphExecutorShape::Inline,
+                &[],
+                vec![model_slot("plan")],
+            ),
+            node_spec(
+                "IMPLEMENT",
+                GraphGateKind::AllOfN { n: 1 },
+                GraphExecutorShape::Inline,
+                &["PLAN"],
+                vec![EvidenceSlotSpec {
+                    id: "mutation".into(),
+                    authority: EvidenceAuthority::ModelAttested,
+                    subject_selector: SubjectSelector::WorkspaceRevision,
+                }],
+            ),
+            node_spec(
+                "VERIFY",
+                GraphGateKind::AllOfN { n: 1 },
+                GraphExecutorShape::FanOut,
+                &["IMPLEMENT"],
+                vec![daemon_slot("verification")],
+            ),
+            node_spec(
+                "REVIEW",
+                GraphGateKind::AllOfN { n: 1 },
+                GraphExecutorShape::Inline,
+                &["VERIFY"],
+                vec![model_slot("review")],
+            ),
+        ],
+    )
+}
+
+/// Cache structure intentionally omits node names and dependency edges.
+#[must_use]
+pub fn child_gate_structure(template: &GraphTemplateSpec) -> String {
+    template
+        .nodes
+        .iter()
+        .map(|node| {
+            let gate = match node.gate {
+                GraphGateKind::CommandGreen => "command-green".to_owned(),
+                GraphGateKind::AllOfN { n } => format!("all-of-{n}"),
+                GraphGateKind::HumanConfirm => "human-confirm".to_owned(),
+            };
+            let slots = node
+                .verify_slots
+                .iter()
+                .map(|slot| format!("{:?}:{:?}", slot.authority, slot.subject_selector))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{gate}[{slots}]")
+        })
+        .collect::<Vec<_>>()
+        .join(">")
 }
 
 #[must_use]
@@ -3211,5 +3611,145 @@ mod tests {
             validate_graph_template(&template).expect("catalog template validates");
             assert!(digests.insert(graph_template_digest(&template)));
         }
+    }
+
+    #[test]
+    fn m2e_decision_gate_defaults_bare_and_requires_exact_triggers() {
+        // MUTATION CHECK: make any omitted selector grant a graph. Expected
+        // failure: the first decision below is no longer one bare attempt.
+        let default = decide_child_workflow(None, None, true);
+        assert!(default.is_bare());
+        assert_eq!(default.reason, "default_bare_attempt");
+        assert!(!default.workflow_author);
+
+        // MUTATION CHECK: accept implement_verify without mutation plus
+        // independent verification. Expected failure: wrong trigger grants.
+        let implement = ChildWorkflowSelector::ImplementVerify;
+        assert!(
+            decide_child_workflow(Some(&implement), Some(ChildWorkflowTrigger::FanOut), false,)
+                .is_bare()
+        );
+        assert!(
+            !decide_child_workflow(
+                Some(&implement),
+                Some(ChildWorkflowTrigger::MutationWithIndependentVerification),
+                false,
+            )
+            .is_bare()
+        );
+
+        // MUTATION CHECK: grant deeper/authoring on the mutation-only trigger.
+        // Expected failure: deeper or workflow_author becomes active below.
+        let deeper = ChildWorkflowSelector::Deeper;
+        assert!(
+            decide_child_workflow(
+                Some(&deeper),
+                Some(ChildWorkflowTrigger::MutationWithIndependentVerification),
+                true,
+            )
+            .is_bare()
+        );
+        let fan_out =
+            decide_child_workflow(Some(&deeper), Some(ChildWorkflowTrigger::FanOut), true);
+        assert!(!fan_out.is_bare());
+        assert!(fan_out.workflow_author);
+
+        // MUTATION CHECK: let workflow_ref bypass the referenced template's
+        // class. Expected failure: either mismatched reference gains a graph.
+        let deeper_ref = ChildWorkflowSelector::WorkflowRef(DEEPER_CHILD_TEMPLATE.into());
+        assert!(
+            decide_child_workflow(
+                Some(&deeper_ref),
+                Some(ChildWorkflowTrigger::MutationWithIndependentVerification),
+                false,
+            )
+            .is_bare()
+        );
+        let implement_ref =
+            ChildWorkflowSelector::WorkflowRef(IMPLEMENT_VERIFY_CHILD_TEMPLATE.into());
+        assert!(
+            decide_child_workflow(
+                Some(&implement_ref),
+                Some(ChildWorkflowTrigger::DistinctReview),
+                false,
+            )
+            .is_bare()
+        );
+        assert!(
+            !decide_child_workflow(
+                Some(&implement_ref),
+                Some(ChildWorkflowTrigger::MutationWithIndependentVerification),
+                false,
+            )
+            .is_bare()
+        );
+    }
+
+    #[test]
+    fn m2e_child_templates_are_bounded_non_human_graphs() {
+        for template in [implement_verify_child_template(), deeper_child_template()] {
+            validate_graph_template(&template).expect("child template validates");
+            assert!(
+                template
+                    .nodes
+                    .iter()
+                    .all(|node| !matches!(node.gate, GraphGateKind::HumanConfirm))
+            );
+        }
+    }
+
+    #[test]
+    fn m2e_child_attachment_is_not_a_cross_graph_edge() {
+        // MUTATION CHECK: teach reduce_graphs to adopt ChildGraphAttached as a
+        // child DAG edge. Expected failure: the child appears in by_graph.
+        let parent = GraphId::new("parent-graph");
+        let child = GraphId::new("child-graph");
+        let template = implement_verify_child_template();
+        let key = ChildTemplateCacheKey {
+            task_shape: "mutation_verify".into(),
+            effective_grant_digest: "grant".into(),
+            gate_structure: child_gate_structure(&template),
+        };
+        let facts = vec![
+            graph_fact(
+                1,
+                EventPayload::GraphPinned(GraphPinned {
+                    graph_id: parent.clone(),
+                    template: template.name.clone(),
+                    digest: graph_template_digest(&template),
+                    template_version: template.version,
+                    start_node: template.start_node.clone(),
+                    nodes: template.nodes.clone(),
+                }),
+            ),
+            graph_fact(
+                2,
+                EventPayload::ChildGraphAttached(ChildGraphAttached {
+                    parent_run_id: RunId::new("parent-run"),
+                    parent_call_id: "call".into(),
+                    parent_tool_item_id: ItemId::new("tool"),
+                    parent_attempt: ParentGraphAttempt {
+                        graph_id: parent.clone(),
+                        node: GraphNodeName::new("IMPLEMENT").expect("node"),
+                        attempt: 1,
+                    },
+                    parent_slot: "mutation".into(),
+                    parent_authority: EvidenceAuthority::ModelAttested,
+                    child_session_id: SessionId::new("child-session"),
+                    child_run_id: RunId::new("child-run"),
+                    child_graph_id: child.clone(),
+                    workflow: ChildWorkflowSelector::ImplementVerify,
+                    template: template.name.clone(),
+                    digest: graph_template_digest(&template),
+                    gate_reason: "mutation_with_independent_verification".into(),
+                    cache_key: key,
+                    cache_hit: false,
+                    workflow_author: false,
+                }),
+            ),
+        ];
+        let reduced = reduce_graphs(&facts);
+        assert!(reduced.graph(&parent).is_some());
+        assert!(reduced.graph(&child).is_none());
     }
 }

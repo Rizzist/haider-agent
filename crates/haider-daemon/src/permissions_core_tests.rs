@@ -2,7 +2,8 @@
 
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
-    BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory, defer_shell_handoff,
+    BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
+    WebCapabilityDegrade, advertised_tool_definitions, defer_shell_handoff,
     durable_session_tool_state, effective_permission_defaults, registered_tool_route,
     registered_tools, tool_inventory_snapshot, typed_tool_result,
 };
@@ -28,6 +29,7 @@ use haider_store::{AcceptedShellExec, EventStore, SessionCreateCommand, Store};
 use haider_tools::{FsEditAnchorMismatch, ToolError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// MUTATION CHECK: advertise a name that has no typed registry route, or add
 /// legacy `exec` to the manifests. Expected runtime failure: advertised and
@@ -94,9 +96,8 @@ fn advertised_equals_dispatchable_for_all_three_c1_tools() {
     }
 }
 
-/// CG-M1 LAW: the root testimony tool is a canonical, effect-free Await tool
-/// and has the exact typed route used by the dispatcher. It is intentionally
-/// absent from delegated child grants (automatic child evidence is M2).
+/// CG-M1/M2e LAW: the testimony tool is canonical and effect-free. It remains
+/// absent from the DEFAULT delegated grant; only workflow children receive it.
 #[test]
 fn graph_evidence_is_advertised_dispatchable_and_root_only() {
     let registry = registered_tools();
@@ -121,6 +122,49 @@ fn graph_evidence_is_advertised_dispatchable_and_root_only() {
             .iter()
             .any(|name| name == "graph_evidence")
     );
+}
+
+/// CG-M2e LAW 4: the bare child pack remains the exact default. A workflow
+/// grant deliberately surfaces graph testimony, and workflow authoring is
+/// independently gated instead of leaking into root or plain-child packs.
+/// MUTATION CHECK: add either capability to `default_child_grant`, or stop
+/// filtering `workflow_author` from roots. Expected failure: a bare path gains
+/// workflow machinery, or the gated pack cannot use its pinned child graph.
+#[test]
+fn workflow_capabilities_are_sparse_and_grant_scoped() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let root = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    let plain_grant = crate::worker::default_child_grant();
+    let plain = advertised_tool_definitions(
+        &factory,
+        Some(&plain_grant),
+        "fake",
+        WebCapabilityDegrade::default(),
+    );
+    assert!(!root.iter().any(|tool| tool.name == "workflow_author"));
+    assert!(!plain.iter().any(|tool| tool.name == "graph_evidence"));
+    assert!(!plain.iter().any(|tool| tool.name == "workflow_author"));
+
+    let mut workflow_grant = plain_grant;
+    workflow_grant.tools.push("graph_evidence".into());
+    let workflow = advertised_tool_definitions(
+        &factory,
+        Some(&workflow_grant),
+        "fake",
+        WebCapabilityDegrade::default(),
+    );
+    assert!(workflow.iter().any(|tool| tool.name == "graph_evidence"));
+    assert!(!workflow.iter().any(|tool| tool.name == "workflow_author"));
+
+    workflow_grant.tools.push("workflow_author".into());
+    let authored = advertised_tool_definitions(
+        &factory,
+        Some(&workflow_grant),
+        "fake",
+        WebCapabilityDegrade::default(),
+    );
+    assert!(authored.iter().any(|tool| tool.name == "graph_evidence"));
+    assert!(authored.iter().any(|tool| tool.name == "workflow_author"));
 }
 
 /// MUTATION CHECK: apply overrides before registry defaults, map exec to the

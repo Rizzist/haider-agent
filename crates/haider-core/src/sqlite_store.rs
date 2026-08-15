@@ -14,16 +14,18 @@ use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn, Cas,
-    ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
-    DelegationRecord, EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
-    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
-    GraphSwitchCommand, GraphSwitchOutcome, HookTrustChange, HookTrustCommand,
-    MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome,
-    ProfileLease, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
-    SessionRenameOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome,
+    ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
+    ChildTemplateObservation, ChildTemplateObservationCommand, ContextCompactionClaim,
+    ContextCompactionReceiptResponse, DelegationCreateOutcome, DelegationRecord, EventStore,
+    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
+    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
+    GraphSwitchOutcome, HookTrustChange, HookTrustCommand, MenuResolutionCommand,
+    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
+    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -281,6 +283,34 @@ impl SqliteStoreHandle {
     ) -> Result<GraphPinOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.pin_graph(&command))).await
+    }
+
+    pub async fn attach_child_graph(
+        &self,
+        command: ChildGraphAttachCommand,
+    ) -> Result<ChildGraphAttachOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.attach_child_graph(&command))).await
+    }
+
+    pub async fn observe_child_template_success(
+        &self,
+        command: ChildTemplateObservationCommand,
+    ) -> Result<ChildTemplateObservation, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.observe_child_template_success(&command))
+        })
+        .await
+    }
+
+    pub async fn child_template_cache_lookup(
+        &self,
+        key: haider_protocol::graph::ChildTemplateCacheKey,
+    ) -> Result<Option<ChildTemplateCacheEntry>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.child_template_cache_lookup(&key)))
+            .await
     }
 
     pub async fn graph_run_set_open_receipt(

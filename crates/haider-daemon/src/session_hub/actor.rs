@@ -363,6 +363,50 @@ pub(super) async fn run_session_actor(
                 );
                 let _ = completed.send(result);
             }
+            ActorCommand::AttachChildGraph { command, completed } => {
+                let result = store.attach_child_graph(command).await;
+                let envelopes = match &result {
+                    Ok(ChildGraphAttachOutcome::Committed { envelopes, .. }) => {
+                        Some(envelopes.as_slice())
+                    }
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    worker.as_ref(),
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
+                let _ = completed.send(result);
+            }
+            ActorCommand::ObserveChildTemplate { command, completed } => {
+                let result = store.observe_child_template_success(command).await;
+                let envelopes = match &result {
+                    Ok(observed) if !observed.envelopes.is_empty() => {
+                        Some(observed.envelopes.as_slice())
+                    }
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    worker.as_ref(),
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
+                let _ = completed.send(result);
+            }
             ActorCommand::OpenGraphRunSet { command, completed } => {
                 let result = store.open_graph_run_set(command).await;
                 let envelopes = match &result {
@@ -1207,6 +1251,9 @@ fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
         Ok(EventPayload::GraphPinned(_)
             | EventPayload::GraphRunSetOpened(_)
             | EventPayload::TodoGraphAttached(_)
+            | EventPayload::ChildGraphAttached(_)
+            | EventPayload::ChildTemplateObserved(_)
+            | EventPayload::ChildTemplatePromoted(_)
             | EventPayload::GraphAttemptOpened(_)
             | EventPayload::EvidenceRecorded(_)
             | EventPayload::GraphGateSatisfied(_)
