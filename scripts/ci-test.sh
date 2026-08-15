@@ -15,15 +15,27 @@ crates="haider-platform haider-protocol haider-accounts haider-core haider-pdf \
 haider-provider haider-daemon haider-daemond haider-rpc haider-tui haider-cli \
 haider-store haider-tools haider-client haider-verify"
 
+# Compile phase first, uncapped — compilation cannot deadlock, and folding it
+# out lets the per-crate EXECUTION cap below be tight. A hanging test then
+# fails its crate in minutes with the crate named, instead of burning the
+# 6-hour job timeout with no attribution (the first Windows test run hung
+# for hours exactly this way).
+echo "::group::compile all test binaries"
+cargo test --workspace --no-run --locked || exit 1
+echo "::endgroup::"
+
+# Per-crate execution cap (15 min — generous for RUNNING tests).
+T="$(command -v timeout || command -v gtimeout || true)"
+
 fail=0
 for crate in $crates; do
   echo "::group::$crate"
   case "$crate" in
     haider-daemon|haider-daemond)
-      cargo test -p "$crate" --locked -- --test-threads=4 || { echo "FAIL: $crate"; fail=$((fail+1)); }
+      ${T:+"$T" 900} cargo test -p "$crate" --locked -- --test-threads=4 || { echo "FAIL: $crate"; fail=$((fail+1)); }
       ;;
     *)
-      cargo test -p "$crate" --locked || { echo "FAIL: $crate"; fail=$((fail+1)); }
+      ${T:+"$T" 900} cargo test -p "$crate" --locked || { echo "FAIL: $crate"; fail=$((fail+1)); }
       ;;
   esac
   echo "::endgroup::"
