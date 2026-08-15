@@ -2,6 +2,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch: {}   # manual build-only run (no release published)
 
 permissions:
   contents: write
@@ -12,12 +13,17 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: macos-15
             target: aarch64-apple-darwin
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -25,28 +31,35 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
-      - name: tag matches workspace version (pre-build check)
+      - name: tag matches workspace version (tag builds only)
+        if: github.event_name == 'push'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
       - name: build
         run: cargo build --release --locked -p haider-cli -p haider-daemond --target ${{ matrix.target }}
-      - name: ad-hoc codesign (diffforge-client trick — quarantine-friendly unsigned distribution)
+      - name: ad-hoc codesign (macOS only — quarantine-friendly unsigned distribution)
+        if: runner.os == 'macOS'
         run: |
           codesign --force -s - target/${{ matrix.target }}/release/haider
           codesign --force -s - target/${{ matrix.target }}/release/haiderd
-      - name: smoke (artifact must match tag + pass self-test)
+      - name: smoke (binary runs + self-test; strict version match on tag builds)
         run: |
           BIN=target/${{ matrix.target }}/release/haider
-          TAG="${GITHUB_REF_NAME#v}"
-          test "$($BIN --version)" = "haider $TAG"
-          $BIN self-test | grep '"ok":true'
+          "$BIN" self-test | grep '"ok":true'
           file "$BIN"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            test "$("$BIN" --version)" = "haider $TAG"
+          else
+            "$BIN" --version
+          fi
       - name: package
         run: |
           BIN=target/${{ matrix.target }}/release/haider
           DBIN=target/${{ matrix.target }}/release/haiderd
-          NAME=haider-${GITHUB_REF_NAME}-${{ matrix.target }}
+          REF="${GITHUB_REF_NAME:-manual}"
+          NAME=haider-${REF}-${{ matrix.target }}
           mkdir -p dist/$NAME
           # BOTH binaries: bare `haider` spawns the SIBLING `haiderd` next to
           # current_exe() (haider-client/src/spawn.rs) — a bundle without the
@@ -61,18 +74,24 @@ jobs:
 
   publish:
     needs: build
-    runs-on: macos-15
+    if: github.event_name == 'push'   # only tag pushes cut a release
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: create release (prerelease until v0.1.0)
+      - name: create or update release (prerelease until v0.1.0)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "haider $GITHUB_REF_NAME" \
-            --prerelease \
-            --notes "Scaffold-train release. Unsigned macOS binaries — verify the sha256, then allow via System Settings → Privacy & Security → Open Anyway."
+          NOTES="Cross-platform scaffold-train release (macOS aarch64/x86_64, Linux x86_64/arm64). Unsigned binaries — verify the sha256. macOS: allow via System Settings → Privacy & Security → Open Anyway. Linux: chmod +x."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "haider $GITHUB_REF_NAME" \
+              --prerelease \
+              --notes "$NOTES"
+          fi
