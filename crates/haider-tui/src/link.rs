@@ -835,6 +835,15 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             cursor: None,
             limit: 32,
         },
+        LiveCommand::RunRetry {
+            command_id,
+            session,
+            worker_generation,
+        } => RequestBody::RunRetry {
+            command_id,
+            session_id: session,
+            worker_generation,
+        },
         LiveCommand::GraphPin {
             command_id,
             session,
@@ -1247,6 +1256,15 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             }],
             None => Vec::new(),
         },
+        // Owner 2026-08-16: the committed manual retry — the reply carries
+        // its own session coordinate, correlated by the command id.
+        ResponseBody::RunRetry { session_id, .. } => {
+            context.command_id.clone().map_or_else(Vec::new, |_| {
+                vec![LiveReply::RunRetried {
+                    session: session_id,
+                }]
+            })
+        }
         // Both graph mutations carry the same driver fact: the receipt id
         // retires the outbox and chains a `graph.status`. The strip moves
         // on daemon truth, never on this reply (the branch discipline).

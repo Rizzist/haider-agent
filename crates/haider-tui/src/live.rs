@@ -236,6 +236,14 @@ pub enum LiveCommand {
     GraphInspect {
         session: SessionId,
     },
+    /// `run.retry` (owner 2026-08-16): receipt-backed manual retry of a
+    /// terminal-failed session's last user turn. DURABLE: a lost response
+    /// retries under the same command id and replays the same coordinates.
+    RunRetry {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+    },
     /// `graph.pin` — receipt-backed pin of the built-in ship-loop template
     /// (CG-M1). DURABLE: a lost response retries under the same command id
     /// and replays the same committed pin. Installs NOTHING locally — the
@@ -487,6 +495,7 @@ impl LiveCommand {
             | Self::SessionDiagnostic { command_id, .. }
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
+            | Self::RunRetry { command_id, .. }
             | Self::Compact { command_id, .. }
             | Self::BranchCreate { command_id, .. }
             | Self::AgentMessage { command_id, .. }
@@ -711,6 +720,10 @@ pub enum LiveReply {
     GraphInspect {
         session: SessionId,
         snapshot: Box<haider_protocol::graph::GraphInspectSnapshot>,
+    },
+    /// `run.retry` committed: a fresh run is live on the same user turn.
+    RunRetried {
+        session: SessionId,
     },
     /// `graph.status` FAILED. A background strip read: it just clears the
     /// in-flight gate and leaves the held reduction untouched (the feature
@@ -1088,6 +1101,9 @@ pub struct LiveDriver {
     /// In-flight `session.select_model` (F2a): the REQUESTED pair, so a
     /// typed refusal can land on the exact selection that asked.
     pending_model_select: Option<(CommandId, SessionId, String, String)>,
+    /// Owner 2026-08-16: the in-flight `run.retry`, for correlating its
+    /// typed refusal back to the retry row.
+    pending_retry: Option<(CommandId, SessionId)>,
     /// In-flight `session.rename` (G2): (command, session), so a typed
     /// refusal lands on the exact session that asked.
     pending_rename: Option<(CommandId, SessionId)>,
@@ -1211,6 +1227,7 @@ impl LiveDriver {
             pending_account_select: None,
             pending_default_model: None,
             pending_model_select: None,
+            pending_retry: None,
             pending_rename: None,
             pending_effort_select: None,
             pending_fast_select: None,
@@ -1715,6 +1732,11 @@ impl LiveDriver {
                 // A graph.inspect error lands here too (same context.graph
                 // tag) — clear its one-shot gate so the screen can refetch.
                 self.graph_inspect_inflight = false;
+                Vec::new()
+            }
+            LiveReply::RunRetried { session } => {
+                self.pending_retry = None;
+                model.apply_run_retried(&session);
                 Vec::new()
             }
             LiveReply::GraphInspect { session, snapshot } => {
@@ -2606,6 +2628,21 @@ impl LiveDriver {
                     } else {
                         model.model_select_failed(&provider, &model_name, &code, &message);
                     }
+                    return Vec::new();
+                }
+                // A failed `run.retry` (owner 2026-08-16): the typed refusal
+                // lands on the retry row that asked and re-arms it.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_retry
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && self.pending_retry.take().is_some()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.run_retry_failed(&message);
                     return Vec::new();
                 }
                 // A failed `session.rename` (G2): the typed public reason
@@ -3859,6 +3896,16 @@ impl LiveDriver {
             AppRequest::FleetRefresh => self.fleet_refresh(model),
             AppRequest::GraphRefresh => self.graph_refresh(model),
             AppRequest::GraphInspectRefresh => self.graph_inspect_refresh(model),
+            AppRequest::RunRetry { session } => {
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_retry = Some((command_id.clone(), session.clone()));
+                vec![self.enqueue(LiveCommand::RunRetry {
+                    command_id,
+                    session,
+                    worker_generation,
+                })]
+            }
             AppRequest::GraphPin => {
                 // Receipt-backed pin of the built-in ship-loop. Installs
                 // NOTHING locally — the daemon's `GraphPinned` fact and the

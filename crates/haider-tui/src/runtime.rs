@@ -1437,6 +1437,7 @@ impl DemoDriver {
             // and the mutations refuse honestly upstream.
             | AppRequest::GraphRefresh
             | AppRequest::GraphInspectRefresh
+            | AppRequest::RunRetry { .. }
             | AppRequest::GraphPin
             | AppRequest::GraphAbandon { .. }
             // B2b live-only vocabulary: `/branch new` in demo mode flashes

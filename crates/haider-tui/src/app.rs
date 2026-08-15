@@ -2181,6 +2181,9 @@ pub enum AppRequest {
     /// M2c: one-shot `graph.inspect` telemetry read (template rollups, tool-
     /// selection stats, evidence provenance) for the `/graph` screen.
     GraphInspectRefresh,
+    /// Owner 2026-08-16 (manual retry): re-run a terminal-failed session's
+    /// last user turn — receipt-backed `run.retry`, no new user message.
+    RunRetry { session: SessionId },
     /// CG-M1: receipt-backed pin of the built-in ship-loop for the active
     /// session (`/graph pin`). The driver mints the command id + worker
     /// generation; nothing is installed until the daemon's fact arrives.
@@ -2361,6 +2364,9 @@ pub enum Hit {
     /// the `/graph` screen (status + telemetry: rollups, tool-selection,
     /// evidence provenance), the owner's "click the workflow → stats" gesture.
     GraphStrip,
+    /// Owner 2026-08-16: the manual-retry ambient row — click retries the
+    /// failed turn.
+    RetryRun,
     /// Aura / Accounts / Peers launcher rows, by identity not ordinal.
     ExtraRow(LauncherRow),
     /// The palette row's actual content at render time.
@@ -3020,6 +3026,9 @@ pub struct AppModel {
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
     pub graph_inspect: Option<haider_protocol::graph::GraphInspectSnapshot>,
+    /// Owner 2026-08-16 (manual retry): a `run.retry` is in flight —
+    /// single-flight so a double-click never risks a duplicate command.
+    pub retry_inflight: bool,
     /// An honest one-line refusal when the attached daemon predates
     /// `convergence_graph_v1` (set on a feature-absent `/graph`).
     pub graph_unsupported: bool,
@@ -3324,6 +3333,7 @@ impl Default for AppModel {
             fleet: crate::fleet::FleetView::default(),
             graph: None,
             graph_inspect: None,
+            retry_inflight: false,
             graph_unsupported: false,
             todos_collapsed: false,
             auto_resuming: false,
@@ -4783,6 +4793,50 @@ impl AppModel {
     /// M2c: install the `graph.inspect` telemetry snapshot for the active
     /// session (rollups, tool-selection stats, evidence provenance). Ignores a
     /// stale reply for a since-switched session, like `apply_graph_status`.
+    /// Owner 2026-08-16 (manual retry): issue `run.retry` for the ACTIVE
+    /// terminal-failed session. Honest refusals: nothing failed → flash;
+    /// stale daemon → the standard note; already in flight → no-op.
+    pub fn issue_run_retry(&mut self) {
+        let Some(session) = self.active_session.clone() else {
+            self.flash = Some("· /retry — no attached session".to_owned());
+            self.dirty = true;
+            return;
+        };
+        if self.retry_inflight {
+            return;
+        }
+        if !self.projection.run_errored() {
+            self.flash = Some("· /retry — the last run did not fail".to_owned());
+            self.dirty = true;
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_RUN_RETRY_V1) {
+            self.flash = Some(self.stale_daemon_note("manual retry"));
+            self.dirty = true;
+            return;
+        }
+        self.retry_inflight = true;
+        self.requests.push(AppRequest::RunRetry { session });
+        self.dirty = true;
+    }
+
+    /// The correlated `run.retry` reply: daemon truth — a fresh run is live
+    /// on the SAME user turn.
+    pub fn apply_run_retried(&mut self, session: &SessionId) {
+        if self.active_session.as_ref() == Some(session) {
+            self.retry_inflight = false;
+            self.flash = Some("· ↻ retrying — same turn, fresh run".to_owned());
+            self.dirty = true;
+        }
+    }
+
+    /// A refused/failed `run.retry`: surface the daemon's reason and re-arm.
+    pub fn run_retry_failed(&mut self, message: &str) {
+        self.retry_inflight = false;
+        self.flash = Some(format!("· ↻ retry refused — {message}"));
+        self.dirty = true;
+    }
+
     pub fn apply_graph_inspect(
         &mut self,
         session_id: &haider_protocol::ids::SessionId,
@@ -9336,6 +9390,9 @@ impl AppModel {
             "hooks" => self.enter_hooks(),
             // CG-M1: `/graph [pin|abandon|status]`.
             "graph" => self.enter_graph(arg.as_deref()),
+            // Owner 2026-08-16: manual retry of the failed turn — the
+            // keyboard path to the ambient retry row's click.
+            "retry" => self.issue_run_retry(),
             // U2: `/usage [provider]` — the cross-provider usage report;
             // the optional first token is a provider prefix filter.
             "usage" => self.enter_usage(arg.as_deref()),
@@ -11121,6 +11178,9 @@ impl AppModel {
             // M2c: a click on the always-visible graph strip opens the
             // `/graph` telemetry screen — the same effect as the command
             // (fetch status + one-shot graph.inspect, then show the view).
+            Hit::RetryRun => {
+                self.issue_run_retry();
+            }
             Hit::GraphStrip => {
                 self.graph_unsupported = false;
                 self.requests.push(AppRequest::GraphRefresh);

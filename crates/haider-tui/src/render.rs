@@ -3236,6 +3236,12 @@ fn render_session(
     // priority ambient row: it sheds before every map of live work.
     let throughput_readout = model.throughput_pill();
     let mut throughput_height = u16::from(throughput_readout.is_some());
+    // Owner 2026-08-16 (manual retry): an ACTIONABLE recovery row when the
+    // last run terminal-failed and the daemon serves run.retry — click (or
+    // /retry) re-runs the SAME turn. Outranks the throughput meter.
+    let retry_row =
+        model.projection.run_errored() && model.daemon_serves(haider_rpc::FEATURE_RUN_RETRY_V1);
+    let mut retry_height = u16::from(retry_row);
     let mut todos_height = model
         .projection
         .todos()
@@ -3318,6 +3324,13 @@ fn render_session(
     } else {
         budget -= graph_height;
     }
+    // The retry row claims before the meter — an actionable recovery
+    // affordance outranks telemetry.
+    if retry_height > budget {
+        retry_height = 0;
+    } else {
+        budget -= retry_height;
+    }
     // The throughput meter claims LAST — beneath even the graph strip.
     if throughput_height > budget {
         throughput_height = 0;
@@ -3364,6 +3377,7 @@ fn render_session(
         queue_area,
         palette_area,
         throughput_area,
+        retry_area,
         rule_area,
         composer_area,
         band_rule_area,
@@ -3383,6 +3397,7 @@ fn render_session(
         Constraint::Length(queue_height),
         Constraint::Length(palette_height),
         Constraint::Length(throughput_height),
+        Constraint::Length(retry_height),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
         Constraint::Length(band_rule_h),
@@ -3792,6 +3807,35 @@ fn render_session(
             spans.push(Span::styled(format!(" · μ{mean}"), theme.dim_style()));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), throughput_area);
+    }
+
+    // Owner 2026-08-16: the manual-retry row — the recovery affordance for a
+    // terminal-failed run. Clickable; /retry is the keyboard path. While the
+    // command is in flight the row wears its progress and takes no clicks.
+    if retry_row && retry_area.height > 0 {
+        if model.retry_inflight {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled("↻ retrying…", theme.dim_style()),
+                ])),
+                retry_area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled("↻", theme.gold_style()),
+                    Span::styled(
+                        " run failed — click to retry the same turn",
+                        theme.err_style(),
+                    ),
+                    Span::styled(" · /retry", theme.dim_style()),
+                ])),
+                retry_area,
+            );
+            hits.push((retry_area, Hit::RetryRun));
+        }
     }
 
     if queue_height > 0 {
