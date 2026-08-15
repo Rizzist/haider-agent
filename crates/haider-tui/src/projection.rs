@@ -640,6 +640,28 @@ impl SessionProjection {
             EventPayload::GraphSuperseded(_) => {
                 self.push_note("⇄ workflow switched — the previous graph was superseded".to_owned());
             }
+            // M2c: a final answer was DEFERRED because the active graph still
+            // has unmet obligations. The guardrail never silently drops — the
+            // model keeps working or explicitly abandons via the menu.
+            EventPayload::GraphFinalizationDeferred(deferred) => {
+                let count = deferred.unmet_nodes.len();
+                let names = deferred
+                    .unmet_nodes
+                    .iter()
+                    .take(3)
+                    .map(haider_protocol::graph::GraphNodeName::label)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = count.saturating_sub(3);
+                let more = if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                };
+                self.push_note(format!(
+                    "⚠ finalize deferred — {count} unmet ({names}{more}) · keep working or abandon the graph"
+                ));
+            }
         }
     }
 

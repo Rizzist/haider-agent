@@ -200,6 +200,39 @@ fn abandoned_graph_status_is_terminal() {
     assert!(graph::plain_status(&status).contains("abandoned"));
 }
 
+/// M2c: a deferred finalization surfaces an honest, BOUNDED transcript note —
+/// the guardrail never silently drops an unfinished graph.
+#[test]
+fn m2c_finalization_deferred_surfaces_a_bounded_note() {
+    let mut projection = SessionProjection::new();
+    projection.apply(&EventPayload::GraphFinalizationDeferred(
+        haider_protocol::graph::GraphFinalizationDeferred {
+            graph_id: GraphId::new("g1"),
+            run_id: haider_protocol::ids::RunId::new("r1"),
+            state_digest: "blake3:deadbeef".into(),
+            unmet_nodes: vec![
+                build_node(),
+                verify_node(),
+                ship_node(),
+                GraphNodeName::new("AUDIT").expect("name"),
+            ],
+        },
+    ));
+    let note = projection
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            TranscriptEntry::Note { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("a deferral note");
+    assert!(note.contains("⚠ finalize deferred"), "{note}");
+    assert!(note.contains("4 unmet"), "{note}");
+    assert!(note.contains("BUILD, VERIFY, SHIP"), "{note}");
+    assert!(note.contains("+1"), "bounds the list to 3 names then +N: {note}");
+    assert!(note.contains("keep working or abandon"), "{note}");
+}
+
 /// M2b: the `/graph` surface is PROPERTY-based — an arbitrary template with
 /// non-ship-loop node names renders off gate kind, never a BUILD/VERIFY/SHIP
 /// name match, and `Superseded` reads terminal.
