@@ -6810,8 +6810,14 @@ pub(crate) async fn tool_inventory_snapshot(
     session_id: &SessionId,
 ) -> Result<ToolInventorySnapshot, HaiderError> {
     let durable = durable_session_tool_state(store, session_id).await?;
+    // M2e: `workflow_author` is a GATED child capability — it is surfaced only
+    // to a workflow-enabled child through the turn-tools grant path (see the
+    // `retain(name != "workflow_author")` on the grantless branch above), never
+    // in the general session inventory. Mirror that gate here so a root
+    // session's inventory does not advertise it.
     let tools = registered_tools()
         .into_iter()
+        .filter(|entry| entry.manifest.name != "workflow_author")
         .map(|entry| ToolInventoryEntry {
             manifest: entry.manifest,
             default: entry.default,
