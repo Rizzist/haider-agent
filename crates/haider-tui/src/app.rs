@@ -9714,6 +9714,13 @@ impl AppModel {
     /// is reported. Off-stream it resets the tracker ONCE to the empty resting
     /// shape, so idle frames stay byte-identical (WG3).
     pub fn note_throughput(&mut self) {
+        // PERSISTENCE (owner 2026-08-15): off-stream the tracker is left
+        // untouched, so the last turn's readout stays visible at rest — the
+        // old off-stream reset made persistence depend on whether any tick
+        // happened to land while idle. The next turn's cumulative count
+        // regresses past the old one and the tracker self-resets (WG4), so
+        // no idle reset is needed; idle frames stay byte-identical because
+        // an unfed tracker is static.
         if self.projection.is_streaming() {
             let now = self.clock_ms;
             let (tokens, exact) = match self.projection.usage().map(|usage| usage.output) {
@@ -9721,8 +9728,6 @@ impl AppModel {
                 _ => (self.projection.streamed_output_tokens_approx(), false),
             };
             self.throughput.observe(now, tokens, exact);
-        } else if !self.throughput.is_empty() {
-            self.throughput.reset();
         }
     }
 

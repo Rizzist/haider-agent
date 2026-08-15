@@ -892,9 +892,14 @@ impl SessionProjection {
     }
 
     fn apply_delta(&mut self, item_id: &ItemId, delta: &ItemDelta) {
-        // W-G: OUTPUT text characters that actually land on the open assistant
-        // block, tallied AFTER the block borrow ends (the counter and the
-        // block are both fields of `self`). Reasoning text is NOT output.
+        // W-G: GENERATED text characters that land on the open block, tallied
+        // AFTER the block borrow ends (the counter and the block are both
+        // fields of `self`). Reasoning and tool-call arguments ARE provider
+        // output — the model generates (and the provider meters) them — so
+        // they count toward the throughput rate; without them the readout
+        // flatlined at 0 through thinking- and tool-heavy turns (owner bug
+        // 2026-08-15). Command OUTPUT is tool-execution data, not generation,
+        // and stays excluded.
         let mut output_chars = 0u64;
         {
             let Some(block) = self.open_block_mut(item_id) else {
@@ -911,9 +916,13 @@ impl SessionProjection {
                 ItemDelta::Reasoning { text } => {
                     if let TurnItem::Reasoning { summary } = &mut block.item {
                         summary.push_str(text);
+                        output_chars = text.chars().count() as u64;
                     }
                 }
-                ItemDelta::ToolArgs { fragment } => block.args_fragments.push_str(fragment),
+                ItemDelta::ToolArgs { fragment } => {
+                    block.args_fragments.push_str(fragment);
+                    output_chars = fragment.chars().count() as u64;
+                }
                 ItemDelta::CommandOutput { chunk_b64, .. } => {
                     match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
                         Ok(bytes) => {

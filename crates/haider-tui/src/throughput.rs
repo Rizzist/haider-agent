@@ -24,6 +24,11 @@ pub const SPARK_RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '�
 /// Per-turn tps samples kept for the sparkline + aggregate stats (decision 3,
 /// N in the 16–24 band).
 const SAMPLE_CAP: usize = 24;
+/// The sparkline's FIXED rendered width (owner 2026-08-15): the readout box
+/// never grows — samples enter at the right edge and roll off the left, and
+/// until the ring fills the missing columns are blank (never a fabricated
+/// floor glyph).
+pub const SPARK_WIDTH: usize = SAMPLE_CAP;
 /// Raw `(t_ms, cumulative_tokens)` observations retained for the windowed rate.
 /// Bounded well above one window's worth at the anim cadence.
 const RAW_CAP: usize = 96;
@@ -186,8 +191,14 @@ impl ThroughputTracker {
         let tps = self.last_tps?;
         let ring: Vec<u32> = self.samples.iter().copied().collect();
         let enough = ring.len() >= STATS_MIN;
+        // Fixed-width roll: left-pad the young ring with blanks so the box
+        // is SPARK_WIDTH columns from the first frame and samples march
+        // right-to-left as the ring fills and caps.
+        let drawn = spark(&ring, SPARK_WIDTH);
+        let pad = SPARK_WIDTH.saturating_sub(drawn.chars().count());
+        let spark = format!("{}{drawn}", " ".repeat(pad));
         Some(ThroughputReadout {
-            spark: spark(&ring, SAMPLE_CAP),
+            spark,
             tps,
             approx: !self.exact_seen,
             mean: enough.then(|| mean(&ring)).flatten(),
@@ -384,11 +395,15 @@ mod tests {
         assert!(!readout.approx, "exact usage → no tilde");
         assert!(readout.mean.is_some());
         assert!(readout.p95.is_some());
-        // The sparkline is populated and its later columns out-rank its first.
-        assert!(!readout.spark.is_empty());
+        // Fixed-width law (owner 2026-08-15): the box is ALWAYS SPARK_WIDTH
+        // columns — a young ring is left-padded with blanks, so samples
+        // enter at the right and roll off the left.
+        assert_eq!(readout.spark.chars().count(), SPARK_WIDTH);
+        // The drawn portion is populated and its later columns out-rank its
+        // first drawn column (padding blanks are not samples).
         let first = SPARK_RAMP
             .iter()
-            .position(|&r| r == readout.spark.chars().next().unwrap())
+            .position(|&r| Some(r) == readout.spark.chars().find(|c| *c != ' '))
             .unwrap();
         let last = SPARK_RAMP
             .iter()

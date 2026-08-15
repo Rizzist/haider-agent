@@ -3230,6 +3230,12 @@ fn render_session(
         .as_ref()
         .filter(|status| status.phase != haider_protocol::graph::GraphPhase::Abandoned);
     let mut graph_height = u16::from(graph_strip.is_some());
+    // W-G (owner 2026-08-15): the throughput readout's OWN ambient row,
+    // directly above the composer band — persistent at rest (the last
+    // turn's rate), fixed-width rolling spark. A meter is the lowest-
+    // priority ambient row: it sheds before every map of live work.
+    let throughput_readout = model.throughput_pill();
+    let mut throughput_height = u16::from(throughput_readout.is_some());
     let mut todos_height = model
         .projection
         .todos()
@@ -3312,6 +3318,12 @@ fn render_session(
     } else {
         budget -= graph_height;
     }
+    // The throughput meter claims LAST — beneath even the graph strip.
+    if throughput_height > budget {
+        throughput_height = 0;
+    } else {
+        budget -= throughput_height;
+    }
     // The closing rule was reserved ABOVE, before the panels (TUI6.1
     // fix 2 — sim anatomy: the border-top of whatever follows the
     // InputBar, SubTree tui.js:4764 / StatusBar tui.js:5497).
@@ -3351,6 +3363,7 @@ fn render_session(
         todos_area,
         queue_area,
         palette_area,
+        throughput_area,
         rule_area,
         composer_area,
         band_rule_area,
@@ -3369,6 +3382,7 @@ fn render_session(
         Constraint::Length(todos_height),
         Constraint::Length(queue_height),
         Constraint::Length(palette_height),
+        Constraint::Length(throughput_height),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
         Constraint::Length(band_rule_h),
@@ -3753,6 +3767,31 @@ fn render_session(
         // M2c: the strip is clickable — a press opens the `/graph` telemetry
         // screen (the owner's "click the workflow → stats" gesture).
         hits.push((graph_area, Hit::GraphStrip));
+    }
+
+    // W-G (owner 2026-08-15): the throughput row — fixed-width rolling spark
+    // + rate on its own line above the composer band. Gold spark + bright
+    // rate while streaming; the whole line dims at rest, wearing the last
+    // turn's measured rate.
+    if let Some(readout) = &throughput_readout
+        && throughput_area.height > 0
+    {
+        let streaming = model.projection.is_streaming();
+        let tilde = if readout.approx { "~" } else { "" };
+        let (spark_ink, rate_ink) = if streaming {
+            (theme.gold_style(), theme.bright_style())
+        } else {
+            (theme.dim_style(), theme.dim_style())
+        };
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::styled(readout.spark.clone(), spark_ink),
+            Span::styled(format!(" {tilde}{} tps", readout.tps), rate_ink),
+        ];
+        if let Some(mean) = readout.mean {
+            spans.push(Span::styled(format!(" · μ{mean}"), theme.dim_style()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), throughput_area);
     }
 
     if queue_height > 0 {
@@ -7075,35 +7114,11 @@ fn render_composer(
     let identity_text = model
         .composer_identity(rule_width.saturating_sub(6))
         .map(|identity| format!(" {identity} "));
-    // W-G: the throughput readout is the LEFT segment of this identity line,
-    // always visible (the last measured rate persists at rest). Session-
-    // scoped, and only alongside the identity — it degrades away first when
-    // the line can't hold both.
-    let throughput_text = matches!(model.screen, Screen::Session | Screen::Subagent)
-        .then(|| model.throughput_pill())
-        .flatten()
-        .map(|readout| format!(" {} ", readout.pill_text()));
-    let rule_line = match (&identity_text, &throughput_text) {
-        (Some(id), Some(tp)) if rule_width >= id.chars().count() + tp.chars().count() + 5 => {
-            let fill = rule_width - tp.chars().count() - id.chars().count() - 4;
-            Line::from(vec![
-                Span::styled("──", theme.gold_style()),
-                Span::styled(tp.clone(), theme.dim_style()),
-                Span::styled("─".repeat(fill), theme.gold_style()),
-                Span::styled(id.clone(), theme.dim_style()),
-                Span::styled("──", theme.gold_style()),
-            ])
-        }
-        // Throughput alone (no model identity yet) still rides the left.
-        (None, Some(tp)) if rule_width >= tp.chars().count() + 4 => {
-            let fill = rule_width - tp.chars().count() - 4;
-            Line::from(vec![
-                Span::styled("──", theme.gold_style()),
-                Span::styled(tp.clone(), theme.dim_style()),
-                Span::styled("─".repeat(fill + 2), theme.gold_style()),
-            ])
-        }
-        (Some(text), _) if rule_width > text.chars().count() + 2 => {
+    // W-G (owner 2026-08-15): the throughput readout moved OFF this rule to
+    // its own ambient row above the composer band — the rule carries the
+    // session identity alone again.
+    let rule_line = match &identity_text {
+        Some(text) if rule_width > text.chars().count() + 2 => {
             let fill = rule_width - text.chars().count() - 2;
             Line::from(vec![
                 Span::styled("─".repeat(fill), theme.gold_style()),
