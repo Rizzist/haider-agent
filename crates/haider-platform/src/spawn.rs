@@ -75,9 +75,7 @@ fn configure_daemon(command: &mut std::process::Command) {
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(|| {
-            for fd in 3..65_536_i32 {
-                rustix::io::close(fd);
-            }
+            crate::process::close_inherited_descriptors();
             Ok(())
         });
     }

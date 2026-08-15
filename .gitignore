@@ -11,3 +11,4 @@ __pycache__/
 gate-logs/
 dist-*/
 codex-*.out
+target-linux/

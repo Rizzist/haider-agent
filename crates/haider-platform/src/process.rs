@@ -99,11 +99,25 @@ pub fn configure_background_process(command: &mut tokio::process::Command) {
     #[allow(unsafe_code)]
     unsafe {
         command.as_std_mut().pre_exec(|| {
-            for fd in 3..65_536_i32 {
-                rustix::io::close(fd);
-            }
+            close_inherited_descriptors();
             Ok(())
         });
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn close_inherited_descriptors() {
+    unsafe extern "C" {
+        fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+
+    // POSIX close(2) is async-signal-safe and EBADF is expected for unused
+    // slots. Do not use rustix::io::close here: its contract requires an open
+    // fd, and the Linux debug backend panics on EBADF. A panic after fork is
+    // converted into SIGABRT by Command's pre-exec guard.
+    for fd in 3..65_536_i32 {
+        let _ = unsafe { close(fd) };
     }
 }
 
@@ -169,7 +183,60 @@ pub fn signal_process_group_id(pid: ProcessId, signal: ProcessSignal) -> std::io
     signal_process_group(ProcessGroup(pid.0), signal)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+pub fn process_group_exists(group: ProcessGroup) -> std::io::Result<bool> {
+    match rustix::process::test_kill_process_group(unix_pid(group.0)?) {
+        Ok(()) => linux_process_group_has_live_member(group),
+        Err(rustix::io::Errno::PERM) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_live_member(group: ProcessGroup) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return Ok(true),
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // If procfs withholds a visible process, retain kill(2)'s
+            // conservative live verdict rather than overlooking a member.
+            Err(_) => return Ok(true),
+        };
+        let Some((state, process_group)) = linux_proc_state_and_group(&stat) else {
+            return Ok(true);
+        };
+        if process_group == group.0 && !matches!(state, b'Z' | b'X') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_state_and_group(stat: &[u8]) -> Option<(u8, u32)> {
+    // The comm field is parenthesized and may itself contain `)`, so split at
+    // the last close-paren. The next fields are state, parent pid, and pgid.
+    let fields = stat.get(stat.iter().rposition(|byte| *byte == b')')? + 2..)?;
+    let mut fields = fields.split(|byte| *byte == b' ');
+    let state = *fields.next()?.first()?;
+    fields.next()?;
+    let process_group = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+    Some((state, process_group))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn process_group_exists(group: ProcessGroup) -> std::io::Result<bool> {
     match rustix::process::test_kill_process_group(unix_pid(group.0)?) {
         Ok(()) | Err(rustix::io::Errno::PERM) => Ok(true),
