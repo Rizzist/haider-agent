@@ -73,6 +73,10 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
         Some(RegisteredToolRoute::FsEdit)
     );
     assert_eq!(
+        registered_tool_route("fs_path"),
+        Some(RegisteredToolRoute::FsPath)
+    );
+    assert_eq!(
         registered_tool_route("message_subagent"),
         Some(RegisteredToolRoute::MessageSubagent)
     );
@@ -81,12 +85,13 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
 /// MUTATION CHECK: drop any C1 registry entry or change its typed route.
 /// Expected RUNTIME failure: the literal manifest name has no matching route.
 #[test]
-fn advertised_equals_dispatchable_for_all_three_c1_tools() {
+fn advertised_equals_dispatchable_for_all_consolidated_fs_tools() {
     let registry = registered_tools();
     for (name, route) in [
         ("fs_search", RegisteredToolRoute::FsSearch),
         ("fs_glob", RegisteredToolRoute::FsGlob),
         ("fs_edit", RegisteredToolRoute::FsEdit),
+        ("fs_path", RegisteredToolRoute::FsPath),
     ] {
         assert!(
             registry.iter().any(|entry| entry.manifest.name == name),
@@ -381,6 +386,31 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
     let snapshot = tool_inventory_snapshot(&store, &session_id)
         .await
         .expect("inventory");
+    assert_eq!(
+        snapshot
+            .tools
+            .iter()
+            .map(|entry| entry.manifest.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "request_input",
+            "todo_write",
+            "graph_evidence",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "fs_path",
+            "process_exec",
+            "spawn_subagent",
+            "message_subagent",
+            "task_output",
+            "task_kill",
+            "web_fetch",
+            "web_search",
+        ]
+    );
     // M2e: `workflow_author` is a GATED child capability, excluded from the
     // general inventory snapshot (see `tool_inventory_snapshot`) — the standard
     // projection is the registry MINUS that gated tool. This session holds an

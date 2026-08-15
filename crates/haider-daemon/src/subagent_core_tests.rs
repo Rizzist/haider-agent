@@ -51,13 +51,12 @@ fn e1d_child_grant_cannot_exceed_parent_and_within_ceiling_survives() {
     use haider_protocol::effect::EffectClass;
 
     let parent = Grant {
-        tools: vec!["fs_read".into(), "fs_list".into(), "spawn_subagent".into()],
+        tools: vec!["fs_read".into(), "spawn_subagent".into()],
         effect_ceiling: vec![EffectClass::FsRead, EffectClass::AgentSpawn],
     };
     let resolved = crate::worker::intersect_grant(crate::worker::default_child_grant(), &parent);
 
     assert!(resolved.tools.contains(&"fs_read".to_owned()));
-    assert!(resolved.tools.contains(&"fs_list".to_owned()));
     assert!(resolved.tools.contains(&"spawn_subagent".to_owned()));
     assert!(!resolved.tools.contains(&"fs_write".to_owned()));
     assert!(!resolved.tools.contains(&"process_exec".to_owned()));

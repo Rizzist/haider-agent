@@ -89,11 +89,11 @@ use haider_provider::{
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
-    CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsCaseMode, FsEdit, FsGlob, FsList,
-    FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink, MessageSubagent,
-    PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds, SessionGrant,
-    SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
-    WebFetch, WorkflowAuthor,
+    CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsCaseMode, FsEdit, FsEditChange,
+    FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence,
+    JournalSink, MessageSubagent, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
+    ResultBounds, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent, ToolError,
+    ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -5302,12 +5302,11 @@ pub(crate) enum RegisteredToolRoute {
     TodoWrite,
     GraphEvidence,
     FsRead,
-    FsList,
-    FsSearch,
     FsGlob,
+    FsSearch,
     FsWrite,
     FsEdit,
-    FsPatch,
+    FsPath,
     ProcessExec,
     WorkflowAuthor,
     SpawnSubagent,
@@ -5340,6 +5339,18 @@ fn registered_tool(
             dispatch,
             input_schema: definition.input_schema,
         },
+        default,
+        route,
+    }
+}
+
+fn registered_manifest(
+    manifest: ToolManifest,
+    default: ToolPermissionDefault,
+    route: RegisteredToolRoute,
+) -> RegisteredTool {
+    RegisteredTool {
+        manifest,
         default,
         route,
     }
@@ -5383,54 +5394,35 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::WorkflowAuthor,
             }
         },
-        registered_tool(
-            tool_definition("fs_read", "Read a UTF-8 file", &["path"]),
-            vec![EffectClass::FsRead],
-            DispatchMode::Await,
+        registered_manifest(
+            haider_tools::fs_read_manifest(),
             ToolPermissionDefault::Allow,
             RegisteredToolRoute::FsRead,
         ),
-        registered_tool(
-            tool_definition("fs_list", "List a directory", &["path"]),
-            vec![EffectClass::FsRead],
-            DispatchMode::Await,
-            ToolPermissionDefault::Allow,
-            RegisteredToolRoute::FsList,
-        ),
-        registered_tool(
-            fs_search_definition(),
-            vec![EffectClass::FsRead],
-            DispatchMode::Await,
-            ToolPermissionDefault::Allow,
-            RegisteredToolRoute::FsSearch,
-        ),
-        registered_tool(
-            fs_glob_definition(),
-            vec![EffectClass::FsRead],
-            DispatchMode::Await,
+        registered_manifest(
+            haider_tools::fs_glob_manifest(),
             ToolPermissionDefault::Allow,
             RegisteredToolRoute::FsGlob,
         ),
-        registered_tool(
-            fs_write_definition(),
-            vec![EffectClass::FsWrite],
-            DispatchMode::Await,
+        registered_manifest(
+            haider_tools::fs_search_manifest(),
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::FsSearch,
+        ),
+        registered_manifest(
+            haider_tools::fs_write_manifest(),
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::FsWrite,
         ),
-        registered_tool(
-            fs_patch_definition(),
-            vec![EffectClass::FsWrite],
-            DispatchMode::Await,
-            ToolPermissionDefault::Ask,
-            RegisteredToolRoute::FsPatch,
-        ),
-        registered_tool(
-            fs_edit_definition(),
-            vec![EffectClass::FsWrite],
-            DispatchMode::Await,
+        registered_manifest(
+            haider_tools::fs_edit_manifest(),
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::FsEdit,
+        ),
+        registered_manifest(
+            haider_tools::fs_path_manifest(),
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::FsPath,
         ),
         registered_tool(
             process_exec_definition(),
@@ -6272,22 +6264,30 @@ impl ToolDispatcher for BrokerToolDispatcher {
         let result = match route {
             RegisteredToolRoute::FsRead => {
                 let path = required_string(&args, "path")?;
+                let offset = optional_u64(&args, "offset")?
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `offset` is too large",
+                            false,
+                        )
+                    })?;
+                let limit = optional_u64(&args, "limit")?
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `limit` is too large",
+                            false,
+                        )
+                    })?;
                 let mut cas = self.cas.lock().await;
                 broker
                     .fs_read(
-                        &FsRead::new(path),
-                        &policy,
-                        &mut *cas,
-                        ResultBounds::default(),
-                    )
-                    .await
-            }
-            RegisteredToolRoute::FsList => {
-                let path = required_string(&args, "path")?;
-                let mut cas = self.cas.lock().await;
-                broker
-                    .fs_list(
-                        &FsList::new(path),
+                        &FsRead::new(path).with_line_range(offset, limit),
                         &policy,
                         &mut *cas,
                         ResultBounds::default(),
@@ -6527,40 +6527,59 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )
                     .await
             }
-            RegisteredToolRoute::FsPatch => {
+            RegisteredToolRoute::FsEdit => {
                 let path = required_string(&args, "path")?;
-                let patch = args.get("patch").ok_or_else(|| {
-                    HaiderError::new(
-                        ErrorCode::InvalidArgument,
-                        "tool argument `patch` must be an object",
-                        false,
-                    )
-                })?;
-                let preimage = required_string(patch, "preimage")?;
-                let replacement = required_string_allow_empty(patch, "replacement")?;
+                let requested_edits = args
+                    .get("edits")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|edits| !edits.is_empty())
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `edits` must be a non-empty array",
+                            false,
+                        )
+                    })?;
+                let mut edits = Vec::with_capacity(requested_edits.len());
+                for edit in requested_edits {
+                    let old = required_string(edit, "old")?;
+                    let new = required_string_allow_empty(edit, "new")?;
+                    let replace_all = optional_bool(edit, "replace_all")?.unwrap_or(false);
+                    edits.push(FsEditChange::new(old, new).replace_all(replace_all));
+                }
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
                 broker
-                    .fs_patch(
-                        &FsPatch::new(path, preimage, replacement),
+                    .fs_edit(
+                        &FsEdit::many(path, edits),
                         &policy,
                         &attribution,
                         &self.ledger,
                     )
                     .await
             }
-            RegisteredToolRoute::FsEdit => {
-                let path = required_string(&args, "path")?;
-                let old_string = required_string(&args, "old_string")?;
-                let new_string = required_string_allow_empty(&args, "new_string")?;
-                let replace_all = optional_bool(&args, "replace_all")?.unwrap_or(false);
+            RegisteredToolRoute::FsPath => {
+                let source = required_string(&args, "source")?;
+                let operation = match required_string(&args, "operation")?.as_str() {
+                    "move" => FsPathOperation::Move,
+                    "delete" => FsPathOperation::Delete,
+                    "copy" => FsPathOperation::Copy,
+                    value => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("unsupported fs_path operation `{value}`"),
+                            false,
+                        ));
+                    }
+                };
+                let destination = optional_string(&args, "destination")?;
+                let overwrite = optional_bool(&args, "overwrite")?.unwrap_or(false);
+                let mut operation = FsPath::new(operation, source).overwrite(overwrite);
+                if let Some(destination) = destination {
+                    operation = operation.with_destination(destination);
+                }
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
                 broker
-                    .fs_edit(
-                        &FsEdit::new(path, old_string, new_string).replace_all(replace_all),
-                        &policy,
-                        &attribution,
-                        &self.ledger,
-                    )
+                    .fs_path(&operation, &policy, &attribution, &self.ledger)
                     .await
             }
             RegisteredToolRoute::WebSearch => {
@@ -6888,7 +6907,6 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
         haider_tools::ToolError::UnreadFile { .. } => ("rejected", "unread_file"),
-        haider_tools::ToolError::Conflict(_) => ("conflict", "patch_conflict"),
         haider_tools::ToolError::EditAnchor(_) => ("conflict", "edit_anchor_count"),
         haider_tools::ToolError::InvalidArgument { .. } => ("rejected", "invalid_argument"),
         haider_tools::ToolError::InvalidMenuAnswer { .. } => ("rejected", "invalid_menu_answer"),
@@ -7087,139 +7105,6 @@ fn request_input_definition() -> ToolDefinition {
             },
             "required": ["kind", "title"],
             "additionalProperties": false
-        }),
-    }
-}
-
-fn fs_search_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "fs_search".into(),
-        description: "Search UTF-8 files by literal or simple wildcard pattern".into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "minLength": 1},
-                "path": {"type": "string", "minLength": 1},
-                "glob": {"type": "string", "minLength": 1},
-                "case": {
-                    "type": "string",
-                    "enum": ["sensitive", "insensitive", "smart"]
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["literal", "simple"],
-                    "description": "simple supports dependency-free * and ? wildcards"
-                },
-                "query": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Legacy alias for pattern"
-                },
-                "root": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Legacy alias for path"
-                }
-            },
-            "anyOf": [
-                {"required": ["pattern"]},
-                {"required": ["query"]}
-            ],
-            "additionalProperties": false
-        }),
-    }
-}
-
-fn fs_glob_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "fs_glob".into(),
-        description: "List workspace files matching a bounded glob".into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "minLength": 1},
-                "path": {"type": "string", "minLength": 1}
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        }),
-    }
-}
-
-fn fs_write_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "fs_write".into(),
-        description: "Create or replace one UTF-8 file after explicit approval".into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "content": {"type": "string"}
-            },
-            "required": ["path", "content"],
-            "additionalProperties": false
-        }),
-    }
-}
-
-fn fs_patch_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "fs_patch".into(),
-        description:
-            "Apply one exact-preimage structured hunk to a UTF-8 file after explicit approval"
-                .into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "patch": {
-                    "type": "object",
-                    "properties": {
-                        "preimage": {"type": "string", "minLength": 1},
-                        "replacement": {"type": "string"}
-                    },
-                    "required": ["preimage", "replacement"],
-                    "additionalProperties": false
-                }
-            },
-            "required": ["path", "patch"],
-            "additionalProperties": false
-        }),
-    }
-}
-
-fn fs_edit_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "fs_edit".into(),
-        description: "Replace one exact string anchor, or every occurrence, in a fresh UTF-8 file"
-            .into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "old_string": {"type": "string", "minLength": 1},
-                "new_string": {"type": "string"},
-                "replace_all": {"type": "boolean"}
-            },
-            "required": ["path", "old_string", "new_string"],
-            "additionalProperties": false
-        }),
-    }
-}
-
-fn tool_definition(name: &str, description: &str, required: &[&str]) -> ToolDefinition {
-    let properties = required
-        .iter()
-        .map(|name| ((*name).to_owned(), serde_json::json!({"type": "string"})))
-        .collect::<serde_json::Map<_, _>>();
-    ToolDefinition {
-        name: name.into(),
-        description: description.into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": false,
         }),
     }
 }

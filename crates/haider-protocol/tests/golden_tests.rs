@@ -415,7 +415,7 @@ fn golden_menu_permission() {
         ],
         blocking: true,
         scope: MenuScope::Session,
-        origin: "fs_patch".into(),
+        origin: "fs_edit".into(),
         ttl_ms: None,
         timeout_option: None,
     };
@@ -763,7 +763,7 @@ fn golden_item_lifecycle() {
             item_id: ItemId::new("it-1"),
             item: TurnItem::ToolCall {
                 call_id: "c-1".into(),
-                name: "fs_patch".into(),
+                name: "fs_edit".into(),
                 args: serde_json::json!({"path": "src/lib.rs"}),
                 status: ToolStatus::InProgress,
             },
@@ -1335,7 +1335,7 @@ fn golden_agent_family() {
             callsign: Some("Hasan".into()),
             model_profile: "gpt-5.6".into(),
             grant: Grant {
-                tools: vec!["fs_read".into(), "fs_patch".into()],
+                tools: vec!["fs_read".into(), "fs_edit".into()],
                 effect_ceiling: vec![haider_protocol::effect::EffectClass::FsWrite],
             },
             budget_tokens: Some(500_000),

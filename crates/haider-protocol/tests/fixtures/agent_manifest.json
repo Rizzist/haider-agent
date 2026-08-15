@@ -7,7 +7,7 @@
   "grant": {
     "tools": [
       "fs_read",
-      "fs_patch"
+      "fs_edit"
     ],
     "effect_ceiling": [
       {

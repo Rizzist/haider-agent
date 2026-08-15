@@ -10,16 +10,17 @@
 //!   retaining at most 200 matches / 8 KiB for the prompt; glob retains the
 //!   lexicographically first 500 paths and reports overflow honestly.
 //! - File freshness is session-scoped and advances only with a durably
-//!   journaled terminal outcome. `fs_read`, `fs_write`, and `fs_edit` attach
-//!   the exact BLAKE3 digest to that outcome. Existing-file writes and edits
-//!   compare it against the locked current snapshot, returning typed unread or
-//!   stale refusals before any replacement is prepared.
-//! - `fs_patch` proves its pre-image before writing (mismatch is a typed
-//!   [`FsPatchConflict`]) and records applied writes in the
+//!   journaled terminal outcome. File `fs_read`, `fs_write`, and `fs_edit`
+//!   attach the exact BLAKE3 digest to that outcome. Existing-file writes and
+//!   edits compare it against the locked current snapshot, returning typed
+//!   unread or stale refusals before any replacement is prepared.
+//! - Mutations record their post-mutation digest in the
 //!   [`crate::ChangeLedger`],
 //!   attributed to the caller's `(session, turn)`, for the verify gate. The
-//!   atomic rename, ledger append, and terminal outcome decision are one
-//!   indivisible blocking critical section. A broker-owned finalizer always
+//!   mutation commit, ledger append, and terminal outcome decision are one
+//!   indivisible blocking critical section. Write/edit commit by atomic
+//!   replacement; path-copy completes in private staging before commit. A
+//!   broker-owned finalizer always
 //!   consumes that decision and journals its outcome, even if the calling task
 //!   is cancelled: once the rename lands, the outcome is journaled as `Ok` or
 //!   as `Failed` carrying the ledger error. [`EffectBroker::close`] drains all
@@ -31,12 +32,14 @@
 //!   walks it component-by-component from the broker's retained root dirfd.
 //!   Every open uses `O_NOFOLLOW`, so a post-authorization symlink swap is a
 //!   typed refusal rather than an access outside the workspace.
-//! - Patch pre-image and final-verify bytes use a same-directory `clonefile`
+//!   Structural mutations also re-resolve their held source/destination
+//!   parents and leaf identities immediately before commit.
+//! - Edit pre-image and final-verify bytes use a same-directory `clonefile`
 //!   COW snapshot when Apple provides one. If cloning is unavailable or fails,
 //!   the read degrades to a metadata-guarded best effort; that portable fallback
 //!   cannot exclude an undetectably torn read from a non-cooperating writer.
 //!   The derived bytes go to a same-directory temp opened through the parent
-//!   dirfd and land through `renameat`. Both `fs_write` and `fs_patch` hold the
+//!   dirfd and land through `renameat`. Both `fs_write` and `fs_edit` hold the
 //!   target's advisory lock through rename, serializing broker-mediated writes
 //!   to an existing target. Immediately before rename, the anchored path is
 //!   checked against the locked inode and its original content hash, and the
@@ -50,11 +53,11 @@
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
-use crate::{FsEditAnchorMismatch, FsPatchConflict, ToolError, ToolResult};
+use crate::{FsEditAnchorMismatch, ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::effect::{EffectClass, FileFreshness};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
-use haider_protocol::tool::BoundedResult;
+use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
@@ -88,6 +91,147 @@ impl Default for ResultBounds {
     }
 }
 
+pub fn fs_read_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "fs_read".into(),
+        description: "Read a bounded UTF-8 file slice or list a directory".into(),
+        effects: vec![EffectClass::FsRead],
+        dispatch: DispatchMode::Await,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "offset": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn fs_glob_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "fs_glob".into(),
+        description: "List workspace files matching a bounded glob".into(),
+        effects: vec![EffectClass::FsRead],
+        dispatch: DispatchMode::Await,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1}
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn fs_search_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "fs_search".into(),
+        description: "Search bounded workspace file contents".into(),
+        effects: vec![EffectClass::FsRead],
+        dispatch: DispatchMode::Await,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "glob": {"type": "string", "minLength": 1},
+                "case": {"type": "string", "enum": ["sensitive", "insensitive", "smart"]},
+                "mode": {"type": "string", "enum": ["literal", "simple"]},
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Legacy alias for pattern"
+                },
+                "root": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Legacy alias for path"
+                }
+            },
+            "anyOf": [
+                {"required": ["pattern"]},
+                {"required": ["query"]}
+            ],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn fs_write_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "fs_write".into(),
+        description: "Create or replace one UTF-8 file, creating parent directories".into(),
+        effects: vec![EffectClass::FsWrite],
+        dispatch: DispatchMode::Await,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "content": {"type": "string"}
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn fs_edit_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "fs_edit".into(),
+        description: "Atomically apply one or more anchored replacements to a fresh UTF-8 file"
+            .into(),
+        effects: vec![EffectClass::FsWrite],
+        dispatch: DispatchMode::Await,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old": {"type": "string", "minLength": 1},
+                            "new": {"type": "string"},
+                            "replace_all": {"type": "boolean"}
+                        },
+                        "required": ["old", "new"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["path", "edits"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn fs_path_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "fs_path".into(),
+        description: "Move, delete, or copy an existing workspace path".into(),
+        effects: vec![EffectClass::FsWrite],
+        dispatch: DispatchMode::Await,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["move", "delete", "copy"]},
+                "source": {"type": "string", "minLength": 1},
+                "destination": {"type": "string", "minLength": 1},
+                "overwrite": {"type": "boolean"}
+            },
+            "required": ["operation", "source"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnAttribution {
     pub session: SessionId,
@@ -103,11 +247,25 @@ impl TurnAttribution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsRead {
     pub path: PathBuf,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 impl FsRead {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            offset: None,
+            limit: None,
+        }
+    }
+
+    /// Selects a one-based line range. Ranged reads are line-numbered; the
+    /// default remains the byte-exact whole-file read used by freshness.
+    pub fn with_line_range(mut self, offset: Option<usize>, limit: Option<usize>) -> Self {
+        self.offset = offset;
+        self.limit = limit;
+        self
     }
 }
 
@@ -121,42 +279,20 @@ impl EffectOperation for FsRead {
     }
 
     fn arguments(&self) -> ToolResult<Value> {
-        Ok(json!({ "path": path_argument(&self.path)? }))
+        Ok(json!({
+            "limit": self.limit,
+            "offset": self.offset,
+            "path": path_argument(&self.path)?,
+        }))
     }
 
     fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
         let path = resolve_workspace_path(workspace_root, &self.path, PathResolution::Existing)?;
-        Ok(json!({ "path": path_argument(&path)? }))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FsList {
-    pub path: PathBuf,
-}
-
-impl FsList {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-impl EffectOperation for FsList {
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::FsRead
-    }
-
-    fn summary(&self) -> String {
-        format!("list {}", self.path.display())
-    }
-
-    fn arguments(&self) -> ToolResult<Value> {
-        Ok(json!({ "path": path_argument(&self.path)? }))
-    }
-
-    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
-        let path = resolve_workspace_path(workspace_root, &self.path, PathResolution::Existing)?;
-        Ok(json!({ "path": path_argument(&path)? }))
+        Ok(json!({
+            "limit": self.limit,
+            "offset": self.offset,
+            "path": path_argument(&path)?,
+        }))
     }
 }
 
@@ -288,9 +424,29 @@ impl EffectOperation for FsGlob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsEdit {
     pub path: PathBuf,
-    pub old_string: String,
-    pub new_string: String,
+    pub edits: Vec<FsEditChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEditChange {
+    pub old: String,
+    pub new: String,
     pub replace_all: bool,
+}
+
+impl FsEditChange {
+    pub fn new(old: impl Into<String>, new: impl Into<String>) -> Self {
+        Self {
+            old: old.into(),
+            new: new.into(),
+            replace_all: false,
+        }
+    }
+
+    pub fn replace_all(mut self, replace_all: bool) -> Self {
+        self.replace_all = replace_all;
+        self
+    }
 }
 
 impl FsEdit {
@@ -301,15 +457,22 @@ impl FsEdit {
     ) -> Self {
         Self {
             path: path.into(),
-            old_string: old_string.into(),
-            new_string: new_string.into(),
-            replace_all: false,
+            edits: vec![FsEditChange::new(old_string, new_string)],
         }
     }
 
     pub fn replace_all(mut self, replace_all: bool) -> Self {
-        self.replace_all = replace_all;
+        if let Some(edit) = self.edits.first_mut() {
+            edit.replace_all = replace_all;
+        }
         self
+    }
+
+    pub fn many(path: impl Into<PathBuf>, edits: Vec<FsEditChange>) -> Self {
+        Self {
+            path: path.into(),
+            edits,
+        }
     }
 }
 
@@ -324,33 +487,39 @@ impl EffectOperation for FsEdit {
 
     fn arguments(&self) -> ToolResult<Value> {
         Ok(json!({
-            "new_string": self.new_string,
-            "old_string": self.old_string,
+            "edits": self.edits.iter().map(|edit| json!({
+                "new": edit.new,
+                "old": edit.old,
+                "replace_all": edit.replace_all,
+            })).collect::<Vec<_>>(),
             "path": path_argument(&self.path)?,
-            "replace_all": self.replace_all,
         }))
     }
 
     fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
         let path = resolve_workspace_path(workspace_root, &self.path, PathResolution::Existing)?;
         Ok(json!({
-            "new_string": self.new_string,
-            "old_string": self.old_string,
+            "edits": self.edits.iter().map(|edit| json!({
+                "new": edit.new,
+                "old": edit.old,
+                "replace_all": edit.replace_all,
+            })).collect::<Vec<_>>(),
             "path": path_argument(&path)?,
-            "replace_all": self.replace_all,
         }))
     }
 
     fn approval_preview(&self) -> Vec<String> {
-        vec![
-            format!("Target: {}", self.path.display()),
+        let mut preview = vec![format!("Target: {}", self.path.display())];
+        preview.extend(self.edits.iter().enumerate().map(|(index, edit)| {
             format!(
-                "Replace {} occurrence(s) of blake3:{} with {} UTF-8 bytes",
-                if self.replace_all { "all" } else { "one" },
-                blake3::hash(self.old_string.as_bytes()).to_hex(),
-                self.new_string.len()
-            ),
-        ]
+                "Edit {}: replace {} occurrence(s) of blake3:{} with {} UTF-8 bytes",
+                index + 1,
+                if edit.replace_all { "all" } else { "one" },
+                blake3::hash(edit.old.as_bytes()).to_hex(),
+                edit.new.len()
+            )
+        }));
+        preview
     }
 }
 
@@ -387,7 +556,7 @@ impl EffectOperation for FsWrite {
 
     fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
         let path =
-            resolve_workspace_path(workspace_root, &self.path, PathResolution::MissingLeafOk)?;
+            resolve_workspace_path(workspace_root, &self.path, PathResolution::MissingPathOk)?;
         Ok(json!({
             "path": path_argument(&path)?,
             "content": self.content,
@@ -407,67 +576,112 @@ impl EffectOperation for FsWrite {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FsPatch {
-    pub path: PathBuf,
-    pub preimage: String,
-    pub replacement: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsPathOperation {
+    Move,
+    Delete,
+    Copy,
 }
 
-impl FsPatch {
-    pub fn new(
-        path: impl Into<PathBuf>,
-        preimage: impl Into<String>,
-        replacement: impl Into<String>,
-    ) -> Self {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsPath {
+    pub operation: FsPathOperation,
+    pub source: PathBuf,
+    pub destination: Option<PathBuf>,
+    pub overwrite: bool,
+}
+
+impl FsPath {
+    pub fn new(operation: FsPathOperation, source: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
-            preimage: preimage.into(),
-            replacement: replacement.into(),
+            operation,
+            source: source.into(),
+            destination: None,
+            overwrite: false,
+        }
+    }
+
+    pub fn with_destination(mut self, destination: impl Into<PathBuf>) -> Self {
+        self.destination = Some(destination.into());
+        self
+    }
+
+    pub fn overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
+        self
+    }
+
+    fn operation_name(&self) -> &'static str {
+        match self.operation {
+            FsPathOperation::Move => "move",
+            FsPathOperation::Delete => "delete",
+            FsPathOperation::Copy => "copy",
+        }
+    }
+
+    fn validate_shape(&self) -> ToolResult<()> {
+        match (self.operation, self.destination.as_ref()) {
+            (FsPathOperation::Delete, None) => Ok(()),
+            (FsPathOperation::Delete, Some(_)) => Err(ToolError::invalid_argument(
+                "fs_path delete does not accept a destination",
+            )),
+            (FsPathOperation::Move | FsPathOperation::Copy, Some(_)) => Ok(()),
+            (FsPathOperation::Move | FsPathOperation::Copy, None) => Err(
+                ToolError::invalid_argument("fs_path move/copy requires a destination"),
+            ),
         }
     }
 }
 
-impl EffectOperation for FsPatch {
+impl EffectOperation for FsPath {
     fn effect_class(&self) -> EffectClass {
         EffectClass::FsWrite
     }
 
     fn summary(&self) -> String {
-        format!("patch {}", self.path.display())
+        match self.destination.as_ref() {
+            Some(destination) => format!(
+                "{} {} to {}",
+                self.operation_name(),
+                self.source.display(),
+                destination.display()
+            ),
+            None => format!("delete {}", self.source.display()),
+        }
     }
 
     fn arguments(&self) -> ToolResult<Value> {
+        self.validate_shape()?;
         Ok(json!({
-            "path": path_argument(&self.path)?,
-            "preimage": self.preimage,
-            "replacement": self.replacement,
+            "destination": self.destination.as_deref().map(path_argument).transpose()?,
+            "operation": self.operation_name(),
+            "overwrite": self.overwrite,
+            "source": path_argument(&self.source)?,
         }))
     }
 
     fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
-        let path =
-            resolve_workspace_path(workspace_root, &self.path, PathResolution::MissingLeafOk)?;
+        self.validate_shape()?;
+        let source = resolve_workspace_path(
+            workspace_root,
+            &self.source,
+            PathResolution::AnchoredExistingLeaf,
+        )?;
+        let destination = self
+            .destination
+            .as_deref()
+            .map(|path| resolve_workspace_path(workspace_root, path, PathResolution::AnchoredLeaf))
+            .transpose()?;
         Ok(json!({
-            "path": path_argument(&path)?,
-            "preimage": self.preimage,
-            "replacement": self.replacement,
+            "destination": destination.as_deref().map(path_argument).transpose()?,
+            "operation": self.operation_name(),
+            "overwrite": self.overwrite,
+            "source": path_argument(&source)?,
         }))
     }
 
     fn approval_preview(&self) -> Vec<String> {
-        let diff = format!(
-            "--- expected\n+++ replacement\n{}\n{}",
-            prefixed_lines('-', &self.preimage),
-            prefixed_lines('+', &self.replacement)
-        );
-        vec![
-            format!("Target: {}", self.path.display()),
-            format!(
-                "Structured exact-preimage hunk:\n{}",
-                bounded_preview(&diff, 4 * 1024)
-            ),
-        ]
+        vec![self.summary(), format!("Overwrite: {}", self.overwrite)]
     }
 }
 
@@ -486,51 +700,33 @@ impl EffectBroker {
             self.workspace_root(),
             &operation.path,
             PathResolution::Existing,
-        )?);
+        )?)
+        .with_line_range(operation.offset, operation.limit);
         let relative = anchored_relative_path(self.workspace_root(), &operation.path)?;
         let display_path = operation.path.clone();
         let workspace_dir = self.duplicate_workspace_dir()?;
         let freshness_path = relative_path_argument(&relative)?.to_owned();
         let intent = self.begin(&operation, policy).await?;
-        let read =
-            run_blocking(move || read_utf8_at(workspace_dir, &relative, &display_path)).await;
+        let offset = operation.offset;
+        let limit = operation.limit;
+        let read = run_blocking(move || {
+            read_path_at(workspace_dir, &relative, &display_path, offset, limit)
+        })
+        .await;
         let (result, freshness) = match read {
-            Ok(contents) => {
-                let digest = digest_bytes(contents.as_bytes());
-                let result = bounded(contents, bounds, cas).await;
-                let freshness = result.as_ref().ok().map(|_| FileFreshness {
-                    path: freshness_path,
-                    digest,
+            Ok(read) => {
+                let result = bounded(read.contents, bounds, cas).await;
+                let freshness = result.as_ref().ok().and_then(|_| {
+                    read.digest.map(|digest| FileFreshness {
+                        path: freshness_path,
+                        digest,
+                    })
                 });
                 (result, freshness)
             }
             Err(error) => (Err(error), None),
         };
         self.finish_with_freshness(&intent, result, freshness).await
-    }
-
-    pub async fn fs_list<C>(
-        &mut self,
-        operation: &FsList,
-        policy: &PermissionPolicy,
-        cas: &mut C,
-        bounds: ResultBounds,
-    ) -> ToolResult<BoundedResult>
-    where
-        C: CasSink,
-    {
-        let operation = FsList::new(resolve_workspace_path(
-            self.workspace_root(),
-            &operation.path,
-            PathResolution::Existing,
-        )?);
-        let relative = anchored_relative_path(self.workspace_root(), &operation.path)?;
-        let display_path = operation.path.clone();
-        let workspace_dir = self.duplicate_workspace_dir()?;
-        self.bounded_read(&operation, policy, cas, bounds, move || {
-            list_directory_at(workspace_dir, &relative, &display_path)
-        })
-        .await
     }
 
     pub async fn fs_search<C>(
@@ -604,30 +800,6 @@ impl EffectBroker {
         self.finish(&intent, result).await
     }
 
-    /// Shared read-class envelope: begin (intent → authorize → dispatched),
-    /// produce the raw text off the async runtime, apply the result bound,
-    /// journal the outcome.
-    async fn bounded_read<O, C, F>(
-        &mut self,
-        operation: &O,
-        policy: &PermissionPolicy,
-        cas: &mut C,
-        bounds: ResultBounds,
-        produce: F,
-    ) -> ToolResult<BoundedResult>
-    where
-        O: EffectOperation,
-        C: CasSink,
-        F: FnOnce() -> ToolResult<String> + Send + 'static,
-    {
-        let intent = self.begin(operation, policy).await?;
-        let result = match run_blocking(produce).await {
-            Ok(contents) => bounded(contents, bounds, cas).await,
-            Err(error) => Err(error),
-        };
-        self.finish(&intent, result).await
-    }
-
     pub async fn fs_write<L>(
         &mut self,
         operation: &FsWrite,
@@ -642,7 +814,7 @@ impl EffectBroker {
             resolve_workspace_path(
                 self.workspace_root(),
                 &operation.path,
-                PathResolution::MissingLeafOk,
+                PathResolution::MissingPathOk,
             )?,
             operation.content.clone(),
         );
@@ -725,9 +897,7 @@ impl EffectBroker {
                 &operation.path,
                 PathResolution::Existing,
             )?,
-            old_string: operation.old_string.clone(),
-            new_string: operation.new_string.clone(),
-            replace_all: operation.replace_all,
+            edits: operation.edits.clone(),
         };
         let intent = self.begin(&operation, policy).await?;
         let relative = anchored_relative_path(self.workspace_root(), &operation.path);
@@ -792,9 +962,9 @@ impl EffectBroker {
         }
     }
 
-    pub async fn fs_patch<L>(
+    pub async fn fs_path<L>(
         &mut self,
-        operation: &FsPatch,
+        operation: &FsPath,
         policy: &PermissionPolicy,
         attribution: &TurnAttribution,
         ledger: &L,
@@ -802,36 +972,60 @@ impl EffectBroker {
     where
         L: ChangeLedgerSink,
     {
-        let operation = FsPatch::new(
-            resolve_workspace_path(
-                self.workspace_root(),
-                &operation.path,
-                PathResolution::MissingLeafOk,
-            )?,
-            operation.preimage.clone(),
-            operation.replacement.clone(),
-        );
+        operation.validate_shape()?;
+        let source = resolve_workspace_path(
+            self.workspace_root(),
+            &operation.source,
+            PathResolution::AnchoredExistingLeaf,
+        )?;
+        let destination = operation
+            .destination
+            .as_deref()
+            .map(|path| {
+                resolve_workspace_path(self.workspace_root(), path, PathResolution::AnchoredLeaf)
+            })
+            .transpose()?;
+        let operation = FsPath {
+            operation: operation.operation,
+            source,
+            destination,
+            overwrite: operation.overwrite,
+        };
         let intent = self.begin(&operation, policy).await?;
-        let relative = anchored_relative_path(self.workspace_root(), &operation.path);
+        let source_relative = anchored_relative_path(self.workspace_root(), &operation.source);
+        let destination_relative = operation
+            .destination
+            .as_deref()
+            .map(|path| anchored_relative_path(self.workspace_root(), path))
+            .transpose();
         let workspace_dir = self.duplicate_workspace_dir();
         let owned_operation = operation.clone();
         let critical_ledger = ledger.clone();
         let attribution = attribution.clone();
         let effect = intent.effect.clone();
         let summary = intent.summary.clone();
-        let (relative, workspace_dir) = match (relative, workspace_dir) {
-            (Ok(relative), Ok(workspace_dir)) => (relative, workspace_dir),
-            (Err(error), _) | (_, Err(error)) => return self.finish(&intent, Err(error)).await,
-        };
+        let (source_relative, destination_relative, workspace_dir) =
+            match (source_relative, destination_relative, workspace_dir) {
+                (Ok(source_relative), Ok(destination_relative), Ok(workspace_dir)) => {
+                    (source_relative, destination_relative, workspace_dir)
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    return self.finish(&intent, Err(error)).await;
+                }
+            };
         let worker = tokio::task::spawn_blocking(move || {
-            apply_patch_and_record(
+            apply_path_and_record(
                 workspace_dir,
-                &relative,
+                &source_relative,
+                destination_relative.as_deref(),
                 &owned_operation,
-                &critical_ledger,
-                attribution,
-                effect,
-                summary,
+                MutationRecordContext {
+                    expected_digest: None,
+                    ledger: &critical_ledger,
+                    attribution,
+                    effect,
+                    summary,
+                },
             )
         });
         // Tokio can abort a queued blocking task, but not one that has begun.
@@ -893,11 +1087,28 @@ impl Drop for WorkerCancelGuard {
     }
 }
 
-fn read_utf8_at(
+struct ReadPathOutput {
+    contents: String,
+    digest: Option<String>,
+}
+
+fn read_path_at(
     workspace_dir: OwnedFd,
     relative: &Path,
     display_path: &Path,
-) -> ToolResult<String> {
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> ToolResult<ReadPathOutput> {
+    if offset == Some(0) {
+        return Err(ToolError::invalid_argument(
+            "fs_read offset must be one or greater",
+        ));
+    }
+    if limit == Some(0) {
+        return Err(ToolError::invalid_argument(
+            "fs_read limit must be one or greater",
+        ));
+    }
     let target = open_target_at(
         workspace_dir,
         relative,
@@ -905,7 +1116,31 @@ fn read_utf8_at(
         "open for read",
         display_path,
     )?;
-    read_utf8_file(fs::File::from(target), display_path)
+    let metadata = rustix::fs::fstat(&target)
+        .map_err(|error| ToolError::io("inspect read target", display_path, error))?;
+    match FileType::from_raw_mode(metadata.st_mode) {
+        FileType::RegularFile => {
+            let contents = read_utf8_file(fs::File::from(target), display_path)?;
+            let digest = mutation_digest(contents.as_bytes());
+            let contents = if offset.is_some() || limit.is_some() {
+                select_numbered_lines(&contents, offset.unwrap_or(1), limit)
+            } else {
+                contents
+            };
+            Ok(ReadPathOutput {
+                contents,
+                digest: Some(digest),
+            })
+        }
+        FileType::Directory => Ok(ReadPathOutput {
+            contents: list_directory_fd(target, display_path)?,
+            digest: None,
+        }),
+        _ => Err(ToolError::invalid_argument(format!(
+            "{} is neither a regular file nor a directory",
+            display_path.display()
+        ))),
+    }
 }
 
 fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String> {
@@ -918,12 +1153,18 @@ fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String>
     })
 }
 
-fn list_directory_at(
-    workspace_dir: OwnedFd,
-    relative: &Path,
-    display_path: &Path,
-) -> ToolResult<String> {
-    let directory = open_directory_at(workspace_dir, relative, "open for list", display_path)?;
+fn select_numbered_lines(contents: &str, offset: usize, limit: Option<usize>) -> String {
+    let limit = limit.unwrap_or(usize::MAX);
+    contents
+        .split_inclusive('\n')
+        .enumerate()
+        .skip(offset - 1)
+        .take(limit)
+        .map(|(index, line)| format!("{}: {line}", index + 1))
+        .collect()
+}
+
+fn list_directory_fd(directory: OwnedFd, display_path: &Path) -> ToolResult<String> {
     let mut entries = rustix::fs::Dir::new(directory)
         .map_err(|error| ToolError::io("list", display_path, error))?;
     let mut listed = Vec::new();
@@ -1365,29 +1606,26 @@ fn wildcard_matches(pattern: &str, text: &str, slash_sensitive: bool) -> bool {
     matches_from(&pattern, &text, slash_sensitive, 0, 0, &mut HashMap::new())
 }
 
-/// Replaces the unique occurrence of the pre-image. Missing or ambiguous
-/// pre-images fail as typed conflicts, so the model must widen an ambiguous
-/// hunk with surrounding context and can never silently patch the wrong copy.
-struct AppliedPatch {
+struct AppliedMutation {
     result: BoundedResult,
-    path: PathBuf,
-    bytes_hash: String,
+    paths: Vec<PathBuf>,
+    post_digest: String,
 }
 
-enum PatchWorkerOutcome {
+enum MutationWorkerOutcome {
     Applied {
         result: BoundedResult,
-        bytes_hash: String,
+        post_digest: String,
     },
     ApplyFailed(ToolError),
     LedgerFailed {
         error: ToolError,
         written: bool,
-        bytes_hash: String,
+        post_digest: String,
     },
 }
 
-impl PatchWorkerOutcome {
+impl MutationWorkerOutcome {
     fn into_result(self) -> ToolResult<BoundedResult> {
         match self {
             Self::Applied { result, .. } => Ok(result),
@@ -1404,25 +1642,28 @@ impl PatchWorkerOutcome {
         relative_path: String,
     ) -> (ToolResult<BoundedResult>, Option<FileFreshness>) {
         match self {
-            Self::Applied { result, bytes_hash } => (
+            Self::Applied {
+                result,
+                post_digest,
+            } => (
                 Ok(result),
                 Some(FileFreshness {
                     path: relative_path,
-                    digest: bytes_hash,
+                    digest: post_digest,
                 }),
             ),
             Self::ApplyFailed(error) => (Err(error), None),
             Self::LedgerFailed {
                 error,
                 written,
-                bytes_hash,
+                post_digest,
             } => {
                 debug_assert!(written, "ledger failure must follow a successful rename");
                 (
                     Err(error),
                     Some(FileFreshness {
                         path: relative_path,
-                        digest: bytes_hash,
+                        digest: post_digest,
                     }),
                 )
             }
@@ -1443,35 +1684,38 @@ fn apply_write_and_record<L>(
     relative: &Path,
     operation: &FsWrite,
     context: MutationRecordContext<'_, L>,
-) -> PatchWorkerOutcome
+) -> MutationWorkerOutcome
 where
     L: ChangeLedgerSink,
 {
     let applied = match apply_write_at(workspace_dir, relative, operation, context.expected_digest)
     {
         Ok(applied) => applied,
-        Err(error) => return PatchWorkerOutcome::ApplyFailed(error),
+        Err(error) => return MutationWorkerOutcome::ApplyFailed(error),
     };
-    let AppliedPatch {
+    let AppliedMutation {
         result,
-        path,
-        bytes_hash,
+        paths,
+        post_digest,
     } = applied;
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
         FsWriteRecord {
             effect: context.effect,
-            paths: vec![path],
+            paths,
             summary: context.summary,
-            bytes_hash: bytes_hash.clone(),
+            bytes_hash: post_digest.clone(),
         },
     ) {
-        Ok(()) => PatchWorkerOutcome::Applied { result, bytes_hash },
-        Err(error) => PatchWorkerOutcome::LedgerFailed {
+        Ok(()) => MutationWorkerOutcome::Applied {
+            result,
+            post_digest,
+        },
+        Err(error) => MutationWorkerOutcome::LedgerFailed {
             error,
             written: true,
-            bytes_hash,
+            post_digest,
         },
     }
 }
@@ -1481,13 +1725,14 @@ fn apply_write_at(
     relative: &Path,
     operation: &FsWrite,
     expected_digest: Option<&str>,
-) -> ToolResult<AppliedPatch> {
+) -> ToolResult<AppliedMutation> {
     let traversal_root = rustix::io::dup(&workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
-    let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
+    let (parent, leaf) = open_parent_creating_at(traversal_root, relative, &operation.path)?;
     // Keep the advisory-exclusive lock on the current inode alive through
-    // rename when overwriting. `fs_patch` enters through the same lock helper,
-    // so every cooperating Haider mutation of an existing target serializes.
+    // rename when overwriting. `fs_edit` enters through the same lock helper,
+    // so every cooperating Haider content mutation of an existing target
+    // serializes.
     // A missing leaf is valid create semantics; any other lookup error stays
     // typed and no-follow.
     let mut source = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
@@ -1495,7 +1740,7 @@ fn apply_write_at(
             let (mut source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
             let (source_bytes, _source_basis) =
                 file_snapshot(&parent, &mut source, &operation.path)?.parts();
-            let current_digest = digest_bytes(&source_bytes);
+            let current_digest = mutation_digest(&source_bytes);
             let Some(expected_digest) = expected_digest else {
                 return Err(ToolError::UnreadFile {
                     path: operation.path.clone(),
@@ -1520,7 +1765,7 @@ fn apply_write_at(
         }
     };
     let bytes = operation.content.as_bytes();
-    let bytes_hash = format!("blake3:{}", blake3::hash(bytes).to_hex());
+    let post_digest = mutation_digest(bytes);
     let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
     let mode = source
         .as_ref()
@@ -1573,7 +1818,7 @@ fn apply_write_at(
         return Err(error);
     }
     drop(source);
-    Ok(AppliedPatch {
+    Ok(AppliedMutation {
         result: BoundedResult {
             preview: format!(
                 "wrote {} bytes to {}",
@@ -1587,8 +1832,8 @@ fn apply_write_at(
             reason: None,
             presentation: None,
         },
-        path: operation.path.clone(),
-        bytes_hash,
+        paths: vec![operation.path.clone()],
+        post_digest,
     })
 }
 
@@ -1597,34 +1842,37 @@ fn apply_edit_and_record<L>(
     relative: &Path,
     operation: &FsEdit,
     context: MutationRecordContext<'_, L>,
-) -> PatchWorkerOutcome
+) -> MutationWorkerOutcome
 where
     L: ChangeLedgerSink,
 {
     let applied = match apply_edit_at(workspace_dir, relative, operation, context.expected_digest) {
         Ok(applied) => applied,
-        Err(error) => return PatchWorkerOutcome::ApplyFailed(error),
+        Err(error) => return MutationWorkerOutcome::ApplyFailed(error),
     };
-    let AppliedPatch {
+    let AppliedMutation {
         result,
-        path,
-        bytes_hash,
+        paths,
+        post_digest,
     } = applied;
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
         FsWriteRecord {
             effect: context.effect,
-            paths: vec![path],
+            paths,
             summary: context.summary,
-            bytes_hash: bytes_hash.clone(),
+            bytes_hash: post_digest.clone(),
         },
     ) {
-        Ok(()) => PatchWorkerOutcome::Applied { result, bytes_hash },
-        Err(error) => PatchWorkerOutcome::LedgerFailed {
+        Ok(()) => MutationWorkerOutcome::Applied {
+            result,
+            post_digest,
+        },
+        Err(error) => MutationWorkerOutcome::LedgerFailed {
             error,
             written: true,
-            bytes_hash,
+            post_digest,
         },
     }
 }
@@ -1634,10 +1882,49 @@ fn apply_edit_at(
     relative: &Path,
     operation: &FsEdit,
     expected_digest: Option<&str>,
-) -> ToolResult<AppliedPatch> {
-    if operation.old_string.is_empty() {
+) -> ToolResult<AppliedMutation> {
+    apply_edit_at_with_commit_hooks(
+        workspace_dir,
+        relative,
+        operation,
+        expected_digest,
+        || {},
+        || {},
+    )
+}
+
+#[cfg(test)]
+fn apply_edit_at_before_replace(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsEdit,
+    expected_digest: Option<&str>,
+    before_replace: impl FnOnce(),
+) -> ToolResult<AppliedMutation> {
+    apply_edit_at_with_commit_hooks(
+        workspace_dir,
+        relative,
+        operation,
+        expected_digest,
+        before_replace,
+        || {},
+    )
+}
+
+fn apply_edit_at_with_commit_hooks(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsEdit,
+    expected_digest: Option<&str>,
+    before_replace: impl FnOnce(),
+    before_commit: impl FnOnce(),
+) -> ToolResult<AppliedMutation> {
+    if operation.edits.is_empty() {
+        return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
+    }
+    if operation.edits.iter().any(|edit| edit.old.is_empty()) {
         return Err(ToolError::invalid_argument(
-            "fs_edit old_string cannot be empty",
+            "fs_edit old anchors cannot be empty",
         ));
     }
     let traversal_root = rustix::io::dup(&workspace_dir)
@@ -1646,7 +1933,7 @@ fn apply_edit_at(
     let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
     let (source_bytes, _source_basis) =
         file_snapshot(&parent, &mut source, &operation.path)?.parts();
-    let current_digest = digest_bytes(&source_bytes);
+    let current_digest = mutation_digest(&source_bytes);
     let Some(expected_digest) = expected_digest else {
         return Err(ToolError::UnreadFile {
             path: operation.path.clone(),
@@ -1660,24 +1947,29 @@ fn apply_edit_at(
         });
     }
     let source_hash = blake3::hash(&source_bytes);
-    let contents = String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
-        message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
-    })?;
-    let matches = contents.match_indices(&operation.old_string).count();
-    if (!operation.replace_all && matches != 1) || (operation.replace_all && matches == 0) {
-        return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
-            path: operation.path.clone(),
-            matches,
-            replace_all: operation.replace_all,
-        }));
+    let mut edited =
+        String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
+            message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
+        })?;
+    let mut replacements = 0usize;
+    for edit in &operation.edits {
+        let matches = edited.match_indices(&edit.old).count();
+        if (!edit.replace_all && matches != 1) || (edit.replace_all && matches == 0) {
+            return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
+                path: operation.path.clone(),
+                matches,
+                replace_all: edit.replace_all,
+            }));
+        }
+        edited = if edit.replace_all {
+            edited.replace(&edit.old, &edit.new)
+        } else {
+            edited.replacen(&edit.old, &edit.new, 1)
+        };
+        replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
     }
-    let edited = if operation.replace_all {
-        contents.replace(&operation.old_string, &operation.new_string)
-    } else {
-        contents.replacen(&operation.old_string, &operation.new_string, 1)
-    };
     let bytes = edited.as_bytes();
-    let bytes_hash = digest_bytes(bytes);
+    let post_digest = mutation_digest(bytes);
     let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
     if let Err(error) = write_patch_temporary(
         temporary_fd,
@@ -1688,6 +1980,7 @@ fn apply_edit_at(
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
+    before_replace();
     if let Err(error) =
         require_unchanged_target(&parent, &leaf, Some(&source_metadata), &operation.path)
     {
@@ -1708,6 +2001,7 @@ fn apply_edit_at(
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
+    before_commit();
     if let Err(error) = require_unchanged_target(
         &commit_parent,
         &leaf,
@@ -1728,13 +2022,13 @@ fn apply_edit_at(
         return Err(error);
     }
     drop(source);
-    Ok(AppliedPatch {
+    Ok(AppliedMutation {
         result: BoundedResult {
             preview: format!(
                 "edited {} ({} replacement{})",
                 operation.path.display(),
-                matches,
-                if matches == 1 { "" } else { "s" }
+                replacements,
+                if replacements == 1 { "" } else { "s" }
             ),
             truncated: false,
             artifact: None,
@@ -1743,192 +2037,668 @@ fn apply_edit_at(
             reason: None,
             presentation: None,
         },
-        path: operation.path.clone(),
-        bytes_hash,
+        paths: vec![operation.path.clone()],
+        post_digest,
     })
 }
 
-fn apply_patch_and_record<L>(
+fn apply_path_and_record<L>(
     workspace_dir: OwnedFd,
-    relative: &Path,
-    operation: &FsPatch,
-    ledger: &L,
-    attribution: TurnAttribution,
-    effect: haider_protocol::ids::EffectId,
-    summary: String,
-) -> PatchWorkerOutcome
+    source_relative: &Path,
+    destination_relative: Option<&Path>,
+    operation: &FsPath,
+    context: MutationRecordContext<'_, L>,
+) -> MutationWorkerOutcome
 where
     L: ChangeLedgerSink,
 {
-    let applied = match apply_patch_at(workspace_dir, relative, operation) {
+    let applied = match apply_path_at(
+        workspace_dir,
+        source_relative,
+        destination_relative,
+        operation,
+    ) {
         Ok(applied) => applied,
-        Err(error) => return PatchWorkerOutcome::ApplyFailed(error),
+        Err(error) => return MutationWorkerOutcome::ApplyFailed(error),
     };
-    let AppliedPatch {
+    let AppliedMutation {
         result,
-        path,
-        bytes_hash,
+        paths,
+        post_digest,
     } = applied;
-    match ledger.record_fs_write(
-        attribution.session,
-        attribution.turn,
+    match context.ledger.record_fs_write(
+        context.attribution.session,
+        context.attribution.turn,
         FsWriteRecord {
-            effect,
-            paths: vec![path],
-            summary,
-            bytes_hash: bytes_hash.clone(),
+            effect: context.effect,
+            paths,
+            summary: context.summary,
+            bytes_hash: post_digest.clone(),
         },
     ) {
-        Ok(()) => PatchWorkerOutcome::Applied { result, bytes_hash },
-        Err(error) => PatchWorkerOutcome::LedgerFailed {
+        Ok(()) => MutationWorkerOutcome::Applied {
+            result,
+            post_digest,
+        },
+        Err(error) => MutationWorkerOutcome::LedgerFailed {
             error,
             written: true,
-            bytes_hash,
+            post_digest,
         },
     }
 }
 
-fn apply_patch_at(
+fn apply_path_at(
     workspace_dir: OwnedFd,
-    relative: &Path,
-    operation: &FsPatch,
-) -> ToolResult<AppliedPatch> {
-    apply_patch_at_before_replace(workspace_dir, relative, operation, || {})
+    source_relative: &Path,
+    destination_relative: Option<&Path>,
+    operation: &FsPath,
+) -> ToolResult<AppliedMutation> {
+    apply_path_at_with_commit_hook(
+        workspace_dir,
+        source_relative,
+        destination_relative,
+        operation,
+        || {},
+    )
 }
 
-fn apply_patch_at_before_replace(
+#[cfg(test)]
+fn apply_path_at_before_mutation(
     workspace_dir: OwnedFd,
-    relative: &Path,
-    operation: &FsPatch,
-    before_replace: impl FnOnce(),
-) -> ToolResult<AppliedPatch> {
-    apply_patch_at_with_commit_hooks(workspace_dir, relative, operation, before_replace, || {})
+    source_relative: &Path,
+    destination_relative: Option<&Path>,
+    operation: &FsPath,
+    before_mutation: impl FnOnce(),
+) -> ToolResult<AppliedMutation> {
+    apply_path_at_with_commit_hook(
+        workspace_dir,
+        source_relative,
+        destination_relative,
+        operation,
+        before_mutation,
+    )
 }
 
-fn apply_patch_at_with_commit_hooks(
+fn apply_path_at_with_commit_hook(
     workspace_dir: OwnedFd,
-    relative: &Path,
-    operation: &FsPatch,
-    before_replace: impl FnOnce(),
-    before_commit: impl FnOnce(),
-) -> ToolResult<AppliedPatch> {
-    if operation.preimage.is_empty() {
+    source_relative: &Path,
+    destination_relative: Option<&Path>,
+    operation: &FsPath,
+    before_mutation: impl FnOnce(),
+) -> ToolResult<AppliedMutation> {
+    if source_relative.as_os_str().is_empty() {
         return Err(ToolError::invalid_argument(
-            "fs_patch preimage cannot be empty",
+            "fs_path refuses to mutate the workspace root",
         ));
     }
-    let traversal_root = rustix::io::dup(&workspace_dir)
-        .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
-    let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
-    let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
-    let (source_bytes, _source_basis) =
-        file_snapshot(&parent, &mut source, &operation.path)?.parts();
-    let source_hash = blake3::hash(&source_bytes);
-    let contents = String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
-        message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
-    })?;
-    let matches = contents
-        .as_bytes()
-        .windows(operation.preimage.len())
-        .filter(|candidate| *candidate == operation.preimage.as_bytes())
-        .count();
-    if matches != 1 {
-        return Err(ToolError::Conflict(FsPatchConflict {
-            path: operation.path.clone(),
-            expected_preimage: operation.preimage.clone(),
-            matches,
-        }));
-    }
-    let patched = contents
-        .replacen(&operation.preimage, &operation.replacement, 1)
-        .into_bytes();
-    let bytes_hash = format!("blake3:{}", blake3::hash(&patched).to_hex());
-    let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
-    let write_result = write_patch_temporary(
-        temporary_fd,
-        source_metadata.st_mode,
-        &patched,
-        &operation.path,
-    );
-    if let Err(error) = write_result {
-        remove_temporary(&parent, &temporary_name);
-        return Err(error);
-    }
-    let applied = AppliedPatch {
-        result: BoundedResult {
-            preview: format!("patched {}", operation.path.display()),
-            truncated: false,
-            artifact: None,
-            cursor: None,
-            status: haider_protocol::tool::ToolResultStatus::Completed,
-            reason: None,
-            presentation: None,
-        },
-        path: operation.path.clone(),
-        bytes_hash,
+    let source_root = rustix::io::dup(&workspace_dir)
+        .map_err(|error| ToolError::io("duplicate workspace root", &operation.source, error))?;
+    let (source_parent, source_leaf) =
+        open_parent_at(source_root, source_relative, &operation.source)?;
+    let source_metadata =
+        rustix::fs::statat(&source_parent, &source_leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(
+            |error| anchored_io_error("inspect fs_path source", &operation.source, error),
+        )?;
+
+    let mut structural = Vec::new();
+    structural.extend_from_slice(operation.operation_name().as_bytes());
+    structural.push(0);
+    structural.extend_from_slice(relative_path_argument(source_relative)?.as_bytes());
+
+    let mut before_mutation = Some(before_mutation);
+    let (result, paths) = match operation.operation {
+        FsPathOperation::Delete => {
+            invoke_path_commit_hook(&mut before_mutation);
+            let commit_source_parent = revalidate_commit_parent(
+                &workspace_dir,
+                source_relative,
+                &source_parent,
+                &operation.source,
+            )?;
+            require_unchanged_target(
+                &commit_source_parent,
+                &source_leaf,
+                Some(&source_metadata),
+                &operation.source,
+            )?;
+            remove_entry_at(&commit_source_parent, &source_leaf, &operation.source)?;
+            (
+                mutation_result(format!("deleted {}", operation.source.display())),
+                vec![operation.source.clone()],
+            )
+        }
+        FsPathOperation::Move | FsPathOperation::Copy => {
+            let destination = operation.destination.as_ref().ok_or_else(|| {
+                ToolError::invalid_argument("fs_path move/copy requires a destination")
+            })?;
+            let destination_relative = destination_relative.ok_or_else(|| {
+                ToolError::invalid_argument("fs_path move/copy requires a destination")
+            })?;
+            if destination_relative.as_os_str().is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "fs_path refuses to replace the workspace root",
+                ));
+            }
+            if source_relative == destination_relative {
+                return Err(ToolError::invalid_argument(
+                    "fs_path source and destination must differ",
+                ));
+            }
+            if FileType::from_raw_mode(source_metadata.st_mode) == FileType::Directory
+                && destination_relative.starts_with(source_relative)
+            {
+                return Err(ToolError::invalid_argument(
+                    "fs_path destination cannot be inside the source directory",
+                ));
+            }
+            structural.push(0);
+            structural.extend_from_slice(relative_path_argument(destination_relative)?.as_bytes());
+            let destination_root = rustix::io::dup(&workspace_dir)
+                .map_err(|error| ToolError::io("duplicate workspace root", destination, error))?;
+            let (destination_parent, destination_leaf) =
+                open_parent_at(destination_root, destination_relative, destination)?;
+            let destination_metadata = match rustix::fs::statat(
+                &destination_parent,
+                &destination_leaf,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(metadata) => Some(metadata),
+                Err(rustix::io::Errno::NOENT) => None,
+                Err(error) => {
+                    return Err(anchored_io_error(
+                        "inspect fs_path destination",
+                        destination,
+                        error,
+                    ));
+                }
+            };
+            if destination_metadata.is_some() && !operation.overwrite {
+                return Err(ToolError::invalid_argument(format!(
+                    "fs_path destination already exists: {}",
+                    destination.display()
+                )));
+            }
+
+            match operation.operation {
+                FsPathOperation::Move => {
+                    if destination_metadata.as_ref().is_some_and(|destination| {
+                        destination.st_dev == source_metadata.st_dev
+                            && destination.st_ino == source_metadata.st_ino
+                    }) {
+                        return Err(ToolError::invalid_argument(
+                            "fs_path move source and destination identify the same path",
+                        ));
+                    }
+                    invoke_path_commit_hook(&mut before_mutation);
+                    let commit_source_parent = revalidate_commit_parent(
+                        &workspace_dir,
+                        source_relative,
+                        &source_parent,
+                        &operation.source,
+                    )?;
+                    let commit_destination_parent = revalidate_commit_parent(
+                        &workspace_dir,
+                        destination_relative,
+                        &destination_parent,
+                        destination,
+                    )?;
+                    require_unchanged_target(
+                        &commit_source_parent,
+                        &source_leaf,
+                        Some(&source_metadata),
+                        &operation.source,
+                    )?;
+                    require_unchanged_target(
+                        &commit_destination_parent,
+                        &destination_leaf,
+                        destination_metadata.as_ref(),
+                        destination,
+                    )?;
+                    if operation.overwrite {
+                        rustix::fs::renameat(
+                            &commit_source_parent,
+                            &source_leaf,
+                            &commit_destination_parent,
+                            &destination_leaf,
+                        )
+                    } else {
+                        rustix::fs::renameat_with(
+                            &commit_source_parent,
+                            &source_leaf,
+                            &commit_destination_parent,
+                            &destination_leaf,
+                            rustix::fs::RenameFlags::NOREPLACE,
+                        )
+                    }
+                    .map_err(|error| anchored_io_error("move path", destination, error))?;
+                    (
+                        mutation_result(format!(
+                            "moved {} to {}",
+                            operation.source.display(),
+                            destination.display()
+                        )),
+                        vec![operation.source.clone(), destination.clone()],
+                    )
+                }
+                FsPathOperation::Copy => {
+                    invoke_path_commit_hook(&mut before_mutation);
+                    let copy_source_parent = revalidate_commit_parent(
+                        &workspace_dir,
+                        source_relative,
+                        &source_parent,
+                        &operation.source,
+                    )?;
+                    let copy_destination_parent = revalidate_commit_parent(
+                        &workspace_dir,
+                        destination_relative,
+                        &destination_parent,
+                        destination,
+                    )?;
+                    require_unchanged_target(
+                        &copy_source_parent,
+                        &source_leaf,
+                        Some(&source_metadata),
+                        &operation.source,
+                    )?;
+                    require_unchanged_target(
+                        &copy_destination_parent,
+                        &destination_leaf,
+                        destination_metadata.as_ref(),
+                        destination,
+                    )?;
+                    let (staging_name, staging_directory) =
+                        create_path_staging_directory(&copy_destination_parent, destination)?;
+                    let staging_leaf = OsStr::new("entry");
+                    if let Err(error) = copy_entry_at(
+                        &copy_source_parent,
+                        &source_leaf,
+                        &staging_directory,
+                        staging_leaf,
+                        &operation.source,
+                        destination,
+                        &mut structural,
+                    ) {
+                        remove_path_staging(&copy_destination_parent, &staging_name, destination);
+                        return Err(error);
+                    }
+                    let commit_source_parent = match revalidate_commit_parent(
+                        &workspace_dir,
+                        source_relative,
+                        &copy_source_parent,
+                        &operation.source,
+                    ) {
+                        Ok(parent) => parent,
+                        Err(error) => {
+                            remove_path_staging(
+                                &copy_destination_parent,
+                                &staging_name,
+                                destination,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let commit_destination_parent = match revalidate_commit_parent(
+                        &workspace_dir,
+                        destination_relative,
+                        &copy_destination_parent,
+                        destination,
+                    ) {
+                        Ok(parent) => parent,
+                        Err(error) => {
+                            remove_path_staging(
+                                &copy_destination_parent,
+                                &staging_name,
+                                destination,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let commit_checks = require_unchanged_target(
+                        &commit_source_parent,
+                        &source_leaf,
+                        Some(&source_metadata),
+                        &operation.source,
+                    )
+                    .and_then(|()| {
+                        require_unchanged_target(
+                            &commit_destination_parent,
+                            &destination_leaf,
+                            destination_metadata.as_ref(),
+                            destination,
+                        )
+                    });
+                    if let Err(error) = commit_checks {
+                        remove_path_staging(&copy_destination_parent, &staging_name, destination);
+                        return Err(error);
+                    }
+                    if let Err(failure) = commit_staged_copy(
+                        &staging_directory,
+                        staging_leaf,
+                        &commit_destination_parent,
+                        &destination_leaf,
+                        destination_metadata.is_some(),
+                        destination,
+                    ) {
+                        let (error, cleanup_safe) = failure.parts();
+                        if cleanup_safe {
+                            remove_path_staging(
+                                &copy_destination_parent,
+                                &staging_name,
+                                destination,
+                            );
+                        }
+                        return Err(error);
+                    }
+                    remove_path_staging(&copy_destination_parent, &staging_name, destination);
+                    (
+                        mutation_result(format!(
+                            "copied {} to {}",
+                            operation.source.display(),
+                            destination.display()
+                        )),
+                        vec![destination.clone()],
+                    )
+                }
+                FsPathOperation::Delete => unreachable!("covered above"),
+            }
+        }
     };
-    before_replace();
-    if let Err(error) =
-        require_unchanged_target(&parent, &leaf, Some(&source_metadata), &operation.path)
-    {
-        remove_temporary(&parent, &temporary_name);
-        return Err(error);
+
+    Ok(AppliedMutation {
+        result,
+        paths,
+        post_digest: mutation_digest(&structural),
+    })
+}
+
+fn invoke_path_commit_hook(hook: &mut Option<impl FnOnce()>) {
+    if let Some(hook) = hook.take() {
+        hook();
     }
-    let commit_parent =
-        match revalidate_commit_parent(&workspace_dir, relative, &parent, &operation.path) {
-            Ok(parent) => parent,
+}
+
+fn mutation_result(preview: String) -> BoundedResult {
+    BoundedResult {
+        preview,
+        truncated: false,
+        artifact: None,
+        cursor: None,
+        status: haider_protocol::tool::ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+    }
+}
+
+fn create_path_staging_directory(
+    parent: &OwnedFd,
+    display_path: &Path,
+) -> ToolResult<(OsString, OwnedFd)> {
+    static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
+    const MAX_NAME_RETRIES: usize = 16;
+    for _ in 0..MAX_NAME_RETRIES {
+        let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
+        let name = OsString::from(format!(
+            ".haider-path-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match rustix::fs::mkdirat(parent, &name, Mode::from_raw_mode(0o700)) {
+            Ok(()) => {
+                let directory = match openat_nofollow(
+                    parent,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY,
+                    "open path staging directory",
+                    display_path,
+                ) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        let _ = rustix::fs::unlinkat(parent, &name, AtFlags::REMOVEDIR);
+                        return Err(error);
+                    }
+                };
+                return Ok((name, directory));
+            }
+            Err(rustix::io::Errno::EXIST) => {}
             Err(error) => {
-                remove_temporary(&parent, &temporary_name);
+                return Err(ToolError::io(
+                    "create path staging directory",
+                    display_path,
+                    error,
+                ));
+            }
+        }
+    }
+    Err(ToolError::Runtime {
+        message: format!(
+            "could not allocate a unique path staging directory for {}",
+            display_path.display()
+        ),
+    })
+}
+
+enum StagedCopyCommitFailure {
+    CleanupSafe(ToolError),
+    PreserveStaging(ToolError),
+}
+
+impl StagedCopyCommitFailure {
+    fn parts(self) -> (ToolError, bool) {
+        match self {
+            Self::CleanupSafe(error) => (error, true),
+            Self::PreserveStaging(error) => (error, false),
+        }
+    }
+}
+
+fn commit_staged_copy(
+    staging_directory: &OwnedFd,
+    staging_leaf: &OsStr,
+    destination_parent: &OwnedFd,
+    destination_leaf: &OsStr,
+    destination_exists: bool,
+    destination_path: &Path,
+) -> Result<(), StagedCopyCommitFailure> {
+    let previous_leaf = OsStr::new("previous");
+    if destination_exists {
+        rustix::fs::renameat_with(
+            destination_parent,
+            destination_leaf,
+            staging_directory,
+            previous_leaf,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            StagedCopyCommitFailure::CleanupSafe(anchored_io_error(
+                "stage previous copy destination",
+                destination_path,
+                error,
+            ))
+        })?;
+    }
+
+    if let Err(error) = rustix::fs::renameat_with(
+        staging_directory,
+        staging_leaf,
+        destination_parent,
+        destination_leaf,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        if destination_exists
+            && let Err(rollback_error) = rustix::fs::renameat_with(
+                staging_directory,
+                previous_leaf,
+                destination_parent,
+                destination_leaf,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+        {
+            return Err(StagedCopyCommitFailure::PreserveStaging(
+                ToolError::PathChanged {
+                    path: destination_path.to_path_buf(),
+                    message: format!(
+                        "copy commit failed ({error}) and restoring the prior destination failed ({rollback_error})"
+                    ),
+                },
+            ));
+        }
+        return Err(StagedCopyCommitFailure::CleanupSafe(anchored_io_error(
+            "commit staged copy",
+            destination_path,
+            error,
+        )));
+    }
+
+    if destination_exists {
+        // The new destination is committed. Cleanup is deliberately best
+        // effort so an inability to remove the private backup cannot report a
+        // false pre-commit failure after the visible mutation succeeded.
+        let _ = remove_entry_at(staging_directory, previous_leaf, destination_path);
+    }
+    Ok(())
+}
+
+fn remove_path_staging(parent: &OwnedFd, name: &OsStr, display_path: &Path) {
+    let _ = remove_entry_at(parent, name, display_path);
+}
+
+fn remove_entry_at(parent: &OwnedFd, leaf: &OsStr, display_path: &Path) -> ToolResult<()> {
+    let metadata = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| anchored_io_error("inspect delete target", display_path, error))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+        return rustix::fs::unlinkat(parent, leaf, AtFlags::empty())
+            .map_err(|error| anchored_io_error("delete path", display_path, error));
+    }
+
+    let directory = openat_nofollow(
+        parent,
+        leaf,
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        "open delete directory",
+        display_path,
+    )?;
+    let mut entries = rustix::fs::Dir::read_from(&directory)
+        .map_err(|error| ToolError::io("list delete directory", display_path, error))?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.read() {
+        let entry =
+            entry.map_err(|error| ToolError::io("list delete directory", display_path, error))?;
+        if !is_dot_entry(entry.file_name()) {
+            names.push(OsString::from_vec(entry.file_name().to_bytes().to_vec()));
+        }
+    }
+    names.sort();
+    for name in names {
+        remove_entry_at(&directory, &name, &display_path.join(&name))?;
+    }
+    rustix::fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR)
+        .map_err(|error| anchored_io_error("delete directory", display_path, error))
+}
+
+fn copy_entry_at(
+    source_parent: &OwnedFd,
+    source_leaf: &OsStr,
+    destination_parent: &OwnedFd,
+    destination_leaf: &OsStr,
+    source_path: &Path,
+    destination_path: &Path,
+    structural: &mut Vec<u8>,
+) -> ToolResult<()> {
+    let metadata = rustix::fs::statat(source_parent, source_leaf, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| anchored_io_error("inspect copy source", source_path, error))?;
+    match FileType::from_raw_mode(metadata.st_mode) {
+        FileType::RegularFile => {
+            let source = openat_nofollow(
+                source_parent,
+                source_leaf,
+                OFlags::RDONLY,
+                "open copy source",
+                source_path,
+            )?;
+            let mut source = fs::File::from(source);
+            let bytes = metadata_guarded_file_snapshot_with_reader(
+                &mut source,
+                source_path,
+                |snapshot, buffer| snapshot.read_at(buffer, 0),
+            )?;
+            let destination = rustix::fs::openat(
+                destination_parent,
+                destination_leaf,
+                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|error| {
+                anchored_io_error("create copy destination", destination_path, error)
+            })?;
+            if let Err(error) =
+                write_patch_temporary(destination, metadata.st_mode, &bytes, destination_path)
+            {
+                let _ =
+                    rustix::fs::unlinkat(destination_parent, destination_leaf, AtFlags::empty());
                 return Err(error);
             }
-        };
-    // This is the final userspace content observation before the atomic
-    // namespace operation. A successful same-directory clonefile gives the
-    // verify a coherent COW basis immune to later writes to the original. If
-    // cloning is unavailable or fails, the metadata-bracketed single read is
-    // best-effort: MAP_SHARED writes, or ordinary writes on coarse-timestamp
-    // filesystems, can tear it without detection. The advisory target lock
-    // excludes cooperating writers in either case.
-    if let Err(error) =
-        require_unchanged_content(&parent, &mut source, source_hash, &operation.path)
-    {
-        remove_temporary(&parent, &temporary_name);
-        return Err(error);
+            structural.extend_from_slice(b"\0file\0");
+            structural.extend_from_slice(destination_leaf.as_encoded_bytes());
+            structural.push(0);
+            structural.extend_from_slice(&bytes);
+            Ok(())
+        }
+        FileType::Directory => {
+            rustix::fs::mkdirat(
+                destination_parent,
+                destination_leaf,
+                Mode::from_raw_mode(metadata.st_mode),
+            )
+            .map_err(|error| anchored_io_error("create copy directory", destination_path, error))?;
+            let source_directory = openat_nofollow(
+                source_parent,
+                source_leaf,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                "open copy source directory",
+                source_path,
+            )?;
+            let destination_directory = openat_nofollow(
+                destination_parent,
+                destination_leaf,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                "open copy destination directory",
+                destination_path,
+            )?;
+            let mut entries = rustix::fs::Dir::read_from(&source_directory)
+                .map_err(|error| ToolError::io("list copy source", source_path, error))?;
+            let mut names = Vec::new();
+            while let Some(entry) = entries.read() {
+                let entry =
+                    entry.map_err(|error| ToolError::io("list copy source", source_path, error))?;
+                if !is_dot_entry(entry.file_name()) {
+                    names.push(OsString::from_vec(entry.file_name().to_bytes().to_vec()));
+                }
+            }
+            names.sort();
+            structural.extend_from_slice(b"\0directory\0");
+            structural.extend_from_slice(destination_leaf.as_encoded_bytes());
+            for name in names {
+                copy_entry_at(
+                    &source_directory,
+                    &name,
+                    &destination_directory,
+                    &name,
+                    &source_path.join(&name),
+                    &destination_path.join(&name),
+                    structural,
+                )?;
+            }
+            Ok(())
+        }
+        FileType::Symlink => Err(ToolError::PathChanged {
+            path: source_path.to_path_buf(),
+            message: "copying symbolic links is refused".into(),
+        }),
+        _ => Err(ToolError::invalid_argument(format!(
+            "fs_path cannot copy special path {}",
+            source_path.display()
+        ))),
     }
-    before_commit();
-    // Repeat the anchored inode check after the (potentially retried) content
-    // verification. This catches the common editor strategy of atomically
-    // renaming a new inode over the target during that read.
-    if let Err(error) = require_unchanged_target(
-        &commit_parent,
-        &leaf,
-        Some(&source_metadata),
-        &operation.path,
-    ) {
-        remove_temporary(&parent, &temporary_name);
-        return Err(error);
-    }
-    // A non-cooperating writer can ignore the advisory lock. On every
-    // filesystem, a same-inode write that lands after the CLONE INSTANT (the
-    // clone read observes the older coherent snapshot, so the writer's newer
-    // content is not seen by the verify), or a replacement inode installed
-    // after this identity check, can still race the rename. The same-inode
-    // check->rename window therefore begins at the clone instant, not after
-    // the verify read completes. On a clonefile fallback, an undetectably torn
-    // verify read is an additional residual. The exact bounds are ledgered in
-    // docs/OPTIMIZATIONS.md under "haider-tools filesystem residual (W4a1.3)".
-    if let Err(error) = replace_temporary_at_commit(
-        &commit_parent,
-        &temporary_name,
-        &leaf,
-        &operation.path,
-        "replace patched file",
-    ) {
-        remove_temporary(&parent, &temporary_name);
-        return Err(error);
-    }
-    drop(source);
-    Ok(applied)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -2442,14 +3212,45 @@ fn open_parent_at(
     let mut components = normal_components(relative);
     let leaf = components
         .pop()
-        .ok_or_else(|| ToolError::invalid_argument("fs_patch path has no file name"))?;
+        .ok_or_else(|| ToolError::invalid_argument("filesystem path has no leaf name"))?;
     let parent = walk_directories(
         workspace_dir,
         &components,
-        "open patch parent",
+        "open mutation parent",
         display_path,
     )?;
     Ok((parent, leaf))
+}
+
+fn open_parent_creating_at(
+    mut directory: OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> ToolResult<(OwnedFd, OsString)> {
+    let mut components = normal_components(relative);
+    let leaf = components
+        .pop()
+        .ok_or_else(|| ToolError::invalid_argument("filesystem path has no leaf name"))?;
+    for component in components {
+        match rustix::fs::mkdirat(&directory, &component, Mode::from_raw_mode(0o755)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => {
+                return Err(anchored_io_error(
+                    "create write parent",
+                    display_path,
+                    error,
+                ));
+            }
+        }
+        directory = openat_nofollow(
+            &directory,
+            &component,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            "open write parent",
+            display_path,
+        )?;
+    }
+    Ok((directory, leaf))
 }
 
 fn normal_components(relative: &Path) -> Vec<OsString> {
@@ -2636,23 +3437,6 @@ fn join_lines(lines: Vec<String>) -> String {
     }
 }
 
-fn prefixed_lines(prefix: char, text: &str) -> String {
-    text.split_inclusive('\n')
-        .map(|line| format!("{prefix}{line}"))
-        .collect()
-}
-
-fn bounded_preview(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… [preview truncated]", &text[..end])
-}
-
 fn path_argument(path: &Path) -> ToolResult<&str> {
     path.to_str().ok_or_else(|| ToolError::InvalidArgument {
         message: format!("path is not valid UTF-8: {}", path.display()),
@@ -2663,7 +3447,10 @@ fn relative_path_argument(path: &Path) -> ToolResult<&str> {
     path_argument(path)
 }
 
-fn digest_bytes(bytes: &[u8]) -> String {
+/// Single digest seam for authored content and structural mutation evidence.
+/// A later workspace-revision producer can consume this value without
+/// duplicating digest logic across mutation tools.
+fn mutation_digest(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
 
@@ -2685,7 +3472,9 @@ fn search_mode_argument(mode: FsSearchMode) -> &'static str {
 #[derive(Debug, Clone, Copy)]
 enum PathResolution {
     Existing,
-    MissingLeafOk,
+    MissingPathOk,
+    AnchoredLeaf,
+    AnchoredExistingLeaf,
 }
 
 fn resolve_workspace_path(
@@ -2693,49 +3482,101 @@ fn resolve_workspace_path(
     requested_path: &Path,
     resolution: PathResolution,
 ) -> ToolResult<PathBuf> {
+    let resolved = match resolution {
+        PathResolution::Existing => {
+            let candidate = if requested_path.is_absolute() {
+                requested_path.to_path_buf()
+            } else {
+                workspace_root.join(requested_path)
+            };
+            fs::canonicalize(&candidate)
+                .map_err(|error| ToolError::io("canonicalize", &candidate, error))?
+        }
+        PathResolution::MissingPathOk => resolve_missing_path(workspace_root, requested_path)?,
+        PathResolution::AnchoredLeaf | PathResolution::AnchoredExistingLeaf => {
+            resolve_anchored_leaf(
+                workspace_root,
+                requested_path,
+                matches!(resolution, PathResolution::AnchoredExistingLeaf),
+            )?
+        }
+    };
+    require_under_root(workspace_root, requested_path, &resolved)?;
+    Ok(resolved)
+}
+
+fn resolve_missing_path(workspace_root: &Path, requested_path: &Path) -> ToolResult<PathBuf> {
     let candidate = if requested_path.is_absolute() {
         requested_path.to_path_buf()
     } else {
         workspace_root.join(requested_path)
     };
-    let resolved = match fs::canonicalize(&candidate) {
-        Ok(path) => path,
-        Err(error)
-            if matches!(resolution, PathResolution::MissingLeafOk)
-                && error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            if fs::symlink_metadata(&candidate)
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-            {
-                return Err(ToolError::WorkspaceBoundary {
-                    workspace_root: workspace_root.to_path_buf(),
-                    requested_path: requested_path.to_path_buf(),
-                    resolved_path: None,
-                });
+    if let Ok(resolved) = fs::canonicalize(&candidate) {
+        require_under_root(workspace_root, requested_path, &resolved)?;
+        return Ok(resolved);
+    }
+
+    let mut ancestor = candidate.clone();
+    let mut missing_tail = Vec::new();
+    let resolved_ancestor = loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let leaf = ancestor
+                    .file_name()
+                    .ok_or_else(|| ToolError::WorkspaceBoundary {
+                        workspace_root: workspace_root.to_path_buf(),
+                        requested_path: requested_path.to_path_buf(),
+                        resolved_path: None,
+                    })?;
+                if matches!(leaf.as_encoded_bytes(), b"." | b"..") {
+                    return Err(ToolError::WorkspaceBoundary {
+                        workspace_root: workspace_root.to_path_buf(),
+                        requested_path: requested_path.to_path_buf(),
+                        resolved_path: None,
+                    });
+                }
+                missing_tail.push(leaf.to_os_string());
+                ancestor.pop();
             }
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| ToolError::WorkspaceBoundary {
-                    workspace_root: workspace_root.to_path_buf(),
-                    requested_path: requested_path.to_path_buf(),
-                    resolved_path: None,
-                })?;
-            let file_name = candidate
-                .file_name()
-                .ok_or_else(|| ToolError::WorkspaceBoundary {
-                    workspace_root: workspace_root.to_path_buf(),
-                    requested_path: requested_path.to_path_buf(),
-                    resolved_path: None,
-                })?;
-            fs::canonicalize(parent)
-                .map_err(|error| ToolError::io("canonicalize parent", parent, error))?
-                .join(file_name)
-        }
-        Err(error) => {
-            return Err(ToolError::io("canonicalize", &candidate, error));
+            Err(error) => return Err(ToolError::io("canonicalize", &ancestor, error)),
         }
     };
-    require_under_root(workspace_root, requested_path, &resolved)?;
+    require_under_root(workspace_root, requested_path, &resolved_ancestor)?;
+    let mut resolved = resolved_ancestor;
+    for component in missing_tail.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn resolve_anchored_leaf(
+    workspace_root: &Path,
+    requested_path: &Path,
+    must_exist: bool,
+) -> ToolResult<PathBuf> {
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        workspace_root.join(requested_path)
+    };
+    if fs::canonicalize(&candidate).is_ok_and(|path| path == workspace_root) {
+        return Ok(workspace_root.to_path_buf());
+    }
+    let leaf = candidate
+        .file_name()
+        .ok_or_else(|| ToolError::invalid_argument("filesystem path has no leaf name"))?;
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| ToolError::invalid_argument("filesystem path has no parent"))?;
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| ToolError::io("canonicalize parent", parent, error))?;
+    require_under_root(workspace_root, requested_path, &parent)?;
+    let resolved = parent.join(leaf);
+    if must_exist {
+        fs::symlink_metadata(&resolved)
+            .map_err(|error| ToolError::io("inspect source", &resolved, error))?;
+    }
     Ok(resolved)
 }
 
@@ -2807,12 +3648,14 @@ mod tests {
             Mode::empty(),
         )
         .expect("open workspace");
-        let operation = FsPatch::new(&target, "before", "after");
+        let operation = FsEdit::new(&target, "before", "after");
+        let expected = mutation_digest(b"before");
 
-        let result = apply_patch_at_before_replace(
+        let result = apply_edit_at_before_replace(
             workspace,
             Path::new("component/target.txt"),
             &operation,
+            Some(&expected),
             || {
                 fs::rename(&component, &escaped_component)
                     .expect("move held parent outside workspace");
@@ -2858,12 +3701,14 @@ mod tests {
             Mode::empty(),
         )
         .expect("open workspace");
-        let operation = FsPatch::new(&target, "before", "after");
+        let operation = FsEdit::new(&target, "before", "after");
+        let expected = mutation_digest(b"before");
 
-        let result = apply_patch_at_with_commit_hooks(
+        let result = apply_edit_at_with_commit_hooks(
             workspace,
             Path::new("component/target.txt"),
             &operation,
+            Some(&expected),
             || {},
             || {
                 fs::rename(&component, &escaped_component)
@@ -2896,17 +3741,23 @@ mod tests {
             Mode::empty(),
         )
         .expect("open workspace");
-        let operation = FsPatch::new(&target, "before", "haider");
+        let operation = FsEdit::new(&target, "before", "haider");
+        let expected = mutation_digest(b"before");
 
-        let result =
-            apply_patch_at_before_replace(workspace, Path::new("target.txt"), &operation, || {
+        let result = apply_edit_at_before_replace(
+            workspace,
+            Path::new("target.txt"),
+            &operation,
+            Some(&expected),
+            || {
                 fs::write(&target, "editor").expect("rewrite target in place");
                 assert_eq!(
                     fs::metadata(&target).expect("rewritten metadata").ino(),
                     initial_inode,
                     "reproduction must preserve the target inode"
                 );
-            });
+            },
+        );
 
         assert_eq!(
             fs::read_to_string(&target).expect("read external target"),
@@ -2925,7 +3776,7 @@ mod tests {
     }
 
     #[test]
-    fn external_leaf_replacement_before_patch_rename_is_typed_path_change() {
+    fn external_leaf_replacement_before_edit_rename_is_typed_path_change() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let target = directory.path().join("target.txt");
         let parked = directory.path().join("parked.txt");
@@ -2936,13 +3787,19 @@ mod tests {
             Mode::empty(),
         )
         .expect("open workspace");
-        let operation = FsPatch::new(&target, "before", "haider");
+        let operation = FsEdit::new(&target, "before", "haider");
+        let expected = mutation_digest(b"before");
 
-        let result =
-            apply_patch_at_before_replace(workspace, Path::new("target.txt"), &operation, || {
+        let result = apply_edit_at_before_replace(
+            workspace,
+            Path::new("target.txt"),
+            &operation,
+            Some(&expected),
+            || {
                 fs::rename(&target, &parked).expect("replace original target");
                 fs::write(&target, "external").expect("install external replacement");
-            });
+            },
+        );
 
         assert!(matches!(result, Err(ToolError::PathChanged { .. })));
         assert_eq!(
@@ -2962,5 +3819,52 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".haider-patch-"))
         );
+    }
+
+    #[test]
+    fn path_parent_escape_before_commit_is_typed_and_mutates_neither_location() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_path = directory.path().join("workspace");
+        fs::create_dir(&workspace_path).expect("create workspace");
+        let workspace_path = fs::canonicalize(workspace_path).expect("canonical workspace");
+        let component = workspace_path.join("component");
+        let escaped_component = directory.path().join("escaped-component");
+        let source = component.join("source.txt");
+        let destination = workspace_path.join("destination.txt");
+        fs::create_dir(&component).expect("create source parent");
+        fs::write(&source, "outside must stay unchanged").expect("seed source");
+        let workspace = rustix::fs::open(
+            &workspace_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open workspace");
+        let operation =
+            FsPath::new(FsPathOperation::Move, &source).with_destination(destination.clone());
+
+        let result = apply_path_at_before_mutation(
+            workspace,
+            Path::new("component/source.txt"),
+            Some(Path::new("destination.txt")),
+            &operation,
+            || {
+                fs::rename(&component, &escaped_component)
+                    .expect("move held source parent outside workspace");
+                fs::create_dir(&component).expect("replace source parent inside workspace");
+                fs::write(component.join("source.txt"), "inside replacement")
+                    .expect("seed replacement source");
+            },
+        );
+
+        assert!(matches!(result, Err(ToolError::PathChanged { .. })));
+        assert_eq!(
+            fs::read_to_string(escaped_component.join("source.txt")).expect("read escaped source"),
+            "outside must stay unchanged"
+        );
+        assert_eq!(
+            fs::read_to_string(component.join("source.txt")).expect("read replacement source"),
+            "inside replacement"
+        );
+        assert!(!destination.exists());
     }
 }

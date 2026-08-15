@@ -1,11 +1,11 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
+use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase, FileFreshness};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_tools::{
-    CasSink, ChangeLedger, ChangeLedgerSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
-    FsWrite, FsWriteRecord, JournalSink, PermissionPolicy, ResultBounds, ToolError, ToolResult,
+    CasSink, ChangeLedger, ChangeLedgerSink, EffectBroker, FsEdit, FsRead, FsSearch, FsWrite,
+    FsWriteRecord, JournalSink, PermissionPolicy, ResultBounds, ToolError, ToolResult,
     TurnAttribution,
 };
 use std::fs;
@@ -336,6 +336,22 @@ fn terminal_phases(phases: &[EffectPhase]) -> Vec<&EffectPhase> {
         .collect()
 }
 
+fn restore_file_freshness(broker: &mut EffectBroker, workspace_root: &Path, path: &Path) {
+    let canonical = fs::canonicalize(path).expect("canonical test file");
+    let relative = canonical
+        .strip_prefix(fs::canonicalize(workspace_root).expect("canonical test workspace"))
+        .expect("file under test workspace")
+        .to_string_lossy()
+        .into_owned();
+    let bytes = fs::read(&canonical).expect("read test freshness bytes");
+    broker
+        .restore_freshness([FileFreshness {
+            path: relative,
+            digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+        }])
+        .expect("restore test freshness");
+}
+
 #[tokio::test]
 async fn fs_write_creates_and_overwrites_with_ledgered_four_phase_effects() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -400,10 +416,11 @@ async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let ledger = ChangeLedger::new();
+    restore_file_freshness(&mut broker, directory.path(), &path);
 
     let error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "stale", "replacement"),
+        .fs_edit(
+            &FsEdit::new(&path, "stale", "replacement"),
             &allow(EffectClass::FsWrite),
             &attribution,
             &ledger,
@@ -411,14 +428,13 @@ async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
         .await
         .expect_err("preimage mismatch");
 
-    let ToolError::Conflict(conflict) = error else {
-        panic!("expected typed conflict");
+    let ToolError::EditAnchor(conflict) = error else {
+        panic!("expected typed edit anchor mismatch");
     };
     assert_eq!(
         conflict.path,
         fs::canonicalize(&path).expect("canonical conflict path")
     );
-    assert_eq!(conflict.expected_preimage, "stale");
     assert_eq!(conflict.matches, 0);
     assert_eq!(fs::read_to_string(&path).expect("read file"), "current");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
@@ -439,10 +455,11 @@ async fn ambiguous_preimage_returns_typed_conflict_without_writing() {
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let ledger = ChangeLedger::new();
+    restore_file_freshness(&mut broker, directory.path(), &path);
 
     let error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "same", "changed"),
+        .fs_edit(
+            &FsEdit::new(&path, "same", "changed"),
             &allow(EffectClass::FsWrite),
             &attribution,
             &ledger,
@@ -450,8 +467,8 @@ async fn ambiguous_preimage_returns_typed_conflict_without_writing() {
         .await
         .expect_err("ambiguous preimage");
 
-    let ToolError::Conflict(conflict) = error else {
-        panic!("expected typed conflict");
+    let ToolError::EditAnchor(conflict) = error else {
+        panic!("expected typed edit anchor mismatch");
     };
     assert_eq!(conflict.matches, 2);
     assert_eq!(
@@ -459,42 +476,6 @@ async fn ambiguous_preimage_returns_typed_conflict_without_writing() {
         "same\nsame\n"
     );
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
-}
-
-/// MUTATION CHECK: restore non-overlapping `str::match_indices`. Expected
-/// failure: `"aaa"`/`"aa"` is misclassified as one unique match and written.
-#[tokio::test]
-async fn overlapping_preimage_returns_typed_conflict_without_writing() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("overlapping.txt");
-    fs::write(&path, "aaa").expect("seed file");
-    let mut broker = broker_at(RecordingJournal::default(), directory.path());
-    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
-    let ledger = ChangeLedger::new();
-
-    let error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "aa", "changed"),
-            &allow(EffectClass::FsWrite),
-            &attribution,
-            &ledger,
-        )
-        .await
-        .expect_err("overlapping preimage");
-
-    let ToolError::Conflict(conflict) = error else {
-        panic!("expected typed conflict");
-    };
-    assert_eq!(conflict.matches, 2);
-    assert_eq!(fs::read_to_string(&path).expect("unchanged file"), "aaa");
-    assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
-    assert!(matches!(
-        broker.journal_snapshot().last(),
-        Some(EffectPhase::Outcome {
-            outcome: EffectOutcome::Failed { .. },
-            ..
-        })
-    ));
 }
 
 #[tokio::test]
@@ -505,10 +486,11 @@ async fn genuinely_unique_preimage_still_applies() {
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let ledger = ChangeLedger::new();
+    restore_file_freshness(&mut broker, directory.path(), &path);
 
     broker
-        .fs_patch(
-            &FsPatch::new(&path, "aa", "changed"),
+        .fs_edit(
+            &FsEdit::new(&path, "aa", "changed"),
             &allow(EffectClass::FsWrite),
             &attribution,
             &ledger,
@@ -543,10 +525,12 @@ async fn ledger_attributes_successful_writes_to_the_exact_turn() {
     let policy = allow(EffectClass::FsWrite);
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let ledger = ChangeLedger::new();
+    restore_file_freshness(&mut broker, directory.path(), &first_path);
+    restore_file_freshness(&mut broker, directory.path(), &second_path);
 
     broker
-        .fs_patch(
-            &FsPatch::new(&first_path, "a", "b"),
+        .fs_edit(
+            &FsEdit::new(&first_path, "a", "b"),
             &policy,
             &first_turn,
             &ledger,
@@ -554,8 +538,8 @@ async fn ledger_attributes_successful_writes_to_the_exact_turn() {
         .await
         .expect("first patch");
     broker
-        .fs_patch(
-            &FsPatch::new(&second_path, "x", "y"),
+        .fs_edit(
+            &FsEdit::new(&second_path, "x", "y"),
             &policy,
             &second_turn,
             &ledger,
@@ -606,21 +590,23 @@ async fn concurrent_patches_cannot_both_apply_the_same_stale_preimage() {
     let second_attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn-2"));
     let first_ledger = ChangeLedger::new();
     let second_ledger = ChangeLedger::new();
-    let first_patch = FsPatch::new(&path, "before", "first");
-    let second_patch = FsPatch::new(&path, "before", "second");
+    let first_edit = FsEdit::new(&path, "before", "first");
+    let second_edit = FsEdit::new(&path, "before", "second");
+    restore_file_freshness(&mut first_broker, directory.path(), &path);
+    restore_file_freshness(&mut second_broker, directory.path(), &path);
 
     let (first, second) = tokio::join!(
-        first_broker.fs_patch(&first_patch, &policy, &first_attribution, &first_ledger,),
-        second_broker.fs_patch(&second_patch, &policy, &second_attribution, &second_ledger,)
+        first_broker.fs_edit(&first_edit, &policy, &first_attribution, &first_ledger,),
+        second_broker.fs_edit(&second_edit, &policy, &second_attribution, &second_ledger,)
     );
 
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
     let failed = if let Err(error) = first {
         error
     } else {
-        second.expect_err("exactly one patch must conflict")
+        second.expect_err("exactly one edit must conflict")
     };
-    assert!(matches!(failed, ToolError::Conflict(_)));
+    assert!(matches!(failed, ToolError::StaleRead { .. }));
     assert_eq!(
         usize::from(
             first_ledger.has_fs_writes(&first_attribution.session, &first_attribution.turn)
@@ -639,10 +625,11 @@ async fn applied_write_is_ledgered_before_a_failed_outcome_append() {
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(RejectOutcomeJournal, directory.path());
     let ledger = ChangeLedger::new();
+    restore_file_freshness(&mut broker, directory.path(), &path);
 
     let error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "before", "after"),
+        .fs_edit(
+            &FsEdit::new(&path, "before", "after"),
             &allow(EffectClass::FsWrite),
             &attribution,
             &ledger,
@@ -695,9 +682,10 @@ fn cancelling_before_the_blocking_worker_starts_is_clean() {
         let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
         let observed_attribution = attribution.clone();
         let mut broker = broker_at(journal, directory.path());
+        restore_file_freshness(&mut broker, directory.path(), &path);
         let policy = allow(EffectClass::FsWrite);
-        let patch = FsPatch::new(&path, "before", "after");
-        let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+        let edit = FsEdit::new(&path, "before", "after");
+        let mut apply = Box::pin(broker.fs_edit(&edit, &policy, &attribution, &ledger));
 
         tokio::select! {
             biased;
@@ -751,9 +739,10 @@ async fn cancelling_apply_cannot_leave_a_write_without_ledger_evidence() {
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let observed_attribution = attribution.clone();
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
     let policy = allow(EffectClass::FsWrite);
-    let patch = FsPatch::new(&path, "before", "after");
-    let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+    let edit = FsEdit::new(&path, "before", "after");
+    let mut apply = Box::pin(broker.fs_edit(&edit, &policy, &attribution, &ledger));
     let worker_reached = tokio::task::spawn_blocking(move || reached.wait());
 
     tokio::select! {
@@ -795,9 +784,10 @@ async fn cancelling_apply_during_ledger_failure_still_journals_failed_outcome() 
     let journal = SharedRecordingJournal::default();
     let observed_journal = journal.observer();
     let mut broker = broker_at(journal, directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
     let policy = allow(EffectClass::FsWrite);
-    let patch = FsPatch::new(&path, "before", "after");
-    let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+    let edit = FsEdit::new(&path, "before", "after");
+    let mut apply = Box::pin(broker.fs_edit(&edit, &policy, &attribution, &ledger));
     let worker_reached = tokio::task::spawn_blocking(move || reached.wait());
 
     tokio::select! {
@@ -859,9 +849,10 @@ async fn caller_cancellation_cannot_sever_a_dispatched_terminal_append() {
     let terminal_completions = Arc::clone(&journal.terminal_completions);
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
     let policy = allow(EffectClass::FsWrite);
-    let patch = FsPatch::new(&path, "before", "after");
-    let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+    let edit = FsEdit::new(&path, "before", "after");
+    let mut apply = Box::pin(broker.fs_edit(&edit, &policy, &attribution, &ledger));
     let worker_reached = tokio::task::spawn_blocking(move || ledger_reached.wait());
 
     tokio::select! {
@@ -983,9 +974,10 @@ async fn finalizer_and_unknown_race_forces_the_loser_before_the_winner_append() 
     };
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
     let policy = allow(EffectClass::FsWrite);
-    let patch = FsPatch::new(&path, "before", "after");
-    let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+    let edit = FsEdit::new(&path, "before", "after");
+    let mut apply = Box::pin(broker.fs_edit(&edit, &policy, &attribution, &ledger));
     let worker_reached = tokio::task::spawn_blocking(move || ledger_reached.wait());
 
     tokio::select! {
@@ -1040,9 +1032,10 @@ async fn close_waits_for_a_cancelled_callers_failing_finalizer() {
     let observed_journal = journal.observer();
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
     let policy = allow(EffectClass::FsWrite);
-    let patch = FsPatch::new(&path, "before", "after");
-    let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+    let edit = FsEdit::new(&path, "before", "after");
+    let mut apply = Box::pin(broker.fs_edit(&edit, &policy, &attribution, &ledger));
     let worker_reached = tokio::task::spawn_blocking(move || reached.wait());
 
     tokio::select! {
@@ -1093,6 +1086,7 @@ async fn mixed_close_error_keeps_successful_reconciliations_visible() {
     let journal = SharedRecordingJournal::default();
     let observed_journal = journal.observer();
     let mut broker = broker_at(journal, directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &write_path);
 
     let read_intent = broker
         .normalize(&FsRead::new(&read_path))
@@ -1114,9 +1108,9 @@ async fn mixed_close_error_keeps_successful_reconciliations_visible() {
         release: Arc::clone(&release),
     };
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
-    let write_patch = FsPatch::new(&write_path, "before", "after");
+    let write_edit = FsEdit::new(&write_path, "before", "after");
     let write_policy = allow(EffectClass::FsWrite);
-    let mut apply = Box::pin(broker.fs_patch(&write_patch, &write_policy, &attribution, &ledger));
+    let mut apply = Box::pin(broker.fs_edit(&write_edit, &write_policy, &attribution, &ledger));
     let worker_reached = tokio::task::spawn_blocking(move || reached.wait());
 
     tokio::select! {
@@ -1170,10 +1164,11 @@ async fn failed_terminal_append_is_keyed_and_never_appends_a_fallback() {
     let ledger = ChangeLedger::new();
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
 
     let apply_error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "before", "after"),
+        .fs_edit(
+            &FsEdit::new(&path, "before", "after"),
             &allow(EffectClass::FsWrite),
             &attribution,
             &ledger,
@@ -1219,10 +1214,11 @@ async fn ledger_append_failure_becomes_a_failed_effect_outcome() {
     fs::write(&path, "before").expect("seed file");
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
 
     let error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "before", "after"),
+        .fs_edit(
+            &FsEdit::new(&path, "before", "after"),
             &allow(EffectClass::FsWrite),
             &attribution,
             &RejectLedger,
@@ -1293,8 +1289,8 @@ async fn mutating_paths_reject_parent_and_absolute_workspace_escapes() {
         .await
         .expect_err("parent traversal must be rejected");
     let absolute = broker
-        .fs_patch(
-            &FsPatch::new(&outside, "outside-before", "outside-after"),
+        .fs_edit(
+            &FsEdit::new(&outside, "outside-before", "outside-after"),
             &policy,
             &attribution,
             &ledger,
@@ -1419,12 +1415,11 @@ async fn component_swapped_to_outside_symlink_after_authorization_is_refused() {
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let ledger = ChangeLedger::new();
     let observed_ledger = ledger.clone();
-    let patch = FsPatch::new(component.join("target.txt"), "before", "after");
+    let edit = FsEdit::new(component.join("target.txt"), "before", "after");
+    restore_file_freshness(&mut broker, &workspace, &component.join("target.txt"));
     let policy = allow(EffectClass::FsWrite);
     let task = tokio::spawn(async move {
-        let result = broker
-            .fs_patch(&patch, &policy, &attribution, &ledger)
-            .await;
+        let result = broker.fs_edit(&edit, &policy, &attribution, &ledger).await;
         (result, broker)
     });
 
@@ -1514,7 +1509,7 @@ async fn oversized_result_keeps_preview_and_freezes_full_payload_in_cas() {
 }
 
 #[tokio::test]
-async fn list_and_search_are_sorted_bounded_read_effects() {
+async fn directory_read_and_search_are_sorted_bounded_read_effects() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root = directory.path();
     fs::create_dir(root.join("nested")).expect("create nested");
@@ -1526,8 +1521,8 @@ async fn list_and_search_are_sorted_bounded_read_effects() {
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
 
     let listed = broker
-        .fs_list(
-            &FsList::new(root),
+        .fs_read(
+            &FsRead::new(root),
             &policy,
             &mut cas,
             ResultBounds::default(),

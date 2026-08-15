@@ -25,10 +25,11 @@ pub use broker::{
     EffectOperation, JournalSink, PermissionPolicy, PolicyDecision, SessionGrant,
     SessionGrantScope,
 };
-pub use error::{FsEditAnchorMismatch, FsPatchConflict, ToolError, ToolResult};
+pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};
 pub use filesystem::{
-    CasSink, FsCaseMode, FsEdit, FsGlob, FsList, FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite,
-    ResultBounds, TurnAttribution,
+    CasSink, FsCaseMode, FsEdit, FsEditChange, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch,
+    FsSearchMode, FsWrite, ResultBounds, TurnAttribution, fs_edit_manifest, fs_glob_manifest,
+    fs_path_manifest, fs_read_manifest, fs_search_manifest, fs_write_manifest,
 };
 pub use graph_evidence::{GraphEvidence, graph_evidence_manifest};
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};

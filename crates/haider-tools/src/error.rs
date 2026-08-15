@@ -5,22 +5,13 @@
 //! retrying as a fresh effect, [`ToolError::InvalidMenuAnswer`] keeps malformed
 //! answers closed and retryable, [`ToolError::WorkspaceBoundary`] reports path
 //! escapes, [`ToolError::PathChanged`] refuses post-authorization namespace
-//! changes, [`ToolError::Conflict`] carries the exact pre-image evidence a
-//! caller needs to rebase a stale patch, and [`ToolError::Ledger`] makes a
-//! post-apply evidence failure explicit.
+//! changes, [`ToolError::EditAnchor`] carries anchored replacement evidence,
+//! and [`ToolError::Ledger`] makes a post-apply evidence failure explicit.
 
 use haider_protocol::ids::MenuId;
 use std::path::PathBuf;
 
 pub type ToolResult<T> = Result<T, ToolError>;
-
-/// A structured exact-preimage patch could not identify one unique target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FsPatchConflict {
-    pub path: PathBuf,
-    pub expected_preimage: String,
-    pub matches: usize,
-}
 
 /// An anchored edit could not identify the required number of occurrences.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +55,6 @@ pub enum ToolError {
         current_digest: String,
     },
     EditAnchor(FsEditAnchorMismatch),
-    Conflict(FsPatchConflict),
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -180,17 +170,6 @@ impl std::fmt::Display for ToolError {
             Self::EditAnchor(conflict) => write!(
                 formatter,
                 "edit anchor for {} matched {} locations; expected exactly 1",
-                conflict.path.display(),
-                conflict.matches
-            ),
-            Self::Conflict(conflict) if conflict.matches == 0 => write!(
-                formatter,
-                "patch conflict for {}: expected pre-image was not present",
-                conflict.path.display()
-            ),
-            Self::Conflict(conflict) => write!(
-                formatter,
-                "patch conflict for {}: expected pre-image matched {} locations",
                 conflict.path.display(),
                 conflict.matches
             ),

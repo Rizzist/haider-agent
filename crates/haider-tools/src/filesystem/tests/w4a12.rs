@@ -52,7 +52,7 @@ fn mid_read_in_place_edit_never_false_passes_a_torn_content_hash() {
 }
 
 /// MUTATION CHECK: remove the final anchored identity check after content
-/// verification. Expected failure: the patch replaces the editor's newly
+/// verification. Expected failure: the edit replaces the editor's newly
 /// renamed inode. Verified by revert in W4a1.2.
 #[test]
 fn leaf_replacement_after_content_verify_is_typed_path_change() {
@@ -67,12 +67,14 @@ fn leaf_replacement_after_content_verify_is_typed_path_change() {
         Mode::empty(),
     )
     .expect("open workspace");
-    let operation = FsPatch::new(&target, "before", "haider");
+    let operation = FsEdit::new(&target, "before", "haider");
+    let expected = mutation_digest(b"before");
 
-    let result = apply_patch_at_with_commit_hooks(
+    let result = apply_edit_at_with_commit_hooks(
         workspace,
         Path::new("target.txt"),
         &operation,
+        Some(&expected),
         || {},
         || {
             fs::rename(&target, &parked).expect("park verified target");
@@ -106,7 +108,7 @@ fn leaf_replacement_after_content_verify_is_typed_path_change() {
 /// identity recheck still makes the first refuse in this choreography.
 /// Verified by revert in W4a1.2.
 #[test]
-fn cooperating_patches_serialize_across_verify_and_rename() {
+fn cooperating_edits_serialize_across_verify_and_rename() {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -127,16 +129,19 @@ fn cooperating_patches_serialize_across_verify_and_rename() {
         Mode::empty(),
     )
     .expect("open second workspace");
-    let first_operation = FsPatch::new(&target, "before", "first");
-    let second_operation = FsPatch::new(&target, "before", "second");
+    let first_operation = FsEdit::new(&target, "before", "first");
+    let second_operation = FsEdit::new(&target, "before", "second");
+    let expected = mutation_digest(b"before");
+    let first_expected = expected.clone();
     let (first_at_commit_sender, first_at_commit_receiver) = mpsc::channel();
     let (release_first_sender, release_first_receiver) = mpsc::channel();
 
     let first = thread::spawn(move || {
-        apply_patch_at_with_commit_hooks(
+        apply_edit_at_with_commit_hooks(
             first_workspace,
             Path::new("target.txt"),
             &first_operation,
+            Some(&first_expected),
             || {},
             || {
                 first_at_commit_sender
@@ -156,7 +161,12 @@ fn cooperating_patches_serialize_across_verify_and_rename() {
         second_started_sender
             .send(())
             .expect("signal second started");
-        let result = apply_patch_at(second_workspace, Path::new("target.txt"), &second_operation);
+        let result = apply_edit_at(
+            second_workspace,
+            Path::new("target.txt"),
+            &second_operation,
+            Some(&expected),
+        );
         second_result_sender
             .send(result)
             .expect("send second result");
@@ -180,12 +190,12 @@ fn cooperating_patches_serialize_across_verify_and_rename() {
 
     assert!(
         !second_finished_early,
-        "the cooperating second patch must wait across verify→rename"
+        "the cooperating second edit must wait across verify→rename"
     );
     assert!(first_result.is_ok(), "first patch must apply");
     assert!(
-        matches!(second_result, Err(ToolError::Conflict(_))),
-        "second patch must re-read the winner before deciding"
+        matches!(second_result, Err(ToolError::StaleRead { .. })),
+        "second edit must re-read the winner before deciding"
     );
     assert_eq!(
         fs::read_to_string(&target).expect("read serialized target"),

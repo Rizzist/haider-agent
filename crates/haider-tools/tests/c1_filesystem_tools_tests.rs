@@ -4,9 +4,9 @@ use haider_protocol::EventPayload;
 use haider_protocol::effect::{EffectClass, EffectPhase, FileFreshness};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_tools::{
-    CasSink, ChangeLedger, ChangeLedgerSink, EffectBroker, FsCaseMode, FsEdit, FsGlob, FsRead,
-    FsSearch, FsSearchMode, FsWrite, FsWriteRecord, JournalSink, PermissionPolicy, ResultBounds,
-    ToolError, ToolResult, TurnAttribution,
+    CasSink, ChangeLedger, ChangeLedgerSink, EffectBroker, FsCaseMode, FsEdit, FsEditChange,
+    FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite, FsWriteRecord,
+    JournalSink, PermissionPolicy, ResultBounds, ToolError, ToolResult, TurnAttribution,
 };
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -134,6 +134,33 @@ async fn read_file(broker: &mut EffectBroker, path: &str) -> String {
         .await
         .expect("read file")
         .preview
+}
+
+#[tokio::test]
+async fn file_read_range_is_line_numbered_bounded_and_tracks_the_full_digest() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let contents = "one\ntwo\nthree\n";
+    fs::write(directory.path().join("lines.txt"), contents).expect("seed lines");
+    let (mut broker, observer) = broker(directory.path(), "read-range", 1);
+
+    let result = broker
+        .fs_read(
+            &FsRead::new("lines.txt").with_line_range(Some(2), Some(1)),
+            &allow(EffectClass::FsRead),
+            &mut RecordingCas::default(),
+            ResultBounds::default(),
+        )
+        .await
+        .expect("ranged read");
+
+    assert_eq!(result.preview, "2: two\n");
+    assert_eq!(
+        observer.freshness(),
+        vec![FileFreshness {
+            path: "lines.txt".to_owned(),
+            digest: format!("blake3:{}", blake3::hash(contents.as_bytes()).to_hex()),
+        }]
+    );
 }
 
 /// MUTATION CHECK: follow a descendant symlink or remove either result cap.
@@ -374,6 +401,248 @@ async fn edit_requires_exactly_one_anchor_or_nonempty_replace_all() {
         fs::read_to_string(directory.path().join("edit.txt")).expect("read"),
         "changed changed\n"
     );
+}
+
+#[tokio::test]
+async fn multi_edit_rejects_atomically_when_a_later_anchor_is_bad() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("batch.txt");
+    fs::write(&path, "alpha beta gamma\n").expect("seed batch");
+    let (mut broker, _) = broker(directory.path(), "batch", 1);
+    assert_eq!(
+        read_file(&mut broker, "batch.txt").await,
+        "alpha beta gamma\n"
+    );
+
+    let error = broker
+        .fs_edit(
+            &FsEdit::many(
+                "batch.txt",
+                vec![
+                    FsEditChange::new("alpha", "one"),
+                    FsEditChange::new("missing", "two"),
+                ],
+            ),
+            &allow(EffectClass::FsWrite),
+            &attribution("batch", "turn"),
+            &ChangeLedger::new(),
+        )
+        .await
+        .expect_err("bad later anchor rejects batch");
+
+    assert!(matches!(
+        error,
+        ToolError::EditAnchor(ref mismatch) if mismatch.matches == 0
+    ));
+    assert_eq!(
+        fs::read_to_string(path).expect("read untouched batch"),
+        "alpha beta gamma\n"
+    );
+
+    broker
+        .fs_edit(
+            &FsEdit::many(
+                "batch.txt",
+                vec![
+                    FsEditChange::new("alpha", "one"),
+                    FsEditChange::new("one beta", "two"),
+                ],
+            ),
+            &allow(EffectClass::FsWrite),
+            &attribution("batch", "turn"),
+            &ChangeLedger::new(),
+        )
+        .await
+        .expect("later edit sees earlier replacement");
+    assert_eq!(
+        fs::read_to_string(directory.path().join("batch.txt")).expect("read ordered batch"),
+        "two gamma\n"
+    );
+}
+
+#[tokio::test]
+async fn write_creates_all_missing_parent_directories() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (mut broker, _) = broker(directory.path(), "mkdir", 1);
+    broker
+        .fs_write(
+            &FsWrite::new("one/two/three.txt", "nested\n"),
+            &allow(EffectClass::FsWrite),
+            &attribution("mkdir", "turn"),
+            &ChangeLedger::new(),
+        )
+        .await
+        .expect("nested write");
+    assert_eq!(
+        fs::read_to_string(directory.path().join("one/two/three.txt")).expect("read nested"),
+        "nested\n"
+    );
+}
+
+#[tokio::test]
+async fn path_copy_move_and_delete_are_workspace_scoped_mutations() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let workspace = directory.path().join("workspace");
+    let outside = directory.path().join("outside");
+    fs::create_dir_all(workspace.join("source")).expect("source directory");
+    fs::write(workspace.join("source/item.txt"), "payload").expect("source file");
+    let (mut broker, _) = broker(&workspace, "paths", 1);
+    let policy = allow(EffectClass::FsWrite);
+    let turn = attribution("paths", "turn");
+    let ledger = ChangeLedger::new();
+
+    broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Copy, "source").with_destination("copied"),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect("copy directory");
+    assert_eq!(
+        fs::read_to_string(workspace.join("copied/item.txt")).expect("copied file"),
+        "payload"
+    );
+
+    broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Move, "copied/item.txt").with_destination("moved.txt"),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect("move file");
+    assert!(!workspace.join("copied/item.txt").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("moved.txt")).expect("moved file"),
+        "payload"
+    );
+
+    broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Delete, "copied"),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect("delete directory");
+    assert!(!workspace.join("copied").exists());
+
+    let escape = broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Copy, "source").with_destination(&outside),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect_err("outside destination rejected");
+    assert!(matches!(escape, ToolError::WorkspaceBoundary { .. }));
+    assert!(!outside.exists());
+}
+
+#[tokio::test]
+async fn path_copy_overwrite_is_staged_and_destination_guards_are_typed() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let workspace = directory.path();
+    fs::write(workspace.join("source.txt"), "new payload").expect("source");
+    fs::write(workspace.join("destination.txt"), "old payload").expect("destination");
+    symlink("source.txt", workspace.join("source-link")).expect("source symlink");
+    let (mut broker, _) = broker(workspace, "path-overwrite", 1);
+    let policy = allow(EffectClass::FsWrite);
+    let turn = attribution("path-overwrite", "turn");
+    let ledger = ChangeLedger::new();
+
+    let exists = broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Copy, "source.txt").with_destination("destination.txt"),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect_err("existing destination requires overwrite");
+    assert!(matches!(exists, ToolError::InvalidArgument { .. }));
+    assert_eq!(
+        fs::read_to_string(workspace.join("destination.txt")).expect("unchanged destination"),
+        "old payload"
+    );
+
+    let refused_source = broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Copy, "source-link")
+                .with_destination("destination.txt")
+                .overwrite(true),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect_err("copying a source symlink is refused");
+    assert!(matches!(refused_source, ToolError::PathChanged { .. }));
+    assert_eq!(
+        fs::read_to_string(workspace.join("destination.txt")).expect("preserved destination"),
+        "old payload"
+    );
+
+    broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Copy, "source.txt")
+                .with_destination("destination.txt")
+                .overwrite(true),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect("staged overwrite");
+    assert_eq!(
+        fs::read_to_string(workspace.join("destination.txt")).expect("overwritten destination"),
+        "new payload"
+    );
+    assert!(
+        fs::read_dir(workspace)
+            .expect("workspace entries")
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".haider-path-"))
+    );
+
+    fs::hard_link(
+        workspace.join("source.txt"),
+        workspace.join("source-alias.txt"),
+    )
+    .expect("source hardlink alias");
+    let alias_move = broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Move, "source.txt")
+                .with_destination("source-alias.txt")
+                .overwrite(true),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect_err("moving between hardlink aliases is refused");
+    assert!(matches!(alias_move, ToolError::InvalidArgument { .. }));
+    assert!(workspace.join("source.txt").exists());
+    assert!(workspace.join("source-alias.txt").exists());
+
+    let root_delete = broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Delete, "."),
+            &policy,
+            &turn,
+            &ledger,
+        )
+        .await
+        .expect_err("workspace root delete is refused");
+    assert!(matches!(root_delete, ToolError::InvalidArgument { .. }));
 }
 
 /// MUTATION CHECK: use lossy UTF-8 conversion in fs_edit. Expected RUNTIME

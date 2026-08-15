@@ -5,8 +5,8 @@ use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectOutcome, 
 use haider_protocol::ids::SessionId;
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_tools::{
-    EffectBroker, FsPatch, FsRead, JournalSink, PermissionPolicy, ProcessExec, ResultBounds,
-    ToolResult,
+    EffectBroker, FsEdit, FsRead, FsWrite, JournalSink, PermissionPolicy, ProcessExec,
+    ResultBounds, ToolResult,
 };
 use std::fs;
 use std::path::Path;
@@ -135,7 +135,7 @@ async fn always_allow_is_bound_to_class_and_exact_argument_digest() {
 async fn authorization_rejects_any_substitute_for_the_journaled_intent() {
     let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let original = broker
-        .normalize(&FsPatch::new("src/lib.rs", "mod broker;", "mod bypass;"))
+        .normalize(&FsEdit::new("src/lib.rs", "mod broker;", "mod bypass;"))
         .await
         .expect("normalize write intent");
     let mut policy = PermissionPolicy::default();
@@ -555,7 +555,7 @@ async fn dispatch_cannot_follow_a_blocked_authorization() {
     let mut policy = PermissionPolicy::default();
     policy.deny(EffectClass::FsWrite, "workspace is read-only");
     let intent = broker
-        .normalize(&FsPatch::new("file.txt", "before", "after"))
+        .normalize(&FsWrite::new("file.txt", "after"))
         .await
         .expect("normalize");
     assert!(matches!(
@@ -591,14 +591,14 @@ async fn deny_is_journaled_and_blocks_filesystem_apply() {
     );
 
     let error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "before", "after"),
+        .fs_edit(
+            &FsEdit::new(&path, "before", "after"),
             &policy,
             &attribution,
             &ledger,
         )
         .await
-        .expect_err("deny must block patch");
+        .expect_err("deny must block edit");
 
     assert!(matches!(
         error,
@@ -633,8 +633,8 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     );
 
     let error = broker
-        .fs_patch(
-            &FsPatch::new(&path, "before", "after"),
+        .fs_edit(
+            &FsEdit::new(&path, "before", "after"),
             &policy,
             &attribution,
             &ledger,

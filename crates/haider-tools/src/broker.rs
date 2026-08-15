@@ -927,7 +927,7 @@ impl EffectBroker {
 
     /// Drains finalizers, then reconciles unterminated dispatches to `Unknown`.
     ///
-    /// Operation errors already returned by `fs_patch` are considered
+    /// Operation errors already returned by filesystem mutations are considered
     /// observed. Errors from a cancelled caller, task failure, or terminal
     /// append are returned here, with terminal append errors keyed by effect
     /// and the complete reconciliation report retained on

@@ -14,7 +14,7 @@
 //!   `(run, agent)` (last snapshot wins; summing them would double-count),
 //!   `model_selected` facts tracked in sequence order so each usage chunk
 //!   prices under the model active when it was reported, lines-of-code from
-//!   COMPLETED `fs_write`/`fs_patch`/`fs_edit` tool receipts, and session
+//!   COMPLETED `fs_write`/`fs_edit`/`fs_path` tool receipts, and session
 //!   span from creation to the last committed event. Sessions, duration,
 //!   and LOC attribute to the session's DOMINANT account (most tokens);
 //!   token totals attribute exactly per usage events.
@@ -706,7 +706,7 @@ fn scope_auth_method(scope: &UsageScope) -> Option<AuthMethod> {
     }
 }
 
-const FS_TOOL_NAMES: [&str; 3] = ["fs_write", "fs_patch", "fs_edit"];
+const FS_TOOL_NAMES: [&str; 3] = ["fs_write", "fs_edit", "fs_path"];
 
 fn line_count(text: &str) -> u64 {
     if text.is_empty() {
@@ -717,23 +717,32 @@ fn line_count(text: &str) -> u64 {
 
 /// Lines added/removed for one COMPLETED fs tool receipt:
 /// - `fs_write { content }` — content lines added (prior contents unknown);
-/// - `fs_patch { preimage, replacement }` — preimage removed, replacement
-///   added;
-/// - `fs_edit { old_string, new_string }` — old removed, new added (counted
-///   once even under `replace_all`; the receipt carries no occurrence
-///   count).
+/// - `fs_edit { edits }` — every old anchor removed and new text added once
+///   (the receipt does not carry `replace_all` occurrence counts);
+/// - `fs_path` — structural mutation with no inferred line delta.
 fn fs_receipt_lines(name: &str, args: &serde_json::Value) -> (u64, u64) {
     let text = |key: &str| args.get(key).and_then(|value| value.as_str()).unwrap_or("");
     match name {
         "fs_write" => (line_count(text("content")), 0),
-        "fs_patch" => (
-            line_count(text("replacement")),
-            line_count(text("preimage")),
-        ),
-        "fs_edit" => (
-            line_count(text("new_string")),
-            line_count(text("old_string")),
-        ),
+        "fs_edit" => args
+            .get("edits")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .fold((0u64, 0u64), |(added, removed), edit| {
+                let old = edit
+                    .get("old")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let new = edit
+                    .get("new")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                (
+                    added.saturating_add(line_count(new)),
+                    removed.saturating_add(line_count(old)),
+                )
+            }),
         _ => (0, 0),
     }
 }

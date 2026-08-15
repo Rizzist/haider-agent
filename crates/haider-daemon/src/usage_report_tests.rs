@@ -475,8 +475,8 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
         None,
         4_000,
         completed_tool(
-            "fs_patch",
-            serde_json::json!({"path":"src/lib.rs","preimage":"a\n","replacement":"b\nc\nd\n"}),
+            "fs_edit",
+            serde_json::json!({"path":"src/lib.rs","edits":[{"old":"a\n","new":"b\nc\nd\n"}]}),
         ),
     ));
     folder.push(&envelope(
@@ -499,8 +499,8 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
                 item_id: haider_protocol::ids::ItemId::new("it-2"),
                 item: haider_protocol::item::TurnItem::ToolCall {
                     call_id: "c-2".into(),
-                    name: "fs_patch".into(),
-                    args: serde_json::json!({"preimage":"zzz\n","replacement":"qqq\n"}),
+                    name: "fs_edit".into(),
+                    args: serde_json::json!({"edits":[{"old":"zzz\n","new":"qqq\n"}]}),
                     status: haider_protocol::item::ToolStatus::Failed,
                 },
             },

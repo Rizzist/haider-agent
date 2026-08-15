@@ -4,7 +4,7 @@
   "item": {
     "item": "tool_call",
     "call_id": "c-1",
-    "name": "fs_patch",
+    "name": "fs_edit",
     "args": {
       "path": "src/lib.rs"
     },

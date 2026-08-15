@@ -26,7 +26,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::context::ContextFootprintTruth;
 use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
-    EffectPhase,
+    EffectPhase, FileFreshness,
 };
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -52,7 +52,7 @@ use haider_rpc::{
 };
 use haider_store::{EventStore, Store};
 use haider_tools::{
-    ChangeLedgerSink, EffectBroker, FsPatch, FsWriteRecord, JournalSink, PermissionPolicy,
+    ChangeLedgerSink, EffectBroker, FsEdit, FsWriteRecord, JournalSink, PermissionPolicy,
     ToolResult, TurnAttribution,
 };
 use std::fs;
@@ -3025,12 +3025,11 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "todo_write",
             "graph_evidence",
             "fs_read",
-            "fs_list",
-            "fs_search",
             "fs_glob",
+            "fs_search",
             "fs_write",
-            "fs_patch",
             "fs_edit",
+            "fs_path",
             "process_exec",
             "spawn_subagent",
             "message_subagent",
@@ -3099,7 +3098,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
         .filter(|entry| {
             matches!(
                 entry.manifest.name.as_str(),
-                "fs_read" | "fs_list" | "fs_search" | "fs_glob"
+                "fs_read" | "fs_search" | "fs_glob"
             )
         })
         .collect::<Vec<_>>();
@@ -5386,7 +5385,7 @@ async fn w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart
 /// W4a1 live acceptance: the production dispatcher applies the model's
 /// structured patch only after a second control attachment wins the real CAS.
 #[tokio::test]
-async fn w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result() {
+async fn w4a1_real_fs_edit_round_trips_approval_and_returns_tool_result() {
     let root = test_root("w4a1-patch-approval-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -5399,18 +5398,29 @@ async fn w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result() {
     );
     let (dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitToolCall {
-            call_id: "patch-note".into(),
-            name: "fs_patch".into(),
+            call_id: "read-note".into(),
+            name: "fs_read".into(),
+            args: serde_json::json!({"path": "note.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "read-note".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "edit-note".into(),
+            name: "fs_edit".into(),
             args: serde_json::json!({
                 "path": "note.txt",
-                "patch": {"preimage": "before", "replacement": "after"}
+                "edits": [{"old": "before", "new": "after"}]
             }),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
         FakeStep::ExpectToolResult {
-            call_id: "patch-note".into(),
+            call_id: "edit-note".into(),
         },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
@@ -5448,7 +5458,7 @@ async fn w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result() {
     assert!(
         menu.body
             .iter()
-            .any(|line| line.contains("--- expected") && line.contains("+++ replacement"))
+            .any(|line| line.contains("Edit 1:") && line.contains("occurrence"))
     );
 
     let mut answerer = UdsClient::connect_control(
@@ -5496,7 +5506,7 @@ async fn w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result() {
             .count(),
         1
     );
-    assert_eq!(fake.requests().len(), 2);
+    assert_eq!(fake.requests().len(), 3);
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
@@ -5516,18 +5526,29 @@ async fn w4a1_pending_patch_approval_restarts_on_the_original_menu_cas() {
     );
     let (dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitToolCall {
-            call_id: "pending-patch".into(),
-            name: "fs_patch".into(),
+            call_id: "read-pending".into(),
+            name: "fs_read".into(),
+            args: serde_json::json!({"path": "pending.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "read-pending".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "pending-edit".into(),
+            name: "fs_edit".into(),
             args: serde_json::json!({
                 "path": "pending.txt",
-                "patch": {"preimage": "before", "replacement": "after"}
+                "edits": [{"old": "before", "new": "after"}]
             }),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
         FakeStep::ExpectToolResult {
-            call_id: "pending-patch".into(),
+            call_id: "pending-edit".into(),
         },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
@@ -5607,7 +5628,7 @@ async fn w4a1_pending_patch_approval_restarts_on_the_original_menu_cas() {
         fs::read_to_string(&target).expect("resumed target"),
         "after"
     );
-    assert_eq!(fake.requests().len(), 2);
+    assert_eq!(fake.requests().len(), 3);
 
     second_task.shutdown_handle().request("test complete");
     second_task.join().await.expect("second daemon joins");
@@ -5652,8 +5673,8 @@ impl JournalSink for PreDispatchCrashJournal {
 impl TurnToolFactory for PreDispatchCrashFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![ToolDefinition {
-            name: "fs_patch".into(),
-            description: "test-paused real fs_patch".into(),
+            name: "fs_edit".into(),
+            description: "test-paused real fs_edit".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }]
     }
@@ -5701,17 +5722,25 @@ impl ToolDispatcher for PreDispatchCrashDispatcher {
         args: serde_json::Value,
         _cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
-        assert_eq!(name, "fs_patch");
+        assert_eq!(name, "fs_edit");
         self.calls.fetch_add(1, Ordering::SeqCst);
         let path = args["path"].as_str().expect("path");
-        let preimage = args["patch"]["preimage"].as_str().expect("preimage");
-        let replacement = args["patch"]["replacement"].as_str().expect("replacement");
+        let old = args["edits"][0]["old"].as_str().expect("old anchor");
+        let new = args["edits"][0]["new"].as_str().expect("new text");
         let mut broker = self.broker.lock().await;
         let broker = broker.as_mut().expect("open broker");
+        let bytes = fs::read(std::path::Path::new(&self.context.metadata.cwd).join(path))
+            .expect("read edit baseline");
+        broker
+            .restore_freshness([FileFreshness {
+                path: path.into(),
+                digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+            }])
+            .expect("restore edit baseline");
         let policy = self.policy.lock().await;
         let result = broker
-            .fs_patch(
-                &FsPatch::new(path, preimage, replacement),
+            .fs_edit(
+                &FsEdit::new(path, old, new),
                 &policy,
                 &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
                 &haider_tools::ChangeLedger::new(),
@@ -5776,10 +5805,10 @@ async fn w4a1_committed_approval_crash_before_dispatched_is_safely_lost() {
     let (mut dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitToolCall {
             call_id: "pre-dispatch-patch".into(),
-            name: "fs_patch".into(),
+            name: "fs_edit".into(),
             args: serde_json::json!({
                 "path": "pre-dispatch.txt",
-                "patch": {"preimage": "before", "replacement": "after"}
+                "edits": [{"old": "before", "new": "after"}]
             }),
         },
         FakeStep::Finish {
@@ -6024,8 +6053,8 @@ struct HeldRealPatchFactory {
 impl TurnToolFactory for HeldRealPatchFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![ToolDefinition {
-            name: "fs_patch".into(),
-            description: "test-held real fs_patch".into(),
+            name: "fs_edit".into(),
+            description: "test-held real fs_edit".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }]
     }
@@ -6115,17 +6144,24 @@ impl ToolDispatcher for HeldRealPatchDispatcher {
         args: serde_json::Value,
         _cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
-        assert_eq!(name, "fs_patch");
+        assert_eq!(name, "fs_edit");
         self.calls.fetch_add(1, Ordering::SeqCst);
         let path = args["path"].as_str().expect("path");
-        let preimage = args["patch"]["preimage"].as_str().expect("preimage");
-        let replacement = args["patch"]["replacement"].as_str().expect("replacement");
+        let old = args["edits"][0]["old"].as_str().expect("old anchor");
+        let new = args["edits"][0]["new"].as_str().expect("new text");
         let mut broker = self.broker.lock().await;
+        let broker = broker.as_mut().expect("open broker");
+        let bytes = fs::read(std::path::Path::new(&self.context.metadata.cwd).join(path))
+            .expect("read edit baseline");
+        broker
+            .restore_freshness([FileFreshness {
+                path: path.into(),
+                digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+            }])
+            .expect("restore edit baseline");
         let result = broker
-            .as_mut()
-            .expect("open broker")
-            .fs_patch(
-                &FsPatch::new(path, preimage, replacement),
+            .fs_edit(
+                &FsEdit::new(path, old, new),
                 &self.policy,
                 &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
                 &self.ledger,
@@ -6150,7 +6186,7 @@ impl ToolDispatcher for HeldRealPatchDispatcher {
 /// or the real patch dispatcher call count exceeds one. Verified by revert in
 /// W4a1.
 #[tokio::test]
-async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() {
+async fn w4a1_dispatched_real_fs_edit_restarts_as_unknown_without_redispatch() {
     let root = test_root("w4a1-patch-restart-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -6164,10 +6200,10 @@ async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() 
     let (mut dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitToolCall {
             call_id: "restart-patch".into(),
-            name: "fs_patch".into(),
+            name: "fs_edit".into(),
             args: serde_json::json!({
                 "path": "restart.txt",
-                "patch": {"preimage": "before", "replacement": "after"}
+                "edits": [{"old": "before", "new": "after"}]
             }),
         },
         FakeStep::Finish {
@@ -6628,10 +6664,10 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispatches,
         scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failure,
         w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart,
-        w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result,
+        w4a1_real_fs_edit_round_trips_approval_and_returns_tool_result,
         w4a1_pending_patch_approval_restarts_on_the_original_menu_cas,
         w4a1_committed_approval_crash_before_dispatched_is_safely_lost,
-        w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch,
+        w4a1_dispatched_real_fs_edit_restarts_as_unknown_without_redispatch,
         w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape,
         w4a2_dispatched_exec_restarts_as_unknown_without_rerun,
         w4a2_cancelled_exec_child_process_group_dies,
@@ -6714,9 +6750,9 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
             "server-side committed-CAS approval gate and durable class-scoped session grant",
         ),
         (
-            "w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result",
+            "w4a1_real_fs_edit_round_trips_approval_and_returns_tool_result",
             HERE,
-            "production fs_patch model definition, structured hunk dispatch, and approval preview",
+            "production fs_edit model definition, structured hunk dispatch, and approval preview",
         ),
         (
             "w4a1_pending_patch_approval_restarts_on_the_original_menu_cas",
@@ -6739,14 +6775,14 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
             "canonical workspace boundary for leaf and parent symlink escapes",
         ),
         (
-            "w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch",
+            "w4a1_dispatched_real_fs_edit_restarts_as_unknown_without_redispatch",
             HERE,
-            "real fs_patch dispatch crash window reconciles Unknown without retry",
+            "real fs_edit dispatch crash window reconciles Unknown without retry",
         ),
         (
-            "external_leaf_replacement_before_patch_rename_is_typed_path_change",
+            "external_leaf_replacement_before_edit_rename_is_typed_path_change",
             "crates/haider-tools/src/filesystem.rs",
-            "anchored target-identity recheck immediately before atomic patch replacement",
+            "anchored target-identity recheck immediately before atomic edit replacement",
         ),
         (
             "w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape",
