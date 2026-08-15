@@ -1293,6 +1293,7 @@ version = "0.0.917"
 dependencies = [
  "async-trait",
  "base64",
+ "blake3",
  "haider-accounts",
  "haider-client",
  "haider-core",
