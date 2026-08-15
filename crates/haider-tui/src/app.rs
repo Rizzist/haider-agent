@@ -2187,6 +2187,9 @@ pub enum AppRequest {
     /// session (single-flight in the driver). Emitted on session open and
     /// on `/graph`; ongoing freshness rides the event-cadence chase.
     GraphRefresh,
+    /// M2c: one-shot `graph.inspect` telemetry read (template rollups, tool-
+    /// selection stats, evidence provenance) for the `/graph` screen.
+    GraphInspectRefresh,
     /// CG-M1: receipt-backed pin of the built-in ship-loop for the active
     /// session (`/graph pin`). The driver mints the command id + worker
     /// generation; nothing is installed until the daemon's fact arrives.
@@ -2363,6 +2366,10 @@ pub enum Hit {
     /// what `open_session` takes, and it cannot collide the way a name
     /// can.
     AttachSession(SessionId),
+    /// M2c: the always-visible graph strip above the composer — a click opens
+    /// the `/graph` screen (status + telemetry: rollups, tool-selection,
+    /// evidence provenance), the owner's "click the workflow → stats" gesture.
+    GraphStrip,
     /// Aura / Accounts / Peers launcher rows, by identity not ordinal.
     ExtraRow(LauncherRow),
     /// The palette row's actual content at render time.
@@ -3018,6 +3025,10 @@ pub struct AppModel {
     /// always-visible strip above the composer and the `/graph` status view;
     /// never fabricated — it is a read of durable daemon truth.
     pub graph: Option<haider_protocol::graph::GraphStatus>,
+    /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
+    /// screen (template rollups, tool-selection stats, evidence provenance with
+    /// real workspace-revision provenance). A one-shot read, refetched on open.
+    pub graph_inspect: Option<haider_protocol::graph::GraphInspectSnapshot>,
     /// An honest one-line refusal when the attached daemon predates
     /// `convergence_graph_v1` (set on a feature-absent `/graph`).
     pub graph_unsupported: bool,
@@ -3318,6 +3329,7 @@ impl Default for AppModel {
             subtree_collapsed: false,
             fleet: crate::fleet::FleetView::default(),
             graph: None,
+            graph_inspect: None,
             graph_unsupported: false,
             todos_collapsed: false,
             auto_resuming: false,
@@ -4770,6 +4782,25 @@ impl AppModel {
         }
         self.graph = status;
         self.graph_unsupported = false;
+        self.dirty = true;
+    }
+
+    /// M2c: install the `graph.inspect` telemetry snapshot for the active
+    /// session (rollups, tool-selection stats, evidence provenance). Ignores a
+    /// stale reply for a since-switched session, like `apply_graph_status`.
+    pub fn apply_graph_inspect(
+        &mut self,
+        session_id: &haider_protocol::ids::SessionId,
+        snapshot: haider_protocol::graph::GraphInspectSnapshot,
+    ) {
+        if self
+            .active_session
+            .as_ref()
+            .is_some_and(|active| active != session_id)
+        {
+            return;
+        }
+        self.graph_inspect = Some(snapshot);
         self.dirty = true;
     }
 
@@ -8610,6 +8641,7 @@ impl AppModel {
             _ => {
                 self.graph_unsupported = false;
                 self.requests.push(AppRequest::GraphRefresh);
+                self.requests.push(AppRequest::GraphInspectRefresh);
                 self.screen = Screen::Graph;
             }
         }
@@ -11054,6 +11086,15 @@ impl AppModel {
             return;
         }
         match hit {
+            // M2c: a click on the always-visible graph strip opens the
+            // `/graph` telemetry screen — the same effect as the command
+            // (fetch status + one-shot graph.inspect, then show the view).
+            Hit::GraphStrip => {
+                self.graph_unsupported = false;
+                self.requests.push(AppRequest::GraphRefresh);
+                self.requests.push(AppRequest::GraphInspectRefresh);
+                self.screen = Screen::Graph;
+            }
             // Every hit below re-checks its OWNING SURFACE: the map may be
             // one frame stale, so a rect from a screen we have since left
             // must never act (review P1-5 — the law documented above was

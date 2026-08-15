@@ -229,6 +229,13 @@ pub enum LiveCommand {
     GraphStatus {
         session: SessionId,
     },
+    /// `graph.inspect` (M2c) — a ONE-SHOT paged read of graph telemetry
+    /// (template rollups, tool-selection stats, evidence provenance with real
+    /// workspace-revision provenance). Issued when the `/graph` screen opens;
+    /// single-flight, NO continuous chase (stats don't need live cadence).
+    GraphInspect {
+        session: SessionId,
+    },
     /// `graph.pin` — receipt-backed pin of the built-in ship-loop template
     /// (CG-M1). DURABLE: a lost response retries under the same command id
     /// and replays the same committed pin. Installs NOTHING locally — the
@@ -519,6 +526,7 @@ impl LiveCommand {
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
             | Self::GraphStatus { .. }
+            | Self::GraphInspect { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. }
             // T2: reads + the deliberately receipt-free secret set (no
@@ -697,6 +705,12 @@ pub enum LiveReply {
     Graph {
         session: SessionId,
         status: Box<Option<haider_protocol::graph::GraphStatus>>,
+    },
+    /// `graph.inspect` reply (M2c): the paged telemetry snapshot. Session-
+    /// tagged so a stale reply for a since-switched session installs nothing.
+    GraphInspect {
+        session: SessionId,
+        snapshot: Box<haider_protocol::graph::GraphInspectSnapshot>,
     },
     /// `graph.status` FAILED. A background strip read: it just clears the
     /// in-flight gate and leaves the held reduction untouched (the feature
@@ -1147,6 +1161,8 @@ pub struct LiveDriver {
     /// flight at a time; concurrent asks fold into one chase re-read.
     graph_inflight: bool,
     graph_chase: bool,
+    /// M2c: single-flight for the one-shot `graph.inspect` fetch (no chase).
+    graph_inspect_inflight: bool,
 }
 
 /// How long the login card may sit in `Submitting` before it says so —
@@ -1222,6 +1238,7 @@ impl LiveDriver {
             fleet_chase: false,
             graph_inflight: false,
             graph_chase: false,
+            graph_inspect_inflight: false,
         }
     }
 
@@ -1695,6 +1712,14 @@ impl LiveDriver {
             LiveReply::GraphFailed => {
                 self.graph_inflight = false;
                 self.graph_chase = false;
+                // A graph.inspect error lands here too (same context.graph
+                // tag) — clear its one-shot gate so the screen can refetch.
+                self.graph_inspect_inflight = false;
+                Vec::new()
+            }
+            LiveReply::GraphInspect { session, snapshot } => {
+                self.graph_inspect_inflight = false;
+                model.apply_graph_inspect(&session, *snapshot);
                 Vec::new()
             }
             LiveReply::GraphMutated { command_id } => {
@@ -3109,6 +3134,23 @@ impl LiveDriver {
         vec![LiveCommand::GraphStatus { session }]
     }
 
+    /// M2c: issue a ONE-SHOT `graph.inspect` read for the telemetry screen.
+    /// Feature-gated on convergence_graph_v3; single-flight (a second call
+    /// while one is in flight is dropped — the screen refetches on next open).
+    fn graph_inspect_refresh(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        if !model.daemon_serves(haider_rpc::FEATURE_CONVERGENCE_GRAPH_V3) {
+            return Vec::new();
+        }
+        let Some(session) = model.active_session.clone() else {
+            return Vec::new();
+        };
+        if self.graph_inspect_inflight {
+            return Vec::new();
+        }
+        self.graph_inspect_inflight = true;
+        vec![LiveCommand::GraphInspect { session }]
+    }
+
     /// The graph strip lives on the SESSION screen, always visible while a
     /// graph is pinned — so its refresh cadence is the event stream itself:
     /// one applied graph-fact envelope for the attached session (any screen)
@@ -3797,6 +3839,7 @@ impl LiveDriver {
             // fold lives in `fleet_refresh`).
             AppRequest::FleetRefresh => self.fleet_refresh(model),
             AppRequest::GraphRefresh => self.graph_refresh(model),
+            AppRequest::GraphInspectRefresh => self.graph_inspect_refresh(model),
             AppRequest::GraphPin => {
                 // Receipt-backed pin of the built-in ship-loop. Installs
                 // NOTHING locally — the daemon's `GraphPinned` fact and the

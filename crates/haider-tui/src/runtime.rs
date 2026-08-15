@@ -1416,6 +1416,7 @@ impl DemoDriver {
             // never fabricated in demo; the feature gate drops the read,
             // and the mutations refuse honestly upstream.
             | AppRequest::GraphRefresh
+            | AppRequest::GraphInspectRefresh
             | AppRequest::GraphPin
             | AppRequest::GraphAbandon { .. }
             // B2b live-only vocabulary: `/branch new` in demo mode flashes

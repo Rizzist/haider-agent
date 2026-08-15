@@ -188,6 +188,7 @@ fn outcome_event(outcome: EffectOutcome) -> EventPayload {
         effect: EffectId::new("eff-1"),
         outcome,
         freshness: None,
+        workspace_mutation: None,
     })
 }
 

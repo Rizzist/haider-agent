@@ -3731,6 +3731,9 @@ fn render_session(
         && graph_area.height > 0
     {
         frame.render_widget(Paragraph::new(graph_strip_line(theme, status)), graph_area);
+        // M2c: the strip is clickable — a press opens the `/graph` telemetry
+        // screen (the owner's "click the workflow → stats" gesture).
+        hits.push((graph_area, Hit::GraphStrip));
     }
 
     if queue_height > 0 {
@@ -5083,6 +5086,90 @@ fn render_graph(
                     Span::styled("→ current: ", theme.faint_style()),
                     Span::styled(current.label().to_owned(), theme.gold_style()),
                     Span::styled(format!(" · {expectation}"), theme.dim_style()),
+                ]));
+            }
+        }
+    }
+    // M2c(#4) inspect telemetry — template rollups, tool-selection stats
+    // (#5), and evidence provenance with real workspace revisions (#1). Rides
+    // the one-shot `graph.inspect` read fetched when this screen opened.
+    if let Some(snapshot) = &model.graph_inspect {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("── telemetry · through seq {} ──", snapshot.through_seq),
+            theme.bright_style(),
+        ));
+        if snapshot.template_rollups.is_empty() {
+            lines.push(Line::styled("  no completed runs yet", theme.faint_style()));
+        }
+        for rollup in snapshot.template_rollups.iter().take(5) {
+            let comp = f64::from(rollup.completion_rate_basis_points) / 100.0;
+            let aband = f64::from(rollup.abandon_rate_basis_points) / 100.0;
+            let per_node = if rollup.declared_nodes > 0 {
+                rollup.node_attempts as f64 / rollup.declared_nodes as f64
+            } else {
+                0.0
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(rollup.template.clone(), theme.gold_style()),
+                Span::styled(
+                    format!(
+                        " · {}/{} done · {comp:.0}%✓ {aband:.0}%✗ · {per_node:.1} att/node · {}ms crit",
+                        rollup.completed, rollup.runs, rollup.critical_path_elapsed_ms
+                    ),
+                    theme.faint_style(),
+                ),
+            ]));
+        }
+        if !snapshot.tool_selection.is_empty() {
+            lines.push(Line::styled("  tools:", theme.dim_style()));
+            for tool in snapshot.tool_selection.iter().take(8) {
+                let err = f64::from(tool.error_rate_basis_points) / 100.0;
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("{:<16}", tool.tool_name), theme.dim_style()),
+                    Span::styled(format!("{} calls", tool.total_calls), theme.faint_style()),
+                    Span::styled(
+                        format!(" · {err:.0}% err"),
+                        if tool.error_rate_basis_points > 0 {
+                            theme.warn_style()
+                        } else {
+                            theme.faint_style()
+                        },
+                    ),
+                    Span::styled(
+                        format!(" · {} redundant", tool.redundant_call_count),
+                        if tool.redundant_call_count > 0 {
+                            theme.warn_style()
+                        } else {
+                            theme.faint_style()
+                        },
+                    ),
+                ]));
+            }
+        }
+        let recent: Vec<_> = snapshot.evidence.iter().rev().take(3).collect();
+        if !recent.is_empty() {
+            lines.push(Line::styled("  recent evidence:", theme.dim_style()));
+            for row in recent.into_iter().rev() {
+                use haider_protocol::graph::EvidenceVerdict;
+                let (glyph, gstyle) = match row.verdict {
+                    EvidenceVerdict::Green => ("✓", theme.ok_style()),
+                    EvidenceVerdict::Red => ("✗", theme.err_style()),
+                };
+                let slot = row
+                    .slot
+                    .as_deref()
+                    .map_or_else(String::new, |s| format!(" {s}"));
+                let rev = row.workspace_mutation.as_ref().map_or_else(String::new, |m| {
+                    format!(" · rev {}", crate::graph::provenance_short(m.workspace_revision.as_str()))
+                });
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("{glyph} "), gstyle),
+                    Span::styled(format!("{}{slot}", row.node.label()), theme.dim_style()),
+                    Span::styled(rev, theme.faint_style()),
                 ]));
             }
         }

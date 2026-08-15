@@ -633,6 +633,7 @@ impl CommandContext {
             fleet: matches!(command, LiveCommand::SessionFleet { .. }),
             graph: match command {
                 LiveCommand::GraphStatus { session } => Some(session.clone()),
+                LiveCommand::GraphInspect { session } => Some(session.clone()),
                 _ => None,
             },
             transcription: match command {
@@ -828,6 +829,11 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         },
         LiveCommand::GraphStatus { session } => RequestBody::GraphStatus {
             session_id: session,
+        },
+        LiveCommand::GraphInspect { session } => RequestBody::GraphInspect {
+            session_id: session,
+            cursor: None,
+            limit: 32,
         },
         LiveCommand::GraphPin {
             command_id,
@@ -1231,6 +1237,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             Some(session) => vec![LiveReply::Graph {
                 session,
                 status: Box::new(status),
+            }],
+            None => Vec::new(),
+        },
+        ResponseBody::GraphInspect { snapshot, .. } => match context.graph.clone() {
+            Some(session) => vec![LiveReply::GraphInspect {
+                session,
+                snapshot: Box::new(snapshot),
             }],
             None => Vec::new(),
         },

@@ -70,6 +70,7 @@ fn completed(task: &str, name: &str, state: TaskTerminalState, tail: &str) -> Ta
         truncated: false,
         full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredQueued,
+        workspace_mutation: None,
     })
 }
 
