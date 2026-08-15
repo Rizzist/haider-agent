@@ -21,8 +21,11 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
-        run: cargo test --workspace --all-targets --locked
+      # Per-crate, mirroring the local gate: one workspace invocation
+      # SIGABRTs/flakes under load (fd + socket pressure across many tokio
+      # test binaries — the documented haider-client/headless flake family).
+      - name: test (per-crate)
+        run: bash scripts/ci-test.sh
       - name: repo guards
         run: cargo run -p xtask -- check
       - name: self-test
