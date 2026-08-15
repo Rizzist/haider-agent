@@ -426,6 +426,7 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         footprint_truth: Some(ContextFootprintTruth::Exact),
         title: None,
         agent_metrics: None,
+        last_model: None,
     }
 }
 
@@ -805,6 +806,7 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
         footprint_truth: None,
         title: None,
         agent_metrics: Some(main),
+        last_model: None,
     });
 
     let text = draw_rows(&model, 150, 40).join("\n");

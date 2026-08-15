@@ -3300,7 +3300,26 @@ impl LiveDriver {
                     model.dirty = true;
                 }
             }
-            haider_protocol::session::SessionConfigEventPayload::ModelSelected(_) => {}
+            // Owner 2026-08-15 (model truth): the durable fact is the
+            // transcript's authority — identity follows it (attach replay
+            // included, so a reattached client converges on the model the
+            // session ACTUALLY runs), and the switch lands as a durable
+            // transcript note so every later turn reads under the model
+            // that served it.
+            haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
+                if model.identity.model_short != selected.model
+                    || model.identity.provider != selected.provider
+                {
+                    model.identity.provider = selected.provider.clone();
+                    model.identity.model_short = selected.model.clone();
+                    model.refresh_context_window();
+                }
+                model.projection.push_note(format!(
+                    "⇄ model → {} · {}",
+                    selected.model, selected.provider
+                ));
+                model.dirty = true;
+            }
             // G2 renames land through the correlated `session.rename` reply
             // and `session.list` summaries, never this raw-fact lane.
             haider_protocol::session::SessionConfigEventPayload::SessionRenamed { .. } => {}

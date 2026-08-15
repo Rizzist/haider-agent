@@ -166,6 +166,26 @@ pub fn sync_notification_persistence(
     }
 }
 
+/// Model retention (owner 2026-08-15): persist a committed model pick so the
+/// next boot opens the harness on it (mirrors the theme/notification sync).
+pub fn sync_model_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.model_commits == *seen_commits {
+        return;
+    }
+    *seen_commits = model.model_commits;
+    if let Some(store) = settings.as_mut() {
+        store.save_last_model_if_changed(
+            model.theme_choice,
+            &model.identity.provider,
+            &model.identity.model_short,
+        );
+    }
+}
+
 /// W-C M2: emit each queued desktop notification as an OSC 9 sequence — but
 /// ONLY to a real terminal. A piped/redirected stdout receives NO escape
 /// bytes (the non-tty suppression law), so a captured run stays clean.
@@ -2752,8 +2772,25 @@ pub async fn run_live(
     if let Some(store) = settings.as_mut() {
         store.set_notifications(notifications_on);
     }
+    // Model retention (owner 2026-08-15): the harness OPENS on the model the
+    // user last selected — seed the identity pair from the persisted pick.
+    // The next CreateSession mints from this pair (M9), and live daemon
+    // replies stay the running authority afterwards.
+    if let Some((provider, model_short)) = settings
+        .as_ref()
+        .and_then(crate::settings::SettingsStore::load_last_model)
+    {
+        model.identity.provider = provider.clone();
+        model.identity.model_short = model_short.clone();
+        model.identity_pinned = true;
+        model.refresh_context_window();
+        if let Some(store) = settings.as_mut() {
+            store.set_last_model(Some((provider, model_short)));
+        }
+    }
     let mut seen_theme_commits = model.theme_commits;
     let mut seen_notification_commits = model.notification_commits;
+    let mut seen_model_commits = model.model_commits;
     let mut active_title = model.window_title();
 
     // Graphics wordmark query — after raw mode, before the input pump (see the
@@ -2899,6 +2936,7 @@ pub async fn run_live(
         // W-C M2: persist a toggle change, then flush any queued desktop
         // notifications as OSC 9 to the terminal (tty-gated inside).
         sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);
+        sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         emit_notifications(&mut model);
         if model.theme != active_theme {
             active_theme = model.theme;

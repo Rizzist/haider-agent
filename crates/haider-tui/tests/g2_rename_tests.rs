@@ -47,6 +47,7 @@ fn summary(
         footprint_truth: None,
         title: title.map(str::to_owned),
         agent_metrics: None,
+        last_model: None,
     }
 }
 
@@ -254,4 +255,60 @@ fn demo_rename_is_local() {
     assert_eq!(model.session_name.as_deref(), Some("local-name"));
     assert_eq!(model.flash.as_deref(), Some("· renamed → local-name"));
     assert!(model.requests.is_empty(), "demo issues no wire command");
+}
+
+// ---- model truth (owner 2026-08-15): rows wear the session's ACTUAL model ----
+
+/// LAW: the roster row's MODEL comes from the daemon's journal-folded
+/// `last_model` — the model the session ACTUALLY runs — never this
+/// client's own identity (the old seed made every row wear the CLIENT's
+/// current model, e.g. gpt-5.6-sol over a DeepSeek session).
+///
+/// MUTATION CHECK: drop the `last_model` hydration from the summary apply
+/// (or stamp rows from `identity.model_short` again). Expected RUNTIME
+/// failure: the background row below keeps the client-seeded model.
+#[test]
+fn session_list_last_model_hydrates_roster_rows() {
+    use haider_tui::live::LiveReply;
+
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    model.sessions.clear();
+    model.identity.model_short = "gpt-5.6-sol".to_owned();
+    let background = SessionId::new("s-model-truth");
+    let mut driver = LiveDriver::new("test");
+    let mut listed = summary(&background, 5, None);
+    listed.last_model = Some("deepseek-v4-flash".to_owned());
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![listed],
+            next_cursor: None,
+        },
+    );
+    let entry = model
+        .sessions
+        .iter()
+        .find(|entry| entry.id == background)
+        .expect("listed row");
+    assert_eq!(
+        entry.model_short, "deepseek-v4-flash",
+        "the row wears the session's ACTUAL model, not the client's"
+    );
+
+    // Absence hydrates nothing (older-daemon tolerance): the row keeps
+    // its hydrated model instead of regressing to the client's.
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(&background, 6, None)],
+            next_cursor: None,
+        },
+    );
+    let entry = model
+        .sessions
+        .iter()
+        .find(|entry| entry.id == background)
+        .expect("row survives");
+    assert_eq!(entry.model_short, "deepseek-v4-flash");
 }

@@ -25,6 +25,14 @@ struct SettingsDto {
     theme: String,
     #[serde(default = "default_notifications")]
     notifications: bool,
+    /// Owner 2026-08-15 (model retention): the last COMMITTED model pick, so
+    /// the harness OPENS on the model the user last selected. Additive —
+    /// older files omit the pair and the boot seed simply defers to the
+    /// existing resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model: Option<String>,
 }
 
 fn default_notifications() -> bool {
@@ -41,6 +49,9 @@ pub struct SettingsStore {
     /// theme save never drops it. Seeded from the file at boot.
     notifications: bool,
     last_saved_notifications: Option<bool>,
+    /// Model retention: the `(provider, model)` pair mirrored into every
+    /// write so a theme/notification save never drops it. Seeded at boot.
+    last_model: Option<(String, String)>,
 }
 
 impl SettingsStore {
@@ -52,6 +63,7 @@ impl SettingsStore {
             last_saved: None,
             notifications: true,
             last_saved_notifications: None,
+            last_model: None,
         }
     }
 
@@ -109,6 +121,35 @@ impl SettingsStore {
         self.last_saved_notifications = Some(enabled);
     }
 
+    /// Model retention: the persisted last-committed `(provider, model)`
+    /// pick, or `None` on a missing/corrupt/foreign file or a pre-retention
+    /// file (either half absent).
+    #[must_use]
+    pub fn load_last_model(&self) -> Option<(String, String)> {
+        let dto = self.load_dto()?;
+        Some((dto.last_provider?, dto.last_model?))
+    }
+
+    /// Seed the tracked pair (from a boot-time load) so a later theme or
+    /// notification save preserves it.
+    pub fn set_last_model(&mut self, pair: Option<(String, String)>) {
+        self.last_model = pair;
+    }
+
+    /// Persist a committed model pick, carrying the current theme +
+    /// notification toggle. A no-op when the pair is unchanged.
+    pub fn save_last_model_if_changed(&mut self, theme: ThemeChoice, provider: &str, model: &str) {
+        let pair = (provider.to_owned(), model.to_owned());
+        if self.last_model.as_ref() == Some(&pair) {
+            return;
+        }
+        self.last_model = Some(pair);
+        if self.write_dto(theme, self.notifications) {
+            self.last_saved = Some(theme);
+            self.last_saved_notifications = Some(self.notifications);
+        }
+    }
+
     /// Persist the theme choice if it differs from the last write this store
     /// made. Atomic (temp file + rename): a crash mid-write leaves the
     /// previous settings, never a truncated file. The current notification
@@ -142,6 +183,11 @@ impl SettingsStore {
             version: SETTINGS_VERSION,
             theme: theme.name().to_owned(),
             notifications,
+            last_provider: self
+                .last_model
+                .as_ref()
+                .map(|(provider, _)| provider.clone()),
+            last_model: self.last_model.as_ref().map(|(_, model)| model.clone()),
         };
         let Ok(json) = serde_json::to_string(&dto) else {
             return false;

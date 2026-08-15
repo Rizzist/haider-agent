@@ -3066,6 +3066,9 @@ pub struct AppModel {
     /// commit counter the runtime watches to persist a change.
     pub notifications_enabled: bool,
     pub notification_commits: u64,
+    /// Model retention (owner 2026-08-15): bumped on every COMMITTED model
+    /// pick so the runtime persists the pair and the next boot opens on it.
+    pub model_commits: u64,
     /// W-C M2: the attached session's last-seen run state — the edge the
     /// notification fires on (one per turn, never mid-stream).
     pub notification_run_state: Option<RunState>,
@@ -3339,6 +3342,7 @@ impl Default for AppModel {
             focus_reported: false,
             notifications_enabled: true,
             notification_commits: 0,
+            model_commits: 0,
             notification_run_state: None,
             background_notification_states: std::collections::HashMap::new(),
             notifications: Vec::new(),
@@ -10962,6 +10966,23 @@ impl AppModel {
                 self.dirty = true;
             }
         }
+        // Model truth (owner 2026-08-15): the roster wears the model the
+        // session ACTUALLY runs — the daemon's journal-folded `last_model` —
+        // never this client's own identity (the old seed made every row wear
+        // the CLIENT's current model). Absence hydrates nothing (older
+        // daemon); the ACTIVE session's identity follows the live
+        // ModelSelected lane instead.
+        if let Some(last_model) = &summary.last_model
+            && self.active_session.as_ref() != Some(&summary.session_id)
+            && let Some(entry) = self
+                .sessions
+                .iter_mut()
+                .find(|row| row.id == summary.session_id)
+            && entry.model_short != *last_model
+        {
+            entry.model_short = last_model.clone();
+            self.dirty = true;
+        }
         if summary.turn_count.is_none() && summary.footprint_tokens.is_none() {
             return;
         }
@@ -11908,6 +11929,8 @@ impl AppModel {
         self.refresh_context_window();
         self.model_picker = None;
         self.pending_cache_change = None;
+        // Model retention: a COMMITTED pick is what the next boot opens on.
+        self.model_commits += 1;
         self.flash = Some(format!("· model → {model} · {provider}"));
         self.dirty = true;
     }

@@ -187,6 +187,7 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         footprint_truth: None,
         title: None,
         agent_metrics: None,
+        last_model: None,
     }
 }
 

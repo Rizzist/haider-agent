@@ -500,6 +500,7 @@ fn trust_revision_event_refreshes_the_summary_workspace() {
                 footprint_truth: None,
                 title: None,
                 agent_metrics: None,
+                last_model: None,
             }],
             next_cursor: None,
         },
