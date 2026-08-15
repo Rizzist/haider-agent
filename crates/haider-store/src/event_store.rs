@@ -915,6 +915,7 @@ pub const ACCOUNT_REMOVE_METHOD: &str = "account.remove";
 pub const ACCOUNT_SET_DEFAULT_MODEL_METHOD: &str = "account.set_default_model";
 pub const PROVIDER_CONFIGURE_METHOD: &str = "provider.configure";
 pub const PROVIDER_REMOVE_METHOD: &str = "provider.remove";
+const PROVIDER_CONFIGURE_NOOP_RESPONSE_FIELD: &str = "revision_unchanged_response";
 pub const HOOKS_TRUST_METHOD: &str = "hooks.trust";
 pub const HOOKS_REVOKE_METHOD: &str = "hooks.revoke";
 
@@ -5672,6 +5673,7 @@ impl Store {
             response,
             now_ms()?,
             "account-login",
+            true,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(revision)
@@ -5796,6 +5798,7 @@ impl Store {
             response,
             now_ms()?,
             "account-add",
+            true,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(revision)
@@ -5833,7 +5836,9 @@ impl Store {
     ///
     /// `recovery_json` contains public, server-derived coordinates needed to
     /// finish a pending command after a crash. It is never part of semantic
-    /// command identity and must never contain secret material.
+    /// command identity and must never contain secret material. A
+    /// provider-configure semantic no-op embeds its public response there so
+    /// claim and current-revision finalization share this one transaction.
     pub fn management_claim_receipt<T>(
         &self,
         command_id: &str,
@@ -5864,7 +5869,7 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        let claim = claim_management_receipt_in_transaction(
+        let mut claim = claim_management_receipt_in_transaction(
             &transaction,
             command_id,
             method,
@@ -5873,6 +5878,33 @@ impl Store {
             recovery_json,
             expected_revision,
         )?;
+        if method == PROVIDER_CONFIGURE_METHOD {
+            let authoritative_recovery = match &claim {
+                ManagementClaim::Fresh => recovery_json,
+                ManagementClaim::ResumePending { recovery_json } => recovery_json.as_deref(),
+                ManagementClaim::Committed { .. } => None,
+            };
+            if let Some((response_json, response)) =
+                provider_configure_noop_response(authoritative_recovery)?
+            {
+                let revision = finalize_management_command_receipt(
+                    &transaction,
+                    command_id,
+                    method,
+                    "",
+                    None,
+                    None,
+                    &response_json,
+                    now_ms()?,
+                    "provider-configure no-op",
+                    false,
+                )?;
+                claim = ManagementClaim::Committed {
+                    response: Box::new(response),
+                    revision,
+                };
+            }
+        }
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(claim)
     }
@@ -6162,8 +6194,10 @@ impl Store {
         Ok(claim)
     }
 
-    /// Finalizes a generic W5 management receipt and allocates its revision
-    /// in the same SQLite transaction.
+    /// Finalizes a generic W5 management receipt and records its revision in
+    /// the same SQLite transaction. Provider-configure receipts may carry the
+    /// additive `revision_unchanged: true` response marker for a semantic
+    /// no-op; those commit at the current revision instead of advancing it.
     pub fn finalize_management_receipt<T: serde::Serialize>(
         &self,
         command_id: &str,
@@ -6186,6 +6220,21 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
+        let advance_revision = if method == PROVIDER_CONFIGURE_METHOD {
+            let response = serde_json::to_value(response).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize management mutation response: {error}"),
+                    false,
+                )
+            })?;
+            response
+                .get("revision_unchanged")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        } else {
+            true
+        };
         let revision = finalize_management_command_receipt(
             &transaction,
             command_id,
@@ -6196,6 +6245,7 @@ impl Store {
             response,
             now_ms()?,
             "management mutation",
+            advance_revision,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(revision)
@@ -6222,6 +6272,7 @@ impl Store {
             response,
             now_ms()?,
             "account-remove",
+            true,
         )?;
         let released = transaction
             .execute(
@@ -6260,6 +6311,7 @@ impl Store {
             response,
             now_ms()?,
             "provider-remove",
+            true,
         )?;
         transaction
             .execute(
@@ -6868,6 +6920,34 @@ where
             recovery_json: existing_recovery.flatten(),
         })
     }
+}
+
+fn provider_configure_noop_response<T>(
+    recovery_json: Option<&str>,
+) -> StoreResult<Option<(serde_json::Value, T)>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let Some(recovery_json) = recovery_json else {
+        return Ok(None);
+    };
+    let recovery: serde_json::Value = serde_json::from_str(recovery_json).map_err(|error| {
+        corrupt(format!(
+            "provider-configure recovery JSON is invalid: {error}"
+        ))
+    })?;
+    let Some(response_json) = recovery
+        .get(PROVIDER_CONFIGURE_NOOP_RESPONSE_FIELD)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let response = serde_json::from_value(response_json.clone()).map_err(|error| {
+        corrupt(format!(
+            "provider-configure no-op response is invalid: {error}"
+        ))
+    })?;
+    Ok(Some((response_json, response)))
 }
 
 fn management_receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagementReceiptRow> {
@@ -9595,6 +9675,7 @@ fn finalize_management_command_receipt<T: serde::Serialize>(
     response: &T,
     updated_at_ms: u64,
     description: &str,
+    advance_revision: bool,
 ) -> StoreResult<u64> {
     let (stored_method, state, final_revision): (String, String, Option<i64>) = transaction
         .query_row(
@@ -9620,7 +9701,19 @@ fn finalize_management_command_receipt<T: serde::Serialize>(
         updated_at_ms,
         description,
     )?;
-    let revision = next_management_revision_in_transaction(transaction)?;
+    let revision = if advance_revision {
+        next_management_revision_in_transaction(transaction)?
+    } else {
+        let current: i64 = transaction
+            .query_row(
+                "SELECT management_revision FROM profile_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        u64::try_from(current)
+            .map_err(|_| corrupt("database contains a negative management revision"))?
+    };
     let updated = transaction
         .execute(
             "UPDATE command_receipts

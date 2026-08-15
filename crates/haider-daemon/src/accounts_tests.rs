@@ -4175,6 +4175,553 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     actor.shutdown().await;
 }
 
+#[derive(Clone)]
+struct EndpointEditProviderStore {
+    profiles: Arc<StdMutex<Vec<ProviderProfileV1>>>,
+}
+
+impl EndpointEditProviderStore {
+    fn new(profiles: Vec<ProviderProfileV1>) -> Self {
+        Self {
+            profiles: Arc::new(StdMutex::new(profiles)),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ProviderProfileV1> {
+        self.profiles
+            .lock()
+            .map(|profiles| profiles.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl ProviderRegistryStoreLike for EndpointEditProviderStore {
+    fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
+        Ok(self.snapshot())
+    }
+
+    fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+        let mut stored = self.profiles.lock().map_err(|_| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "endpoint-edit provider store lock is unavailable",
+                true,
+            )
+        })?;
+        *stored = profiles.to_vec();
+        Ok(())
+    }
+}
+
+struct EndpointEditCanonicalValidator {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ProviderEndpointValidator for EndpointEditCanonicalValidator {
+    async fn validate(&self, origin: &str) -> Result<String, HaiderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(origin.trim_end_matches('/').to_owned())
+    }
+}
+
+fn endpoint_edit_profile(provider: &str, origin: &str) -> ProviderProfileV1 {
+    ProviderProfileV1 {
+        provider_id: provider.to_owned(),
+        display_name: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        base_url: Some(origin.to_owned()),
+        enabled: true,
+        auth_requirement: ProviderAuthRequirementWire::ApiKey,
+        configured_models: vec!["model-a".to_owned()],
+        default_model: Some("model-a".to_owned()),
+        provenance: ProviderProvenance::Custom,
+    }
+}
+
+fn endpoint_edit_registry(
+    provider_store: EndpointEditProviderStore,
+    provider_names: &[&str],
+) -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    for provider in provider_names {
+        model_source.replace(
+            (*provider).to_owned(),
+            vec![haider_provider::DiscoveredModel {
+                slug: "model-a".to_owned(),
+                display_name: "Model A".to_owned(),
+                context_window: None,
+                description: Some("endpoint-edit fixture".to_owned()),
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+                extensions: None,
+            }],
+        );
+    }
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(provider_store);
+    ProviderRegistry::new(provider_store, Vec::new(), model_source)
+        .expect("endpoint-edit provider registry")
+}
+
+fn endpoint_repoint_input(provider: &str, origin: &str) -> ProviderConfigureInput {
+    ProviderConfigureInput {
+        provider: provider.to_owned(),
+        api_family: None,
+        origin: Some(origin.to_owned()),
+        auth_requirement: None,
+        enabled: true,
+        models: vec!["model-a".to_owned()],
+        default_model: Some("model-a".to_owned()),
+    }
+}
+
+fn endpoint_create_input(provider: &str, origin: &str) -> ProviderConfigureInput {
+    ProviderConfigureInput {
+        provider: provider.to_owned(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some(origin.to_owned()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: vec!["model-a".to_owned()],
+        default_model: Some("model-a".to_owned()),
+    }
+}
+
+fn endpoint_configure_command(
+    sink: &Arc<dyn FrameSink>,
+    command_id: &str,
+    input: ProviderConfigureInput,
+    expected_revision: u64,
+) -> AccountCommand {
+    AccountCommand::ConfigureProvider(Box::new(ProviderConfigureJob {
+        command_id: command_id.to_owned(),
+        input,
+        expected_revision,
+        route: LoginRoute {
+            request_id: RequestId::new(format!("{command_id}-request")),
+            sink: Arc::clone(sink),
+        },
+    }))
+}
+
+/// MUTATION-CHECK: remove the custom-origin assignment from
+/// `ProviderRegistry::configured_profiles_with_inventory`. Expected RUNTIME
+/// failure: the response and durable provider-store snapshot retain the old
+/// origin even though the configure revision advances.
+#[tokio::test]
+async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
+    let old_origin = "https://old-models.example.invalid/v1";
+    let new_origin = "https://new-models.example.invalid/v1";
+    let provider_store =
+        EndpointEditProviderStore::new(vec![endpoint_edit_profile("custom", old_origin)]);
+    let providers = endpoint_edit_registry(provider_store.clone(), &["custom"]);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let alias = CredentialAlias::new("custom-endpoint-key");
+    let mut accounts = memory_accounts();
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: "custom".to_owned(),
+            base_url: Some(old_origin.to_owned()),
+            auth_method: AuthMethod::ApiKey,
+            identity: "custom endpoint key".to_owned(),
+            status: CredentialStatus::Ok,
+            active: true,
+        })
+        .expect("custom descriptor");
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alias, b"CUSTOM_ENDPOINT_KEY_SENTINEL_91bd")
+        .expect("seed custom key");
+    let validation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), Vec::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault.clone(),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management.clone()),
+        profile_id: "endpoint-repoint".to_owned(),
+        default_model: "unused".to_owned(),
+        providers,
+        provider_endpoint_validator: Arc::new(EndpointEditCanonicalValidator {
+            calls: Arc::clone(&validation_calls),
+        }),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-repoint",
+            endpoint_repoint_input("custom", &format!("{new_origin}/")),
+            0,
+        ))
+        .await
+        .expect("send origin repoint");
+
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("repoint deadline")
+        .expect("repoint response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { provider, revision },
+            ..
+        } => {
+            assert_eq!(provider.provider, "custom", "the name remains the identity");
+            assert_eq!(provider.endpoint.as_deref(), Some(new_origin));
+            assert_eq!(revision, 1);
+        }
+        other => panic!("unexpected repoint response: {other:?}"),
+    }
+    assert_eq!(validation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    let stored = provider_store.snapshot();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].provider_id, "custom");
+    assert_eq!(stored[0].display_name, "custom");
+    assert_eq!(stored[0].base_url.as_deref(), Some(new_origin));
+    assert_eq!(stored[0].configured_models, vec!["model-a".to_owned()]);
+    assert_eq!(stored[0].default_model.as_deref(), Some("model-a"));
+    assert_eq!(
+        vault
+            .resolve(&alias)
+            .expect("preserved custom key")
+            .expose_secret(),
+        b"CUSTOM_ENDPOINT_KEY_SENTINEL_91bd"
+    );
+    let view = management.read().expect("management snapshot");
+    assert_eq!(view.revision, 1);
+    assert_eq!(
+        view.descriptors.len(),
+        1,
+        "the credential descriptor is preserved"
+    );
+    assert_eq!(view.descriptors[0].provider, "custom");
+    assert_eq!(view.descriptors[0].base_url.as_deref(), Some(old_origin));
+    drop(view);
+
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+/// MUTATION-CHECK: remove the changed-custom-origin arm from
+/// `handle_provider_configure`. Expected RUNTIME failure: the link-local
+/// repoint bypasses `ProductionProviderEndpointValidator`, succeeds, and
+/// advances the revision instead of surfacing typed `invalid_argument`.
+#[tokio::test]
+async fn custom_provider_origin_repoint_rejects_invalid_origin() {
+    let old_origin = "https://old-models.example.invalid/v1";
+    let duplicate_origin = "https://claimed-models.example.invalid/v1";
+    let provider_store = EndpointEditProviderStore::new(vec![
+        endpoint_edit_profile("custom", old_origin),
+        endpoint_edit_profile("claimed", duplicate_origin),
+    ]);
+    let providers = endpoint_edit_registry(provider_store.clone(), &["custom", "claimed"]);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management),
+        profile_id: "endpoint-repoint-invalid".to_owned(),
+        default_model: "unused".to_owned(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-invalid",
+            endpoint_repoint_input("custom", "http://169.254.169.254/v1"),
+            0,
+        ))
+        .await
+        .expect("send invalid repoint");
+
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("invalid repoint deadline")
+        .expect("invalid repoint response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code,
+                    retryable,
+                    message,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_INVALID_ARGUMENT);
+            assert!(!retryable);
+            assert!(message.contains("must not target"));
+        }
+        other => panic!("unexpected invalid repoint response: {other:?}"),
+    }
+
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-duplicate",
+            endpoint_repoint_input("custom", duplicate_origin),
+            0,
+        ))
+        .await
+        .expect("send duplicate repoint");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("duplicate repoint deadline")
+        .expect("duplicate repoint response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::Error { code, message, .. },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_INVALID_ARGUMENT);
+            assert!(message.contains("already registered"));
+        }
+        other => panic!("unexpected duplicate repoint response: {other:?}"),
+    }
+    assert_eq!(store.management_revision().await.expect("revision"), 0);
+    let stored = provider_store.snapshot();
+    let custom = stored
+        .iter()
+        .find(|profile| profile.provider_id == "custom")
+        .expect("stored custom provider");
+    assert_eq!(custom.base_url.as_deref(), Some(old_origin));
+
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+/// MUTATION-CHECK: make `finalize_management_command_receipt` always advance
+/// the management revision. Expected RUNTIME failure: the same-origin command
+/// returns revision one instead of zero, and its replay cannot return the
+/// original no-op revision after the later disable mutation.
+#[tokio::test]
+async fn custom_provider_origin_repoint_same_origin_is_revision_noop() {
+    let origin = "https://models.example.invalid/v1";
+    let provider_store =
+        EndpointEditProviderStore::new(vec![endpoint_edit_profile("custom", origin)]);
+    let providers = endpoint_edit_registry(provider_store.clone(), &["custom"]);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let validation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management.clone()),
+        profile_id: "endpoint-repoint-noop".to_owned(),
+        default_model: "unused".to_owned(),
+        providers,
+        provider_endpoint_validator: Arc::new(EndpointEditCanonicalValidator {
+            calls: Arc::clone(&validation_calls),
+        }),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-noop",
+            endpoint_repoint_input("custom", origin),
+            0,
+        ))
+        .await
+        .expect("send same-origin repoint");
+
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("same-origin deadline")
+        .expect("same-origin response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { provider, revision },
+            ..
+        } => {
+            assert_eq!(provider.provider, "custom");
+            assert_eq!(provider.endpoint.as_deref(), Some(origin));
+            assert_eq!(revision, 0);
+        }
+        other => panic!("unexpected same-origin response: {other:?}"),
+    }
+    assert_eq!(validation_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.management_revision().await.expect("revision"), 0);
+    let no_op_receipts = store
+        .management_receipts(PROVIDER_CONFIGURE_METHOD.to_owned())
+        .await
+        .expect("no-op receipt");
+    assert_eq!(no_op_receipts.len(), 1);
+    assert_eq!(no_op_receipts[0].state, "committed");
+    assert_eq!(no_op_receipts[0].final_revision, Some(0));
+    assert_eq!(management.read().expect("management snapshot").revision, 0);
+    assert_eq!(
+        provider_store.snapshot(),
+        vec![endpoint_edit_profile("custom", origin)]
+    );
+
+    let mut disable = endpoint_repoint_input("custom", origin);
+    disable.origin = None;
+    disable.enabled = false;
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-disable",
+            disable,
+            0,
+        ))
+        .await
+        .expect("send later provider mutation");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("later mutation deadline")
+            .expect("later mutation response"),
+        WireFrame::Response {
+            body:
+                ResponseBody::ProviderConfigure {
+                    provider,
+                    revision: 1,
+                },
+            ..
+        } if !provider.enabled
+    ));
+
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-noop",
+            endpoint_repoint_input("custom", origin),
+            0,
+        ))
+        .await
+        .expect("replay same-origin repoint");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("same-origin replay deadline")
+            .expect("same-origin replay response"),
+        WireFrame::Response {
+            body:
+                ResponseBody::ProviderConfigure {
+                    provider,
+                    revision: 0,
+                },
+            ..
+        } if provider.enabled
+    ));
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    assert_eq!(management.read().expect("management snapshot").revision, 1);
+    assert!(!provider_store.snapshot()[0].enabled);
+
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
+/// MUTATION-CHECK: change the missing-name branch in
+/// `handle_provider_configure` to skip endpoint validation as though it were
+/// a repoint. Expected RUNTIME failure: the brand-new provider either stores
+/// the trailing-slash spelling or the validator call count remains zero,
+/// breaking the existing create contract.
+#[tokio::test]
+async fn custom_provider_origin_create_semantics_remain_unchanged() {
+    let provider = "brand-new";
+    let canonical_origin = "https://brand-new.example.invalid/v1";
+    let provider_store = EndpointEditProviderStore::new(Vec::new());
+    let providers = endpoint_edit_registry(provider_store.clone(), &[provider]);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let validation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management),
+        profile_id: "endpoint-create-regression".to_owned(),
+        default_model: "unused".to_owned(),
+        providers,
+        provider_endpoint_validator: Arc::new(EndpointEditCanonicalValidator {
+            calls: Arc::clone(&validation_calls),
+        }),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-create",
+            endpoint_create_input(provider, &format!("{canonical_origin}/")),
+            0,
+        ))
+        .await
+        .expect("send provider create");
+
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("create deadline")
+        .expect("create response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { provider, revision },
+            ..
+        } => {
+            assert_eq!(provider.provider, "brand-new");
+            assert_eq!(provider.endpoint.as_deref(), Some(canonical_origin));
+            assert_eq!(provider.default_model.as_deref(), Some("model-a"));
+            assert!(provider.enabled);
+            assert_eq!(revision, 1);
+        }
+        other => panic!("unexpected create response: {other:?}"),
+    }
+    assert_eq!(validation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    let stored = provider_store.snapshot();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].provider_id, provider);
+    assert_eq!(
+        stored[0].api_family,
+        ProviderApiFamilyWire::OpenAiChatCompletions
+    );
+    assert_eq!(stored[0].base_url.as_deref(), Some(canonical_origin));
+    assert_eq!(
+        stored[0].auth_requirement,
+        ProviderAuthRequirementWire::ApiKey
+    );
+    assert_eq!(stored[0].configured_models, vec!["model-a".to_owned()]);
+    assert_eq!(stored[0].default_model.as_deref(), Some("model-a"));
+
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
 /// Startup reconciliation keeps a failed vault deletion pending and reserved,
 /// then completes it idempotently on the next reconciliation attempt.
 ///

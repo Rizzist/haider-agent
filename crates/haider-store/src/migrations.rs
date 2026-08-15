@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 struct Migration {
     version: u32,
@@ -218,6 +218,60 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (session_id, seq),
                 FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
             );
+        ",
+    },
+    Migration {
+        version: 12,
+        sql: "
+            CREATE TABLE command_receipts_v12 (
+                command_id       TEXT PRIMARY KEY,
+                method           TEXT NOT NULL,
+                request_digest   TEXT NOT NULL,
+                request_json     TEXT NOT NULL,
+                state            TEXT NOT NULL
+                    CHECK (state IN ('pending', 'committed', 'failed')),
+                session_id       TEXT,
+                run_id           TEXT,
+                accepted_seq     INTEGER CHECK (accepted_seq IS NULL OR accepted_seq > 0),
+                response_json    TEXT,
+                created_at_ms    INTEGER NOT NULL,
+                updated_at_ms    INTEGER NOT NULL,
+                final_revision   INTEGER
+                    CHECK (final_revision IS NULL OR final_revision >= 0),
+                recovery_json    TEXT
+            );
+
+            CREATE TABLE account_alias_reservations_v12 (
+                alias           TEXT PRIMARY KEY,
+                command_id      TEXT NOT NULL UNIQUE,
+                provider        TEXT NOT NULL,
+                was_active      INTEGER NOT NULL
+                    CHECK (was_active IN (0, 1)),
+                created_at_ms   INTEGER NOT NULL,
+                FOREIGN KEY (command_id) REFERENCES command_receipts_v12(command_id)
+            );
+
+            INSERT INTO command_receipts_v12(
+                rowid, command_id, method, request_digest, request_json, state,
+                session_id, run_id, accepted_seq, response_json,
+                created_at_ms, updated_at_ms, final_revision, recovery_json
+            )
+            SELECT rowid, command_id, method, request_digest, request_json, state,
+                   session_id, run_id, accepted_seq, response_json,
+                   created_at_ms, updated_at_ms, final_revision, recovery_json
+            FROM command_receipts;
+
+            INSERT INTO account_alias_reservations_v12(
+                alias, command_id, provider, was_active, created_at_ms
+            )
+            SELECT alias, command_id, provider, was_active, created_at_ms
+            FROM account_alias_reservations;
+
+            DROP TABLE account_alias_reservations;
+            DROP TABLE command_receipts;
+            ALTER TABLE command_receipts_v12 RENAME TO command_receipts;
+            ALTER TABLE account_alias_reservations_v12
+                RENAME TO account_alias_reservations;
         ",
     },
 ];

@@ -190,9 +190,9 @@ fn configured_default_must_come_from_the_discovered_inventory() {
 
 /// MUTATION CHECK: make `require_matching_identity` return `Ok(())`
 /// unconditionally. Expected runtime failure: the existing custom provider
-/// accepts the retargeting request instead of returning `invalid_argument`.
+/// accepts an API-family mutation instead of returning `invalid_argument`.
 #[test]
-fn existing_custom_provider_identity_fields_are_create_only() {
+fn existing_custom_provider_keeps_api_family_and_auth_create_only() {
     let store = MemoryProviderStore::default();
     let source = model_source([("custom", vec![discovered("frontier-a", true, None)])]);
     let mut registry =
@@ -211,15 +211,28 @@ fn existing_custom_provider_identity_fields_are_create_only() {
     let error = registry
         .configure(ProviderConfigureInput {
             provider: "custom".to_owned(),
-            api_family: None,
-            origin: Some("https://attacker.example".to_owned()),
+            api_family: Some(ProviderApiFamilyWire::AnthropicMessages),
+            origin: None,
             auth_requirement: None,
             enabled: true,
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
         })
-        .expect_err("identity mutation must fail");
-    assert!(error.message.contains("create-only"));
+        .expect_err("API-family mutation must fail");
+    assert!(error.message.contains("cannot change its API family"));
+
+    let error = registry
+        .configure(ProviderConfigureInput {
+            provider: "custom".to_owned(),
+            api_family: None,
+            origin: None,
+            auth_requirement: Some(ProviderAuthRequirementWire::None),
+            enabled: true,
+            models: vec!["frontier-a".to_owned()],
+            default_model: Some("frontier-a".to_owned()),
+        })
+        .expect_err("auth-requirement mutation must fail");
+    assert!(error.message.contains("auth requirement"));
 }
 
 /// Summary inventory comes only from the provider-owned cache and applies
@@ -793,11 +806,10 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
 }
 
 /// LAW (G4b origin mutability): the enterprise builtins' origins move ONLY
-/// through their shape validators — a region re-configure applies, an
-/// off-template URL is refused with nothing stored, and custom profiles
-/// keep the create-only identity law untouched (both directions; the
-/// create-only half is additionally pinned by
-/// `existing_custom_provider_identity_fields_are_create_only`).
+/// through their shape validators — a region re-configure applies and an
+/// off-template URL is refused with nothing stored. Custom-profile origin
+/// repoints are governed separately by the account actor's shared endpoint
+/// validator.
 ///
 /// MUTATION CHECK: skip the validator call in the enterprise origin-update
 /// branch of `configured_profiles_with_inventory`. Expected RUNTIME

@@ -36,11 +36,11 @@ pub struct ProductionProviderEndpointValidator;
 #[async_trait::async_trait]
 impl ProviderEndpointValidator for ProductionProviderEndpointValidator {
     async fn validate(&self, origin: &str) -> Result<String, HaiderError> {
-        // This validator runs ONLY for brand-new `provider.configure`
-        // profiles — always Custom provenance — so it validates under the
-        // scoped TrustedLan matrix (G4a): RFC1918 LAN origins are legal for
-        // custom local endpoints; link-local/metadata and public plain HTTP
-        // stay refused. Builtin providers never route through here.
+        // This validator runs for brand-new and repointed custom
+        // `provider.configure` profiles, so both paths share the scoped
+        // TrustedLan matrix (G4a): RFC1918 LAN origins are legal for custom
+        // local endpoints; link-local/metadata and public plain HTTP stay
+        // refused. Builtin providers never route through here.
         haider_provider::validate_openai_compatible_endpoint(
             origin,
             haider_provider::CompatibleOriginPolicy::TrustedLan,
@@ -291,8 +291,9 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     pub(crate) fn validate_configure(
         &self,
         input: ProviderConfigureInput,
-    ) -> Result<(), HaiderError> {
-        self.configured_profiles(input).map(|_| ())
+    ) -> Result<bool, HaiderError> {
+        self.configured_profiles(input)
+            .map(|(next, _)| next != self.profiles)
     }
 
     pub(crate) fn remove_custom(&mut self, provider: &str) -> Result<(), HaiderError> {
@@ -367,6 +368,18 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .find(|profile| profile.provider_id == input.provider)
         {
             require_matching_identity(existing, &input)?;
+            // A custom provider's NAME is its stable identity. Its validated
+            // origin is mutable metadata, but one endpoint cannot be claimed
+            // by two different provider names during a repoint.
+            if matches!(existing.provenance, ProviderProvenance::Custom)
+                && let Some(origin) = input
+                    .origin
+                    .as_ref()
+                    .filter(|origin| Some(*origin) != existing.base_url.as_ref())
+            {
+                require_unique_repoint_origin(&self.profiles, &existing.provider_id, origin)?;
+                existing.base_url = Some(origin.clone());
+            }
             // G4b: an enterprise builtin's origin change (region/project
             // re-configuration) applies only through its shape validator —
             // an off-template URL is refused, never stored.
@@ -910,17 +923,36 @@ fn require_matching_identity(
             .origin
             .as_ref()
             .is_some_and(|origin| Some(origin) != existing.base_url.as_ref())
-            // G4b: the enterprise builtins' origins are deliberately
-            // MUTABLE — the card supplies region/project coordinates —
-            // and stay pinned by their URL-shape validators instead.
+            // Custom-provider names are the stable identity, so their
+            // origins are mutable after the actor validates them through
+            // the same endpoint guard used on create. G4b enterprise
+            // builtins likewise have mutable origins pinned by their
+            // URL-shape validators.
+            && !matches!(existing.provenance, ProviderProvenance::Custom)
             && enterprise_origin_validator(&existing.provider_id).is_none()
         || input
             .auth_requirement
             .is_some_and(|requirement| requirement != existing.auth_requirement)
     {
         return Err(invalid(format!(
-            "provider `{}` identity fields are create-only; use a new provider id for a different API family, origin, or auth requirement",
+            "provider `{}` cannot change its API family or auth requirement, and its origin is mutable only when the provider supports repointing",
             existing.provider_id
+        )));
+    }
+    Ok(())
+}
+
+fn require_unique_repoint_origin(
+    profiles: &[ProviderProfileV1],
+    provider_id: &str,
+    origin: &str,
+) -> Result<(), HaiderError> {
+    if let Some(duplicate) = profiles.iter().find(|profile| {
+        profile.provider_id != provider_id && profile.base_url.as_deref() == Some(origin)
+    }) {
+        return Err(invalid(format!(
+            "provider origin `{origin}` is already registered to provider `{}`",
+            duplicate.provider_id
         )));
     }
     Ok(())

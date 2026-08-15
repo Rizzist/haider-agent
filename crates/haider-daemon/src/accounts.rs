@@ -2491,6 +2491,16 @@ struct ProviderConfigureIdentity {
     expected_revision: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ProviderConfigureRecovery {
+    #[serde(flatten)]
+    input: ProviderConfigureInput,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    revision_unchanged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision_unchanged_response: Option<ProviderReceipt>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ProviderRemoveIdentity {
     provider: String,
@@ -2500,6 +2510,8 @@ struct ProviderRemoveIdentity {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ProviderReceipt {
     provider: ProviderSummaryWire,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    revision_unchanged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3143,7 +3155,10 @@ async fn handle_set_default_model(
         );
         return;
     };
-    let receipt = ProviderReceipt { provider };
+    let receipt = ProviderReceipt {
+        provider,
+        revision_unchanged: false,
+    };
     let revision = match store
         .finalize_management_receipt(
             job.command_id,
@@ -3201,12 +3216,14 @@ async fn handle_provider_configure(
             request_json.clone(),
         )
         .await;
+    let fresh_command = matches!(&preflight, Ok(None));
     if matches!(&preflight, Ok(None))
         && let Err(error) = check_expected_revision(store, job.expected_revision).await
     {
         respond_management_error(&job.route, &error);
         return;
     }
+    let mut accepted_revision_unchanged = None;
     match preflight {
         Ok(Some(ManagementClaim::Committed { response, revision })) => {
             respond(
@@ -3218,7 +3235,26 @@ async fn handle_provider_configure(
             );
             return;
         }
-        Ok(_) => {}
+        Ok(Some(ManagementClaim::ResumePending {
+            recovery_json: Some(recovery),
+        })) => match serde_json::from_str::<ProviderConfigureRecovery>(&recovery) {
+            Ok(recovery) => {
+                job.input = recovery.input;
+                accepted_revision_unchanged = Some(recovery.revision_unchanged);
+            }
+            Err(error) => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("pending provider recovery coordinates are invalid: {error}"),
+                        false,
+                    ),
+                );
+                return;
+            }
+        },
+        Ok(Some(ManagementClaim::Fresh | ManagementClaim::ResumePending { .. }) | None) => {}
         Err(error) => {
             respond_management_error(&job.route, &error);
             return;
@@ -3228,18 +3264,19 @@ async fn handle_provider_configure(
         respond_management_error(&job.route, &error);
         return;
     }
-    if providers.get(&job.input.provider).is_none() {
-        let Some(origin) = job.input.origin.as_deref() else {
-            respond_management_error(
-                &job.route,
-                &HaiderError::new(
-                    ErrorCode::InvalidArgument,
-                    "new provider configuration requires an origin",
-                    false,
-                ),
-            );
-            return;
-        };
+    let endpoint_to_validate = match accepted_revision_unchanged {
+        Some(_) => None,
+        None => match providers.get(&job.input.provider) {
+            None => job.input.origin.as_deref(),
+            Some(profile) if matches!(profile.provenance, ProviderProvenance::Custom) => job
+                .input
+                .origin
+                .as_deref()
+                .filter(|origin| Some(*origin) != profile.base_url.as_deref()),
+            Some(_) => None,
+        },
+    };
+    if let Some(origin) = endpoint_to_validate {
         let origin = origin.to_owned();
         let validation =
             tokio::spawn(async move { endpoint_validator.validate(&origin).await }).await;
@@ -3262,7 +3299,50 @@ async fn handle_provider_configure(
             }
         }
     }
-    let recovery_json = match serde_json::to_string(&job.input) {
+    let custom_repoint = providers.get(&job.input.provider).is_some_and(|profile| {
+        matches!(profile.provenance, ProviderProvenance::Custom) && job.input.origin.is_some()
+    });
+    let configuration_changed = match providers.validate_configure(job.input.clone()) {
+        Ok(changed) => changed,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    // A fresh configure that explicitly supplies the custom provider's
+    // already-stored origin (including a spelling canonicalized by the
+    // shared validator) is a semantic no-op. Its recovery coordinates embed
+    // the public response so the store can atomically claim and commit the
+    // receipt at the current revision; replay stays durable without opening
+    // a pending-receipt window for an operation with no profile side effect.
+    let mut revision_unchanged = accepted_revision_unchanged
+        .unwrap_or(fresh_command && custom_repoint && !configuration_changed);
+    let revision_unchanged_response = if revision_unchanged {
+        match providers.summary(&job.input.provider, &provider_has_credential(accounts)) {
+            Some(provider) => Some(ProviderReceipt {
+                provider,
+                revision_unchanged: true,
+            }),
+            None => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "no-op provider configuration disappeared before receipt claim",
+                        false,
+                    ),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let recovery_json = match serde_json::to_string(&ProviderConfigureRecovery {
+        input: job.input.clone(),
+        revision_unchanged,
+        revision_unchanged_response,
+    }) {
         Ok(recovery_json) => recovery_json,
         Err(error) => {
             respond_management_error(
@@ -3300,8 +3380,9 @@ async fn handle_provider_configure(
         Ok(ManagementClaim::ResumePending {
             recovery_json: Some(recovery),
         }) => {
-            if let Ok(input) = serde_json::from_str(&recovery) {
-                job.input = input;
+            if let Ok(recovery) = serde_json::from_str::<ProviderConfigureRecovery>(&recovery) {
+                job.input = recovery.input;
+                revision_unchanged = recovery.revision_unchanged;
             }
         }
         Ok(ManagementClaim::Fresh | ManagementClaim::ResumePending { .. }) => {}
@@ -3310,11 +3391,28 @@ async fn handle_provider_configure(
             return;
         }
     }
-    let profile = match providers.configure(job.input) {
-        Ok(profile) => profile,
-        Err(error) => {
-            respond_management_error(&job.route, &error);
-            return;
+    let profile = if revision_unchanged {
+        match providers.get(&job.input.provider).cloned() {
+            Some(profile) => profile,
+            None => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "no-op provider configuration disappeared before finalization",
+                        false,
+                    ),
+                );
+                return;
+            }
+        }
+    } else {
+        match providers.configure(job.input) {
+            Ok(profile) => profile,
+            Err(error) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
         }
     };
     let Some(provider) =
@@ -3330,7 +3428,10 @@ async fn handle_provider_configure(
         );
         return;
     };
-    let receipt = ProviderReceipt { provider };
+    let receipt = ProviderReceipt {
+        provider,
+        revision_unchanged,
+    };
     let revision = match store
         .finalize_management_receipt(
             job.command_id,
@@ -3345,7 +3446,7 @@ async fn handle_provider_configure(
             return;
         }
     };
-    if let Some(management) = management {
+    if !revision_unchanged && let Some(management) = management {
         management.publish(
             revision,
             accounts.list().to_vec(),
@@ -7308,7 +7409,7 @@ async fn reconcile_provider_receipts(
             }
             continue;
         }
-        let profile = match row.method.as_str() {
+        let (profile, revision_unchanged) = match row.method.as_str() {
             ACCOUNT_SET_DEFAULT_MODEL_METHOD => {
                 let identity: SetDefaultModelIdentity = serde_json::from_str(&row.request_json)
                     .map_err(|error| {
@@ -7318,10 +7419,13 @@ async fn reconcile_provider_receipts(
                             false,
                         )
                     })?;
-                providers.reconcile_set_default_model(&identity.provider, &identity.model)?
+                (
+                    providers.reconcile_set_default_model(&identity.provider, &identity.model)?,
+                    false,
+                )
             }
             PROVIDER_CONFIGURE_METHOD => {
-                let input: ProviderConfigureInput = row
+                let recovery: ProviderConfigureRecovery = row
                     .recovery_json
                     .as_deref()
                     .and_then(|json| serde_json::from_str(json).ok())
@@ -7332,7 +7436,22 @@ async fn reconcile_provider_receipts(
                             false,
                         )
                     })?;
-                providers.reconcile_configure(input)?
+                let revision_unchanged = recovery.revision_unchanged;
+                let profile = if revision_unchanged {
+                    providers
+                        .get(&recovery.input.provider)
+                        .cloned()
+                        .ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                "pending no-op provider configuration targets a missing provider",
+                                false,
+                            )
+                        })?
+                } else {
+                    providers.reconcile_configure(recovery.input)?
+                };
+                (profile, revision_unchanged)
             }
             PROVIDER_REMOVE_METHOD => {
                 let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
@@ -7365,7 +7484,16 @@ async fn reconcile_provider_receipts(
                     .await?;
                 continue;
             }
-            _ => unreachable!("provider receipt methods were validated above"),
+            _ => {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "unexpected pending provider management method `{}`",
+                        row.method
+                    ),
+                    false,
+                ));
+            }
         };
         let summary = providers
             .summary(&profile.provider_id, &provider_has_credential(accounts))
@@ -7380,7 +7508,10 @@ async fn reconcile_provider_receipts(
             .finalize_management_receipt(
                 row.command_id,
                 row.method,
-                ProviderReceipt { provider: summary },
+                ProviderReceipt {
+                    provider: summary,
+                    revision_unchanged,
+                },
             )
             .await?;
     }
