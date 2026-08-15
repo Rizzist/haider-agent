@@ -1328,19 +1328,32 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
                 ],
             };
             for (label, value, field) in fields {
+                // In edit mode the NAME line is the locked stable identity —
+                // dim it so the fixed id reads apart from the editable
+                // origin/model lines.
+                let identity_locked = card.edit && field == crate::app::CustomField::Name;
+                let field_style = if identity_locked {
+                    theme.dim_style()
+                } else {
+                    theme.text_style()
+                };
                 lines_out.push(Line::styled(
                     format!(
                         "  {label} ❯ {}{}",
                         value,
                         caret(editing && card.focus == field)
                     ),
-                    theme.text_style(),
+                    field_style,
                 ));
             }
             if editing {
                 let hint = match card.kind {
                     CustomCardKind::Generic => {
-                        "  the model the server serves (e.g. llama3.1:8b) · the key is asked next"
+                        if card.edit {
+                            "  repoint the endpoint or change the model · name is the fixed id"
+                        } else {
+                            "  the model the server serves (e.g. llama3.1:8b) · the key is asked next"
+                        }
                     }
                     CustomCardKind::Azure => {
                         "  https://{resource}.openai.azure.com + your DEPLOYMENT name · api-key asked next"
@@ -1354,7 +1367,11 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
                 };
                 lines_out.push(Line::styled(hint, theme.dim_style()));
                 lines_out.push(Line::styled(
-                    "  ⏎ create · tab field · esc cancel",
+                    if card.edit {
+                        "  ⏎ save · tab origin/model · esc cancel"
+                    } else {
+                        "  ⏎ create · tab field · esc cancel"
+                    },
                     theme.gold_style(),
                 ));
             } else {

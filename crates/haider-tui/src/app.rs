@@ -8367,9 +8367,15 @@ impl AppModel {
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
                     card.focus = if card.edit {
-                        // Identity is locked in edit mode — only the model
-                        // line takes focus.
-                        CustomField::Model
+                        // A custom provider's endpoint is repointable in
+                        // place: NAME stays the locked stable identity, but
+                        // Origin and Model both take focus so the endpoint
+                        // can be changed. Tab cycles origin ↔ model and
+                        // never lands on the identity line.
+                        match card.focus {
+                            CustomField::Origin => CustomField::Model,
+                            _ => CustomField::Origin,
+                        }
                     } else {
                         match (card.kind, card.focus) {
                             // Bedrock has ONE field (the region).
@@ -8389,13 +8395,22 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
-                    card.focus = match (card.kind, card.focus) {
-                        (CustomCardKind::Bedrock, _) => CustomField::Origin,
-                        (CustomCardKind::Vertex, CustomField::Origin) => CustomField::Extra,
-                        (CustomCardKind::Vertex, _) => CustomField::Origin,
-                        (_, CustomField::Name) => CustomField::Model,
-                        (_, CustomField::Origin) => CustomField::Name,
-                        (_, CustomField::Model | CustomField::Extra) => CustomField::Origin,
+                    card.focus = if card.edit {
+                        // Mirror Tab in edit mode: origin ↔ model only, the
+                        // identity line stays locked in both directions.
+                        match card.focus {
+                            CustomField::Origin => CustomField::Model,
+                            _ => CustomField::Origin,
+                        }
+                    } else {
+                        match (card.kind, card.focus) {
+                            (CustomCardKind::Bedrock, _) => CustomField::Origin,
+                            (CustomCardKind::Vertex, CustomField::Origin) => CustomField::Extra,
+                            (CustomCardKind::Vertex, _) => CustomField::Origin,
+                            (_, CustomField::Name) => CustomField::Model,
+                            (_, CustomField::Origin) => CustomField::Name,
+                            (_, CustomField::Model | CustomField::Extra) => CustomField::Origin,
+                        }
                     };
                     self.dirty = true;
                 }

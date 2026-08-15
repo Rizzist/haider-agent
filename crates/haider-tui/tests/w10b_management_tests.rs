@@ -5,7 +5,7 @@
 
 use haider_protocol::EventPayload;
 use haider_protocol::state::HarnessStatus;
-use haider_tui::app::{AccountRow, AppEvent, AppModel, CustomField, RuntimeMode, Screen};
+use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, CustomField, RuntimeMode, Screen};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
 use ratatui::crossterm::event::KeyCode;
@@ -164,10 +164,12 @@ fn provider_remove_issues_and_surfaces_the_typed_refusal() {
     );
 }
 
-/// MUTATION CHECK: drop the edit lock (focus cycles into identity) or the
-/// prefill. Expected RUNTIME failure: the assertions below.
+/// MUTATION CHECK: relock the origin in edit mode (Tab pins back to Model),
+/// let Tab/BackTab land on the identity line, or drop the prefill. Expected
+/// RUNTIME failure: the assertions below — the endpoint becomes unreachable
+/// for repointing, or the fixed name takes focus.
 #[test]
-fn edit_card_prefills_and_locks_identity() {
+fn edit_card_prefills_and_repoints_endpoint_with_locked_name() {
     let mut model = live_model();
     model
         .daemon_features
@@ -184,12 +186,81 @@ fn edit_card_prefills_and_locks_identity() {
     assert_eq!(card.origin, "http://127.0.0.1:9999/v1");
     assert_eq!(card.model, "m-1");
     assert_eq!(card.focus, CustomField::Model);
-    // Tab never leaves the model line in edit mode.
+    // The endpoint is repointable in place: Tab reaches the origin line…
+    model.handle(key(KeyCode::Tab));
+    assert_eq!(
+        model.custom_add.as_ref().expect("card").focus,
+        CustomField::Origin
+    );
+    // …and cycles back to the model, never onto the locked identity line.
     model.handle(key(KeyCode::Tab));
     assert_eq!(
         model.custom_add.as_ref().expect("card").focus,
         CustomField::Model
     );
+    // BackTab mirrors the two-field cycle and also stays off the name line.
+    model.handle(key(KeyCode::BackTab));
+    assert_eq!(
+        model.custom_add.as_ref().expect("card").focus,
+        CustomField::Origin
+    );
+}
+
+/// MUTATION CHECK: send the ORIGINAL (unedited) origin on an edit submit,
+/// or block char input on the origin line in edit mode. Expected RUNTIME
+/// failure: the emitted `provider.configure` carries the stale origin (or
+/// the origin never changes), so the repoint never reaches the daemon.
+#[test]
+fn edit_card_submits_repointed_origin_under_the_same_name() {
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1.to_owned());
+    model
+        .providers
+        .apply_snapshot(vec![provider_summary("probefix")], 3);
+    model.screen = Screen::Providers;
+
+    model.handle(key(KeyCode::Char('e')));
+    model.requests.clear();
+
+    // Focus the origin line and repoint the endpoint to a new address.
+    model.handle(key(KeyCode::Tab));
+    assert_eq!(
+        model.custom_add.as_ref().expect("card").focus,
+        CustomField::Origin
+    );
+    for _ in 0.."http://127.0.0.1:9999/v1".len() {
+        model.handle(key(KeyCode::Backspace));
+    }
+    for c in "http://10.0.0.5:1234/v1".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    assert_eq!(
+        model.custom_add.as_ref().expect("card").origin,
+        "http://10.0.0.5:1234/v1",
+        "the origin line accepts edits in edit mode"
+    );
+
+    model.handle(key(KeyCode::Enter));
+    let (name, origin, expected_revision) = model
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            AppRequest::ProviderConfigure {
+                name,
+                origin,
+                expected_revision,
+                ..
+            } => Some((name.clone(), origin.clone(), *expected_revision)),
+            _ => None,
+        })
+        .expect("edit submit emits a provider.configure");
+    // The NAME (stable identity) is unchanged; the ORIGIN carries the
+    // repoint; the observed revision gates the durable write.
+    assert_eq!(name, "probefix");
+    assert_eq!(origin, "http://10.0.0.5:1234/v1");
+    assert_eq!(expected_revision, 3);
 }
 
 /// MUTATION CHECK: drop the HuggingFace preset arm. Expected RUNTIME
