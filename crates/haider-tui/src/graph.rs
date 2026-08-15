@@ -8,8 +8,45 @@
 
 use haider_protocol::graph::{
     EvidenceAuthority, EvidenceVerdict, GraphBlockReason, GraphEvidenceSlotStatus, GraphGateKind,
-    GraphNodeStatus, GraphPhase, GraphStatus,
+    GraphNodeStatus, GraphPhase, GraphRunSetStatus, GraphStatus, TodoGraphStatus,
 };
+
+/// A child (per-todo) graph's glyph + stage word for the run-set section.
+/// M2d: purely property/phase-based, like the node glyphs.
+#[must_use]
+pub fn child_glyph_stage(child: &TodoGraphStatus) -> (&'static str, String) {
+    match child.phase {
+        GraphPhase::Completed => ("✓", "complete".to_owned()),
+        GraphPhase::Abandoned => ("⊘", "abandoned".to_owned()),
+        GraphPhase::Superseded => ("⊘", "superseded".to_owned()),
+        GraphPhase::Blocked => ("✗", "blocked".to_owned()),
+        GraphPhase::Active => (
+            "◉",
+            child.current_node.as_ref().map_or_else(
+                || "pending".to_owned(),
+                |node| format!("{} attempt {}", node.label(), child.attempt),
+            ),
+        ),
+    }
+}
+
+/// The M2d per-todo run-set section as plain rows: an aggregate
+/// `run-set N/K todos` header + one child row (glyph · todo N · stage [· dep]).
+#[must_use]
+pub fn plain_run_set(run_set: &GraphRunSetStatus) -> Vec<String> {
+    let mut lines = vec![format!(
+        "run-set {}/{} todos",
+        run_set.terminal_children, run_set.required_children
+    )];
+    for child in &run_set.children {
+        let (glyph, stage) = child_glyph_stage(child);
+        let dep = child
+            .depends_on_todo_id
+            .map_or_else(String::new, |id| format!(" → after todo {id}"));
+        lines.push(format!("  {glyph} todo {} · {stage}{dep}", child.todo_id));
+    }
+    lines
+}
 
 /// A node whose gate is a human confirmation — the M2b PROPERTY-based
 /// replacement for the old `node == SHIP` name check, with a canonical-name
@@ -143,6 +180,12 @@ pub fn plain_status(status: &GraphStatus) -> String {
         // M2a: one indented provenance row per declared evidence slot.
         for slot in &node.evidence_slots {
             lines.push(format!("      {}", slot_row(slot)));
+        }
+    }
+    // M2d: the per-todo run-set (K child graphs), when this turn drives one.
+    if let Some(run_set) = &status.run_set {
+        for line in plain_run_set(run_set) {
+            lines.push(format!("  {line}"));
         }
     }
     match status.phase {

@@ -662,6 +662,17 @@ impl SessionProjection {
                     "⚠ finalize deferred — {count} unmet ({names}{more}) · keep working or abandon the graph"
                 ));
             }
+            // M2d: a per-todo workflow run-set opened over the current plan —
+            // one aggregate note; the strip/status view carries completed/K.
+            EventPayload::GraphRunSetOpened(opened) => {
+                self.push_note(format!(
+                    "⚑ run-set opened — {} todo workflow(s)",
+                    opened.required_children
+                ));
+            }
+            // M2d: one child graph bound to a todo — quiet (the run-set note +
+            // the aggregate render carry the story), like `GraphNodeReadied`.
+            EventPayload::TodoGraphAttached(_) => {}
         }
     }
 

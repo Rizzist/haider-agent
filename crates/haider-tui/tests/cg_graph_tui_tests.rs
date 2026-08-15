@@ -69,6 +69,7 @@ fn mid_run() -> GraphStatus {
         blocked_reason: None,
         pending_menu: None,
         pending_menus: Vec::new(),
+        run_set: None,
     }
 }
 
@@ -233,6 +234,46 @@ fn m2c_finalization_deferred_surfaces_a_bounded_note() {
     assert!(note.contains("keep working or abandon"), "{note}");
 }
 
+/// M2d: the per-todo run-set renders an aggregate `N/K todos` line + one child
+/// row per todo (glyph · stage · dependency), all off the fetched GraphStatus.
+#[test]
+fn m2d_run_set_renders_aggregate_and_child_stages() {
+    use haider_protocol::graph::{GraphRunSetStatus, TodoGraphStatus};
+    use haider_protocol::ids::{EventId, GraphRunSetId, ItemId};
+    let child = |todo_id: u32,
+                 phase: GraphPhase,
+                 current: Option<&str>,
+                 attempt: u32,
+                 dep: Option<u32>| TodoGraphStatus {
+        todo_id,
+        depends_on_todo_id: dep,
+        graph_id: GraphId::new(format!("child-{todo_id}")),
+        ordinal: todo_id,
+        phase,
+        current_node: current.map(|n| GraphNodeName::new(n).expect("name")),
+        attempt,
+    };
+    let mut status = mid_run();
+    status.run_set = Some(GraphRunSetStatus {
+        run_set_id: GraphRunSetId::new("rs1"),
+        root_graph_id: GraphId::new("g1"),
+        plan_item_id: ItemId::new("plan1"),
+        plan_event_id: EventId::new("ev1"),
+        required_children: 3,
+        terminal_children: 1,
+        children: vec![
+            child(1, GraphPhase::Completed, None, 1, None),
+            child(2, GraphPhase::Active, Some("VERIFY"), 2, None),
+            child(3, GraphPhase::Active, None, 1, Some(2)),
+        ],
+    });
+    let body = graph::plain_status(&status);
+    assert!(body.contains("run-set 1/3 todos"), "{body}");
+    assert!(body.contains("✓ todo 1 · complete"), "{body}");
+    assert!(body.contains("◉ todo 2 · VERIFY attempt 2"), "{body}");
+    assert!(body.contains("todo 3 · pending → after todo 2"), "{body}");
+}
+
 /// M2b: the `/graph` surface is PROPERTY-based — an arbitrary template with
 /// non-ship-loop node names renders off gate kind, never a BUILD/VERIFY/SHIP
 /// name match, and `Superseded` reads terminal.
@@ -268,6 +309,7 @@ fn m2b_status_is_property_based_not_name_based() {
         blocked_reason: None,
         pending_menu: None,
         pending_menus: Vec::new(),
+        run_set: None,
     };
     let body = graph::plain_status(&status);
     // Gate labels derive from the gate KIND, not a hardcoded node name.

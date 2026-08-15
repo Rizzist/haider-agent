@@ -5009,6 +5009,41 @@ fn render_graph(
     }
     lines.push(Line::raw(""));
 
+    // M2d: the per-todo run-set (K child graphs) rides the fetched GraphStatus.
+    if let Some(run_set) = &status.run_set {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "run-set {}/{} todos",
+                run_set.terminal_children, run_set.required_children
+            ),
+            if run_set.is_complete() {
+                theme.ok_style()
+            } else {
+                theme.gold_style()
+            },
+        )]));
+        for child in &run_set.children {
+            use haider_protocol::graph::GraphPhase as ChildPhase;
+            let (glyph, stage) = crate::graph::child_glyph_stage(child);
+            let glyph_style = match child.phase {
+                ChildPhase::Completed => theme.ok_style(),
+                ChildPhase::Active => theme.gold_style(),
+                ChildPhase::Blocked => theme.err_style(),
+                ChildPhase::Abandoned | ChildPhase::Superseded => theme.faint_style(),
+            };
+            let dep = child
+                .depends_on_todo_id
+                .map_or_else(String::new, |id| format!(" → after todo {id}"));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{glyph} "), glyph_style),
+                Span::styled(format!("todo {}", child.todo_id), theme.dim_style()),
+                Span::styled(format!(" · {stage}{dep}"), theme.faint_style()),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+
     // Footer: the current expectation, or the terminal/blocked line.
     match status.phase {
         GraphPhase::Completed => lines.push(Line::styled(
