@@ -31,6 +31,9 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
+      - name: install Linux system deps (ALSA for the audio/STT stack)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: tag matches workspace version (tag builds only)
         if: github.event_name == 'push'
         run: |
