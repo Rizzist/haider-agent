@@ -1767,7 +1767,12 @@ fn glob_files_at(
         }
         Ok(())
     })?;
-    Ok(matches.finish())
+    // Same collector → output conversion as the Unix glob path.
+    let truncated = matches.truncated;
+    Ok(CappedOutput {
+        contents: join_lines(matches.entries.into_sorted_vec()),
+        truncated,
+    })
 }
 
 #[cfg(windows)]

@@ -190,7 +190,9 @@ pub fn workspace_state_digest(root: &Path) -> String {
                     loop {
                         match file.read(&mut buffer) {
                             Ok(0) => break,
-                            Ok(read) => hasher.update(&buffer[..read]),
+                            Ok(read) => {
+                                hasher.update(&buffer[..read]);
+                            }
                             Err(error) => {
                                 hasher.update(b"read-file-error");
                                 update_field(hasher, error.kind().to_string().as_bytes());
