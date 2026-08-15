@@ -961,6 +961,13 @@ impl SessionFolder {
         }
     }
 
+    /// Model active at the latest envelope folded into this session.
+    /// Empty means the session supplied neither typed metadata nor a
+    /// `model_selected` fact.
+    pub(crate) fn active_model(&self) -> Option<&str> {
+        (!self.current_model.is_empty()).then_some(self.current_model.as_str())
+    }
+
     pub(crate) fn push(&mut self, envelope: &RawEnvelope) {
         // Delegated sessions begin with an unscoped SessionCreated fact, then
         // name their durable agent on the accepted turn. Remember that first

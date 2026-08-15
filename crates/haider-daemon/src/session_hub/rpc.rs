@@ -112,13 +112,21 @@ async fn session_summary_truth(
 /// Compact direct-agent metrics from the same sealed journal head carried by
 /// `SessionSummary`. The live child path publishes the identical shape into
 /// the parent journal; this summary copy is the cold/reconnect and `/usage`
-/// main-agent fallback.
+/// main-agent fallback. The same fold also returns the model active at that
+/// head: its seed is the metadata model and each durable `model_selected`
+/// fact replaces it in sequence order.
 async fn session_agent_metrics_truth(
     store: &dyn StoreHandle,
     session_id: &SessionId,
     through_seq: u64,
     initial_model: &str,
-) -> Result<Option<haider_protocol::agent::AgentMetricsSnapshot>, HaiderError> {
+) -> Result<
+    (
+        Option<haider_protocol::agent::AgentMetricsSnapshot>,
+        Option<String>,
+    ),
+    HaiderError,
+> {
     let mut folder = crate::usage_report::SessionFolder::new(initial_model);
     let mut since_seq = 0;
     while since_seq < through_seq {
@@ -129,7 +137,10 @@ async fn session_agent_metrics_truth(
         let mut advanced = false;
         for envelope in page {
             if envelope.seq > through_seq {
-                return Ok(folder.primary_agent_snapshot(session_id, through_seq));
+                return Ok((
+                    folder.primary_agent_snapshot(session_id, through_seq),
+                    folder.active_model().map(str::to_owned),
+                ));
             }
             since_seq = envelope.seq;
             advanced = true;
@@ -139,7 +150,10 @@ async fn session_agent_metrics_truth(
             break;
         }
     }
-    Ok(folder.primary_agent_snapshot(session_id, through_seq))
+    Ok((
+        folder.primary_agent_snapshot(session_id, through_seq),
+        folder.active_model().map(str::to_owned),
+    ))
 }
 
 struct FleetChildTruth {
@@ -5433,8 +5447,13 @@ impl HubConnection {
         }
         let mut sessions = Vec::with_capacity(selected.len());
         for session_id in &selected {
-            let head_seq = self.hub.inner.store.latest_seq(session_id).await?;
+            // Read the fold seed before sealing the head. Model selection
+            // updates metadata and appends its fact atomically: a selection
+            // between these reads is therefore included by the later head,
+            // while one after the head cannot leak a post-head seed into the
+            // summary.
             let metadata = self.hub.inner.store.session_metadata(session_id).await?;
+            let head_seq = self.hub.inner.store.latest_seq(session_id).await?;
             // Roster truth for unattached sessions: replay the same sealed
             // journal the observe surface reads. The launcher must never
             // show "0 turns · 0 tok" for a session that merely lacks an
@@ -5446,7 +5465,7 @@ impl HubConnection {
             let initial_model = metadata
                 .as_ref()
                 .map_or("", |metadata| metadata.model.as_str());
-            let agent_metrics = session_agent_metrics_truth(
+            let (agent_metrics, last_model) = session_agent_metrics_truth(
                 &self.hub.inner.store,
                 session_id,
                 head_seq,
@@ -5464,6 +5483,7 @@ impl HubConnection {
                 worker_generation: self.hub.inner.store.worker_generation(),
                 workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
                 metadata,
+                last_model,
                 turn_count: Some(turns),
                 footprint_tokens,
                 footprint_truth,

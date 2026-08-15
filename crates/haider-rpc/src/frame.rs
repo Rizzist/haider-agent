@@ -865,6 +865,14 @@ pub struct SessionSummary {
     /// readers must not infer anything from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
+    /// Additive roster-truth field: the model active at this committed
+    /// session head. The latest durable `model_selected` fact wins, falling
+    /// back to the create-time metadata model when no selection fact exists.
+    /// `None` when an older daemon omits the field or the session has neither
+    /// typed metadata nor a selection fact — readers must never infer a model
+    /// from its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
     /// Additive canonical workspace coordinate for clients that list a
     /// session from a different process cwd. Absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]

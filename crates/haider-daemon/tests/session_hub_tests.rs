@@ -33,6 +33,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{FinishReason, Usage, UsageRequestKind, UsageScope, UsageSource};
+use haider_protocol::session::ModelSelected;
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
 use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
@@ -1993,6 +1994,23 @@ fn user_turn_envelope(
     envelope
 }
 
+fn model_selected_envelope(
+    session_id: &SessionId,
+    event_id: &str,
+    worker_generation: u64,
+    provider: &str,
+    model: &str,
+) -> RawEnvelope {
+    let mut envelope = envelope(session_id, event_id, worker_generation);
+    envelope.payload = ModelSelected {
+        provider: provider.into(),
+        model: model.into(),
+    }
+    .to_payload_value()
+    .expect("model selection serializes");
+    envelope
+}
+
 async fn list_summaries(hub: &SessionHub) -> Vec<SessionSummary> {
     let sink = Arc::new(CollectSink::default());
     let connection = hub
@@ -2037,6 +2055,132 @@ async fn session_summary_carries_its_committed_workspace_cwd() {
         .find(|summary| summary.session_id == session_id)
         .expect("created session summary");
     assert_eq!(summary.workspace_cwd.as_deref(), Some("/tmp"));
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// OWNER BUG: the roster model is head truth, not the model copied into
+/// metadata when the session was created. Multiple switches prove sequence
+/// ordering; the user turns on both sides make the switches mid-life.
+///
+/// MUTATION CHECK: remove the `SessionFolder::active_model` result from
+/// `session_agent_metrics_truth`, or stop `SessionFolder::push` from applying
+/// `model_selected`. Expected RUNTIME failure: `last_model` remains
+/// `test-model` (or becomes `None`) instead of `deepseek-reasoner`, while the
+/// untouched metadata assertion continues to report `test-model`.
+#[tokio::test]
+async fn session_list_last_model_tracks_latest_main_timeline_switch() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-last-model-switched");
+    let generation = store.worker_generation();
+    create_typed_session(&store, &session_id, "fake").await;
+    let mut events = vec![
+        user_turn_envelope(&session_id, "before-switch", generation, false),
+        model_selected_envelope(
+            &session_id,
+            "switch-to-deepseek-chat",
+            generation,
+            "deepseek",
+            "deepseek-chat",
+        ),
+        user_turn_envelope(&session_id, "between-switches", generation, false),
+        model_selected_envelope(
+            &session_id,
+            "switch-to-deepseek-reasoner",
+            generation,
+            "deepseek",
+            "deepseek-reasoner",
+        ),
+        user_turn_envelope(&session_id, "after-switch", generation, false),
+    ];
+    hub.append(&mut events).await.expect("timeline appends");
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("switched session summary");
+    assert_eq!(summary.last_model.as_deref(), Some("deepseek-reasoner"));
+    assert_eq!(
+        summary
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.model.as_str()),
+        Some("test-model"),
+        "create-time metadata remains untouched by replay projection"
+    );
+    assert_eq!(
+        store
+            .session_metadata(&session_id)
+            .await
+            .expect("metadata read")
+            .expect("typed metadata")
+            .model,
+        "test-model"
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// A typed session with no model-selection fact still has an exact roster
+/// model: the create-time metadata model seeds the same head fold.
+///
+/// MUTATION CHECK: initialize `SessionFolder` with an empty model in
+/// `session_agent_metrics_truth`. Expected RUNTIME failure: this summary's
+/// `last_model` is `None` instead of the metadata fallback `test-model`.
+#[tokio::test]
+async fn session_list_last_model_falls_back_to_creation_metadata() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-last-model-metadata");
+    create_typed_session(&store, &session_id, "fake").await;
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("typed session summary");
+    assert_eq!(summary.last_model.as_deref(), Some("test-model"));
+    assert_eq!(
+        summary
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.model.as_str()),
+        Some("test-model")
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// A legacy session with no typed metadata, user turns, or model-selection
+/// facts has no model truth to report; absence must stay honest.
+///
+/// MUTATION CHECK: coerce the empty `SessionFolder::active_model` seed into a
+/// string or synthesize a default in `session_list`. Expected RUNTIME
+/// failure: this metadata-less empty summary reports `Some(...)` instead of
+/// `None`.
+#[tokio::test]
+async fn session_list_last_model_is_none_without_metadata_or_switch() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-last-model-empty-legacy");
+    append_one(
+        &hub,
+        &session_id,
+        store.worker_generation(),
+        "legacy-session-seed",
+    )
+    .await;
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("legacy session summary");
+    assert_eq!(summary.metadata, None);
+    assert_eq!(summary.turn_count, Some(0));
+    assert_eq!(summary.last_model, None);
 
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
