@@ -1,0 +1,36 @@
+name: xplat-check
+# Fast cross-platform compile check — the iteration loop for the Windows
+# port. `cargo check --all-targets` surfaces type/cfg errors in minutes
+# without a full build; Windows has no local toolchain on the dev box, so
+# this workflow IS the Windows compiler.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: install Linux system deps (ALSA for the audio/STT stack)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: check (all targets — lib + bins + tests compile)
+        run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
