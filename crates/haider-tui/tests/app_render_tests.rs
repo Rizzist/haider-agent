@@ -526,6 +526,11 @@ fn digit_attaches_a_sample_and_autoplay_is_one_shot() {
 #[test]
 fn status_bar_has_boxed_chips_and_hint() {
     let mut model = AppModel::new();
+    // Deterministic device: the real hostname's length decides how much of
+    // the fixed-width bar survives the shed ladder (a long CI-runner
+    // hostname pushed the voice chip out at 118 cols — the host-dependent
+    // pin class; inject, never inherit).
+    model.identity.device = "test-mac".to_owned();
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
         HarnessStatus::Ready,
     ))));
