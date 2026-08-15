@@ -55,10 +55,10 @@ use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
 use crate::{FsEditAnchorMismatch, ToolError, ToolResult};
 use async_trait::async_trait;
+use haider_platform::WorkspaceDirectory as OwnedFd;
 use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
-use haider_platform::WorkspaceDirectory as OwnedFd;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
@@ -1775,8 +1775,8 @@ fn windows_walk_files(
     root: &Path,
     visit: &mut impl FnMut(&Path) -> ToolResult<()>,
 ) -> ToolResult<()> {
-    let metadata = fs::symlink_metadata(root)
-        .map_err(|error| ToolError::io("inspect", root, error))?;
+    let metadata =
+        fs::symlink_metadata(root).map_err(|error| ToolError::io("inspect", root, error))?;
     if metadata.file_type().is_symlink() {
         return Err(ToolError::PathChanged {
             path: root.to_path_buf(),

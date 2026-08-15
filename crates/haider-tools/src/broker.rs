@@ -875,7 +875,7 @@ impl EffectBroker {
             )));
         }
         let workspace_dir = haider_platform::open_workspace_directory(&workspace_root)
-        .map_err(|error| ToolError::io("open workspace root", &workspace_root, error))?;
+            .map_err(|error| ToolError::io("open workspace root", &workspace_root, error))?;
         Ok(Self {
             journal: BrokerJournal::new(journal),
             workspace_root,

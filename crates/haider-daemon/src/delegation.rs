@@ -2401,7 +2401,10 @@ fn seed_handoff_dir(workspace: &Path, session_short: &str) -> Result<(), HaiderE
             false,
         ));
     }
-    let directory = workspace.join(".haider").join("handoff").join(session_short);
+    let directory = workspace
+        .join(".haider")
+        .join("handoff")
+        .join(session_short);
     std::fs::create_dir_all(&directory)
         .map_err(|error| handoff_windows_io_error(&directory, error))?;
     for ancestor in [

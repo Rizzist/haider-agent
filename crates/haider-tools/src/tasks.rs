@@ -21,10 +21,10 @@ use crate::process::{
     signal_group_for_sweep,
 };
 use crate::{ToolError, ToolResult};
+use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
 use haider_protocol::effect::WorkspaceMutation;
 use haider_protocol::ids::EffectId;
 use haider_protocol::item::OutputStream;
-use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::env;

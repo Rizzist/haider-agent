@@ -185,7 +185,10 @@ fn slotted_verify_never_labels_an_attested_slot_verified() {
     assert!(body.contains("2/3 slots"), "{body}");
     // A daemon-verified slot reads `verified`, with a BOUNDED digest.
     assert!(body.contains("tests  verified · blake3:aabbcc"), "{body}");
-    assert!(!body.contains("aabbccddeeff"), "digest stays bounded: {body}");
+    assert!(
+        !body.contains("aabbccddeeff"),
+        "digest stays bounded: {body}"
+    );
     // A model-attested slot reads `attested` and is NEVER labelled verified.
     assert!(body.contains("review  attested"), "{body}");
     assert!(!body.contains("review  verified"), "{body}");
@@ -230,7 +233,10 @@ fn m2c_finalization_deferred_surfaces_a_bounded_note() {
     assert!(note.contains("⚠ finalize deferred"), "{note}");
     assert!(note.contains("4 unmet"), "{note}");
     assert!(note.contains("BUILD, VERIFY, SHIP"), "{note}");
-    assert!(note.contains("+1"), "bounds the list to 3 names then +N: {note}");
+    assert!(
+        note.contains("+1"),
+        "bounds the list to 3 names then +N: {note}"
+    );
     assert!(note.contains("keep working or abandon"), "{note}");
 }
 
@@ -240,19 +246,18 @@ fn m2c_finalization_deferred_surfaces_a_bounded_note() {
 fn m2d_run_set_renders_aggregate_and_child_stages() {
     use haider_protocol::graph::{GraphRunSetStatus, TodoGraphStatus};
     use haider_protocol::ids::{EventId, GraphRunSetId, ItemId};
-    let child = |todo_id: u32,
-                 phase: GraphPhase,
-                 current: Option<&str>,
-                 attempt: u32,
-                 dep: Option<u32>| TodoGraphStatus {
-        todo_id,
-        depends_on_todo_id: dep,
-        graph_id: GraphId::new(format!("child-{todo_id}")),
-        ordinal: todo_id,
-        phase,
-        current_node: current.map(|n| GraphNodeName::new(n).expect("name")),
-        attempt,
-    };
+    let child =
+        |todo_id: u32, phase: GraphPhase, current: Option<&str>, attempt: u32, dep: Option<u32>| {
+            TodoGraphStatus {
+                todo_id,
+                depends_on_todo_id: dep,
+                graph_id: GraphId::new(format!("child-{todo_id}")),
+                ordinal: todo_id,
+                phase,
+                current_node: current.map(|n| GraphNodeName::new(n).expect("name")),
+                attempt,
+            }
+        };
     let mut status = mid_run();
     status.run_set = Some(GraphRunSetStatus {
         run_set_id: GraphRunSetId::new("rs1"),
@@ -302,9 +307,24 @@ fn m2b_status_is_property_based_not_name_based() {
         ready_nodes: vec![GraphNodeName::new("REVIEW").expect("name")],
         attempt: 1,
         nodes: vec![
-            mk("SCAN", GraphGateKind::CommandGreen, GraphExecutorShape::Inline, true),
-            mk("REVIEW", GraphGateKind::AllOfN { n: 5 }, GraphExecutorShape::FanOut, false),
-            mk("APPROVE", GraphGateKind::HumanConfirm, GraphExecutorShape::Human, false),
+            mk(
+                "SCAN",
+                GraphGateKind::CommandGreen,
+                GraphExecutorShape::Inline,
+                true,
+            ),
+            mk(
+                "REVIEW",
+                GraphGateKind::AllOfN { n: 5 },
+                GraphExecutorShape::FanOut,
+                false,
+            ),
+            mk(
+                "APPROVE",
+                GraphGateKind::HumanConfirm,
+                GraphExecutorShape::Human,
+                false,
+            ),
         ],
         blocked_reason: None,
         pending_menu: None,

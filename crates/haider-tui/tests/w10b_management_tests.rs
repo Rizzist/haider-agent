@@ -5,7 +5,9 @@
 
 use haider_protocol::EventPayload;
 use haider_protocol::state::HarnessStatus;
-use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, CustomField, RuntimeMode, Screen};
+use haider_tui::app::{
+    AccountRow, AppEvent, AppModel, AppRequest, CustomField, RuntimeMode, Screen,
+};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
 use ratatui::crossterm::event::KeyCode;

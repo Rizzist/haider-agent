@@ -5179,9 +5179,15 @@ fn render_graph(
                     .slot
                     .as_deref()
                     .map_or_else(String::new, |s| format!(" {s}"));
-                let rev = row.workspace_mutation.as_ref().map_or_else(String::new, |m| {
-                    format!(" · rev {}", crate::graph::provenance_short(m.workspace_revision.as_str()))
-                });
+                let rev = row
+                    .workspace_mutation
+                    .as_ref()
+                    .map_or_else(String::new, |m| {
+                        format!(
+                            " · rev {}",
+                            crate::graph::provenance_short(m.workspace_revision.as_str())
+                        )
+                    });
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(format!("{glyph} "), gstyle),

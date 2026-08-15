@@ -638,7 +638,9 @@ impl SessionProjection {
             // M2b: the pinned workflow was replaced by a mid-run switch. A new
             // `GraphPinned` note follows; this records the supersession itself.
             EventPayload::GraphSuperseded(_) => {
-                self.push_note("⇄ workflow switched — the previous graph was superseded".to_owned());
+                self.push_note(
+                    "⇄ workflow switched — the previous graph was superseded".to_owned(),
+                );
             }
             // M2c: a final answer was DEFERRED because the active graph still
             // has unmet obligations. The guardrail never silently drops — the

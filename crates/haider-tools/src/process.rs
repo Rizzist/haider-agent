@@ -17,11 +17,11 @@ use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use haider_platform::WorkspaceDirectory as OwnedFd;
+use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
 use haider_protocol::effect::{EffectClass, EffectOutcome, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, EffectId, WorkspaceRevision};
 use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
-use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
-use haider_platform::WorkspaceDirectory as OwnedFd;
 #[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
@@ -1667,9 +1667,7 @@ pub(crate) fn signal_group_for_sweep(
         // Darwin reports EPERM when a group contains only the caller's zombie
         // child. Since that zombie pins this exact PGID, no live member of the
         // original group remains signalable in this case.
-        Err(error)
-            if leader_is_zombie && haider_platform::process_error_is_permission(&error) =>
-        {
+        Err(error) if leader_is_zombie && haider_platform::process_error_is_permission(&error) => {
             Ok(false)
         }
         Err(error) => Err(ToolError::Runtime {
@@ -1682,9 +1680,10 @@ pub(crate) fn signal_group_for_sweep(
 }
 
 pub(crate) fn process_group_exists(pid: Pid) -> ToolResult<bool> {
-    let group = haider_platform::process_group(Some(pid.id())).ok_or_else(|| ToolError::Runtime {
-        message: "probe process group: invalid process id".into(),
-    })?;
+    let group =
+        haider_platform::process_group(Some(pid.id())).ok_or_else(|| ToolError::Runtime {
+            message: "probe process group: invalid process id".into(),
+        })?;
     haider_platform::process_group_exists(group).map_err(|error| ToolError::Runtime {
         message: format!("probe process group {}: {error}", pid.as_raw_nonzero()),
     })

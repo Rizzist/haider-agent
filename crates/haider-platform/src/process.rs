@@ -200,13 +200,7 @@ pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE, WaitForSingleObject,
     };
 
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-            0,
-            pid.0,
-        )
-    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid.0) };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         return if error.raw_os_error() == Some(87) {

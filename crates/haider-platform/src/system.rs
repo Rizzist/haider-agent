@@ -16,12 +16,7 @@ pub fn local_device_name() -> Option<String> {
     std::env::var_os("COMPUTERNAME")
         .and_then(|name| name.into_string().ok())
         .and_then(|name| {
-            let short = name
-                .split('.')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
+            let short = name.split('.').next().unwrap_or("").trim().to_lowercase();
             (!short.is_empty()).then_some(short)
         })
 }
