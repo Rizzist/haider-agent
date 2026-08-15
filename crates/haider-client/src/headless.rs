@@ -848,12 +848,10 @@ impl HeadlessReducer {
                         option_index,
                     });
                 }
-                MenuKind::ErrorRecovery { presentation, .. } => {
-                    if menu.blocking {
-                        self.blocking_presentation = Some(presentation);
-                        self.actions
-                            .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired));
-                    }
+                MenuKind::ErrorRecovery { presentation, .. } if menu.blocking => {
+                    self.blocking_presentation = Some(presentation);
+                    self.actions
+                        .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired));
                 }
                 _ if menu.blocking => self
                     .actions

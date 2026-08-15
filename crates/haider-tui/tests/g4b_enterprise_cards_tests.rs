@@ -372,7 +372,7 @@ fn enterprise_footer_buttons_and_edit_routing() {
         AccountAddKind::Vertex,
     ] {
         assert!(
-            hits.iter().any(|hit| *hit == Hit::AccountAdd(kind)),
+            hits.contains(&Hit::AccountAdd(kind)),
             "button hit for {kind:?}"
         );
     }

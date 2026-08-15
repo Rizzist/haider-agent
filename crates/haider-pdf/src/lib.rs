@@ -412,20 +412,21 @@ fn parse_objects(bytes: &[u8]) -> Result<BTreeMap<(u32, u16), PdfObject>, PdfErr
 
 fn find_object_header(bytes: &[u8], mut cursor: usize) -> Option<(u32, u16, usize)> {
     while cursor < bytes.len() {
-        if bytes[cursor].is_ascii_digit() && (cursor == 0 || is_pdf_whitespace(bytes[cursor - 1])) {
-            if let Some((object, after_object)) = parse_u32(bytes, cursor) {
-                let after_object = skip_ws(bytes, after_object);
-                if let Some((generation, after_generation)) = parse_u32(bytes, after_object) {
-                    let after_generation = skip_ws(bytes, after_generation);
-                    if keyword_at(bytes, after_generation, b"obj")
-                        && let Ok(generation) = u16::try_from(generation)
-                    {
-                        return Some((
-                            object,
-                            generation,
-                            skip_ws(bytes, after_generation + b"obj".len()),
-                        ));
-                    }
+        if bytes[cursor].is_ascii_digit()
+            && (cursor == 0 || is_pdf_whitespace(bytes[cursor - 1]))
+            && let Some((object, after_object)) = parse_u32(bytes, cursor)
+        {
+            let after_object = skip_ws(bytes, after_object);
+            if let Some((generation, after_generation)) = parse_u32(bytes, after_object) {
+                let after_generation = skip_ws(bytes, after_generation);
+                if keyword_at(bytes, after_generation, b"obj")
+                    && let Ok(generation) = u16::try_from(generation)
+                {
+                    return Some((
+                        object,
+                        generation,
+                        skip_ws(bytes, after_generation + b"obj".len()),
+                    ));
                 }
             }
         }
@@ -922,6 +923,7 @@ fn take_chars(value: &str, count: usize) -> String {
 pub const CRATE_NAME: &str = "haider-pdf";
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

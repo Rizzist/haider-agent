@@ -929,6 +929,7 @@ async fn compile_ancestry(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_verbatim(
     verbatim: &mut Vec<RawEnvelope>,
     all_envelopes: &[RawEnvelope],

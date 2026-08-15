@@ -62,7 +62,8 @@ fn listening_pulse_animates_across_the_clock_and_is_deterministic() {
         "the travelling crest lights a gold column"
     );
     // The threshold that routes real-vs-synthesized is a sane small value.
-    assert!(LISTENING_SIGNAL_MIN > 0.0 && LISTENING_SIGNAL_MIN < 0.2);
+    let listening_signal_min = std::hint::black_box(LISTENING_SIGNAL_MIN);
+    assert!(listening_signal_min > 0.0 && listening_signal_min < 0.2);
 }
 
 #[test]

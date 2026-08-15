@@ -1680,10 +1680,9 @@ impl Store {
         if has_more {
             evidence.truncate(limit);
         }
-        let next_cursor = if has_more {
-            let graph_id = graph_id
-                .clone()
-                .expect("non-empty evidence always belongs to a graph");
+        // Non-empty evidence always belongs to a graph; if that invariant
+        // ever broke, pagination simply ends (no cursor) rather than panic.
+        let next_cursor = if has_more && let Some(graph_id) = graph_id.clone() {
             let after_seq = evidence.last().map_or(after_seq, |row| row.seq);
             Some(
                 serde_json::to_string(&GraphInspectCursor {
@@ -11705,6 +11704,7 @@ fn corrupt(message: impl Into<String>) -> HaiderError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod m2d_law_tests {
     use super::*;
 

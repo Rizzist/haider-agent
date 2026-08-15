@@ -46,7 +46,10 @@ impl ProcessId {
         self.0
     }
 
+    /// The id was validated non-zero and i32-representable at construction
+    /// ([`Self::from_raw`]), so these conversions cannot fail.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn as_raw_nonzero(self) -> std::num::NonZeroI32 {
         std::num::NonZeroI32::new(i32::try_from(self.0).expect("validated process id"))
             .expect("non-zero process id")
@@ -197,8 +200,12 @@ pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
 pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE, WaitForSingleObject,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
+
+    // SYNCHRONIZE is a frozen Win32 access-right bit; windows-sys moves its
+    // module home between releases, so pin the ABI value directly.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
 
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid.0) };
     if handle.is_null() {

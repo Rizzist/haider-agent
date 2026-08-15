@@ -1442,20 +1442,18 @@ impl DelegationHandle {
                         item: TurnItem::AgentMessage { text },
                         ..
                     }) if !text.trim().is_empty() => summary = Some(text),
-                    haider_protocol::EventPayload::ProcessSignalRecorded(signal) => {
-                        if signal.workspace_revision.is_some() {
-                            latest_revision = signal.workspace_revision;
-                        }
+                    haider_protocol::EventPayload::ProcessSignalRecorded(signal)
+                        if signal.workspace_revision.is_some() =>
+                    {
+                        latest_revision = signal.workspace_revision;
                     }
                     haider_protocol::EventPayload::Effect(
                         haider_protocol::effect::EffectPhase::Outcome {
                             workspace_mutation: Some(mutation),
                             ..
                         },
-                    ) => {
-                        if mutation.workspace_revision.is_some() {
-                            latest_revision = mutation.workspace_revision;
-                        }
+                    ) if mutation.workspace_revision.is_some() => {
+                        latest_revision = mutation.workspace_revision;
                     }
                     _ => {}
                 }

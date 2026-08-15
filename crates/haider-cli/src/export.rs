@@ -385,6 +385,7 @@ impl SessionExport {
     /// The codex rollout export: a `rollout-*.jsonl` (filename uuid ==
     /// `session_meta` id) plus a `history.jsonl` append.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn to_codex(&self, masked: bool) -> CodexExport {
         let uuid = derive_uuid(&self.meta.session_id, self.meta.created_at_ms, 7);
         let stamp = filename_stamp(self.meta.created_at_ms);
@@ -526,6 +527,7 @@ impl SessionExport {
     /// uuid/parentUuid chain of user + assistant records in the native
     /// Anthropic message shape, plus ai-title / last-prompt picker rows.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn to_claude_code(&self, masked: bool) -> ClaudeCodeExport {
         let session_uuid = derive_uuid(&self.meta.session_id, self.meta.created_at_ms, 4);
         let slug = claude_slug(&self.meta.cwd);
@@ -533,15 +535,13 @@ impl SessionExport {
 
         let mut lines: Vec<String> = Vec::new();
         let mut parent: Option<String> = None;
-        let mut index = 0u64;
         let mut leaf = session_uuid.clone();
-        for turn in &self.turns {
+        for (index, turn) in self.turns.iter().enumerate() {
             let uuid = derive_uuid(
                 &format!("{session_uuid}:{index}"),
                 self.meta.created_at_ms,
                 4,
             );
-            index += 1;
             let iso = iso8601_ms(turn.at_ms());
             let (kind, message) = match turn {
                 Turn::User { text, .. } => (
@@ -612,13 +612,12 @@ impl SessionExport {
     /// The opencode row set: a session, its messages, and text parts — ids in
     /// COLUMNS (opencode's shape). The db INSERT is a separate guarded step.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn to_opencode(&self, masked: bool) -> OpenCodeExport {
         let session_id = format!("ses_{}", short_hash(&self.meta.session_id));
         let mut messages = Vec::new();
-        let mut index = 0u64;
-        for turn in &self.turns {
+        for (index, turn) in self.turns.iter().enumerate() {
             let seed = format!("{session_id}:{index}");
-            index += 1;
             let message_id = format!("msg_{}", short_hash(&seed));
             let part_id = format!("prt_{}", short_hash(&format!("{seed}:part")));
             let (role, text) = match turn {

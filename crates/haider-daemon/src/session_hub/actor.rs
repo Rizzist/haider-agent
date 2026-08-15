@@ -1278,6 +1278,7 @@ fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod error_wave3_tests {
     use super::*;
     use haider_protocol::effect::{EffectOutcome, EffectPhase};

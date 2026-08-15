@@ -405,7 +405,7 @@ pub fn load(project_dir: Option<&Path>, global_dir: Option<&Path>) -> LoadResult
 #[must_use]
 pub fn load_for(cwd: Option<&Path>, home: Option<&Path>) -> LoadResult {
     let project = cwd.and_then(discover_project_commands_dir);
-    let global = home.map(|home| global_commands_dir(home));
+    let global = home.map(global_commands_dir);
     load(project.as_deref(), global.as_deref())
 }
 

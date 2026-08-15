@@ -69,7 +69,9 @@ pub struct BoundEndpoint {
 
 impl BoundEndpoint {
     pub async fn bind(endpoint: &Endpoint, _runtime_dir: &Path) -> Result<Self, EndpointError> {
-        let name = pipe_name(endpoint)?;
+        let name = pipe_name(endpoint).map_err(|error| {
+            EndpointError::io("resolve Windows named-pipe name", endpoint.address(), error)
+        })?;
         let server = ServerOptions::new()
             .first_pipe_instance(true)
             .create(name)

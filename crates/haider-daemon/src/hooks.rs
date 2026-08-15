@@ -2278,7 +2278,7 @@ fn read_hook_bytes(
         Err(error) => {
             notices.push(notice(
                 None,
-                &path,
+                path,
                 format!("hook configuration was skipped: {error}"),
             ));
             return None;
@@ -2289,7 +2289,7 @@ fn read_hook_bytes(
         Err(error) => {
             notices.push(notice(
                 None,
-                &path,
+                path,
                 format!("hook configuration metadata failed: {error}"),
             ));
             return None;
@@ -2298,7 +2298,7 @@ fn read_hook_bytes(
     if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
         notices.push(notice(
             None,
-            &path,
+            path,
             "hook configuration is not a regular file",
         ));
         return None;
@@ -2308,7 +2308,7 @@ fn read_hook_bytes(
     if let Err(error) = fs::File::from(file).take(limit).read_to_end(&mut bytes) {
         notices.push(notice(
             None,
-            &path,
+            path,
             format!("hook configuration could not be read: {error}"),
         ));
         return None;

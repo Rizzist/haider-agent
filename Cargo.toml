@@ -67,6 +67,11 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+# Perf-shape hints, deliberately deferred: the wire/event enums and the
+# workspace error type are large by design (E5-8 structured errors); boxing
+# them is a real refactor tracked as backlog, not a CI gate.
+result_large_err = "allow"
+large_enum_variant = "allow"
 
 [profile.release]
 lto = "thin"

@@ -204,9 +204,11 @@ fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> S
         stats.estimated_savings_usd,
     ) {
         (Some(with), Some(without), Some(savings)) => {
-            let qualifier = (stats.metered_input_tokens < stats.logical_input_tokens)
-                .then_some(" (metered lanes)")
-                .unwrap_or("");
+            let qualifier = if stats.metered_input_tokens < stats.logical_input_tokens {
+                " (metered lanes)"
+            } else {
+                ""
+            };
             out.push_str(&format!(
                 " · input ${with:.4} cached / ${without:.4} without · savings ${savings:.4}{qualifier}"
             ));

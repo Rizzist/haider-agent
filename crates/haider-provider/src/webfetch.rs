@@ -606,10 +606,8 @@ pub fn reduce_html_to_text(html: &str) -> String {
                     ensure_break(&mut output);
                 }
             }
-            "td" | "th" => {
-                if closing && !output.ends_with(char::is_whitespace) {
-                    output.push(' ');
-                }
+            "td" | "th" if closing && !output.ends_with(char::is_whitespace) => {
+                output.push(' ');
             }
             "a" => {
                 if closing {

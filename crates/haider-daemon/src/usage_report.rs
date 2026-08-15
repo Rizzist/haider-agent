@@ -835,9 +835,11 @@ fn add_agent_usage_component(
     let write = normalized.map_or(0, |usage| usage.cache_write_input);
     let billed_output = normalized.map_or(output, |usage| usage.billed_output);
     let additional_reasoning = normalized.map_or(0, |usage| {
-        (usage.reasoning_accounting == ReasoningAccounting::AdditionalToOutput)
-            .then_some(usage.reasoning_detail)
-            .unwrap_or(0)
+        if usage.reasoning_accounting == ReasoningAccounting::AdditionalToOutput {
+            usage.reasoning_detail
+        } else {
+            0
+        }
     });
     let covered = normalized.map_or(0, |usage| usage.cache_telemetry_input);
     let model = scope
@@ -1167,13 +1169,12 @@ impl SessionFolder {
                     let denominator = accumulator
                         .cache_read_tokens
                         .saturating_add(accumulator.uncached_input_tokens);
-                    if denominator == 0 {
-                        0
-                    } else {
-                        let points =
-                            accumulator.cache_read_tokens.saturating_mul(10_000) / denominator;
-                        u32::try_from(points).unwrap_or(10_000).min(10_000)
-                    }
+                    let points = accumulator
+                        .cache_read_tokens
+                        .saturating_mul(10_000)
+                        .checked_div(denominator)
+                        .unwrap_or_default();
+                    u32::try_from(points).unwrap_or(10_000).min(10_000)
                 });
             let metered_cost_microusd = accumulator
                 .has_metered_lanes

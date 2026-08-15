@@ -1025,7 +1025,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
             .as_array()
             .expect("content")
             .as_slice(),
-        &[signed_text.clone()],
+        std::slice::from_ref(&signed_text),
         "a rehydrated signed text block passes through untouched"
     );
 

@@ -1149,6 +1149,7 @@ struct PendingSecret {
     claimed_at: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_account_actor(
     config: AccountActorConfig,
     commands: mpsc::Sender<AccountCommand>,
@@ -6302,7 +6303,7 @@ pub(crate) fn openai_effort_for(
             .map(|detail| detail.supported_efforts.as_slice())
     });
     match declared {
-        Some(ladder) if !ladder.is_empty() && !ladder.iter().any(|level| *level == effort) => None,
+        Some(ladder) if !ladder.is_empty() && !ladder.contains(&effort) => None,
         _ => Some(effort),
     }
 }

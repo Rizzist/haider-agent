@@ -757,12 +757,15 @@ fn gemini_cached_content_create_payload(
         "contents": stable_payload.get("contents").cloned().unwrap_or_else(|| serde_json::json!([])),
         "ttl": "3600s",
     });
-    let object = payload.as_object_mut().expect("literal JSON object");
-    if let Some(system) = stable_payload.get("system_instruction") {
-        object.insert("systemInstruction".into(), system.clone());
-    }
-    if let Some(tools) = stable_payload.get("tools") {
-        object.insert("tools".into(), tools.clone());
+    // The literal above is always an object; a non-object would simply skip
+    // the optional inserts rather than panic.
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(system) = stable_payload.get("system_instruction") {
+            object.insert("systemInstruction".into(), system.clone());
+        }
+        if let Some(tools) = stable_payload.get("tools") {
+            object.insert("tools".into(), tools.clone());
+        }
     }
     payload
 }

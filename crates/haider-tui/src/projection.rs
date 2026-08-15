@@ -1534,19 +1534,19 @@ pub fn format_error_presentation(presentation: &ErrorPresentation) -> String {
             + presentation.subcode.as_str().len()
             + 32,
     );
-    write!(
+    // Writing to a String is infallible; discard the Ok(()) result.
+    let _ = write!(
         out,
         "{} — {} [{}]",
         presentation.title,
         presentation.detail,
         presentation.subcode.as_str()
-    )
-    .expect("writing to String cannot fail");
+    );
     if let Some(status) = presentation.provider_http_status {
-        write!(out, " · HTTP {status}").expect("writing to String cannot fail");
+        let _ = write!(out, " · HTTP {status}");
     }
     if let Some(request_id) = &presentation.provider_request_id {
-        write!(out, " · req {request_id}").expect("writing to String cannot fail");
+        let _ = write!(out, " · req {request_id}");
     }
     if let Some(retry_after) = presentation.retry_after_ms {
         out.push_str(" · ");

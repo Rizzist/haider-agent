@@ -895,6 +895,7 @@ fn recovery_envelopes(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod partial_stream_recovery_tests {
     use super::*;
     use haider_protocol::error::ErrorAction;

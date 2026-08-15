@@ -413,15 +413,15 @@ fn fleet_metrics_totals(
         .filter_map(|snapshot| snapshot.usage.as_ref())
         .all(|item| item.cache_hit_basis_points.is_some())
         .then(|| {
-            if usage.logical_input_tokens == 0 {
-                0
-            } else {
-                u32::try_from(
-                    usage.cache_read_tokens.saturating_mul(10_000) / usage.logical_input_tokens,
-                )
-                .unwrap_or(10_000)
-                .min(10_000)
-            }
+            usage
+                .cache_read_tokens
+                .saturating_mul(10_000)
+                .checked_div(usage.logical_input_tokens)
+                .map_or(0, |cache_hit_basis_points| {
+                    u32::try_from(cache_hit_basis_points)
+                        .unwrap_or(10_000)
+                        .min(10_000)
+                })
         });
     totals.usage = Some(usage);
     (totals, metrics_complete)
@@ -3513,6 +3513,7 @@ impl HubConnection {
     /// `crate::model_select`; the store owns durability; the next logical
     /// turn re-reads the committed metadata (R6 re-resolution), so commit
     /// here IS next-turn pickup.
+    #[allow(clippy::too_many_arguments)]
     async fn session_select_model(
         &self,
         request_id: RequestId,
@@ -4341,9 +4342,11 @@ impl HubConnection {
         {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
-        let changed_fields = (current.effort != effort)
-            .then(|| vec!["effort/thinking".to_owned()])
-            .unwrap_or_default();
+        let changed_fields = if current.effort != effort {
+            vec!["effort/thinking".to_owned()]
+        } else {
+            Vec::new()
+        };
         let current_scope =
             crate::cache_policy::latest_main_cache_scope(&self.hub.inner.store, &session_id)
                 .await?;
@@ -4445,9 +4448,11 @@ impl HubConnection {
         if let Err(refusal) = authority.validate_fast(&current.provider, &current.model, enabled) {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
-        let changed_fields = (current.fast != enabled)
-            .then(|| vec!["fast/speed".to_owned()])
-            .unwrap_or_default();
+        let changed_fields = if current.fast != enabled {
+            vec!["fast/speed".to_owned()]
+        } else {
+            Vec::new()
+        };
         let current_scope =
             crate::cache_policy::latest_main_cache_scope(&self.hub.inner.store, &session_id)
                 .await?;
@@ -6571,6 +6576,7 @@ async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod error_wave3_tests {
     use super::*;
 

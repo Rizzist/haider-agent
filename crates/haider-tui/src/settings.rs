@@ -93,7 +93,7 @@ impl SettingsStore {
     /// foreign-version file defaults to `true` (notifications on).
     #[must_use]
     pub fn load_notifications(&self) -> bool {
-        self.load_dto().map_or(true, |dto| dto.notifications)
+        self.load_dto().is_none_or(|dto| dto.notifications)
     }
 
     fn load_dto(&self) -> Option<SettingsDto> {

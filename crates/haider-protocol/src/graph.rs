@@ -3218,6 +3218,7 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

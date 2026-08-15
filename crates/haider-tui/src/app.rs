@@ -11980,7 +11980,7 @@ impl AppModel {
         };
         let effort = if requested.eq_ignore_ascii_case("default") {
             None
-        } else if ladder.iter().any(|level| *level == requested) {
+        } else if ladder.contains(&requested) {
             Some(requested)
         } else {
             self.flash = Some(format!(

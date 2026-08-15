@@ -2209,9 +2209,11 @@ fn render_usage(
             cache.estimated_savings_usd,
         ) {
             (Some(with), Some(without), Some(savings)) => {
-                let qualifier = (cache.metered_input_tokens < cache.logical_input_tokens)
-                    .then_some(" · metered lanes only")
-                    .unwrap_or("");
+                let qualifier = if cache.metered_input_tokens < cache.logical_input_tokens {
+                    " · metered lanes only"
+                } else {
+                    ""
+                };
                 let equivalent = if cache.breakdowns.iter().any(|breakdown| {
                     breakdown.auth_method == Some(haider_protocol::credential::AuthMethod::OAuth)
                 }) {
@@ -4449,9 +4451,7 @@ fn subtree_needed(model: &AppModel, on_subagent: bool) -> u16 {
     u16::try_from(rows + 1).unwrap_or(u16::MAX)
 }
 
-fn direct_metrics<'a>(
-    model: &'a AppModel,
-) -> Option<Vec<&'a haider_protocol::agent::AgentMetricsSnapshot>> {
+fn direct_metrics(model: &AppModel) -> Option<Vec<&haider_protocol::agent::AgentMetricsSnapshot>> {
     let snapshots = model
         .chips
         .iter()

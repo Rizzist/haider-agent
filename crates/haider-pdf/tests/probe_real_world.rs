@@ -3,6 +3,7 @@
 //! so CI never depends on host files. Used to verify the extraction ladder
 //! against generator populations fixtures cannot represent (Chrome/Skia,
 //! cupsfilter, Acrobat object-stream files).
+#![allow(clippy::expect_used)]
 #[test]
 fn probe_real_world_pdf() {
     let Ok(path) = std::env::var("HAIDER_PDF_PROBE") else {

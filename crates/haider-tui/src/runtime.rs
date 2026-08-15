@@ -2747,7 +2747,7 @@ pub async fn run_live(
     // mirror it into the store so a later theme save never drops it.
     let notifications_on = settings
         .as_ref()
-        .map_or(true, crate::settings::SettingsStore::load_notifications);
+        .is_none_or(crate::settings::SettingsStore::load_notifications);
     model.set_notifications_enabled(notifications_on);
     if let Some(store) = settings.as_mut() {
         store.set_notifications(notifications_on);

@@ -1361,6 +1361,7 @@ impl Utf8Assembler {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod e2_contract_tests {
     use super::*;
 

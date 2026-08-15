@@ -275,6 +275,7 @@ pub fn percentile(samples: &[u32], p: u8) -> Option<u32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

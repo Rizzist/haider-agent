@@ -476,7 +476,10 @@ pub fn retry_jittered_backoff_ms(run_id: &RunId, attempt: usize) -> u64 {
     let floor = base / 2;
     let digest =
         blake3::hash(format!("haider/provider-retry-jitter/{run_id}/{attempt}").as_bytes());
-    let sample = u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes"));
+    let bytes = digest.as_bytes();
+    let sample = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
     floor + sample % (base.saturating_sub(floor).saturating_add(1))
 }
 
@@ -2706,6 +2709,7 @@ impl HarnessActor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_pre_first_event_retry(
         &mut self,
         context: ProviderRetryContext<'_>,

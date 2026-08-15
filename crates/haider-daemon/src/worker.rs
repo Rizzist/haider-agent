@@ -5884,6 +5884,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
         Ok(Some(brief))
     }
 
+    #[allow(clippy::expect_used)]
     async fn execute(
         &self,
         run_id: &RunId,
@@ -7386,6 +7387,7 @@ fn process_result_with_signal(
     }
 }
 
+#[allow(clippy::expect_used)]
 fn process_failure_reason(result: &ProcessResult) -> Option<String> {
     match result.status {
         haider_protocol::item::ToolStatus::Completed => None,

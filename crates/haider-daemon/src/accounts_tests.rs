@@ -6173,10 +6173,11 @@ async fn expired_claude_snapshot_reads_through_live_owner_without_refresh_grant(
         stored.refresh_token(),
         Some(b"fake-claude-live-refresh-token-2".as_slice())
     );
-    let current = snapshot.lock().expect("snapshot after read-through");
-    assert_eq!(current[0].status, CredentialStatus::Ok);
-    assert!(current[0].active);
-    drop(current);
+    {
+        let current = snapshot.lock().expect("snapshot after read-through");
+        assert_eq!(current[0].status, CredentialStatus::Ok);
+        assert!(current[0].active);
+    }
 
     assert!(broker.shutdown().await);
     actor.shutdown().await;

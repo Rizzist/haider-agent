@@ -1,5 +1,5 @@
 //! H1 CLI schema, parser, help, exit, and no-daemon laws.
-#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

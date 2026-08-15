@@ -487,7 +487,7 @@ impl AnthropicProvider {
             self.fast,
             self.web_tools,
             self.prompt_caching_verified
-                .then(|| request.cache_metadata.as_ref())
+                .then_some(request.cache_metadata.as_ref())
                 .flatten()
                 .filter(|metadata| {
                     metadata.boundaries_valid(request.messages.len())
