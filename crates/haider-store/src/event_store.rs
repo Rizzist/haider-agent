@@ -25,13 +25,17 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
-    EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GraphAbandoned,
-    GraphAdvanced, GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted,
-    GraphEvidenceSource, GraphGateKind, GraphGateSatisfied, GraphNodeName, GraphNodeReadied,
-    GraphPhase, GraphPinned, GraphReduction, GraphReductions, GraphStatus, GraphSuperseded,
-    GraphTemplateRejection, ProcessSignalRecorded, ProcessSignalRef, SubjectSelector, build_node,
-    evidence_fingerprint, graph_template, graph_template_digest, normalize_evidence_detail,
-    process_signal_subject_digest, reduce_graphs, validate_graph_template,
+    EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict, GRAPH_INSPECT_MAX_RUNS,
+    GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS, GRAPH_TELEMETRY_MAX_RUN_ROWS,
+    GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
+    GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
+    GraphEvidenceSource, GraphFinalizationDeferred, GraphGateKind, GraphGateSatisfied,
+    GraphInspectSnapshot, GraphNodeAttemptRow, GraphNodeName, GraphNodeReadied, GraphPhase,
+    GraphPinned, GraphReduction, GraphReductions, GraphRunRow, GraphSignalProvenance, GraphStatus,
+    GraphSuperseded, GraphTelemetryProjection, GraphTemplateRejection, GraphTemplateRollup,
+    ProcessSignalRecorded, ProcessSignalRef, SubjectSelector, build_node, evidence_fingerprint,
+    graph_template, graph_template_digest, graph_template_rollups, normalize_evidence_detail,
+    process_signal_subject_digest, reduce_graph_telemetry, reduce_graphs, validate_graph_template,
 };
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
 use haider_protocol::hook::HookEventPayload;
@@ -186,6 +190,47 @@ pub enum GraphAbandonOutcome {
     IdempotentReplay {
         abandoned: AbandonedGraph,
     },
+}
+
+/// Daemon-internal coordinates for the provider EndTurn guardrail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphFinalizationCommand {
+    pub session_id: SessionId,
+    pub branch_id: Option<BranchId>,
+    pub run_id: RunId,
+    pub worker_generation: u64,
+    pub device_id: DeviceId,
+}
+
+/// Durable graph authority's decision at one provider finalization boundary.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum GraphFinalizationOutcome {
+    AllowDone,
+    Deferred {
+        graph_id: GraphId,
+        /// True only for the first committed deferral for `(graph, run)`.
+        emit_reminder: bool,
+        envelopes: Vec<RawEnvelope>,
+    },
+    ConfirmRequired {
+        menu: Menu,
+        /// Empty when an already-open durable menu is replayed.
+        envelopes: Vec<RawEnvelope>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphInspectResult {
+    pub snapshot: GraphInspectSnapshot,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct GraphInspectCursor {
+    graph_id: GraphId,
+    through_seq: u64,
+    after_seq: u64,
 }
 
 /// Internal receipt-backed graph testimony. The identity derives from the
@@ -1016,6 +1061,7 @@ pub struct Store {
     worker_generation: u64,
     connection: Mutex<Connection>,
     graph_reductions: Mutex<HashMap<SessionId, CachedGraphReduction>>,
+    graph_telemetry: Mutex<GraphTelemetryCache>,
     cas: FileCas,
     _lock: ProfileLock,
 }
@@ -1026,6 +1072,22 @@ struct CachedGraphReduction {
     // the authority and a restart simply rebuilds this value.
     envelopes: Vec<RawEnvelope>,
     reductions: GraphReductions,
+}
+
+#[derive(Default)]
+struct GraphTelemetryCache {
+    by_session: HashMap<SessionId, CachedSessionGraphTelemetry>,
+}
+
+struct CachedSessionGraphTelemetry {
+    envelopes: Vec<RawEnvelope>,
+    projection: GraphTelemetryProjection,
+}
+
+fn trim_to_latest<T>(rows: &mut Vec<T>, limit: usize) {
+    if rows.len() > limit {
+        rows.drain(..rows.len() - limit);
+    }
 }
 
 impl Store {
@@ -1055,6 +1117,7 @@ impl Store {
         connection.set_prepared_statement_cache_capacity(16);
         let cas = FileCas::open(&root)?;
         let worker_generation = next_worker_generation(&mut connection)?;
+        let graph_telemetry = rebuild_graph_telemetry_cache(&connection)?;
 
         Ok(Self {
             root,
@@ -1062,6 +1125,7 @@ impl Store {
             worker_generation,
             connection: Mutex::new(connection),
             graph_reductions: Mutex::new(HashMap::new()),
+            graph_telemetry: Mutex::new(graph_telemetry),
             cas,
             _lock: profile_lock,
         })
@@ -1341,6 +1405,311 @@ impl Store {
             .graph_reductions(&connection, session_id)?
             .graph(graph_id)
             .cloned())
+    }
+
+    /// Rebuildable per-instance telemetry for one session.
+    pub fn graph_runs(&self, session_id: &SessionId) -> StoreResult<Vec<GraphRunRow>> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        let mut runs = self
+            .graph_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_session
+            .get(session_id)
+            .map(|cached| cached.projection.graph_runs.clone())
+            .unwrap_or_default();
+        trim_to_latest(&mut runs, GRAPH_TELEMETRY_MAX_RUN_ROWS);
+        drop(connection);
+        Ok(runs)
+    }
+
+    /// Rebuildable wall-clock node-attempt intervals for one session.
+    pub fn graph_node_attempts(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<Vec<GraphNodeAttemptRow>> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        let mut attempts = self
+            .graph_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_session
+            .get(session_id)
+            .map(|cached| cached.projection.graph_node_attempts.clone())
+            .unwrap_or_default();
+        trim_to_latest(&mut attempts, GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS);
+        drop(connection);
+        Ok(attempts)
+    }
+
+    /// Profile-wide template adoption aggregate rebuilt from journal facts.
+    pub fn graph_template_rollups(&self) -> StoreResult<Vec<GraphTemplateRollup>> {
+        let connection = self.connection()?;
+        let telemetry = self
+            .graph_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut runs = Vec::new();
+        let mut attempts = Vec::new();
+        for cached in telemetry.by_session.values() {
+            runs.extend(cached.projection.graph_runs.iter().cloned());
+            attempts.extend(cached.projection.graph_node_attempts.iter().cloned());
+        }
+        let mut rollups = graph_template_rollups(&runs, &attempts);
+        rollups.truncate(GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS);
+        drop(connection);
+        Ok(rollups)
+    }
+
+    /// Bounded graph inspection snapshot with keyset-paged evidence
+    /// provenance. The cursor is bound to both graph identity and journal
+    /// head, so a mid-page mutation is rejected rather than mixing snapshots.
+    pub fn graph_inspect(
+        &self,
+        session_id: &SessionId,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StoreResult<GraphInspectResult> {
+        if limit == 0 {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "graph.inspect limit must be greater than zero",
+                false,
+            ));
+        }
+        let limit = usize::try_from(limit.min(haider_protocol::graph::GRAPH_INSPECT_MAX_PAGE))
+            .unwrap_or(usize::MAX);
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        let through_seq = latest_seq_in_connection(&connection, session_id)?;
+        let reductions = self.graph_reductions(&connection, session_id)?;
+        let reduction = reductions.active().cloned();
+        let status = reduction
+            .as_ref()
+            .and_then(|reduction| reduction.status.clone());
+        let graph_id = status.as_ref().map(|status| status.graph_id.clone());
+        let after_seq = match cursor {
+            None => 0,
+            Some(cursor) => {
+                let cursor = serde_json::from_str::<GraphInspectCursor>(cursor).map_err(|_| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        "graph.inspect cursor is malformed",
+                        false,
+                    )
+                })?;
+                if graph_id.as_ref() != Some(&cursor.graph_id) || cursor.through_seq != through_seq
+                {
+                    return Err(store_error(
+                        ErrorCode::RevisionConflict,
+                        "graph.inspect cursor is stale for the current graph snapshot",
+                        false,
+                    ));
+                }
+                cursor.after_seq
+            }
+        };
+        let mut evidence = if let (Some(graph_id), Some(reduction)) = (&graph_id, &reduction) {
+            graph_evidence_provenance(
+                &connection,
+                session_id,
+                graph_id,
+                reduction,
+                after_seq,
+                through_seq,
+                limit.saturating_add(1),
+            )?
+        } else {
+            Vec::new()
+        };
+        let has_more = evidence.len() > limit;
+        if has_more {
+            evidence.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            let graph_id = graph_id
+                .clone()
+                .expect("non-empty evidence always belongs to a graph");
+            let after_seq = evidence.last().map_or(after_seq, |row| row.seq);
+            Some(
+                serde_json::to_string(&GraphInspectCursor {
+                    graph_id,
+                    through_seq,
+                    after_seq,
+                })
+                .map_err(|error| {
+                    store_error(
+                        ErrorCode::Internal,
+                        format!("cannot encode graph.inspect cursor: {error}"),
+                        false,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let telemetry = self
+            .graph_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut runs = telemetry
+            .by_session
+            .get(session_id)
+            .map(|cached| cached.projection.graph_runs.clone())
+            .unwrap_or_default();
+        runs.reverse();
+        runs.truncate(GRAPH_INSPECT_MAX_RUNS);
+        let mut all_runs = Vec::new();
+        let mut all_attempts = Vec::new();
+        for cached in telemetry.by_session.values() {
+            all_runs.extend(cached.projection.graph_runs.iter().cloned());
+            all_attempts.extend(cached.projection.graph_node_attempts.iter().cloned());
+        }
+        let mut template_rollups = graph_template_rollups(&all_runs, &all_attempts);
+        if let Some(active_template) = status.as_ref().map(|status| status.template.as_str())
+            && let Some(position) = template_rollups
+                .iter()
+                .position(|rollup| rollup.template == active_template)
+        {
+            template_rollups.swap(0, position);
+        }
+        template_rollups.truncate(GRAPH_INSPECT_MAX_RUNS);
+        let result = GraphInspectResult {
+            snapshot: GraphInspectSnapshot {
+                through_seq,
+                status,
+                runs,
+                template_rollups,
+                evidence,
+            },
+            next_cursor,
+        };
+        drop(telemetry);
+        drop(connection);
+        Ok(result)
+    }
+
+    /// Atomically applies the provider finalization guardrail against the
+    /// current active-root reduction. Only an Active graph is guarded;
+    /// Blocked and every terminal phase pass through unchanged.
+    pub fn guard_graph_finalization(
+        &self,
+        command: &GraphFinalizationCommand,
+    ) -> StoreResult<GraphFinalizationOutcome> {
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_typed_session(&transaction, &command.session_id)?;
+        let reductions = self.graph_reductions(&transaction, &command.session_id)?;
+        let Some(reduction) = reductions.active().cloned() else {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphFinalizationOutcome::AllowDone);
+        };
+        let Some(status) = reduction.status.clone() else {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphFinalizationOutcome::AllowDone);
+        };
+        if status.phase != GraphPhase::Active || !status.nodes.iter().any(|node| !node.satisfied) {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphFinalizationOutcome::AllowDone);
+        }
+        let state_digest = graph_finalization_state_digest(&status)?;
+        let same_state_deferred = reduction.finalization_deferrals.iter().any(|deferred| {
+            deferred.run_id == command.run_id && deferred.state_digest == state_digest
+        });
+        if !same_state_deferred {
+            let emit_reminder = !reduction
+                .finalization_deferrals
+                .iter()
+                .any(|deferred| deferred.run_id == command.run_id);
+            let deferred = GraphFinalizationDeferred {
+                graph_id: status.graph_id.clone(),
+                run_id: command.run_id.clone(),
+                state_digest: state_digest.clone(),
+                unmet_nodes: status
+                    .nodes
+                    .iter()
+                    .filter(|node| !node.satisfied)
+                    .map(|node| node.node.clone())
+                    .collect(),
+            };
+            let mut envelopes = vec![graph_finalization_envelope(
+                command,
+                &state_digest,
+                "deferred",
+                EventPayload::GraphFinalizationDeferred(deferred),
+            )?];
+            append_transaction_envelopes(
+                &transaction,
+                &command.session_id,
+                now_ms()?,
+                &mut envelopes,
+            )?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            self.extend_graph_reduction(&command.session_id, &envelopes);
+            return Ok(GraphFinalizationOutcome::Deferred {
+                graph_id: status.graph_id,
+                emit_reminder,
+                envelopes,
+            });
+        }
+
+        let pending = graph_pending_menus(&status);
+        if let Some(existing) = reduction.finalization_menus.iter().rev().find(|opened| {
+            opened.run_id == command.run_id
+                && opened.state_digest == state_digest
+                && pending.iter().any(|menu| menu == &opened.menu_id)
+        }) {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphFinalizationOutcome::ConfirmRequired {
+                menu: graph_abandon_confirm_menu(
+                    existing.menu_id.clone(),
+                    status.graph_id,
+                    command.run_id.clone(),
+                    state_digest,
+                ),
+                envelopes: Vec::new(),
+            });
+        }
+
+        let ordinal = reduction
+            .finalization_menus
+            .iter()
+            .filter(|opened| opened.run_id == command.run_id && opened.state_digest == state_digest)
+            .count()
+            .saturating_add(1);
+        let menu_id = graph_abandon_confirm_menu_id(
+            &command.session_id,
+            &status.graph_id,
+            &command.run_id,
+            &state_digest,
+            ordinal,
+        );
+        let menu = graph_abandon_confirm_menu(
+            menu_id,
+            status.graph_id,
+            command.run_id.clone(),
+            state_digest.clone(),
+        );
+        let mut envelopes = vec![graph_finalization_envelope(
+            command,
+            &state_digest,
+            &format!("confirm-{ordinal}"),
+            EventPayload::MenuOpened(menu.clone()),
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now_ms()?, &mut envelopes)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        self.extend_graph_reduction(&command.session_id, &envelopes);
+        Ok(GraphFinalizationOutcome::ConfirmRequired { menu, envelopes })
     }
 
     /// Appends one daemon-observed process signal, or returns the exact
@@ -2045,6 +2414,19 @@ impl Store {
         let no_progress = command.verdict == EvidenceVerdict::Red
             && previous_red_fingerprint.is_some_and(|previous| previous == fingerprint);
         let mut payloads = vec![EventPayload::EvidenceRecorded(evidence)];
+        let pending = graph_pending_menus(&status);
+        let pending_finalization_menus = reduction
+            .finalization_menus
+            .iter()
+            .filter(|opened| pending.iter().any(|menu| menu == &opened.menu_id))
+            .map(|opened| opened.menu_id.clone())
+            .collect::<Vec<_>>();
+        payloads.extend(pending_finalization_menus.iter().cloned().map(|menu| {
+            EventPayload::MenuClosed {
+                menu,
+                reason: MenuCloseReason::Dismissed,
+            }
+        }));
         if no_progress {
             payloads.push(EventPayload::GraphBlocked(GraphBlocked {
                 graph_id: graph_id.clone(),
@@ -2108,7 +2490,10 @@ impl Store {
                 } else {
                     // No back-edge: the new START epoch is an immutable
                     // attempt opening, never GraphAdvanced traversal.
-                    for menu in graph_pending_menus(&status) {
+                    for menu in graph_pending_menus(&status)
+                        .into_iter()
+                        .filter(|menu| !pending_finalization_menus.contains(menu))
+                    {
                         payloads.push(EventPayload::MenuClosed {
                             menu,
                             reason: MenuCloseReason::Dismissed,
@@ -5188,11 +5573,10 @@ impl Store {
             ..
         } = &outcome
         {
-            self.extend_graph_reduction(
-                &command.session_id,
-                std::slice::from_ref(envelope.as_ref()),
-            );
-            self.extend_graph_reduction(&command.session_id, follow_up);
+            let mut graph_events = Vec::with_capacity(1 + follow_up.len());
+            graph_events.push(envelope.as_ref().clone());
+            graph_events.extend(follow_up.iter().cloned());
+            self.extend_graph_reduction(&command.session_id, &graph_events);
         }
         Ok(outcome)
     }
@@ -5330,22 +5714,48 @@ impl Store {
             .graph_reductions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(cached) = graph_reductions.get_mut(session_id) else {
+        if let Some(cached) = graph_reductions.get_mut(session_id) {
+            cached.envelopes.extend(
+                envelopes
+                    .iter()
+                    .filter(|envelope| graph_reduction_event(&envelope.payload))
+                    .cloned(),
+            );
+            cached.reductions = reduce_graphs(&cached.envelopes);
+        }
+        drop(graph_reductions);
+        let graph_envelopes = envelopes
+            .iter()
+            .filter(|envelope| graph_reduction_event(&envelope.payload))
+            .cloned()
+            .collect::<Vec<_>>();
+        if graph_envelopes.is_empty() {
             return;
-        };
-        cached.envelopes.extend(
-            envelopes
-                .iter()
-                .filter(|envelope| graph_reduction_event(&envelope.payload))
-                .cloned(),
-        );
-        cached.reductions = reduce_graphs(&cached.envelopes);
+        }
+        let mut telemetry = self
+            .graph_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cached = telemetry
+            .by_session
+            .entry(session_id.clone())
+            .or_insert_with(|| CachedSessionGraphTelemetry {
+                envelopes: Vec::new(),
+                projection: GraphTelemetryProjection::default(),
+            });
+        cached.envelopes.extend(graph_envelopes);
+        cached.projection = reduce_graph_telemetry(&cached.envelopes);
     }
 
     fn invalidate_graph_reduction(&self, session_id: &SessionId) {
         self.graph_reductions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.graph_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_session
             .remove(session_id);
     }
 }
@@ -5699,6 +6109,168 @@ fn require_typed_session(connection: &Connection, session_id: &SessionId) -> Sto
     Ok(())
 }
 
+fn latest_seq_in_connection(connection: &Connection, session_id: &SessionId) -> StoreResult<u64> {
+    let latest: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    u64::try_from(latest).map_err(|_| corrupt("database contains a negative event sequence"))
+}
+
+#[allow(clippy::result_large_err)]
+fn graph_evidence_provenance(
+    connection: &Connection,
+    session_id: &SessionId,
+    graph_id: &GraphId,
+    reduction: &GraphReduction,
+    after_seq: u64,
+    through_seq: u64,
+    limit: usize,
+) -> StoreResult<Vec<GraphEvidenceProvenanceRow>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND seq > ?2
+               AND seq <= ?3
+               AND instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
+               AND json_extract(envelope_json, '$.payload.graph_id') = ?4
+             ORDER BY seq ASC
+             LIMIT ?5",
+        )
+        .map_err(map_sqlite_error)?;
+    let encoded = statement
+        .query_map(
+            params![
+                session_id.as_str(),
+                to_sqlite_integer(after_seq)?,
+                to_sqlite_integer(through_seq)?,
+                graph_id.as_str(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    let mut recorded = Vec::<(RawEnvelope, EvidenceRecorded)>::new();
+    for json in encoded {
+        let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid graph provenance envelope in session {session_id}: {error}"
+            ))
+        })?;
+        match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+            Ok(EventPayload::EvidenceRecorded(evidence)) if evidence.graph_id == *graph_id => {
+                recorded.push((envelope, evidence));
+            }
+            _ => {}
+        }
+    }
+    let required_signals = recorded
+        .iter()
+        .filter_map(|(_, evidence)| match &evidence.source {
+            GraphEvidenceSource::ProcessSignal {
+                run_id,
+                call_id,
+                effect_id,
+            } => Some((run_id.clone(), call_id.clone(), effect_id.clone())),
+            GraphEvidenceSource::Model { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut signals = HashMap::<(RunId, String, EffectId), ProcessSignalRecorded>::new();
+    if !required_signals.is_empty() {
+        let mut signal_statement = connection
+            .prepare_cached(
+                "SELECT envelope_json FROM events
+                 WHERE session_id = ?1
+                   AND seq <= ?2
+                   AND instr(envelope_json, '\"type\":\"process_signal_recorded\"') > 0
+                 ORDER BY seq ASC",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = signal_statement
+            .query_map(
+                params![session_id.as_str(), to_sqlite_integer(through_seq)?],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sqlite_error)?;
+        for json in rows {
+            let json = json.map_err(map_sqlite_error)?;
+            let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+                corrupt(format!(
+                    "invalid graph signal provenance envelope in session {session_id}: {error}"
+                ))
+            })?;
+            if let Ok(EventPayload::ProcessSignalRecorded(signal)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            {
+                let key = (
+                    signal.run_id.clone(),
+                    signal.call_id.clone(),
+                    signal.effect_id.clone(),
+                );
+                if required_signals.contains(&key) {
+                    signals.insert(key, signal);
+                    if signals.len() == required_signals.len() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    recorded
+        .into_iter()
+        .map(|(envelope, evidence)| {
+            let slot_spec = reduction
+                .template_nodes
+                .iter()
+                .find(|spec| spec.name == evidence.node)
+                .and_then(|spec| {
+                    evidence.slot.as_deref().and_then(|slot_id| {
+                        spec.verify_slots.iter().find(|slot| slot.id == slot_id)
+                    })
+                });
+            let signal = match &evidence.source {
+                GraphEvidenceSource::ProcessSignal {
+                    run_id,
+                    call_id,
+                    effect_id,
+                } => signals
+                    .get(&(run_id.clone(), call_id.clone(), effect_id.clone()))
+                    .map(|signal| GraphSignalProvenance {
+                        command_arg_digest: signal.command_arg_digest.clone(),
+                        exit_code: signal.exit_code,
+                        transcript_digest: signal.transcript_digest.clone(),
+                        workspace_revision: signal.workspace_revision.clone(),
+                        subject_digest: signal.subject_digest.clone(),
+                        artifact: signal.artifact.clone(),
+                    }),
+                GraphEvidenceSource::Model { .. } => None,
+            };
+            Ok(GraphEvidenceProvenanceRow {
+                seq: envelope.seq,
+                committed_at_ms: envelope.committed_at_ms,
+                graph_id: evidence.graph_id,
+                node: evidence.node,
+                attempt: evidence.attempt,
+                slot: evidence.slot,
+                authority: slot_spec
+                    .map_or(EvidenceAuthority::ModelAttested, |slot| slot.authority),
+                subject_selector: slot_spec.map(|slot| slot.subject_selector),
+                verdict: evidence.verdict,
+                fingerprint: evidence.fingerprint,
+                subject_digest: evidence.subject_digest,
+                source: evidence.source,
+                signal,
+            })
+        })
+        .collect()
+}
+
 fn load_graph_reduction(
     connection: &Connection,
     session_id: &SessionId,
@@ -5744,6 +6316,49 @@ fn load_graph_reduction_envelopes(
         })
         .collect::<StoreResult<Vec<_>>>()?;
     Ok(envelopes)
+}
+
+fn rebuild_graph_telemetry_cache(connection: &Connection) -> StoreResult<GraphTelemetryCache> {
+    let mut statement = connection
+        .prepare(
+            "SELECT envelope_json FROM events
+             WHERE instr(envelope_json, '\"type\":\"graph_') > 0
+                OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
+                OR instr(envelope_json, '\"type\":\"menu_') > 0
+             ORDER BY session_id ASC, seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?;
+    let mut grouped = HashMap::<SessionId, Vec<RawEnvelope>>::new();
+    for json in rows {
+        let json = json.map_err(map_sqlite_error)?;
+        let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid graph telemetry envelope during store open: {error}"
+            ))
+        })?;
+        grouped
+            .entry(envelope.session_id.clone())
+            .or_default()
+            .push(envelope);
+    }
+    Ok(GraphTelemetryCache {
+        by_session: grouped
+            .into_iter()
+            .map(|(session_id, envelopes)| {
+                let projection = reduce_graph_telemetry(&envelopes);
+                (
+                    session_id,
+                    CachedSessionGraphTelemetry {
+                        envelopes,
+                        projection,
+                    },
+                )
+            })
+            .collect(),
+    })
 }
 
 trait GraphCommandCoordinates {
@@ -6477,6 +7092,120 @@ fn graph_confirm_menu(status: &GraphStatus, node: &GraphNodeName, attempt: u32) 
     }
 }
 
+fn graph_finalization_state_digest(status: &GraphStatus) -> StoreResult<String> {
+    let mut obligation = status.clone();
+    // Guardrail menus are presentation/wait state, not graph progress. If
+    // included, opening the confirmation would make its own coordinates stale
+    // before either valid answer could commit.
+    obligation.pending_menu = None;
+    obligation.pending_menus.clear();
+    let encoded = serde_json::to_vec(&obligation).map_err(|error| {
+        store_error(
+            ErrorCode::Internal,
+            format!("cannot encode graph finalization state: {error}"),
+            false,
+        )
+    })?;
+    Ok(blake3::hash(&encoded).to_hex().to_string())
+}
+
+fn graph_abandon_confirm_menu_id(
+    session_id: &SessionId,
+    graph_id: &GraphId,
+    run_id: &RunId,
+    state_digest: &str,
+    ordinal: usize,
+) -> MenuId {
+    let mut hasher = blake3::Hasher::new();
+    let ordinal = ordinal.to_string();
+    for value in [
+        session_id.as_str(),
+        graph_id.as_str(),
+        run_id.as_str(),
+        state_digest,
+        &ordinal,
+    ] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    MenuId::new(format!(
+        "graph-abandon-confirm-{}",
+        hasher.finalize().to_hex()
+    ))
+}
+
+fn graph_abandon_confirm_menu(
+    id: MenuId,
+    graph_id: GraphId,
+    run_id: RunId,
+    state_digest: String,
+) -> Menu {
+    Menu {
+        id,
+        kind: MenuKind::GraphAbandonConfirm {
+            graph_id,
+            run_id,
+            state_digest,
+        },
+        title: "Workflow is unfinished".into(),
+        body: vec![
+            "The final response left required workflow obligations unmet.".into(),
+            "Continue working, or explicitly abandon the workflow and finish.".into(),
+        ],
+        options: vec![
+            haider_protocol::menu::MenuOption {
+                key: "continue-work".into(),
+                label: "Continue work".into(),
+                detail: Some(
+                    "Resume the current run and satisfy the remaining obligations.".into(),
+                ),
+                decision: None,
+            },
+            haider_protocol::menu::MenuOption {
+                key: "abandon-and-finish".into(),
+                label: "Abandon and finish".into(),
+                detail: Some(
+                    "Durably abandon this workflow, then accept the final response.".into(),
+                ),
+                decision: None,
+            },
+        ],
+        blocking: true,
+        scope: haider_protocol::menu::MenuScope::Session,
+        origin: "convergence-graph-finalization".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
+
+fn graph_finalization_envelope(
+    command: &GraphFinalizationCommand,
+    state_digest: &str,
+    kind: &str,
+    payload: EventPayload,
+) -> StoreResult<RawEnvelope> {
+    let mut hasher = blake3::Hasher::new();
+    for value in [
+        command.session_id.as_str(),
+        command.run_id.as_str(),
+        state_digest,
+        kind,
+    ] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    unstamped_command_envelope(
+        EventId::new(format!("graph-finalization-{}", hasher.finalize().to_hex())),
+        &command.session_id,
+        command.branch_id.clone(),
+        Some(command.run_id.clone()),
+        command.device_id.clone(),
+        command.worker_generation,
+        payload,
+        PromptRender::Omit,
+    )
+}
+
 type DurableRunHead = (RunState, u64, Option<BranchId>);
 
 fn latest_run_states(
@@ -6972,7 +7701,10 @@ fn resolve_menu_transaction(
             )
         })?;
     let menu = opened_menu(&opening, &command.answer.menu)?;
-    let graph_menu = matches!(menu.kind, MenuKind::GraphHumanConfirm { .. });
+    let graph_menu = matches!(
+        menu.kind,
+        MenuKind::GraphHumanConfirm { .. } | MenuKind::GraphAbandonConfirm { .. }
+    );
     if command.worker_generation != current_worker_generation
         && !command.allow_prior_generation
         && !graph_menu
@@ -7134,6 +7866,95 @@ fn resolve_menu_transaction(
                     )
                 })?,
             });
+        }
+    }
+    if let MenuKind::GraphAbandonConfirm {
+        graph_id,
+        run_id,
+        state_digest,
+    } = &menu.kind
+    {
+        let reduction = load_graph_reduction(transaction, &command.session_id)?;
+        let status = reduction.status.clone().ok_or_else(|| {
+            store_error(
+                ErrorCode::GraphNotActive,
+                "graph finalization confirmation has no graph instance",
+                false,
+            )
+        })?;
+        if status.graph_id != *graph_id
+            || status.phase != GraphPhase::Active
+            || opening.run_id.as_ref() != Some(run_id)
+            || graph_finalization_state_digest(&status)? != *state_digest
+            || !graph_pending_menus(&status).iter().any(|id| id == &menu.id)
+        {
+            return Err(store_error(
+                ErrorCode::GraphWrongNode,
+                "graph finalization confirmation is stale for the current obligation",
+                false,
+            ));
+        }
+        let key =
+            command.answer.option_key.as_deref().ok_or_else(|| {
+                store_error(ErrorCode::InvalidArgument, "missing answer key", false)
+            })?;
+        match key {
+            "continue-work" => {}
+            "abandon-and-finish" => {
+                let payloads = std::iter::once(EventPayload::GraphAbandoned(GraphAbandoned {
+                    graph_id: graph_id.clone(),
+                    why: "explicit finalization override".into(),
+                }))
+                .chain(
+                    graph_pending_menus(&status)
+                        .into_iter()
+                        .filter(|pending| pending != &menu.id)
+                        .map(|menu| EventPayload::MenuClosed {
+                            menu,
+                            reason: MenuCloseReason::Dismissed,
+                        }),
+                );
+                for (index, payload) in payloads.enumerate() {
+                    envelopes.push(EventEnvelope {
+                        schema_version: SCHEMA_VERSION,
+                        event_id: EventId::new(format!(
+                            "graph-finalization-settle-{}-{}",
+                            event_id,
+                            index + 1
+                        )),
+                        seq: 0,
+                        session_id: command.session_id.clone(),
+                        branch_id: opening.branch_id.clone(),
+                        run_id: opening.run_id.clone(),
+                        agent_id: opening.agent_id.clone(),
+                        device_id: command.device_id.clone(),
+                        authority_epoch: opening.authority_epoch,
+                        worker_generation: current_worker_generation,
+                        causation_id: Some(event_id.clone()),
+                        correlation_id: opening.correlation_id.clone(),
+                        committed_at_ms: 0,
+                        render: RenderTargets {
+                            ui: true,
+                            durable: true,
+                            prompt: PromptRender::Omit,
+                        },
+                        payload: serde_json::to_value(payload).map_err(|error| {
+                            store_error(
+                                ErrorCode::InvalidArgument,
+                                format!("cannot serialize graph finalization settlement: {error}"),
+                                false,
+                            )
+                        })?,
+                    });
+                }
+            }
+            _ => {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "unsupported graph finalization answer",
+                    false,
+                ));
+            }
         }
     }
     append_transaction_envelopes(
@@ -7640,6 +8461,29 @@ fn validate_worker_run_transitions(
     session_id: &SessionId,
     envelopes: &[RawEnvelope],
 ) -> StoreResult<()> {
+    let commits_done = envelopes.iter().any(|envelope| {
+        matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::RunState(RunState::Done))
+        )
+    });
+    if commits_done
+        && load_graph_reduction(transaction, session_id)?
+            .status
+            .is_some_and(|status| {
+                status.phase == GraphPhase::Active
+                    && status.nodes.iter().any(|node| !node.satisfied)
+            })
+    {
+        // Final guard against a pin/switch racing the provider's earlier
+        // guard decision. MUTATION: removing this check permits Done to land
+        // beside newly unmet obligations.
+        return Err(store_error(
+            ErrorCode::GraphNotActive,
+            "cannot commit Done while the active Convergence Graph has unmet obligations",
+            false,
+        ));
+    }
     let mut states = latest_run_states(transaction, session_id)?;
     for envelope in envelopes {
         let supplemental_project_instructions =

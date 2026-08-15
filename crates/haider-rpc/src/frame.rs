@@ -7,7 +7,7 @@ use haider_protocol::agent::{AgentMessageReceipt, AgentMetricsSnapshot, AgentUsa
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::graph::GraphStatus as ConvergenceGraphStatus;
+use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
 use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, GraphId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
@@ -297,6 +297,9 @@ pub const FEATURE_CONVERGENCE_GRAPH_V1: &str = "convergence_graph_v1";
 /// Daemon implements M2b general templates, dependency-ready sets, retained
 /// graph instances, and receipted atomic `graph.switch`.
 pub const FEATURE_CONVERGENCE_GRAPH_V2: &str = "convergence_graph_v2";
+/// Daemon implements M2c finalization guardrails, rebuildable telemetry, and
+/// the bounded `graph.inspect` read surface.
+pub const FEATURE_CONVERGENCE_GRAPH_V3: &str = "convergence_graph_v3";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1196,6 +1199,13 @@ pub enum RequestBody {
     },
     #[serde(rename = "graph.status")]
     GraphStatus { session_id: SessionId },
+    #[serde(rename = "graph.inspect")]
+    GraphInspect {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        limit: u32,
+    },
     /// Persists a client-detected compatibility fault in the session journal.
     #[serde(rename = "session.diagnostic")]
     SessionDiagnostic {
@@ -1646,6 +1656,12 @@ pub enum ResponseBody {
     GraphStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ConvergenceGraphStatus>,
+    },
+    #[serde(rename = "graph.inspect")]
+    GraphInspect {
+        snapshot: GraphInspectSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
     },
     #[serde(rename = "session.diagnostic")]
     SessionDiagnostic { recorded_seq: u64 },

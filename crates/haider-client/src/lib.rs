@@ -31,8 +31,8 @@ pub use client::{
     PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient, connect,
 };
 pub use graph::{
-    GraphAbandonResult, GraphClientError, GraphPinResult, GraphSwitchResult, graph_abandon,
-    graph_pin, graph_pin_template, graph_status, graph_switch,
+    GraphAbandonResult, GraphClientError, GraphInspectPage, GraphPinResult, GraphSwitchResult,
+    graph_abandon, graph_inspect, graph_pin, graph_pin_template, graph_status, graph_switch,
 };
 pub use headless::{
     DEFAULT_TERMINAL_GRACE, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,

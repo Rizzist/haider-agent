@@ -102,11 +102,11 @@ use async_trait::async_trait;
 use haider_core::{
     AbandonedGraph, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
     CancelledTurn, CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome,
-    GraphEvidenceCommand, GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome,
-    GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand,
-    MenuResolutionOutcome, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome,
-    ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast,
-    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
+    GraphInspectResult, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome,
+    HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome, PinnedGraph, ProcessSignalCommand,
+    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort,
+    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
     SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
     SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
@@ -804,6 +804,10 @@ enum ActorCommand {
     RecordGraphEvidence {
         command: GraphEvidenceCommand,
         completed: oneshot::Sender<Result<GraphEvidenceOutcome, HaiderError>>,
+    },
+    GuardGraphFinalization {
+        command: GraphFinalizationCommand,
+        completed: oneshot::Sender<Result<GraphFinalizationOutcome, HaiderError>>,
     },
     RecordProcessSignal {
         command: ProcessSignalCommand,
@@ -1696,6 +1700,36 @@ impl SessionHub {
             .store
             .graph_status(session_id)
             .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn graph_inspect(
+        &self,
+        session_id: &SessionId,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<GraphInspectResult, SessionHubError> {
+        self.inner
+            .store
+            .graph_inspect(session_id, cursor, limit)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn guard_graph_finalization(
+        &self,
+        command: GraphFinalizationCommand,
+    ) -> Result<GraphFinalizationOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::GuardGraphFinalization { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
             .map_err(Into::into)
     }
 

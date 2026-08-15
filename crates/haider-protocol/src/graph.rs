@@ -8,9 +8,9 @@
 
 use crate::EventPayload;
 use crate::envelope::RawEnvelope;
-use crate::ids::{ArtifactRef, EffectId, GraphId, MenuId, RunId, WorkspaceRevision};
+use crate::ids::{ArtifactRef, EffectId, GraphId, MenuId, RunId, SessionId, WorkspaceRevision};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 pub const SHIP_LOOP_TEMPLATE: &str = "ship-loop";
@@ -27,6 +27,11 @@ pub const GRAPH_MAX_ATTEMPTS: u32 = 8;
 pub const GRAPH_MAX_EVIDENCE_PER_ATTEMPT: u32 = 8;
 pub const GRAPH_EVIDENCE_DETAIL_MAX_BYTES: usize = 1_024;
 pub const GRAPH_BRIEF_MAX_BYTES: usize = 400;
+pub const GRAPH_INSPECT_MAX_PAGE: u32 = 100;
+pub const GRAPH_INSPECT_MAX_RUNS: usize = 32;
+pub const GRAPH_TELEMETRY_MAX_RUN_ROWS: usize = 1_024;
+pub const GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS: usize = 4_096;
+pub const GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS: usize = 256;
 
 /// Bounded durable node identity. Node names are data, never control-flow
 /// discriminants. The accepted wire form is one ASCII upper-case identifier
@@ -352,6 +357,18 @@ pub struct GraphAbandoned {
     pub why: String,
 }
 
+/// Durable claim that one provider run tried to finalize while the active
+/// graph still had obligations. The state digest distinguishes genuine graph
+/// progress while `(graph_id, run_id)` bounds the one automatic reminder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphFinalizationDeferred {
+    pub graph_id: GraphId,
+    pub run_id: RunId,
+    pub state_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_nodes: Vec<GraphNodeName>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphPhase {
@@ -538,6 +555,12 @@ impl GraphStatus {
 pub struct GraphReduction {
     pub status: Option<GraphStatus>,
     pub evidence: Vec<EvidenceRecorded>,
+    /// Durable finalization attempts retained for restart-safe guardrail
+    /// idempotence. This is a projection only; the journal remains authority.
+    pub finalization_deferrals: Vec<GraphFinalizationDeferred>,
+    /// Every guardrail confirmation ever opened for this graph. Pending state
+    /// remains represented by `GraphStatus::pending_menus`.
+    pub finalization_menus: Vec<GraphFinalizationMenu>,
     /// The immutable executable specs stamped by the latest GraphPinned
     /// fact. Kept beside the wire-facing status so resumed old instances are
     /// reduced with their own gates and bounds, not current binary defaults.
@@ -558,6 +581,154 @@ impl GraphReduction {
 pub struct GraphReductions {
     pub active_root: Option<GraphId>,
     pub by_graph: HashMap<GraphId, GraphReduction>,
+}
+
+/// Coordinates retained from a durable `GraphAbandonConfirm` menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphFinalizationMenu {
+    pub menu_id: MenuId,
+    pub run_id: RunId,
+    pub state_digest: String,
+}
+
+/// How one node-attempt interval ended in the committed journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphNodeAttemptOutcome {
+    Open,
+    Satisfied,
+    Retried,
+    Blocked,
+    Completed,
+    Abandoned,
+    Superseded,
+}
+
+/// Rebuildable wall-clock interval for one opened node in one graph epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNodeAttemptRow {
+    pub session_id: SessionId,
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    pub attempt: u32,
+    pub opened_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at_ms: Option<u64>,
+    pub wall_ms: u64,
+    pub outcome: GraphNodeAttemptOutcome,
+}
+
+/// Rebuildable telemetry for one immutable pinned graph instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRunRow {
+    pub session_id: SessionId,
+    pub graph_id: GraphId,
+    pub template: String,
+    pub template_version: u32,
+    pub digest: String,
+    pub phase: GraphPhase,
+    pub opened_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_at_ms: Option<u64>,
+    pub wall_elapsed_ms: u64,
+    pub critical_path_elapsed_ms: u64,
+    pub declared_nodes: u32,
+    pub node_attempts: u32,
+    pub mis_gate_count: u32,
+    pub override_count: u32,
+}
+
+/// Per-node aggregate nested under a template rollup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNodeRollup {
+    pub node: GraphNodeName,
+    pub attempts: u64,
+    pub wall_ms: u64,
+}
+
+/// Stable, integer-only profile aggregate for one immutable template digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphTemplateRollup {
+    pub template: String,
+    pub template_version: u32,
+    pub digest: String,
+    pub runs: u64,
+    pub active: u64,
+    pub blocked: u64,
+    pub completed: u64,
+    pub abandoned: u64,
+    pub superseded: u64,
+    pub completion_rate_basis_points: u32,
+    pub abandon_rate_basis_points: u32,
+    pub mis_gate_count: u64,
+    pub override_count: u64,
+    pub node_attempts: u64,
+    pub declared_nodes: u64,
+    pub attempts_per_node_millis: u64,
+    pub node_wall_ms: u64,
+    pub critical_path_elapsed_ms: u64,
+    pub nodes: Vec<GraphNodeRollup>,
+}
+
+/// Complete deterministic telemetry projection over a bounded journal input.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphTelemetryProjection {
+    #[serde(default)]
+    pub graph_runs: Vec<GraphRunRow>,
+    #[serde(default)]
+    pub graph_node_attempts: Vec<GraphNodeAttemptRow>,
+    #[serde(default)]
+    pub graph_template_rollups: Vec<GraphTemplateRollup>,
+}
+
+/// Signal fields safe for inspection. Digests and durable coordinates are
+/// exposed; transcript/output bytes are never carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSignalProvenance {
+    pub command_arg_digest: String,
+    pub exit_code: Option<i32>,
+    pub transcript_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<WorkspaceRevision>,
+    pub subject_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactRef>,
+}
+
+/// One bounded evidence-log row returned by `graph.inspect`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphEvidenceProvenanceRow {
+    pub seq: u64,
+    pub committed_at_ms: u64,
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    pub authority: EvidenceAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_selector: Option<SubjectSelector>,
+    pub verdict: EvidenceVerdict,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_digest: Option<String>,
+    pub source: GraphEvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<GraphSignalProvenance>,
+}
+
+/// Bounded read model returned by the feature-negotiated inspect RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphInspectSnapshot {
+    pub through_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<GraphStatus>,
+    #[serde(default)]
+    pub runs: Vec<GraphRunRow>,
+    #[serde(default)]
+    pub template_rollups: Vec<GraphTemplateRollup>,
+    #[serde(default)]
+    pub evidence: Vec<GraphEvidenceProvenanceRow>,
 }
 
 impl GraphReductions {
@@ -647,6 +818,8 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     GraphReduction {
                         status: Some(status),
                         evidence: Vec::new(),
+                        finalization_deferrals: Vec::new(),
+                        finalization_menus: Vec::new(),
                         template_nodes,
                     },
                 );
@@ -832,6 +1005,16 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     status.pending_menus.clear();
                 }
             }
+            EventPayload::GraphFinalizationDeferred(deferred) => {
+                if let Some(reduction) = reductions.by_graph.get_mut(&deferred.graph_id)
+                    && !reduction.finalization_deferrals.iter().any(|prior| {
+                        prior.run_id == deferred.run_id
+                            && prior.state_digest == deferred.state_digest
+                    })
+                {
+                    reduction.finalization_deferrals.push(deferred);
+                }
+            }
             EventPayload::GraphSuperseded(superseded) => {
                 if let Some(status) = reductions
                     .by_graph
@@ -847,18 +1030,40 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 reductions.active_root = Some(superseded.new);
             }
             EventPayload::MenuOpened(menu) => {
-                if let crate::menu::MenuKind::GraphHumanConfirm { graph_id, .. } = &menu.kind
+                let finalization_menu = matches!(
+                    &menu.kind,
+                    crate::menu::MenuKind::GraphAbandonConfirm { .. }
+                );
+                let graph_id = match &menu.kind {
+                    crate::menu::MenuKind::GraphHumanConfirm { graph_id, .. }
+                    | crate::menu::MenuKind::GraphAbandonConfirm { graph_id, .. } => Some(graph_id),
+                    _ => None,
+                };
+                if let Some(graph_id) = graph_id
                     && let Some(status) = reductions
                         .by_graph
                         .get_mut(graph_id)
                         .and_then(|reduction| reduction.status_for_graph_mut(graph_id))
                 {
                     status.pending_menu.get_or_insert_with(|| menu.id.clone());
-                    if status.template_version > 0
+                    if (status.template_version > 0 || finalization_menu)
                         && !status.pending_menus.iter().any(|id| id == &menu.id)
                     {
-                        status.pending_menus.push(menu.id);
+                        status.pending_menus.push(menu.id.clone());
                     }
+                }
+                if let crate::menu::MenuKind::GraphAbandonConfirm {
+                    graph_id,
+                    run_id,
+                    state_digest,
+                } = menu.kind
+                    && let Some(reduction) = reductions.by_graph.get_mut(&graph_id)
+                {
+                    reduction.finalization_menus.push(GraphFinalizationMenu {
+                        menu_id: menu.id,
+                        run_id,
+                        state_digest,
+                    });
                 }
             }
             EventPayload::MenuAnswered(crate::menu::MenuAnswer { menu, .. })
@@ -897,6 +1102,418 @@ fn refresh_current_node(status: &mut GraphStatus, template_nodes: &[GraphNodeSpe
             .unwrap_or(usize::MAX)
     });
     status.current_node = status.ready_nodes.first().cloned();
+}
+
+#[derive(Debug, Clone)]
+struct TelemetryAttempt {
+    node: GraphNodeName,
+    attempt: u32,
+    opened_at_ms: u64,
+    closed_at_ms: Option<u64>,
+    outcome: GraphNodeAttemptOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct TelemetryRun {
+    session_id: SessionId,
+    graph_id: GraphId,
+    template: String,
+    template_version: u32,
+    digest: String,
+    phase: GraphPhase,
+    opened_at_ms: u64,
+    terminal_at_ms: Option<u64>,
+    last_observed_at_ms: u64,
+    start_node: Option<GraphNodeName>,
+    specs: Vec<GraphNodeSpec>,
+    attempts: Vec<TelemetryAttempt>,
+    mis_gate_count: u32,
+    override_count: u32,
+}
+
+impl TelemetryRun {
+    fn close_open_attempts(&mut self, at_ms: u64, outcome: GraphNodeAttemptOutcome) {
+        for attempt in &mut self.attempts {
+            if attempt.closed_at_ms.is_none() {
+                attempt.closed_at_ms = Some(at_ms);
+                attempt.outcome = outcome;
+            }
+        }
+        self.last_observed_at_ms = self.last_observed_at_ms.max(at_ms);
+    }
+
+    fn close_attempt(
+        &mut self,
+        node: &GraphNodeName,
+        epoch: u32,
+        at_ms: u64,
+        outcome: GraphNodeAttemptOutcome,
+    ) {
+        if let Some(attempt) = self.attempts.iter_mut().rev().find(|attempt| {
+            attempt.node == *node && attempt.attempt == epoch && attempt.closed_at_ms.is_none()
+        }) {
+            attempt.closed_at_ms = Some(at_ms);
+            attempt.outcome = outcome;
+        }
+        self.last_observed_at_ms = self.last_observed_at_ms.max(at_ms);
+    }
+}
+
+/// Rebuilds graph adoption telemetry solely from committed journal facts.
+/// The same function is used for incremental cache refresh and store reopen.
+#[must_use]
+pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjection {
+    let mut runs = HashMap::<(SessionId, GraphId), TelemetryRun>::new();
+    let mut guard_menus = HashMap::<(SessionId, MenuId), (GraphId, RunId)>::new();
+
+    for envelope in envelopes {
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            continue;
+        };
+        let session_id = envelope.session_id.clone();
+        let at_ms = envelope.committed_at_ms;
+        match payload {
+            EventPayload::GraphPinned(pinned) => {
+                let key = (session_id.clone(), pinned.graph_id.clone());
+                runs.entry(key).or_insert_with(|| TelemetryRun {
+                    session_id,
+                    graph_id: pinned.graph_id,
+                    template: pinned.template,
+                    template_version: pinned.template_version,
+                    digest: pinned.digest,
+                    phase: GraphPhase::Active,
+                    opened_at_ms: at_ms,
+                    terminal_at_ms: None,
+                    last_observed_at_ms: at_ms,
+                    start_node: pinned.start_node,
+                    specs: pinned.nodes,
+                    attempts: Vec::new(),
+                    mis_gate_count: 0,
+                    override_count: 0,
+                });
+            }
+            EventPayload::GraphAttemptOpened(opened) => {
+                if let Some(run) = runs.get_mut(&(session_id, opened.graph_id.clone())) {
+                    let is_new_epoch = run
+                        .start_node
+                        .as_ref()
+                        .or_else(|| run.specs.first().map(|spec| &spec.name))
+                        .is_some_and(|start| start == &opened.node)
+                        && run
+                            .attempts
+                            .iter()
+                            .any(|prior| prior.attempt < opened.attempt);
+                    if is_new_epoch {
+                        run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Retried);
+                    }
+                    run.last_observed_at_ms = run.last_observed_at_ms.max(at_ms);
+                    run.attempts.push(TelemetryAttempt {
+                        node: opened.node,
+                        attempt: opened.attempt,
+                        opened_at_ms: at_ms,
+                        closed_at_ms: None,
+                        outcome: GraphNodeAttemptOutcome::Open,
+                    });
+                }
+            }
+            EventPayload::GraphGateSatisfied(satisfied) => {
+                if let Some(run) = runs.get_mut(&(session_id, satisfied.graph_id.clone())) {
+                    run.close_attempt(
+                        &satisfied.node,
+                        satisfied.attempt,
+                        at_ms,
+                        GraphNodeAttemptOutcome::Satisfied,
+                    );
+                }
+            }
+            EventPayload::GraphBlocked(blocked) => {
+                if let Some(run) = runs.get_mut(&(session_id, blocked.graph_id.clone())) {
+                    run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Blocked);
+                    run.phase = GraphPhase::Blocked;
+                }
+            }
+            EventPayload::GraphCompleted(completed) => {
+                if let Some(run) = runs.get_mut(&(session_id, completed.graph_id.clone())) {
+                    run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Completed);
+                    run.phase = GraphPhase::Completed;
+                    run.terminal_at_ms = Some(at_ms);
+                }
+            }
+            EventPayload::GraphAbandoned(abandoned) => {
+                if let Some(run) = runs.get_mut(&(session_id, abandoned.graph_id.clone())) {
+                    run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Abandoned);
+                    run.phase = GraphPhase::Abandoned;
+                    run.terminal_at_ms = Some(at_ms);
+                }
+            }
+            EventPayload::GraphSuperseded(superseded) => {
+                if let Some(run) = runs.get_mut(&(session_id, superseded.old.clone())) {
+                    run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Superseded);
+                    run.phase = GraphPhase::Superseded;
+                    run.terminal_at_ms = Some(at_ms);
+                }
+            }
+            EventPayload::GraphFinalizationDeferred(deferred) => {
+                if let Some(run) = runs.get_mut(&(session_id, deferred.graph_id.clone())) {
+                    run.last_observed_at_ms = run.last_observed_at_ms.max(at_ms);
+                    run.mis_gate_count = run.mis_gate_count.saturating_add(1);
+                }
+            }
+            EventPayload::MenuOpened(menu) => {
+                if let crate::menu::MenuKind::GraphAbandonConfirm {
+                    graph_id, run_id, ..
+                } = menu.kind
+                {
+                    guard_menus.insert((session_id, menu.id), (graph_id, run_id));
+                }
+            }
+            EventPayload::MenuAnswered(answer)
+                if answer.option_key.as_deref() == Some("abandon-and-finish") =>
+            {
+                if let Some((graph_id, _)) =
+                    guard_menus.get(&(session_id.clone(), answer.menu)).cloned()
+                    && let Some(run) = runs.get_mut(&(session_id, graph_id))
+                {
+                    run.override_count = run.override_count.saturating_add(1);
+                    run.last_observed_at_ms = run.last_observed_at_ms.max(at_ms);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut graph_runs = Vec::with_capacity(runs.len());
+    let mut graph_node_attempts = Vec::new();
+    for run in runs.values() {
+        let observed_end = run.terminal_at_ms.unwrap_or(run.last_observed_at_ms);
+        let attempts = run
+            .attempts
+            .iter()
+            .map(|attempt| {
+                let end = attempt.closed_at_ms.unwrap_or(observed_end);
+                GraphNodeAttemptRow {
+                    session_id: run.session_id.clone(),
+                    graph_id: run.graph_id.clone(),
+                    node: attempt.node.clone(),
+                    attempt: attempt.attempt,
+                    opened_at_ms: attempt.opened_at_ms,
+                    closed_at_ms: attempt.closed_at_ms,
+                    wall_ms: end.saturating_sub(attempt.opened_at_ms),
+                    outcome: attempt.outcome,
+                }
+            })
+            .collect::<Vec<_>>();
+        let critical_path_elapsed_ms = graph_critical_path_ms(&run.specs, &attempts);
+        graph_runs.push(GraphRunRow {
+            session_id: run.session_id.clone(),
+            graph_id: run.graph_id.clone(),
+            template: run.template.clone(),
+            template_version: run.template_version,
+            digest: run.digest.clone(),
+            phase: run.phase,
+            opened_at_ms: run.opened_at_ms,
+            terminal_at_ms: run.terminal_at_ms,
+            wall_elapsed_ms: observed_end.saturating_sub(run.opened_at_ms),
+            critical_path_elapsed_ms,
+            declared_nodes: u32::try_from(run.specs.len()).unwrap_or(u32::MAX),
+            node_attempts: u32::try_from(attempts.len()).unwrap_or(u32::MAX),
+            mis_gate_count: run.mis_gate_count,
+            override_count: run.override_count,
+        });
+        graph_node_attempts.extend(attempts);
+    }
+    graph_runs.sort_by(|left, right| {
+        left.session_id
+            .as_str()
+            .cmp(right.session_id.as_str())
+            .then_with(|| left.opened_at_ms.cmp(&right.opened_at_ms))
+            .then_with(|| left.graph_id.as_str().cmp(right.graph_id.as_str()))
+    });
+    graph_node_attempts.sort_by(|left, right| {
+        left.session_id
+            .as_str()
+            .cmp(right.session_id.as_str())
+            .then_with(|| left.graph_id.as_str().cmp(right.graph_id.as_str()))
+            .then_with(|| left.attempt.cmp(&right.attempt))
+            .then_with(|| left.opened_at_ms.cmp(&right.opened_at_ms))
+            .then_with(|| left.node.cmp(&right.node))
+    });
+    let graph_template_rollups = graph_template_rollups(&graph_runs, &graph_node_attempts);
+    GraphTelemetryProjection {
+        graph_runs,
+        graph_node_attempts,
+        graph_template_rollups,
+    }
+}
+
+fn graph_critical_path_ms(specs: &[GraphNodeSpec], attempts: &[GraphNodeAttemptRow]) -> u64 {
+    let mut epochs = BTreeMap::<u32, HashMap<GraphNodeName, u64>>::new();
+    for attempt in attempts {
+        epochs
+            .entry(attempt.attempt)
+            .or_default()
+            .insert(attempt.node.clone(), attempt.wall_ms);
+    }
+    epochs
+        .values()
+        .map(|durations| {
+            let mut memo = HashMap::<GraphNodeName, u64>::new();
+            specs
+                .iter()
+                .map(|spec| graph_node_path_ms(&spec.name, specs, durations, &mut memo))
+                .max()
+                .unwrap_or(0)
+        })
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn graph_node_path_ms(
+    node: &GraphNodeName,
+    specs: &[GraphNodeSpec],
+    durations: &HashMap<GraphNodeName, u64>,
+    memo: &mut HashMap<GraphNodeName, u64>,
+) -> u64 {
+    if let Some(elapsed) = memo.get(node) {
+        return *elapsed;
+    }
+    let own = durations.get(node).copied().unwrap_or(0);
+    let dependency = specs
+        .iter()
+        .find(|spec| &spec.name == node)
+        .into_iter()
+        .flat_map(|spec| spec.depends_on.iter())
+        .map(|dependency| graph_node_path_ms(dependency, specs, durations, memo))
+        .max()
+        .unwrap_or(0);
+    let elapsed = dependency.saturating_add(own);
+    memo.insert(node.clone(), elapsed);
+    elapsed
+}
+
+/// Aggregates stable template rows from rebuildable run/attempt projections.
+#[must_use]
+pub fn graph_template_rollups(
+    runs: &[GraphRunRow],
+    attempts: &[GraphNodeAttemptRow],
+) -> Vec<GraphTemplateRollup> {
+    let mut rollups = BTreeMap::<(String, u32, String), GraphTemplateRollup>::new();
+    let run_keys = runs
+        .iter()
+        .map(|run| {
+            (
+                (run.session_id.clone(), run.graph_id.clone()),
+                (
+                    run.template.clone(),
+                    run.template_version,
+                    run.digest.clone(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for run in runs {
+        let key = (
+            run.template.clone(),
+            run.template_version,
+            run.digest.clone(),
+        );
+        let rollup = rollups.entry(key).or_insert_with(|| GraphTemplateRollup {
+            template: run.template.clone(),
+            template_version: run.template_version,
+            digest: run.digest.clone(),
+            runs: 0,
+            active: 0,
+            blocked: 0,
+            completed: 0,
+            abandoned: 0,
+            superseded: 0,
+            completion_rate_basis_points: 0,
+            abandon_rate_basis_points: 0,
+            mis_gate_count: 0,
+            override_count: 0,
+            node_attempts: 0,
+            declared_nodes: 0,
+            attempts_per_node_millis: 0,
+            node_wall_ms: 0,
+            critical_path_elapsed_ms: 0,
+            nodes: Vec::new(),
+        });
+        rollup.runs = rollup.runs.saturating_add(1);
+        match run.phase {
+            GraphPhase::Active => rollup.active = rollup.active.saturating_add(1),
+            GraphPhase::Blocked => rollup.blocked = rollup.blocked.saturating_add(1),
+            GraphPhase::Completed => rollup.completed = rollup.completed.saturating_add(1),
+            GraphPhase::Abandoned => rollup.abandoned = rollup.abandoned.saturating_add(1),
+            GraphPhase::Superseded => rollup.superseded = rollup.superseded.saturating_add(1),
+        }
+        rollup.mis_gate_count = rollup
+            .mis_gate_count
+            .saturating_add(u64::from(run.mis_gate_count));
+        rollup.override_count = rollup
+            .override_count
+            .saturating_add(u64::from(run.override_count));
+        rollup.declared_nodes = rollup
+            .declared_nodes
+            .saturating_add(u64::from(run.declared_nodes));
+        rollup.critical_path_elapsed_ms = rollup
+            .critical_path_elapsed_ms
+            .saturating_add(run.critical_path_elapsed_ms);
+    }
+    let mut nodes = BTreeMap::<(String, u32, String, GraphNodeName), GraphNodeRollup>::new();
+    for attempt in attempts {
+        let Some((template, version, digest)) =
+            run_keys.get(&(attempt.session_id.clone(), attempt.graph_id.clone()))
+        else {
+            continue;
+        };
+        let rollup_key = (template.clone(), *version, digest.clone());
+        if let Some(rollup) = rollups.get_mut(&rollup_key) {
+            rollup.node_attempts = rollup.node_attempts.saturating_add(1);
+            rollup.node_wall_ms = rollup.node_wall_ms.saturating_add(attempt.wall_ms);
+        }
+        let node = nodes
+            .entry((
+                template.clone(),
+                *version,
+                digest.clone(),
+                attempt.node.clone(),
+            ))
+            .or_insert_with(|| GraphNodeRollup {
+                node: attempt.node.clone(),
+                attempts: 0,
+                wall_ms: 0,
+            });
+        node.attempts = node.attempts.saturating_add(1);
+        node.wall_ms = node.wall_ms.saturating_add(attempt.wall_ms);
+    }
+    for ((template, version, digest, _), node) in nodes {
+        if let Some(rollup) = rollups.get_mut(&(template, version, digest)) {
+            rollup.nodes.push(node);
+        }
+    }
+    for rollup in rollups.values_mut() {
+        rollup.completion_rate_basis_points = u32::try_from(
+            rollup
+                .completed
+                .saturating_mul(10_000)
+                .checked_div(rollup.runs)
+                .unwrap_or(0),
+        )
+        .unwrap_or(u32::MAX);
+        rollup.abandon_rate_basis_points = u32::try_from(
+            rollup
+                .abandoned
+                .saturating_mul(10_000)
+                .checked_div(rollup.runs)
+                .unwrap_or(0),
+        )
+        .unwrap_or(u32::MAX);
+        rollup.attempts_per_node_millis = rollup
+            .node_attempts
+            .saturating_mul(1_000)
+            .checked_div(rollup.declared_nodes)
+            .unwrap_or(0);
+    }
+    rollups.into_values().collect()
 }
 
 fn graph_reduction_payload(payload: &serde_json::Value) -> Option<EventPayload> {

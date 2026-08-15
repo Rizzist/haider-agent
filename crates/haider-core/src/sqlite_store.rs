@@ -16,10 +16,11 @@ use haider_store::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn, Cas,
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
     DelegationRecord, EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome,
-    HookTrustChange, HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome,
-    ProcessSignalCommand, ProcessSignalOutcome, ProfileLease, SessionCreateCommand,
-    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
+    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
+    GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome, HookTrustChange,
+    HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand,
+    ProcessSignalOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome,
+    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
     TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
@@ -208,6 +209,54 @@ impl SqliteStoreHandle {
             owner.with_store(|store| store.graph_reduction_by_id(&session_id, &graph_id))
         })
         .await
+    }
+
+    pub async fn graph_runs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<haider_protocol::graph::GraphRunRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || owner.with_store(|store| store.graph_runs(&session_id))).await
+    }
+
+    pub async fn graph_node_attempts(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<haider_protocol::graph::GraphNodeAttemptRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || owner.with_store(|store| store.graph_node_attempts(&session_id))).await
+    }
+
+    pub async fn graph_template_rollups(
+        &self,
+    ) -> Result<Vec<haider_protocol::graph::GraphTemplateRollup>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::graph_template_rollups)).await
+    }
+
+    pub async fn graph_inspect(
+        &self,
+        session_id: &SessionId,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<GraphInspectResult, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.graph_inspect(&session_id, cursor.as_deref(), limit))
+        })
+        .await
+    }
+
+    pub async fn guard_graph_finalization(
+        &self,
+        command: GraphFinalizationCommand,
+    ) -> Result<GraphFinalizationOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.guard_graph_finalization(&command)))
+            .await
     }
 
     pub async fn graph_pin_receipt(

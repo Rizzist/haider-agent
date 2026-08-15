@@ -109,6 +109,7 @@ pub enum EventPayload {
     GraphCompleted(graph::GraphCompleted),
     GraphAbandoned(graph::GraphAbandoned),
     GraphSuperseded(graph::GraphSuperseded),
+    GraphFinalizationDeferred(graph::GraphFinalizationDeferred),
     ProcessSignalRecorded(graph::ProcessSignalRecorded),
     // accounts
     Rotation(credential::RotationEvent),

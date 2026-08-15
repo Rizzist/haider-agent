@@ -1,16 +1,19 @@
 #![allow(clippy::expect_used)]
 
-use haider_protocol::graph::{GraphEvidenceTally, GraphNodeStatus, GraphPhase, GraphStatus};
+use haider_protocol::graph::{
+    GraphEvidenceTally, GraphInspectSnapshot, GraphNodeStatus, GraphPhase, GraphStatus,
+};
 use haider_protocol::ids::{GraphId, MenuId, SessionId};
 use haider_rpc::{
-    CommandId, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2, RequestBody,
-    ResponseBody,
+    CommandId, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2,
+    FEATURE_CONVERGENCE_GRAPH_V3, RequestBody, ResponseBody,
 };
 
 #[test]
 fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V1, "convergence_graph_v1");
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V2, "convergence_graph_v2");
+    assert_eq!(FEATURE_CONVERGENCE_GRAPH_V3, "convergence_graph_v3");
     let session_id = SessionId::new("session-graph");
     let graph_id = GraphId::new("graph-1");
     let cases = vec![
@@ -72,6 +75,43 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
             serde_json::json!({
                 "method": "graph.status",
                 "session_id": "session-graph"
+            }),
+        ),
+        (
+            serde_json::to_value(RequestBody::GraphInspect {
+                session_id: session_id.clone(),
+                cursor: Some("opaque-cursor".into()),
+                limit: 25,
+            })
+            .expect("inspect request"),
+            serde_json::json!({
+                "method": "graph.inspect",
+                "session_id": "session-graph",
+                "cursor": "opaque-cursor",
+                "limit": 25
+            }),
+        ),
+        (
+            serde_json::to_value(ResponseBody::GraphInspect {
+                snapshot: GraphInspectSnapshot {
+                    through_seq: 42,
+                    status: None,
+                    runs: Vec::new(),
+                    template_rollups: Vec::new(),
+                    evidence: Vec::new(),
+                },
+                next_cursor: Some("next-cursor".into()),
+            })
+            .expect("inspect response"),
+            serde_json::json!({
+                "method": "graph.inspect",
+                "snapshot": {
+                    "through_seq": 42,
+                    "runs": [],
+                    "template_rollups": [],
+                    "evidence": []
+                },
+                "next_cursor": "next-cursor"
             }),
         ),
         (

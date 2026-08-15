@@ -162,6 +162,9 @@ pub struct HarnessConfig {
     /// Durable compaction implementation installed by the daemon. Standalone
     /// actors surface context overflow when none is configured.
     pub context_compactor: Option<Arc<dyn ContextCompactor>>,
+    /// Daemon-owned provider EndTurn guard. Standalone actors have no graph
+    /// authority and therefore leave this unset.
+    pub finalization_guard: Option<Arc<dyn FinalizationGuard>>,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
     /// Hard ceiling on provider requests made by one logical turn.
@@ -218,6 +221,7 @@ impl HarnessConfig {
             provider_attempt_resolver: None,
             retry_sleeper: Arc::new(RealRetrySleeper),
             context_compactor: None,
+            finalization_guard: None,
             command_capacity: 8,
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
@@ -369,6 +373,23 @@ pub enum ToolDispatchResult {
     Completed(BoundedResult),
     ApprovalRequired(Menu),
     Deferred(DeferredTicket),
+}
+
+/// Durable authority decision immediately before a provider response may
+/// commit `RunState::Done`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FinalizationGuardDecision {
+    AllowDone,
+    Continue {
+        /// Present only for the one automatic reminder per `(graph, run)`.
+        reminder: Option<String>,
+    },
+    ConfirmRequired(Menu),
+}
+
+#[async_trait]
+pub trait FinalizationGuard: Send + Sync + std::fmt::Debug {
+    async fn before_done(&self, run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError>;
 }
 
 /// A provider/account replacement for the current logical turn.
@@ -761,12 +782,15 @@ impl HarnessHandle {
     /// edge is intentionally separate from the bounded command queue: one
     /// menu can have only one authoritative resolution.
     pub fn apply_committed_menu_event(&self, envelope: RawEnvelope) -> Result<(), HaiderError> {
-        if !serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            .is_ok_and(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
-        {
+        if !serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
+            matches!(
+                payload,
+                EventPayload::MenuAnswered(_) | EventPayload::MenuClosed { .. }
+            )
+        }) {
             return Err(HaiderError::new(
                 ErrorCode::InvalidArgument,
-                "committed menu wake must carry MenuAnswered",
+                "committed menu wake must carry MenuAnswered or MenuClosed",
                 false,
             ));
         }
@@ -2467,6 +2491,122 @@ impl HarnessActor {
                                 return self.errored_state_outcome(&run_id, error).await;
                             }
                         }
+                        if reason == FinishReason::EndTurn
+                            && let Some(guard) = self.config.finalization_guard.clone()
+                        {
+                            if let Err(error) =
+                                finalize_request_usage(&mut completed_usage, &mut request_usage)
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                            loop {
+                                let decision = match guard.before_done(&run_id).await {
+                                    Ok(decision) => decision,
+                                    Err(error) => {
+                                        return self
+                                            .errored_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                };
+                                match decision {
+                                    FinalizationGuardDecision::AllowDone => break,
+                                    FinalizationGuardDecision::Continue { reminder } => {
+                                        if let Some(reminder) = reminder {
+                                            messages.push(Message::user_text(reminder));
+                                        }
+                                        provider_attempt = 0;
+                                        if let Err(error) =
+                                            self.commit_state(&run_id, RunState::Thinking).await
+                                        {
+                                            return self
+                                                .errored_state_outcome(&run_id, error)
+                                                .await;
+                                        }
+                                        continue 'requests;
+                                    }
+                                    FinalizationGuardDecision::ConfirmRequired(menu) => {
+                                        if let Err(error) = self
+                                            .commit_state(
+                                                &run_id,
+                                                RunState::InputRequired {
+                                                    menu: menu.id.clone(),
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            return self
+                                                .errored_state_outcome(&run_id, error)
+                                                .await;
+                                        }
+                                        match self
+                                            .wait_for_graph_finalization_answer(
+                                                &run_id, &cancel, &menu,
+                                            )
+                                            .await
+                                        {
+                                            Ok(GraphFinalizationAnswer::ContinueWork) => {
+                                                messages.push(Message::user_text(
+                                                    "Continue working on the current workflow obligations. Do not finalize until they are satisfied, or ask for explicit abandonment again.",
+                                                ));
+                                                provider_attempt = 0;
+                                                if let Err(error) = self
+                                                    .commit_state(&run_id, RunState::Thinking)
+                                                    .await
+                                                {
+                                                    return self
+                                                        .errored_state_outcome(&run_id, error)
+                                                        .await;
+                                                }
+                                                continue 'requests;
+                                            }
+                                            Ok(GraphFinalizationAnswer::AbandonAndFinish) => {
+                                                // Re-consult durable authority: a graph pin/switch
+                                                // may race the menu settlement before Done.
+                                            }
+                                            Ok(GraphFinalizationAnswer::Reconsult) => {
+                                                // A concurrent graph event closed the durable card.
+                                                // Re-read authority instead of parking forever.
+                                            }
+                                            Err(DriveError::Cancelled) => {
+                                                return self
+                                                    .cancelled_outcome_with_items(
+                                                        &run_id,
+                                                        &mut message,
+                                                        &mut reasoning,
+                                                        &mut tools,
+                                                    )
+                                                    .await;
+                                            }
+                                            Err(error) => {
+                                                return self
+                                                    .drive_error_outcome_with_items(
+                                                        &run_id,
+                                                        &mut message,
+                                                        &mut reasoning,
+                                                        &mut tools,
+                                                        error,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         return self.finish_outcome(&run_id, reason).await;
                     }
                 };
@@ -3449,6 +3589,129 @@ impl HarnessActor {
                     return Ok(answer);
                 }
             }
+        }
+    }
+
+    /// Waits for the daemon CAS that owns a durable graph-abandon card. The
+    /// model cannot answer this menu and core never appends a duplicate fact.
+    async fn wait_for_graph_finalization_answer(
+        &mut self,
+        run_id: &RunId,
+        cancel: &CancelToken,
+        menu: &Menu,
+    ) -> Result<GraphFinalizationAnswer, DriveError> {
+        loop {
+            let wake = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuClosed {
+                            menu: menu.id.clone(),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    return Err(DriveError::Cancelled);
+                },
+                changed = self.committed_menus.changed(),
+                    if self.committed_menus.has_changed().is_ok() =>
+                {
+                    match changed {
+                        Ok(()) => self
+                            .committed_menus
+                            .borrow_and_update()
+                            .clone()
+                            .map(MenuWake::Committed),
+                        Err(_) => None,
+                    }
+                },
+                command = self.commands.recv() => command.map(MenuWake::Command),
+            };
+            let Some(wake) = wake else {
+                return Err(DriveError::Provider(provider_protocol_error(
+                    "session actor command channel closed with graph finalization unanswered",
+                )));
+            };
+            let answer = match wake {
+                MenuWake::Command(command @ ActorCommand::Submit { .. }) => {
+                    self.defer_submit_or_reject(command);
+                    continue;
+                }
+                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                    self.service_command_without_menu(command);
+                    continue;
+                }
+                MenuWake::Command(ActorCommand::AnswerMenu { completed, .. }) => {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::PermissionDenied,
+                        "graph finalization requires the daemon's committed menu CAS",
+                        false,
+                    )));
+                    continue;
+                }
+                MenuWake::Command(ActorCommand::Stop { completed }) => {
+                    cancel.cancel();
+                    let _ = completed.send(());
+                    continue;
+                }
+                MenuWake::Committed(envelope) => {
+                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
+                        .map_err(|error| {
+                            DriveError::Store(HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                format!(
+                                    "committed graph finalization wake could not decode: {error}"
+                                ),
+                                false,
+                            ))
+                        })?;
+                    match payload {
+                        EventPayload::MenuAnswered(answer) => answer,
+                        EventPayload::MenuClosed { menu: closed, .. } if closed == menu.id => {
+                            return Ok(GraphFinalizationAnswer::Reconsult);
+                        }
+                        EventPayload::MenuClosed { menu: closed, .. } => {
+                            return Err(DriveError::Store(HaiderError::new(
+                                ErrorCode::MenuNotFound,
+                                format!(
+                                    "committed closure for menu {closed} reached graph finalization waiter for {}",
+                                    menu.id
+                                ),
+                                false,
+                            )));
+                        }
+                        _ => {
+                            return Err(DriveError::Store(HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                "committed graph finalization wake was not a menu resolution",
+                                false,
+                            )));
+                        }
+                    }
+                }
+            };
+            if answer.menu != menu.id {
+                return Err(DriveError::Store(HaiderError::new(
+                    ErrorCode::MenuNotFound,
+                    format!(
+                        "committed answer for menu {} reached graph finalization waiter for {}",
+                        answer.menu, menu.id
+                    ),
+                    false,
+                )));
+            }
+            return match answer.option_key.as_deref() {
+                Some("continue-work") => Ok(GraphFinalizationAnswer::ContinueWork),
+                Some("abandon-and-finish") => Ok(GraphFinalizationAnswer::AbandonAndFinish),
+                _ => Err(DriveError::Store(HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "unsupported graph finalization answer",
+                    false,
+                ))),
+            };
         }
     }
 
@@ -5044,6 +5307,13 @@ struct ToolAccumulator {
 enum GeneralToolOutcome {
     Completed(BoundedResult),
     Deferred(Box<DeferredTicket>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphFinalizationAnswer {
+    ContinueWork,
+    AbandonAndFinish,
+    Reconsult,
 }
 
 #[derive(Debug, Clone)]

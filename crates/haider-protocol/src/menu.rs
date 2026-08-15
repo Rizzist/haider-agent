@@ -90,6 +90,13 @@ pub enum MenuKind {
         node: GraphNodeName,
         attempt: u32,
     },
+    /// Provider finalization guardrail. This blocking card is opened only
+    /// after one durable automatic deferral for the same unmet graph state.
+    GraphAbandonConfirm {
+        graph_id: GraphId,
+        run_id: RunId,
+        state_digest: String,
+    },
 }
 
 /// Visual/behavioral class for [`MenuKind::ErrorRecovery`]. New classes are

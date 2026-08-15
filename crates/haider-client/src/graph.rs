@@ -4,7 +4,7 @@
 //! worker generation from a control attachment, while `graph.status` is a
 //! receipt-free view and needs no attachment.
 
-use haider_protocol::graph::GraphStatus as ConvergenceGraphStatus;
+use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
 use haider_protocol::ids::{GraphId, SessionId};
 use haider_rpc::{CommandId, RequestBody, ResponseBody};
 
@@ -42,6 +42,12 @@ pub struct GraphSwitchResult {
     pub pinned_seq: u64,
     pub opened_seq: u64,
     pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphInspectPage {
+    pub snapshot: GraphInspectSnapshot,
+    pub next_cursor: Option<String>,
 }
 
 /// A transport failure, daemon rejection, or mismatched response method.
@@ -104,6 +110,36 @@ pub async fn graph_status(
         ResponseBody::GraphStatus { status } => Ok(status),
         _ => Err(GraphClientError::Protocol(
             "graph.status response method mismatch",
+        )),
+    }
+}
+
+/// Reads one bounded, snapshot-bound page of graph telemetry and evidence
+/// provenance. Pass `next_cursor` back verbatim for the following page.
+pub async fn graph_inspect(
+    client: &RpcClient,
+    session_id: SessionId,
+    cursor: Option<String>,
+    limit: u32,
+) -> Result<GraphInspectPage, GraphClientError> {
+    match rpc_error(
+        client
+            .request(RequestBody::GraphInspect {
+                session_id,
+                cursor,
+                limit,
+            })
+            .await?,
+    )? {
+        ResponseBody::GraphInspect {
+            snapshot,
+            next_cursor,
+        } => Ok(GraphInspectPage {
+            snapshot,
+            next_cursor,
+        }),
+        _ => Err(GraphClientError::Protocol(
+            "graph.inspect response method mismatch",
         )),
     }
 }

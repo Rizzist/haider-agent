@@ -41,11 +41,12 @@ use base64::Engine;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, CompiledPromptProjection,
     ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
-    DeferredToolResult, EventIdGenerator, GraphEvidenceCommand, GraphEvidenceOutcome, HarnessActor,
-    HarnessConfig, PartialStreamCheckpoint, ProcessSignalCommand, ProcessSignalOutcome,
-    PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn,
-    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
-    ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
+    DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
+    HarnessActor, HarnessConfig, PartialStreamCheckpoint, ProcessSignalCommand,
+    ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle,
+    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
     estimate_provider_request_input_tokens, presentation_for_haider_error,
     sanitized_failure_message,
 };
@@ -225,6 +226,56 @@ impl std::fmt::Debug for DaemonContextCompactor {
             .field("session_id", self.store.session_id())
             .field("model", &self.model)
             .finish_non_exhaustive()
+    }
+}
+
+struct DaemonGraphFinalizationGuard {
+    store: HubStoreHandle,
+    branch_id: Option<BranchId>,
+    device_id: DeviceId,
+}
+
+impl std::fmt::Debug for DaemonGraphFinalizationGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonGraphFinalizationGuard")
+            .field("session_id", self.store.session_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl FinalizationGuard for DaemonGraphFinalizationGuard {
+    async fn before_done(&self, run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError> {
+        let outcome = self
+            .store
+            .hub()
+            .guard_graph_finalization(GraphFinalizationCommand {
+                session_id: self.store.session_id().clone(),
+                branch_id: self.branch_id.clone(),
+                run_id: run_id.clone(),
+                worker_generation: self.store.worker_generation(),
+                device_id: self.device_id.clone(),
+            })
+            .await
+            .map_err(hub_error)?;
+        Ok(match outcome {
+            GraphFinalizationOutcome::AllowDone => FinalizationGuardDecision::AllowDone,
+            GraphFinalizationOutcome::Deferred {
+                graph_id,
+                emit_reminder,
+                ..
+            } => FinalizationGuardDecision::Continue {
+                reminder: emit_reminder.then(|| {
+                    format!(
+                        "The active workflow {graph_id} still has unmet obligations. Continue working and satisfy them, or explicitly abandon the workflow before finalizing."
+                    )
+                }),
+            },
+            GraphFinalizationOutcome::ConfirmRequired { menu, .. } => {
+                FinalizationGuardDecision::ConfirmRequired(menu)
+            }
+        })
     }
 }
 
@@ -4023,6 +4074,11 @@ async fn start_turn(
         branch_id: accepted.branch_id.clone(),
         usage_scope: config.usage_scope.clone(),
         usage_account: config.usage_account.clone(),
+    }));
+    config.finalization_guard = Some(Arc::new(DaemonGraphFinalizationGuard {
+        store: lease.clone(),
+        branch_id: accepted.branch_id.clone(),
+        device_id: device_id.clone(),
     }));
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;

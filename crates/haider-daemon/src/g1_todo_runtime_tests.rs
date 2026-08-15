@@ -11,8 +11,8 @@ use crate::worker::{
     registered_tool_route, registered_tools,
 };
 use haider_core::{
-    GraphPinCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
-    TurnAdmissionDisposition,
+    GraphPinCommand, MenuResolutionCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle,
+    TurnAcceptCommand, TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -22,6 +22,7 @@ use haider_protocol::graph::SHIP_LOOP_TEMPLATE;
 use haider_protocol::history::{NodeKind, TodoState};
 use haider_protocol::ids::{DeviceId, EventId, GraphId, ItemId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::menu::{AnswerVia, MenuAnswer, MenuKind};
 use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
@@ -148,6 +149,88 @@ impl World {
         run_id
     }
 
+    async fn run_turn_with_explicit_graph_abandon(&self, label: &str, text: &str) -> RunId {
+        let run_id = RunId::new(format!("{label}-run"));
+        let accepted = self
+            .hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("submit-{label}"),
+                request_digest: format!("submit-{label}-digest"),
+                request_json: format!(r#"{{"turn":"{label}"}}"#),
+                session_id: self.session_id.clone(),
+                worker_generation: self.store.worker_generation(),
+                run_id: run_id.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+                queued_event_id: EventId::new(format!("{label}-queued")),
+                user_event_id: EventId::new(format!("{label}-user")),
+                active_event_id: EventId::new(format!("{label}-active")),
+                device_id: self.device_id.clone(),
+            })
+            .await
+            .expect("accept turn");
+        self.manager
+            .handle()
+            .submit(accepted)
+            .await
+            .expect("submit turn");
+        let (menu, request_seq) = timeout(Duration::from_secs(10), async {
+            loop {
+                let events = self
+                    .store
+                    .read(&self.session_id, 0, 2048)
+                    .await
+                    .expect("read journal");
+                if let Some(opening) = events.into_iter().find(|event| {
+                    event.run_id.as_ref() == Some(&run_id)
+                        && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                            |payload| {
+                                matches!(
+                                    payload,
+                                    EventPayload::MenuOpened(ref menu)
+                                        if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. })
+                                )
+                            },
+                        )
+                }) {
+                    let EventPayload::MenuOpened(menu) =
+                        serde_json::from_value(opening.payload).expect("typed menu")
+                    else {
+                        unreachable!();
+                    };
+                    break (menu, opening.seq);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guard opens abandonment confirmation");
+        self.hub
+            .resolve_hook_menu(MenuResolutionCommand {
+                command_id: format!("abandon-{label}"),
+                session_id: self.session_id.clone(),
+                request_seq,
+                worker_generation: self.store.worker_generation(),
+                allow_prior_generation: false,
+                answer: MenuAnswer {
+                    menu: menu.id,
+                    option_key: Some("abandon-and-finish".into()),
+                    option_index: 1,
+                    value: None,
+                    via: AnswerVia::Rpc,
+                },
+                device_id: self.device_id.clone(),
+                input_is_secret_reference: false,
+            })
+            .await
+            .expect("explicit graph abandonment commits");
+        self.await_done(&self.session_id.clone(), &run_id).await;
+        run_id
+    }
+
     async fn await_done(&self, session_id: &SessionId, run_id: &RunId) {
         timeout(Duration::from_secs(10), async {
             loop {
@@ -230,9 +313,14 @@ fn plan_facts(payloads: &[(EventPayload, PromptRender)]) -> Vec<&ItemEvent> {
 /// absent from durable event payloads.
 #[tokio::test]
 async fn active_graph_brief_reaches_the_provider_but_not_durable_history() {
-    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
-        reason: FinishReason::EndTurn,
-    }]));
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
     let world = World::boot("graph-brief-runtime", provider.clone()).await;
     world
         .hub
@@ -249,11 +337,11 @@ async fn active_graph_brief_reaches_the_provider_but_not_durable_history() {
         .await
         .expect("pin graph");
     world
-        .run_turn("graph-brief-runtime", "continue the work")
+        .run_turn_with_explicit_graph_abandon("graph-brief-runtime", "continue the work")
         .await;
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert!(requests[0].messages.iter().any(|message| {
         matches!(
             message.blocks.as_slice(),
@@ -297,6 +385,9 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
     ]));
     let world = World::boot("graph-evidence-runtime", provider.clone()).await;
     world
@@ -314,7 +405,7 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
         .await
         .expect("pin graph");
     let run_id = world
-        .run_turn("graph-evidence-runtime", "build and record evidence")
+        .run_turn_with_explicit_graph_abandon("graph-evidence-runtime", "build and record evidence")
         .await;
     let status = world
         .hub
@@ -328,7 +419,7 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
     );
     assert_eq!(status.attempt, 1);
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert!(requests[0].messages.last().is_some_and(|message| {
         matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("GraphBrief: BUILD attempt 1/8;"))
     }));
@@ -361,13 +452,18 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
     }));
 }
 
-/// CG-M1 LAW: outstanding VERIFY testimony is graph-local. It neither parks
-/// the session nor changes the ordinary provider/run-state lifecycle.
+/// CG-M2c LAW: outstanding VERIFY testimony remains graph-local, but the
+/// provider turn reaches Done only after an explicit guardrail exit.
 #[tokio::test]
 async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
-    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
-        reason: FinishReason::EndTurn,
-    }]));
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
     let world = World::boot("graph-verify-nonblocking", provider).await;
     world
         .hub
@@ -405,7 +501,10 @@ async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
         .await
         .expect("BUILD advances to VERIFY");
     let run_id = world
-        .run_turn("graph-verify-nonblocking", "ordinary interactive followup")
+        .run_turn_with_explicit_graph_abandon(
+            "graph-verify-nonblocking",
+            "ordinary interactive followup",
+        )
         .await;
     let payloads = world.typed_payloads().await;
     assert!(

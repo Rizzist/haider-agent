@@ -351,6 +351,7 @@ pub(super) async fn run_session_actor(
                 };
                 publish_graph_commit(
                     envelopes,
+                    worker.as_ref(),
                     &session_id,
                     &mut head,
                     &mut authority_epoch,
@@ -372,6 +373,7 @@ pub(super) async fn run_session_actor(
                 };
                 publish_graph_commit(
                     envelopes,
+                    worker.as_ref(),
                     &session_id,
                     &mut head,
                     &mut authority_epoch,
@@ -393,6 +395,7 @@ pub(super) async fn run_session_actor(
                 };
                 publish_graph_commit(
                     envelopes,
+                    worker.as_ref(),
                     &session_id,
                     &mut head,
                     &mut authority_epoch,
@@ -414,6 +417,30 @@ pub(super) async fn run_session_actor(
                 };
                 publish_graph_commit(
                     envelopes,
+                    worker.as_ref(),
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
+                let _ = completed.send(result);
+            }
+            ActorCommand::GuardGraphFinalization { command, completed } => {
+                let result = store.guard_graph_finalization(command).await;
+                let envelopes = match &result {
+                    Ok(GraphFinalizationOutcome::Deferred { envelopes, .. })
+                    | Ok(GraphFinalizationOutcome::ConfirmRequired { envelopes, .. }) => {
+                        Some(envelopes.as_slice())
+                    }
+                    Ok(GraphFinalizationOutcome::AllowDone) | Err(_) => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    worker.as_ref(),
                     &session_id,
                     &mut head,
                     &mut authority_epoch,
@@ -435,6 +462,7 @@ pub(super) async fn run_session_actor(
                 };
                 publish_graph_commit(
                     envelopes,
+                    worker.as_ref(),
                     &session_id,
                     &mut head,
                     &mut authority_epoch,
@@ -957,6 +985,7 @@ pub(super) async fn run_session_actor(
 #[allow(clippy::too_many_arguments)]
 fn publish_graph_commit(
     envelopes: Option<&[RawEnvelope]>,
+    worker: Option<&RegisteredWorker>,
     session_id: &SessionId,
     head: &mut u64,
     authority_epoch: &mut u64,
@@ -978,6 +1007,26 @@ fn publish_graph_commit(
         through_seq: *head,
     });
     publish(attachments, envelopes, catch_up_byte_budget, metrics, hooks);
+    if let Some(harness) = worker.and_then(|worker| worker.harness.as_ref())
+        && let Some(RunState::InputRequired { menu: waiting }) = harness.current_state()
+    {
+        for envelope in envelopes {
+            let closes_waiting = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| {
+                    matches!(payload, EventPayload::MenuClosed { menu, .. } if menu == waiting)
+                });
+            if closes_waiting {
+                if let Err(error) = harness.apply_committed_menu_event(envelope.clone()) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = ?error,
+                        "committed graph menu closure could not wake the live harness"
+                    );
+                }
+                break;
+            }
+        }
+    }
     observer.observe(HubObservation::Published {
         session_id: session_id.clone(),
         through_seq: *head,
@@ -1143,9 +1192,10 @@ fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
             | EventPayload::GraphCompleted(_)
             | EventPayload::GraphAbandoned(_)
             | EventPayload::GraphSuperseded(_)
+            | EventPayload::GraphFinalizationDeferred(_)
             | EventPayload::ProcessSignalRecorded(_)
             | EventPayload::MenuOpened(Menu {
-                kind: MenuKind::GraphHumanConfirm { .. },
+                kind: MenuKind::GraphHumanConfirm { .. } | MenuKind::GraphAbandonConfirm { .. },
                 ..
             })
             | EventPayload::MenuAnswered(_)

@@ -2,10 +2,10 @@
 
 use async_trait::async_trait;
 use haider_core::{
-    CommittedRange, ContextCompactor, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
-    ProviderAttemptDecision, ProviderAttemptResolver, ResolvedProviderAttempt, StoreHandle,
-    SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
-    VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
+    CommittedRange, ContextCompactor, FinalizationGuard, FinalizationGuardDecision, HarnessActor,
+    HarnessConfig, HarnessHandle, MemoryStore, ProviderAttemptDecision, ProviderAttemptResolver,
+    ResolvedProviderAttempt, StoreHandle, SubmitCommittedTurn, SubmitTurn, ToolDispatchResult,
+    ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -18,10 +18,11 @@ use haider_protocol::history::{
     CompactionResume, ContinuationCheckpoint,
 };
 use haider_protocol::ids::{
-    ArtifactRef, BranchId, CredentialAlias, DeviceId, ItemId, NodeId, RunId, SessionId,
+    ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, GraphId, ItemId, MenuId, NodeId,
+    RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{AnswerVia, MenuAnswer};
+use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{AttachmentBlock, BoundedResult};
@@ -29,7 +30,7 @@ use haider_provider::{
     FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderErrorKind, ProviderStream,
     ResolvedAttachment, TurnRequest,
 };
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -120,6 +121,145 @@ fn assert_items_closed_before_terminal(events: &[RawEnvelope]) {
     }
     assert!(saw_terminal, "fixture did not commit a terminal run state");
     assert!(open.is_empty(), "fixture ended with open items");
+}
+
+#[derive(Debug)]
+struct ScriptedFinalizationGuard {
+    decisions: Mutex<VecDeque<FinalizationGuardDecision>>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl FinalizationGuard for ScriptedFinalizationGuard {
+    async fn before_done(&self, _run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.decisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "scripted finalization guard exhausted",
+                    false,
+                )
+            })
+    }
+}
+
+/// Expected failure under mutation: moving the guard after `Done`, dropping
+/// the reminder continuation, or treating the blocking card as advisory lets
+/// this turn terminalize before durable abandonment authority is observed.
+#[tokio::test]
+async fn m2c_end_turn_defers_once_then_waits_for_committed_abandonment() {
+    let reminder = "continue unfinished graph obligations".to_string();
+    let menu = Menu {
+        id: MenuId::new("m2c-finalization-menu"),
+        kind: MenuKind::GraphAbandonConfirm {
+            graph_id: GraphId::new("m2c-finalization-graph"),
+            run_id: RunId::new("placeholder-run"),
+            state_digest: "state-digest".into(),
+        },
+        title: "Unfinished workflow".into(),
+        body: Vec::new(),
+        options: vec![
+            MenuOption {
+                key: "continue-work".into(),
+                label: "Continue work".into(),
+                detail: None,
+                decision: None,
+            },
+            MenuOption {
+                key: "abandon-and-finish".into(),
+                label: "Abandon and finish".into(),
+                detail: None,
+                decision: None,
+            },
+        ],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "convergence-graph".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let guard = Arc::new(ScriptedFinalizationGuard {
+        decisions: Mutex::new(VecDeque::from([
+            FinalizationGuardDecision::Continue {
+                reminder: Some(reminder.clone()),
+            },
+            FinalizationGuardDecision::ConfirmRequired(menu.clone()),
+            FinalizationGuardDecision::AllowDone,
+        ])),
+        calls: AtomicUsize::new(0),
+    });
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let mut runtime_config = config();
+    runtime_config.finalization_guard = Some(guard.clone());
+    let handle = HarnessActor::spawn(runtime_config, provider.clone(), store.clone());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("finish only when graph authority permits"))
+        .await
+        .expect("turn accepted");
+    let mut states = handle.state_receiver();
+    let parked = states
+        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
+        .await
+        .expect("guard parks on durable confirmation")
+        .clone();
+    assert_eq!(
+        parked,
+        Some(RunState::InputRequired {
+            menu: menu.id.clone()
+        })
+    );
+    let history = store.events(&SessionId::new(SESSION)).await;
+    assert!(
+        !history
+            .iter()
+            .any(|event| { matches!(typed(event), EventPayload::RunState(RunState::Done)) })
+    );
+    assert_eq!(provider.requests().len(), 2);
+    assert!(
+        provider.requests()[1]
+            .messages
+            .contains(&Message::user_text(reminder))
+    );
+
+    let mut answer = [RawEnvelope {
+        event_id: EventId::new("m2c-committed-abandon-answer"),
+        seq: 0,
+        committed_at_ms: 0,
+        causation_id: None,
+        payload: serde_json::to_value(EventPayload::MenuAnswered(MenuAnswer {
+            menu: menu.id,
+            option_key: Some("abandon-and-finish".into()),
+            option_index: 1,
+            value: None,
+            via: AnswerVia::Rpc,
+        }))
+        .expect("answer serializes"),
+        ..history.last().expect("run history").clone()
+    }];
+    store
+        .append(&mut answer)
+        .await
+        .expect("answer commits first");
+    handle
+        .apply_committed_menu_event(answer[0].clone())
+        .expect("committed answer wakes guard");
+    assert_eq!(
+        turn.wait().await.expect("turn completes").state,
+        RunState::Done
+    );
+    assert_eq!(guard.calls.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]

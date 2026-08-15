@@ -721,6 +721,7 @@ fn observe_menu_kind(kind: &MenuKind) -> &'static str {
         MenuKind::File => "file",
         MenuKind::Conflict => "conflict",
         MenuKind::GraphHumanConfirm { .. } => "graph_human_confirm",
+        MenuKind::GraphAbandonConfirm { .. } => "graph_abandon_confirm",
     }
 }
 
@@ -1236,6 +1237,23 @@ impl HubConnection {
                     );
                 }
                 self.graph_status(request_id, session_id).await
+            }
+            RequestBody::GraphInspect {
+                session_id,
+                cursor,
+                limit,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.graph_inspect(request_id, session_id, cursor, limit)
+                    .await
             }
             RequestBody::SessionDiagnostic {
                 command_id,
@@ -3765,6 +3783,29 @@ impl HubConnection {
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::GraphStatus { status },
+        })
+    }
+
+    async fn graph_inspect(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<(), SessionHubError> {
+        let inspected = match self.hub.graph_inspect(&session_id, cursor, limit).await {
+            Ok(inspected) => inspected,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::GraphInspect {
+                snapshot: inspected.snapshot,
+                next_cursor: inspected.next_cursor,
+            },
         })
     }
 

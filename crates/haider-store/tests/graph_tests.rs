@@ -7,19 +7,21 @@ use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPh
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::graph::{
-    EvidenceAuthority, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphGateKind,
-    GraphNodeName, GraphPhase, GraphPinned, ProcessSignalRecorded, ProcessSignalRef,
+    EvidenceAuthority, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphCompleted,
+    GraphExecutorShape, GraphFinalizationDeferred, GraphGateKind, GraphNodeName, GraphNodeSpec,
+    GraphPhase, GraphPinned, GraphSuperseded, ProcessSignalRecorded, ProcessSignalRef,
     SHIP_LOOP_TEMPLATE, STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector,
     evidence_fingerprint, graph_template, graph_template_catalog, process_signal_subject_digest,
-    ship_loop_nodes,
+    reduce_graph_telemetry, ship_loop_nodes,
 };
-use haider_protocol::ids::{DeviceId, EffectId, EventId, GraphId, RunId, SessionId};
-use haider_protocol::menu::{AnswerVia, MenuAnswer};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, GraphId, MenuId, RunId, SessionId};
+use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
+use haider_protocol::state::RunState;
 use haider_store::{
     EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome,
-    MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome,
-    SessionCreateCommand, Store,
+    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphPinCommand,
+    GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome, MenuResolutionCommand,
+    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, SessionCreateCommand, Store,
 };
 
 fn create_session(store: &Store, name: &str) -> SessionId {
@@ -67,6 +69,20 @@ fn pin(store: &Store, session_id: &SessionId, suffix: &str) -> GraphId {
         panic!("fresh pin must commit");
     };
     pinned.graph_id
+}
+
+fn finalization_command(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> GraphFinalizationCommand {
+    GraphFinalizationCommand {
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: run_id.clone(),
+        worker_generation: store.worker_generation(),
+        device_id: DeviceId::new("graph-test"),
+    }
 }
 
 fn evidence_command(
@@ -2330,4 +2346,800 @@ fn m2b_all_catalog_templates_reach_completion_on_green_paths() {
             template.name
         );
     }
+}
+
+#[test]
+fn m2c_first_finalization_defers_and_second_requires_explicit_exit() {
+    // Expected failure under mutation: allowing EndTurn through, omitting the
+    // deferral fact, or accepting an invented third menu choice breaks this.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2c-finalization");
+    let graph_id = pin(&store, &session_id, "m2c-finalization");
+    let run_id = RunId::new("run-m2c-finalization");
+    let command = finalization_command(&store, &session_id, &run_id);
+
+    let GraphFinalizationOutcome::Deferred {
+        graph_id: deferred_graph,
+        emit_reminder,
+        envelopes,
+    } = store
+        .guard_graph_finalization(&command)
+        .expect("first finalization")
+    else {
+        panic!("first finalization must defer");
+    };
+    assert_eq!(deferred_graph, graph_id);
+    assert!(
+        emit_reminder,
+        "law 1: the first deferral emits the reminder"
+    );
+    assert!(matches!(
+        serde_json::from_value::<EventPayload>(envelopes[0].payload.clone()).expect("payload"),
+        EventPayload::GraphFinalizationDeferred(GraphFinalizationDeferred { .. })
+    ));
+    assert!(
+        !store
+            .journal_replay(&session_id)
+            .expect("journal")
+            .iter()
+            .any(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        payload == EventPayload::RunState(haider_protocol::state::RunState::Done)
+                    },
+                )
+            })
+    );
+
+    let GraphFinalizationOutcome::ConfirmRequired { menu, envelopes } = store
+        .guard_graph_finalization(&command)
+        .expect("second finalization")
+    else {
+        panic!("second finalization must open confirmation");
+    };
+    assert_eq!(envelopes.len(), 1);
+    assert!(matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. }));
+    assert_eq!(
+        menu.options
+            .iter()
+            .map(|option| option.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["continue-work", "abandon-and-finish"]
+    );
+    let invalid = answer_graph_menu(
+        &store,
+        &session_id,
+        &menu.id,
+        envelopes[0].seq,
+        "m2c-invalid-exit",
+        0,
+        "finish-anyway",
+    );
+    assert_eq!(
+        store
+            .resolve_menu(&invalid)
+            .expect_err("invented exit rejects")
+            .code,
+        ErrorCode::InvalidArgument
+    );
+    let continued = answer_graph_menu(
+        &store,
+        &session_id,
+        &menu.id,
+        envelopes[0].seq,
+        "m2c-continue",
+        0,
+        "continue-work",
+    );
+    assert!(matches!(
+        store.resolve_menu(&continued).expect("continue answer"),
+        MenuResolutionOutcome::Committed { .. }
+    ));
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Active
+    );
+
+    let GraphFinalizationOutcome::ConfirmRequired {
+        menu: abandon_menu,
+        envelopes: abandon_opening,
+    } = store
+        .guard_graph_finalization(&command)
+        .expect("confirmation reopens after continue-work")
+    else {
+        panic!("unfinished graph still requires explicit exit");
+    };
+    let abandoned = answer_graph_menu(
+        &store,
+        &session_id,
+        &abandon_menu.id,
+        abandon_opening[0].seq,
+        "m2c-abandon",
+        1,
+        "abandon-and-finish",
+    );
+    let MenuResolutionOutcome::Committed { follow_up, .. } = store
+        .resolve_menu(&abandoned)
+        .expect("abandon-and-finish answer")
+    else {
+        panic!("fresh abandon answer commits");
+    };
+    assert!(follow_up.iter().any(|envelope| {
+        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            .is_ok_and(|payload| matches!(payload, EventPayload::GraphAbandoned(_)))
+    }));
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Abandoned
+    );
+    assert_eq!(
+        store
+            .guard_graph_finalization(&command)
+            .expect("abandon permits finalization"),
+        GraphFinalizationOutcome::AllowDone
+    );
+}
+
+#[test]
+fn m2c_one_reminder_coordinate_survives_store_reopen() {
+    // Expected failure under mutation: keeping the reminder bit only in RAM
+    // makes the reopened store return Deferred with emit_reminder=true again.
+    let root = tempfile::tempdir().expect("tempdir");
+    let session_id = SessionId::new("m2c-reminder-reopen");
+    let run_id = RunId::new("run-m2c-reminder-reopen");
+    {
+        let store = Store::open(root.path()).expect("open store");
+        create_session(&store, session_id.as_str());
+        pin(&store, &session_id, "m2c-reminder-reopen");
+        let GraphFinalizationOutcome::Deferred { emit_reminder, .. } = store
+            .guard_graph_finalization(&finalization_command(&store, &session_id, &run_id))
+            .expect("first guard")
+        else {
+            panic!("first guard must defer");
+        };
+        assert!(emit_reminder);
+    }
+    let store = Store::open(root.path()).expect("reopen store");
+    assert!(matches!(
+        store
+            .guard_graph_finalization(&finalization_command(&store, &session_id, &run_id))
+            .expect("replayed guard"),
+        GraphFinalizationOutcome::ConfirmRequired { .. }
+    ));
+    let deferrals = store
+        .journal_replay(&session_id)
+        .expect("journal")
+        .into_iter()
+        .filter(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| matches!(payload, EventPayload::GraphFinalizationDeferred(_)))
+        })
+        .count();
+    assert_eq!(deferrals, 1, "law 3: one durable reminder coordinate");
+}
+
+#[test]
+fn m2c_pending_confirmation_replays_across_store_reopen() {
+    // Expected failure under mutation: hashing pending-menu presentation
+    // state makes a durable confirmation invalidate itself after reopening.
+    let root = tempfile::tempdir().expect("tempdir");
+    let session_id = SessionId::new("m2c-confirm-reopen");
+    let run_id = RunId::new("run-m2c-confirm-reopen");
+    let (menu_id, head) = {
+        let store = Store::open(root.path()).expect("open store");
+        create_session(&store, session_id.as_str());
+        pin(&store, &session_id, "m2c-confirm-reopen");
+        assert!(matches!(
+            store
+                .guard_graph_finalization(&finalization_command(&store, &session_id, &run_id))
+                .expect("first guard"),
+            GraphFinalizationOutcome::Deferred {
+                emit_reminder: true,
+                ..
+            }
+        ));
+        let GraphFinalizationOutcome::ConfirmRequired { menu, .. } = store
+            .guard_graph_finalization(&finalization_command(&store, &session_id, &run_id))
+            .expect("second guard")
+        else {
+            panic!("second guard opens confirmation");
+        };
+        (menu.id, store.latest_seq(&session_id).expect("head"))
+    };
+    let store = Store::open(root.path()).expect("reopen store");
+    let GraphFinalizationOutcome::ConfirmRequired { menu, envelopes } = store
+        .guard_graph_finalization(&finalization_command(&store, &session_id, &run_id))
+        .expect("replay pending guard")
+    else {
+        panic!("pending confirmation must replay");
+    };
+    assert_eq!(menu.id, menu_id);
+    assert!(envelopes.is_empty());
+    assert_eq!(store.latest_seq(&session_id).expect("unchanged head"), head);
+}
+
+#[test]
+fn m2c_non_active_graph_phases_do_not_defer() {
+    // Expected failure under mutation: using GraphStatus::is_unfinished()
+    // directly would incorrectly defer the Blocked case.
+    for (label, terminal) in [
+        (
+            "completed",
+            EventPayload::GraphCompleted(GraphCompleted {
+                graph_id: GraphId::new("graph-completed"),
+            }),
+        ),
+        (
+            "abandoned",
+            EventPayload::GraphAbandoned(haider_protocol::graph::GraphAbandoned {
+                graph_id: GraphId::new("graph-abandoned"),
+                why: "test".into(),
+            }),
+        ),
+        (
+            "blocked",
+            EventPayload::GraphBlocked(haider_protocol::graph::GraphBlocked {
+                graph_id: GraphId::new("graph-blocked"),
+                node: haider_protocol::graph::build_node(),
+                reason: GraphBlockReason::HumanHold,
+            }),
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = create_session(&store, &format!("m2c-{label}"));
+        let graph_id = pin(&store, &session_id, label);
+        let terminal = match terminal {
+            EventPayload::GraphCompleted(_) => {
+                EventPayload::GraphCompleted(GraphCompleted { graph_id })
+            }
+            EventPayload::GraphAbandoned(abandoned) => {
+                EventPayload::GraphAbandoned(haider_protocol::graph::GraphAbandoned {
+                    graph_id,
+                    why: abandoned.why,
+                })
+            }
+            EventPayload::GraphBlocked(blocked) => {
+                EventPayload::GraphBlocked(haider_protocol::graph::GraphBlocked {
+                    graph_id,
+                    node: blocked.node,
+                    reason: blocked.reason,
+                })
+            }
+            _ => unreachable!(),
+        };
+        let mut event = vec![raw_envelope(
+            &store,
+            &session_id,
+            &RunId::new(format!("run-{label}")),
+            format!("terminal-{label}"),
+            terminal,
+        )];
+        store.append(&mut event).expect("terminal graph fact");
+        assert_eq!(
+            store
+                .guard_graph_finalization(&finalization_command(
+                    &store,
+                    &session_id,
+                    &RunId::new(format!("run-{label}")),
+                ))
+                .expect("guard"),
+            GraphFinalizationOutcome::AllowDone,
+            "phase {label} must not defer"
+        );
+    }
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2c-superseded");
+    let old = pin(&store, &session_id, "m2c-superseded-old");
+    let new = GraphId::new("graph-unpinned-successor");
+    let mut event = vec![raw_envelope(
+        &store,
+        &session_id,
+        &RunId::new("run-superseded"),
+        "terminal-superseded",
+        EventPayload::GraphSuperseded(GraphSuperseded { old, new }),
+    )];
+    store.append(&mut event).expect("supersede graph");
+    assert_eq!(
+        store
+            .guard_graph_finalization(&finalization_command(
+                &store,
+                &session_id,
+                &RunId::new("run-superseded"),
+            ))
+            .expect("guard"),
+        GraphFinalizationOutcome::AllowDone
+    );
+}
+
+#[test]
+fn m2c_worker_done_rechecks_graph_authority_in_append_transaction() {
+    // Expected failure under mutation: trusting an earlier AllowDone decision
+    // lets a racing graph pin coexist with a committed terminal run state.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2c-done-race");
+    let run_id = RunId::new("run-m2c-done-race");
+    let mut queued = vec![raw_envelope(
+        &store,
+        &session_id,
+        &run_id,
+        "m2c-race-queued",
+        EventPayload::RunState(RunState::Queued),
+    )];
+    store.append(&mut queued).expect("seed accepted run state");
+    pin(&store, &session_id, "m2c-done-race");
+    let mut done = vec![raw_envelope(
+        &store,
+        &session_id,
+        &run_id,
+        "m2c-race-done",
+        EventPayload::RunState(RunState::Done),
+    )];
+    let error = store
+        .append_worker(&mut done)
+        .expect_err("Done must recheck active graph authority");
+    assert_eq!(error.code, ErrorCode::GraphNotActive);
+    assert!(
+        !store
+            .journal_replay(&session_id)
+            .expect("journal")
+            .iter()
+            .any(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
+            })
+    );
+}
+
+#[test]
+fn m2c_metrics_rebuild_byte_for_byte_after_reopen() {
+    // Expected failure under mutation: a cache-only counter or non-stable map
+    // order changes the serialized projection after Store::open rebuilds it.
+    let root = tempfile::tempdir().expect("tempdir");
+    let session_id = SessionId::new("m2c-metrics-rebuild");
+    let before = {
+        let store = Store::open(root.path()).expect("open store");
+        create_session(&store, session_id.as_str());
+        pin(&store, &session_id, "m2c-metrics-rebuild");
+        record(
+            &store,
+            &session_id,
+            31_000,
+            haider_protocol::graph::build_node(),
+            EvidenceVerdict::Green,
+            "build green",
+        );
+        let run_id = RunId::new("run-metrics-rebuild");
+        let command = finalization_command(&store, &session_id, &run_id);
+        assert!(matches!(
+            store
+                .guard_graph_finalization(&command)
+                .expect("first guard"),
+            GraphFinalizationOutcome::Deferred { .. }
+        ));
+        let GraphFinalizationOutcome::ConfirmRequired { menu, envelopes } = store
+            .guard_graph_finalization(&command)
+            .expect("second guard")
+        else {
+            panic!("second guard opens confirmation");
+        };
+        store
+            .resolve_menu(&answer_graph_menu(
+                &store,
+                &session_id,
+                &menu.id,
+                envelopes[0].seq,
+                "m2c-metrics-abandon",
+                1,
+                "abandon-and-finish",
+            ))
+            .expect("explicit override");
+        serde_json::to_vec(&(
+            store.graph_runs(&session_id).expect("runs"),
+            store.graph_node_attempts(&session_id).expect("attempts"),
+            store.graph_template_rollups().expect("rollups"),
+        ))
+        .expect("serialize projection")
+    };
+    let store = Store::open(root.path()).expect("reopen store");
+    let after = serde_json::to_vec(&(
+        store.graph_runs(&session_id).expect("runs"),
+        store.graph_node_attempts(&session_id).expect("attempts"),
+        store.graph_template_rollups().expect("rollups"),
+    ))
+    .expect("serialize rebuilt projection");
+    assert_eq!(before, after, "law 5: rebuild is byte-for-byte stable");
+}
+
+fn telemetry_envelope(
+    session_id: &SessionId,
+    seq: u64,
+    committed_at_ms: u64,
+    payload: EventPayload,
+) -> haider_protocol::envelope::RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(format!("telemetry-{seq}")),
+        seq,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("telemetry-test"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(payload).expect("payload"),
+    }
+}
+
+fn telemetry_node(name: &str, dependencies: &[&str]) -> GraphNodeSpec {
+    GraphNodeSpec {
+        name: GraphNodeName::new(name).expect("node"),
+        gate: GraphGateKind::CommandGreen,
+        executor: GraphExecutorShape::Inline,
+        max_attempts: 2,
+        max_evidence_per_attempt: Some(2),
+        depends_on: dependencies
+            .iter()
+            .map(|dependency| GraphNodeName::new(*dependency).expect("dependency"))
+            .collect(),
+        verify_slots: Vec::new(),
+    }
+}
+
+#[test]
+fn m2c_parallel_node_durations_use_critical_path_not_sum() {
+    // Expected failure under mutation: summing sibling BACKEND and FRONTEND
+    // durations yields 80ms instead of the 60ms critical path.
+    let session_id = SessionId::new("m2c-parallel-cp");
+    let graph_id = GraphId::new("graph-parallel-cp");
+    let start = GraphNodeName::new("START").expect("node");
+    let backend = GraphNodeName::new("BACKEND").expect("node");
+    let frontend = GraphNodeName::new("FRONTEND").expect("node");
+    let integrate = GraphNodeName::new("INTEGRATE").expect("node");
+    let nodes = vec![
+        telemetry_node("START", &[]),
+        telemetry_node("BACKEND", &["START"]),
+        telemetry_node("FRONTEND", &["START"]),
+        telemetry_node("INTEGRATE", &["BACKEND", "FRONTEND"]),
+    ];
+    let facts = vec![
+        telemetry_envelope(
+            &session_id,
+            1,
+            0,
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_id.clone(),
+                template: "parallel-law".into(),
+                digest: "parallel-digest".into(),
+                template_version: 1,
+                start_node: Some(start.clone()),
+                nodes,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            2,
+            0,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: graph_id.clone(),
+                node: start.clone(),
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            3,
+            10,
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: graph_id.clone(),
+                node: start,
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            4,
+            10,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: graph_id.clone(),
+                node: backend.clone(),
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            5,
+            10,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: graph_id.clone(),
+                node: frontend.clone(),
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            6,
+            30,
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: graph_id.clone(),
+                node: backend,
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            7,
+            50,
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: graph_id.clone(),
+                node: frontend,
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            8,
+            50,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: graph_id.clone(),
+                node: integrate.clone(),
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            9,
+            60,
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: graph_id.clone(),
+                node: integrate,
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            10,
+            60,
+            EventPayload::GraphCompleted(GraphCompleted { graph_id }),
+        ),
+    ];
+    let projection = reduce_graph_telemetry(&facts);
+    assert_eq!(projection.graph_runs[0].critical_path_elapsed_ms, 60);
+    assert_eq!(
+        projection
+            .graph_node_attempts
+            .iter()
+            .map(|attempt| attempt.wall_ms)
+            .sum::<u64>(),
+        80,
+        "the fixture must distinguish critical path from additive node time"
+    );
+}
+
+#[test]
+fn m2c_rollups_count_misgates_overrides_completion_and_abandonment() {
+    // Expected failure under mutation: deriving from current status alone
+    // loses the deferral/override history and one of the terminal counts.
+    let session_id = SessionId::new("m2c-scripted-rollup");
+    let graph_one = GraphId::new("graph-scripted-one");
+    let graph_two = GraphId::new("graph-scripted-two");
+    let run_two = RunId::new("run-scripted-two");
+    let nodes = vec![telemetry_node("START", &[])];
+    let menu_id = MenuId::new("scripted-abandon-menu");
+    let menu = Menu {
+        id: menu_id.clone(),
+        kind: MenuKind::GraphAbandonConfirm {
+            graph_id: graph_two.clone(),
+            run_id: run_two.clone(),
+            state_digest: "state-two".into(),
+        },
+        title: "unfinished".into(),
+        body: Vec::new(),
+        options: vec![MenuOption {
+            key: "abandon-and-finish".into(),
+            label: "Abandon and finish".into(),
+            detail: None,
+            decision: None,
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let facts = vec![
+        telemetry_envelope(
+            &session_id,
+            1,
+            0,
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_one.clone(),
+                template: "scripted".into(),
+                digest: "scripted-digest".into(),
+                template_version: 1,
+                start_node: Some(GraphNodeName::new("START").expect("node")),
+                nodes: nodes.clone(),
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            2,
+            1,
+            EventPayload::GraphFinalizationDeferred(GraphFinalizationDeferred {
+                graph_id: graph_one.clone(),
+                run_id: RunId::new("run-scripted-one"),
+                state_digest: "state-one".into(),
+                unmet_nodes: vec![GraphNodeName::new("START").expect("node")],
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            3,
+            2,
+            EventPayload::GraphCompleted(GraphCompleted {
+                graph_id: graph_one,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            4,
+            3,
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_two.clone(),
+                template: "scripted".into(),
+                digest: "scripted-digest".into(),
+                template_version: 1,
+                start_node: Some(GraphNodeName::new("START").expect("node")),
+                nodes,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            5,
+            4,
+            EventPayload::GraphFinalizationDeferred(GraphFinalizationDeferred {
+                graph_id: graph_two.clone(),
+                run_id: run_two,
+                state_digest: "state-two".into(),
+                unmet_nodes: vec![GraphNodeName::new("START").expect("node")],
+            }),
+        ),
+        telemetry_envelope(&session_id, 6, 5, EventPayload::MenuOpened(menu)),
+        telemetry_envelope(
+            &session_id,
+            7,
+            6,
+            EventPayload::MenuAnswered(MenuAnswer {
+                menu: menu_id,
+                option_key: Some("abandon-and-finish".into()),
+                option_index: 0,
+                value: None,
+                via: AnswerVia::Rpc,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            8,
+            6,
+            EventPayload::GraphAbandoned(haider_protocol::graph::GraphAbandoned {
+                graph_id: graph_two,
+                why: "override".into(),
+            }),
+        ),
+    ];
+    let projection = reduce_graph_telemetry(&facts);
+    let rollup = &projection.graph_template_rollups[0];
+    assert_eq!((rollup.runs, rollup.completed, rollup.abandoned), (2, 1, 1));
+    assert_eq!((rollup.mis_gate_count, rollup.override_count), (2, 1));
+    assert_eq!(rollup.completion_rate_basis_points, 5_000);
+    assert_eq!(rollup.abandon_rate_basis_points, 5_000);
+}
+
+#[test]
+fn m2c_supersession_is_not_abandonment_telemetry() {
+    // Expected failure under mutation: folding all non-completion terminals
+    // into abandonment makes both counters equal one.
+    let session_id = SessionId::new("m2c-supersession-metric");
+    let graph_id = GraphId::new("graph-supersession-metric");
+    let facts = vec![
+        telemetry_envelope(
+            &session_id,
+            1,
+            0,
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_id.clone(),
+                template: "supersession-law".into(),
+                digest: "supersession-digest".into(),
+                template_version: 1,
+                start_node: Some(GraphNodeName::new("START").expect("node")),
+                nodes: vec![telemetry_node("START", &[])],
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            2,
+            10,
+            EventPayload::GraphSuperseded(GraphSuperseded {
+                old: graph_id,
+                new: GraphId::new("graph-successor"),
+            }),
+        ),
+    ];
+    let projection = reduce_graph_telemetry(&facts);
+    let rollup = &projection.graph_template_rollups[0];
+    assert_eq!(rollup.superseded, 1);
+    assert_eq!(rollup.abandoned, 0);
+}
+
+#[test]
+fn m2c_graph_inspect_is_bounded_paged_and_never_exposes_evidence_detail() {
+    // Expected failure under mutation: returning raw evidence detail, ignoring
+    // the page bound, or dropping M2a signal provenance breaks this surface.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2c-inspect");
+    pin(&store, &session_id, "m2c-inspect");
+    record(
+        &store,
+        &session_id,
+        41_000,
+        haider_protocol::graph::build_node(),
+        EvidenceVerdict::Green,
+        "SECRET RAW BUILD OUTPUT",
+    );
+    record_verify_slot(
+        &store,
+        &session_id,
+        41_001,
+        "tests",
+        EvidenceVerdict::Green,
+        "SECRET RAW TEST OUTPUT",
+    );
+    let first = store
+        .graph_inspect(&session_id, None, 1)
+        .expect("first inspect page");
+    assert_eq!(first.snapshot.evidence.len(), 1);
+    let cursor = first.next_cursor.expect("more evidence");
+    let second = store
+        .graph_inspect(&session_id, Some(&cursor), 1)
+        .expect("second inspect page");
+    assert_eq!(second.snapshot.evidence.len(), 1);
+    assert!(second.snapshot.evidence[0].signal.is_some());
+    let encoded = serde_json::to_string(&(first.snapshot, second.snapshot))
+        .expect("inspect snapshot serializes");
+    assert!(!encoded.contains("SECRET RAW"));
+
+    let clamped = store
+        .graph_inspect(&session_id, None, u32::MAX)
+        .expect("oversized limit clamps");
+    assert!(
+        clamped.snapshot.evidence.len()
+            <= usize::try_from(haider_protocol::graph::GRAPH_INSPECT_MAX_PAGE)
+                .expect("page max fits usize")
+    );
+    assert!(clamped.snapshot.runs.len() <= haider_protocol::graph::GRAPH_INSPECT_MAX_RUNS);
+    assert!(
+        clamped.snapshot.template_rollups.len() <= haider_protocol::graph::GRAPH_INSPECT_MAX_RUNS
+    );
 }
