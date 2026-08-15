@@ -381,7 +381,14 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
     let snapshot = tool_inventory_snapshot(&store, &session_id)
         .await
         .expect("inventory");
-    let registry = registered_tools();
+    // M2e: `workflow_author` is a GATED child capability, excluded from the
+    // general inventory snapshot (see `tool_inventory_snapshot`) — the standard
+    // projection is the registry MINUS that gated tool. This session holds an
+    // FsWrite grant, not the workflow-author grant, so it must not surface.
+    let registry: Vec<_> = registered_tools()
+        .into_iter()
+        .filter(|entry| entry.manifest.name != "workflow_author")
+        .collect();
     assert_eq!(snapshot.tools.len(), registry.len());
     for (projected, registered) in snapshot.tools.iter().zip(registry) {
         assert_eq!(projected.manifest, registered.manifest);
