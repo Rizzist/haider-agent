@@ -1264,16 +1264,20 @@ fn normalize_windows_credential(mut bytes: Zeroizing<Vec<u8>>) -> Option<Zeroizi
     let big_endian = bytes.starts_with(&[0xfe, 0xff]);
     let little_endian = bytes.starts_with(&[0xff, 0xfe]);
     let start = usize::from(big_endian || little_endian) * 2;
-    let mut units = bytes[start..]
-        .chunks_exact(2)
-        .map(|unit| {
-            if big_endian {
-                u16::from_be_bytes([unit[0], unit[1]])
-            } else {
-                u16::from_le_bytes([unit[0], unit[1]])
-            }
-        })
-        .collect::<Zeroizing<Vec<_>>>();
+    // Zeroizing has no FromIterator — collect first, then wrap (same
+    // zeroize-on-drop guarantee).
+    let mut units = Zeroizing::new(
+        bytes[start..]
+            .chunks_exact(2)
+            .map(|unit| {
+                if big_endian {
+                    u16::from_be_bytes([unit[0], unit[1]])
+                } else {
+                    u16::from_le_bytes([unit[0], unit[1]])
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
     while units.last() == Some(&0) {
         units.pop();
     }
