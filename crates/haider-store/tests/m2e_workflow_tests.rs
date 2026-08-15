@@ -88,6 +88,7 @@ fn m2e_authored_replacement_cannot_launder_model_testimony_into_daemon_authority
             slot: None,
             subject_digest: None,
             signal: None,
+            workspace_mutation: None,
             child_contract: None,
             device_id: DeviceId::new("m2e-test"),
         })
@@ -184,6 +185,7 @@ fn m2e_authored_replacement_cannot_launder_model_testimony_into_daemon_authority
             slot: Some("model".into()),
             subject_digest: Some("model-revision".into()),
             signal: None,
+            workspace_mutation: None,
             child_contract: None,
             device_id: DeviceId::new("m2e-test"),
         })
@@ -223,6 +225,7 @@ fn m2e_authored_replacement_cannot_launder_model_testimony_into_daemon_authority
             slot: Some("tests".into()),
             subject_digest: Some(child_contract_subject_digest(&contract)),
             signal: None,
+            workspace_mutation: None,
             child_contract: Some(contract),
             device_id: DeviceId::new("m2e-test"),
         })
@@ -333,6 +336,7 @@ fn m2e_exact_parent_attempt_attaches_once_and_collapses_once_without_authority_g
             slot: None,
             subject_digest: None,
             signal: None,
+            workspace_mutation: None,
             child_contract: None,
             device_id: DeviceId::new("m2e-test"),
         })
@@ -491,6 +495,7 @@ fn m2e_exact_parent_attempt_attaches_once_and_collapses_once_without_authority_g
             slot: Some("tests".into()),
             subject_digest: Some("competing-subject".into()),
             signal: None,
+            workspace_mutation: None,
             child_contract: None,
             device_id: DeviceId::new("m2e-test"),
         })
@@ -550,6 +555,7 @@ fn m2e_exact_parent_attempt_attaches_once_and_collapses_once_without_authority_g
         slot: Some("tests".into()),
         subject_digest: Some(child_contract_subject_digest(&contract)),
         signal: None,
+        workspace_mutation: None,
         child_contract: Some(contract),
         device_id: DeviceId::new("m2e-test"),
     };

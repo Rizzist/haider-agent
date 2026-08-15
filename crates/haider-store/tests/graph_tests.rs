@@ -5,28 +5,36 @@
 use std::collections::HashSet;
 
 use haider_protocol::EventPayload;
-use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPhase};
+use haider_protocol::effect::{
+    EffectClass, EffectIntent, EffectOutcome, EffectPhase, WorkspaceMutation,
+};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
     ChildWorkflowSelector, EvidenceAuthority, EvidenceRecorded, EvidenceVerdict,
     GraphAttemptOpened, GraphBlockReason, GraphCompleted, GraphEvidenceSource, GraphExecutorShape,
-    GraphFinalizationDeferred, GraphGateKind, GraphNodeName, GraphNodeSpec, GraphPhase,
-    GraphPinned, GraphRunScope, GraphRunSetOpened, GraphSuperseded, GraphTemplateSpec,
+    GraphFinalizationDeferred, GraphGateKind, GraphInspectSnapshot, GraphNodeName, GraphNodeSpec,
+    GraphPhase, GraphPinned, GraphRunScope, GraphRunSetOpened, GraphSuperseded, GraphTemplateSpec,
     ParentGraphAttempt, ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE,
-    STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector, TodoGraphAttached, build_node,
-    child_contract_subject_digest, child_gate_structure, evidence_fingerprint, graph_template,
-    graph_template_catalog, graph_template_digest, implement_verify_child_template,
-    process_signal_subject_digest, reduce_graph_telemetry, ship_loop_nodes,
+    STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector, TodoGraphAttached,
+    WorkspaceMutationRef, build_node, child_contract_subject_digest, child_gate_structure,
+    evidence_fingerprint, graph_template, graph_template_catalog, graph_template_digest,
+    implement_verify_child_template, process_signal_subject_digest, reduce_graph_telemetry,
+    ship_loop_nodes,
 };
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{
-    DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId, RunId, SessionId,
+    DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId, RunId, SessionId, TaskId,
+    WorkspaceRevision,
 };
-use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
+use haider_protocol::task::{
+    TaskCompleted, TaskCompletionDelivery, TaskEventPayload, TaskTerminalState,
+};
+use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_store::{
     ChildTemplateObservationCommand, EventStore, GraphAbandonCommand, GraphAbandonOutcome,
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
@@ -123,6 +131,7 @@ fn evidence_command(
         slot: None,
         subject_digest: None,
         signal: None,
+        workspace_mutation: None,
         child_contract: None,
         device_id: DeviceId::new("graph-test"),
     }
@@ -287,6 +296,7 @@ fn process_signal_command_for_args(
                 effect: effect_id.clone(),
                 outcome,
                 freshness: None,
+                workspace_mutation: None,
             }),
         ),
     ];
@@ -314,11 +324,82 @@ fn process_signal_command_for_args(
                 subject_digest: subject_digest.clone(),
                 artifact: None,
             },
+            stamp_workspace_revision: false,
             device_id: DeviceId::new("graph-test"),
         },
         signal_ref,
         subject_digest,
     )
+}
+
+fn append_workspace_mutation(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &RunId,
+    serial: usize,
+    class: EffectClass,
+) -> (WorkspaceMutation, u64) {
+    let effect_id = EffectId::new(format!("mutation-effect-{serial}"));
+    let mutation_digest = format!("blake3:mutation-{serial}");
+    let mut facts = vec![
+        raw_envelope(
+            store,
+            session_id,
+            run_id,
+            format!("mutation-intent-{serial}"),
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect_id.clone(),
+                class,
+                summary: format!("mutation {serial}"),
+                args_digest: format!("blake3:mutation-args-{serial}"),
+                workspace_revision: None,
+            })),
+        ),
+        raw_envelope(
+            store,
+            session_id,
+            run_id,
+            format!("mutation-outcome-{serial}"),
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: effect_id.clone(),
+                outcome: EffectOutcome::Ok,
+                freshness: None,
+                workspace_mutation: Some(WorkspaceMutation {
+                    effect_id,
+                    mutation_digest,
+                    workspace_revision: None,
+                    subject_digest: None,
+                }),
+            }),
+        ),
+    ];
+    store.append(&mut facts).expect("append mutation facts");
+    let EventPayload::Effect(EffectPhase::Outcome {
+        workspace_mutation: Some(mutation),
+        ..
+    }) = serde_json::from_value::<EventPayload>(facts[1].payload.clone())
+        .expect("decode stamped mutation")
+    else {
+        panic!("mutation outcome remains present");
+    };
+    (mutation, facts[1].seq)
+}
+
+fn record_revision_process_signal(
+    store: &Store,
+    session_id: &SessionId,
+    serial: usize,
+) -> ProcessSignalRecorded {
+    let (mut command, _, _) =
+        process_signal_command(store, session_id, serial, 0, "revision signal");
+    command.stamp_workspace_revision = true;
+    match store
+        .record_process_signal(&command)
+        .expect("record revision-aware process signal")
+    {
+        ProcessSignalOutcome::Committed { signal, .. }
+        | ProcessSignalOutcome::IdempotentReplay { signal, .. } => signal,
+    }
 }
 
 fn attach_verify_signal(
@@ -868,6 +949,381 @@ fn stale_process_subject_is_typed_rejection() {
             .details
             .as_ref()
             .and_then(|value| value["kind"].as_str()),
+        Some("stale_evidence_subject")
+    );
+}
+
+#[test]
+fn workspace_revisions_advance_only_on_mutations_and_rebuild_uniformly() {
+    // LAWS 1, 3, 4 — MUTATION CHECK: stamping a read, using separate process/
+    // filesystem counters, or retaining cache-only subjects changes these
+    // exact durable bytes (including after reopen).
+    let root = tempfile::tempdir().expect("tempdir");
+    let session_id = SessionId::new("workspace-revision-laws");
+    let before = {
+        let store = Store::open(root.path()).expect("open store");
+        create_session(&store, session_id.as_str());
+        let run_id = RunId::new("workspace-revision-run");
+        let (fs_mutation, fs_seq) =
+            append_workspace_mutation(&store, &session_id, &run_id, 50_001, EffectClass::FsWrite);
+        assert_eq!(
+            fs_mutation.workspace_revision,
+            Some(WorkspaceRevision::new(format!(
+                "workspace-revision:{fs_seq}"
+            )))
+        );
+
+        let mut read = vec![
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "workspace-read-intent",
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    effect: EffectId::new("workspace-read"),
+                    class: EffectClass::FsRead,
+                    summary: "read only".into(),
+                    args_digest: "blake3:read-only".into(),
+                    workspace_revision: None,
+                })),
+            ),
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "workspace-read-outcome",
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect: EffectId::new("workspace-read"),
+                    outcome: EffectOutcome::Ok,
+                    freshness: None,
+                    workspace_mutation: None,
+                }),
+            ),
+        ];
+        store.append(&mut read).expect("append pure read");
+        let after_read = record_revision_process_signal(&store, &session_id, 50_002);
+        assert_eq!(
+            after_read.workspace_revision, fs_mutation.workspace_revision,
+            "pure read must not advance the revision"
+        );
+
+        let (process_mutation, process_seq) = append_workspace_mutation(
+            &store,
+            &session_id,
+            &run_id,
+            50_003,
+            EffectClass::ProcessExec,
+        );
+        assert_eq!(
+            process_mutation.workspace_revision,
+            Some(WorkspaceRevision::new(format!(
+                "workspace-revision:{process_seq}"
+            )))
+        );
+        assert_ne!(
+            process_mutation.workspace_revision, fs_mutation.workspace_revision,
+            "both mutation classes share one monotonic revision stream"
+        );
+
+        let background_effect = EffectId::new("background-mutation-effect");
+        let mut background_effect_facts = vec![
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "background-mutation-intent",
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    effect: background_effect.clone(),
+                    class: EffectClass::ProcessExec,
+                    summary: "background mutation".into(),
+                    args_digest: "blake3:background-args".into(),
+                    workspace_revision: None,
+                })),
+            ),
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "background-spawn-outcome",
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect: background_effect.clone(),
+                    outcome: EffectOutcome::Ok,
+                    freshness: None,
+                    workspace_mutation: None,
+                }),
+            ),
+        ];
+        store
+            .append(&mut background_effect_facts)
+            .expect("append background process spawn");
+        let completed = TaskCompleted {
+            task: TaskId::new("background-mutation-task"),
+            name: "background-mutation".into(),
+            state: TaskTerminalState::Completed { exit_code: Some(0) },
+            elapsed_ms: 1,
+            output_bytes: 0,
+            tail: String::new(),
+            artifact: None,
+            full_output_unavailable: false,
+            truncated: false,
+            delivery: TaskCompletionDelivery::DeliveredQueued,
+            workspace_mutation: Some(WorkspaceMutation {
+                effect_id: background_effect.clone(),
+                mutation_digest: "blake3:background-mutation".into(),
+                workspace_revision: None,
+                subject_digest: None,
+            }),
+        };
+        let mut background_completion = raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "background-mutation-completed",
+            EventPayload::RunState(RunState::Thinking),
+        );
+        background_completion.payload = completed.to_payload_value().expect("task payload");
+        let mut background_completion = vec![background_completion];
+        store
+            .append(&mut background_completion)
+            .expect("append background mutation completion");
+        let Some(TaskEventPayload::TaskCompleted(completed)) =
+            TaskEventPayload::from_payload_value(&background_completion[0].payload)
+        else {
+            panic!("stamped task completion remains decodable");
+        };
+        let background_revision = completed
+            .workspace_mutation
+            .and_then(|mutation| mutation.workspace_revision)
+            .expect("background mutation revision");
+        assert_eq!(
+            background_revision,
+            WorkspaceRevision::new(format!(
+                "workspace-revision:{}",
+                background_completion[0].seq
+            ))
+        );
+        assert_eq!(
+            record_revision_process_signal(&store, &session_id, 50_004).workspace_revision,
+            Some(background_revision),
+            "detached and foreground process mutations share the revision stream"
+        );
+        serde_json::to_vec(&store.journal_replay(&session_id).expect("journal"))
+            .expect("encode journal")
+    };
+    let store = Store::open(root.path()).expect("reopen store");
+    let after = serde_json::to_vec(&store.journal_replay(&session_id).expect("rebuilt journal"))
+        .expect("encode rebuilt journal");
+    assert_eq!(before, after, "revision provenance rebuilds byte-for-byte");
+}
+
+#[test]
+fn process_signal_binds_to_its_outcome_revision_across_interleaved_mutation() {
+    // LAW 2 — MUTATION CHECK: sampling the revision in the signal transaction
+    // incorrectly assigns the later mutation to an earlier process result.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "process-outcome-revision-race");
+    pin(&store, &session_id, "process-outcome-revision-race");
+    advance_to_verify(&store, &session_id, 50_100);
+    let (first_mutation, _) = append_workspace_mutation(
+        &store,
+        &session_id,
+        &RunId::new("race-first-mutation"),
+        50_101,
+        EffectClass::FsWrite,
+    );
+    let (mut signal_command, signal_ref, _) =
+        process_signal_command(&store, &session_id, 50_102, 0, "tests passed");
+    signal_command.stamp_workspace_revision = true;
+    append_workspace_mutation(
+        &store,
+        &session_id,
+        &RunId::new("race-later-mutation"),
+        50_103,
+        EffectClass::FsWrite,
+    );
+    let signal = match store
+        .record_process_signal(&signal_command)
+        .expect("record interleaved signal")
+    {
+        ProcessSignalOutcome::Committed { signal, .. }
+        | ProcessSignalOutcome::IdempotentReplay { signal, .. } => signal,
+    };
+    assert_eq!(signal.workspace_revision, first_mutation.workspace_revision);
+
+    let mut evidence = evidence_command(
+        &store,
+        &session_id,
+        50_104,
+        haider_protocol::graph::verify_node(),
+        EvidenceVerdict::Green,
+        "interleaved result is stale",
+    );
+    evidence.run_id = signal.run_id.clone();
+    evidence.slot = Some("tests".into());
+    evidence.subject_digest = Some(signal.subject_digest.clone());
+    evidence.signal = Some(signal_ref);
+    let error = store
+        .record_graph_evidence(&evidence)
+        .expect_err("later mutation must stale the earlier process boundary");
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details["kind"].as_str()),
+        Some("stale_evidence_subject")
+    );
+}
+
+#[test]
+fn read_class_effect_cannot_forge_a_workspace_mutation() {
+    // LAW 1 — MUTATION CHECK: a caller-supplied mutation on a pure read must
+    // not advance the durable revision counter.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "read-cannot-bump-revision");
+    let run_id = RunId::new("read-cannot-bump-run");
+    let head = store.latest_seq(&session_id).expect("head");
+    let effect = EffectId::new("forged-read-mutation");
+    let mut facts = vec![
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "forged-read-intent",
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class: EffectClass::FsRead,
+                summary: "pure read".into(),
+                args_digest: "blake3:pure-read".into(),
+                workspace_revision: None,
+            })),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "forged-read-outcome",
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: effect.clone(),
+                outcome: EffectOutcome::Ok,
+                freshness: None,
+                workspace_mutation: Some(WorkspaceMutation {
+                    effect_id: effect,
+                    mutation_digest: "blake3:forged-read".into(),
+                    workspace_revision: None,
+                    subject_digest: None,
+                }),
+            }),
+        ),
+    ];
+    let error = store
+        .append(&mut facts)
+        .expect_err("read-class mutation must reject");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(store.latest_seq(&session_id).expect("head"), head);
+}
+
+#[test]
+fn later_filesystem_mutation_stales_revision_bound_process_evidence() {
+    // LAW 2 — MUTATION CHECK: removing the journal-current revision compare
+    // lets this otherwise valid command-bound process subject prove green.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "workspace-revision-stale-law");
+    pin(&store, &session_id, "workspace-revision-stale-law");
+    advance_to_verify(&store, &session_id, 51_000);
+    let signal = record_revision_process_signal(&store, &session_id, 51_001);
+    append_workspace_mutation(
+        &store,
+        &session_id,
+        &RunId::new("later-fs-mutation"),
+        51_002,
+        EffectClass::FsWrite,
+    );
+
+    let mut command = evidence_command(
+        &store,
+        &session_id,
+        51_003,
+        haider_protocol::graph::verify_node(),
+        EvidenceVerdict::Green,
+        "old tests are now stale",
+    );
+    command.run_id = signal.run_id.clone();
+    command.slot = Some("tests".into());
+    command.subject_digest = Some(signal.subject_digest.clone());
+    command.signal = Some(ProcessSignalRef {
+        run_id: signal.run_id,
+        call_id: signal.call_id,
+        effect_id: signal.effect_id,
+    });
+    let error = store
+        .record_graph_evidence(&command)
+        .expect_err("later mutation must stale earlier evidence");
+    assert_eq!(error.code, ErrorCode::RevisionConflict);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details["kind"].as_str()),
+        Some("stale_evidence_subject")
+    );
+}
+
+#[test]
+fn filesystem_mutation_subject_is_daemon_verified_and_stale_checkable() {
+    // LAWS 2/4 — MUTATION CHECK: dropping the fs provenance branch either
+    // rejects a fresh subject or accepts it after the common revision moves.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "fs-mutation-evidence-law");
+    pin(&store, &session_id, "fs-mutation-evidence-law");
+    advance_to_verify(&store, &session_id, 52_000);
+    let run_id = RunId::new("fs-mutation-evidence-run");
+    let (mutation, _) =
+        append_workspace_mutation(&store, &session_id, &run_id, 52_001, EffectClass::FsWrite);
+    let mutation_ref = WorkspaceMutationRef {
+        run_id: run_id.clone(),
+        effect_id: mutation.effect_id.clone(),
+    };
+    let mut fresh = evidence_command(
+        &store,
+        &session_id,
+        52_002,
+        haider_protocol::graph::verify_node(),
+        EvidenceVerdict::Green,
+        "filesystem mutation committed",
+    );
+    fresh.run_id = run_id;
+    fresh.slot = Some("tests".into());
+    fresh.subject_digest = mutation.subject_digest.clone();
+    fresh.workspace_mutation = Some(mutation_ref.clone());
+    store
+        .record_graph_evidence(&fresh)
+        .expect("fresh fs mutation is daemon-verifiable");
+
+    append_workspace_mutation(
+        &store,
+        &session_id,
+        &RunId::new("fs-mutation-evidence-later"),
+        52_003,
+        EffectClass::FsWrite,
+    );
+    let mut stale = fresh;
+    stale.command_id = "fs-mutation-stale-command".into();
+    stale.request_digest = "fs-mutation-stale-digest".into();
+    stale.request_json = r#"{"stale":true}"#.into();
+    stale.workspace_mutation = Some(mutation_ref);
+    let error = store
+        .record_graph_evidence(&stale)
+        .expect_err("later mutation stales fs subject");
+    assert_eq!(error.code, ErrorCode::RevisionConflict);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details["kind"].as_str()),
         Some("stale_evidence_subject")
     );
 }
@@ -1484,7 +1940,8 @@ fn replaying_the_same_signal_and_evidence_is_exactly_once() {
             .record_process_signal(&signal_command)
             .expect("signal lost-response replay"),
         ProcessSignalOutcome::IdempotentReplay {
-            recorded: recorded.clone()
+            recorded: recorded.clone(),
+            signal: signal_command.signal.clone(),
         }
     );
 
@@ -2869,6 +3326,228 @@ fn telemetry_envelope(
         },
         payload: serde_json::to_value(payload).expect("payload"),
     }
+}
+
+fn append_tool_attempt(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &RunId,
+    call_id: &str,
+    tool_name: &str,
+    args: serde_json::Value,
+    result_status: ToolResultStatus,
+) {
+    let item_id = ItemId::new(format!("item-{call_id}"));
+    let item_status = result_status.item_status();
+    let mut facts = vec![
+        raw_envelope(
+            store,
+            session_id,
+            run_id,
+            format!("tool-started-{call_id}"),
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: TurnItem::ToolCall {
+                    call_id: call_id.into(),
+                    name: tool_name.into(),
+                    args: args.clone(),
+                    status: ToolStatus::InProgress,
+                },
+            }),
+        ),
+        raw_envelope(
+            store,
+            session_id,
+            run_id,
+            format!("tool-result-{call_id}"),
+            EventPayload::ToolResult {
+                call_id: call_id.into(),
+                result: BoundedResult {
+                    preview: format!("{tool_name} result"),
+                    truncated: false,
+                    artifact: None,
+                    cursor: None,
+                    status: result_status,
+                    reason: (!result_status.is_completed()).then(|| "typed rejection".into()),
+                    presentation: None,
+                },
+            },
+        ),
+        raw_envelope(
+            store,
+            session_id,
+            run_id,
+            format!("tool-completed-{call_id}"),
+            EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item: TurnItem::ToolCall {
+                    call_id: call_id.into(),
+                    name: tool_name.into(),
+                    args,
+                    status: item_status,
+                },
+            }),
+        ),
+    ];
+    store.append(&mut facts).expect("append tool attempt facts");
+}
+
+#[test]
+fn tool_selection_rollup_counts_repairs_without_flagging_normal_read_edit_read() {
+    // LAWS 6–9 — MUTATION CHECK: counting lifecycle duplicates, treating all
+    // retries as redundant, losing the cache on reopen, or omitting the
+    // bounded inspect field changes these exact rows/bytes.
+    let root = tempfile::tempdir().expect("tempdir");
+    let session_id = SessionId::new("tool-selection-laws");
+    let before = {
+        let store = Store::open(root.path()).expect("open store");
+        create_session(&store, session_id.as_str());
+        let run_id = RunId::new("tool-selection-run");
+
+        append_tool_attempt(
+            &store,
+            &session_id,
+            &run_id,
+            "read-rejected",
+            "fs_read",
+            serde_json::json!({"path":"missing.txt"}),
+            ToolResultStatus::Rejected,
+        );
+        append_tool_attempt(
+            &store,
+            &session_id,
+            &run_id,
+            "read-repair",
+            "fs_read",
+            serde_json::json!({"path":"present.txt"}),
+            ToolResultStatus::Completed,
+        );
+        // This successful read -> edit -> read is legitimate and must not add
+        // a redundancy despite the repeated tool name.
+        append_tool_attempt(
+            &store,
+            &session_id,
+            &run_id,
+            "read-before-edit",
+            "fs_read",
+            serde_json::json!({"path":"src/lib.rs"}),
+            ToolResultStatus::Completed,
+        );
+        append_tool_attempt(
+            &store,
+            &session_id,
+            &run_id,
+            "edit",
+            "fs_edit",
+            serde_json::json!({"path":"src/lib.rs","edits":[{"old":"a","new":"b"}]}),
+            ToolResultStatus::Completed,
+        );
+        append_tool_attempt(
+            &store,
+            &session_id,
+            &run_id,
+            "read-after-edit",
+            "fs_read",
+            serde_json::json!({"path":"src/lib.rs"}),
+            ToolResultStatus::Completed,
+        );
+        append_tool_attempt(
+            &store,
+            &session_id,
+            &run_id,
+            "process-failed",
+            "process_exec",
+            serde_json::json!({"command":"false"}),
+            ToolResultStatus::Failed,
+        );
+
+        let inspect = store
+            .graph_inspect(&session_id, None, u32::MAX)
+            .expect("inspect tool selection");
+        assert_eq!(
+            inspect.snapshot.tool_selection,
+            vec![
+                haider_protocol::graph::ToolSelectionRow {
+                    tool_name: "fs_read".into(),
+                    total_calls: 4,
+                    error_count: 1,
+                    error_rate_basis_points: 2_500,
+                    redundant_call_count: 1,
+                },
+                haider_protocol::graph::ToolSelectionRow {
+                    tool_name: "fs_edit".into(),
+                    total_calls: 1,
+                    error_count: 0,
+                    error_rate_basis_points: 0,
+                    redundant_call_count: 0,
+                },
+                haider_protocol::graph::ToolSelectionRow {
+                    tool_name: "process_exec".into(),
+                    total_calls: 1,
+                    error_count: 1,
+                    error_rate_basis_points: 10_000,
+                    redundant_call_count: 0,
+                },
+            ]
+        );
+        for index in 0..40 {
+            append_tool_attempt(
+                &store,
+                &session_id,
+                &run_id,
+                &format!("bounded-{index}"),
+                &format!("tool_{index:02}"),
+                serde_json::json!({"index":index}),
+                ToolResultStatus::Completed,
+            );
+        }
+        let bounded = store
+            .graph_inspect(&session_id, None, u32::MAX)
+            .expect("bounded inspect");
+        assert_eq!(
+            bounded.snapshot.tool_selection.len(),
+            haider_protocol::graph::GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS
+        );
+        serde_json::to_vec(&bounded.snapshot.tool_selection).expect("encode rollup")
+    };
+    let store = Store::open(root.path()).expect("reopen store");
+    let after_snapshot = store
+        .graph_inspect(&session_id, None, u32::MAX)
+        .expect("inspect rebuilt rollup")
+        .snapshot;
+    let after = serde_json::to_vec(&after_snapshot.tool_selection).expect("encode rebuilt rollup");
+    assert_eq!(before, after, "tool rollup rebuilds byte-for-byte");
+    assert!(
+        after_snapshot.tool_selection.len()
+            <= haider_protocol::graph::GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS
+    );
+
+    let legacy: GraphInspectSnapshot = serde_json::from_value(serde_json::json!({
+        "through_seq": 0,
+        "runs": [],
+        "template_rollups": [],
+        "evidence": []
+    }))
+    .expect("legacy inspect snapshot decodes without additive field");
+    assert!(legacy.tool_selection.is_empty());
+
+    #[derive(serde::Deserialize)]
+    struct LegacyInspectSnapshot {
+        through_seq: u64,
+        runs: Vec<serde_json::Value>,
+        template_rollups: Vec<serde_json::Value>,
+        evidence: Vec<serde_json::Value>,
+    }
+    let legacy_reader: LegacyInspectSnapshot =
+        serde_json::from_value(serde_json::to_value(&after_snapshot).expect("new snapshot json"))
+            .expect("legacy reader ignores additive tool_selection field");
+    assert_eq!(legacy_reader.through_seq, after_snapshot.through_seq);
+    assert_eq!(legacy_reader.runs.len(), after_snapshot.runs.len());
+    assert_eq!(
+        legacy_reader.template_rollups.len(),
+        after_snapshot.template_rollups.len()
+    );
+    assert_eq!(legacy_reader.evidence.len(), after_snapshot.evidence.len());
 }
 
 fn telemetry_node(name: &str, dependencies: &[&str]) -> GraphNodeSpec {

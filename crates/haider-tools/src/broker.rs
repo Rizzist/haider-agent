@@ -49,7 +49,7 @@ use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
-    EffectPhase, FileFreshness,
+    EffectPhase, FileFreshness, WorkspaceMutation,
 };
 use haider_protocol::ids::{EffectId, MenuId, SessionId, WorkspaceRevision};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
@@ -666,6 +666,7 @@ impl BrokerJournal {
         intent: &EffectIntent,
         result: ToolResult<T>,
         freshness: Option<FileFreshness>,
+        workspace_mutation: Option<WorkspaceMutation>,
     ) -> ToolResult<T> {
         let outcome = match &result {
             Ok(_) => EffectOutcome::Ok,
@@ -676,7 +677,7 @@ impl BrokerJournal {
         let Some(claim) = self.claim_terminal(intent)? else {
             return result;
         };
-        match claim.append(outcome, freshness).await {
+        match claim.append(outcome, freshness, workspace_mutation).await {
             Ok(()) => result,
             Err(error) => Err(error),
         }
@@ -710,12 +711,14 @@ impl TerminalClaim {
         mut self,
         outcome: EffectOutcome,
         freshness: Option<FileFreshness>,
+        workspace_mutation: Option<WorkspaceMutation>,
     ) -> ToolResult<()> {
         self.dispatched = true;
         let phase = EffectPhase::Outcome {
             effect: self.effect.clone(),
             outcome,
             freshness,
+            workspace_mutation,
         };
         match self.journal.append_phase(phase).await {
             Ok(()) => {
@@ -761,27 +764,52 @@ impl FinalizerObserver {
 }
 
 impl EffectFinish {
+    #[allow(dead_code)]
     pub(crate) async fn finish<T>(self, result: ToolResult<T>) -> ToolResult<T> {
         self.journal
-            .finish_in_finalizer(&self.intent, result, None)
+            .finish_in_finalizer(&self.intent, result, None, None)
             .await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn finish_with_freshness<T>(
         self,
         result: ToolResult<T>,
         freshness: Option<FileFreshness>,
     ) -> ToolResult<T> {
         self.journal
-            .finish_in_finalizer(&self.intent, result, freshness)
+            .finish_in_finalizer(&self.intent, result, freshness, None)
             .await
     }
 
+    pub(crate) async fn finish_with_workspace_mutation<T>(
+        self,
+        result: ToolResult<T>,
+        freshness: Option<FileFreshness>,
+        workspace_mutation: Option<WorkspaceMutation>,
+    ) -> ToolResult<T> {
+        self.journal
+            .finish_in_finalizer(&self.intent, result, freshness, workspace_mutation)
+            .await
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn finish_outcome(self, outcome: EffectOutcome) -> ToolResult<()> {
         let Some(claim) = self.journal.claim_terminal(&self.intent)? else {
             return Ok(());
         };
-        claim.append(outcome, None).await
+        claim.append(outcome, None, None).await
+    }
+
+    pub(crate) async fn finish_outcome_with_workspace_mutation(
+        self,
+        outcome: EffectOutcome,
+        workspace_mutation: Option<WorkspaceMutation>,
+    ) -> ToolResult<()> {
+        let Some(claim) = self.journal.claim_terminal(&self.intent)? else {
+            return Ok(());
+        };
+        claim.append(outcome, None, workspace_mutation).await
     }
 }
 
@@ -952,7 +980,8 @@ impl EffectBroker {
             let Some(claim) = claim else {
                 continue;
             };
-            let (id, result) = self.register_terminal_append(claim, EffectOutcome::Unknown, None);
+            let (id, result) =
+                self.register_terminal_append(claim, EffectOutcome::Unknown, None, None);
             match result.await {
                 Ok(Ok(())) => {
                     self.observe_finalizer(id);
@@ -1200,7 +1229,7 @@ impl EffectBroker {
         intent: &EffectIntent,
         outcome: EffectOutcome,
     ) -> ToolResult<()> {
-        self.dispatch_terminal(intent, outcome, None).await
+        self.dispatch_terminal(intent, outcome, None, None).await
     }
 
     /// Reconciles a dispatch/outcome recovery window explicitly.
@@ -1280,7 +1309,7 @@ impl EffectBroker {
                 error: error.to_string(),
             },
         };
-        match self.dispatch_terminal(intent, outcome, None).await {
+        match self.dispatch_terminal(intent, outcome, None, None).await {
             Ok(()) => result,
             Err(error) => Err(error),
         }
@@ -1298,7 +1327,10 @@ impl EffectBroker {
                 error: error.to_string(),
             },
         };
-        match self.dispatch_terminal(intent, outcome, freshness).await {
+        match self
+            .dispatch_terminal(intent, outcome, freshness, None)
+            .await
+        {
             Ok(()) => result,
             Err(error) => Err(error),
         }
@@ -1343,10 +1375,11 @@ impl EffectBroker {
         claim: TerminalClaim,
         outcome: EffectOutcome,
         freshness: Option<FileFreshness>,
+        workspace_mutation: Option<WorkspaceMutation>,
     ) -> (u64, tokio::sync::oneshot::Receiver<ToolResult<()>>) {
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let id = self.register_finalizer(async move {
-            let result = claim.append(outcome, freshness).await;
+            let result = claim.append(outcome, freshness, workspace_mutation).await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -1359,11 +1392,13 @@ impl EffectBroker {
         intent: &EffectIntent,
         outcome: EffectOutcome,
         freshness: Option<FileFreshness>,
+        workspace_mutation: Option<WorkspaceMutation>,
     ) -> ToolResult<()> {
         let Some(claim) = self.journal.claim_terminal(intent)? else {
             return Ok(());
         };
-        let (id, result) = self.register_terminal_append(claim, outcome, freshness);
+        let (id, result) =
+            self.register_terminal_append(claim, outcome, freshness, workspace_mutation);
         match result.await {
             Ok(result) => {
                 self.observe_finalizer(id);

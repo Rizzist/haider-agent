@@ -103,6 +103,7 @@ fn effect_recovery_payloads(
                 effect: effect.clone(),
                 outcome: haider_protocol::effect::EffectOutcome::Ok,
                 freshness: None,
+                workspace_mutation: None,
             }),
             EventPayload::RunState(RunState::Done),
             EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
@@ -116,6 +117,7 @@ fn effect_recovery_payloads(
                     error: "settled for explicit user retry".into(),
                 },
                 freshness: None,
+                workspace_mutation: None,
             }),
             EventPayload::RunState(RunState::Errored),
             EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
@@ -129,6 +131,7 @@ fn effect_recovery_payloads(
                     error: "abandoned by user after unknown outcome".into(),
                 },
                 freshness: None,
+                workspace_mutation: None,
             }),
             EventPayload::RunFailed {
                 code: ErrorCode::EffectUnknownOutcome,

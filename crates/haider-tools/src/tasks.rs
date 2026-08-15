@@ -20,6 +20,7 @@ use crate::process::{
     reap_process_leader, set_anchored_current_dir, signal_group, signal_group_for_sweep,
 };
 use crate::{ToolError, ToolResult};
+use haider_protocol::effect::WorkspaceMutation;
 use haider_protocol::ids::EffectId;
 use haider_protocol::item::OutputStream;
 use rustix::process::{Pid, Signal};
@@ -27,7 +28,7 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::env;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -184,6 +185,8 @@ pub struct BackgroundSpawn {
     stdout: ChildStdout,
     stderr: ChildStderr,
     pid_handle: Pid,
+    workspace_root: PathBuf,
+    workspace_digest_before: String,
 }
 
 impl std::fmt::Debug for BackgroundSpawn {
@@ -249,6 +252,17 @@ impl EffectBroker {
                 policy,
             )
             .await?;
+        let workspace_root = self.workspace_root().to_path_buf();
+        let workspace_digest_before = tokio::task::spawn_blocking({
+            let workspace_root = workspace_root.clone();
+            move || crate::process::workspace_state_digest(&workspace_root)
+        })
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: format!(
+                "workspace snapshot worker failed before background process execution: {error}"
+            ),
+        })?;
         let cwd_fd =
             match prepared.cwd_for_spawn(self.workspace_root(), self.duplicate_workspace_dir()?) {
                 Ok(cwd_fd) => cwd_fd,
@@ -318,6 +332,8 @@ impl EffectBroker {
             stdout,
             stderr,
             pid_handle,
+            workspace_root,
+            workspace_digest_before,
         };
         self.finish(&intent, Ok(spawn)).await
     }
@@ -467,6 +483,8 @@ pub struct BackgroundExitStatus {
     pub killed: bool,
     /// Supervision fault detail (probe/signal/reap errors), if any.
     pub fault: Option<String>,
+    /// Mutation observed between process spawn and terminal supervision.
+    pub workspace_mutation: Option<WorkspaceMutation>,
 }
 
 /// Supervises one background child to its terminal observation: pipes tee
@@ -486,12 +504,14 @@ pub async fn supervise_background(
 ) -> BackgroundExitStatus {
     let BackgroundSpawn {
         call_id,
-        effect: _,
+        effect,
         pid: _,
         mut child,
         stdout,
         stderr,
         pid_handle: pid,
+        workspace_root,
+        workspace_digest_before,
     } = spawn;
     let (captured_sender, mut captured) = mpsc::channel(1);
     tokio::spawn(read_output(
@@ -682,6 +702,24 @@ pub async fn supervise_background(
     if let Some(error) = &fatal {
         fault_parts.push(error.to_string());
     }
+    let workspace_mutation = match tokio::task::spawn_blocking(move || {
+        crate::process::workspace_state_digest(&workspace_root)
+    })
+    .await
+    {
+        Ok(after) => (after != workspace_digest_before).then_some(WorkspaceMutation {
+            effect_id: effect,
+            mutation_digest: after,
+            workspace_revision: None,
+            subject_digest: None,
+        }),
+        Err(error) => {
+            fault_parts.push(format!(
+                "workspace snapshot worker failed after background process execution: {error}"
+            ));
+            None
+        }
+    };
     BackgroundExitStatus {
         exit_code: exit_status
             .as_ref()
@@ -691,6 +729,7 @@ pub async fn supervise_background(
             .and_then(std::os::unix::process::ExitStatusExt::signal),
         killed,
         fault: (!fault_parts.is_empty()).then(|| fault_parts.join("; ")),
+        workspace_mutation,
     }
 }
 

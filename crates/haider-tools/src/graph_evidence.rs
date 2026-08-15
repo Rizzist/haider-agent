@@ -7,6 +7,7 @@
 use crate::{ToolError, ToolResult};
 use haider_protocol::graph::{
     EvidenceVerdict, GRAPH_EVIDENCE_DETAIL_MAX_BYTES, GraphNodeName, ProcessSignalRef,
+    WorkspaceMutationRef,
 };
 use haider_protocol::ids::GraphId;
 use haider_protocol::tool::{DispatchMode, ToolManifest};
@@ -28,6 +29,8 @@ pub struct GraphEvidence {
     pub subject_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<ProcessSignalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation: Option<WorkspaceMutationRef>,
 }
 
 impl GraphEvidence {
@@ -73,6 +76,19 @@ impl GraphEvidence {
         }) {
             return Err(ToolError::invalid_argument(
                 "graph_evidence signal coordinates must not be empty",
+            ));
+        }
+        if request.workspace_mutation.as_ref().is_some_and(|mutation| {
+            mutation.run_id.as_str().trim().is_empty()
+                || mutation.effect_id.as_str().trim().is_empty()
+        }) {
+            return Err(ToolError::invalid_argument(
+                "graph_evidence workspace_mutation coordinates must not be empty",
+            ));
+        }
+        if request.signal.is_some() && request.workspace_mutation.is_some() {
+            return Err(ToolError::invalid_argument(
+                "graph_evidence accepts either signal or workspace_mutation provenance, not both",
             ));
         }
         Ok(request)
@@ -132,6 +148,16 @@ pub fn graph_evidence_manifest() -> ToolManifest {
                     "required": ["run_id", "call_id", "effect_id"],
                     "additionalProperties": false,
                     "description": "Required for daemon-verified slots; must reference a durable process signal"
+                },
+                "workspace_mutation": {
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 },
+                        "effect_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["run_id", "effect_id"],
+                    "additionalProperties": false,
+                    "description": "Alternative daemon provenance for a durable filesystem mutation"
                 }
             },
             "required": ["graph_id", "node", "verdict", "detail"],

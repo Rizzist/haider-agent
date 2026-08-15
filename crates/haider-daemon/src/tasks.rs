@@ -336,6 +336,7 @@ impl TaskFacade {
                 truncated: false,
                 full_output_unavailable: false,
                 delivery: TaskCompletionDelivery::DeliveredQueued,
+                workspace_mutation: None,
             };
             let mut envelopes = [self.task_fact_envelope(
                 session_id,
@@ -570,6 +571,7 @@ impl TaskFacade {
             truncated,
             full_output_unavailable,
             delivery: TaskCompletionDelivery::DeliveredQueued,
+            workspace_mutation: status.workspace_mutation.clone(),
         };
         let notice =
             haider_core::task_event_notice(&TaskEventPayload::TaskCompleted(completed.clone()));

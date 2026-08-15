@@ -571,6 +571,7 @@ fn golden_additive_task_facts_and_unknown_kind_tolerance() {
         truncated: true,
         full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredQueued,
+        workspace_mutation: None,
     });
     golden("task_completed", &completed);
     for fact in [&started, &completed] {
@@ -932,6 +933,7 @@ fn golden_effect_phases() {
             effect: EffectId::new("ef-shell"),
             outcome: EffectOutcome::Cancelled,
             freshness: None,
+            workspace_mutation: None,
         },
     );
     golden(
@@ -942,6 +944,7 @@ fn golden_effect_phases() {
                 note: "SIGKILL escalation failed".into(),
             },
             freshness: None,
+            workspace_mutation: None,
         },
     );
     golden(
@@ -950,6 +953,7 @@ fn golden_effect_phases() {
             effect: EffectId::new("ef-1"),
             outcome: EffectOutcome::Unknown,
             freshness: None,
+            workspace_mutation: None,
         },
     );
     golden(
@@ -961,6 +965,7 @@ fn golden_effect_phases() {
                 path: "src/lib.rs".into(),
                 digest: "blake3:fresh".into(),
             }),
+            workspace_mutation: None,
         },
     );
 }

@@ -44,6 +44,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::task::TaskEventPayload;
 use haider_tools::{MessageSubagent, SpawnSubagent};
 use rustix::fs::{Mode, OFlags};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -806,6 +807,7 @@ impl DelegationHandle {
                 slot: Some(attached.parent_slot.clone()),
                 subject_digest: Some(subject_digest),
                 signal: None,
+                workspace_mutation: None,
                 child_contract: Some(contract.clone()),
                 device_id: self.hub.device_id(),
             })
@@ -1408,9 +1410,17 @@ impl DelegationHandle {
                 if envelope.run_id.as_ref() != Some(&record.child_run_id) {
                     continue;
                 }
-                let Ok(payload) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
-                else {
+                let Ok(payload) = serde_json::from_value::<haider_protocol::EventPayload>(
+                    envelope.payload.clone(),
+                ) else {
+                    if let Some(TaskEventPayload::TaskCompleted(completed)) =
+                        TaskEventPayload::from_payload_value(&envelope.payload)
+                        && let Some(revision) = completed
+                            .workspace_mutation
+                            .and_then(|mutation| mutation.workspace_revision)
+                    {
+                        latest_revision = Some(revision);
+                    }
                     continue;
                 };
                 match payload {
@@ -1434,6 +1444,16 @@ impl DelegationHandle {
                     haider_protocol::EventPayload::ProcessSignalRecorded(signal) => {
                         if signal.workspace_revision.is_some() {
                             latest_revision = signal.workspace_revision;
+                        }
+                    }
+                    haider_protocol::EventPayload::Effect(
+                        haider_protocol::effect::EffectPhase::Outcome {
+                            workspace_mutation: Some(mutation),
+                            ..
+                        },
+                    ) => {
+                        if mutation.workspace_revision.is_some() {
+                            latest_revision = mutation.workspace_revision;
                         }
                     }
                     _ => {}

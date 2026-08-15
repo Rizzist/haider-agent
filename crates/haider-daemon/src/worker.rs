@@ -55,11 +55,12 @@ use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1}
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
+    WorkspaceMutation,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
-    ProcessSignalRecorded, ProcessSignalRef, process_signal_subject_digest,
+    ProcessSignalRecorded, ProcessSignalRef, WorkspaceMutationRef, process_signal_subject_digest,
 };
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -2933,6 +2934,7 @@ async fn append_unknown_effect_scan(
                 effect: effect.clone(),
                 outcome: EffectOutcome::Unknown,
                 freshness: None,
+                workspace_mutation: None,
             }));
         }
         if mode == UnknownReconcile::Park {
@@ -2960,6 +2962,52 @@ async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<Run
         runs.into_iter()
             .find_map(|(candidate, state, _, _)| (candidate == *run_id).then_some(state))
     })
+}
+
+async fn durable_workspace_mutation(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+    effect_id: &EffectId,
+) -> ToolResult<WorkspaceMutation> {
+    let mut cursor = 0;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256)
+            .await
+            .map_err(|error| ToolError::Runtime {
+                message: error.message,
+            })?;
+        if page.is_empty() {
+            return Err(ToolError::Runtime {
+                message: format!(
+                    "workspace mutation for effect {effect_id} was not durable after completion"
+                ),
+            });
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let Ok(EventPayload::Effect(EffectPhase::Outcome {
+                effect,
+                workspace_mutation: Some(mutation),
+                ..
+            })) = serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            if &effect == effect_id {
+                if mutation.workspace_revision.is_none() || mutation.subject_digest.is_none() {
+                    return Err(ToolError::Runtime {
+                        message: format!(
+                            "workspace mutation for effect {effect_id} lacks daemon provenance"
+                        ),
+                    });
+                }
+                return Ok(mutation);
+            }
+        }
+    }
 }
 
 /// Parks a recoverable checkpoint/delegated child across a GRACEFUL drain:
@@ -5938,6 +5986,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 slot: request.slot,
                 subject_digest: request.subject_digest,
                 signal: request.signal,
+                workspace_mutation: request.workspace_mutation,
                 child_contract: None,
                 device_id: self.output.device_id.clone(),
             };
@@ -6261,6 +6310,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 presentation: None,
             }));
         }
+        let fs_write_count = self
+            .ledger
+            .changes_for(&self.session_id, run_id)
+            .map_or(0, |changes| changes.writes.len());
         let result = match route {
             RegisteredToolRoute::FsRead => {
                 let path = required_string(&args, "path")?;
@@ -6651,6 +6704,59 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     false,
                 ));
             }
+        };
+        let result = if matches!(
+            route,
+            RegisteredToolRoute::FsWrite
+                | RegisteredToolRoute::FsEdit
+                | RegisteredToolRoute::FsPath
+        ) {
+            match result {
+                Ok(mut result) => {
+                    let Some(changes) = self.ledger.changes_for(&self.session_id, run_id) else {
+                        return Err(HaiderError::new(
+                            ErrorCode::Internal,
+                            "filesystem mutation committed without ledger provenance",
+                            false,
+                        ));
+                    };
+                    let Some(record) = changes.writes.get(fs_write_count) else {
+                        return Err(HaiderError::new(
+                            ErrorCode::Internal,
+                            "filesystem mutation committed without one new ledger record",
+                            false,
+                        ));
+                    };
+                    if changes.writes.len() != fs_write_count.saturating_add(1) {
+                        return Err(HaiderError::new(
+                            ErrorCode::Internal,
+                            "filesystem mutation produced ambiguous ledger provenance",
+                            false,
+                        ));
+                    }
+                    let mutation =
+                        durable_workspace_mutation(&self.output.store, run_id, &record.effect)
+                            .await
+                            .map_err(tool_error)?;
+                    let subject_digest = mutation.subject_digest.clone();
+                    let workspace_revision = mutation.workspace_revision.clone();
+                    result.preview = serde_json::json!({
+                        "result": result.preview,
+                        "mutation_digest": mutation.mutation_digest,
+                        "workspace_revision": workspace_revision,
+                        "subject_digest": subject_digest,
+                        "workspace_mutation": WorkspaceMutationRef {
+                            run_id: run_id.clone(),
+                            effect_id: record.effect.clone(),
+                        },
+                    })
+                    .to_string();
+                    Ok(result)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            result
         };
         match result {
             Ok(result) => Ok(ToolDispatchResult::Completed(result)),
@@ -7245,6 +7351,7 @@ fn process_result_with_signal(
             "output_bytes": result.output_bytes,
             "command_arg_digest": result.command_arg_digest,
             "transcript_digest": result.transcript_digest,
+            "workspace_revision": signal.and_then(|signal| signal.workspace_revision.as_ref()),
             "subject_digest": signal.map(|signal| signal.subject_digest.as_str()),
             "process_signal": signal.map(|signal| ProcessSignalRef {
                 run_id: signal.run_id.clone(),
@@ -7366,11 +7473,12 @@ impl HubCommandOutputContext {
             worker_generation: self.store.worker_generation(),
             branch_id: self.branch_id.clone(),
             signal: signal.clone(),
+            stamp_workspace_revision: true,
             device_id: self.device_id.clone(),
         };
         match self.store.hub().record_process_signal(command).await {
-            Ok(ProcessSignalOutcome::Committed { .. })
-            | Ok(ProcessSignalOutcome::IdempotentReplay { .. }) => Ok(signal),
+            Ok(ProcessSignalOutcome::Committed { signal, .. })
+            | Ok(ProcessSignalOutcome::IdempotentReplay { signal, .. }) => Ok(signal),
             Err(SessionHubError::Store(error)) => Err(error),
             Err(error) => Err(HaiderError::new(
                 ErrorCode::Internal,

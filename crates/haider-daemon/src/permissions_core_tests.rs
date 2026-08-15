@@ -453,6 +453,7 @@ async fn durable_tool_state_reduces_latest_freshness_per_session() {
                     path: "src/lib.rs".into(),
                     digest: "blake3:old-literal".into(),
                 }),
+                workspace_mutation: None,
             }),
         ),
         envelope(
@@ -465,6 +466,7 @@ async fn durable_tool_state_reduces_latest_freshness_per_session() {
                     path: "src/lib.rs".into(),
                     digest: "blake3:new-literal".into(),
                 }),
+                workspace_mutation: None,
             }),
         ),
         envelope(
@@ -477,6 +479,7 @@ async fn durable_tool_state_reduces_latest_freshness_per_session() {
                     path: "README.md".into(),
                     digest: "blake3:readme-literal".into(),
                 }),
+                workspace_mutation: None,
             }),
         ),
     ];

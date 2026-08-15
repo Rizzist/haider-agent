@@ -106,6 +106,7 @@ pub async fn reconcile_dispatched_effects(
                         effect: effect.clone(),
                         outcome: EffectOutcome::Unknown,
                         freshness: None,
+                        workspace_mutation: None,
                     }),
                 )?);
                 report.reconciled_effects.push(effect.clone());

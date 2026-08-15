@@ -38,7 +38,7 @@ pub use process::{
     CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,
     ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,
     ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
-    ProcessSignal,
+    ProcessSignal, workspace_state_digest,
 };
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{

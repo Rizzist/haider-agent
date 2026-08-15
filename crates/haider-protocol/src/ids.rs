@@ -72,7 +72,7 @@ string_id!(
     ArtifactRef
 );
 string_id!(
-    #[doc = "Content hash of a sealed workspace tree (verification binds to this)."]
+    #[doc = "Durable monotonic workspace state identity (verification binds to this)."]
     WorkspaceRevision
 );
 string_id!(

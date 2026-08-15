@@ -1996,6 +1996,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         truncated: true,
         full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredQueued,
+        workspace_mutation: None,
     });
     let steered = TaskEventPayload::TaskCompleted(TaskCompleted {
         task: haider_protocol::ids::TaskId::new("task-12"),
@@ -2008,6 +2009,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         truncated: false,
         full_output_unavailable: false,
         delivery: TaskCompletionDelivery::DeliveredSteer,
+        workspace_mutation: None,
     });
     let mut events = vec![
         envelope(

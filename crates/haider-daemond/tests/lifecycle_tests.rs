@@ -1814,6 +1814,7 @@ async fn reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_eff
                     effect: completed.clone(),
                     outcome: EffectOutcome::Ok,
                     freshness: None,
+                    workspace_mutation: None,
                 }),
             ),
         ];

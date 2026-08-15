@@ -55,7 +55,7 @@ use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
 use crate::{FsEditAnchorMismatch, ToolError, ToolResult};
 use async_trait::async_trait;
-use haider_protocol::effect::{EffectClass, FileFreshness};
+use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
 use rustix::fd::OwnedFd;
@@ -854,7 +854,7 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let (result, freshness) = match worker.await {
+            let (result, freshness, workspace_mutation) = match worker.await {
                 Ok(outcome) => outcome.into_result_with_freshness(freshness_path),
                 Err(error) if error.is_cancelled() => return None,
                 Err(error) => (
@@ -862,9 +862,12 @@ impl EffectBroker {
                         message: format!("blocking filesystem worker failed: {error}"),
                     }),
                     None,
+                    None,
                 ),
             };
-            let result = finish.finish_with_freshness(result, freshness).await;
+            let result = finish
+                .finish_with_workspace_mutation(result, freshness, workspace_mutation)
+                .await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -935,7 +938,7 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let (result, freshness) = match worker.await {
+            let (result, freshness, workspace_mutation) = match worker.await {
                 Ok(outcome) => outcome.into_result_with_freshness(freshness_path),
                 Err(error) if error.is_cancelled() => return None,
                 Err(error) => (
@@ -943,9 +946,12 @@ impl EffectBroker {
                         message: format!("blocking filesystem worker failed: {error}"),
                     }),
                     None,
+                    None,
                 ),
             };
-            let result = finish.finish_with_freshness(result, freshness).await;
+            let result = finish
+                .finish_with_workspace_mutation(result, freshness, workspace_mutation)
+                .await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -1036,14 +1042,19 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let result = match worker.await {
+            let (result, workspace_mutation) = match worker.await {
                 Ok(outcome) => outcome.into_result(),
                 Err(error) if error.is_cancelled() => return None,
-                Err(error) => Err(ToolError::Runtime {
-                    message: format!("blocking filesystem worker failed: {error}"),
-                }),
+                Err(error) => (
+                    Err(ToolError::Runtime {
+                        message: format!("blocking filesystem worker failed: {error}"),
+                    }),
+                    None,
+                ),
             };
-            let result = finish.finish(result).await;
+            let result = finish
+                .finish_with_workspace_mutation(result, None, workspace_mutation)
+                .await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -1615,24 +1626,35 @@ struct AppliedMutation {
 enum MutationWorkerOutcome {
     Applied {
         result: BoundedResult,
+        effect: haider_protocol::ids::EffectId,
         post_digest: String,
     },
     ApplyFailed(ToolError),
     LedgerFailed {
         error: ToolError,
         written: bool,
+        effect: haider_protocol::ids::EffectId,
         post_digest: String,
     },
 }
 
 impl MutationWorkerOutcome {
-    fn into_result(self) -> ToolResult<BoundedResult> {
+    fn into_result(self) -> (ToolResult<BoundedResult>, Option<WorkspaceMutation>) {
         match self {
-            Self::Applied { result, .. } => Ok(result),
-            Self::ApplyFailed(error) => Err(error),
-            Self::LedgerFailed { error, written, .. } => {
+            Self::Applied {
+                result,
+                effect,
+                post_digest,
+            } => (Ok(result), Some(workspace_mutation(effect, post_digest))),
+            Self::ApplyFailed(error) => (Err(error), None),
+            Self::LedgerFailed {
+                error,
+                written,
+                effect,
+                post_digest,
+            } => {
                 debug_assert!(written, "ledger failure must follow a successful rename");
-                Err(error)
+                (Err(error), Some(workspace_mutation(effect, post_digest)))
             }
         }
     }
@@ -1640,34 +1662,58 @@ impl MutationWorkerOutcome {
     fn into_result_with_freshness(
         self,
         relative_path: String,
-    ) -> (ToolResult<BoundedResult>, Option<FileFreshness>) {
+    ) -> (
+        ToolResult<BoundedResult>,
+        Option<FileFreshness>,
+        Option<WorkspaceMutation>,
+    ) {
         match self {
             Self::Applied {
                 result,
+                effect,
                 post_digest,
-            } => (
-                Ok(result),
-                Some(FileFreshness {
-                    path: relative_path,
-                    digest: post_digest,
-                }),
-            ),
-            Self::ApplyFailed(error) => (Err(error), None),
+            } => {
+                let mutation = workspace_mutation(effect, post_digest.clone());
+                (
+                    Ok(result),
+                    Some(FileFreshness {
+                        path: relative_path,
+                        digest: post_digest,
+                    }),
+                    Some(mutation),
+                )
+            }
+            Self::ApplyFailed(error) => (Err(error), None, None),
             Self::LedgerFailed {
                 error,
                 written,
+                effect,
                 post_digest,
             } => {
                 debug_assert!(written, "ledger failure must follow a successful rename");
+                let mutation = workspace_mutation(effect, post_digest.clone());
                 (
                     Err(error),
                     Some(FileFreshness {
                         path: relative_path,
                         digest: post_digest,
                     }),
+                    Some(mutation),
                 )
             }
         }
+    }
+}
+
+fn workspace_mutation(
+    effect_id: haider_protocol::ids::EffectId,
+    mutation_digest: String,
+) -> WorkspaceMutation {
+    WorkspaceMutation {
+        effect_id,
+        mutation_digest,
+        workspace_revision: None,
+        subject_digest: None,
     }
 }
 
@@ -1698,6 +1744,7 @@ where
         paths,
         post_digest,
     } = applied;
+    let effect = context.effect.clone();
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
@@ -1710,11 +1757,13 @@ where
     ) {
         Ok(()) => MutationWorkerOutcome::Applied {
             result,
+            effect,
             post_digest,
         },
         Err(error) => MutationWorkerOutcome::LedgerFailed {
             error,
             written: true,
+            effect,
             post_digest,
         },
     }
@@ -1855,6 +1904,7 @@ where
         paths,
         post_digest,
     } = applied;
+    let effect = context.effect.clone();
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
@@ -1867,11 +1917,13 @@ where
     ) {
         Ok(()) => MutationWorkerOutcome::Applied {
             result,
+            effect,
             post_digest,
         },
         Err(error) => MutationWorkerOutcome::LedgerFailed {
             error,
             written: true,
+            effect,
             post_digest,
         },
     }
@@ -2066,6 +2118,7 @@ where
         paths,
         post_digest,
     } = applied;
+    let effect = context.effect.clone();
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
@@ -2078,11 +2131,13 @@ where
     ) {
         Ok(()) => MutationWorkerOutcome::Applied {
             result,
+            effect,
             post_digest,
         },
         Err(error) => MutationWorkerOutcome::LedgerFailed {
             error,
             written: true,
+            effect,
             post_digest,
         },
     }

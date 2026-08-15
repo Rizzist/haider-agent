@@ -299,6 +299,59 @@ async fn process_exec_streams_exact_bytes_freezes_overflow_and_journals_four_pha
     broker.close().await.expect("broker closes");
 }
 
+#[tokio::test]
+async fn workspace_mutation_fact_fires_only_when_process_changes_the_tree() {
+    // LAW 1 mutation guard: deleting either comparison makes a pure command
+    // advance revision state or lets a real process mutation disappear.
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::write(workspace.path().join("input.txt"), "stable").expect("seed input");
+    let (mut broker, journal) = broker(workspace.path());
+
+    broker
+        .process_exec(
+            &ProcessExec::new("pure-read", "cat input.txt >/dev/null"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("pure process starts")
+        .wait()
+        .await
+        .expect("pure process completes");
+    broker
+        .process_exec(
+            &ProcessExec::new("mutation", "printf changed > output.txt"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("mutating process starts")
+        .wait()
+        .await
+        .expect("mutating process completes");
+
+    let outcomes = phases(&journal)
+        .into_iter()
+        .filter_map(|phase| match phase {
+            EffectPhase::Outcome {
+                workspace_mutation, ..
+            } => Some(workspace_mutation),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes[0].is_none(), "pure read must not mutate");
+    assert!(
+        outcomes[1].is_some(),
+        "real process mutation must be recorded"
+    );
+    broker.close().await.expect("broker closes");
+}
+
 #[tokio::test(start_paused = true)]
 async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
     let workspace = tempfile::tempdir().expect("tempdir");

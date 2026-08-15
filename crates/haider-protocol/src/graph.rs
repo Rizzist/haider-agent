@@ -9,8 +9,8 @@
 use crate::EventPayload;
 use crate::envelope::RawEnvelope;
 use crate::ids::{
-    ArtifactRef, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId, RunId, SessionId,
-    WorkspaceRevision,
+    AgentId, ArtifactRef, BranchId, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId,
+    RunId, SessionId, WorkspaceRevision,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -34,6 +34,7 @@ pub const GRAPH_EVIDENCE_DETAIL_MAX_BYTES: usize = 1_024;
 pub const GRAPH_BRIEF_MAX_BYTES: usize = 400;
 pub const GRAPH_INSPECT_MAX_PAGE: u32 = 100;
 pub const GRAPH_INSPECT_MAX_RUNS: usize = 32;
+pub const GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS: usize = 32;
 pub const GRAPH_MAX_TODO_CHILDREN: usize = 50;
 pub const GRAPH_TELEMETRY_MAX_RUN_ROWS: usize = 1_024;
 pub const GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS: usize = 4_096;
@@ -264,6 +265,10 @@ pub enum GraphEvidenceSource {
         call_id: String,
         effect_id: EffectId,
     },
+    WorkspaceMutation {
+        run_id: RunId,
+        effect_id: EffectId,
+    },
     /// One terminal delegated workflow collapsed at the parent graph
     /// boundary. The daemon validates these coordinates against both the
     /// delegation record and [`ChildGraphAttached`] before accepting it.
@@ -286,6 +291,14 @@ pub struct ProcessSignalRef {
     pub effect_id: EffectId,
 }
 
+/// Stable coordinates submitted by `graph_evidence` for a daemon-stamped
+/// workspace mutation (for example `fs_write`, `fs_edit`, or `fs_path`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkspaceMutationRef {
+    pub run_id: RunId,
+    pub effect_id: EffectId,
+}
+
 /// Daemon-internal reference used to collapse one terminal child workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildContractRef {
@@ -301,6 +314,29 @@ pub struct ChildContractRef {
 pub fn child_contract_subject_digest(contract: &ChildContractRef) -> String {
     let bytes = serde_json::to_vec(contract).unwrap_or_default();
     blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// Binds one mutation effect and its post-state digest to the exact monotonic
+/// revision assigned by the store. Length-prefixing prevents ambiguous
+/// concatenations and keeps the digest domain independent from process
+/// subjects.
+#[must_use]
+pub fn workspace_mutation_subject_digest(
+    effect_id: &EffectId,
+    mutation_digest: &str,
+    workspace_revision: &WorkspaceRevision,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.workspace-mutation.subject.v1");
+    for value in [
+        effect_id.as_str(),
+        mutation_digest,
+        workspace_revision.as_str(),
+    ] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 /// Daemon-observed terminal truth for one process execution.
@@ -1101,6 +1137,17 @@ pub struct GraphTemplateRollup {
     pub nodes: Vec<GraphNodeRollup>,
 }
 
+/// Session-scoped tool-selection aggregate rebuilt exclusively from tool-call
+/// item lifecycles and their correlated terminal results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSelectionRow {
+    pub tool_name: String,
+    pub total_calls: u64,
+    pub error_count: u64,
+    pub error_rate_basis_points: u32,
+    pub redundant_call_count: u64,
+}
+
 /// Complete deterministic telemetry projection over a bounded journal input.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphTelemetryProjection {
@@ -1110,6 +1157,8 @@ pub struct GraphTelemetryProjection {
     pub graph_node_attempts: Vec<GraphNodeAttemptRow>,
     #[serde(default)]
     pub graph_template_rollups: Vec<GraphTemplateRollup>,
+    #[serde(default)]
+    pub tool_selection: Vec<ToolSelectionRow>,
 }
 
 /// Signal fields safe for inspection. Digests and durable coordinates are
@@ -1124,6 +1173,14 @@ pub struct GraphSignalProvenance {
     pub subject_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphWorkspaceMutationProvenance {
+    pub effect_id: EffectId,
+    pub mutation_digest: String,
+    pub workspace_revision: WorkspaceRevision,
+    pub subject_digest: String,
 }
 
 /// One bounded evidence-log row returned by `graph.inspect`.
@@ -1146,6 +1203,8 @@ pub struct GraphEvidenceProvenanceRow {
     pub source: GraphEvidenceSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<GraphSignalProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation: Option<GraphWorkspaceMutationProvenance>,
 }
 
 /// Bounded read model returned by the feature-negotiated inspect RPC.
@@ -1160,6 +1219,8 @@ pub struct GraphInspectSnapshot {
     pub template_rollups: Vec<GraphTemplateRollup>,
     #[serde(default)]
     pub evidence: Vec<GraphEvidenceProvenanceRow>,
+    #[serde(default)]
+    pub tool_selection: Vec<ToolSelectionRow>,
 }
 
 impl GraphReductions {
@@ -2054,11 +2115,181 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
             .then_with(|| left.node.cmp(&right.node))
     });
     let graph_template_rollups = graph_template_rollups(&graph_runs, &graph_node_attempts);
+    let tool_selection = reduce_tool_selection(envelopes);
     GraphTelemetryProjection {
         graph_runs,
         graph_node_attempts,
         graph_template_rollups,
+        tool_selection,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ToolCallLane {
+    branch_id: Option<BranchId>,
+    run_id: Option<RunId>,
+    agent_id: Option<AgentId>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallTelemetry {
+    lane: ToolCallLane,
+    call_id: String,
+    tool_name: String,
+    args: serde_json::Value,
+    started_seq: u64,
+    completed_seq: Option<u64>,
+    result_status: Option<crate::tool::ToolResultStatus>,
+}
+
+/// Rebuilds the session-local tool-selection rollup from durable call/result
+/// facts. A call is conservatively classified as redundant only when it ends
+/// in a typed `Rejected`/`Conflict`, then the first call started after its
+/// completed item in the same lane retries the same tool with different final
+/// arguments. The rejected original is counted, never the repair.
+#[must_use]
+pub fn reduce_tool_selection(envelopes: &[RawEnvelope]) -> Vec<ToolSelectionRow> {
+    let mut calls = Vec::<ToolCallTelemetry>::new();
+    let mut positions = HashMap::<(ToolCallLane, String), usize>::new();
+
+    for envelope in envelopes {
+        let lane = ToolCallLane {
+            branch_id: envelope.branch_id.clone(),
+            run_id: envelope.run_id.clone(),
+            agent_id: envelope.agent_id.clone(),
+        };
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            continue;
+        };
+        match payload {
+            EventPayload::Item(crate::item::ItemEvent::Started {
+                item:
+                    crate::item::TurnItem::ToolCall {
+                        call_id,
+                        name,
+                        args,
+                        ..
+                    },
+                ..
+            }) => {
+                let key = (lane.clone(), call_id.clone());
+                if positions.contains_key(&key) {
+                    continue;
+                }
+                positions.insert(key, calls.len());
+                calls.push(ToolCallTelemetry {
+                    lane,
+                    call_id,
+                    tool_name: name,
+                    args,
+                    started_seq: envelope.seq,
+                    completed_seq: None,
+                    result_status: None,
+                });
+            }
+            EventPayload::Item(crate::item::ItemEvent::Completed {
+                item:
+                    crate::item::TurnItem::ToolCall {
+                        call_id,
+                        name,
+                        args,
+                        ..
+                    },
+                ..
+            }) => {
+                let key = (lane.clone(), call_id.clone());
+                if let Some(index) = positions.get(&key).copied() {
+                    let call = &mut calls[index];
+                    call.tool_name = name;
+                    call.args = args;
+                    call.completed_seq = Some(envelope.seq);
+                } else {
+                    positions.insert(key, calls.len());
+                    calls.push(ToolCallTelemetry {
+                        lane,
+                        call_id,
+                        tool_name: name,
+                        args,
+                        started_seq: envelope.seq,
+                        completed_seq: Some(envelope.seq),
+                        result_status: None,
+                    });
+                }
+            }
+            EventPayload::ToolResult { call_id, result } => {
+                if let Some(index) = positions.get(&(lane, call_id)).copied()
+                    && calls[index].result_status.is_none()
+                {
+                    calls[index].result_status = Some(result.status);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    calls.sort_by_key(|call| call.started_seq);
+    let mut redundant = HashSet::<(ToolCallLane, String)>::new();
+    for (index, call) in calls.iter().enumerate() {
+        if !matches!(
+            call.result_status,
+            Some(crate::tool::ToolResultStatus::Rejected | crate::tool::ToolResultStatus::Conflict)
+        ) {
+            continue;
+        }
+        let Some(completed_seq) = call.completed_seq else {
+            continue;
+        };
+        let repair = calls[index + 1..]
+            .iter()
+            .find(|candidate| candidate.lane == call.lane && candidate.started_seq > completed_seq);
+        if repair.is_some_and(|candidate| {
+            candidate.tool_name == call.tool_name
+                && candidate.completed_seq.is_some()
+                && candidate.args != call.args
+        }) {
+            redundant.insert((call.lane.clone(), call.call_id.clone()));
+        }
+    }
+
+    let mut rollups = BTreeMap::<String, (u64, u64, u64)>::new();
+    for call in calls {
+        let row = rollups.entry(call.tool_name).or_default();
+        row.0 = row.0.saturating_add(1);
+        if call
+            .result_status
+            .is_some_and(|status| !status.is_completed())
+        {
+            row.1 = row.1.saturating_add(1);
+        }
+        if redundant.contains(&(call.lane, call.call_id)) {
+            row.2 = row.2.saturating_add(1);
+        }
+    }
+    let mut rows = rollups
+        .into_iter()
+        .map(
+            |(tool_name, (total_calls, error_count, redundant_call_count))| {
+                let rate = error_count
+                    .saturating_mul(10_000)
+                    .checked_div(total_calls)
+                    .unwrap_or(0);
+                ToolSelectionRow {
+                    tool_name,
+                    total_calls,
+                    error_count,
+                    error_rate_basis_points: u32::try_from(rate).unwrap_or(u32::MAX),
+                    redundant_call_count,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .total_calls
+            .cmp(&left.total_calls)
+            .then_with(|| left.tool_name.cmp(&right.tool_name))
+    });
+    rows
 }
 
 fn graph_critical_path_ms(specs: &[GraphNodeSpec], attempts: &[GraphNodeAttemptRow]) -> u64 {

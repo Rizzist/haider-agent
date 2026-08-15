@@ -185,6 +185,42 @@ async fn background_output_is_bounded_with_honest_truncation() {
     assert_eq!(cursor, 1024);
 }
 
+/// Workspace revision producer guard: detached `process_exec` reports the
+/// same mutation provenance shape as a foreground execution when it changes
+/// the workspace, while the spawn-boundary effect remains immediately `Ok`.
+#[tokio::test]
+async fn background_process_reports_post_completion_workspace_mutation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (mut broker, _observer) = broker(workspace.path());
+    let spawn = broker
+        .process_exec_background(
+            &background(
+                "bg-workspace-mutation",
+                "printf 'changed by background task' > changed.txt",
+            ),
+            &exec_policy(),
+        )
+        .await
+        .expect("background spawn");
+    let effect = spawn.effect.clone();
+    let (_kill, kill_signal) = task_kill_channel();
+    let status = supervise_background(
+        spawn,
+        kill_signal,
+        shared_task_output(1024, 64),
+        Duration::from_millis(200),
+    )
+    .await;
+    assert_eq!(status.exit_code, Some(0));
+    let mutation = status
+        .workspace_mutation
+        .expect("background write reports mutation");
+    assert_eq!(mutation.effect_id, effect);
+    assert!(mutation.mutation_digest.starts_with("blake3:"));
+    assert!(mutation.workspace_revision.is_none());
+    assert!(mutation.subject_digest.is_none());
+}
+
 /// MUTATION CHECK (kill-fence seam): signal only the leader pid instead of
 /// the group, or skip the KILL escalation. Expected RUNTIME failure: the
 /// TERM-immune group member survives the ladder and the group probe stays

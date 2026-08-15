@@ -5,6 +5,7 @@
 //! preserve these newer event kinds; the journal is the truth and every
 //! in-memory task registry is a projection of these facts.
 
+use crate::effect::WorkspaceMutation;
 use crate::ids::{ArtifactRef, TaskId};
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,10 @@ pub struct TaskCompleted {
     /// True when `output_bytes` exceeded the retained cap.
     pub truncated: bool,
     pub delivery: TaskCompletionDelivery,
+    /// Post-completion workspace provenance for a detached process that
+    /// changed the tree. The store stamps its revision at this fact's commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation: Option<WorkspaceMutation>,
 }
 
 /// Additive task-event union (same pattern as

@@ -14,6 +14,22 @@ pub struct FileFreshness {
     pub digest: String,
 }
 
+/// Daemon-stamped provenance for one effect that changed workspace state.
+///
+/// Producers supply `mutation_digest`; the store assigns the monotonic
+/// revision and its subject digest at the same commit point as the terminal
+/// effect fact. All fields are nested under an optional outcome field so
+/// pre-revision journals retain their exact wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMutation {
+    pub effect_id: EffectId,
+    pub mutation_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<WorkspaceRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_digest: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
 pub enum EffectClass {
@@ -87,6 +103,10 @@ pub enum EffectPhase {
         /// terminal effect. `None` preserves the pre-C1 wire shape exactly.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         freshness: Option<FileFreshness>,
+        /// Present only when the effect actually changed workspace state.
+        /// The store stamps the revision and subject atomically on commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_mutation: Option<WorkspaceMutation>,
     },
 }
 

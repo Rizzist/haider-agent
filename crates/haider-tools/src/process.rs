@@ -17,7 +17,7 @@ use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use haider_protocol::effect::{EffectClass, EffectOutcome};
+use haider_protocol::effect::{EffectClass, EffectOutcome, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, EffectId, WorkspaceRevision};
 use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
 use rustix::fd::OwnedFd;
@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -43,6 +45,101 @@ use tokio::time::{Sleep, sleep};
 
 /// Maximum raw payload retained by one pipe-read chunk.
 pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Content-addresses the observable workspace tree before and after a process
+/// execution. Directory ordering and all field boundaries are canonical;
+/// atime is deliberately excluded so taking the snapshot cannot classify
+/// itself as a mutation.
+pub fn workspace_state_digest(root: &Path) -> String {
+    fn update_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher) {
+        let path = root.join(relative);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                hasher.update(b"metadata-error");
+                update_field(hasher, relative.as_os_str().as_bytes());
+                update_field(hasher, error.kind().to_string().as_bytes());
+                return;
+            }
+        };
+        update_field(hasher, relative.as_os_str().as_bytes());
+        hasher.update(&metadata.mode().to_be_bytes());
+        hasher.update(&metadata.uid().to_be_bytes());
+        hasher.update(&metadata.gid().to_be_bytes());
+        hasher.update(&metadata.ino().to_be_bytes());
+        hasher.update(&metadata.mtime().to_be_bytes());
+        hasher.update(&metadata.mtime_nsec().to_be_bytes());
+        hasher.update(&metadata.ctime().to_be_bytes());
+        hasher.update(&metadata.ctime_nsec().to_be_bytes());
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            hasher.update(b"directory");
+            let mut entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+                Err(error) => {
+                    hasher.update(b"read-dir-error");
+                    update_field(hasher, error.kind().to_string().as_bytes());
+                    return;
+                }
+            };
+            entries.sort_by(|left, right| {
+                left.file_name()
+                    .as_bytes()
+                    .cmp(right.file_name().as_bytes())
+            });
+            for entry in entries {
+                walk(root, &relative.join(entry.file_name()), hasher);
+            }
+        } else if file_type.is_file() {
+            hasher.update(b"file");
+            hasher.update(&metadata.len().to_be_bytes());
+            match std::fs::File::open(&path) {
+                Ok(mut file) => {
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        match file.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                hasher.update(&buffer[..read]);
+                            }
+                            Err(error) => {
+                                hasher.update(b"read-file-error");
+                                update_field(hasher, error.kind().to_string().as_bytes());
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    hasher.update(b"open-file-error");
+                    update_field(hasher, error.kind().to_string().as_bytes());
+                }
+            }
+        } else if file_type.is_symlink() {
+            hasher.update(b"symlink");
+            match std::fs::read_link(&path) {
+                Ok(target) => update_field(hasher, target.as_os_str().as_bytes()),
+                Err(error) => {
+                    hasher.update(b"read-link-error");
+                    update_field(hasher, error.kind().to_string().as_bytes());
+                }
+            }
+        } else {
+            hasher.update(b"special");
+            hasher.update(&metadata.rdev().to_be_bytes());
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.workspace-state.v1");
+    walk(root, Path::new(""), &mut hasher);
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessExec {
@@ -673,6 +770,15 @@ impl EffectBroker {
             Some(policy) => self.begin(&prepared, policy).await?,
             None => self.begin_user_typed(&prepared).await?,
         };
+        let workspace_root = self.workspace_root().to_path_buf();
+        let before_workspace_digest = tokio::task::spawn_blocking({
+            let workspace_root = workspace_root.clone();
+            move || workspace_state_digest(&workspace_root)
+        })
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: format!("workspace snapshot worker failed before process execution: {error}"),
+        })?;
         let cwd_fd =
             match prepared.cwd_for_spawn(self.workspace_root(), self.duplicate_workspace_dir()?) {
                 Ok(cwd_fd) => cwd_fd,
@@ -792,6 +898,26 @@ impl EffectBroker {
                         .push(ProcessLifecycleEvent::RegistryRemoved);
                 }
             }
+            let after_workspace_digest =
+                tokio::task::spawn_blocking(move || workspace_state_digest(&workspace_root))
+                    .await
+                    .map_err(|error| ToolError::Runtime {
+                        message: format!(
+                            "workspace snapshot worker failed after process execution: {error}"
+                        ),
+                    });
+            let workspace_mutation = match after_workspace_digest {
+                Ok(after) => (after != before_workspace_digest).then(|| WorkspaceMutation {
+                    effect_id: effect.clone(),
+                    mutation_digest: after,
+                    workspace_revision: None,
+                    subject_digest: None,
+                }),
+                Err(error) => {
+                    process_result.result = Err(error);
+                    None
+                }
+            };
             let outcome = match (&process_result.result, process_result.cancelled) {
                 (_, true) => match &process_result.escalation_note {
                     Some(note) => EffectOutcome::CancelledEscalated { note: note.clone() },
@@ -807,7 +933,9 @@ impl EffectBroker {
                     error: error.to_string(),
                 },
             };
-            let terminal = finish.finish_outcome(outcome).await;
+            let terminal = finish
+                .finish_outcome_with_workspace_mutation(outcome, workspace_mutation)
+                .await;
             let delivered = match terminal {
                 Ok(()) => process_result.result,
                 Err(error) => Err(error),

@@ -19,7 +19,7 @@ use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::credential::CredentialDescriptor;
-use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
+use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
@@ -27,25 +27,27 @@ use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorSco
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
     ChildTemplatePromoted, EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict,
-    GRAPH_INSPECT_MAX_RUNS, GRAPH_MAX_TODO_CHILDREN, GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS,
-    GRAPH_TELEMETRY_MAX_RUN_ROWS, GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced,
-    GraphAttemptOpened, GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
+    GRAPH_INSPECT_MAX_RUNS, GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_TODO_CHILDREN,
+    GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS, GRAPH_TELEMETRY_MAX_RUN_ROWS,
+    GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
+    GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
     GraphEvidenceSource, GraphFinalizationDeferred, GraphGateKind, GraphGateSatisfied,
     GraphInspectSnapshot, GraphNodeAttemptRow, GraphNodeName, GraphNodeReadied, GraphPhase,
     GraphPinned, GraphReduction, GraphReductions, GraphRunRow, GraphRunScope, GraphRunSetOpened,
     GraphSignalProvenance, GraphStatus, GraphSuperseded, GraphTelemetryProjection,
-    GraphTemplateRejection, GraphTemplateRollup, GraphTemplateSpec, ProcessSignalRecorded,
-    ProcessSignalRef, SubjectSelector, TodoGraphAttached, build_node,
-    child_contract_subject_digest, child_gate_structure, evidence_fingerprint, graph_template,
-    graph_template_digest, graph_template_rollups, normalize_evidence_detail,
-    process_signal_subject_digest, reduce_graph_telemetry, reduce_graphs, todo_child_graph_id,
-    todo_run_set_id, validate_graph_template,
+    GraphTemplateRejection, GraphTemplateRollup, GraphTemplateSpec,
+    GraphWorkspaceMutationProvenance, ProcessSignalRecorded, ProcessSignalRef, SubjectSelector,
+    TodoGraphAttached, WorkspaceMutationRef, build_node, child_contract_subject_digest,
+    child_gate_structure, evidence_fingerprint, graph_template, graph_template_digest,
+    graph_template_rollups, normalize_evidence_detail, process_signal_subject_digest,
+    reduce_graph_telemetry, reduce_graphs, todo_child_graph_id, todo_run_set_id,
+    validate_graph_template, workspace_mutation_subject_digest,
 };
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId,
-    MenuId, NodeId, RunId, SessionId,
+    MenuId, NodeId, RunId, SessionId, WorkspaceRevision,
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
@@ -55,6 +57,7 @@ use haider_protocol::session::{
     SessionPermissionOverridesV1,
 };
 use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::task::TaskEventPayload;
 use haider_protocol::tool::AttachmentBlock;
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
@@ -371,6 +374,7 @@ pub struct GraphEvidenceCommand {
     pub slot: Option<String>,
     pub subject_digest: Option<String>,
     pub signal: Option<ProcessSignalRef>,
+    pub workspace_mutation: Option<WorkspaceMutationRef>,
     pub child_contract: Option<ChildContractRef>,
     pub device_id: DeviceId,
 }
@@ -381,6 +385,9 @@ pub struct ProcessSignalCommand {
     pub worker_generation: u64,
     pub branch_id: Option<BranchId>,
     pub signal: ProcessSignalRecorded,
+    /// Production workers request post-effect revision stamping. `false`
+    /// preserves exact validation/replay behavior for legacy signal writers.
+    pub stamp_workspace_revision: bool,
     pub device_id: DeviceId,
 }
 
@@ -395,10 +402,12 @@ pub struct RecordedProcessSignal {
 pub enum ProcessSignalOutcome {
     Committed {
         recorded: RecordedProcessSignal,
+        signal: ProcessSignalRecorded,
         envelopes: Vec<RawEnvelope>,
     },
     IdempotentReplay {
         recorded: RecordedProcessSignal,
+        signal: ProcessSignalRecorded,
     },
 }
 
@@ -1737,6 +1746,12 @@ impl Store {
             template_rollups.swap(0, position);
         }
         template_rollups.truncate(GRAPH_INSPECT_MAX_RUNS);
+        let mut tool_selection = telemetry
+            .by_session
+            .get(session_id)
+            .map(|cached| cached.projection.tool_selection.clone())
+            .unwrap_or_default();
+        tool_selection.truncate(GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS);
         let result = GraphInspectResult {
             snapshot: GraphInspectSnapshot {
                 through_seq,
@@ -1744,6 +1759,7 @@ impl Store {
                 runs,
                 template_rollups,
                 evidence,
+                tool_selection,
             },
             next_cursor,
         };
@@ -1899,10 +1915,22 @@ impl Store {
                         envelope.event_id
                     ))
                 })?;
+            let EventPayload::ProcessSignalRecorded(existing_signal) = existing else {
+                return Err(graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "mismatched_signal_provenance",
+                    "process signal event id belongs to another payload",
+                ));
+            };
+            let signal_matches = if command.stamp_workspace_revision {
+                process_signal_base_matches(&existing_signal, &command.signal)
+            } else {
+                existing_signal == command.signal
+            };
             if envelope.session_id != command.session_id
                 || envelope.branch_id != command.branch_id
                 || envelope.run_id.as_ref() != Some(&command.signal.run_id)
-                || existing != EventPayload::ProcessSignalRecorded(command.signal.clone())
+                || !signal_matches
             {
                 return Err(graph_evidence_error(
                     ErrorCode::InvalidArgument,
@@ -1916,7 +1944,10 @@ impl Store {
                 worker_generation: envelope.worker_generation,
             };
             transaction.commit().map_err(map_sqlite_error)?;
-            return Ok(ProcessSignalOutcome::IdempotentReplay { recorded });
+            return Ok(ProcessSignalOutcome::IdempotentReplay {
+                recorded,
+                signal: existing_signal,
+            });
         }
         if command.worker_generation != self.worker_generation {
             return Err(stale_generation(
@@ -1925,27 +1956,45 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        validate_process_signal_provenance(&transaction, &command.session_id, &command.signal)?;
+        let mut signal = command.signal.clone();
+        if command.stamp_workspace_revision {
+            let outcome_seq = process_effect_outcome_seq(
+                &transaction,
+                &command.session_id,
+                &signal.run_id,
+                &signal.effect_id,
+            )?;
+            let revision =
+                workspace_revision_at_or_before(&transaction, &command.session_id, outcome_seq)?;
+            signal.workspace_revision = Some(revision);
+            signal.subject_digest = process_signal_subject_digest(
+                &signal.command_arg_digest,
+                &signal.transcript_digest,
+                signal.workspace_revision.as_ref(),
+            );
+        }
+        validate_process_signal_provenance(&transaction, &command.session_id, &signal)?;
         let now = now_ms()?;
         let mut envelopes = vec![unstamped_command_envelope(
             event_id,
             &command.session_id,
             command.branch_id.clone(),
-            Some(command.signal.run_id.clone()),
+            Some(signal.run_id.clone()),
             command.device_id.clone(),
             command.worker_generation,
-            EventPayload::ProcessSignalRecorded(command.signal.clone()),
+            EventPayload::ProcessSignalRecorded(signal.clone()),
             PromptRender::Omit,
         )?];
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let recorded = RecordedProcessSignal {
-            effect_id: command.signal.effect_id.clone(),
+            effect_id: signal.effect_id.clone(),
             signal_seq: envelopes[0].seq,
             worker_generation: self.worker_generation,
         };
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(ProcessSignalOutcome::Committed {
             recorded,
+            signal,
             envelopes,
         })
     }
@@ -6659,12 +6708,16 @@ impl Store {
             cached.reductions = reduce_graphs(&cached.envelopes);
         }
         drop(graph_reductions);
-        let graph_envelopes = envelopes
+        self.extend_graph_telemetry(session_id, envelopes);
+    }
+
+    fn extend_graph_telemetry(&self, session_id: &SessionId, envelopes: &[RawEnvelope]) {
+        let telemetry_envelopes = envelopes
             .iter()
-            .filter(|envelope| graph_reduction_event(&envelope.payload))
+            .filter(|envelope| graph_telemetry_event(&envelope.payload))
             .cloned()
             .collect::<Vec<_>>();
-        if graph_envelopes.is_empty() {
+        if telemetry_envelopes.is_empty() {
             return;
         }
         let mut telemetry = self
@@ -6678,7 +6731,7 @@ impl Store {
                 envelopes: Vec::new(),
                 projection: GraphTelemetryProjection::default(),
             });
-        cached.envelopes.extend(graph_envelopes);
+        cached.envelopes.extend(telemetry_envelopes);
         cached.projection = reduce_graph_telemetry(&cached.envelopes);
     }
 
@@ -7113,7 +7166,9 @@ fn graph_evidence_provenance(
                 call_id,
                 effect_id,
             } => Some((run_id.clone(), call_id.clone(), effect_id.clone())),
-            GraphEvidenceSource::Model { .. } | GraphEvidenceSource::ChildContract { .. } => None,
+            GraphEvidenceSource::Model { .. }
+            | GraphEvidenceSource::WorkspaceMutation { .. }
+            | GraphEvidenceSource::ChildContract { .. } => None,
         })
         .collect::<HashSet<_>>();
     let mut signals = HashMap::<(RunId, String, EffectId), ProcessSignalRecorded>::new();
@@ -7157,6 +7212,70 @@ fn graph_evidence_provenance(
             }
         }
     }
+    let required_mutations = recorded
+        .iter()
+        .filter_map(|(_, evidence)| match &evidence.source {
+            GraphEvidenceSource::WorkspaceMutation { run_id, effect_id } => {
+                Some((run_id.clone(), effect_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut mutations = HashMap::<(RunId, EffectId), GraphWorkspaceMutationProvenance>::new();
+    if !required_mutations.is_empty() {
+        let mut mutation_statement = connection
+            .prepare_cached(
+                "SELECT envelope_json FROM events
+                 WHERE session_id = ?1
+                   AND seq <= ?2
+                   AND instr(envelope_json, '\"workspace_mutation\"') > 0
+                 ORDER BY seq ASC",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = mutation_statement
+            .query_map(
+                params![session_id.as_str(), to_sqlite_integer(through_seq)?],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sqlite_error)?;
+        for json in rows {
+            let json = json.map_err(map_sqlite_error)?;
+            let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+                corrupt(format!(
+                    "invalid graph mutation provenance envelope in session {session_id}: {error}"
+                ))
+            })?;
+            let Some(run_id) = envelope.run_id else {
+                continue;
+            };
+            let Ok(EventPayload::Effect(EffectPhase::Outcome {
+                effect,
+                workspace_mutation: Some(mutation),
+                ..
+            })) = serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            let key = (run_id, effect.clone());
+            if !required_mutations.contains(&key) {
+                continue;
+            }
+            let (Some(workspace_revision), Some(subject_digest)) =
+                (mutation.workspace_revision, mutation.subject_digest)
+            else {
+                continue;
+            };
+            mutations.insert(
+                key,
+                GraphWorkspaceMutationProvenance {
+                    effect_id: effect,
+                    mutation_digest: mutation.mutation_digest,
+                    workspace_revision,
+                    subject_digest,
+                },
+            );
+        }
+    }
     recorded
         .into_iter()
         .map(|(envelope, evidence)| {
@@ -7184,9 +7303,15 @@ fn graph_evidence_provenance(
                         subject_digest: signal.subject_digest.clone(),
                         artifact: signal.artifact.clone(),
                     }),
-                GraphEvidenceSource::Model { .. } | GraphEvidenceSource::ChildContract { .. } => {
-                    None
+                GraphEvidenceSource::Model { .. }
+                | GraphEvidenceSource::WorkspaceMutation { .. }
+                | GraphEvidenceSource::ChildContract { .. } => None,
+            };
+            let workspace_mutation = match &evidence.source {
+                GraphEvidenceSource::WorkspaceMutation { run_id, effect_id } => {
+                    mutations.get(&(run_id.clone(), effect_id.clone())).cloned()
                 }
+                _ => None,
             };
             Ok(GraphEvidenceProvenanceRow {
                 seq: envelope.seq,
@@ -7203,6 +7328,7 @@ fn graph_evidence_provenance(
                 subject_digest: evidence.subject_digest,
                 source: evidence.source,
                 signal,
+                workspace_mutation,
             })
         })
         .collect()
@@ -7273,6 +7399,8 @@ fn rebuild_graph_telemetry_cache(connection: &Connection) -> StoreResult<GraphTe
                 OR instr(envelope_json, '\"type\":\"todo_graph_attached\"') > 0
                 OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
                 OR instr(envelope_json, '\"type\":\"menu_') > 0
+                OR instr(envelope_json, '\"item\":\"tool_call\"') > 0
+                OR instr(envelope_json, '\"type\":\"tool_result\"') > 0
              ORDER BY session_id ASC, seq ASC",
         )
         .map_err(map_sqlite_error)?;
@@ -7786,7 +7914,10 @@ fn validate_graph_evidence_authority(
         );
     }
     let Some(slot) = slot else {
-        if command.signal.is_some() || command.subject_digest.is_some() {
+        if command.signal.is_some()
+            || command.workspace_mutation.is_some()
+            || command.subject_digest.is_some()
+        {
             return Err(graph_evidence_error(
                 ErrorCode::InvalidArgument,
                 "wrong_evidence_authority",
@@ -7800,7 +7931,7 @@ fn validate_graph_evidence_authority(
     };
     match slot.authority {
         EvidenceAuthority::ModelAttested => {
-            if command.signal.is_some() {
+            if command.signal.is_some() || command.workspace_mutation.is_some() {
                 return Err(graph_evidence_error(
                     ErrorCode::InvalidArgument,
                     "wrong_evidence_authority",
@@ -7827,6 +7958,24 @@ fn validate_graph_evidence_authority(
             })
         }
         EvidenceAuthority::DaemonVerified => {
+            if let Some(mutation_ref) = command.workspace_mutation.as_ref() {
+                if command.signal.is_some() {
+                    return Err(graph_evidence_error(
+                        ErrorCode::InvalidArgument,
+                        "wrong_evidence_authority",
+                        "daemon evidence cannot claim both process and mutation provenance",
+                    ));
+                }
+                return validate_workspace_mutation_authority(
+                    transaction,
+                    session_id,
+                    command,
+                    slot,
+                    graph_id,
+                    attempt,
+                    mutation_ref,
+                );
+            }
             let signal_ref = command.signal.as_ref().ok_or_else(|| {
                 graph_evidence_error(
                     ErrorCode::InvalidArgument,
@@ -7897,6 +8046,215 @@ fn validate_graph_evidence_authority(
 }
 
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+fn validate_workspace_mutation_authority(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    command: &GraphEvidenceCommand,
+    slot: &EvidenceSlotSpec,
+    graph_id: &GraphId,
+    attempt: u32,
+    mutation_ref: &WorkspaceMutationRef,
+) -> StoreResult<GraphEvidenceSource> {
+    if mutation_ref.run_id != command.run_id {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_signal_provenance",
+            "workspace mutation belongs to a different provider run",
+        ));
+    }
+    if slot.subject_selector == SubjectSelector::Freeform {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "wrong_evidence_authority",
+            format!(
+                "daemon-verified evidence slot `{}` cannot use a freeform subject",
+                slot.id
+            ),
+        ));
+    }
+    let loaded = load_workspace_mutation(transaction, session_id, mutation_ref)?;
+    let expected_subject = loaded.mutation.subject_digest.as_deref().ok_or_else(|| {
+        graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "mismatched_signal_provenance",
+            "workspace mutation has no daemon-stamped subject digest",
+        )
+    })?;
+    if command.subject_digest.as_deref() != Some(expected_subject) {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            format!(
+                "evidence slot `{}` references a stale workspace-mutation subject",
+                slot.id
+            ),
+        ));
+    }
+    let revision = loaded
+        .mutation
+        .workspace_revision
+        .as_ref()
+        .ok_or_else(|| corrupt("workspace mutation has no stamped revision"))?;
+    if current_workspace_revision(transaction, session_id)? != *revision {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            format!(
+                "evidence slot `{}` predates a later workspace mutation",
+                slot.id
+            ),
+        ));
+    }
+    let epoch_seq = graph_attempt_opened_seq(
+        transaction,
+        session_id,
+        graph_id,
+        command.node.clone(),
+        attempt,
+    )?;
+    if loaded.seq < epoch_seq {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            format!(
+                "evidence slot `{}` references a mutation from an older graph epoch",
+                slot.id
+            ),
+        ));
+    }
+    if command.verdict == EvidenceVerdict::Green && loaded.outcome != EffectOutcome::Ok {
+        return Err(graph_evidence_error(
+            ErrorCode::InvalidArgument,
+            "non_zero_exit_claimed_green",
+            format!(
+                "evidence slot `{}` claimed green from a failed workspace mutation",
+                slot.id
+            ),
+        ));
+    }
+    Ok(GraphEvidenceSource::WorkspaceMutation {
+        run_id: mutation_ref.run_id.clone(),
+        effect_id: mutation_ref.effect_id.clone(),
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn load_workspace_mutation(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    mutation_ref: &WorkspaceMutationRef,
+) -> StoreResult<LoadedWorkspaceMutation> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND instr(envelope_json, '\"workspace_mutation\"') > 0
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?;
+    for json in rows {
+        let json = json.map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid workspace-mutation envelope in session {session_id}: {error}"
+            ))
+        })?;
+        if envelope.run_id.as_ref() != Some(&mutation_ref.run_id) {
+            continue;
+        }
+        let Ok(EventPayload::Effect(EffectPhase::Outcome {
+            effect,
+            outcome,
+            workspace_mutation: Some(mutation),
+            ..
+        })) = serde_json::from_value::<EventPayload>(envelope.payload)
+        else {
+            continue;
+        };
+        if effect != mutation_ref.effect_id {
+            continue;
+        }
+        if mutation.effect_id != effect {
+            return Err(corrupt(format!(
+                "workspace mutation effect mismatch in session {session_id}, seq {}",
+                envelope.seq
+            )));
+        }
+        let revision = mutation
+            .workspace_revision
+            .as_ref()
+            .ok_or_else(|| corrupt("workspace mutation has no stamped revision"))?;
+        let expected_subject =
+            workspace_mutation_subject_digest(&effect, &mutation.mutation_digest, revision);
+        if mutation.subject_digest.as_deref() != Some(expected_subject.as_str()) {
+            return Err(corrupt(format!(
+                "workspace mutation subject mismatch in session {session_id}, seq {}",
+                envelope.seq
+            )));
+        }
+        let mut intent_statement = transaction
+            .prepare_cached(
+                "SELECT envelope_json FROM events
+                 WHERE session_id = ?1
+                   AND instr(envelope_json, '\"type\":\"effect\"') > 0
+                 ORDER BY seq ASC",
+            )
+            .map_err(map_sqlite_error)?;
+        let intent_rows = intent_statement
+            .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?;
+        let mut matched_intent = false;
+        for intent_json in intent_rows {
+            let intent_json = intent_json.map_err(map_sqlite_error)?;
+            let intent_envelope: RawEnvelope =
+                serde_json::from_str(&intent_json).map_err(|error| {
+                    corrupt(format!(
+                        "invalid effect envelope in session {session_id}: {error}"
+                    ))
+                })?;
+            let Ok(EventPayload::Effect(EffectPhase::Intent(intent))) =
+                serde_json::from_value::<EventPayload>(intent_envelope.payload)
+            else {
+                continue;
+            };
+            if intent.effect == effect {
+                if intent.class != EffectClass::FsWrite
+                    || intent_envelope.run_id.as_ref() != Some(&mutation_ref.run_id)
+                {
+                    return Err(graph_evidence_error(
+                        ErrorCode::InvalidArgument,
+                        "mismatched_signal_provenance",
+                        "workspace mutation does not match a durable filesystem intent",
+                    ));
+                }
+                matched_intent = true;
+                break;
+            }
+        }
+        if !matched_intent {
+            return Err(graph_evidence_error(
+                ErrorCode::InvalidArgument,
+                "mismatched_signal_provenance",
+                "workspace mutation is missing its durable filesystem intent",
+            ));
+        }
+        return Ok(LoadedWorkspaceMutation {
+            mutation,
+            outcome,
+            seq: envelope.seq,
+        });
+    }
+    Err(graph_evidence_error(
+        ErrorCode::InvalidArgument,
+        "mismatched_signal_provenance",
+        "workspace mutation reference does not match a durable effect outcome",
+    ))
+}
+
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn validate_child_contract_authority(
     transaction: &Transaction<'_>,
     session_id: &SessionId,
@@ -7906,7 +8264,7 @@ fn validate_child_contract_authority(
     attempt: u32,
     contract: &ChildContractRef,
 ) -> StoreResult<GraphEvidenceSource> {
-    if command.signal.is_some() {
+    if command.signal.is_some() || command.workspace_mutation.is_some() {
         return Err(graph_evidence_error(
             ErrorCode::InvalidArgument,
             "wrong_evidence_authority",
@@ -8350,6 +8708,12 @@ struct LoadedProcessSignal {
     branch_id: Option<BranchId>,
 }
 
+struct LoadedWorkspaceMutation {
+    mutation: WorkspaceMutation,
+    outcome: EffectOutcome,
+    seq: u64,
+}
+
 #[allow(clippy::result_large_err)]
 fn load_process_signal(
     transaction: &Transaction<'_>,
@@ -8406,6 +8770,19 @@ fn validate_process_signal_freshness(
             "stale_evidence_subject",
             format!(
                 "evidence slot `{}` references a process signal from an older graph epoch",
+                slot.id
+            ),
+        ));
+    }
+
+    if let Some(revision) = loaded.signal.workspace_revision.as_ref()
+        && current_workspace_revision(transaction, session_id)? != *revision
+    {
+        return Err(graph_evidence_error(
+            ErrorCode::RevisionConflict,
+            "stale_evidence_subject",
+            format!(
+                "evidence slot `{}` predates a later workspace mutation",
                 slot.id
             ),
         ));
@@ -8548,6 +8925,128 @@ fn process_signals_since(
     Ok(signals)
 }
 
+fn process_signal_base_matches(
+    left: &ProcessSignalRecorded,
+    right: &ProcessSignalRecorded,
+) -> bool {
+    left.run_id == right.run_id
+        && left.call_id == right.call_id
+        && left.effect_id == right.effect_id
+        && left.command_arg_digest == right.command_arg_digest
+        && left.exit_code == right.exit_code
+        && left.transcript_digest == right.transcript_digest
+        && left.artifact == right.artifact
+}
+
+#[allow(clippy::result_large_err)]
+fn current_workspace_revision(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+) -> StoreResult<WorkspaceRevision> {
+    workspace_revision_at_or_before(transaction, session_id, i64::MAX as u64)
+}
+
+#[allow(clippy::result_large_err)]
+fn workspace_revision_at_or_before(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    through_seq: u64,
+) -> StoreResult<WorkspaceRevision> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1 AND seq <= ?2
+               AND instr(envelope_json, '\"workspace_mutation\"') > 0
+             ORDER BY seq DESC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![
+            session_id.as_str(),
+            to_sqlite_integer(through_seq)?
+        ])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let json: String = row.get(0).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid workspace-mutation envelope in session {session_id}: {error}"
+            ))
+        })?;
+        let mutation =
+            match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                Ok(EventPayload::Effect(EffectPhase::Outcome {
+                    workspace_mutation: Some(mutation),
+                    ..
+                })) => Some(mutation),
+                _ => TaskEventPayload::from_payload_value(&envelope.payload).and_then(|event| {
+                    match event {
+                        TaskEventPayload::TaskCompleted(completed) => completed.workspace_mutation,
+                        TaskEventPayload::TaskStarted(_) => None,
+                    }
+                }),
+            };
+        let Some(mutation) = mutation else {
+            continue;
+        };
+        return mutation.workspace_revision.ok_or_else(|| {
+            corrupt(format!(
+                "workspace mutation in session {session_id}, seq {} has no stamped revision",
+                envelope.seq
+            ))
+        });
+    }
+    Ok(workspace_revision_for_seq(0))
+}
+
+#[allow(clippy::result_large_err)]
+fn process_effect_outcome_seq(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    effect_id: &EffectId,
+) -> StoreResult<u64> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND instr(envelope_json, '\"type\":\"effect\"') > 0
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let json: String = row.get(0).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid process-effect envelope in session {session_id}: {error}"
+            ))
+        })?;
+        let Ok(EventPayload::Effect(EffectPhase::Outcome { effect, .. })) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        else {
+            continue;
+        };
+        if effect == *effect_id {
+            if envelope.run_id.as_ref() != Some(run_id) {
+                return Err(graph_evidence_error(
+                    ErrorCode::InvalidArgument,
+                    "mismatched_signal_provenance",
+                    "process signal does not match its durable effect outcome run",
+                ));
+            }
+            return Ok(envelope.seq);
+        }
+    }
+    Err(graph_evidence_error(
+        ErrorCode::InvalidArgument,
+        "mismatched_signal_provenance",
+        "process signal is missing its durable terminal effect outcome",
+    ))
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_process_signal_provenance(
     transaction: &Transaction<'_>,
@@ -8606,7 +9105,6 @@ fn validate_process_signal_provenance(
                 if envelope.run_id.as_ref() != Some(&signal.run_id)
                     || intent.class != EffectClass::ProcessExec
                     || intent.args_digest != signal.command_arg_digest
-                    || intent.workspace_revision != signal.workspace_revision
                 {
                     return Err(graph_evidence_error(
                         ErrorCode::InvalidArgument,
@@ -8976,6 +9474,7 @@ fn append_transaction_envelopes(
             .checked_add(offset)
             .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
         envelope.committed_at_ms = committed_at_ms;
+        stamp_workspace_mutation(transaction, envelope)?;
         let json = serde_json::to_string(envelope).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -9983,6 +10482,9 @@ fn append_envelopes(
     let changes_graph_reduction = envelopes
         .iter()
         .any(|envelope| graph_reduction_event(&envelope.payload));
+    let changes_graph_telemetry = envelopes
+        .iter()
+        .any(|envelope| graph_telemetry_event(&envelope.payload));
     let mut connection = store.connection()?;
     // IMMEDIATE makes durable-head validation, sequence allocation, and the
     // batch insert one indivisible write critical section.
@@ -10026,6 +10528,7 @@ fn append_envelopes(
             let mut envelope = envelope.clone();
             envelope.seq = seq;
             envelope.committed_at_ms = committed_at_ms;
+            stamp_workspace_mutation(&transaction, &mut envelope)?;
             let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -10053,12 +10556,141 @@ fn append_envelopes(
     }
     if changes_graph_reduction {
         store.extend_graph_reduction(&session, envelopes);
+    } else if changes_graph_telemetry {
+        store.extend_graph_telemetry(&session, envelopes);
     }
     Ok(CommittedSeqRange {
         session_id: session,
         first_seq,
         last_seq,
     })
+}
+
+fn workspace_revision_for_seq(seq: u64) -> WorkspaceRevision {
+    WorkspaceRevision::new(format!("workspace-revision:{seq}"))
+}
+
+#[allow(clippy::result_large_err)]
+fn stamp_workspace_mutation(
+    transaction: &Transaction<'_>,
+    envelope: &mut RawEnvelope,
+) -> StoreResult<()> {
+    if let Ok(EventPayload::Effect(EffectPhase::Outcome {
+        effect,
+        workspace_mutation: Some(mut mutation),
+        outcome,
+        freshness,
+    })) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+    {
+        validate_workspace_mutation_intent(transaction, envelope, &effect, &mutation)?;
+        stamp_workspace_mutation_fields(envelope.seq, &effect, &mut mutation);
+        envelope.payload = serde_json::to_value(EventPayload::Effect(EffectPhase::Outcome {
+            effect,
+            outcome,
+            freshness,
+            workspace_mutation: Some(mutation),
+        }))
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize workspace mutation outcome: {error}"),
+                false,
+            )
+        })?;
+        return Ok(());
+    }
+    let Some(TaskEventPayload::TaskCompleted(mut completed)) =
+        TaskEventPayload::from_payload_value(&envelope.payload)
+    else {
+        return Ok(());
+    };
+    let Some(mut mutation) = completed.workspace_mutation.take() else {
+        return Ok(());
+    };
+    let effect = mutation.effect_id.clone();
+    validate_workspace_mutation_intent(transaction, envelope, &effect, &mutation)?;
+    stamp_workspace_mutation_fields(envelope.seq, &effect, &mut mutation);
+    completed.workspace_mutation = Some(mutation);
+    envelope.payload = completed.to_payload_value().map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize background workspace mutation: {error}"),
+            false,
+        )
+    })?;
+    Ok(())
+}
+
+fn stamp_workspace_mutation_fields(seq: u64, effect: &EffectId, mutation: &mut WorkspaceMutation) {
+    let revision = workspace_revision_for_seq(seq);
+    let subject_digest =
+        workspace_mutation_subject_digest(effect, &mutation.mutation_digest, &revision);
+    mutation.workspace_revision = Some(revision);
+    mutation.subject_digest = Some(subject_digest);
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_workspace_mutation_intent(
+    transaction: &Transaction<'_>,
+    envelope: &RawEnvelope,
+    effect: &EffectId,
+    mutation: &WorkspaceMutation,
+) -> StoreResult<()> {
+    if mutation.effect_id != *effect || mutation.mutation_digest.trim().is_empty() {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "workspace mutation must match its effect and carry a non-empty digest",
+            false,
+        ));
+    }
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND instr(envelope_json, '\"type\":\"effect\"') > 0
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map([envelope.session_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(map_sqlite_error)?;
+    for json in rows {
+        let json = json.map_err(map_sqlite_error)?;
+        let candidate: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid effect envelope in session {}: {error}",
+                envelope.session_id
+            ))
+        })?;
+        let Ok(EventPayload::Effect(EffectPhase::Intent(intent))) =
+            serde_json::from_value::<EventPayload>(candidate.payload)
+        else {
+            continue;
+        };
+        if intent.effect != *effect {
+            continue;
+        }
+        if candidate.run_id != envelope.run_id
+            || !matches!(
+                intent.class,
+                EffectClass::FsWrite | EffectClass::ProcessExec
+            )
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "workspace mutation does not match a mutation-class effect intent in the same run",
+                false,
+            ));
+        }
+        return Ok(());
+    }
+    Err(store_error(
+        ErrorCode::InvalidArgument,
+        "workspace mutation has no durable mutation-class effect intent",
+        false,
+    ))
 }
 
 fn graph_reduction_event(payload: &serde_json::Value) -> bool {
@@ -10071,6 +10703,23 @@ fn graph_reduction_event(payload: &serde_json::Value) -> bool {
                 || kind == "evidence_recorded"
                 || kind.starts_with("menu_")
         })
+}
+
+fn graph_telemetry_event(payload: &serde_json::Value) -> bool {
+    if graph_reduction_event(payload) {
+        return true;
+    }
+    match payload.get("type").and_then(serde_json::Value::as_str) {
+        Some("tool_result") => true,
+        Some("item") => {
+            payload
+                .get("item")
+                .and_then(|item| item.get("item"))
+                .and_then(serde_json::Value::as_str)
+                == Some("tool_call")
+        }
+        _ => false,
+    }
 }
 
 fn validate_worker_run_transitions(

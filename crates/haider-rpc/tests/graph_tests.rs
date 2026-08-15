@@ -118,6 +118,7 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                     status: None,
                     runs: Vec::new(),
                     template_rollups: Vec::new(),
+                    tool_selection: Vec::new(),
                     evidence: Vec::new(),
                 },
                 next_cursor: Some("next-cursor".into()),
@@ -129,6 +130,7 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                     "through_seq": 42,
                     "runs": [],
                     "template_rollups": [],
+                    "tool_selection": [],
                     "evidence": []
                 },
                 "next_cursor": "next-cursor"
