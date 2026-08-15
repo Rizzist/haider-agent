@@ -3,10 +3,11 @@
 use haider_protocol::graph::{
     GraphEvidenceTally, GraphInspectSnapshot, GraphNodeStatus, GraphPhase, GraphStatus,
 };
-use haider_protocol::ids::{GraphId, MenuId, SessionId};
+use haider_protocol::ids::{GraphId, GraphRunSetId, ItemId, MenuId, SessionId};
 use haider_rpc::{
     CommandId, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2,
-    FEATURE_CONVERGENCE_GRAPH_V3, RequestBody, ResponseBody,
+    FEATURE_CONVERGENCE_GRAPH_V3, FEATURE_CONVERGENCE_GRAPH_V4, RequestBody, ResponseBody,
+    TodoGraphOpenedWire,
 };
 
 #[test]
@@ -14,6 +15,7 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V1, "convergence_graph_v1");
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V2, "convergence_graph_v2");
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V3, "convergence_graph_v3");
+    assert_eq!(FEATURE_CONVERGENCE_GRAPH_V4, "convergence_graph_v4");
     let session_id = SessionId::new("session-graph");
     let graph_id = GraphId::new("graph-1");
     let cases = vec![
@@ -31,6 +33,24 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                 "session_id": "session-graph",
                 "worker_generation": 7,
                 "template": "ship-loop"
+            }),
+        ),
+        (
+            serde_json::to_value(RequestBody::GraphRunSetOpen {
+                command_id: CommandId::new("run-set-command"),
+                session_id: session_id.clone(),
+                worker_generation: 7,
+                plan_item_id: ItemId::new("plan-item"),
+                plan_event_seq: 12,
+            })
+            .expect("run-set request"),
+            serde_json::json!({
+                "method": "graph.run_set.open",
+                "command_id": "run-set-command",
+                "session_id": "session-graph",
+                "worker_generation": 7,
+                "plan_item_id": "plan-item",
+                "plan_event_seq": 12
             }),
         ),
         (
@@ -112,6 +132,49 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                     "evidence": []
                 },
                 "next_cursor": "next-cursor"
+            }),
+        ),
+        (
+            serde_json::to_value(ResponseBody::GraphRunSetOpen {
+                session_id: session_id.clone(),
+                run_set_id: GraphRunSetId::new("run-set-1"),
+                root_graph_id: graph_id.clone(),
+                plan_item_id: ItemId::new("plan-item"),
+                plan_event_seq: 12,
+                template: "ship-loop".into(),
+                digest: "blake3:template".into(),
+                run_set_opened_seq: 13,
+                through_seq: 16,
+                children: vec![TodoGraphOpenedWire {
+                    todo_id: 10,
+                    depends_on_todo_id: None,
+                    child_graph_id: GraphId::new("todo-child-10"),
+                    attached_seq: 14,
+                    pinned_seq: 15,
+                    opened_seq: Some(16),
+                }],
+                worker_generation: 7,
+            })
+            .expect("run-set response"),
+            serde_json::json!({
+                "method": "graph.run_set.open",
+                "session_id": "session-graph",
+                "run_set_id": "run-set-1",
+                "root_graph_id": "graph-1",
+                "plan_item_id": "plan-item",
+                "plan_event_seq": 12,
+                "template": "ship-loop",
+                "digest": "blake3:template",
+                "run_set_opened_seq": 13,
+                "through_seq": 16,
+                "children": [{
+                    "todo_id": 10,
+                    "child_graph_id": "todo-child-10",
+                    "attached_seq": 14,
+                    "pinned_seq": 15,
+                    "opened_seq": 16
+                }],
+                "worker_generation": 7
             }),
         ),
         (
@@ -208,6 +271,7 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                     blocked_reason: None,
                     pending_menu: Some(MenuId::new("ship-confirm-2")),
                     pending_menus: Vec::new(),
+                    run_set: None,
                 }),
             })
             .expect("status response"),
@@ -258,6 +322,7 @@ fn graph_status_terminal_variants_have_stable_typed_shapes() {
         blocked_reason,
         pending_menu: None,
         pending_menus: Vec::new(),
+        run_set: None,
     };
     let blocked = serde_json::to_value(ResponseBody::GraphStatus {
         status: Some(base(

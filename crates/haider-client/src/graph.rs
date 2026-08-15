@@ -5,8 +5,8 @@
 //! receipt-free view and needs no attachment.
 
 use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
-use haider_protocol::ids::{GraphId, SessionId};
-use haider_rpc::{CommandId, RequestBody, ResponseBody};
+use haider_protocol::ids::{GraphId, GraphRunSetId, ItemId, SessionId};
+use haider_rpc::{CommandId, RequestBody, ResponseBody, TodoGraphOpenedWire};
 
 use crate::{ClientError, RpcClient};
 
@@ -48,6 +48,21 @@ pub struct GraphSwitchResult {
 pub struct GraphInspectPage {
     pub snapshot: GraphInspectSnapshot,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRunSetOpenResult {
+    pub session_id: SessionId,
+    pub run_set_id: GraphRunSetId,
+    pub root_graph_id: GraphId,
+    pub plan_item_id: ItemId,
+    pub plan_event_seq: u64,
+    pub template: String,
+    pub digest: String,
+    pub run_set_opened_seq: u64,
+    pub through_seq: u64,
+    pub children: Vec<TodoGraphOpenedWire>,
+    pub worker_generation: u64,
 }
 
 /// A transport failure, daemon rejection, or mismatched response method.
@@ -197,6 +212,58 @@ pub async fn graph_pin_template(
         }),
         _ => Err(GraphClientError::Protocol(
             "graph.pin response method mismatch",
+        )),
+    }
+}
+
+/// Opens one independently reduced child graph per todo in an exact durable
+/// Plan fact.
+pub async fn graph_run_set_open(
+    client: &RpcClient,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    plan_item_id: ItemId,
+    plan_event_seq: u64,
+) -> Result<GraphRunSetOpenResult, GraphClientError> {
+    match rpc_error(
+        client
+            .request(RequestBody::GraphRunSetOpen {
+                command_id,
+                session_id,
+                worker_generation,
+                plan_item_id,
+                plan_event_seq,
+            })
+            .await?,
+    )? {
+        ResponseBody::GraphRunSetOpen {
+            session_id,
+            run_set_id,
+            root_graph_id,
+            plan_item_id,
+            plan_event_seq,
+            template,
+            digest,
+            run_set_opened_seq,
+            through_seq,
+            children,
+            worker_generation,
+        } => Ok(GraphRunSetOpenResult {
+            session_id,
+            run_set_id,
+            root_graph_id,
+            plan_item_id,
+            plan_event_seq,
+            template,
+            digest,
+            run_set_opened_seq,
+            through_seq,
+            children,
+            worker_generation,
+        }),
+        _ => Err(GraphClientError::Protocol(
+            "graph.run_set.open response method mismatch",
         )),
     }
 }

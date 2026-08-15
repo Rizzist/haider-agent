@@ -17,12 +17,13 @@ use haider_store::{
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
     DelegationRecord, EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
     GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
-    GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome, HookTrustChange,
-    HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand,
-    ProcessSignalOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome,
-    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
+    GraphSwitchCommand, GraphSwitchOutcome, HookTrustChange, HookTrustCommand,
+    MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome,
+    ProfileLease, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    SessionRenameOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -280,6 +281,29 @@ impl SqliteStoreHandle {
     ) -> Result<GraphPinOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.pin_graph(&command))).await
+    }
+
+    pub async fn graph_run_set_open_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::OpenedGraphRunSet>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.graph_run_set_open_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn open_graph_run_set(
+        &self,
+        command: GraphRunSetOpenCommand,
+    ) -> Result<GraphRunSetOpenOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.open_graph_run_set(&command))).await
     }
 
     pub async fn graph_switch_receipt(

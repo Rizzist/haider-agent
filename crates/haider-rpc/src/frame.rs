@@ -9,7 +9,8 @@ use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, GraphId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, GraphId, GraphRunSetId, ItemId, MenuId, NodeId, RunId,
+    SessionId,
 };
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
@@ -300,6 +301,22 @@ pub const FEATURE_CONVERGENCE_GRAPH_V2: &str = "convergence_graph_v2";
 /// Daemon implements M2c finalization guardrails, rebuildable telemetry, and
 /// the bounded `graph.inspect` read surface.
 pub const FEATURE_CONVERGENCE_GRAPH_V3: &str = "convergence_graph_v3";
+/// Daemon implements M2d todo run-sets, independently reduced child graphs,
+/// aggregate telemetry, and receipted `graph.run_set.open`.
+pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
+
+/// One todo child returned by `graph.run_set.open`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoGraphOpenedWire {
+    pub todo_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on_todo_id: Option<u32>,
+    pub child_graph_id: GraphId,
+    pub attached_seq: u64,
+    pub pinned_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_seq: Option<u64>,
+}
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1182,6 +1199,14 @@ pub enum RequestBody {
         worker_generation: u64,
         template: String,
     },
+    #[serde(rename = "graph.run_set.open")]
+    GraphRunSetOpen {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        plan_item_id: ItemId,
+        plan_event_seq: u64,
+    },
     #[serde(rename = "graph.switch")]
     GraphSwitch {
         command_id: CommandId,
@@ -1631,6 +1656,21 @@ pub enum ResponseBody {
         digest: String,
         pinned_seq: u64,
         opened_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "graph.run_set.open")]
+    GraphRunSetOpen {
+        session_id: SessionId,
+        run_set_id: GraphRunSetId,
+        root_graph_id: GraphId,
+        plan_item_id: ItemId,
+        plan_event_seq: u64,
+        template: String,
+        digest: String,
+        run_set_opened_seq: u64,
+        through_seq: u64,
+        #[serde(default)]
+        children: Vec<TodoGraphOpenedWire>,
         worker_generation: u64,
     },
     #[serde(rename = "graph.switch")]

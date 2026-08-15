@@ -8,7 +8,10 @@
 
 use crate::EventPayload;
 use crate::envelope::RawEnvelope;
-use crate::ids::{ArtifactRef, EffectId, GraphId, MenuId, RunId, SessionId, WorkspaceRevision};
+use crate::ids::{
+    ArtifactRef, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId, RunId, SessionId,
+    WorkspaceRevision,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -29,6 +32,7 @@ pub const GRAPH_EVIDENCE_DETAIL_MAX_BYTES: usize = 1_024;
 pub const GRAPH_BRIEF_MAX_BYTES: usize = 400;
 pub const GRAPH_INSPECT_MAX_PAGE: u32 = 100;
 pub const GRAPH_INSPECT_MAX_RUNS: usize = 32;
+pub const GRAPH_MAX_TODO_CHILDREN: usize = 50;
 pub const GRAPH_TELEMETRY_MAX_RUN_ROWS: usize = 1_024;
 pub const GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS: usize = 4_096;
 pub const GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS: usize = 256;
@@ -126,7 +130,7 @@ pub enum GraphGateKind {
     HumanConfirm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphExecutorShape {
     Inline,
@@ -331,6 +335,32 @@ pub struct GraphSuperseded {
     pub new: GraphId,
 }
 
+/// Opens one immutable aggregate over the todo list carried by a particular
+/// Plan fact. `plan_event_id` disambiguates whole-list replacements that reuse
+/// the same G1 Plan `ItemId`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRunSetOpened {
+    pub run_set_id: GraphRunSetId,
+    pub root_graph_id: GraphId,
+    pub plan_item_id: ItemId,
+    pub plan_event_id: EventId,
+    pub required_children: u32,
+}
+
+/// Immutable binding between one todo identity and one child graph. Dependency
+/// coordinates are frozen here, so a later reordered replacement list cannot
+/// retarget an existing child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoGraphAttached {
+    pub run_set_id: GraphRunSetId,
+    pub plan_item_id: ItemId,
+    pub todo_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on_todo_id: Option<u32>,
+    pub child_graph_id: GraphId,
+    pub ordinal: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphBlockReason {
@@ -369,7 +399,7 @@ pub struct GraphFinalizationDeferred {
     pub unmet_nodes: Vec<GraphNodeName>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphPhase {
     Active,
@@ -463,6 +493,10 @@ pub struct GraphStatus {
     pub pending_menu: Option<MenuId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_menus: Vec<MenuId>,
+    /// Present only when this graph is the aggregate owner of an M2d todo
+    /// run-set. Legacy graph statuses omit the field byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_set: Option<GraphRunSetStatus>,
 }
 
 impl GraphStatus {
@@ -488,6 +522,26 @@ impl GraphStatus {
     pub fn graph_brief(&self) -> Option<String> {
         if !self.is_unfinished() {
             return None;
+        }
+        if let Some(run_set) = &self.run_set {
+            let children = run_set
+                .children
+                .iter()
+                .map(|child| {
+                    let stage = child
+                        .current_node
+                        .as_ref()
+                        .map_or_else(|| format!("{:?}", child.phase), ToString::to_string);
+                    format!("{}={}@{}", child.todo_id, child.graph_id, stage)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut line = format!(
+                "GraphBrief: todo run-set {} {}/{} terminal; children [{}]. Record evidence against the child graph_id and its open stage.",
+                run_set.run_set_id, run_set.terminal_children, run_set.required_children, children,
+            );
+            truncate_utf8(&mut line, GRAPH_BRIEF_MAX_BYTES);
+            return Some(line);
         }
         let node = self.current_node.as_ref()?;
         let node_status = self.nodes.iter().find(|status| &status.node == node)?;
@@ -551,6 +605,43 @@ impl GraphStatus {
     }
 }
 
+/// Read-facing projection of one todo-bound child graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoGraphStatus {
+    pub todo_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on_todo_id: Option<u32>,
+    pub graph_id: GraphId,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ordinal: u32,
+    pub phase: GraphPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_node: Option<GraphNodeName>,
+    pub attempt: u32,
+}
+
+/// Current aggregate state for one Plan list. Terminal children contribute
+/// exactly one contract apiece regardless of whether they completed,
+/// abandoned, or were superseded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRunSetStatus {
+    pub run_set_id: GraphRunSetId,
+    pub root_graph_id: GraphId,
+    pub plan_item_id: ItemId,
+    pub plan_event_id: EventId,
+    pub required_children: u32,
+    pub terminal_children: u32,
+    #[serde(default)]
+    pub children: Vec<TodoGraphStatus>,
+}
+
+impl GraphRunSetStatus {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.terminal_children == self.required_children
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphReduction {
     pub status: Option<GraphStatus>,
@@ -581,6 +672,8 @@ impl GraphReduction {
 pub struct GraphReductions {
     pub active_root: Option<GraphId>,
     pub by_graph: HashMap<GraphId, GraphReduction>,
+    pub active_run_set: Option<GraphRunSetId>,
+    pub run_sets: HashMap<GraphRunSetId, GraphRunSetStatus>,
 }
 
 /// Coordinates retained from a durable `GraphAbandonConfirm` menu.
@@ -636,6 +729,46 @@ pub struct GraphRunRow {
     pub node_attempts: u32,
     pub mis_gate_count: u32,
     pub override_count: u32,
+    /// M2d ownership metadata. Omitted for every legacy/single graph row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<GraphRunScope>,
+}
+
+/// Stage histogram entry for a todo run-set aggregate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphStageCount {
+    pub phase: GraphPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<GraphNodeName>,
+    pub count: u32,
+}
+
+/// Distinguishes ordinary graph rows, todo children, and the synthetic
+/// aggregate row without changing legacy row bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GraphRunScope {
+    TodoChild {
+        run_set_id: GraphRunSetId,
+        plan_item_id: ItemId,
+        todo_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depends_on_todo_id: Option<u32>,
+    },
+    RunSetAggregate {
+        run_set_id: GraphRunSetId,
+        plan_item_id: ItemId,
+        completed_children: u32,
+        required_children: u32,
+        #[serde(default)]
+        stage_counts: Vec<GraphStageCount>,
+    },
+}
+
+impl GraphRunScope {
+    fn is_run_set_aggregate(&self) -> bool {
+        matches!(self, Self::RunSetAggregate { .. })
+    }
 }
 
 /// Per-node aggregate nested under a template rollup.
@@ -812,6 +945,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     blocked_reason: None,
                     pending_menu: None,
                     pending_menus: Vec::new(),
+                    run_set: None,
                 };
                 reductions.by_graph.insert(
                     graph_id.clone(),
@@ -823,7 +957,69 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                         template_nodes,
                     },
                 );
-                reductions.active_root = Some(graph_id);
+                let attached_child = reductions.run_sets.values().any(|run_set| {
+                    run_set
+                        .children
+                        .iter()
+                        .any(|child| child.graph_id == graph_id)
+                });
+                if !attached_child {
+                    reductions.active_root = Some(graph_id);
+                }
+            }
+            EventPayload::GraphRunSetOpened(opened) => {
+                if reductions.run_sets.contains_key(&opened.run_set_id)
+                    || reductions.graph(&opened.root_graph_id).is_none()
+                {
+                    continue;
+                }
+                reductions.active_run_set = Some(opened.run_set_id.clone());
+                reductions.run_sets.insert(
+                    opened.run_set_id.clone(),
+                    GraphRunSetStatus {
+                        run_set_id: opened.run_set_id,
+                        root_graph_id: opened.root_graph_id,
+                        plan_item_id: opened.plan_item_id,
+                        plan_event_id: opened.plan_event_id,
+                        required_children: opened.required_children,
+                        terminal_children: 0,
+                        children: Vec::new(),
+                    },
+                );
+            }
+            EventPayload::TodoGraphAttached(attached) => {
+                let child_graph_already_attached = reductions.run_sets.values().any(|candidate| {
+                    candidate
+                        .children
+                        .iter()
+                        .any(|child| child.graph_id == attached.child_graph_id)
+                });
+                let Some(run_set) = reductions.run_sets.get_mut(&attached.run_set_id) else {
+                    continue;
+                };
+                if run_set.plan_item_id != attached.plan_item_id
+                    || run_set.children.len()
+                        >= usize::try_from(run_set.required_children).unwrap_or(usize::MAX)
+                    || run_set
+                        .children
+                        .iter()
+                        .any(|child| child.todo_id == attached.todo_id)
+                    || child_graph_already_attached
+                {
+                    continue;
+                }
+                run_set.children.push(TodoGraphStatus {
+                    todo_id: attached.todo_id,
+                    depends_on_todo_id: attached.depends_on_todo_id,
+                    graph_id: attached.child_graph_id,
+                    ordinal: attached.ordinal,
+                    phase: GraphPhase::Active,
+                    current_node: None,
+                    attempt: 0,
+                });
+                run_set
+                    .children
+                    .sort_by_key(|child| (child.ordinal, child.todo_id));
             }
             EventPayload::GraphAttemptOpened(opened) => {
                 let Some(reduction) = reductions.by_graph.get_mut(&opened.graph_id) else {
@@ -1027,7 +1223,15 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     status.pending_menu = None;
                     status.pending_menus.clear();
                 }
-                reductions.active_root = Some(superseded.new);
+                let child_supersession = reductions.run_sets.values().any(|run_set| {
+                    run_set
+                        .children
+                        .iter()
+                        .any(|child| child.graph_id == superseded.old)
+                });
+                if !child_supersession {
+                    reductions.active_root = Some(superseded.new);
+                }
             }
             EventPayload::MenuOpened(menu) => {
                 let finalization_menu = matches!(
@@ -1080,7 +1284,69 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
             _ => {}
         }
     }
+    refresh_run_set_projections(&mut reductions);
     reductions
+}
+
+fn refresh_run_set_projections(reductions: &mut GraphReductions) {
+    for run_set in reductions.run_sets.values_mut() {
+        for child in &mut run_set.children {
+            let Some(status) = reductions
+                .by_graph
+                .get(&child.graph_id)
+                .and_then(|reduction| reduction.status.as_ref())
+            else {
+                continue;
+            };
+            child.phase = status.phase;
+            child.current_node = status.current_node.clone();
+            child.attempt = status.attempt;
+        }
+        run_set.terminal_children = u32::try_from(
+            run_set
+                .children
+                .iter()
+                .filter(|child| graph_phase_is_terminal(child.phase))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+        .min(run_set.required_children);
+    }
+
+    let owned = reductions
+        .active_run_set
+        .as_ref()
+        .and_then(|run_set_id| reductions.run_sets.get(run_set_id))
+        .cloned();
+    let Some(run_set) = owned else {
+        return;
+    };
+    let Some(root) = reductions
+        .by_graph
+        .get_mut(&run_set.root_graph_id)
+        .and_then(|reduction| reduction.status.as_mut())
+    else {
+        return;
+    };
+    root.run_set = Some(run_set.clone());
+    if !matches!(root.phase, GraphPhase::Abandoned | GraphPhase::Superseded) {
+        root.phase = if run_set.is_complete() {
+            GraphPhase::Completed
+        } else {
+            GraphPhase::Active
+        };
+        root.current_node = None;
+        root.ready_nodes.clear();
+        root.pending_menu = None;
+        root.pending_menus.clear();
+    }
+}
+
+fn graph_phase_is_terminal(phase: GraphPhase) -> bool {
+    matches!(
+        phase,
+        GraphPhase::Completed | GraphPhase::Abandoned | GraphPhase::Superseded
+    )
 }
 
 fn push_ready_in_template_order(
@@ -1131,6 +1397,16 @@ struct TelemetryRun {
     override_count: u32,
 }
 
+#[derive(Debug, Clone)]
+struct TelemetryRunSet {
+    session_id: SessionId,
+    run_set_id: GraphRunSetId,
+    root_graph_id: GraphId,
+    plan_item_id: ItemId,
+    required_children: u32,
+    opened_at_ms: u64,
+}
+
 impl TelemetryRun {
     fn close_open_attempts(&mut self, at_ms: u64, outcome: GraphNodeAttemptOutcome) {
         for attempt in &mut self.attempts {
@@ -1165,6 +1441,8 @@ impl TelemetryRun {
 pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjection {
     let mut runs = HashMap::<(SessionId, GraphId), TelemetryRun>::new();
     let mut guard_menus = HashMap::<(SessionId, MenuId), (GraphId, RunId)>::new();
+    let mut run_sets = HashMap::<(SessionId, GraphRunSetId), TelemetryRunSet>::new();
+    let mut todo_attachments = HashMap::<(SessionId, GraphId), TodoGraphAttached>::new();
 
     for envelope in envelopes {
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
@@ -1173,6 +1451,23 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
         let session_id = envelope.session_id.clone();
         let at_ms = envelope.committed_at_ms;
         match payload {
+            EventPayload::GraphRunSetOpened(opened) => {
+                run_sets
+                    .entry((session_id.clone(), opened.run_set_id.clone()))
+                    .or_insert(TelemetryRunSet {
+                        session_id,
+                        run_set_id: opened.run_set_id,
+                        root_graph_id: opened.root_graph_id,
+                        plan_item_id: opened.plan_item_id,
+                        required_children: opened.required_children,
+                        opened_at_ms: at_ms,
+                    });
+            }
+            EventPayload::TodoGraphAttached(attached) => {
+                todo_attachments
+                    .entry((session_id, attached.child_graph_id.clone()))
+                    .or_insert(attached);
+            }
             EventPayload::GraphPinned(pinned) => {
                 let key = (session_id.clone(), pinned.graph_id.clone());
                 runs.entry(key).or_insert_with(|| TelemetryRun {
@@ -1319,8 +1614,130 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
             node_attempts: u32::try_from(attempts.len()).unwrap_or(u32::MAX),
             mis_gate_count: run.mis_gate_count,
             override_count: run.override_count,
+            scope: None,
         });
         graph_node_attempts.extend(attempts);
+    }
+
+    for row in &mut graph_runs {
+        let Some(attached) = todo_attachments.get(&(row.session_id.clone(), row.graph_id.clone()))
+        else {
+            continue;
+        };
+        row.scope = Some(GraphRunScope::TodoChild {
+            run_set_id: attached.run_set_id.clone(),
+            plan_item_id: attached.plan_item_id.clone(),
+            todo_id: attached.todo_id,
+            depends_on_todo_id: attached.depends_on_todo_id,
+        });
+    }
+
+    let reductions_by_session = envelopes
+        .iter()
+        .fold(
+            HashMap::<SessionId, Vec<RawEnvelope>>::new(),
+            |mut by_session, envelope| {
+                by_session
+                    .entry(envelope.session_id.clone())
+                    .or_default()
+                    .push(envelope.clone());
+                by_session
+            },
+        )
+        .into_iter()
+        .map(|(session_id, session_envelopes)| (session_id, reduce_graphs(&session_envelopes)))
+        .collect::<HashMap<_, _>>();
+    for run_set in run_sets.values() {
+        let child_rows = graph_runs
+            .iter()
+            .filter(|row| {
+                matches!(
+                    &row.scope,
+                    Some(GraphRunScope::TodoChild { run_set_id, .. })
+                        if run_set_id == &run_set.run_set_id && row.session_id == run_set.session_id
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let completed_children = u32::try_from(
+            child_rows
+                .iter()
+                .filter(|row| graph_phase_is_terminal(row.phase))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+        .min(run_set.required_children);
+        let complete = completed_children == run_set.required_children;
+        let observed_end = child_rows
+            .iter()
+            .map(|row| row.opened_at_ms.saturating_add(row.wall_elapsed_ms))
+            .max()
+            .unwrap_or(run_set.opened_at_ms);
+        let root = graph_runs
+            .iter()
+            .find(|row| {
+                row.session_id == run_set.session_id
+                    && row.graph_id == run_set.root_graph_id
+                    && row.scope.is_none()
+            })
+            .cloned();
+        let Some(root) = root else {
+            continue;
+        };
+        let child_statuses = reductions_by_session
+            .get(&run_set.session_id)
+            .and_then(|reductions| reductions.run_sets.get(&run_set.run_set_id))
+            .map(|status| status.children.as_slice())
+            .unwrap_or_default();
+        let mut stage_counts = BTreeMap::<(GraphPhase, Option<GraphNodeName>), u32>::new();
+        for child in child_statuses {
+            let count = stage_counts
+                .entry((child.phase, child.current_node.clone()))
+                .or_default();
+            *count = count.saturating_add(1);
+        }
+        graph_runs.push(GraphRunRow {
+            session_id: run_set.session_id.clone(),
+            graph_id: run_set.root_graph_id.clone(),
+            template: root.template.clone(),
+            template_version: root.template_version,
+            digest: root.digest.clone(),
+            phase: if complete {
+                GraphPhase::Completed
+            } else {
+                GraphPhase::Active
+            },
+            opened_at_ms: run_set.opened_at_ms,
+            terminal_at_ms: complete.then_some(observed_end),
+            wall_elapsed_ms: observed_end.saturating_sub(run_set.opened_at_ms),
+            critical_path_elapsed_ms: child_rows
+                .iter()
+                .map(|row| row.critical_path_elapsed_ms)
+                .max()
+                .unwrap_or(0),
+            declared_nodes: child_rows
+                .iter()
+                .fold(0_u32, |total, row| total.saturating_add(row.declared_nodes)),
+            node_attempts: child_rows
+                .iter()
+                .fold(0_u32, |total, row| total.saturating_add(row.node_attempts)),
+            mis_gate_count: child_rows
+                .iter()
+                .fold(0_u32, |total, row| total.saturating_add(row.mis_gate_count)),
+            override_count: child_rows
+                .iter()
+                .fold(0_u32, |total, row| total.saturating_add(row.override_count)),
+            scope: Some(GraphRunScope::RunSetAggregate {
+                run_set_id: run_set.run_set_id.clone(),
+                plan_item_id: run_set.plan_item_id.clone(),
+                completed_children,
+                required_children: run_set.required_children,
+                stage_counts: stage_counts
+                    .into_iter()
+                    .map(|((phase, node), count)| GraphStageCount { phase, node, count })
+                    .collect(),
+            }),
+        });
     }
     graph_runs.sort_by(|left, right| {
         left.session_id
@@ -1399,6 +1816,11 @@ pub fn graph_template_rollups(
     let mut rollups = BTreeMap::<(String, u32, String), GraphTemplateRollup>::new();
     let run_keys = runs
         .iter()
+        .filter(|run| {
+            !run.scope
+                .as_ref()
+                .is_some_and(GraphRunScope::is_run_set_aggregate)
+        })
         .map(|run| {
             (
                 (run.session_id.clone(), run.graph_id.clone()),
@@ -1411,6 +1833,13 @@ pub fn graph_template_rollups(
         })
         .collect::<HashMap<_, _>>();
     for run in runs {
+        if run
+            .scope
+            .as_ref()
+            .is_some_and(GraphRunScope::is_run_set_aggregate)
+        {
+            continue;
+        }
         let key = (
             run.template.clone(),
             run.template_version,
@@ -1518,7 +1947,11 @@ pub fn graph_template_rollups(
 
 fn graph_reduction_payload(payload: &serde_json::Value) -> Option<EventPayload> {
     let kind = payload.get("type")?.as_str()?;
-    if !kind.starts_with("graph_") && kind != "evidence_recorded" && !kind.starts_with("menu_") {
+    if !kind.starts_with("graph_")
+        && kind != "todo_graph_attached"
+        && kind != "evidence_recorded"
+        && !kind.starts_with("menu_")
+    {
         return None;
     }
     serde_json::from_value(payload.clone()).ok()
@@ -2091,6 +2524,50 @@ pub fn process_signal_subject_digest(
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
+/// Deterministic identity for the run-set opened by one exact Plan fact. The
+/// event coordinate keeps whole-list replacements distinct even though G1
+/// deliberately reuses the Plan `ItemId` inside a lifecycle.
+#[must_use]
+pub fn todo_run_set_id(
+    session_id: &SessionId,
+    plan_item_id: &ItemId,
+    plan_event_id: &EventId,
+) -> GraphRunSetId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.todo-run-set.v1");
+    for value in [
+        session_id.as_str(),
+        plan_item_id.as_str(),
+        plan_event_id.as_str(),
+    ] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    GraphRunSetId::new(format!("todo-run-set-{}", hasher.finalize().to_hex()))
+}
+
+/// Deterministic child graph identity for one frozen todo attachment.
+#[must_use]
+pub fn todo_child_graph_id(
+    session_id: &SessionId,
+    run_set_id: &GraphRunSetId,
+    plan_item_id: &ItemId,
+    todo_id: u32,
+) -> GraphId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.todo-child-graph.v1");
+    for value in [
+        session_id.as_str(),
+        run_set_id.as_str(),
+        plan_item_id.as_str(),
+    ] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&todo_id.to_be_bytes());
+    GraphId::new(format!("todo-graph-{}", hasher.finalize().to_hex()))
+}
+
 #[must_use]
 fn bound_utf8(value: &str, max_bytes: usize) -> String {
     let mut bounded = value.to_owned();
@@ -2112,6 +2589,120 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn graph_fact(seq: u64, payload: EventPayload) -> RawEnvelope {
+        crate::envelope::EventEnvelope {
+            schema_version: crate::envelope::SCHEMA_VERSION,
+            event_id: EventId::new(format!("m2d-fact-{seq}")),
+            seq,
+            session_id: SessionId::new("m2d-session"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: crate::ids::DeviceId::new("m2d-test"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: seq.saturating_mul(10),
+            render: crate::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: crate::envelope::PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).expect("graph payload"),
+        }
+    }
+
+    fn one_node_pin(graph_id: &GraphId) -> GraphPinned {
+        GraphPinned {
+            graph_id: graph_id.clone(),
+            template: "m2d-one-node".into(),
+            digest: "m2d-one-node-digest".into(),
+            template_version: 1,
+            start_node: Some(build_node()),
+            nodes: vec![GraphNodeSpec {
+                name: build_node(),
+                gate: GraphGateKind::CommandGreen,
+                executor: GraphExecutorShape::Inline,
+                max_attempts: 2,
+                max_evidence_per_attempt: Some(2),
+                depends_on: Vec::new(),
+                verify_slots: Vec::new(),
+            }],
+        }
+    }
+
+    fn run_set_prefix(required: u32) -> (Vec<RawEnvelope>, GraphId, GraphRunSetId, ItemId) {
+        let root = GraphId::new("m2d-root");
+        let run_set = GraphRunSetId::new("m2d-run-set");
+        let plan = ItemId::new("m2d-plan");
+        let facts = vec![
+            graph_fact(1, EventPayload::GraphPinned(one_node_pin(&root))),
+            graph_fact(
+                2,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id: root.clone(),
+                    node: build_node(),
+                    attempt: 1,
+                }),
+            ),
+            graph_fact(
+                3,
+                EventPayload::GraphRunSetOpened(GraphRunSetOpened {
+                    run_set_id: run_set.clone(),
+                    root_graph_id: root.clone(),
+                    plan_item_id: plan.clone(),
+                    plan_event_id: EventId::new("plan-event-1"),
+                    required_children: required,
+                }),
+            ),
+        ];
+        (facts, root, run_set, plan)
+    }
+
+    fn attach_and_pin(
+        facts: &mut Vec<RawEnvelope>,
+        run_set: &GraphRunSetId,
+        plan: &ItemId,
+        todo_id: u32,
+        dependency: Option<u32>,
+        graph_id: &GraphId,
+    ) {
+        let seq = u64::try_from(facts.len()).unwrap_or(u64::MAX) + 1;
+        facts.push(graph_fact(
+            seq,
+            EventPayload::TodoGraphAttached(TodoGraphAttached {
+                run_set_id: run_set.clone(),
+                plan_item_id: plan.clone(),
+                todo_id,
+                depends_on_todo_id: dependency,
+                child_graph_id: graph_id.clone(),
+                ordinal: todo_id,
+            }),
+        ));
+        facts.push(graph_fact(
+            seq + 1,
+            EventPayload::GraphPinned(one_node_pin(graph_id)),
+        ));
+    }
+
+    fn model_green(graph_id: &GraphId, attempt: u32, detail: &str) -> EvidenceRecorded {
+        EvidenceRecorded {
+            graph_id: graph_id.clone(),
+            node: build_node(),
+            attempt,
+            verdict: EvidenceVerdict::Green,
+            detail: detail.into(),
+            fingerprint: evidence_fingerprint(detail),
+            slot: None,
+            subject_digest: None,
+            source: GraphEvidenceSource::Model {
+                run_id: RunId::new(format!("run-{detail}")),
+                call_id: format!("call-{detail}"),
+            },
+        }
+    }
 
     #[test]
     fn template_digest_is_stable_and_brief_is_bounded() {
@@ -2154,6 +2745,7 @@ mod tests {
             blocked_reason: None,
             pending_menu: None,
             pending_menus: Vec::new(),
+            run_set: None,
         };
         let brief = status.graph_brief().unwrap_or_default();
         assert!(!brief.is_empty());
@@ -2168,6 +2760,277 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(evidence_fingerprint(&a), evidence_fingerprint(&b));
         assert!(normalize_evidence_detail(&"🦀".repeat(1_000)).len() <= 1_024);
+    }
+
+    #[test]
+    fn m2d_plan_reorder_cannot_retarget_an_existing_child() {
+        // Expected failure under mutation: key attachments by array position,
+        // or overwrite an earlier `(run-set, Plan ItemId, todo id)` binding.
+        let (mut facts, root, run_set_one, plan) = run_set_prefix(1);
+        let child_one = GraphId::new("child-one");
+        attach_and_pin(&mut facts, &run_set_one, &plan, 7, None, &child_one);
+        facts.push(graph_fact(
+            6,
+            EventPayload::TodoGraphAttached(TodoGraphAttached {
+                run_set_id: run_set_one.clone(),
+                plan_item_id: plan.clone(),
+                todo_id: 7,
+                depends_on_todo_id: None,
+                child_graph_id: GraphId::new("retargeted-by-reorder"),
+                ordinal: 0,
+            }),
+        ));
+        let run_set_two = GraphRunSetId::new("m2d-run-set-two");
+        facts.push(graph_fact(
+            7,
+            EventPayload::GraphRunSetOpened(GraphRunSetOpened {
+                run_set_id: run_set_two.clone(),
+                root_graph_id: root,
+                plan_item_id: plan.clone(),
+                plan_event_id: EventId::new("plan-event-2"),
+                required_children: 1,
+            }),
+        ));
+        let child_two = GraphId::new("child-two");
+        attach_and_pin(&mut facts, &run_set_two, &plan, 7, None, &child_two);
+
+        let reduced = reduce_graphs(&facts);
+        assert_eq!(
+            reduced.run_sets[&run_set_one].children[0].graph_id,
+            child_one
+        );
+        assert_eq!(
+            reduced.run_sets[&run_set_two].children[0].graph_id,
+            child_two
+        );
+        assert_eq!(reduced.active_run_set.as_ref(), Some(&run_set_two));
+    }
+
+    #[test]
+    fn m2d_retrying_one_child_preserves_its_siblings_green_state() {
+        // Expected failure under mutation: share one epoch/frontier across all
+        // todos, causing child A's retry to clear child B's satisfied green.
+        let (mut facts, _, run_set, plan) = run_set_prefix(2);
+        let child_a = GraphId::new("child-a");
+        let child_b = GraphId::new("child-b");
+        attach_and_pin(&mut facts, &run_set, &plan, 1, None, &child_a);
+        attach_and_pin(&mut facts, &run_set, &plan, 2, None, &child_b);
+        for child in [&child_a, &child_b] {
+            let seq = u64::try_from(facts.len()).unwrap_or(u64::MAX) + 1;
+            facts.push(graph_fact(
+                seq,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id: child.clone(),
+                    node: build_node(),
+                    attempt: 1,
+                }),
+            ));
+            facts.push(graph_fact(
+                seq + 1,
+                EventPayload::EvidenceRecorded(model_green(child, 1, child.as_str())),
+            ));
+            facts.push(graph_fact(
+                seq + 2,
+                EventPayload::GraphGateSatisfied(GraphGateSatisfied {
+                    graph_id: child.clone(),
+                    node: build_node(),
+                    attempt: 1,
+                }),
+            ));
+        }
+        facts.push(graph_fact(
+            14,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: child_a.clone(),
+                node: build_node(),
+                attempt: 2,
+            }),
+        ));
+
+        let reduced = reduce_graphs(&facts);
+        let sibling = reduced.graph(&child_b).unwrap().status.as_ref().unwrap();
+        assert_eq!(sibling.attempt, 1);
+        assert_eq!(sibling.nodes[0].current_attempt, Some(1));
+        assert_eq!(sibling.current_node, None);
+        assert!(sibling.nodes[0].satisfied);
+        assert_eq!(sibling.nodes[0].evidence.effective_green, 1);
+        let retried = reduced.graph(&child_a).unwrap().status.as_ref().unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(retried.nodes[0].current_attempt, Some(2));
+        assert_eq!(retried.current_node, Some(build_node()));
+        assert!(!retried.nodes[0].satisfied);
+        assert_eq!(retried.nodes[0].evidence.effective_green, 0);
+    }
+
+    #[test]
+    fn m2d_aggregate_requires_all_k_terminal_child_contracts() {
+        // Expected failure under mutation: treat any terminal child, or K-1
+        // child contracts, as sufficient to complete the aggregate root.
+        let (mut facts, root, run_set, plan) = run_set_prefix(2);
+        let child_a = GraphId::new("contract-a");
+        let child_b = GraphId::new("contract-b");
+        attach_and_pin(&mut facts, &run_set, &plan, 1, None, &child_a);
+        attach_and_pin(&mut facts, &run_set, &plan, 2, None, &child_b);
+        facts.push(graph_fact(
+            8,
+            EventPayload::GraphCompleted(GraphCompleted {
+                graph_id: child_a.clone(),
+            }),
+        ));
+        let k_minus_one = reduce_graphs(&facts);
+        assert_eq!(
+            k_minus_one
+                .graph(&root)
+                .unwrap()
+                .status
+                .as_ref()
+                .unwrap()
+                .phase,
+            GraphPhase::Active
+        );
+        assert_eq!(k_minus_one.run_sets[&run_set].terminal_children, 1);
+
+        facts.push(graph_fact(
+            9,
+            EventPayload::GraphAbandoned(GraphAbandoned {
+                graph_id: child_a,
+                why: "duplicate terminal contract".into(),
+            }),
+        ));
+        let duplicate_same_child = reduce_graphs(&facts);
+        assert_eq!(duplicate_same_child.run_sets[&run_set].terminal_children, 1);
+        assert_eq!(
+            duplicate_same_child
+                .graph(&root)
+                .unwrap()
+                .status
+                .as_ref()
+                .unwrap()
+                .phase,
+            GraphPhase::Active
+        );
+
+        facts.push(graph_fact(
+            10,
+            EventPayload::GraphSuperseded(GraphSuperseded {
+                old: child_b,
+                new: GraphId::new("contract-b-successor"),
+            }),
+        ));
+        let all_k = reduce_graphs(&facts);
+        assert_eq!(
+            all_k.graph(&root).unwrap().status.as_ref().unwrap().phase,
+            GraphPhase::Completed
+        );
+        assert_eq!(all_k.run_sets[&run_set].terminal_children, 2);
+    }
+
+    #[test]
+    fn m2d_child_graphs_apply_epoch_and_dag_laws_independently() {
+        // Expected failure under mutation: bypass M2b validation for a child,
+        // or retain child A's epoch-1 green after opening its epoch 2.
+        let malformed = GraphTemplateSpec {
+            name: "bad-child".into(),
+            version: 1,
+            start_node: Some(GraphNodeName::new("A").unwrap()),
+            nodes: vec![GraphNodeSpec {
+                name: GraphNodeName::new("A").unwrap(),
+                gate: GraphGateKind::CommandGreen,
+                executor: GraphExecutorShape::Inline,
+                max_attempts: 2,
+                max_evidence_per_attempt: Some(1),
+                depends_on: vec![GraphNodeName::new("A").unwrap()],
+                verify_slots: Vec::new(),
+            }],
+        };
+        assert_eq!(
+            validate_graph_template(&malformed).unwrap_err().kind,
+            GraphTemplateRejection::NoStart
+        );
+
+        let (mut facts, _, run_set, plan) = run_set_prefix(2);
+        let child_a = GraphId::new("law-child-a");
+        let child_b = GraphId::new("law-child-b");
+        attach_and_pin(&mut facts, &run_set, &plan, 1, None, &child_a);
+        attach_and_pin(&mut facts, &run_set, &plan, 2, None, &child_b);
+        for child in [&child_a, &child_b] {
+            let seq = u64::try_from(facts.len()).unwrap_or(u64::MAX) + 1;
+            facts.push(graph_fact(
+                seq,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id: child.clone(),
+                    node: build_node(),
+                    attempt: 1,
+                }),
+            ));
+            facts.push(graph_fact(
+                seq + 1,
+                EventPayload::EvidenceRecorded(model_green(child, 1, child.as_str())),
+            ));
+        }
+        facts.push(graph_fact(
+            12,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: child_a.clone(),
+                node: build_node(),
+                attempt: 2,
+            }),
+        ));
+        let reduced = reduce_graphs(&facts);
+        assert_eq!(
+            reduced
+                .graph(&child_a)
+                .unwrap()
+                .status
+                .as_ref()
+                .unwrap()
+                .nodes[0]
+                .evidence
+                .effective_green,
+            0
+        );
+        assert_eq!(
+            reduced
+                .graph(&child_b)
+                .unwrap()
+                .status
+                .as_ref()
+                .unwrap()
+                .nodes[0]
+                .evidence
+                .effective_green,
+            1
+        );
+    }
+
+    #[test]
+    fn m2d_legacy_single_graph_status_bytes_are_unchanged() {
+        // Expected failure under mutation: serialize any M2d default field into
+        // a journal reduction that contains no run-set facts.
+        let graph_id = GraphId::new("legacy");
+        let mut legacy_pin = one_node_pin(&graph_id);
+        legacy_pin.template = SHIP_LOOP_TEMPLATE.into();
+        legacy_pin.digest = "d".into();
+        legacy_pin.template_version = 0;
+        legacy_pin.start_node = None;
+        let facts = vec![
+            graph_fact(1, EventPayload::GraphPinned(legacy_pin)),
+            graph_fact(
+                2,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id,
+                    node: build_node(),
+                    attempt: 1,
+                }),
+            ),
+        ];
+        let encoded =
+            serde_json::to_string(reduce_graph(&facts).status.as_ref().expect("legacy status"))
+                .unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"graph_id":"legacy","template":"ship-loop","digest":"d","phase":"active","current_node":"BUILD","attempt":1,"nodes":[{"node":"BUILD","attempts_opened":1,"current_attempt":1,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false}]}"#
+        );
     }
 
     #[test]

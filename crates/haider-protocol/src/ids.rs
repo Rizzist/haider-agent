@@ -91,3 +91,7 @@ string_id!(
     #[doc = "One immutable Convergence Graph template instance."]
     GraphId
 );
+string_id!(
+    #[doc = "One immutable aggregate over the todo graphs opened from a Plan list."]
+    GraphRunSetId
+);

@@ -111,6 +111,8 @@ pub enum EventPayload {
     GraphSuperseded(graph::GraphSuperseded),
     GraphFinalizationDeferred(graph::GraphFinalizationDeferred),
     ProcessSignalRecorded(graph::ProcessSignalRecorded),
+    GraphRunSetOpened(graph::GraphRunSetOpened),
+    TodoGraphAttached(graph::TodoGraphAttached),
     // accounts
     Rotation(credential::RotationEvent),
     // token accounting

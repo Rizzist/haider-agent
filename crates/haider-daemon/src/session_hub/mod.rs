@@ -103,21 +103,25 @@ use haider_core::{
     AbandonedGraph, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
     CancelledTurn, CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome,
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
-    GraphInspectResult, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome,
-    HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome, PinnedGraph, ProcessSignalCommand,
-    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, SelectedEffort,
-    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
-    SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    GraphInspectResult, GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand,
+    GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle,
+    MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph,
+    ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache,
+    RenamedSession, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
+    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{BranchId, DeviceId, EventId, GraphId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{
+    BranchId, DeviceId, EventId, GraphId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_protocol::menu::{
     AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind,
     effect_recovery_menu,
@@ -135,7 +139,8 @@ use haider_rpc::{
     ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
     ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
     ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, WireFrame,
+    ResponseBody, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
+    TodoGraphOpenedWire, WireFrame,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -792,6 +797,10 @@ enum ActorCommand {
     PinGraph {
         command: GraphPinCommand,
         completed: oneshot::Sender<Result<GraphPinOutcome, HaiderError>>,
+    },
+    OpenGraphRunSet {
+        command: GraphRunSetOpenCommand,
+        completed: oneshot::Sender<Result<GraphRunSetOpenOutcome, HaiderError>>,
     },
     SwitchGraph {
         command: GraphSwitchCommand,
@@ -1759,6 +1768,40 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::PinGraph { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn graph_run_set_open_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<OpenedGraphRunSet>, SessionHubError> {
+        self.inner
+            .store
+            .graph_run_set_open_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn open_graph_run_set(
+        &self,
+        command: GraphRunSetOpenCommand,
+    ) -> Result<GraphRunSetOpenOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::OpenGraphRunSet { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

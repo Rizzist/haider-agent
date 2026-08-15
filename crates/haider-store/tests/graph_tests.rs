@@ -2,6 +2,8 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::collections::HashSet;
+
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
@@ -9,19 +11,25 @@ use haider_protocol::error::ErrorCode;
 use haider_protocol::graph::{
     EvidenceAuthority, EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphCompleted,
     GraphExecutorShape, GraphFinalizationDeferred, GraphGateKind, GraphNodeName, GraphNodeSpec,
-    GraphPhase, GraphPinned, GraphSuperseded, ProcessSignalRecorded, ProcessSignalRef,
-    SHIP_LOOP_TEMPLATE, STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector,
-    evidence_fingerprint, graph_template, graph_template_catalog, process_signal_subject_digest,
+    GraphPhase, GraphPinned, GraphRunScope, GraphRunSetOpened, GraphSuperseded, GraphTemplateSpec,
+    ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE, STAGGERED_TEMPLATE,
+    SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector, TodoGraphAttached, evidence_fingerprint,
+    graph_template, graph_template_catalog, graph_template_digest, process_signal_subject_digest,
     reduce_graph_telemetry, ship_loop_nodes,
 };
-use haider_protocol::ids::{DeviceId, EffectId, EventId, GraphId, MenuId, RunId, SessionId};
+use haider_protocol::history::{TodoItem, TodoState};
+use haider_protocol::ids::{
+    DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId, RunId, SessionId,
+};
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
 use haider_store::{
     EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
     GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphPinCommand,
-    GraphPinOutcome, GraphSwitchCommand, GraphSwitchOutcome, MenuResolutionCommand,
-    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, SessionCreateCommand, Store,
+    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
+    GraphSwitchOutcome, MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand,
+    ProcessSignalOutcome, SessionCreateCommand, Store,
 };
 
 fn create_session(store: &Store, name: &str) -> SessionId {
@@ -144,6 +152,72 @@ fn raw_envelope(
         },
         payload: serde_json::to_value(payload).expect("serialize test payload"),
     }
+}
+
+fn append_plan(
+    store: &Store,
+    session_id: &SessionId,
+    plan_item_id: &ItemId,
+    event_id: &str,
+    items: Vec<TodoItem>,
+) -> u64 {
+    let mut envelopes = vec![raw_envelope(
+        store,
+        session_id,
+        &RunId::new(format!("run-{event_id}")),
+        event_id,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: plan_item_id.clone(),
+            item: TurnItem::Plan { items },
+        }),
+    )];
+    store
+        .append(&mut envelopes)
+        .expect("append exact Plan fact")
+        .first_seq
+}
+
+fn todo(id: u32, dep: Option<u32>) -> TodoItem {
+    TodoItem {
+        id,
+        text: format!("todo {id}"),
+        state: TodoState::Listed,
+        dep,
+    }
+}
+
+fn open_run_set(
+    store: &Store,
+    session_id: &SessionId,
+    plan_item_id: &ItemId,
+    plan_event_seq: u64,
+    suffix: &str,
+) -> haider_store::OpenedGraphRunSet {
+    let command = GraphRunSetOpenCommand {
+        command_id: format!("open-run-set-{suffix}"),
+        request_digest: format!("open-run-set-digest-{suffix}"),
+        request_json: format!(r#"{{"plan_event_seq":{plan_event_seq}}}"#),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        plan_item_id: plan_item_id.clone(),
+        plan_event_seq,
+        device_id: DeviceId::new("graph-test"),
+    };
+    let GraphRunSetOpenOutcome::Committed { opened, .. } = store
+        .open_graph_run_set(&command)
+        .expect("open todo graph run-set")
+    else {
+        panic!("fresh run-set command must commit");
+    };
+    assert_eq!(
+        store
+            .open_graph_run_set(&command)
+            .expect("lost response replay"),
+        GraphRunSetOpenOutcome::IdempotentReplay {
+            opened: opened.clone(),
+        }
+    );
+    opened
 }
 
 fn process_signal_command(
@@ -3090,6 +3164,349 @@ fn m2c_supersession_is_not_abandonment_telemetry() {
     let rollup = &projection.graph_template_rollups[0];
     assert_eq!(rollup.superseded, 1);
     assert_eq!(rollup.abandoned, 0);
+}
+
+#[test]
+fn m2d_plan_replacement_opens_a_new_run_set_without_retargeting_children() {
+    // Expected failure under mutation: deriving child ownership from the Plan
+    // ItemId alone retargets the first list when the replacement is reordered.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2d-plan-scope");
+    pin(&store, &session_id, "m2d-plan-scope");
+    let plan_item_id = ItemId::new("stable-plan-item");
+    let first_seq = append_plan(
+        &store,
+        &session_id,
+        &plan_item_id,
+        "plan-first",
+        vec![todo(10, None), todo(20, Some(10))],
+    );
+    let first = open_run_set(&store, &session_id, &plan_item_id, first_seq, "first");
+    let second_seq = append_plan(
+        &store,
+        &session_id,
+        &plan_item_id,
+        "plan-replacement",
+        vec![todo(20, None), todo(10, Some(20))],
+    );
+    let second = open_run_set(
+        &store,
+        &session_id,
+        &plan_item_id,
+        second_seq,
+        "replacement",
+    );
+
+    assert_ne!(first.run_set_id, second.run_set_id);
+    for todo_id in [10, 20] {
+        let old = first
+            .children
+            .iter()
+            .find(|child| child.todo_id == todo_id)
+            .expect("first binding");
+        let new = second
+            .children
+            .iter()
+            .find(|child| child.todo_id == todo_id)
+            .expect("replacement binding");
+        assert_ne!(old.child_graph_id, new.child_graph_id);
+        assert_eq!(
+            store
+                .graph_status_by_id(&session_id, &old.child_graph_id)
+                .expect("old child read")
+                .expect("old child retained")
+                .phase,
+            GraphPhase::Superseded
+        );
+    }
+    let aggregate = store
+        .graph_status(&session_id)
+        .expect("root status")
+        .expect("selected root")
+        .run_set
+        .expect("aggregate projection");
+    assert_eq!(aggregate.run_set_id, second.run_set_id);
+    assert_eq!(
+        (aggregate.terminal_children, aggregate.required_children),
+        (0, 2)
+    );
+    assert_eq!(
+        aggregate
+            .children
+            .iter()
+            .map(|child| (child.todo_id, child.depends_on_todo_id))
+            .collect::<Vec<_>>(),
+        vec![(20, None), (10, Some(20))]
+    );
+    let inspect = store
+        .graph_inspect(&session_id, None, 25)
+        .expect("inspect active run-set");
+    assert!(inspect.snapshot.runs.iter().any(|row| {
+        matches!(
+            &row.scope,
+            Some(GraphRunScope::RunSetAggregate {
+                run_set_id,
+                completed_children: 0,
+                required_children: 2,
+                ..
+            }) if run_set_id == &second.run_set_id
+        )
+    }));
+    assert_eq!(
+        inspect
+            .snapshot
+            .runs
+            .iter()
+            .filter_map(|row| match &row.scope {
+                Some(GraphRunScope::TodoChild {
+                    run_set_id,
+                    todo_id,
+                    ..
+                }) if run_set_id == &second.run_set_id => Some(*todo_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>(),
+        HashSet::from([10, 20])
+    );
+}
+
+#[test]
+fn m2d_child_metrics_are_independent_and_aggregate_critical_path_is_max() {
+    // Expected failure under mutation: summing the two child critical paths
+    // reports 100ms instead of the parallel aggregate's 70ms.
+    let session_id = SessionId::new("m2d-child-metrics");
+    let root_graph_id = GraphId::new("m2d-root");
+    let first_graph_id = GraphId::new("m2d-child-10");
+    let second_graph_id = GraphId::new("m2d-child-20");
+    let run_set_id = GraphRunSetId::new("m2d-run-set");
+    let plan_item_id = ItemId::new("m2d-plan");
+    let node = GraphNodeName::new("WORK").expect("node");
+    let pinned = |graph_id: GraphId| {
+        EventPayload::GraphPinned(GraphPinned {
+            graph_id,
+            template: "one-node".into(),
+            digest: "one-node-digest".into(),
+            template_version: 1,
+            start_node: Some(node.clone()),
+            nodes: vec![telemetry_node("WORK", &[])],
+        })
+    };
+    let facts = vec![
+        telemetry_envelope(&session_id, 1, 0, pinned(root_graph_id.clone())),
+        telemetry_envelope(
+            &session_id,
+            2,
+            10,
+            EventPayload::GraphRunSetOpened(GraphRunSetOpened {
+                run_set_id: run_set_id.clone(),
+                root_graph_id: root_graph_id.clone(),
+                plan_item_id: plan_item_id.clone(),
+                plan_event_id: EventId::new("m2d-plan-event"),
+                required_children: 2,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            3,
+            10,
+            EventPayload::TodoGraphAttached(TodoGraphAttached {
+                run_set_id: run_set_id.clone(),
+                plan_item_id: plan_item_id.clone(),
+                todo_id: 10,
+                depends_on_todo_id: None,
+                child_graph_id: first_graph_id.clone(),
+                ordinal: 0,
+            }),
+        ),
+        telemetry_envelope(&session_id, 4, 10, pinned(first_graph_id.clone())),
+        telemetry_envelope(
+            &session_id,
+            5,
+            10,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: first_graph_id.clone(),
+                node: node.clone(),
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            6,
+            10,
+            EventPayload::TodoGraphAttached(TodoGraphAttached {
+                run_set_id: run_set_id.clone(),
+                plan_item_id,
+                todo_id: 20,
+                depends_on_todo_id: None,
+                child_graph_id: second_graph_id.clone(),
+                ordinal: 1,
+            }),
+        ),
+        telemetry_envelope(&session_id, 7, 10, pinned(second_graph_id.clone())),
+        telemetry_envelope(
+            &session_id,
+            8,
+            10,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: second_graph_id.clone(),
+                node: node.clone(),
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            9,
+            40,
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: first_graph_id.clone(),
+                node: node.clone(),
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            10,
+            40,
+            EventPayload::GraphCompleted(GraphCompleted {
+                graph_id: first_graph_id.clone(),
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            11,
+            80,
+            EventPayload::GraphGateSatisfied(haider_protocol::graph::GraphGateSatisfied {
+                graph_id: second_graph_id.clone(),
+                node,
+                attempt: 1,
+            }),
+        ),
+        telemetry_envelope(
+            &session_id,
+            12,
+            80,
+            EventPayload::GraphCompleted(GraphCompleted {
+                graph_id: second_graph_id.clone(),
+            }),
+        ),
+    ];
+    let projection = reduce_graph_telemetry(&facts);
+    let first = projection
+        .graph_runs
+        .iter()
+        .find(|row| row.graph_id == first_graph_id)
+        .expect("first child row");
+    let second = projection
+        .graph_runs
+        .iter()
+        .find(|row| row.graph_id == second_graph_id)
+        .expect("second child row");
+    assert_eq!(first.critical_path_elapsed_ms, 30);
+    assert_eq!(second.critical_path_elapsed_ms, 70);
+    assert!(matches!(
+        first.scope,
+        Some(GraphRunScope::TodoChild { todo_id: 10, .. })
+    ));
+    assert!(matches!(
+        second.scope,
+        Some(GraphRunScope::TodoChild { todo_id: 20, .. })
+    ));
+    let aggregate = projection
+        .graph_runs
+        .iter()
+        .find(|row| {
+            matches!(
+                row.scope,
+                Some(GraphRunScope::RunSetAggregate {
+                    completed_children: 2,
+                    required_children: 2,
+                    ..
+                })
+            )
+        })
+        .expect("aggregate row");
+    assert_eq!(aggregate.critical_path_elapsed_ms, 70);
+    assert_eq!(aggregate.node_attempts, 2);
+}
+
+#[test]
+fn m2d_run_set_open_revalidates_the_selected_template_before_child_creation() {
+    // Expected failure under mutation: bypassing M2b validation in the run-set
+    // store command instantiates every child with the malformed cyclic DAG.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2d-invalid-child-template");
+    let node = GraphNodeName::new("A").expect("node");
+    let malformed = GraphTemplateSpec {
+        name: "malformed-child-template".into(),
+        version: 1,
+        start_node: Some(node.clone()),
+        nodes: vec![GraphNodeSpec {
+            name: node.clone(),
+            gate: GraphGateKind::CommandGreen,
+            executor: GraphExecutorShape::Inline,
+            max_attempts: 2,
+            max_evidence_per_attempt: Some(2),
+            depends_on: vec![node],
+            verify_slots: Vec::new(),
+        }],
+    };
+    let root_graph_id = GraphId::new("malformed-root");
+    let mut pin = vec![raw_envelope(
+        &store,
+        &session_id,
+        &RunId::new("run-malformed-root"),
+        "malformed-root-pin",
+        EventPayload::GraphPinned(GraphPinned {
+            graph_id: root_graph_id,
+            template: malformed.name.clone(),
+            digest: graph_template_digest(&malformed),
+            template_version: malformed.version,
+            start_node: malformed.start_node,
+            nodes: malformed.nodes,
+        }),
+    )];
+    store
+        .append(&mut pin)
+        .expect("append historical malformed pin");
+    let plan_item_id = ItemId::new("malformed-plan");
+    let plan_event_seq = append_plan(
+        &store,
+        &session_id,
+        &plan_item_id,
+        "malformed-plan-event",
+        vec![todo(1, None)],
+    );
+    let head = store
+        .latest_seq(&session_id)
+        .expect("head before rejection");
+    let error = store
+        .open_graph_run_set(&GraphRunSetOpenCommand {
+            command_id: "open-malformed-run-set".into(),
+            request_digest: "open-malformed-run-set-digest".into(),
+            request_json: format!(r#"{{"plan_event_seq":{plan_event_seq}}}"#),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            plan_item_id,
+            plan_event_seq,
+            device_id: DeviceId::new("graph-test"),
+        })
+        .expect_err("malformed selected template must reject");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(store.latest_seq(&session_id).expect("unchanged head"), head);
+    assert!(
+        store
+            .graph_runs(&session_id)
+            .expect("telemetry")
+            .iter()
+            .all(|row| {
+                !matches!(
+                    row.scope,
+                    Some(GraphRunScope::TodoChild { .. } | GraphRunScope::RunSetAggregate { .. })
+                )
+            })
+    );
 }
 
 #[test]

@@ -1757,6 +1757,32 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::GraphRunSetOpen {
+                command_id,
+                session_id,
+                worker_generation,
+                plan_item_id,
+                plan_event_seq,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.graph_run_set_open(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    plan_item_id,
+                    plan_event_seq,
+                )
+                .await
+            }
             RequestBody::GraphSwitch {
                 command_id,
                 session_id,
@@ -3895,6 +3921,113 @@ impl HubConnection {
                 pinned_seq: pinned.pinned_seq,
                 opened_seq: pinned.opened_seq,
                 worker_generation: pinned.worker_generation,
+            },
+        })
+    }
+
+    async fn graph_run_set_open(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        plan_item_id: ItemId,
+        plan_event_seq: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() || plan_event_seq == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "graph run-set open needs a command id and nonzero Plan event sequence",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "plan_item_id": &plan_item_id,
+            "plan_event_seq": plan_event_seq,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode graph run-set open: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .graph_run_set_open_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(opened)) => return self.respond_graph_run_set_opened(request_id, opened),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "graph run-set open requires a control attachment to this session",
+                false,
+                None,
+            );
+        }
+        let command = GraphRunSetOpenCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            plan_item_id,
+            plan_event_seq,
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let opened = match self.hub.open_graph_run_set(command).await {
+            Ok(GraphRunSetOpenOutcome::Committed { opened, .. })
+            | Ok(GraphRunSetOpenOutcome::IdempotentReplay { opened }) => opened,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_graph_run_set_opened(request_id, opened)
+    }
+
+    fn respond_graph_run_set_opened(
+        &self,
+        request_id: RequestId,
+        opened: OpenedGraphRunSet,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::GraphRunSetOpen {
+                session_id: opened.session_id,
+                run_set_id: opened.run_set_id,
+                root_graph_id: opened.root_graph_id,
+                plan_item_id: opened.plan_item_id,
+                plan_event_seq: opened.plan_event_seq,
+                template: opened.template,
+                digest: opened.digest,
+                run_set_opened_seq: opened.run_set_opened_seq,
+                through_seq: opened.through_seq,
+                children: opened
+                    .children
+                    .into_iter()
+                    .map(|child| TodoGraphOpenedWire {
+                        todo_id: child.todo_id,
+                        depends_on_todo_id: child.depends_on_todo_id,
+                        child_graph_id: child.child_graph_id,
+                        attached_seq: child.attached_seq,
+                        pinned_seq: child.pinned_seq,
+                        opened_seq: child.opened_seq,
+                    })
+                    .collect(),
+                worker_generation: opened.worker_generation,
             },
         })
     }
