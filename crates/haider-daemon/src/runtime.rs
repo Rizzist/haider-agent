@@ -429,6 +429,7 @@ async fn run_inner(
     for work in recovered_work {
         let result = match work {
             RecoveredWork::Queued(accepted) => worker_handle.recover_queued(accepted).await,
+            RecoveredWork::Retry(accepted) => worker_handle.recover_retry(accepted).await,
             RecoveredWork::Checkpoint(recovered) => {
                 worker_handle
                     .recover_checkpoint(

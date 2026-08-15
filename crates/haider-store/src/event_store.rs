@@ -52,6 +52,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
+use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
     SessionPermissionOverridesV1,
@@ -873,6 +874,45 @@ pub enum TurnAcceptOutcome {
     },
     IdempotentReplay {
         accepted: AcceptedTurn,
+    },
+}
+
+/// Secret-free semantic input for one manual retry acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRetryCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub run_id: RunId,
+    pub queued_event_id: EventId,
+    pub retried_event_id: EventId,
+    pub active_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Durable coordinates stored in a committed `run.retry` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptedRunRetry {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub failed_run_id: RunId,
+    pub prompt_run_id: RunId,
+    pub user_seq: u64,
+    pub accepted_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic manual-retry acceptance transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunRetryOutcome {
+    Committed {
+        accepted: AcceptedRunRetry,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        accepted: AcceptedRunRetry,
     },
 }
 
@@ -4971,6 +5011,168 @@ impl Store {
         validate_command_identity(command_id, request_digest, request_json)?;
         let connection = self.connection()?;
         lookup_turn_accept_receipt(&connection, command_id, request_digest, request_json)
+    }
+
+    /// Looks up a committed `run.retry` response before generation/state
+    /// validation so response-loss replay remains safe across restarts.
+    pub fn run_retry_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<AcceptedRunRetry>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "run.retry",
+            request_digest,
+            request_json,
+            "run-retry",
+        )
+    }
+
+    /// Atomically accepts a fresh run from the latest failed main-timeline
+    /// user turn, without appending another `UserMessage` or tree node.
+    ///
+    /// The live-run gate and receipt finalization share this transaction:
+    /// two distinct retry commands cannot both observe the failed session as
+    /// idle, and a replay of one committed command cannot mint another run.
+    pub fn accept_run_retry(&self, command: &RunRetryCommand) -> StoreResult<RunRetryOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(accepted) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "run.retry",
+            &command.request_digest,
+            &command.request_json,
+            "run-retry",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(RunRetryOutcome::IdempotentReplay { accepted });
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let states = latest_run_states(&transaction, &command.session_id)?;
+        if states.contains_key(&command.run_id) {
+            return Err(corrupt("daemon-minted retry run id already exists"));
+        }
+        if let Some((run_id, (state, _, _))) = states
+            .iter()
+            .filter(|(_, (state, _, _))| !state.is_terminal())
+            .max_by_key(|(_, (_, seq, _))| *seq)
+        {
+            let message = if matches!(state, RunState::Retrying { .. }) {
+                format!("run retry refused: run {run_id} is already retrying automatically")
+            } else {
+                format!(
+                    "run retry requires a terminal-failed session; run {run_id} is still live ({state:?})"
+                )
+            };
+            return Err(store_error(ErrorCode::InvalidArgument, message, false));
+        }
+        let Some((failed_run_id, prompt_run_id, user_seq)) =
+            latest_main_timeline_failed_turn(&transaction, &command.session_id)?
+        else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "run retry requires the latest main-timeline user turn to be terminal-failed",
+                false,
+            ));
+        };
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "run.retry",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let retried_payload = RunRetryEventPayload::RunRetried {
+            failed_run_id: failed_run_id.clone(),
+            prompt_run_id: prompt_run_id.clone(),
+            user_seq,
+        }
+        .to_payload_value()
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize run-retried payload: {error}"),
+                false,
+            )
+        })?;
+        let mut envelopes = vec![
+            unstamped_command_envelope(
+                command.queued_event_id.clone(),
+                &command.session_id,
+                None,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::RunState(RunState::Queued),
+                PromptRender::Omit,
+            )?,
+            unstamped_raw_command_envelope(
+                command.retried_event_id.clone(),
+                &command.session_id,
+                None,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                retried_payload,
+                PromptRender::Omit,
+            )?,
+            unstamped_command_envelope(
+                command.active_event_id.clone(),
+                &command.session_id,
+                None,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::SessionState(SessionState::ActiveRun),
+                PromptRender::Omit,
+            )?,
+        ];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let accepted = AcceptedRunRetry {
+            session_id: command.session_id.clone(),
+            run_id: command.run_id.clone(),
+            failed_run_id,
+            prompt_run_id,
+            user_seq,
+            accepted_seq: envelopes[1].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            Some(command.run_id.as_str()),
+            Some(accepted.accepted_seq),
+            &accepted,
+            now,
+            "run-retry",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(RunRetryOutcome::Committed {
+            accepted,
+            envelopes,
+        })
     }
 
     /// Looks up a committed direct-shell acceptance before generation/busy
@@ -9422,6 +9624,77 @@ fn latest_run_states(
         }
     }
     Ok(states)
+}
+
+/// Returns the latest main-timeline user coordinate only when that exact
+/// run owns both the latest terminal `Errored` state and a durable
+/// `RunFailed` cause. A later successful/cancelled user turn therefore
+/// makes an older failure ineligible for manual retry.
+fn latest_main_timeline_failed_turn(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<(RunId, RunId, u64)>> {
+    let states = latest_run_states(connection, session_id)?;
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json FROM events
+             WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut latest_user = None::<(RunId, u64)>;
+    let mut retries = Vec::<(RunId, RunId, u64)>::new();
+    let mut failed = HashSet::<RunId>::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
+        let json: String = row.get(1).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+            ))
+        })?;
+        let Some(run_id) = envelope.run_id else {
+            continue;
+        };
+        let main_timeline = envelope.branch_id.is_none() && envelope.agent_id.is_none();
+        let payload = envelope.payload;
+        match serde_json::from_value::<EventPayload>(payload.clone()) {
+            Ok(EventPayload::UserMessage { .. }) if main_timeline => {
+                latest_user = Some((run_id, seq));
+            }
+            Ok(EventPayload::RunFailed { .. }) if main_timeline => {
+                failed.insert(run_id);
+            }
+            _ if main_timeline => {
+                if let Ok(RunRetryEventPayload::RunRetried {
+                    prompt_run_id,
+                    user_seq,
+                    ..
+                }) = RunRetryEventPayload::from_payload_value(payload)
+                {
+                    retries.push((run_id, prompt_run_id, user_seq));
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some((user_run_id, user_seq)) = latest_user else {
+        return Ok(None);
+    };
+    let (run_id, prompt_run_id) = retries
+        .into_iter()
+        .filter(|(_, _, retried_user_seq)| *retried_user_seq == user_seq)
+        .last()
+        .map_or_else(
+            || (user_run_id.clone(), user_run_id),
+            |(retry_run_id, prompt_run_id, _)| (retry_run_id, prompt_run_id),
+        );
+    let eligible = states.get(&run_id).is_some_and(|(state, _, branch_id)| {
+        *state == RunState::Errored && branch_id.is_none() && failed.contains(&run_id)
+    });
+    Ok(eligible.then_some((run_id, prompt_run_id, user_seq)))
 }
 
 fn latest_tree_head(

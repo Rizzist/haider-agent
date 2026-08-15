@@ -26,6 +26,7 @@ pub mod item;
 pub mod menu;
 pub mod project_instructions;
 pub mod provider;
+pub mod retry;
 pub mod rpc;
 pub mod session;
 pub mod state;

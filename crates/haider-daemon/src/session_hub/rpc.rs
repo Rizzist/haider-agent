@@ -1612,6 +1612,35 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::RunRetry {
+                command_id,
+                session_id,
+                worker_generation,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "run retry requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.run_retry(request_id, command_id, session_id, worker_generation)
+                    .await
+            }
             RequestBody::SessionCompactOnBranch {
                 command_id,
                 session_id,
@@ -5142,6 +5171,85 @@ impl HubConnection {
                     TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
                 },
                 terminal_seq: cancelled.terminal_seq,
+            },
+        })
+    }
+
+    async fn run_retry(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "run-retry command id must not be empty",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode run-retry coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let accepted = match self
+            .hub
+            .run_retry_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(accepted)) => accepted,
+            Ok(None) => {
+                let command = RunRetryCommand {
+                    command_id: command_id.0,
+                    request_digest,
+                    request_json,
+                    session_id: session_id.clone(),
+                    worker_generation,
+                    run_id: RunId::new(random_id("retry-run")?),
+                    queued_event_id: EventId::new(random_id("retry-queued")?),
+                    retried_event_id: EventId::new(random_id("run-retried")?),
+                    active_event_id: EventId::new(random_id("retry-active")?),
+                    device_id: self.hub.inner.device_id.clone(),
+                };
+                match self.hub.accept_run_retry(command).await {
+                    Ok(RunRetryOutcome::Committed { accepted, .. })
+                    | Ok(RunRetryOutcome::IdempotentReplay { accepted }) => accepted,
+                    Err(SessionHubError::Store(error)) => {
+                        return self.respond_turn_error(request_id, error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        // Same-command receipt replay may follow a transient manager handoff
+        // failure. Re-submitting the SAME run is safe: supervisor admission
+        // deduplicates by durable run id, while a distinct command cannot
+        // pass the store's atomic live-run gate.
+        if accepted.worker_generation == self.hub.inner.store.worker_generation()
+            && let Err(error) = self.hub.worker_manager()?.retry(accepted.clone()).await
+        {
+            return self.respond_turn_error(request_id, error);
+        }
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::RunRetry {
+                session_id: accepted.session_id,
+                run_id: accepted.run_id,
+                failed_run_id: accepted.failed_run_id,
+                user_seq: accepted.user_seq,
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
             },
         })
     }

@@ -3067,6 +3067,10 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 .recover_queued(accepted)
                 .await
                 .expect("recover queued work"),
+            RecoveredWork::Retry(accepted) => manager_handle
+                .recover_retry(accepted)
+                .await
+                .expect("recover retry work"),
             RecoveredWork::Checkpoint(recovered) => manager_handle
                 .recover_checkpoint(
                     recovered.accepted,

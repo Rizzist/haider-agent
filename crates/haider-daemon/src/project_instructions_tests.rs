@@ -735,7 +735,8 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
     assert_eq!(work.len(), 1);
     let accepted = match work.pop().expect("queued work") {
         RecoveredWork::Queued(accepted) => accepted,
-        RecoveredWork::Checkpoint(_)
+        RecoveredWork::Retry(_)
+        | RecoveredWork::Checkpoint(_)
         | RecoveredWork::PartialStream(_)
         | RecoveredWork::ChildWait(_) => {
             panic!("expected queued recovery")

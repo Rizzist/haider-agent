@@ -76,6 +76,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SESSION_RENAME_V1`. Expected RUNTIME
 /// failure: clients cannot discover the served receipted `session.rename`
 /// surface (G2) and the TUI keeps its stale-daemon notice forever.
+///
+/// MUTATION CHECK: remove `FEATURE_RUN_RETRY_V1`. Expected RUNTIME failure:
+/// clients cannot discover the served receipt-backed `run.retry` command.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -101,6 +104,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
+            haider_rpc::FEATURE_RUN_RETRY_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),

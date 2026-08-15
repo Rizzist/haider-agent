@@ -1,0 +1,6 @@
+{
+  "type": "run_retried",
+  "failed_run_id": "run-failed-7",
+  "prompt_run_id": "run-original-3",
+  "user_seq": 42
+}

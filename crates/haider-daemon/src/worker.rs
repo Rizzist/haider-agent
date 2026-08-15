@@ -39,16 +39,17 @@ use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payl
 use async_trait::async_trait;
 use base64::Engine;
 use haider_core::{
-    AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, CompiledPromptProjection,
-    ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
-    DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
-    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
-    GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
-    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint,
-    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
-    presentation_for_haider_error, sanitized_failure_message,
+    AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint,
+    CompiledPromptProjection, ContextCompactionClaim, ContextCompactionReceiptResponse,
+    ContextCompactor, DeferredTicket, DeferredToolResult, EventIdGenerator, FinalizationGuard,
+    FinalizationGuardDecision, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphFinalizationCommand, GraphFinalizationOutcome, GraphSwitchCommand, GraphSwitchOutcome,
+    HarnessActor, HarnessConfig, PartialStreamCheckpoint, ProcessSignalCommand,
+    ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle,
+    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
+    estimate_provider_request_input_tokens, presentation_for_haider_error,
+    sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
@@ -76,6 +77,7 @@ use haider_protocol::provider::{
     AccountUsage, CacheBoundaryIdentity, FeatureResolve, FinishReason, PrefixDigests, StreamEvent,
     Usage, UsageRequestKind, UsageScope,
 };
+use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{
@@ -779,6 +781,10 @@ enum ManagerCommand {
         accepted: AcceptedTurn,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
+    Retry {
+        accepted: AcceptedRunRetry,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     Recover {
         pending: Box<PendingTurn>,
     },
@@ -848,6 +854,9 @@ pub(crate) fn defer_shell_handoff(
 
 struct PendingTurn {
     accepted: AcceptedTurn,
+    /// Manual retries compile the durable source run's ancestry while the
+    /// harness commits all new lifecycle facts under `accepted.run_id`.
+    prompt_run_id: Option<RunId>,
     checkpoint: Option<RequestInputCheckpoint>,
     partial_stream: Option<PartialStreamCheckpoint>,
     child_wait: Option<ChildWaitCheckpoint>,
@@ -874,6 +883,29 @@ impl PendingTurn {
     fn accepted(accepted: AcceptedTurn) -> Self {
         Self {
             accepted,
+            prompt_run_id: None,
+            checkpoint: None,
+            partial_stream: None,
+            child_wait: None,
+            committed_answer: None,
+            recovery_ready: None,
+            recovering: false,
+        }
+    }
+
+    fn retry(accepted: AcceptedRunRetry) -> Self {
+        Self {
+            accepted: AcceptedTurn {
+                session_id: accepted.session_id,
+                run_id: accepted.run_id,
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
+                branch_id: None,
+                disposition: haider_core::TurnAdmissionDisposition::Started,
+                first_user_turn: false,
+                pdf_attachments: Vec::new(),
+            },
+            prompt_run_id: Some(accepted.prompt_run_id),
             checkpoint: None,
             partial_stream: None,
             child_wait: None,
@@ -982,6 +1014,23 @@ impl WorkerManagerHandle {
             }
             self.commands
                 .try_send(ManagerCommand::Submit {
+                    accepted,
+                    completed,
+                })
+                .map_err(manager_try_send)?;
+        }
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn retry(&self, accepted: AcceptedRunRetry) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        {
+            let open = self.admission.lock().map_err(|_| manager_stopped())?;
+            if !*open {
+                return Err(manager_busy("worker admission is draining"));
+            }
+            self.commands
+                .try_send(ManagerCommand::Retry {
                     accepted,
                     completed,
                 })
@@ -1099,6 +1148,7 @@ impl WorkerManagerHandle {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
             accepted,
+            prompt_run_id: None,
             checkpoint: Some(checkpoint),
             partial_stream: None,
             child_wait: None,
@@ -1118,6 +1168,7 @@ impl WorkerManagerHandle {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
             accepted,
+            prompt_run_id: None,
             checkpoint: None,
             partial_stream: Some(partial_stream),
             child_wait: None,
@@ -1132,6 +1183,7 @@ impl WorkerManagerHandle {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
             accepted,
+            prompt_run_id: None,
             checkpoint: None,
             partial_stream: None,
             child_wait: None,
@@ -1139,6 +1191,18 @@ impl WorkerManagerHandle {
             recovery_ready: Some(completed),
             recovering: true,
         })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_retry(
+        &self,
+        accepted: AcceptedRunRetry,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        let mut pending = PendingTurn::retry(accepted);
+        pending.recovery_ready = Some(completed);
+        pending.recovering = true;
+        self.send_recovery(pending)?;
         response.await.map_err(|_| manager_stopped())?
     }
 
@@ -1150,6 +1214,7 @@ impl WorkerManagerHandle {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
             accepted,
+            prompt_run_id: None,
             checkpoint: None,
             partial_stream: None,
             child_wait: Some(child_wait),
@@ -1210,6 +1275,31 @@ async fn run_manager(
                 {
                     Ok(supervisor) => supervisor
                         .try_send(SupervisorCommand::Submit(Box::new(PendingTurn::accepted(
+                            accepted,
+                        ))))
+                        .map_err(supervisor_try_send),
+                    Err(error) => Err(error),
+                };
+                let _ = completed.send(result);
+            }
+            ManagerCommand::Retry {
+                accepted,
+                completed,
+            } => {
+                let result = match supervisor_for(
+                    &hub,
+                    &dependencies,
+                    &drain_wakes,
+                    &mut supervisors,
+                    &mut tasks,
+                    &mut task_sessions,
+                    &mut incarnations,
+                    accepted.session_id.clone(),
+                )
+                .await
+                {
+                    Ok(supervisor) => supervisor
+                        .try_send(SupervisorCommand::Submit(Box::new(PendingTurn::retry(
                             accepted,
                         ))))
                         .map_err(supervisor_try_send),
@@ -1471,7 +1561,7 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
         let runs = durable_runs(&lease).await?;
         let candidates = runs
             .iter()
-            .filter(|(_, state, _, _)| {
+            .filter(|(_, state, _, _, _)| {
                 !state.is_terminal()
                     && !matches!(
                         state,
@@ -1485,14 +1575,15 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             .collect::<Vec<_>>();
         let reconciliation_targets = candidates
             .iter()
-            .map(|(run_id, _, _, branch_id)| UnknownReconcileTarget {
+            .map(|(run_id, _, _, branch_id, _)| UnknownReconcileTarget {
                 run_id,
                 branch_id: branch_id.as_ref(),
             })
             .collect::<Vec<_>>();
         let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
         let mut terminalized = false;
-        for ((run_id, state, _, branch_id), effect_scan) in candidates.into_iter().zip(effect_scans)
+        for ((run_id, state, _, branch_id, _), effect_scan) in
+            candidates.into_iter().zip(effect_scans)
         {
             // P3-4 (park, don't cancel): request-input, permission, and local
             // child checkpoints were excluded from this sweep above.
@@ -1610,18 +1701,18 @@ pub(crate) async fn terminalize_supervisor_exit(
     let runs = durable_runs(&lease)
         .await?
         .into_iter()
-        .filter(|(_, state, _, _)| !state.is_terminal())
+        .filter(|(_, state, _, _, _)| !state.is_terminal())
         .collect::<Vec<_>>();
     let reconciliation_targets = runs
         .iter()
-        .map(|(run_id, _, _, branch_id)| UnknownReconcileTarget {
+        .map(|(run_id, _, _, branch_id, _)| UnknownReconcileTarget {
             run_id,
             branch_id: branch_id.as_ref(),
         })
         .collect::<Vec<_>>();
     let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
     let mut terminalized = false;
-    for ((run_id, state, _, branch_id), effect_scan) in runs.iter().zip(effect_scans) {
+    for ((run_id, state, _, branch_id, _), effect_scan) in runs.iter().zip(effect_scans) {
         // Panic can strand a dispatched effect regardless of the run state.
         // Reconcile before either cancellation-shaped or failure-shaped
         // terminalization; a reconciliation error fences every terminal.
@@ -1868,7 +1959,7 @@ async fn run_supervisor(
             }
             let direct_shell_owns_session = durable_runs(&lease).await.is_ok_and(|runs| {
                 runs.into_iter()
-                    .any(|(_, state, _, _)| state == RunState::RunningTool)
+                    .any(|(_, state, _, _, _)| state == RunState::RunningTool)
             });
             while !direct_shell_owns_session && let Some(pending) = queue.pop_front() {
                 let mut pending = pending;
@@ -2452,7 +2543,7 @@ async fn admit_pending(
     let branch_id = pending.accepted.branch_id.clone();
     let state = durable_runs(store).await.ok().and_then(|runs| {
         runs.into_iter()
-            .find_map(|(candidate, state, _, _)| (candidate == run_id).then_some(state))
+            .find_map(|(candidate, state, _, _, _)| (candidate == run_id).then_some(state))
     });
     match state {
         Some(RunState::Queued) => {
@@ -2558,7 +2649,7 @@ async fn refill_queued_turns(
         return true;
     };
     let mut more = false;
-    for (run_id, state, accepted_seq, branch_id) in runs {
+    for (run_id, state, accepted_seq, branch_id, prompt_run_id) in runs {
         if state != RunState::Queued
             || active_run == Some(&run_id)
             || queue
@@ -2574,7 +2665,7 @@ async fn refill_queued_turns(
         let Some(accepted_seq) = accepted_seq else {
             continue;
         };
-        queue.push_back(PendingTurn::accepted(AcceptedTurn {
+        let mut pending = PendingTurn::accepted(AcceptedTurn {
             session_id: store.session_id().clone(),
             run_id,
             accepted_seq,
@@ -2583,7 +2674,9 @@ async fn refill_queued_turns(
             disposition: haider_core::TurnAdmissionDisposition::Queued,
             first_user_turn: false,
             pdf_attachments: Vec::new(),
-        }));
+        });
+        pending.prompt_run_id = prompt_run_id;
+        queue.push_back(pending);
     }
     more
 }
@@ -2600,7 +2693,7 @@ async fn reconcile_durable_cancellations(
     };
     let active_run = active.map(|(run_id, _)| run_id);
     let mut terminalized = Vec::new();
-    for (run_id, state, _, branch_id) in runs {
+    for (run_id, state, _, branch_id, _) in runs {
         if state != RunState::Cancelling {
             continue;
         }
@@ -2637,9 +2730,19 @@ async fn reconcile_durable_cancellations(
 /// `docs/OPTIMIZATIONS.md` under W3c1.
 async fn durable_runs(
     store: &HubStoreHandle,
-) -> Result<Vec<(RunId, RunState, Option<u64>, Option<BranchId>)>, HaiderError> {
+) -> Result<
+    Vec<(
+        RunId,
+        RunState,
+        Option<u64>,
+        Option<BranchId>,
+        Option<RunId>,
+    )>,
+    HaiderError,
+> {
     let mut cursor = 0;
-    let mut runs = HashMap::<RunId, (RunState, Option<u64>, Option<BranchId>)>::new();
+    let mut runs =
+        HashMap::<RunId, (RunState, Option<u64>, Option<BranchId>, Option<RunId>)>::new();
     loop {
         let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
         if page.is_empty() {
@@ -2650,29 +2753,36 @@ async fn durable_runs(
             let Some(run_id) = envelope.run_id else {
                 continue;
             };
+            if let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
+                RunRetryEventPayload::from_payload_value(envelope.payload.clone())
+            {
+                let (state, branch_id) = runs.get(&run_id).map_or(
+                    (RunState::Queued, envelope.branch_id.clone()),
+                    |(state, _, branch_id, _)| (state.clone(), branch_id.clone()),
+                );
+                if branch_id != envelope.branch_id {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("run {run_id} crosses branch scopes"),
+                        false,
+                    ));
+                }
+                runs.insert(
+                    run_id,
+                    (state, Some(envelope.seq), branch_id, Some(prompt_run_id)),
+                );
+                continue;
+            }
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
                 continue;
             };
             match payload {
                 EventPayload::RunState(state) => {
-                    let (accepted, branch_id) = runs
-                        .get(&run_id)
-                        .map_or((None, envelope.branch_id.clone()), |(_, seq, branch_id)| {
-                            (*seq, branch_id.clone())
-                        });
-                    if branch_id != envelope.branch_id {
-                        return Err(HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!("run {run_id} crosses branch scopes"),
-                            false,
-                        ));
-                    }
-                    runs.insert(run_id, (state, accepted, branch_id));
-                }
-                EventPayload::UserMessage { .. } => {
-                    let (state, branch_id) = runs.get(&run_id).map_or(
-                        (RunState::Queued, envelope.branch_id.clone()),
-                        |(state, _, branch_id)| (state.clone(), branch_id.clone()),
+                    let (accepted, branch_id, prompt_run_id) = runs.get(&run_id).map_or(
+                        (None, envelope.branch_id.clone(), None),
+                        |(_, seq, branch_id, prompt_run_id)| {
+                            (*seq, branch_id.clone(), prompt_run_id.clone())
+                        },
                     );
                     if branch_id != envelope.branch_id {
                         return Err(HaiderError::new(
@@ -2681,7 +2791,26 @@ async fn durable_runs(
                             false,
                         ));
                     }
-                    runs.insert(run_id, (state, Some(envelope.seq), branch_id));
+                    runs.insert(run_id, (state, accepted, branch_id, prompt_run_id));
+                }
+                EventPayload::UserMessage { .. } => {
+                    let (state, branch_id, prompt_run_id) = runs.get(&run_id).map_or(
+                        (RunState::Queued, envelope.branch_id.clone(), None),
+                        |(state, _, branch_id, prompt_run_id)| {
+                            (state.clone(), branch_id.clone(), prompt_run_id.clone())
+                        },
+                    );
+                    if branch_id != envelope.branch_id {
+                        return Err(HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("run {run_id} crosses branch scopes"),
+                            false,
+                        ));
+                    }
+                    runs.insert(
+                        run_id,
+                        (state, Some(envelope.seq), branch_id, prompt_run_id),
+                    );
                 }
                 _ => {}
             }
@@ -2689,9 +2818,11 @@ async fn durable_runs(
     }
     let mut runs = runs
         .into_iter()
-        .map(|(run_id, (state, accepted, branch_id))| (run_id, state, accepted, branch_id))
+        .map(|(run_id, (state, accepted, branch_id, prompt_run_id))| {
+            (run_id, state, accepted, branch_id, prompt_run_id)
+        })
         .collect::<Vec<_>>();
-    runs.sort_by_key(|(_, _, accepted, _)| accepted.unwrap_or(u64::MAX));
+    runs.sort_by_key(|(_, _, accepted, _, _)| accepted.unwrap_or(u64::MAX));
     Ok(runs)
 }
 
@@ -2960,7 +3091,7 @@ async fn append_unknown_effect_scan(
 async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<RunState> {
     durable_runs(store).await.ok().and_then(|runs| {
         runs.into_iter()
-            .find_map(|(candidate, state, _, _)| (candidate == *run_id).then_some(state))
+            .find_map(|(candidate, state, _, _, _)| (candidate == *run_id).then_some(state))
     })
 }
 
@@ -3044,7 +3175,7 @@ async fn cancel_durable_queued_turns(
     active_run: Option<&RunId>,
 ) -> Option<RunId> {
     let mut last = None;
-    for (run_id, state, _, branch_id) in durable_runs(store).await.unwrap_or_default() {
+    for (run_id, state, _, branch_id, _) in durable_runs(store).await.unwrap_or_default() {
         if active_run == Some(&run_id) || state != RunState::Queued {
             continue;
         }
@@ -3235,7 +3366,7 @@ async fn perform_manual_compaction(
         && durable_runs(lease)
             .await?
             .iter()
-            .any(|(_, state, _, _)| !state.is_terminal())
+            .any(|(_, state, _, _, _)| !state.is_terminal())
     {
         return Err(HaiderError::new(
             ErrorCode::Busy,
@@ -3839,6 +3970,7 @@ async fn start_turn(
 ) -> Result<ActiveTurn, HaiderError> {
     let PendingTurn {
         accepted,
+        prompt_run_id,
         checkpoint,
         partial_stream,
         child_wait,
@@ -3912,11 +4044,12 @@ async fn start_turn(
     )
     .await?;
     let prompt_compile_started = Instant::now();
+    let prompt_run_id = prompt_run_id.as_ref().unwrap_or(&accepted.run_id);
     let mut compiled = lease
         .compile_prompt_projection(
             accepted.branch_id.as_ref(),
             agent_id.as_ref(),
-            &accepted.run_id,
+            prompt_run_id,
         )
         .await?;
     // G3 (LT3): provider-opaque continuation facts are only valid on the

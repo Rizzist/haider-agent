@@ -704,6 +704,7 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
                 Some((checkpoint.checkpoint.menu.id, checkpoint.accepted.branch_id))
             }
             RecoveredWork::Queued(_)
+            | RecoveredWork::Retry(_)
             | RecoveredWork::PartialStream(_)
             | RecoveredWork::ChildWait(_) => None,
         })

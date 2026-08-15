@@ -33,7 +33,7 @@
 //! workers own those; the generation fence skips them).
 
 use haider_core::{
-    AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
+    AcceptedRunRetry, AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
     PartialStreamCheckpoint, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle,
     TurnAdmissionDisposition,
 };
@@ -47,6 +47,7 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind};
+use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use std::collections::{HashMap, HashSet};
 
@@ -54,6 +55,7 @@ const PAGE_SIZE: usize = 512;
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
+    Retry(AcceptedRunRetry),
     Checkpoint(Box<RecoveredCheckpoint>),
     PartialStream(Box<RecoveredPartialStream>),
     ChildWait(Box<RecoveredChildWait>),
@@ -84,6 +86,7 @@ struct RunReduction {
     state: Option<(RunState, u64)>,
     state_generation: u64,
     user_seq: Option<u64>,
+    retry_source: Option<(RunId, RunId, u64, u64)>,
     open_items: HashMap<ItemId, OpenItem>,
     incomplete_items: HashMap<ItemId, String>,
     menu: Option<OpenMenu>,
@@ -136,7 +139,12 @@ pub(crate) async fn recover_interrupted_turns(
             }
         }
         let mut runs = reductions.into_iter().collect::<Vec<_>>();
-        runs.sort_by_key(|(_, reduction)| reduction.user_seq.unwrap_or(u64::MAX));
+        runs.sort_by_key(|(_, reduction)| {
+            reduction
+                .user_seq
+                .or_else(|| reduction.retry_source.as_ref().map(|(_, _, seq, _)| *seq))
+                .unwrap_or(u64::MAX)
+        });
         let mut activated_recovered_queue = false;
         for (run_id, reduction) in runs {
             if reduction.branch_mismatch {
@@ -181,6 +189,22 @@ pub(crate) async fn recover_interrupted_turns(
                         store.worker_generation(),
                         reduction.branch_id.clone(),
                     )));
+                } else if let Some((failed_run_id, prompt_run_id, user_seq, accepted_seq)) =
+                    reduction.retry_source
+                {
+                    if !activated_recovered_queue {
+                        append_recovered_active(store, device_id, &session_id, &run_id).await?;
+                        activated_recovered_queue = true;
+                    }
+                    recovered.push(RecoveredWork::Retry(AcceptedRunRetry {
+                        session_id: session_id.clone(),
+                        run_id,
+                        failed_run_id,
+                        prompt_run_id,
+                        user_seq,
+                        accepted_seq,
+                        worker_generation: store.worker_generation(),
+                    }));
                 }
                 continue;
             }
@@ -356,13 +380,15 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
     let Some(run_id) = envelope.run_id.clone() else {
         return;
     };
-    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+    let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+    let retry_payload = RunRetryEventPayload::from_payload_value(envelope.payload.clone()).ok();
+    if payload.is_none() && retry_payload.is_none() {
         return;
-    };
+    }
     // SessionState is session-global even when it names the run that caused
     // the aggregate transition. Route it by payload type before enforcing
     // the immutable branch coordinate of run-scoped history.
-    if matches!(payload, EventPayload::SessionState(_)) {
+    if matches!(payload.as_ref(), Some(EventPayload::SessionState(_))) {
         return;
     }
     let reduction = reductions.entry(run_id).or_default();
@@ -372,6 +398,18 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
         reduction.branch_id = envelope.branch_id.clone();
         reduction.branch_observed = true;
     }
+    if let Some(RunRetryEventPayload::RunRetried {
+        failed_run_id,
+        prompt_run_id,
+        user_seq,
+    }) = retry_payload
+    {
+        reduction.retry_source = Some((failed_run_id, prompt_run_id, user_seq, envelope.seq));
+        return;
+    }
+    let Some(payload) = payload else {
+        return;
+    };
     match payload {
         EventPayload::RunState(state) => {
             reduction.state = Some((state, envelope.seq));

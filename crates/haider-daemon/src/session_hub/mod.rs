@@ -100,21 +100,22 @@ use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
 use haider_core::{
-    AbandonedGraph, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
-    CancelledTurn, ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
-    ChildTemplateObservation, ChildTemplateObservationCommand, CreatedBranch, CreatedSession,
-    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
-    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
-    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
-    GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
-    PromptHistoryCache, RenamedSession, SelectedEffort, SelectedFast, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
-    TurnCancelOutcome, TurnCancellationStatus,
+    AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, BranchCreateCommand,
+    BranchCreateOutcome, CancelledTurn, ChildGraphAttachCommand, ChildGraphAttachOutcome,
+    ChildTemplateCacheEntry, ChildTemplateObservation, ChildTemplateObservationCommand,
+    CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
+    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
+    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
+    GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand,
+    MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand,
+    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, RunRetryCommand,
+    RunRetryOutcome, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
+    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -842,6 +843,10 @@ enum ActorCommand {
     AcceptTurn {
         command: TurnAcceptCommand,
         completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
+    },
+    AcceptRunRetry {
+        command: RunRetryCommand,
+        completed: oneshot::Sender<Result<RunRetryOutcome, HaiderError>>,
     },
     AcceptShellExec {
         command: ShellExecAcceptCommand,
@@ -2036,6 +2041,40 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::AcceptTurn { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn run_retry_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<AcceptedRunRetry>, SessionHubError> {
+        self.inner
+            .store
+            .run_retry_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn accept_run_retry(
+        &self,
+        command: RunRetryCommand,
+    ) -> Result<RunRetryOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AcceptRunRetry { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

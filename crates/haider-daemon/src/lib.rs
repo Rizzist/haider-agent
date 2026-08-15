@@ -63,6 +63,8 @@ mod error;
 mod gcloud;
 mod hooks;
 mod lifecycle;
+#[cfg(test)]
+mod manual_retry_tests;
 mod model_select;
 mod oauth;
 #[cfg(test)]

@@ -13,8 +13,8 @@ use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorSco
 use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
-    AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn, Cas,
-    ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
+    AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
+    CancelledTurn, Cas, ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
     ChildTemplateObservation, ChildTemplateObservationCommand, ContextCompactionClaim,
     ContextCompactionReceiptResponse, DelegationCreateOutcome, DelegationRecord, EventStore,
     GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
@@ -22,10 +22,10 @@ use haider_store::{
     GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
     GraphSwitchOutcome, HookTrustChange, HookTrustCommand, MenuResolutionCommand,
     MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome,
+    RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
+    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -653,6 +653,31 @@ impl SqliteStoreHandle {
     ) -> Result<TurnAcceptOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.accept_turn(&command))).await
+    }
+
+    /// Unfenced `run.retry` receipt lookup for response-loss recovery.
+    pub async fn run_retry_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<AcceptedRunRetry>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.run_retry_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Blocking-pool adapter for atomic terminal-failure retry acceptance.
+    pub async fn accept_run_retry(
+        &self,
+        command: RunRetryCommand,
+    ) -> Result<RunRetryOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.accept_run_retry(&command))).await
     }
 
     /// Unfenced direct-shell receipt lookup for response-loss recovery.

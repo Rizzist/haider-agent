@@ -622,6 +622,35 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::AcceptRunRetry { command, completed } => {
+                // MUTATION CHECK: moving the live-run gate out of the store
+                // transaction lets two distinct retry command ids mint two
+                // runs from one failed turn. Acceptance, receipt, and the
+                // `Queued`/`RunRetried`/`ActiveRun` batch must stay atomic.
+                let result = store.accept_run_retry(command).await;
+                if let Ok(RunRetryOutcome::Committed { envelopes, .. }) = &result {
+                    if let Some(last) = envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::AcceptShellExec { command, completed } => {
                 // The acceptance receipt and started command item commit in
                 // one transaction before publication or worker handoff.
@@ -1242,6 +1271,9 @@ async fn non_tree_fact_only_delta(
 }
 
 fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
+    if haider_protocol::retry::RunRetryEventPayload::from_payload_value(payload.clone()).is_ok() {
+        return true;
+    }
     if serde_json::from_value::<haider_protocol::session::SessionConfigEventPayload>(
         payload.clone(),
     )

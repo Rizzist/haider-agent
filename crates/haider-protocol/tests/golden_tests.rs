@@ -34,6 +34,7 @@ use haider_protocol::menu::{
 use haider_protocol::project_instructions::{
     ProjectInstructionFileFact, ProjectInstructionsEventPayload, ProjectInstructionsLoaded,
 };
+use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, VerifyStep, WaitReason};
 use haider_protocol::tool::{
     BoundedResult, DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
@@ -538,6 +539,24 @@ fn golden_error_presentation_contract() {
                 ),
             },
         }),
+    );
+}
+
+/// MUTATION CHECK: rename `run_retried` or omit any source coordinate.
+/// Expected runtime failure: restart recovery and transcript clients can no
+/// longer bind a fresh run to its failed run and original committed user turn.
+#[test]
+fn golden_run_retried_contract() {
+    let fact = RunRetryEventPayload::RunRetried {
+        failed_run_id: RunId::new("run-failed-7"),
+        prompt_run_id: RunId::new("run-original-3"),
+        user_seq: 42,
+    };
+    additive_golden("run_retried", &fact);
+    let value = serde_json::to_value(&fact).expect("retry fact value");
+    assert!(
+        serde_json::from_value::<EventPayload>(value).is_err(),
+        "the additive fact must not break exhaustive core-event consumers"
     );
 }
 

@@ -23,9 +23,9 @@ mod profile_lock;
 pub use cas::FileCas;
 pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
-    AbandonedGraph, AcceptedShellExec, AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse,
-    AccountAddReceiptRow, AccountRemoveReceiptRow, AttachedChildGraph, BranchCreateCommand,
-    BranchCreateOutcome, CachedModels, CancelledTurn, ChildGraphAttachCommand,
+    AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AccountAddClaim,
+    AccountAddReceiptResponse, AccountAddReceiptRow, AccountRemoveReceiptRow, AttachedChildGraph,
+    BranchCreateCommand, BranchCreateOutcome, CachedModels, CancelledTurn, ChildGraphAttachCommand,
     ChildGraphAttachOutcome, ChildTemplateCacheEntry, ChildTemplateObservation,
     ChildTemplateObservationCommand, CommittedSeqRange, ContextCompactionClaim,
     ContextCompactionReceiptResponse, CreatedBranch, CreatedSession, DelegationCreateOutcome,
@@ -38,13 +38,13 @@ pub use event_store::{
     MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, OpenedTodoGraph,
     PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, PinnedGraph, ProcessSignalCommand,
     ProcessSignalOutcome, ProfileLease, RecordedGraphEvidence, RecordedProcessSignal,
-    RenamedSession, SUBAGENT_LIVE_LIMIT, SelectedEffort, SelectedFast, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    RenamedSession, RunRetryCommand, RunRetryOutcome, SUBAGENT_LIVE_LIMIT, SelectedEffort,
+    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
+    SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 

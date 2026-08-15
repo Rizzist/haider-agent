@@ -221,6 +221,8 @@ pub const ERROR_CODE_GRAPH_WRONG_NODE: &str = "graph_wrong_node";
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 /// Daemon implements durable submit/cancel turn control.
 pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
+/// Daemon implements receipt-backed terminal-failure retry (`run.retry`).
+pub const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 /// Daemon implements durable idle-only context compaction.
 pub const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
 /// Daemon implements the durable `account.login_api` command (R7/R10).
@@ -1346,6 +1348,15 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
+    /// Starts a fresh run from the latest failed main-timeline user turn.
+    /// No new `UserMessage` is committed. Mid-backoff automatic retries are
+    /// refused rather than creating a second run.
+    #[serde(rename = "run.retry")]
+    RunRetry {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    },
     /// Branch-capable decode form of `session.compact`.
     #[serde(rename = "session.compact")]
     SessionCompactOnBranch {
@@ -1782,6 +1793,18 @@ pub enum ResponseBody {
         status: CancelStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
+    },
+    /// Durable coordinates of a fresh manual retry run. `failed_run_id` and
+    /// `user_seq` identify the reused turn; `accepted_seq` is the committed
+    /// `run_retried` fact for the new run.
+    #[serde(rename = "run.retry")]
+    RunRetry {
+        session_id: SessionId,
+        run_id: RunId,
+        failed_run_id: RunId,
+        user_seq: u64,
+        accepted_seq: u64,
+        worker_generation: u64,
     },
     #[serde(rename = "session.compact")]
     SessionCompact {
