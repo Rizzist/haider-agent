@@ -21,7 +21,6 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 // 60s, not 10 (W5f-3): the full per-crate gate runs this suite's daemons
 // under heavy compile/test contention, and the 10s ceiling flaked
@@ -33,13 +32,19 @@ pub const DEADLINE: Duration = Duration::from_secs(60);
 pub fn test_root(prefix: &str) -> tempfile::TempDir {
     #[cfg(target_os = "macos")]
     const SHORT_TMP_ROOT: &str = "/private/tmp";
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), unix))]
     const SHORT_TMP_ROOT: &str = "/tmp";
 
-    tempfile::Builder::new()
+    #[cfg(unix)]
+    return tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(SHORT_TMP_ROOT)
-        .expect("short temporary root")
+        .expect("short temporary root");
+    #[cfg(windows)]
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("temporary root")
 }
 
 /// Hermeticity law for every black-box daemon: integration tests must NEVER
@@ -85,7 +90,7 @@ async fn await_ready(task: DaemonTask) -> DaemonTask {
 }
 
 pub struct UdsClient {
-    pub stream: UnixStream,
+    pub stream: haider_platform::IpcStream,
     decoder: uds_codec::Decoder,
     pending: VecDeque<WireFrame>,
 }
@@ -93,7 +98,7 @@ pub struct UdsClient {
 impl UdsClient {
     pub async fn connect(path: &Path, frame_limit: usize) -> std::io::Result<Self> {
         Ok(Self {
-            stream: UnixStream::connect(path).await?,
+            stream: haider_platform::connect(path).await?,
             decoder: uds_codec::Decoder::new(frame_limit),
             pending: VecDeque::new(),
         })

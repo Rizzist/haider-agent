@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Real-daemon W9a drain/restart/health/rollback acceptance.
 #![allow(clippy::expect_used)]
 #![allow(dead_code)]

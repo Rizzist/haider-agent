@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Bare-`haider` auto-spawn acceptance over REAL subprocess binaries
 //! (report §6.2 tests): the concurrent-launch race, stale-socket recovery by
 //! the winner only, and parent-exit-leaves-daemon.

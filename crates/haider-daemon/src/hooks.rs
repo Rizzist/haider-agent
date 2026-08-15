@@ -34,14 +34,15 @@ use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind}
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_rpc::{CommandId, HookSummaryWire, HookTrustStateWire};
+#[cfg(unix)]
 use rustix::fd::OwnedFd;
+#[cfg(unix)]
 use rustix::fs::{FileType, Mode, OFlags};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,6 +51,15 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
+
+#[cfg(unix)]
+type DirectoryHandle = OwnedFd;
+#[cfg(windows)]
+type DirectoryHandle = PathBuf;
+#[cfg(unix)]
+type DirectoryOpenError = rustix::io::Errno;
+#[cfg(windows)]
+type DirectoryOpenError = std::io::Error;
 
 const HOOKS_FILE: &str = "hooks.json";
 const MAX_HOOK_CONFIG_BYTES: usize = 1024 * 1024;
@@ -1645,10 +1655,8 @@ async fn run_command(
     let Some(cwd_fd) = cwd_fd else {
         return failed_process_output("workspace cwd is no longer canonical");
     };
-    let mut command = tokio::process::Command::new("/bin/sh");
+    let mut command = hook_command(&definition.command);
     command
-        .arg("-c")
-        .arg(&definition.command)
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1659,27 +1667,16 @@ async fn run_command(
             command.env(name, value);
         }
     }
-    command.as_std_mut().process_group(0);
-    // SAFETY: between fork and exec this closure invokes only fchdir(2) and
-    // close(2), both async-signal-safe, without allocating or locking.
-    #[allow(unsafe_code)]
-    unsafe {
-        command.pre_exec(move || {
-            rustix::process::fchdir(&cwd_fd).map_err(std::io::Error::from)?;
-            for fd in 3..65_536i32 {
-                rustix::io::close(fd);
-            }
-            Ok(())
-        });
-    }
+    haider_platform::configure_process_group(&mut command);
+    configure_hook_cwd(&mut command, cwd_fd);
+    haider_platform::configure_background_process(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return failed_process_output(&format!("hook spawn failed: {error}")),
     };
     let pid = child
         .id()
-        .and_then(|pid| i32::try_from(pid).ok())
-        .and_then(rustix::process::Pid::from_raw);
+        .and_then(|pid| haider_platform::process_group(Some(pid)));
     let process_group = ProcessGroupGuard { pid };
     let mut stdin = child.stdin.take();
     let stdout = child.stdout.take();
@@ -1823,13 +1820,14 @@ fn cancelled_process_output() -> HookProcessResult {
 }
 
 struct ProcessGroupGuard {
-    pid: Option<rustix::process::Pid>,
+    pid: Option<haider_platform::ProcessGroup>,
 }
 
 impl ProcessGroupGuard {
     fn kill(&self) {
         if let Some(pid) = self.pid {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            let _ =
+                haider_platform::signal_process_group(pid, haider_platform::ProcessSignal::Kill);
         }
     }
 }
@@ -1892,8 +1890,7 @@ async fn run_subscriber(
         let process_group = ProcessGroupGuard {
             pid: child
                 .id()
-                .and_then(|pid| i32::try_from(pid).ok())
-                .and_then(rustix::process::Pid::from_raw),
+                .and_then(|pid| haider_platform::process_group(Some(pid))),
         };
         let mut stdin = child.stdin.take();
         service
@@ -2017,10 +2014,8 @@ async fn subscriber_backoff(
 
 fn spawn_subscriber(definition: &HookDefinition) -> Option<tokio::process::Child> {
     let cwd_fd = open_canonical_directory(&definition.workspace_cwd)?;
-    let mut command = tokio::process::Command::new("/bin/sh");
+    let mut command = hook_command(&definition.command);
     command
-        .arg("-c")
-        .arg(&definition.command)
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2031,18 +2026,9 @@ fn spawn_subscriber(definition: &HookDefinition) -> Option<tokio::process::Child
             command.env(name, value);
         }
     }
-    command.as_std_mut().process_group(0);
-    // SAFETY: see `run_command`; only async-signal-safe syscalls run here.
-    #[allow(unsafe_code)]
-    unsafe {
-        command.pre_exec(move || {
-            rustix::process::fchdir(&cwd_fd).map_err(std::io::Error::from)?;
-            for fd in 3..65_536i32 {
-                rustix::io::close(fd);
-            }
-            Ok(())
-        });
-    }
+    haider_platform::configure_process_group(&mut command);
+    configure_hook_cwd(&mut command, cwd_fd);
+    haider_platform::configure_background_process(&mut command);
     command.spawn().ok()
 }
 
@@ -2153,7 +2139,7 @@ fn discover(cwd: &Path, profile_root: &Path) -> Result<Discovery, String> {
 
 #[allow(clippy::too_many_arguments)]
 fn read_document(
-    directory: &OwnedFd,
+    directory: &DirectoryHandle,
     display_directory: &Path,
     source: HookSource,
     workspace_cwd: &Path,
@@ -2162,52 +2148,7 @@ fn read_document(
     notices: &mut Vec<HookNotice>,
 ) -> Option<HookTrustPolicy> {
     let path = display_directory.join(HOOKS_FILE);
-    let file = match rustix::fs::openat(
-        directory,
-        HOOKS_FILE,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(file) => file,
-        Err(rustix::io::Errno::NOENT) => return None,
-        Err(error) => {
-            notices.push(notice(
-                None,
-                &path,
-                format!("hook configuration was skipped: {error}"),
-            ));
-            return None;
-        }
-    };
-    let metadata = match rustix::fs::fstat(&file) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            notices.push(notice(
-                None,
-                &path,
-                format!("hook configuration metadata failed: {error}"),
-            ));
-            return None;
-        }
-    };
-    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
-        notices.push(notice(
-            None,
-            &path,
-            "hook configuration is not a regular file",
-        ));
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(MAX_HOOK_CONFIG_BYTES.min(16 * 1024));
-    let limit = u64::try_from(MAX_HOOK_CONFIG_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
-    if let Err(error) = fs::File::from(file).take(limit).read_to_end(&mut bytes) {
-        notices.push(notice(
-            None,
-            &path,
-            format!("hook configuration could not be read: {error}"),
-        ));
-        return None;
-    }
+    let bytes = read_hook_bytes(directory, &path, notices)?;
     if bytes.len() > MAX_HOOK_CONFIG_BYTES {
         notices.push(notice(
             None,
@@ -2320,6 +2261,112 @@ fn read_document(
     policy
 }
 
+#[cfg(unix)]
+fn read_hook_bytes(
+    directory: &DirectoryHandle,
+    path: &Path,
+    notices: &mut Vec<HookNotice>,
+) -> Option<Vec<u8>> {
+    let file = match rustix::fs::openat(
+        directory,
+        HOOKS_FILE,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => file,
+        Err(rustix::io::Errno::NOENT) => return None,
+        Err(error) => {
+            notices.push(notice(
+                None,
+                &path,
+                format!("hook configuration was skipped: {error}"),
+            ));
+            return None;
+        }
+    };
+    let metadata = match rustix::fs::fstat(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            notices.push(notice(
+                None,
+                &path,
+                format!("hook configuration metadata failed: {error}"),
+            ));
+            return None;
+        }
+    };
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        notices.push(notice(
+            None,
+            &path,
+            "hook configuration is not a regular file",
+        ));
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(MAX_HOOK_CONFIG_BYTES.min(16 * 1024));
+    let limit = u64::try_from(MAX_HOOK_CONFIG_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
+    if let Err(error) = fs::File::from(file).take(limit).read_to_end(&mut bytes) {
+        notices.push(notice(
+            None,
+            &path,
+            format!("hook configuration could not be read: {error}"),
+        ));
+        return None;
+    }
+    Some(bytes)
+}
+
+#[cfg(windows)]
+fn read_hook_bytes(
+    directory: &DirectoryHandle,
+    path: &Path,
+    notices: &mut Vec<HookNotice>,
+) -> Option<Vec<u8>> {
+    let candidate = directory.join(HOOKS_FILE);
+    let metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            notices.push(notice(
+                None,
+                path,
+                format!("hook configuration was skipped: {error}"),
+            ));
+            return None;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        notices.push(notice(
+            None,
+            path,
+            "hook configuration is not a regular file",
+        ));
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(MAX_HOOK_CONFIG_BYTES.min(16 * 1024));
+    let limit = u64::try_from(MAX_HOOK_CONFIG_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
+    let file = match fs::File::open(&candidate) {
+        Ok(file) => file,
+        Err(error) => {
+            notices.push(notice(
+                None,
+                path,
+                format!("hook configuration could not be read: {error}"),
+            ));
+            return None;
+        }
+    };
+    if let Err(error) = file.take(limit).read_to_end(&mut bytes) {
+        notices.push(notice(
+            None,
+            path,
+            format!("hook configuration could not be read: {error}"),
+        ));
+        return None;
+    }
+    Some(bytes)
+}
+
 fn hook_digest(bytes: &[u8], command: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(bytes);
@@ -2351,7 +2398,41 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn open_canonical_directory(path: &Path) -> Option<OwnedFd> {
+#[cfg(unix)]
+fn hook_command(script: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+#[cfg(windows)]
+fn hook_command(script: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("cmd.exe");
+    command.args(["/D", "/S", "/C"]).arg(script);
+    command
+}
+
+#[cfg(unix)]
+fn configure_hook_cwd(command: &mut tokio::process::Command, directory: DirectoryHandle) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: between fork and exec this closure invokes only fchdir(2), an
+    // async-signal-safe syscall, without allocating or locking.
+    #[allow(unsafe_code)]
+    unsafe {
+        command
+            .as_std_mut()
+            .pre_exec(move || rustix::process::fchdir(&directory).map_err(std::io::Error::from));
+    }
+}
+
+#[cfg(windows)]
+fn configure_hook_cwd(command: &mut tokio::process::Command, directory: DirectoryHandle) {
+    command.current_dir(directory);
+}
+
+#[cfg(unix)]
+fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
     if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
         return None;
     }
@@ -2371,7 +2452,11 @@ fn open_canonical_directory(path: &Path) -> Option<OwnedFd> {
     Some(directory)
 }
 
-fn open_directory_at(directory: &OwnedFd, path: &Path) -> Result<OwnedFd, rustix::io::Errno> {
+#[cfg(unix)]
+fn open_directory_at(
+    directory: &DirectoryHandle,
+    path: &Path,
+) -> Result<DirectoryHandle, DirectoryOpenError> {
     rustix::fs::openat(
         directory,
         path,
@@ -2380,9 +2465,40 @@ fn open_directory_at(directory: &OwnedFd, path: &Path) -> Result<OwnedFd, rustix
     )
 }
 
-fn same_directory(left: &OwnedFd, right: &OwnedFd) -> bool {
+#[cfg(unix)]
+fn same_directory(left: &DirectoryHandle, right: &DirectoryHandle) -> bool {
     let (Ok(left), Ok(right)) = (rustix::fs::fstat(left), rustix::fs::fstat(right)) else {
         return false;
     };
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+#[cfg(windows)]
+fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
+    if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
+        return None;
+    }
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())?;
+    Some(path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn open_directory_at(
+    directory: &DirectoryHandle,
+    path: &Path,
+) -> Result<DirectoryHandle, DirectoryOpenError> {
+    let candidate = directory.join(path);
+    let canonical = fs::canonicalize(&candidate)?;
+    let metadata = fs::symlink_metadata(&candidate)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::other("path is not a real directory"));
+    }
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn same_directory(left: &DirectoryHandle, right: &DirectoryHandle) -> bool {
+    left == right
 }

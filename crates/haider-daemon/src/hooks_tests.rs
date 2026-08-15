@@ -1735,6 +1735,7 @@ fn standalone_definition(workspace: &Path, command: String) -> HookDefinition {
 /// Expected RUNTIME failure: the live hook observes descriptor 333, HOME, or
 /// another non-allowlisted variable.
 #[tokio::test]
+#[cfg(unix)]
 async fn hook_spawn_is_live_but_inherits_no_descriptors_or_secret_environment() {
     let sentinel = "H2_VAULT_SENTINEL_7d3930b1";
     let child = std::process::Command::new(std::env::current_exe().expect("current test binary"))

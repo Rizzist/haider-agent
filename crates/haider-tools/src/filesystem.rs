@@ -58,14 +58,19 @@ use async_trait::async_trait;
 use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
-use rustix::fd::OwnedFd;
+use haider_platform::WorkspaceDirectory as OwnedFd;
+#[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
 use std::collections::{BinaryHeap, HashMap};
-use std::ffi::{CStr, OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::CStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1103,6 +1108,7 @@ struct ReadPathOutput {
     digest: Option<String>,
 }
 
+#[cfg(unix)]
 fn read_path_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1154,11 +1160,22 @@ fn read_path_at(
     }
 }
 
+#[cfg(unix)]
 fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String> {
     let bytes =
         metadata_guarded_file_snapshot_with_reader(&mut file, display_path, |snapshot, buffer| {
             snapshot.read_at(buffer, 0)
         })?;
+    String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
+        message: format!("{} is not UTF-8 text: {error}", display_path.display()),
+    })
+}
+
+#[cfg(windows)]
+fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| ToolError::io("read", display_path, error))?;
     String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", display_path.display()),
     })
@@ -1175,6 +1192,7 @@ fn select_numbered_lines(contents: &str, offset: usize, limit: Option<usize>) ->
         .collect()
 }
 
+#[cfg(unix)]
 fn list_directory_fd(directory: OwnedFd, display_path: &Path) -> ToolResult<String> {
     let mut entries = rustix::fs::Dir::new(directory)
         .map_err(|error| ToolError::io("list", display_path, error))?;
@@ -1194,6 +1212,7 @@ fn list_directory_fd(directory: OwnedFd, display_path: &Path) -> ToolResult<Stri
     Ok(join_lines(listed))
 }
 
+#[cfg(unix)]
 fn search_files_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1218,6 +1237,7 @@ fn search_files_at(
     Ok(matches.finish())
 }
 
+#[cfg(unix)]
 fn collect_search_matches_at(
     directory: OwnedFd,
     relative: &Path,
@@ -1297,6 +1317,7 @@ fn collect_search_matches_at(
     Ok(())
 }
 
+#[cfg(unix)]
 fn collect_file_matches(
     file: OwnedFd,
     display_path: &Path,
@@ -1422,6 +1443,7 @@ impl GlobCollector {
     }
 }
 
+#[cfg(unix)]
 fn glob_files_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1449,6 +1471,7 @@ fn glob_files_at(
     })
 }
 
+#[cfg(unix)]
 fn collect_glob_paths_at(
     directory: OwnedFd,
     relative: &Path,
@@ -1617,6 +1640,210 @@ fn wildcard_matches(pattern: &str, text: &str, slash_sensitive: bool) -> bool {
     matches_from(&pattern, &text, slash_sensitive, 0, 0, &mut HashMap::new())
 }
 
+#[cfg(windows)]
+fn read_path_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> ToolResult<ReadPathOutput> {
+    if offset == Some(0) {
+        return Err(ToolError::invalid_argument(
+            "fs_read offset must be one or greater",
+        ));
+    }
+    if limit == Some(0) {
+        return Err(ToolError::invalid_argument(
+            "fs_read limit must be one or greater",
+        ));
+    }
+    let target = windows_anchored_path(&workspace_dir, relative, display_path)?;
+    let metadata = fs::symlink_metadata(&target)
+        .map_err(|error| ToolError::io("inspect", display_path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "symbolic links are refused".into(),
+        });
+    }
+    if metadata.is_file() {
+        let contents = read_utf8_file(
+            fs::File::open(&target)
+                .map_err(|error| ToolError::io("open for read", display_path, error))?,
+            display_path,
+        )?;
+        let digest = format!("blake3:{}", blake3::hash(contents.as_bytes()).to_hex());
+        let contents = offset.map_or(contents.clone(), |offset| {
+            select_numbered_lines(&contents, offset, limit)
+        });
+        Ok(ReadPathOutput {
+            contents,
+            digest: Some(digest),
+        })
+    } else if metadata.is_dir() {
+        let mut entries = fs::read_dir(&target)
+            .map_err(|error| ToolError::io("list directory", display_path, error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ToolError::io("list directory", display_path, error))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        let contents = entries
+            .into_iter()
+            .map(|entry| {
+                let mut name = entry.file_name().to_string_lossy().into_owned();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    name.push('/');
+                }
+                name
+            })
+            .collect::<Vec<_>>();
+        Ok(ReadPathOutput {
+            contents: join_lines(contents),
+            digest: None,
+        })
+    } else {
+        Err(ToolError::invalid_argument(format!(
+            "fs_read path is not a regular file or directory: {}",
+            display_path.display()
+        )))
+    }
+}
+
+#[cfg(windows)]
+fn search_files_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsSearch,
+    max_preview_bytes: usize,
+) -> ToolResult<SearchOutput> {
+    if operation.query.is_empty() {
+        return Err(ToolError::invalid_argument(
+            "fs_search query cannot be empty",
+        ));
+    }
+    let root = windows_anchored_path(&workspace_dir, relative, &operation.root)?;
+    let mut matches = SearchCollector::new(max_preview_bytes)?;
+    windows_walk_files(&root, &mut |path| {
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        if operation
+            .glob
+            .as_deref()
+            .is_some_and(|glob| !glob_matches(glob, &relative.to_string_lossy().replace('\\', "/")))
+        {
+            return Ok(());
+        }
+        let bytes = fs::read(path).map_err(|error| ToolError::io("read", path, error))?;
+        let Ok(contents) = std::str::from_utf8(&bytes) else {
+            return Ok(());
+        };
+        for (index, line) in contents.lines().enumerate() {
+            if search_line_matches(line, operation) {
+                matches.push(format!("{}:{}:{}", path.display(), index + 1, line))?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(matches.finish())
+}
+
+#[cfg(windows)]
+fn glob_files_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsGlob,
+) -> ToolResult<CappedOutput> {
+    if operation.pattern.is_empty() {
+        return Err(ToolError::invalid_argument(
+            "fs_glob pattern cannot be empty",
+        ));
+    }
+    let root = windows_anchored_path(&workspace_dir, relative, &operation.root)?;
+    let mut matches = GlobCollector::new();
+    windows_walk_files(&root, &mut |path| {
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        let candidate = relative.to_string_lossy().replace('\\', "/");
+        if glob_matches(&operation.pattern, &candidate) {
+            matches.push(path.display().to_string());
+        }
+        Ok(())
+    })?;
+    Ok(matches.finish())
+}
+
+#[cfg(windows)]
+fn windows_walk_files(
+    root: &Path,
+    visit: &mut impl FnMut(&Path) -> ToolResult<()>,
+) -> ToolResult<()> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| ToolError::io("inspect", root, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(ToolError::PathChanged {
+            path: root.to_path_buf(),
+            message: "symbolic links are refused".into(),
+        });
+    }
+    if metadata.is_file() {
+        return visit(root);
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| ToolError::io("list", root, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ToolError::io("list", root, error))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|error| ToolError::io("inspect", &path, error))?;
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            windows_walk_files(&path, visit)?;
+        } else if kind.is_file() {
+            visit(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_anchored_path(
+    workspace_root: &Path,
+    relative: &Path,
+    display_path: &Path,
+) -> ToolResult<PathBuf> {
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(ToolError::WorkspaceBoundary {
+            workspace_root: workspace_root.to_path_buf(),
+            requested_path: display_path.to_path_buf(),
+            resolved_path: None,
+        });
+    }
+    let candidate = workspace_root.join(relative);
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|error| ToolError::io("canonicalize", display_path, error))?;
+    if !canonical.starts_with(workspace_root) {
+        return Err(ToolError::WorkspaceBoundary {
+            workspace_root: workspace_root.to_path_buf(),
+            requested_path: display_path.to_path_buf(),
+            resolved_path: Some(canonical),
+        });
+    }
+    Ok(candidate)
+}
+
 struct AppliedMutation {
     result: BoundedResult,
     paths: Vec<PathBuf>,
@@ -1725,6 +1952,53 @@ struct MutationRecordContext<'a, L> {
     summary: String,
 }
 
+#[cfg(windows)]
+fn apply_write_and_record<L>(
+    _workspace_dir: OwnedFd,
+    _relative: &Path,
+    _operation: &FsWrite,
+    _context: MutationRecordContext<'_, L>,
+) -> MutationWorkerOutcome
+where
+    L: ChangeLedgerSink,
+{
+    MutationWorkerOutcome::ApplyFailed(ToolError::Runtime {
+        message: "fs_write is not yet available on Windows".into(),
+    })
+}
+
+#[cfg(windows)]
+fn apply_edit_and_record<L>(
+    _workspace_dir: OwnedFd,
+    _relative: &Path,
+    _operation: &FsEdit,
+    _context: MutationRecordContext<'_, L>,
+) -> MutationWorkerOutcome
+where
+    L: ChangeLedgerSink,
+{
+    MutationWorkerOutcome::ApplyFailed(ToolError::Runtime {
+        message: "fs_edit is not yet available on Windows".into(),
+    })
+}
+
+#[cfg(windows)]
+fn apply_path_and_record<L>(
+    _workspace_dir: OwnedFd,
+    _source_relative: &Path,
+    _destination_relative: Option<&Path>,
+    _operation: &FsPath,
+    _context: MutationRecordContext<'_, L>,
+) -> MutationWorkerOutcome
+where
+    L: ChangeLedgerSink,
+{
+    MutationWorkerOutcome::ApplyFailed(ToolError::Runtime {
+        message: "fs_path mutations are not yet available on Windows".into(),
+    })
+}
+
+#[cfg(unix)]
 fn apply_write_and_record<L>(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1769,6 +2043,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn apply_write_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1886,6 +2161,7 @@ fn apply_write_at(
     })
 }
 
+#[cfg(unix)]
 fn apply_edit_and_record<L>(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1929,6 +2205,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn apply_edit_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1946,6 +2223,7 @@ fn apply_edit_at(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn apply_edit_at_before_replace(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -1963,6 +2241,7 @@ fn apply_edit_at_before_replace(
     )
 }
 
+#[cfg(unix)]
 fn apply_edit_at_with_commit_hooks(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -2094,6 +2373,7 @@ fn apply_edit_at_with_commit_hooks(
     })
 }
 
+#[cfg(unix)]
 fn apply_path_and_record<L>(
     workspace_dir: OwnedFd,
     source_relative: &Path,
@@ -2143,6 +2423,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn apply_path_at(
     workspace_dir: OwnedFd,
     source_relative: &Path,
@@ -2159,6 +2440,7 @@ fn apply_path_at(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn apply_path_at_before_mutation(
     workspace_dir: OwnedFd,
     source_relative: &Path,
@@ -2175,6 +2457,7 @@ fn apply_path_at_before_mutation(
     )
 }
 
+#[cfg(unix)]
 fn apply_path_at_with_commit_hook(
     workspace_dir: OwnedFd,
     source_relative: &Path,
@@ -2467,6 +2750,7 @@ fn apply_path_at_with_commit_hook(
     })
 }
 
+#[cfg(unix)]
 fn invoke_path_commit_hook(hook: &mut Option<impl FnOnce()>) {
     if let Some(hook) = hook.take() {
         hook();
@@ -2485,6 +2769,7 @@ fn mutation_result(preview: String) -> BoundedResult {
     }
 }
 
+#[cfg(unix)]
 fn create_path_staging_directory(
     parent: &OwnedFd,
     display_path: &Path,
@@ -2546,6 +2831,7 @@ impl StagedCopyCommitFailure {
     }
 }
 
+#[cfg(unix)]
 fn commit_staged_copy(
     staging_directory: &OwnedFd,
     staging_leaf: &OsStr,
@@ -2613,10 +2899,12 @@ fn commit_staged_copy(
     Ok(())
 }
 
+#[cfg(unix)]
 fn remove_path_staging(parent: &OwnedFd, name: &OsStr, display_path: &Path) {
     let _ = remove_entry_at(parent, name, display_path);
 }
 
+#[cfg(unix)]
 fn remove_entry_at(parent: &OwnedFd, leaf: &OsStr, display_path: &Path) -> ToolResult<()> {
     let metadata = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| anchored_io_error("inspect delete target", display_path, error))?;
@@ -2650,6 +2938,7 @@ fn remove_entry_at(parent: &OwnedFd, leaf: &OsStr, display_path: &Path) -> ToolR
         .map_err(|error| anchored_io_error("delete directory", display_path, error))
 }
 
+#[cfg(unix)]
 fn copy_entry_at(
     source_parent: &OwnedFd,
     source_leaf: &OsStr,
@@ -2756,7 +3045,7 @@ fn copy_entry_at(
     }
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(unix, target_vendor = "apple"))]
 fn replace_temporary_at_commit(
     parent: &OwnedFd,
     temporary_name: &OsStr,
@@ -2774,7 +3063,7 @@ fn replace_temporary_at_commit(
         .map_err(|error| anchored_io_error(operation, display_path, error))
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn replace_temporary_at_commit(
     parent: &OwnedFd,
     temporary_name: &OsStr,
@@ -2786,6 +3075,7 @@ fn replace_temporary_at_commit(
         .map_err(|error| anchored_io_error(operation, display_path, error))
 }
 
+#[cfg(unix)]
 fn require_unchanged_content(
     parent: &OwnedFd,
     source: &mut fs::File,
@@ -2823,6 +3113,7 @@ impl FileSnapshot {
     }
 }
 
+#[cfg(unix)]
 fn file_snapshot(
     parent: &OwnedFd,
     source: &mut fs::File,
@@ -2837,6 +3128,7 @@ fn file_snapshot(
     )
 }
 
+#[cfg(unix)]
 fn file_snapshot_with_reader(
     parent: &OwnedFd,
     source: &mut fs::File,
@@ -2868,6 +3160,7 @@ fn file_snapshot_with_reader(
 /// identity, size, or timestamps trigger a bounded retry. This remains
 /// best-effort for a non-cooperating writer: MAP_SHARED writes can leave those
 /// fields unchanged, and ordinary writes may evade coarse timestamps.
+#[cfg(unix)]
 fn metadata_guarded_file_snapshot_with_reader(
     source: &mut fs::File,
     display_path: &Path,
@@ -2964,6 +3257,7 @@ fn try_clone_file_at(_parent: &OwnedFd, _source: &fs::File) -> Option<fs::File> 
     None
 }
 
+#[cfg(unix)]
 fn snapshot_metadata_matches(before: &rustix::fs::Stat, after: &rustix::fs::Stat) -> bool {
     before.st_dev == after.st_dev
         && before.st_ino == after.st_ino
@@ -2974,6 +3268,7 @@ fn snapshot_metadata_matches(before: &rustix::fs::Stat, after: &rustix::fs::Stat
         && before.st_ctime_nsec == after.st_ctime_nsec
 }
 
+#[cfg(unix)]
 fn require_unchanged_target(
     parent: &OwnedFd,
     leaf: &OsStr,
@@ -3004,6 +3299,7 @@ fn require_unchanged_target(
     }
 }
 
+#[cfg(unix)]
 fn revalidate_commit_parent(
     workspace_dir: &OwnedFd,
     relative: &Path,
@@ -3062,6 +3358,7 @@ fn revalidate_commit_parent(
     Ok(current_parent)
 }
 
+#[cfg(unix)]
 fn workspace_root_from_target(display_path: &Path, relative: &Path) -> Option<PathBuf> {
     let mut workspace_root = display_path.to_path_buf();
     for _ in normal_components(relative) {
@@ -3072,6 +3369,7 @@ fn workspace_root_from_target(display_path: &Path, relative: &Path) -> Option<Pa
     Some(workspace_root)
 }
 
+#[cfg(unix)]
 fn require_same_directory(
     expected: &OwnedFd,
     current: &OwnedFd,
@@ -3123,6 +3421,7 @@ fn require_commit_parent_path(_parent: &OwnedFd, _display_path: &Path) -> ToolRe
 /// A writer may have opened the old inode before another writer atomically
 /// replaced the path. Comparing the locked fd's identity with an anchored
 /// `statat` detects that stale-open race and retries before reading any bytes.
+#[cfg(unix)]
 fn open_locked_current_at(
     parent: &OwnedFd,
     leaf: &OsStr,
@@ -3152,6 +3451,7 @@ fn open_locked_current_at(
     })
 }
 
+#[cfg(unix)]
 fn create_patch_temporary(
     parent: &OwnedFd,
     display_path: &Path,
@@ -3185,6 +3485,7 @@ fn create_patch_temporary(
     })
 }
 
+#[cfg(unix)]
 fn write_patch_temporary(
     temporary: OwnedFd,
     source_mode: rustix::fs::RawMode,
@@ -3202,6 +3503,7 @@ fn write_patch_temporary(
         .map_err(|error| ToolError::io("sync patch temporary", display_path, error))
 }
 
+#[cfg(unix)]
 fn remove_temporary(parent: &OwnedFd, name: &OsStr) {
     let _ = rustix::fs::unlinkat(parent, name, AtFlags::empty());
 }
@@ -3234,6 +3536,7 @@ fn anchored_relative_path(workspace_root: &Path, canonical_path: &Path) -> ToolR
     Ok(checked)
 }
 
+#[cfg(unix)]
 fn open_target_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -3249,6 +3552,7 @@ fn open_target_at(
     openat_nofollow(&parent, &leaf, flags, operation, display_path)
 }
 
+#[cfg(unix)]
 fn open_directory_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -3259,6 +3563,7 @@ fn open_directory_at(
     walk_directories(workspace_dir, &components, operation, display_path)
 }
 
+#[cfg(unix)]
 fn open_parent_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -3277,6 +3582,7 @@ fn open_parent_at(
     Ok((parent, leaf))
 }
 
+#[cfg(unix)]
 fn open_parent_creating_at(
     mut directory: OwnedFd,
     relative: &Path,
@@ -3318,6 +3624,7 @@ fn normal_components(relative: &Path) -> Vec<OsString> {
         .collect()
 }
 
+#[cfg(unix)]
 fn walk_directories(
     mut directory: OwnedFd,
     components: &[OsString],
@@ -3336,6 +3643,7 @@ fn walk_directories(
     Ok(directory)
 }
 
+#[cfg(unix)]
 fn openat_nofollow(
     directory: &OwnedFd,
     path: impl rustix::path::Arg,
@@ -3352,6 +3660,7 @@ fn openat_nofollow(
     .map_err(|error| anchored_io_error(operation, display_path, error))
 }
 
+#[cfg(unix)]
 fn anchored_io_error(
     operation: &'static str,
     display_path: &Path,
@@ -3370,6 +3679,7 @@ fn anchored_io_error(
     }
 }
 
+#[cfg(unix)]
 fn is_dot_entry(name: &CStr) -> bool {
     matches!(name.to_bytes(), b"." | b"..")
 }
@@ -3663,17 +3973,17 @@ where
         })?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::expect_used)]
 #[path = "filesystem/tests/w4a12.rs"]
 mod w4a12_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::expect_used, unsafe_code)]
 #[path = "filesystem/tests/w4a13.rs"]
 mod w4a13_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;

@@ -7,6 +7,7 @@
 
 use super::*;
 use tokio::io::AsyncReadExt;
+use tokio::net::UnixStream;
 
 fn ordinary(bytes: &[u8]) -> QueuedFrame {
     QueuedFrame::ordinary(bytes.to_vec())

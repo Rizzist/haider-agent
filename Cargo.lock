@@ -1188,12 +1188,14 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 name = "haider-accounts"
 version = "0.0.920"
 dependencies = [
+ "haider-platform",
  "haider-protocol",
  "hex",
  "security-framework",
  "serde",
  "serde_json",
  "tempfile",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -1205,6 +1207,7 @@ dependencies = [
  "haider-accounts",
  "haider-client",
  "haider-core",
+ "haider-platform",
  "haider-protocol",
  "haider-provider",
  "haider-rpc",
@@ -1224,6 +1227,7 @@ version = "0.0.920"
 dependencies = [
  "blake3",
  "haider-pdf",
+ "haider-platform",
  "haider-protocol",
  "haider-rpc",
  "rustix 1.1.4",
@@ -1265,6 +1269,7 @@ dependencies = [
  "haider-client",
  "haider-core",
  "haider-pdf",
+ "haider-platform",
  "haider-protocol",
  "haider-provider",
  "haider-rpc",
@@ -1298,6 +1303,7 @@ dependencies = [
  "haider-client",
  "haider-core",
  "haider-daemon",
+ "haider-platform",
  "haider-protocol",
  "haider-provider",
  "haider-rpc",
@@ -1324,6 +1330,17 @@ dependencies = [
  "flate2",
  "lopdf 0.44.0",
  "pdf-extract",
+]
+
+[[package]]
+name = "haider-platform"
+version = "0.0.920"
+dependencies = [
+ "blake3",
+ "getrandom 0.3.4",
+ "rustix 1.1.4",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1398,6 +1415,7 @@ dependencies = [
  "async-trait",
  "base64",
  "blake3",
+ "haider-platform",
  "haider-protocol",
  "rustix 1.1.4",
  "serde",
@@ -1412,13 +1430,13 @@ version = "0.0.920"
 dependencies = [
  "base64",
  "haider-client",
+ "haider-platform",
  "haider-protocol",
  "haider-rpc",
  "haider-stt",
  "image",
  "ratatui",
  "ratatui-image",
- "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",

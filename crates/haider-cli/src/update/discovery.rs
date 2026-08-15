@@ -6,7 +6,6 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -223,10 +222,10 @@ impl CurlTransport {
                 .unwrap_or("download")
         );
         let header_path = path.with_file_name(header_name);
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut header_options = OpenOptions::new();
+        header_options.write(true).create_new(true);
+        haider_platform::configure_file_mode(&mut header_options, 0o600);
+        header_options
             .open(&header_path)
             .map_err(|error| UpdateError::io("create private response headers", error))?;
         let mut file = OpenOptions::new()

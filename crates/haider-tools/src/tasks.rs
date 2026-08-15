@@ -17,22 +17,22 @@ use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::process::{
     Captured, PreparedProcessExec, ProcessBounds, ProcessExec, begin_group_termination,
     observe_process_leader_exit, process_arguments, process_group_exists, read_output,
-    reap_process_leader, set_anchored_current_dir, signal_group, signal_group_for_sweep,
+    reap_process_leader, set_anchored_current_dir, shell_command, signal_group,
+    signal_group_for_sweep,
 };
 use crate::{ToolError, ToolResult};
 use haider_protocol::effect::WorkspaceMutation;
 use haider_protocol::ids::EffectId;
 use haider_protocol::item::OutputStream;
-use rustix::process::{Pid, Signal};
+use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::env;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Sleep, sleep};
 
@@ -268,10 +268,8 @@ impl EffectBroker {
                 Ok(cwd_fd) => cwd_fd,
                 Err(error) => return self.finish(&intent, Err(error)).await,
             };
-        let mut command = Command::new("/bin/sh");
+        let mut command = shell_command(&resolved.command);
         command
-            .arg("-c")
-            .arg(&resolved.command)
             .env_clear()
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -282,8 +280,8 @@ impl EffectBroker {
             }
         }
         set_anchored_current_dir(&mut command, cwd_fd);
-        command.as_std_mut().process_group(0);
-        close_inherited_descriptors(&mut command);
+        haider_platform::configure_process_group(&mut command);
+        haider_platform::configure_background_process(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -336,30 +334,6 @@ impl EffectBroker {
             workspace_digest_before,
         };
         self.finish(&intent, Ok(spawn)).await
-    }
-}
-
-/// gate52 fd hygiene for children that outlive their spawner's expectations:
-/// close every descriptor above stderr between fork and exec. macOS creates
-/// pipes without atomic CLOEXEC, so a concurrent spawn on another thread can
-/// capture a sibling's descriptor; a leaked pipe write end held by a
-/// long-lived task starves the original reader of EOF forever.
-///
-/// Registered AFTER the anchored `fchdir` hook, so the cwd fd has already
-/// served its purpose when it is closed.
-#[allow(unsafe_code)]
-fn close_inherited_descriptors(command: &mut Command) {
-    // SAFETY: the hook runs between fork and exec and calls only the
-    // async-signal-safe `close(2)`; no allocation, locking, or Rust runtime
-    // machinery is touched.
-    unsafe {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().pre_exec(|| {
-            for fd in 3..65_536_i32 {
-                rustix::io::close(fd);
-            }
-            Ok(())
-        });
     }
 }
 
@@ -724,9 +698,7 @@ pub async fn supervise_background(
         exit_code: exit_status
             .as_ref()
             .and_then(std::process::ExitStatus::code),
-        signal: exit_status
-            .as_ref()
-            .and_then(std::os::unix::process::ExitStatusExt::signal),
+        signal: exit_status.as_ref().and_then(haider_platform::exit_signal),
         killed,
         fault: (!fault_parts.is_empty()).then(|| fault_parts.join("; ")),
         workspace_mutation,

@@ -32,7 +32,7 @@
 // Crate-internal by necessity: these tests exercise the private fair queue and
 // writer's reserved drain lane directly. The externally visible session laws
 // live in `tests/session_hub_tests.rs` and haider-daemond's UDS tests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "connection_tests.rs"]
 mod connection_tests;
 
@@ -40,6 +40,7 @@ use crate::DaemonError;
 use crate::session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub,
 };
+use haider_platform::{IpcStream, IpcWriteHalf};
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_ACCOUNT_LOGIN_API_V1,
     FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1, FEATURE_BRANCH_CREATE_V1,
@@ -56,8 +57,6 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
@@ -874,24 +873,23 @@ pub(crate) struct ConnectionContext {
 /// broadcast fires. Errors returned here end only this connection; the
 /// [`ConnectionExit`] is what the drain barrier reads to stay honest.
 pub(crate) async fn serve(
-    stream: UnixStream,
+    stream: IpcStream,
     context: ConnectionContext,
     mut drain: watch::Receiver<Option<DrainNotice>>,
 ) -> Result<ConnectionExit, DaemonError> {
-    let credentials = stream.peer_cred().map_err(|error| {
+    let credentials = haider_platform::peer_credentials(&stream).map_err(|error| {
         DaemonError::io("read Unix peer credentials", &context.endpoint_path, error)
     })?;
-    if credentials.uid() != context.owner_uid {
+    if !haider_platform::peer_credentials_are_owner(&credentials, context.owner_uid) {
         return Err(DaemonError::Protocol {
             message: format!(
                 "refusing peer uid {}, endpoint owner is {}",
-                credentials.uid(),
-                context.owner_uid
+                credentials.uid, context.owner_uid
             ),
         });
     }
 
-    let (mut reader, writer) = stream.into_split();
+    let (mut reader, writer) = haider_platform::split(stream);
     let lane = OutboundLane::new(
         context.outbound_queue_capacity,
         context.outbound_queued_bytes,
@@ -1077,7 +1075,7 @@ pub(crate) async fn serve(
 /// follow under the same deadline. Returns whether `ServerDraining` reached
 /// the wire.
 async fn run_writer(
-    mut writer: OwnedWriteHalf,
+    mut writer: IpcWriteHalf,
     queued: OutboundLane,
     mut reserved: mpsc::Receiver<ReservedNotice>,
 ) -> std::io::Result<bool> {
@@ -1180,7 +1178,7 @@ async fn run_writer(
 /// Writes one ordinary frame, adopting the drain deadline the moment the
 /// reserved notice appears.
 async fn write_ordinary(
-    writer: &mut OwnedWriteHalf,
+    writer: &mut IpcWriteHalf,
     bytes: &[u8],
     notice: &mut Option<ReservedNotice>,
     reserve_open: &mut bool,
@@ -1510,11 +1508,8 @@ fn encode_drain_notice(
 /// tokio's `try_write` reports `WouldBlock` on a socket whose writable
 /// readiness the reactor has not yet observed, which would silently drop the
 /// rejection this function exists to deliver.
-pub(crate) fn reject_over_limit(stream: &UnixStream, context: &ConnectionContext) {
-    if !stream
-        .peer_cred()
-        .is_ok_and(|credentials| credentials.uid() == context.owner_uid)
-    {
+pub(crate) fn reject_over_limit(stream: &IpcStream, context: &ConnectionContext) {
+    if !haider_platform::peer_is_owner(stream, context.owner_uid).unwrap_or(false) {
         return;
     }
     let frame = WireFrame::ProtocolError(ProtocolError {
@@ -1530,13 +1525,5 @@ pub(crate) fn reject_over_limit(stream: &UnixStream, context: &ConnectionContext
     let Ok(bytes) = encode_outbound(&frame, context.frame_limit) else {
         return;
     };
-    let mut written = 0;
-    while written < bytes.len() {
-        match rustix::io::write(stream, &bytes[written..]) {
-            Ok(0) => break,
-            Ok(count) => written = written.saturating_add(count),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(_) => break,
-        }
-    }
+    haider_platform::write_immediate(stream, &bytes);
 }

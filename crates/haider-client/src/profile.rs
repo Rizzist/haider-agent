@@ -203,8 +203,7 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
 /// protects the tight OS limit on Unix socket path length (`sun_path`,
 /// ~104 bytes on macOS).
 pub fn endpoint_path_for(runtime_dir: &Path, profile_id: &str) -> PathBuf {
-    let digest = blake3::hash(profile_id.as_bytes()).to_hex();
-    runtime_dir.join(format!("haider-{}.sock", &digest.as_str()[..32]))
+    haider_platform::Endpoint::new(runtime_dir, profile_id).into_address()
 }
 
 /// Resolves the runtime directory (never environment-overridable).
@@ -215,27 +214,35 @@ fn runtime_dir(env: &ProfileEnv) -> PathBuf {
     {
         return xdg.join("haider");
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), unix))]
     let _ = env;
-    PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()))
+    #[cfg(unix)]
+    return PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()));
+    #[cfg(windows)]
+    {
+        let _ = env;
+        std::env::temp_dir().join("haider")
+    }
 }
 
 /// Effective UID of this process.
+#[cfg(unix)]
 pub fn effective_uid() -> u32 {
-    rustix::process::geteuid().as_raw()
+    haider_platform::effective_user_id()
+}
+
+/// Windows has no Unix effective UID. The endpoint is protected by its named
+/// pipe DACL rather than this compatibility value.
+#[cfg(windows)]
+pub fn effective_uid() -> u32 {
+    0
 }
 
 /// A directory qualifies as an XDG runtime base only when it is a real
 /// directory owned by this UID with no group/other access.
 #[cfg(target_os = "linux")]
 fn verified_owner_private(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            metadata.is_dir() && metadata.uid() == effective_uid() && metadata.mode() & 0o077 == 0
-        }
-        Err(_) => false,
-    }
+    haider_platform::is_owner_private_directory(path)
 }
 
 /// Resolves the release-owned default model for an EXPLICIT store directory

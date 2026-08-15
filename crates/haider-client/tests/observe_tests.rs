@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! H1 observation stream cursor and forward-compatibility laws.
 #![allow(clippy::expect_used)]
 

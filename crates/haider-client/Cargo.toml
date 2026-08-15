@@ -11,7 +11,7 @@ blake3.workspace = true
 haider-rpc = { path = "../haider-rpc" }
 haider-protocol = { path = "../haider-protocol" }
 haider-pdf = { path = "../haider-pdf" }
-rustix.workspace = true
+haider-platform = { path = "../haider-platform" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -19,6 +19,9 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

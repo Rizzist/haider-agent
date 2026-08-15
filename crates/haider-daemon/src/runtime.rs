@@ -156,14 +156,10 @@ pub async fn run_with_signals_and_dependencies(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|error| DaemonError::Task {
-        message: format!("cannot install SIGTERM handler: {error}"),
-    })?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|error| DaemonError::Task {
-        message: format!("cannot install SIGINT handler: {error}"),
-    })?;
+    let mut signals =
+        haider_platform::ShutdownSignals::new().map_err(|error| DaemonError::Task {
+            message: format!("cannot install {} handler: {error}", error.signal()),
+        })?;
     let task = spawn_with_dependencies(config, dependencies);
     let shutdown = task.shutdown_handle();
     let mut joined: Pin<Box<dyn Future<Output = Result<ShutdownOutcome, DaemonError>> + Send>> =
@@ -171,14 +167,9 @@ pub async fn run_with_signals_and_dependencies(
     loop {
         tokio::select! {
             result = &mut joined => return result,
-            signal = terminate.recv() => {
-                if signal.is_some() {
-                    shutdown.request("SIGTERM");
-                }
-            }
-            signal = interrupt.recv() => {
-                if signal.is_some() {
-                    shutdown.request("SIGINT");
+            signal = haider_platform::shutdown_signal(&mut signals) => {
+                if let Some(signal) = signal {
+                    shutdown.request(signal.reason());
                 }
             }
         }
@@ -517,7 +508,7 @@ async fn run_inner(
         max_connections: config.max_connections,
         handshake_timeout: config.handshake_timeout,
         writers: writer_sender,
-        owner_uid: endpoint.owner_uid,
+        owner_uid: endpoint.owner_uid(),
         hub: hub.clone(),
         endpoint_path: endpoint.path().to_path_buf(),
     };

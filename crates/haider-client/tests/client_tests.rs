@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! RpcClient + auto-spawn seam tests against in-process fake daemons.
 //!
 //! These pin the client-side W3c2 laws: request correlation, the R9

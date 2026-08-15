@@ -5,7 +5,6 @@ use super::staging::{VerifiedStagedPair, bounded_command_output, sha256_file, sy
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,12 +54,12 @@ impl InstallLayout {
         for (path, name) in [(&self.haider, "haider"), (&self.haiderd, "haiderd")] {
             let metadata = fs::metadata(path)
                 .map_err(|error| UpdateError::io("inspect installed binary link count", error))?;
-            if metadata.mode() & 0o200 == 0 {
+            if haider_platform::metadata_mode(&metadata) & 0o200 == 0 {
                 return Err(UpdateError::Refused(format!(
                     "installed `{name}` is read-only"
                 )));
             }
-            if metadata.nlink() != 1 {
+            if haider_platform::metadata_link_count(&metadata) != 1 {
                 return Err(UpdateError::Refused(format!(
                     "installed `{name}` is hard-linked or managed"
                 )));
@@ -95,9 +94,9 @@ fn validate_real_directory(path: &Path) -> Result<(), UpdateError> {
             "install directory is symlinked or is not a directory".into(),
         ));
     }
-    if metadata.uid() != haider_client::effective_uid()
-        || metadata.mode() & 0o200 == 0
-        || metadata.mode() & 0o022 != 0
+    if !haider_platform::metadata_is_current_user(&metadata)
+        || haider_platform::metadata_mode(&metadata) & 0o200 == 0
+        || haider_platform::metadata_mode(&metadata) & 0o022 != 0
     {
         return Err(UpdateError::Refused(
             "install directory is managed, read-only, or not owned by this user".into(),
@@ -114,9 +113,9 @@ fn validate_recoverable_binary(path: &Path, name: &str) -> Result<(), UpdateErro
             "installed `{name}` is symlinked or not a regular file"
         )));
     }
-    if metadata.uid() != haider_client::effective_uid()
-        || metadata.mode() & 0o100 == 0
-        || metadata.mode() & 0o022 != 0
+    if !haider_platform::metadata_is_current_user(&metadata)
+        || haider_platform::metadata_mode(&metadata) & 0o100 == 0
+        || haider_platform::metadata_mode(&metadata) & 0o022 != 0
     {
         return Err(UpdateError::Refused(format!(
             "installed `{name}` is managed or not owner-executable"
@@ -166,18 +165,22 @@ impl PreparedTransaction {
         {
             return Err(UpdateError::Refused("update lock is a symlink".into()));
         }
-        let lock = OpenOptions::new()
+        let mut lock_options = OpenOptions::new();
+        lock_options
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .mode(0o600)
+            .truncate(false);
+        haider_platform::configure_file_mode(&mut lock_options, 0o600);
+        let lock = lock_options
             .open(&lock_path)
             .map_err(|error| UpdateError::io("open update lock", error))?;
         let metadata = lock
             .metadata()
             .map_err(|error| UpdateError::io("inspect update lock", error))?;
-        if metadata.uid() != haider_client::effective_uid() || metadata.mode() & 0o077 != 0 {
+        if !haider_platform::metadata_is_current_user(&metadata)
+            || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+        {
             return Err(UpdateError::Refused(
                 "update lock is not owner-only and owned by this user".into(),
             ));
@@ -540,7 +543,7 @@ pub(crate) fn commit_pair<F: FaultInjector, V: InstalledPairVerifier>(
 }
 
 fn make_owner_writable(path: &Path) -> Result<(), UpdateError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    haider_platform::set_mode(path, 0o700)
         .map_err(|error| UpdateError::io("make installed binary owner-writable", error))?;
     File::open(path)
         .and_then(|file| file.sync_all())
@@ -611,7 +614,7 @@ fn verify_restore_source(
             .map_err(|error| UpdateError::io("inspect recovery backup", error))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || metadata.uid() != haider_client::effective_uid()
+            || !haider_platform::metadata_is_current_user(&metadata)
         {
             return Err(UpdateError::Internal(format!(
                 "recovery backup {} is not a trusted regular file",
@@ -719,10 +722,10 @@ fn write_marker(layout: &InstallLayout, marker: &Marker) -> Result<(), UpdateErr
     let mut bytes = serde_json::to_vec(&value)
         .map_err(|error| UpdateError::Internal(format!("encode update marker: {error}")))?;
     bytes.push(b'\n');
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut marker_options = OpenOptions::new();
+    marker_options.write(true).create_new(true);
+    haider_platform::configure_file_mode(&mut marker_options, 0o600);
+    let mut file = marker_options
         .open(&part)
         .map_err(|error| UpdateError::io("create durable update marker", error))?;
     file.write_all(&bytes)
@@ -739,8 +742,8 @@ fn read_marker(path: &Path) -> Result<Option<Marker>, UpdateError> {
         Ok(metadata)
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
-                || metadata.uid() != haider_client::effective_uid()
-                || metadata.mode() & 0o077 != 0 =>
+                || !haider_platform::metadata_is_current_user(&metadata)
+                || haider_platform::metadata_mode(&metadata) & 0o077 != 0 =>
         {
             return Err(UpdateError::Internal(
                 "update recovery marker is not a trusted owner-only regular file".into(),

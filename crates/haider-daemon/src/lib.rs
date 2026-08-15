@@ -72,10 +72,10 @@ mod project_instructions;
 mod provider_registry;
 mod runtime;
 mod session_hub;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod subagent_core_tests;
 mod tasks;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tasks_runtime_tests;
 mod turn_recovery;
 mod usage_report;

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Daemon-backed headless transaction laws over a real Unix socket.
 #![allow(clippy::expect_used)]
 

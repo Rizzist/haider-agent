@@ -19,25 +19,15 @@ pub const KEYCHAIN_SERVICE: &str = "ai.haider.agent";
 
 // Security.framework OSStatus values from SecBase.h. These stay local rather
 // than adding a direct security-framework-sys dependency solely for constants.
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_IO: i32 = -36;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_PARAM: i32 = -50;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_USER_CANCELED: i32 = -128;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34_018;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_NOT_AVAILABLE: i32 = -25_291;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_AUTH_FAILED: i32 = -25_293;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25_308;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_INTERACTION_REQUIRED: i32 = -25_315;
-#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_IN_DARK_WAKE: i32 = -25_320;
 
 /// Maps a Security.framework OSStatus to Haider's stable code and retry flag.
@@ -45,7 +35,6 @@ const ERR_SEC_IN_DARK_WAKE: i32 = -25_320;
 /// Unknown statuses are non-retryable: callers should retry only failures
 /// explicitly known to clear after I/O recovery, Keychain availability, or
 /// authentication UI becomes available.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) const fn classify_os_status(status: i32) -> (ErrorCode, bool) {
     match status {
         ERR_SEC_ITEM_NOT_FOUND => (ErrorCode::CredentialMissing, false),
@@ -172,32 +161,4 @@ mod platform {
             retryable,
         )
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-impl Vault for KeychainVault {
-    fn put(&self, _alias: &CredentialAlias, _secret: &[u8]) -> AccountsResult<()> {
-        Err(unsupported())
-    }
-
-    fn resolve(&self, _alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
-        Err(unsupported())
-    }
-
-    fn delete(&self, _alias: &CredentialAlias) -> AccountsResult<()> {
-        Err(unsupported())
-    }
-
-    fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
-        Err(unsupported())
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn unsupported() -> haider_protocol::error::HaiderError {
-    accounts_error(
-        ErrorCode::Internal,
-        "KeychainVault requires macOS Security.framework",
-        false,
-    )
 }

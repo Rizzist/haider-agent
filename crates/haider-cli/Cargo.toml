@@ -19,6 +19,7 @@ haider-tools = { path = "../haider-tools" }
 haider-verify = { path = "../haider-verify" }
 haider-accounts = { path = "../haider-accounts" }
 haider-client = { path = "../haider-client" }
+haider-platform = { path = "../haider-platform" }
 haider-rpc = { path = "../haider-rpc" }
 haider-tui = { path = "../haider-tui" }
 rusqlite.workspace = true

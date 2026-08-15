@@ -53,8 +53,6 @@ use haider_protocol::effect::{
 };
 use haider_protocol::ids::{EffectId, MenuId, SessionId, WorkspaceRevision};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
-use rustix::fd::OwnedFd;
-use rustix::fs::{Mode, OFlags};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -817,7 +815,7 @@ impl EffectFinish {
 pub struct EffectBroker {
     journal: BrokerJournal,
     workspace_root: PathBuf,
-    workspace_dir: OwnedFd,
+    workspace_dir: haider_platform::WorkspaceDirectory,
     session_id: SessionId,
     worker_generation: u64,
     started_at_ms: u64,
@@ -876,12 +874,7 @@ impl EffectBroker {
                 workspace_root.display()
             )));
         }
-        let workspace_dir = rustix::fs::openat(
-            rustix::fs::CWD,
-            &workspace_root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
+        let workspace_dir = haider_platform::open_workspace_directory(&workspace_root)
         .map_err(|error| ToolError::io("open workspace root", &workspace_root, error))?;
         Ok(Self {
             journal: BrokerJournal::new(journal),
@@ -906,8 +899,10 @@ impl EffectBroker {
         &self.workspace_root
     }
 
-    pub(crate) fn duplicate_workspace_dir(&self) -> ToolResult<OwnedFd> {
-        rustix::io::dup(&self.workspace_dir)
+    pub(crate) fn duplicate_workspace_dir(
+        &self,
+    ) -> ToolResult<haider_platform::WorkspaceDirectory> {
+        haider_platform::duplicate_workspace_directory(&self.workspace_dir)
             .map_err(|error| ToolError::io("duplicate workspace root", &self.workspace_root, error))
     }
 

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! W-A background task laws at the tools seam: immediate spawn return, the
 //! detached-from-broker lifetime, bounded output, the pgid kill ladder, and
 //! orphan reaping through the injected liveness seam.

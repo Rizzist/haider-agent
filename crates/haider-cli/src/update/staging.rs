@@ -5,7 +5,6 @@ use super::discovery::{ReleaseSelection, UpdateTransport};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -161,8 +160,8 @@ impl VerifiedStagedPair {
                 .map_err(|error| UpdateError::io("inspect staged binary", error))?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
-                || metadata.uid() != haider_client::effective_uid()
-                || metadata.permissions().mode() & 0o777 != 0o500
+                || !haider_platform::metadata_is_current_user(&metadata)
+                || haider_platform::metadata_mode(&metadata) & 0o777 != 0o500
             {
                 return Err(UpdateError::Refused(format!(
                     "verified staged `{name}` is no longer immutable"
@@ -201,7 +200,7 @@ pub(crate) fn verified_pair_for_test(
     fs::copy(haiderd_source, &haiderd)
         .map_err(|error| UpdateError::io("copy verified fixture haiderd", error))?;
     for binary in [&haider, &haiderd] {
-        fs::set_permissions(binary, fs::Permissions::from_mode(0o500))
+        haider_platform::set_mode(binary, 0o500)
             .map_err(|error| UpdateError::io("chmod verified fixture binary", error))?;
         File::open(binary)
             .and_then(|file| file.sync_all())
@@ -270,7 +269,7 @@ pub(crate) fn stage_release<T: UpdateTransport, V: StageVerifier>(
     let extracted = root.join(&top);
     fs::create_dir(&extracted)
         .map_err(|error| UpdateError::io("create extracted staging directory", error))?;
-    fs::set_permissions(&extracted, fs::Permissions::from_mode(0o700))
+    haider_platform::set_mode(&extracted, 0o700)
         .map_err(|error| UpdateError::io("protect extracted staging directory", error))?;
     extract_strict(&archive, root, &top)?;
 
@@ -285,7 +284,7 @@ pub(crate) fn stage_release<T: UpdateTransport, V: StageVerifier>(
     verifier.smoke_haiderd(&haiderd, &selection.version.to_string())?;
 
     for binary in [&haider, &haiderd] {
-        fs::set_permissions(binary, fs::Permissions::from_mode(0o500))
+        haider_platform::set_mode(binary, 0o500)
             .map_err(|error| UpdateError::io("protect staged binary", error))?;
         File::open(binary)
             .and_then(|file| file.sync_all())
@@ -318,7 +317,7 @@ fn create_stage_dir(install_dir: &Path) -> Result<PathBuf, UpdateError> {
             std::process::id()
         ));
         let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
+        haider_platform::configure_directory_mode(&mut builder, 0o700);
         match builder.create(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -331,10 +330,10 @@ fn create_stage_dir(install_dir: &Path) -> Result<PathBuf, UpdateError> {
 }
 
 fn create_private_file(path: &Path) -> Result<(), UpdateError> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    haider_platform::configure_file_mode(&mut options, 0o600);
+    options
         .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| UpdateError::io("create private partial download", error))?;
@@ -546,10 +545,10 @@ fn extract_member(
     destination: &Path,
     size: u64,
 ) -> Result<(), UpdateError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    haider_platform::configure_file_mode(&mut options, 0o700);
+    let mut file = options
         .open(destination)
         .map_err(|error| UpdateError::io("create staged binary", error))?;
     let mut remaining = size;
@@ -729,7 +728,5 @@ pub(crate) fn bounded_command_output(
 }
 
 pub(crate) fn sync_dir(path: &Path) -> Result<(), UpdateError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| UpdateError::io("fsync directory", error))
+    haider_platform::sync_directory(path).map_err(|error| UpdateError::io("fsync directory", error))
 }

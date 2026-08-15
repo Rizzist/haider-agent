@@ -1345,16 +1345,7 @@ pub fn remove_chip(chips: &mut Vec<ChipModel>, agent: &str) -> bool {
 #[must_use]
 pub fn local_device_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NAME.get_or_init(|| {
-        let uname = rustix::system::uname();
-        let node = uname.nodename().to_string_lossy();
-        let short = node.split('.').next().unwrap_or("").trim().to_lowercase();
-        if short.is_empty() {
-            "this-mac".to_owned()
-        } else {
-            short
-        }
-    })
+    NAME.get_or_init(|| haider_platform::local_device_name().unwrap_or_else(|| "this-mac".into()))
 }
 
 /// A render-resolved jump anchor (B2b-m3, research §Q3): the durable

@@ -20,19 +20,19 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::effect::{EffectClass, EffectOutcome, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, EffectId, WorkspaceRevision};
 use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
-use rustix::fd::OwnedFd;
+use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
+use haider_platform::WorkspaceDirectory as OwnedFd;
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
-use rustix::process::{
-    Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -43,6 +43,11 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{Sleep, sleep};
 
+#[cfg(unix)]
+type DirectoryIdentity = rustix::fs::Stat;
+#[cfg(windows)]
+type DirectoryIdentity = PathBuf;
+
 /// Maximum raw payload retained by one pipe-read chunk.
 pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 
@@ -50,6 +55,7 @@ pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 /// execution. Directory ordering and all field boundaries are canonical;
 /// atime is deliberately excluded so taking the snapshot cannot classify
 /// itself as a mutation.
+#[cfg(unix)]
 pub fn workspace_state_digest(root: &Path) -> String {
     fn update_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_be_bytes());
@@ -132,6 +138,83 @@ pub fn workspace_state_digest(root: &Path) -> String {
         } else {
             hasher.update(b"special");
             hasher.update(&metadata.rdev().to_be_bytes());
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.workspace-state.v1");
+    walk(root, Path::new(""), &mut hasher);
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+#[cfg(windows)]
+pub fn workspace_state_digest(root: &Path) -> String {
+    fn update_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher) {
+        let path = root.join(relative);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                hasher.update(b"metadata-error");
+                update_field(hasher, relative.to_string_lossy().as_bytes());
+                update_field(hasher, error.kind().to_string().as_bytes());
+                return;
+            }
+        };
+        update_field(hasher, relative.to_string_lossy().as_bytes());
+        hasher.update(&metadata.len().to_be_bytes());
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            hasher.update(b"directory");
+            let mut entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+                Err(error) => {
+                    hasher.update(b"read-dir-error");
+                    update_field(hasher, error.kind().to_string().as_bytes());
+                    return;
+                }
+            };
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                walk(root, &relative.join(entry.file_name()), hasher);
+            }
+        } else if file_type.is_file() {
+            hasher.update(b"file");
+            match std::fs::File::open(&path) {
+                Ok(mut file) => {
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        match file.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(read) => hasher.update(&buffer[..read]),
+                            Err(error) => {
+                                hasher.update(b"read-file-error");
+                                update_field(hasher, error.kind().to_string().as_bytes());
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    hasher.update(b"open-file-error");
+                    update_field(hasher, error.kind().to_string().as_bytes());
+                }
+            }
+        } else if file_type.is_symlink() {
+            hasher.update(b"symlink");
+            match std::fs::read_link(&path) {
+                Ok(target) => update_field(hasher, target.to_string_lossy().as_bytes()),
+                Err(error) => {
+                    hasher.update(b"read-link-error");
+                    update_field(hasher, error.kind().to_string().as_bytes());
+                }
+            }
+        } else {
+            hasher.update(b"special");
         }
     }
 
@@ -258,7 +341,7 @@ impl EffectOperation for ProcessExec {
 
 pub(crate) struct PreparedProcessExec {
     pub(crate) operation: ProcessExec,
-    cwd_identity: rustix::fs::Stat,
+    cwd_identity: DirectoryIdentity,
     bounds: ProcessBounds,
 }
 
@@ -271,8 +354,7 @@ impl PreparedProcessExec {
     ) -> ToolResult<Self> {
         let operation = operation.resolved(workspace_root)?;
         let cwd_fd = open_directory_beneath(workspace_dir, workspace_root, &operation.cwd)?;
-        let identity = rustix::fs::fstat(&cwd_fd)
-            .map_err(|error| ToolError::io("inspect process cwd", &operation.cwd, error))?;
+        let identity = directory_identity(&cwd_fd, &operation.cwd, "inspect process cwd")?;
         Ok(Self {
             operation,
             cwd_identity: identity,
@@ -297,11 +379,12 @@ impl PreparedProcessExec {
                 path: self.operation.cwd.clone(),
                 message: format!("cwd no longer resolves through the workspace root: {error}"),
             })?;
-        let current = rustix::fs::fstat(&cwd_fd).map_err(|error| {
-            ToolError::io("verify authorized process cwd", &self.operation.cwd, error)
-        })?;
-        if current.st_dev != self.cwd_identity.st_dev || current.st_ino != self.cwd_identity.st_ino
-        {
+        let current = directory_identity(
+            &cwd_fd,
+            &self.operation.cwd,
+            "verify authorized process cwd",
+        )?;
+        if !same_directory_identity(&current, &self.cwd_identity) {
             return Err(ToolError::PathChanged {
                 path: self.operation.cwd.clone(),
                 message: "process cwd identity changed before spawn".into(),
@@ -784,10 +867,8 @@ impl EffectBroker {
                 Ok(cwd_fd) => cwd_fd,
                 Err(error) => return self.finish(&intent, Err(error)).await,
             };
-        let mut command = Command::new("/bin/sh");
+        let mut command = shell_command(&operation.command);
         command
-            .arg("-c")
-            .arg(&operation.command)
             .env_clear()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -798,7 +879,7 @@ impl EffectBroker {
             }
         }
         set_anchored_current_dir(&mut command, cwd_fd);
-        command.as_std_mut().process_group(0);
+        haider_platform::configure_process_group(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -1475,9 +1556,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         exit_code: exit_status
             .as_ref()
             .and_then(std::process::ExitStatus::code),
-        signal: exit_status
-            .as_ref()
-            .and_then(std::os::unix::process::ExitStatusExt::signal),
+        signal: exit_status.as_ref().and_then(haider_platform::exit_signal),
         output_bytes,
         transcript_digest: format!("blake3:{}", transcript_hasher.finalize().to_hex()),
         inline_output,
@@ -1566,7 +1645,7 @@ async fn apply_control(active: &ActiveProcess, control: &ProcessControl) -> Tool
 }
 
 pub(crate) fn signal_group(pid: Pid, signal: Signal) -> ToolResult<()> {
-    kill_process_group(pid, signal).map_err(|error| ToolError::Runtime {
+    haider_platform::signal_process_group_id(pid, signal).map_err(|error| ToolError::Runtime {
         message: format!(
             "send signal {signal:?} to process group {}: {error}",
             pid.as_raw_nonzero()
@@ -1582,13 +1661,17 @@ pub(crate) fn signal_group_for_sweep(
     signal: Signal,
     leader_is_zombie: bool,
 ) -> ToolResult<bool> {
-    match kill_process_group(pid, signal) {
+    match haider_platform::signal_process_group_id(pid, signal) {
         Ok(()) => Ok(true),
-        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(error) if haider_platform::process_error_is_missing(&error) => Ok(false),
         // Darwin reports EPERM when a group contains only the caller's zombie
         // child. Since that zombie pins this exact PGID, no live member of the
         // original group remains signalable in this case.
-        Err(rustix::io::Errno::PERM) if leader_is_zombie => Ok(false),
+        Err(error)
+            if leader_is_zombie && haider_platform::process_error_is_permission(&error) =>
+        {
+            Ok(false)
+        }
         Err(error) => Err(ToolError::Runtime {
             message: format!(
                 "send signal {signal:?} to process group {}: {error}",
@@ -1599,25 +1682,18 @@ pub(crate) fn signal_group_for_sweep(
 }
 
 pub(crate) fn process_group_exists(pid: Pid) -> ToolResult<bool> {
-    match test_kill_process_group(pid) {
-        Ok(()) => Ok(true),
-        Err(rustix::io::Errno::SRCH) => Ok(false),
-        // `killpg(..., 0)` reports EPERM only when the group exists but the
-        // caller cannot signal at least one member. Preserve "exists" so the
-        // TERM/KILL path records the real escalation result.
-        Err(rustix::io::Errno::PERM) => Ok(true),
-        Err(error) => Err(ToolError::Runtime {
-            message: format!("probe process group {}: {error}", pid.as_raw_nonzero()),
-        }),
-    }
+    let group = haider_platform::process_group(Some(pid.id())).ok_or_else(|| ToolError::Runtime {
+        message: "probe process group: invalid process id".into(),
+    })?;
+    haider_platform::process_group_exists(group).map_err(|error| ToolError::Runtime {
+        message: format!("probe process group {}: {error}", pid.as_raw_nonzero()),
+    })
 }
 
 pub(crate) async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
-    let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
     loop {
-        let exited = match waitid(WaitId::Pid(pid), options) {
-            Ok(Some(status)) => status.exited() || status.killed() || status.dumped(),
-            Ok(None) => false,
+        let exited = match haider_platform::process_leader_exited(pid) {
+            Ok(exited) => exited,
             Err(error) => {
                 return Err(ToolError::Runtime {
                     message: format!(
@@ -1700,6 +1776,7 @@ pub(crate) fn begin_group_termination(
     }
 }
 
+#[cfg(unix)]
 fn open_directory_beneath(
     mut directory: OwnedFd,
     workspace_root: &Path,
@@ -1727,8 +1804,43 @@ fn open_directory_beneath(
     Ok(directory)
 }
 
+#[cfg(windows)]
+fn open_directory_beneath(
+    directory: OwnedFd,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> ToolResult<OwnedFd> {
+    let relative = cwd
+        .strip_prefix(workspace_root)
+        .map_err(|_| ToolError::WorkspaceBoundary {
+            workspace_root: workspace_root.to_path_buf(),
+            requested_path: cwd.to_path_buf(),
+            resolved_path: Some(cwd.to_path_buf()),
+        })?;
+    let candidate = directory.join(relative);
+    let canonical = std::fs::canonicalize(&candidate)
+        .map_err(|error| ToolError::io("open anchored process cwd", cwd, error))?;
+    if canonical != cwd {
+        return Err(ToolError::PathChanged {
+            path: cwd.to_path_buf(),
+            message: "process cwd identity changed before spawn".into(),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(&candidate)
+        .map_err(|error| ToolError::io("open anchored process cwd", cwd, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ToolError::PathChanged {
+            path: cwd.to_path_buf(),
+            message: "process cwd is not a real directory".into(),
+        });
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd_fd: OwnedFd) {
+    use std::os::unix::process::CommandExt as _;
     // SAFETY: `pre_exec` runs after fork and before exec. This closure performs
     // only the async-signal-safe `fchdir` syscall and owns the directory fd,
     // so the child cannot follow the authorized pathname again.
@@ -1737,6 +1849,53 @@ pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd_fd: OwnedFd) {
             .as_std_mut()
             .pre_exec(move || rustix::process::fchdir(&cwd_fd).map_err(std::io::Error::from));
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd: OwnedFd) {
+    command.current_dir(cwd);
+}
+
+#[cfg(unix)]
+fn directory_identity(
+    directory: &OwnedFd,
+    path: &Path,
+    operation: &'static str,
+) -> ToolResult<DirectoryIdentity> {
+    rustix::fs::fstat(directory).map_err(|error| ToolError::io(operation, path, error))
+}
+
+#[cfg(windows)]
+fn directory_identity(
+    directory: &OwnedFd,
+    path: &Path,
+    operation: &'static str,
+) -> ToolResult<DirectoryIdentity> {
+    std::fs::canonicalize(directory).map_err(|error| ToolError::io(operation, path, error))
+}
+
+#[cfg(unix)]
+fn same_directory_identity(left: &DirectoryIdentity, right: &DirectoryIdentity) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+#[cfg(windows)]
+fn same_directory_identity(left: &DirectoryIdentity, right: &DirectoryIdentity) -> bool {
+    left == right
+}
+
+#[cfg(unix)]
+pub(crate) fn shell_command(script: &str) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+#[cfg(windows)]
+pub(crate) fn shell_command(script: &str) -> Command {
+    let mut command = Command::new("cmd.exe");
+    command.args(["/D", "/S", "/C"]).arg(script);
+    command
 }
 
 pub(crate) fn process_arguments(

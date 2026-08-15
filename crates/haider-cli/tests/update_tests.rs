@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! W9a discovery, staging, transaction, and recovery laws.
 #![allow(clippy::expect_used)]
 #![allow(dead_code)]

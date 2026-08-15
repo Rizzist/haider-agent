@@ -46,6 +46,7 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::task::TaskEventPayload;
 use haider_tools::{MessageSubagent, SpawnSubagent};
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -2310,6 +2311,7 @@ pub(crate) fn handoff_dir(workspace: &str, session_id: &SessionId) -> PathBuf {
         .join(handoff_session_short(session_id))
 }
 
+#[cfg(unix)]
 fn seed_handoff_dir(workspace: &Path, session_short: &str) -> Result<(), HaiderError> {
     if !workspace.is_absolute()
         || std::fs::canonicalize(workspace)
@@ -2371,7 +2373,83 @@ fn seed_handoff_dir(workspace: &Path, session_short: &str) -> Result<(), HaiderE
     Ok(())
 }
 
+#[cfg(unix)]
 fn handoff_io_error(path: &Path, error: rustix::io::Errno) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        format!(
+            "cannot prepare ephemeral handoff path {}: {error}",
+            path.display()
+        ),
+        false,
+    )
+}
+
+#[cfg(windows)]
+fn seed_handoff_dir(workspace: &Path, session_short: &str) -> Result<(), HaiderError> {
+    use std::io::Write as _;
+
+    if !workspace.is_absolute()
+        || std::fs::canonicalize(workspace)
+            .ok()
+            .as_deref()
+            .is_none_or(|canonical| canonical != workspace)
+    {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "handoff workspace must be an existing canonical directory",
+            false,
+        ));
+    }
+    let directory = workspace.join(".haider").join("handoff").join(session_short);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| handoff_windows_io_error(&directory, error))?;
+    for ancestor in [
+        workspace.join(".haider"),
+        workspace.join(".haider").join("handoff"),
+        directory.clone(),
+    ] {
+        let metadata = std::fs::symlink_metadata(&ancestor)
+            .map_err(|error| handoff_windows_io_error(&ancestor, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                format!(
+                    "cannot prepare ephemeral handoff path {}: path is not a real directory",
+                    ancestor.display()
+                ),
+                false,
+            ));
+        }
+        haider_platform::set_mode(&ancestor, 0o700)
+            .map_err(|error| handoff_windows_io_error(&ancestor, error))?;
+    }
+    let ignore_path = directory.join(".gitignore");
+    if std::fs::symlink_metadata(&ignore_path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(HaiderError::new(
+            ErrorCode::Internal,
+            format!(
+                "cannot prepare ephemeral handoff path {}: path is a symlink",
+                ignore_path.display()
+            ),
+            false,
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    haider_platform::configure_file_mode(&mut options, 0o600);
+    let mut ignore = options
+        .open(&ignore_path)
+        .map_err(|error| handoff_windows_io_error(&ignore_path, error))?;
+    ignore
+        .write_all(HANDOFF_IGNORE)
+        .map_err(|error| handoff_windows_io_error(&ignore_path, error))
+}
+
+#[cfg(windows)]
+fn handoff_windows_io_error(path: &Path, error: std::io::Error) -> HaiderError {
     HaiderError::new(
         ErrorCode::Internal,
         format!(

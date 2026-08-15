@@ -20,12 +20,12 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use haider_platform::{IpcReadHalf, IpcStream, IpcWriteHalf};
 use haider_rpc::{
     Capability, CapabilitySet, ClientKind, CodecError, DEFAULT_FRAME_LIMIT, Hello, ProtocolError,
     RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
@@ -209,19 +209,18 @@ pub struct PeerCredentials {
 
 /// Dials the endpoint and completes the `Hello`/`Welcome` handshake.
 pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, ConnectError> {
-    let mut stream = match UnixStream::connect(path).await {
+    let mut stream = match haider_platform::connect(path).await {
         Ok(stream) => stream,
         Err(error) => return Err(classify_connect_error(error)),
     };
     // Capture before `RpcClient::start` consumes the stream and splits it.
     // The peer credentials are the update signal authority; the lock-file
     // PID is deliberately never consulted.
-    let peer_credentials = stream
-        .peer_cred()
+    let peer_credentials = haider_platform::peer_credentials(&stream)
         .map(|credentials| PeerCredentials {
-            pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
-            uid: credentials.uid(),
-            gid: credentials.gid(),
+            pid: credentials.pid,
+            uid: credentials.uid,
+            gid: credentials.gid,
         })
         .unwrap_or(PeerCredentials {
             pid: None,
@@ -369,7 +368,7 @@ pub struct RpcClient {
 
 impl RpcClient {
     fn start(
-        stream: UnixStream,
+        stream: IpcStream,
         decoder: uds_codec::Decoder,
         leftovers: VecDeque<WireFrame>,
         config: &ClientConfig,
@@ -389,7 +388,7 @@ impl RpcClient {
         let outbound_limit = config.frame_limit.min(welcome.frame_limit as usize).max(1);
         let (outbound, outbound_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>(OUTBOUND_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel::<WireFrame>(EVENT_CAPACITY);
-        let (reader_half, writer_half) = stream.into_split();
+        let (reader_half, writer_half) = haider_platform::split(stream);
 
         let tasks = vec![
             tokio::spawn(run_reader(
@@ -591,7 +590,7 @@ impl Drop for RpcClient {
 }
 
 async fn run_reader(
-    mut reader: tokio::net::unix::OwnedReadHalf,
+    mut reader: IpcReadHalf,
     mut decoder: uds_codec::Decoder,
     leftovers: VecDeque<WireFrame>,
     shared: Arc<Shared>,
@@ -689,7 +688,7 @@ async fn route_frame(
 }
 
 async fn run_writer(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut writer: IpcWriteHalf,
     mut outbound: mpsc::Receiver<Zeroizing<Vec<u8>>>,
     shared: Arc<Shared>,
 ) {

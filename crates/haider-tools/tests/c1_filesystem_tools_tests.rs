@@ -1,3 +1,4 @@
+#![cfg(unix)]
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;

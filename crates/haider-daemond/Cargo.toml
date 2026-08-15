@@ -23,6 +23,7 @@ async-trait.workspace = true
 base64.workspace = true
 blake3.workspace = true
 haider-accounts = { path = "../haider-accounts" }
+haider-platform = { path = "../haider-platform" }
 haider-core = { path = "../haider-core" }
 haider-provider = { path = "../haider-provider" }
 haider-protocol = { path = "../haider-protocol" }
@@ -32,7 +33,6 @@ haider-tools = { path = "../haider-tools" }
 haider-tui = { path = "../haider-tui" }
 ratatui.workspace = true
 reqwest.workspace = true
-rustix.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -40,6 +40,9 @@ tempfile.workspace = true
 tracing.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

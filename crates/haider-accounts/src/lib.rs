@@ -17,8 +17,9 @@ mod env_bridge;
 mod file_vault;
 #[cfg(test)]
 mod file_vault_tests;
+#[cfg(target_os = "macos")]
 mod keychain;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
 mod oauth;
 mod resolver;
@@ -32,6 +33,7 @@ pub use haider_protocol::credential::{
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 pub use haider_protocol::ids::CredentialAlias;
+#[cfg(target_os = "macos")]
 pub use keychain::{KEYCHAIN_SERVICE, KeychainVault};
 pub use oauth::{OAuthIdentityV1, OAuthTokenBundleV1};
 pub use resolver::{Resolver, RotationCallback, RotationDecision, RotationTrigger};

@@ -4,7 +4,7 @@ use super::UpdateError;
 use super::transaction::{CommittedUpdate, TransactionPhase};
 use haider_client::{
     ClientConfig, ConnectError, Connected, ConnectionState, ResolvedProfile, RpcClient, connect,
-    required_live_features, signal_authenticated_peer, spawn_daemon_retained,
+    required_live_features, spawn_daemon_retained,
 };
 use haider_protocol::error::ErrorCode;
 use haider_rpc::{LifecyclePhase, Welcome, WireFrame};
@@ -38,7 +38,7 @@ impl RestartHooks for SystemRestartHooks {
     }
 
     fn signal(&self, pid: u32) -> Result<(), UpdateError> {
-        signal_authenticated_peer(pid)
+        haider_platform::signal_process(pid, haider_platform::ProcessSignal::Terminate)
             .map_err(|error| UpdateError::RestartTimeout(format!("SIGTERM failed: {error}")))
     }
 }

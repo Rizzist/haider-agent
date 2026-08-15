@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! W3c3 M2 — the live IO shell (`link.rs`) against a fake daemon peer.
 //!
 //! `LiveDriver` is pure and pinned without a socket; the LINK is the half

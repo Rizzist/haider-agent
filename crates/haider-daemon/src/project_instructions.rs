@@ -7,11 +7,22 @@
 use haider_protocol::project_instructions::{
     ProjectInstructionFileFact, ProjectInstructionsLoaded,
 };
+#[cfg(unix)]
 use rustix::fs::{FileType, Mode, OFlags};
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+type DirectoryHandle = OwnedFd;
+#[cfg(windows)]
+type DirectoryHandle = PathBuf;
+#[cfg(unix)]
+type DirectoryOpenError = rustix::io::Errno;
+#[cfg(windows)]
+type DirectoryOpenError = std::io::Error;
 
 pub(crate) const MAX_PROJECT_INSTRUCTION_FILE_BYTES: usize = 48 * 1024;
 pub(crate) const MAX_PROJECT_INSTRUCTION_TOTAL_BYTES: usize = 96 * 1024;
@@ -144,7 +155,7 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
 }
 
 fn load_directory_winner(
-    directory: &OwnedFd,
+    directory: &DirectoryHandle,
     display_directory: &Path,
     remaining: usize,
 ) -> Option<LoadedProjectInstruction> {
@@ -165,7 +176,17 @@ enum CandidateRead {
 }
 
 fn read_candidate(
-    directory: &OwnedFd,
+    directory: &DirectoryHandle,
+    name: &str,
+    display_path: &Path,
+    remaining: usize,
+) -> CandidateRead {
+    read_candidate_platform(directory, name, display_path, remaining)
+}
+
+#[cfg(unix)]
+fn read_candidate_platform(
+    directory: &DirectoryHandle,
     name: &str,
     display_path: &Path,
     remaining: usize,
@@ -235,6 +256,76 @@ fn read_candidate(
     })
 }
 
+#[cfg(windows)]
+fn read_candidate_platform(
+    directory: &DirectoryHandle,
+    name: &str,
+    display_path: &Path,
+    remaining: usize,
+) -> CandidateRead {
+    let path = directory.join(name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CandidateRead::Missing;
+        }
+        Err(error) => {
+            instruction_notice(
+                display_path,
+                &format!("instruction file was skipped: {error}"),
+            );
+            return CandidateRead::Skipped;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        instruction_notice(display_path, "instruction path is not a regular file");
+        return CandidateRead::Skipped;
+    }
+    let cap = remaining.min(MAX_PROJECT_INSTRUCTION_FILE_BYTES);
+    let read_limit = u64::try_from(cap.saturating_add(1)).unwrap_or(u64::MAX);
+    let mut bytes = Vec::with_capacity(cap.saturating_add(1));
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            instruction_notice(
+                display_path,
+                &format!("instruction file was unreadable: {error}"),
+            );
+            return CandidateRead::Skipped;
+        }
+    };
+    if let Err(error) = file.take(read_limit).read_to_end(&mut bytes) {
+        instruction_notice(
+            display_path,
+            &format!("instruction file was unreadable: {error}"),
+        );
+        return CandidateRead::Skipped;
+    }
+    loaded_candidate(display_path, bytes, cap)
+}
+
+#[cfg(windows)]
+fn loaded_candidate(display_path: &Path, bytes: Vec<u8>, cap: usize) -> CandidateRead {
+    let Some((text, truncated)) = bounded_utf8(bytes, cap) else {
+        instruction_notice(
+            display_path,
+            "instruction file was not valid bounded UTF-8 or no truncation marker fit",
+        );
+        return CandidateRead::Skipped;
+    };
+    let Some(path) = display_path.to_str() else {
+        instruction_notice(display_path, "instruction path is not UTF-8");
+        return CandidateRead::Skipped;
+    };
+    let digest = blake3::hash(text.as_bytes()).to_hex().to_string();
+    CandidateRead::Loaded(LoadedProjectInstruction {
+        path: path.to_owned(),
+        text,
+        digest,
+        truncated,
+    })
+}
+
 fn bounded_utf8(bytes: Vec<u8>, cap: usize) -> Option<(String, bool)> {
     if bytes.len() <= cap {
         return String::from_utf8(bytes).ok().map(|text| (text, false));
@@ -256,7 +347,8 @@ fn bounded_utf8(bytes: Vec<u8>, cap: usize) -> Option<(String, bool)> {
     Some((text, true))
 }
 
-fn open_canonical_directory(path: &Path) -> Option<OwnedFd> {
+#[cfg(unix)]
+fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
     if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
         return None;
     }
@@ -276,7 +368,11 @@ fn open_canonical_directory(path: &Path) -> Option<OwnedFd> {
     Some(directory)
 }
 
-fn open_directory_at(directory: &OwnedFd, path: &Path) -> Result<OwnedFd, rustix::io::Errno> {
+#[cfg(unix)]
+fn open_directory_at(
+    directory: &DirectoryHandle,
+    path: &Path,
+) -> Result<DirectoryHandle, DirectoryOpenError> {
     rustix::fs::openat(
         directory,
         path,
@@ -285,11 +381,42 @@ fn open_directory_at(directory: &OwnedFd, path: &Path) -> Result<OwnedFd, rustix
     )
 }
 
-fn same_directory(left: &OwnedFd, right: &OwnedFd) -> bool {
+#[cfg(unix)]
+fn same_directory(left: &DirectoryHandle, right: &DirectoryHandle) -> bool {
     let (Ok(left), Ok(right)) = (rustix::fs::fstat(left), rustix::fs::fstat(right)) else {
         return false;
     };
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+#[cfg(windows)]
+fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
+    if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
+        return None;
+    }
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())?;
+    Some(path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn open_directory_at(
+    directory: &DirectoryHandle,
+    path: &Path,
+) -> Result<DirectoryHandle, DirectoryOpenError> {
+    let candidate = directory.join(path);
+    let canonical = fs::canonicalize(&candidate)?;
+    let metadata = fs::symlink_metadata(&candidate)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::other("path is not a real directory"));
+    }
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn same_directory(left: &DirectoryHandle, right: &DirectoryHandle) -> bool {
+    left == right
 }
 
 fn instruction_notice(path: &Path, reason: &str) {

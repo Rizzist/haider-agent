@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! W3c3 P1-3 — the ordered-send half of a correlated request.
 //!
 //! `request` is one round trip with two halves that want opposite things:

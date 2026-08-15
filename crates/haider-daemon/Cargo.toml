@@ -15,6 +15,7 @@ getrandom.workspace = true
 haider-client = { path = "../haider-client" }
 haider-core = { path = "../haider-core" }
 haider-pdf = { path = "../haider-pdf" }
+haider-platform = { path = "../haider-platform" }
 haider-accounts = { path = "../haider-accounts" }
 haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }
@@ -22,7 +23,6 @@ haider-rpc = { path = "../haider-rpc" }
 haider-tools = { path = "../haider-tools" }
 jsonwebtoken.workspace = true
 reqwest.workspace = true
-rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -41,8 +41,11 @@ tempfile.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
 [lints]
 workspace = true

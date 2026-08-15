@@ -69,12 +69,8 @@ impl FileVault {
         }
         std::fs::create_dir_all(&self.root)
             .map_err(|error| io_error("create vault directory", &error))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| io_error("restrict vault directory", &error))?;
-        }
+        haider_platform::set_mode(&self.root, 0o700)
+            .map_err(|error| io_error("restrict vault directory", &error))?;
         Ok(())
     }
 }
@@ -102,11 +98,7 @@ impl Vault for FileVault {
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        haider_platform::configure_file_mode(&mut options, 0o600);
         let result = (|| {
             let mut file = options
                 .open(&temp)
@@ -115,11 +107,8 @@ impl Vault for FileVault {
                 .and_then(|()| file.sync_all())
                 .map_err(|error| io_error("write vault secret", &error))?;
             drop(file);
-            std::fs::rename(&temp, &target)
-                .map_err(|error| io_error("commit vault secret", &error))?;
-            std::fs::File::open(&self.root)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| io_error("sync vault directory", &error))
+            commit_temp(&temp, &target).map_err(|error| io_error("commit vault secret", &error))?;
+            sync_directory(&self.root).map_err(|error| io_error("sync vault directory", &error))
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
@@ -187,11 +176,7 @@ impl Vault for FileVault {
         let path = self.refresh_lock_path_for(alias);
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        haider_platform::configure_file_mode(&mut options, 0o600);
         let file = options
             .open(path)
             .map_err(|error| io_error("open vault refresh lock", &error))?;
@@ -203,6 +188,54 @@ impl Vault for FileVault {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn commit_temp(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn commit_temp(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp = temp
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            temp.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
+    haider_platform::sync_directory(path)
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &std::path::Path) -> std::io::Result<()> {
+    // MOVEFILE_WRITE_THROUGH above flushes the replacement before returning.
+    Ok(())
 }
 
 fn missing(alias: &CredentialAlias) -> haider_protocol::error::HaiderError {

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/haider-platform",
     "crates/haider-protocol",
     "crates/haider-store",
     "crates/haider-core",
@@ -56,6 +57,9 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 zeroize = "1"
+
+[workspace.dependencies.windows-sys]
+version = "0.61.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

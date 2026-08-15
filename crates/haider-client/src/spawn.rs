@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
 use haider_rpc::{
@@ -378,65 +378,25 @@ fn spawn_daemon(
     options: &EnsureOptions,
     log_path: &Path,
 ) -> Result<Child, EnsureError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::CommandExt;
-
     let binary = daemon_binary(options)?;
-    // Owner-only (0600) profile daemon log; stdout and stderr both append.
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(log_path)
-        .map_err(|error| EnsureError::Spawn {
-            binary: binary.clone(),
-            message: format!("cannot open daemon log {}: {error}", log_path.display()),
-        })?;
-    let log_err = log.try_clone().map_err(|error| EnsureError::Spawn {
-        binary: binary.clone(),
-        message: format!("cannot clone daemon log handle: {error}"),
-    })?;
-    let mut command = std::process::Command::new(&binary);
-    command
-        .arg("--profile")
-        .arg(&profile.profile_id)
-        .arg("--store-dir")
-        .arg(&profile.store_dir)
-        .arg("--runtime-dir")
-        .arg(&profile.runtime_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        // Detach from the launcher's terminal/process group so terminal
-        // signals never reach the daemon and parent exit leaves it running.
-        .process_group(0);
-    // The daemon outlives its launcher, so an accidentally inherited
-    // descriptor outlives the caller's expectations with it. macOS creates
-    // pipes without atomic CLOEXEC (`pipe()` then `fcntl`), a concurrent
-    // spawn on another thread can capture a sibling's descriptor inside that
-    // window, and `Command` demonstrably forwards non-CLOEXEC descriptors on
-    // this platform — a leaked pipe write end held by the long-lived daemon
-    // then starves the original reader of EOF forever. Close every
-    // descriptor above stderr between fork and exec so the daemon starts
-    // with exactly its three configured stdio descriptors (`close(2)` is
-    // async-signal-safe).
-    //
-    // SAFETY: the hook runs between fork and exec and calls only the
-    // async-signal-safe `close(2)`; no allocation, locking, or Rust runtime
-    // machinery is touched.
-    #[allow(unsafe_code)]
-    unsafe {
-        use std::os::unix::process::CommandExt as _;
-        command.pre_exec(|| {
-            for fd in 3..65_536i32 {
-                rustix::io::close(fd);
+    haider_platform::spawn_daemon(haider_platform::DaemonSpawn {
+        binary: &binary,
+        profile_id: &profile.profile_id,
+        store_dir: &profile.store_dir,
+        runtime_dir: &profile.runtime_dir,
+        log_path,
+    })
+    .map_err(|error| {
+        let message = match error {
+            haider_platform::DaemonSpawnError::OpenLog(error) => {
+                format!("cannot open daemon log {}: {error}", log_path.display())
             }
-            Ok(())
-        });
-    }
-    command.spawn().map_err(|error| EnsureError::Spawn {
-        binary,
-        message: error.to_string(),
+            haider_platform::DaemonSpawnError::CloneLog(error) => {
+                format!("cannot clone daemon log handle: {error}")
+            }
+            haider_platform::DaemonSpawnError::Spawn(error) => error.to_string(),
+        };
+        EnsureError::Spawn { binary, message }
     })
 }
 
@@ -468,11 +428,5 @@ pub fn spawn_daemon_retained(
 /// `SIGTERM` syscall and never retries; a runtime failure is returned to the
 /// caller so update cannot accidentally turn a timeout into a second signal.
 pub fn signal_authenticated_peer(pid: u32) -> std::io::Result<()> {
-    use rustix::process::{Pid, Signal, kill_process};
-
-    let raw = i32::try_from(pid)
-        .ok()
-        .and_then(Pid::from_raw)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid peer PID"))?;
-    kill_process(raw, Signal::TERM).map_err(std::io::Error::from)
+    haider_platform::signal_process(pid, haider_platform::ProcessSignal::Terminate)
 }

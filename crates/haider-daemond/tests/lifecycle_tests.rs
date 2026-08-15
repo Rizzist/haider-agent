@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! W3b1 acceptance matrix — EXHAUSTIVE. Every `#[tokio::test]` in this file
 //! appears below; a case added without a row here is a gap in the matrix, not
 //! a shortcut. Cases are grouped by the law they defend (d1 report

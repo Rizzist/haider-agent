@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! T2 — the thin transcription-secret client helpers: request builders
 //! against the T1 wire goldens, tolerant response parsing, typed error
 //! mapping, and one full async round-trip against an in-process fake

@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 haider-protocol = { path = "../haider-protocol" }
+haider-platform = { path = "../haider-platform" }
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -15,6 +16,9 @@ zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile.workspace = true

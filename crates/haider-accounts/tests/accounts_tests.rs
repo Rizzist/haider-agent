@@ -9,10 +9,12 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(target_os = "macos")]
+use haider_accounts::KeychainVault;
 use haider_accounts::{
     AccountStore, AccountsResult, AuthMethod, CredentialAlias, CredentialDescriptor,
-    CredentialStatus, ErrorCode, JsonFileStore, KeychainVault, MemoryVault, Resolver,
-    RotationCallback, RotationDecision, RotationTrigger, StoreLike, Vault, import_env,
+    CredentialStatus, ErrorCode, JsonFileStore, MemoryVault, Resolver, RotationCallback,
+    RotationDecision, RotationTrigger, StoreLike, Vault, import_env,
 };
 use haider_protocol::credential::RotationCause;
 
