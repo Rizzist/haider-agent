@@ -290,6 +290,13 @@ fn chip_header_names_manifest_handoff_directory() {
         chip.handoff_dir.as_deref(),
         Some("/work/project/.haider/handoff/0123456789abcdef")
     );
+    // The CHIP carries its own device string (seeded from the host at spawn):
+    // a 60-char CI-runner hostname pushes the `· handoff` segment past the
+    // 120-col draw. Deterministic device on the CHIP itself, not the model
+    // identity (the round-5 screen dump named this).
+    haider_tui::app::find_chip_mut(&mut model.chips, CHILD)
+        .expect("chip installed")
+        .device = "test-mac".to_owned();
 
     model.screen = Screen::Subagent;
     model.view_path = vec![CHILD.to_owned()];
