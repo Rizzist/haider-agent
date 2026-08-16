@@ -63,6 +63,13 @@ pub struct FleetView {
     pub grid_cols: std::cell::Cell<usize>,
     /// Visible body rows measured by RENDER, for PgUp/PgDn.
     pub page_rows: std::cell::Cell<usize>,
+    /// Owner 2026-08-16: a LEAF member's DETAIL frame — drilling a leaf
+    /// opens its transcript/workflow page; esc closes it before popping
+    /// the drill stack.
+    pub detail: Option<AgentId>,
+    /// The detail member's OWN child-graph status. `None` = no answer yet;
+    /// `Some((session, None))` = answered honestly: no personal workflow.
+    pub detail_graph: Option<(SessionId, Option<haider_protocol::graph::GraphStatus>)>,
 }
 
 /// Which density the current root renders at. Derived, never stored —

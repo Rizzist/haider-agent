@@ -3896,6 +3896,12 @@ impl LiveDriver {
             AppRequest::FleetRefresh => self.fleet_refresh(model),
             AppRequest::GraphRefresh => self.graph_refresh(model),
             AppRequest::GraphInspectRefresh => self.graph_inspect_refresh(model),
+            AppRequest::FleetMemberGraph { session } => {
+                // A one-shot, session-tagged graph read for the fleet
+                // member's detail frame — outside the active session's
+                // single-flight chase (the reply routes by its session tag).
+                vec![self.enqueue(LiveCommand::GraphStatus { session })]
+            }
             AppRequest::RunRetry { session } => {
                 let command_id = self.mint();
                 let worker_generation = self.generations.get(&session).copied().unwrap_or_default();

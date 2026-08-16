@@ -495,11 +495,18 @@ fn enter_reroots_esc_walks_up_and_out() {
         "the children are the rows: {drilled}"
     );
 
-    // ⏎ on a leaf drills nowhere — the refusal is honest.
+    // ⏎ on a leaf opens its DETAIL frame (owner 2026-08-16) — the drill
+    // stack itself never re-roots on a leaf.
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.fleet.stack.len(), 1, "a leaf never re-roots");
+    assert!(
+        model.fleet.detail.is_some(),
+        "a leaf opens its detail frame"
+    );
 
-    // esc walks UP one level, then OUT from the root.
+    // esc closes the detail, walks UP one level, then OUT from the root.
+    model.handle(key(KeyCode::Esc));
+    assert!(model.fleet.detail.is_none(), "first esc closes the detail");
     model.handle(key(KeyCode::Esc));
     assert!(model.fleet.stack.is_empty(), "esc pops one drill level");
     assert_eq!(model.screen, Screen::Fleet);
@@ -775,4 +782,59 @@ fn stale_reply_for_another_session_installs_nothing() {
         model.fleet.snapshot.is_none(),
         "a snapshot for a session no longer attached installs nothing"
     );
+}
+
+// ------------------------------------------------ member detail (owner) ----
+
+/// LAW (owner 2026-08-16, fleet member detail): ⏎ on a LEAF opens the
+/// member's DETAIL frame — identity + a workflow section fed by the
+/// member's own child-graph answer (honestly empty for ad-hoc members) +
+/// the transcript door — and esc closes the detail BEFORE popping the
+/// drill stack.
+///
+/// MUTATION CHECK: restore the leaf refusal in `fleet_drill` (or drop the
+/// detail branch in `render_fleet`, or the session-tag guard in
+/// `apply_graph_status`). Expected RUNTIME failure: the detail never
+/// opens, the workflow section never fills, or esc skips a level.
+#[test]
+fn leaf_enter_opens_member_detail_with_workflow_and_esc_backs_out() {
+    use haider_tui::app::{AppRequest, RuntimeMode};
+
+    let leaf = node(
+        "solo",
+        "prune-25",
+        "trim the pool",
+        1,
+        FleetAgentStateWire::Done,
+        Vec::new(),
+    );
+    let mut model = fleet_model(snapshot(vec![leaf], false));
+    model.mode = RuntimeMode::Live; // the detail issues the live graph read
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(
+        model.fleet.detail.as_ref().map(|agent| agent.as_str()),
+        Some("solo"),
+        "a leaf ⏎ opens the detail frame"
+    );
+    assert!(
+        matches!(
+            model.requests.last(),
+            Some(AppRequest::FleetMemberGraph { session }) if session.as_str() == "child-solo"
+        ),
+        "the detail asks for the member's OWN graph"
+    );
+    let page = draw_rows(&model, 100, 32).join("\n");
+    assert!(page.contains("prune-25"), "{page}");
+    assert!(page.contains("reading the member's graph"), "{page}");
+
+    // The honest no-workflow answer fills the section (session-tagged).
+    model.apply_graph_status(&SessionId::new("child-solo"), None);
+    let page = draw_rows(&model, 100, 32).join("\n");
+    assert!(page.contains("no personal workflow"), "{page}");
+    assert!(page.contains("transcript"), "{page}");
+
+    // esc: the detail closes FIRST — the fleet level survives.
+    model.handle(key(KeyCode::Esc));
+    assert!(model.fleet.detail.is_none(), "first esc closes the detail");
+    assert_eq!(model.screen, Screen::Fleet, "still on the fleet surface");
 }

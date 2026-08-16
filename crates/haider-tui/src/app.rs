@@ -2192,6 +2192,9 @@ pub enum AppRequest {
     /// Owner 2026-08-16 (manual retry): re-run a terminal-failed session's
     /// last user turn — receipt-backed `run.retry`, no new user message.
     RunRetry { session: SessionId },
+    /// Owner 2026-08-16 (fleet member detail): read the DETAIL member's own
+    /// child-graph status for its workflow section.
+    FleetMemberGraph { session: SessionId },
     /// CG-M1: receipt-backed pin of the built-in ship-loop for the active
     /// session (`/graph pin`). The driver mints the command id + worker
     /// generation; nothing is installed until the daemon's fact arrives.
@@ -4625,7 +4628,7 @@ impl AppModel {
     }
 
     /// The agent at the current selection, in the current density's order.
-    fn fleet_selected_agent(&self) -> Option<(haider_protocol::ids::AgentId, bool)> {
+    fn fleet_selected_agent(&self) -> Option<(haider_protocol::ids::AgentId, SessionId, bool)> {
         let snapshot = self.fleet.snapshot.as_ref()?;
         let (level, _) = crate::fleet::resolve(snapshot, &self.fleet.stack);
         let (_, density) = self.fleet_nav()?;
@@ -4633,17 +4636,27 @@ impl AppModel {
             crate::fleet::Density::List => crate::fleet::flatten(level).get(self.fleet.sel)?.node,
             crate::fleet::Density::Grid => level.get(self.fleet.sel)?,
         };
-        Some((node.agent_id.clone(), !node.children.is_empty()))
+        Some((
+            node.agent_id.clone(),
+            node.session_id.clone(),
+            !node.children.is_empty(),
+        ))
     }
 
-    /// ⏎ — re-root on the selected subtree. A leaf drills nowhere (slice 1
-    /// has no agent-detail frame); the refusal is honest and quiet.
+    /// ⏎ — re-root on the selected subtree; a LEAF opens its DETAIL frame
+    /// (owner 2026-08-16: transcript + the member's own dynamically-made
+    /// workflow) and asks the daemon for the member's child-graph status.
     fn fleet_drill(&mut self) {
-        let Some((agent, has_children)) = self.fleet_selected_agent() else {
+        let Some((agent, session, has_children)) = self.fleet_selected_agent() else {
             return;
         };
         if !has_children {
-            self.flash = Some("· no children — nothing to drill into".to_owned());
+            self.fleet.detail = Some(agent);
+            self.fleet.detail_graph = None;
+            if self.mode == RuntimeMode::Live {
+                self.requests.push(AppRequest::FleetMemberGraph { session });
+            }
+            self.dirty = true;
             return;
         }
         self.fleet.stack.push(agent);
@@ -4677,12 +4690,37 @@ impl AppModel {
         let page = isize::try_from(self.fleet.page_rows.get().max(1)).unwrap_or(1);
         match code {
             KeyCode::Esc => {
-                if self.fleet.stack.pop().is_none() {
+                // The detail frame closes FIRST — esc walks back out the
+                // way it came (detail → level → parent level → session).
+                if self.fleet.detail.take().is_some() {
+                    self.fleet.detail_graph = None;
+                    self.dirty = true;
+                } else if self.fleet.stack.pop().is_none() {
                     self.switch_surface(Screen::Session);
                 }
                 self.fleet.sel = 0;
             }
-            KeyCode::Enter => self.fleet_drill(),
+            KeyCode::Enter => {
+                // From a member's detail frame, ⏎ opens the FULL transcript
+                // (the chip view) when this member is one of the active
+                // session's own chips; deeper/foreign members keep the
+                // honest flash.
+                if let Some(agent) = self.fleet.detail.clone() {
+                    if find_chip(&self.chips, agent.as_str()).is_some() {
+                        self.view_path = vec![agent.as_str().to_owned()];
+                        self.screen = Screen::Subagent;
+                        self.dirty = true;
+                    } else {
+                        self.flash = Some(
+                            "· transcript lives on the member's own session — attach to view"
+                                .to_owned(),
+                        );
+                        self.dirty = true;
+                    }
+                } else {
+                    self.fleet_drill();
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => self.fleet_move(-stride),
             KeyCode::Down | KeyCode::Char('j') => self.fleet_move(stride),
             KeyCode::Left if grid => self.fleet_move(-1),
@@ -4786,6 +4824,25 @@ impl AppModel {
         session_id: &haider_protocol::ids::SessionId,
         status: Option<haider_protocol::graph::GraphStatus>,
     ) {
+        // Owner 2026-08-16 (fleet member detail): a graph answer for the
+        // OPEN detail member's session fills the member's workflow section
+        // — session-tagged, so a since-closed detail installs nothing.
+        if let Some(detail) = &self.fleet.detail {
+            let member_session = self.fleet.snapshot.as_ref().and_then(|snapshot| {
+                let (_, path) = crate::fleet::resolve(snapshot, &self.fleet.stack);
+                let level = path
+                    .last()
+                    .map_or(snapshot.roots.as_slice(), |node| node.children.as_slice());
+                crate::fleet::flatten(level)
+                    .into_iter()
+                    .find(|row| &row.node.agent_id == detail)
+                    .map(|row| row.node.session_id.clone())
+            });
+            if member_session.as_ref() == Some(session_id) {
+                self.fleet.detail_graph = Some((session_id.clone(), status.clone()));
+                self.dirty = true;
+            }
+        }
         if self
             .active_session
             .as_ref()

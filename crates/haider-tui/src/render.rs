@@ -5364,6 +5364,89 @@ fn render_fleet(
         return;
     };
     let (level, _path) = resolved.unwrap_or((&[], Vec::new()));
+
+    // Owner 2026-08-16: the MEMBER DETAIL frame — a leaf's own page:
+    // identity + metrics, the member's OWN workflow (its dynamically-made
+    // child graph, honestly empty when it ran ad-hoc), and the transcript
+    // door (⏎ opens the chip view for the active session's own chips).
+    if let Some(detail) = &view.detail {
+        let node = fleet::flatten(level)
+            .into_iter()
+            .find(|row| &row.node.agent_id == detail)
+            .map(|row| row.node);
+        crumbs.push(Span::styled(" › ", theme.faint_style()));
+        crumbs.push(Span::styled(
+            node.map(fleet::callsign).unwrap_or("member").to_owned(),
+            theme.bright_style().add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(crumbs));
+        lines.push(Line::raw(""));
+        match node {
+            None => lines.push(Line::styled(
+                "member left the fleet — esc back",
+                theme.dim_style(),
+            )),
+            Some(node) => {
+                let glyph = fleet::state_glyph(node.state);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{glyph} "),
+                        fleet_glyph_style(theme, node.state, model.anim_phase),
+                    ),
+                    Span::styled(
+                        fleet::callsign(node).to_owned(),
+                        theme.bright_style().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" · {}", node.task), theme.text_style()),
+                ]));
+                let metric = fleet::node_metric(node);
+                if !metric.is_empty() {
+                    lines.push(Line::styled(format!("  {metric}"), theme.dim_style()));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("workflow", theme.gold_style()));
+                match &view.detail_graph {
+                    None => lines.push(Line::styled(
+                        "  reading the member's graph…",
+                        theme.dim_style(),
+                    )),
+                    Some((_, None)) => lines.push(Line::styled(
+                        "  no personal workflow — this member ran ad-hoc",
+                        theme.dim_style(),
+                    )),
+                    Some((_, Some(status))) => lines.push(Line::from(vec![
+                        Span::styled(format!("  {} ", status.template), theme.bright_style()),
+                        Span::styled(format!("· {:?}", status.phase), theme.dim_style()),
+                        Span::styled(
+                            status
+                                .current_node
+                                .as_ref()
+                                .map(|at| format!(" · at {}", at.as_str()))
+                                .unwrap_or_default(),
+                            theme.gold_style(),
+                        ),
+                    ])),
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("transcript", theme.gold_style()));
+                if crate::app::find_chip(&model.chips, node.agent_id.as_str()).is_some() {
+                    lines.push(Line::styled(
+                        "  ⏎ open the full transcript (chip view)",
+                        theme.dim_style(),
+                    ));
+                } else {
+                    lines.push(Line::styled(
+                        "  lives on the member's own session — attach to view",
+                        theme.dim_style(),
+                    ));
+                }
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("esc back", theme.dim_style()));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
     let roll = fleet::rollup(level);
     let density = fleet::density(roll.total);
 
