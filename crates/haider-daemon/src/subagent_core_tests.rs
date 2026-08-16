@@ -2307,6 +2307,20 @@ async fn committed_child_progress_resets_the_stall_deadline() {
 /// parent) dies. A nudge is a question, not a sentence.
 #[tokio::test]
 async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
+    // Linux CI can defer both Tokio tasks past a 5ms nominal margin. Give the
+    // silent child two complete 25ms poll opportunities after its 35ms-style
+    // threshold, while retaining enough post-nudge room for the first
+    // recovered heartbeat. The 120ms heartbeat train still outlasts a mutant
+    // cancellation window measured from the nudge alone.
+    #[cfg(target_os = "linux")]
+    const STALL_DEADLINE: Duration = Duration::from_millis(100);
+    #[cfg(target_os = "linux")]
+    const INITIAL_SILENCE_MS: u64 = 175;
+    #[cfg(not(target_os = "linux"))]
+    const STALL_DEADLINE: Duration = Duration::from_millis(35);
+    #[cfg(not(target_os = "linux"))]
+    const INITIAL_SILENCE_MS: u64 = 65;
+
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let mut script = vec![
@@ -2318,11 +2332,12 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        // Silent past the 35ms deadline AND across a 25ms poll tick (the
-        // supervision grid samples at 25/50/75…; a shorter silence falls
-        // between polls and the nudge never fires) — then recovering
-        // INSIDE the post-nudge window, which is the whole point.
-        FakeStep::Delay { ms: 65 },
+        // Silent past the deadline AND across a complete 25ms poll tick; a
+        // shorter silence can fall between samples and never draw the nudge.
+        // Recovery still begins inside the post-nudge cancellation window.
+        FakeStep::Delay {
+            ms: INITIAL_SILENCE_MS,
+        },
     ];
     for index in 0..10 {
         script.push(FakeStep::EmitReasoning {
@@ -2358,7 +2373,7 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     ]);
     let provider = Arc::new(FakeProvider::new(script));
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
-    let delegation = DelegationHandle::with_stall_deadline(hub.clone(), Duration::from_millis(35));
+    let delegation = DelegationHandle::with_stall_deadline(hub.clone(), STALL_DEADLINE);
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {

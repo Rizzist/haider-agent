@@ -9685,8 +9685,7 @@ fn latest_main_timeline_failed_turn(
     };
     let (run_id, prompt_run_id) = retries
         .into_iter()
-        .filter(|(_, _, retried_user_seq)| *retried_user_seq == user_seq)
-        .last()
+        .rfind(|(_, _, retried_user_seq)| *retried_user_seq == user_seq)
         .map_or_else(
             || (user_run_id.clone(), user_run_id),
             |(retry_run_id, prompt_run_id, _)| (retry_run_id, prompt_run_id),

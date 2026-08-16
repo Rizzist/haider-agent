@@ -18,20 +18,29 @@ fn haider_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_haider"))
 }
 
-/// The sibling `haiderd` next to the `haider` under test — built on demand
-/// when this test crate is run in isolation (a full workspace test build
-/// already produced it).
+/// The sibling `haiderd` next to the `haider` under test — fingerprint-checked
+/// on Linux and built on demand elsewhere when this test crate runs alone.
 fn ensure_haiderd_built() -> PathBuf {
     static BUILD: std::sync::Once = std::sync::Once::new();
     let sibling = haider_binary()
         .parent()
         .expect("haider binary has a parent directory")
         .join("haiderd");
-    if !sibling.exists() {
+    // A persistent Linux target directory can contain a sibling built from
+    // older sources even though this package's test artifacts are current.
+    // Enter Cargo's fingerprint/build lock once on Linux instead of trusting
+    // existence alone; this also prevents another integration-test process
+    // from replacing `haiderd` while this suite starts it. Non-Linux retains
+    // the historical existence-only behavior.
+    if cfg!(target_os = "linux") || !sibling.exists() {
         BUILD.call_once(|| {
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let status = Command::new(cargo)
-                .args(["build", "-p", "haider-daemond", "--bin", "haiderd"])
+            let mut command = Command::new(cargo);
+            command.arg("build");
+            #[cfg(target_os = "linux")]
+            command.arg("--locked");
+            let status = command
+                .args(["-p", "haider-daemond", "--bin", "haiderd"])
                 .status()
                 .expect("build haiderd for auto-spawn tests");
             assert!(status.success(), "haiderd build failed");
