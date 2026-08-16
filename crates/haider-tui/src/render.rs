@@ -3241,11 +3241,13 @@ fn render_session(
     let meters_fit = area.height >= 16;
     let throughput_readout = model.throughput_pill().filter(|_| meters_fit);
     let mut throughput_height = u16::from(throughput_readout.is_some());
-    // Owner 2026-08-16 (manual retry): an ACTIONABLE recovery row when the
-    // last run terminal-failed and the daemon serves run.retry — click (or
-    // /retry) re-runs the SAME turn. Outranks the throughput meter.
+    // Owner 2026-08-16/17 (manual retry): an ACTIONABLE recovery row when
+    // the last run terminal-failed OR the run is mid-BACKOFF (the daemon's
+    // wake seam short-circuits the remaining delay) — click (or /retry)
+    // re-runs / fires the next attempt NOW. Outranks the throughput meter.
+    let retry_backoff = model.projection.retrying().is_some();
     let retry_row = meters_fit
-        && model.projection.run_errored()
+        && (model.projection.run_errored() || retry_backoff)
         && model.daemon_serves(haider_rpc::FEATURE_RUN_RETRY_V1);
     let mut retry_height = u16::from(retry_row);
     let mut todos_height = model
@@ -3828,14 +3830,22 @@ fn render_session(
                 retry_area,
             );
         } else {
+            let (message, ink) = if retry_backoff {
+                (
+                    " retrying automatically — click to retry NOW",
+                    theme.gold_style(),
+                )
+            } else {
+                (
+                    " run failed — click to retry the same turn",
+                    theme.err_style(),
+                )
+            };
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw(" "),
                     Span::styled("↻", theme.gold_style()),
-                    Span::styled(
-                        " run failed — click to retry the same turn",
-                        theme.err_style(),
-                    ),
+                    Span::styled(message, ink),
                     Span::styled(" · /retry", theme.dim_style()),
                 ])),
                 retry_area,

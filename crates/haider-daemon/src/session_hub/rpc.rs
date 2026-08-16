@@ -5191,6 +5191,7 @@ impl HubConnection {
                 None,
             );
         }
+        let wake_command_id = command_id.0.clone();
         let request_json = serde_json::to_string(&serde_json::json!({
             "session_id": &session_id,
             "worker_generation": worker_generation,
@@ -5232,14 +5233,25 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
-        // Same-command receipt replay may follow a transient manager handoff
-        // failure. Re-submitting the SAME run is safe: supervisor admission
-        // deduplicates by durable run id, while a distinct command cannot
-        // pass the store's atomic live-run gate.
-        if accepted.worker_generation == self.hub.inner.store.worker_generation()
-            && let Err(error) = self.hub.worker_manager()?.retry(accepted.clone()).await
-        {
-            return self.respond_turn_error(request_id, error);
+        if accepted.worker_generation == self.hub.inner.store.worker_generation() {
+            let handoff = if accepted.backoff_event_id.is_some() {
+                // Receipt replay delivers the same command/event pair. Core
+                // consumes that pair once; if the natural timer already won,
+                // the handoff is a fulfilled idempotent no-op.
+                self.hub
+                    .worker_manager()?
+                    .wake_retry(&accepted, wake_command_id)
+                    .await
+            } else {
+                // Same-command terminal-failure receipt replay may follow a
+                // transient manager handoff failure. Re-submitting the SAME
+                // fresh run is safe: supervisor admission deduplicates by its
+                // durable run id.
+                self.hub.worker_manager()?.retry(accepted.clone()).await
+            };
+            if let Err(error) = handoff {
+                return self.respond_turn_error(request_id, error);
+            }
         }
         self.send(WireFrame::Response {
             request_id,

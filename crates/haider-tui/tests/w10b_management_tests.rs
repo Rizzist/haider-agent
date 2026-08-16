@@ -474,3 +474,45 @@ fn live_chips_claim_roster_callsigns_when_the_wire_sends_none() {
     );
     assert!(!chip.hon.is_empty(), "the honorific pairs with the claim");
 }
+
+/// LAW (owner 2026-08-17, mid-backoff manual retry): while the run is
+/// RETRYING (auto-backoff), `/retry` issues the same durable `run.retry`
+/// — the daemon's wake seam fires the next attempt NOW — instead of the
+/// idle refusal flash.
+///
+/// MUTATION CHECK: restore the errored-only gate in `issue_run_retry`.
+/// Expected RUNTIME failure: mid-backoff `/retry` flashes "did not fail"
+/// and no RunRetry request is issued below.
+#[test]
+fn mid_backoff_retry_issues_the_wake_command() {
+    use common::run_slash;
+    use haider_protocol::ids::SessionId;
+    use haider_protocol::state::RunState;
+
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_RUN_RETRY_V1.to_owned());
+    model.upsert_live_session(&SessionId::new("s-backoff"));
+    model.open_session(&SessionId::new("s-backoff"));
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::RunState(
+        RunState::Retrying {
+            attempt: 3,
+            max: 10,
+            delay_ms: 8_000,
+            reason: haider_protocol::state::WaitReason::Other {
+                tag: "ECONNRESET".to_owned(),
+            },
+        },
+    ))));
+    model.requests.clear();
+    run_slash(&mut model, "/retry");
+    assert!(
+        matches!(
+            model.requests.last(),
+            Some(AppRequest::RunRetry { session }) if session.as_str() == "s-backoff"
+        ),
+        "mid-backoff /retry sends the wake: {:?}",
+        model.requests
+    );
+}

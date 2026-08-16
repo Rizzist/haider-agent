@@ -902,6 +902,12 @@ pub struct AcceptedRunRetry {
     pub user_seq: u64,
     pub accepted_seq: u64,
     pub worker_generation: u64,
+    /// Present when the receipt accepts a wake of this exact durable
+    /// `Retrying` fact instead of minting a fresh terminal-failure run.
+    /// Event identity (rather than attempt number) prevents a delayed receipt
+    /// replay from waking a later provider request's new backoff ladder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_event_id: Option<EventId>,
 }
 
 /// Result of the atomic manual-retry acceptance transaction.
@@ -5071,19 +5077,94 @@ impl Store {
         if states.contains_key(&command.run_id) {
             return Err(corrupt("daemon-minted retry run id already exists"));
         }
+        // Queued turns may have newer state sequences than the worker's one
+        // active run. Find an eligible main-timeline backoff across ALL
+        // nonterminal run heads before applying the generic newest-live-run
+        // refusal, so queued work cannot shadow the wait that `run.retry`
+        // exists to wake.
+        let mut eligible_backoff = None;
+        for (run_id, (_, state_seq, _)) in states
+            .iter()
+            .filter(|(_, (state, _, _))| matches!(state, RunState::Retrying { .. }))
+        {
+            let Some(backoff_event_id) = main_timeline_retrying_event_id(
+                &transaction,
+                &command.session_id,
+                run_id,
+                *state_seq,
+            )?
+            else {
+                continue;
+            };
+            let Some((prompt_run_id, user_seq)) =
+                main_timeline_run_prompt_source(&transaction, &command.session_id, run_id)?
+            else {
+                continue;
+            };
+            if eligible_backoff
+                .as_ref()
+                .is_some_and(|(_, accepted_seq, _, _, _)| accepted_seq >= state_seq)
+            {
+                continue;
+            }
+            eligible_backoff = Some((
+                run_id.clone(),
+                *state_seq,
+                backoff_event_id,
+                prompt_run_id,
+                user_seq,
+            ));
+        }
+        if let Some((run_id, state_seq, backoff_event_id, prompt_run_id, user_seq)) =
+            eligible_backoff
+        {
+            let now = now_ms()?;
+            claim_pending_receipt(
+                &transaction,
+                &command.command_id,
+                "run.retry",
+                &command.request_digest,
+                &command.request_json,
+                now,
+            )?;
+            let accepted = AcceptedRunRetry {
+                session_id: command.session_id.clone(),
+                run_id: run_id.clone(),
+                failed_run_id: run_id,
+                prompt_run_id,
+                user_seq,
+                accepted_seq: state_seq,
+                worker_generation: self.worker_generation,
+                backoff_event_id: Some(backoff_event_id),
+            };
+            finalize_command_receipt(
+                &transaction,
+                &command.command_id,
+                command.session_id.as_str(),
+                Some(accepted.run_id.as_str()),
+                Some(accepted.accepted_seq),
+                &accepted,
+                now,
+                "run-retry",
+            )?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(RunRetryOutcome::Committed {
+                accepted,
+                envelopes: Vec::new(),
+            });
+        }
         if let Some((run_id, (state, _, _))) = states
             .iter()
             .filter(|(_, (state, _, _))| !state.is_terminal())
             .max_by_key(|(_, (_, seq, _))| *seq)
         {
-            let message = if matches!(state, RunState::Retrying { .. }) {
-                format!("run retry refused: run {run_id} is already retrying automatically")
-            } else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
                 format!(
-                    "run retry requires a terminal-failed session; run {run_id} is still live ({state:?})"
-                )
-            };
-            return Err(store_error(ErrorCode::InvalidArgument, message, false));
+                    "run retry requires a terminal-failed session or main-timeline provider backoff; run {run_id} is still live ({state:?})"
+                ),
+                false,
+            ));
         }
         let Some((failed_run_id, prompt_run_id, user_seq)) =
             latest_main_timeline_failed_turn(&transaction, &command.session_id)?
@@ -5157,6 +5238,7 @@ impl Store {
             user_seq,
             accepted_seq: envelopes[1].seq,
             worker_generation: self.worker_generation,
+            backoff_event_id: None,
         };
         finalize_command_receipt(
             &transaction,
@@ -9624,6 +9706,93 @@ fn latest_run_states(
         }
     }
     Ok(states)
+}
+
+/// Resolves the exact main-timeline `Retrying` event currently named by the
+/// run-state reduction. Returning `None` keeps branch/agent backoffs outside
+/// the main-session `run.retry` command family.
+fn main_timeline_retrying_event_id(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+    state_seq: u64,
+) -> StoreResult<Option<EventId>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1 AND seq = ?2",
+        )
+        .map_err(map_sqlite_error)?;
+    let stored_seq = i64::try_from(state_seq)
+        .map_err(|_| corrupt("event sequence exceeds SQLite INTEGER range"))?;
+    let Some(json) = statement
+        .query_row(rusqlite::params![session_id.as_str(), stored_seq], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(map_sqlite_error)?
+    else {
+        return Ok(None);
+    };
+    let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        corrupt(format!(
+            "invalid envelope JSON for session {session_id}, seq {state_seq}: {error}"
+        ))
+    })?;
+    let main_timeline = envelope.branch_id.is_none() && envelope.agent_id.is_none();
+    let exact_run = envelope.run_id.as_ref() == Some(run_id);
+    let retrying = serde_json::from_value::<EventPayload>(envelope.payload)
+        .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Retrying { .. })));
+    Ok((main_timeline && exact_run && retrying).then_some(envelope.event_id))
+}
+
+/// Finds the immutable user/prompt source for one main-timeline run. Ordinary
+/// runs own their `UserMessage`; fresh manual-retry runs own a `RunRetried`
+/// fact that points back to the original prompt ancestry.
+fn main_timeline_run_prompt_source(
+    connection: &Connection,
+    session_id: &SessionId,
+    target_run_id: &RunId,
+) -> StoreResult<Option<(RunId, u64)>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json FROM events
+             WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut source = None;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
+        let json: String = row.get(1).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+            ))
+        })?;
+        if envelope.run_id.as_ref() != Some(target_run_id)
+            || envelope.branch_id.is_some()
+            || envelope.agent_id.is_some()
+        {
+            continue;
+        }
+        let payload = envelope.payload;
+        if serde_json::from_value::<EventPayload>(payload.clone())
+            .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
+        {
+            source = Some((target_run_id.clone(), seq));
+        } else if let Ok(RunRetryEventPayload::RunRetried {
+            prompt_run_id,
+            user_seq,
+            ..
+        }) = RunRetryEventPayload::from_payload_value(payload)
+        {
+            source = Some((prompt_run_id, user_seq));
+        }
+    }
+    Ok(source)
 }
 
 /// Returns the latest main-timeline user coordinate only when that exact

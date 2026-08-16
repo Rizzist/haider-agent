@@ -221,7 +221,8 @@ pub const ERROR_CODE_GRAPH_WRONG_NODE: &str = "graph_wrong_node";
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 /// Daemon implements durable submit/cancel turn control.
 pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
-/// Daemon implements receipt-backed terminal-failure retry (`run.retry`).
+/// Daemon implements receipt-backed terminal-failure and backoff-wake retry
+/// (`run.retry`).
 pub const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 /// Daemon implements durable idle-only context compaction.
 pub const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
@@ -1348,9 +1349,9 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
-    /// Starts a fresh run from the latest failed main-timeline user turn.
-    /// No new `UserMessage` is committed. Mid-backoff automatic retries are
-    /// refused rather than creating a second run.
+    /// Starts a fresh run from the latest failed main-timeline user turn, or
+    /// wakes the exact current automatic provider backoff. No new
+    /// `UserMessage` is committed in either case.
     #[serde(rename = "run.retry")]
     RunRetry {
         command_id: CommandId,
@@ -1794,9 +1795,10 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
     },
-    /// Durable coordinates of a fresh manual retry run. `failed_run_id` and
-    /// `user_seq` identify the reused turn; `accepted_seq` is the committed
-    /// `run_retried` fact for the new run.
+    /// Durable coordinates of manual retry acceptance. For terminal failure,
+    /// `run_id` is fresh and `accepted_seq` names its committed `run_retried`
+    /// fact. During provider backoff, `run_id == failed_run_id` and
+    /// `accepted_seq` names the existing `Retrying` fact being woken.
     #[serde(rename = "run.retry")]
     RunRetry {
         session_id: SessionId,

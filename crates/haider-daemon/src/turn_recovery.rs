@@ -204,6 +204,7 @@ pub(crate) async fn recover_interrupted_turns(
                         user_seq,
                         accepted_seq,
                         worker_generation: store.worker_generation(),
+                        backoff_event_id: None,
                     }));
                 }
                 continue;

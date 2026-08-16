@@ -785,6 +785,13 @@ enum ManagerCommand {
         accepted: AcceptedRunRetry,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
+    WakeRetry {
+        session_id: SessionId,
+        run_id: RunId,
+        retrying_event_id: EventId,
+        command_id: String,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     Recover {
         pending: Box<PendingTurn>,
     },
@@ -814,6 +821,12 @@ enum ManagerCommand {
 
 enum SupervisorCommand {
     Submit(Box<PendingTurn>),
+    WakeRetry {
+        run_id: RunId,
+        retrying_event_id: EventId,
+        command_id: String,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     Nudge {
         run_id: RunId,
         accepted_seq: u64,
@@ -1032,6 +1045,40 @@ impl WorkerManagerHandle {
             self.commands
                 .try_send(ManagerCommand::Retry {
                     accepted,
+                    completed,
+                })
+                .map_err(manager_try_send)?;
+        }
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    /// Delivers a receipt-backed wake to the exact durable provider backoff.
+    /// A missing/already-finished active turn is success: the attempt won the
+    /// race naturally, so replay is an idempotent response-only no-op.
+    pub(crate) async fn wake_retry(
+        &self,
+        accepted: &AcceptedRunRetry,
+        command_id: String,
+    ) -> Result<(), HaiderError> {
+        let retrying_event_id = accepted.backoff_event_id.clone().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "backoff-wake receipt has no retrying event id",
+                false,
+            )
+        })?;
+        let (completed, response) = oneshot::channel();
+        {
+            let open = self.admission.lock().map_err(|_| manager_stopped())?;
+            if !*open {
+                return Err(manager_busy("worker admission is draining"));
+            }
+            self.commands
+                .try_send(ManagerCommand::WakeRetry {
+                    session_id: accepted.session_id.clone(),
+                    run_id: accepted.run_id.clone(),
+                    retrying_event_id,
+                    command_id,
                     completed,
                 })
                 .map_err(manager_try_send)?;
@@ -1306,6 +1353,37 @@ async fn run_manager(
                     Err(error) => Err(error),
                 };
                 let _ = completed.send(result);
+            }
+            ManagerCommand::WakeRetry {
+                session_id,
+                run_id,
+                retrying_event_id,
+                command_id,
+                completed,
+            } => {
+                if let Some(supervisor) = supervisors.get(&session_id) {
+                    if let Err(error) = supervisor.sender.try_send(SupervisorCommand::WakeRetry {
+                        run_id,
+                        retrying_event_id,
+                        command_id,
+                        completed,
+                    }) {
+                        let (completed, error) = match error {
+                            mpsc::error::TrySendError::Full(SupervisorCommand::WakeRetry {
+                                completed,
+                                ..
+                            }) => (completed, manager_busy("session worker queue is full")),
+                            mpsc::error::TrySendError::Closed(SupervisorCommand::WakeRetry {
+                                completed,
+                                ..
+                            }) => (completed, manager_stopped()),
+                            _ => unreachable!(),
+                        };
+                        let _ = completed.send(Err(error));
+                    }
+                } else {
+                    let _ = completed.send(Ok(()));
+                }
             }
             ManagerCommand::Recover { mut pending } => {
                 let session_id = pending.accepted.session_id.clone();
@@ -2115,6 +2193,22 @@ async fn run_supervisor(
                                 *pending,
                             ).await;
                         }
+                        Some(SupervisorCommand::WakeRetry {
+                            run_id,
+                            retrying_event_id,
+                            command_id,
+                            completed,
+                        }) => {
+                            if run_id == active_run {
+                                let _ = turn
+                                    .harness
+                                    .wake_provider_retry(command_id, &retrying_event_id);
+                            }
+                            // A natural timer/attempt/terminal transition may
+                            // have won after durable receipt acceptance. That
+                            // is the fulfilled idempotent no-op case.
+                            let _ = completed.send(Ok(()));
+                        }
                         Some(SupervisorCommand::Nudge {
                             run_id,
                             accepted_seq,
@@ -2416,6 +2510,11 @@ async fn run_supervisor(
                             None,
                             *pending,
                         ).await;
+                    }
+                    Some(SupervisorCommand::WakeRetry { completed, .. }) => {
+                        // The backoff ended between receipt commit and worker
+                        // delivery. Never create/restart a run here.
+                        let _ = completed.send(Ok(()));
                     }
                     Some(SupervisorCommand::Nudge { completed, .. }) => {
                         let _ = completed.send(Err(HaiderError::new(

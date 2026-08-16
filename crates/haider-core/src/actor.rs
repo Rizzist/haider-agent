@@ -68,10 +68,11 @@ use haider_provider::{
     ToolDefinition, TurnRequest, canonical_tool_definitions_digest,
 };
 use haider_tools::{RequestInput, TodoWrite};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use std::sync::{Mutex, PoisonError};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
 const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
@@ -654,6 +655,7 @@ pub struct HarnessHandle {
     events: broadcast::Sender<RawEnvelope>,
     state: watch::Receiver<Option<RunState>>,
     committed_menus: watch::Sender<Option<RawEnvelope>>,
+    provider_retry_wake: Arc<ProviderRetryWake>,
 }
 
 impl HarnessHandle {
@@ -818,6 +820,22 @@ impl HarnessHandle {
     pub fn state_receiver(&self) -> watch::Receiver<Option<RunState>> {
         self.state.clone()
     }
+
+    /// Short-circuits the exact durable provider backoff named by
+    /// `retrying_event_id`. The command id is consumed once for the lifetime
+    /// of this actor, so receipt replay is an idempotent no-op and cannot wake
+    /// a later retry ladder that happens to show the same attempt number.
+    ///
+    /// Returns `true` only when this call changed the armed wait to fired.
+    #[must_use]
+    pub fn wake_provider_retry(
+        &self,
+        command_id: impl Into<String>,
+        retrying_event_id: &EventId,
+    ) -> bool {
+        self.provider_retry_wake
+            .wake(command_id.into(), retrying_event_id)
+    }
 }
 
 enum ActorCommand {
@@ -851,6 +869,81 @@ enum MenuWake {
     Committed(RawEnvelope),
 }
 
+/// One actor-owned provider-backoff wake latch.
+///
+/// `Notify` supplies the pending-future wake edge, while the mutex state is
+/// the source of truth: it retains a wake that arrives before the future is
+/// first polled, coalesces distinct commands for one backoff, and remembers
+/// command ids across later backoffs so receipt replay cannot fire twice.
+#[derive(Debug, Default)]
+struct ProviderRetryWake {
+    state: Mutex<ProviderRetryWakeState>,
+    notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct ProviderRetryWakeState {
+    armed_event_id: Option<EventId>,
+    fired: bool,
+    consumed_commands: HashSet<String>,
+}
+
+impl ProviderRetryWake {
+    fn state(&self) -> std::sync::MutexGuard<'_, ProviderRetryWakeState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn arm(&self, retrying_event_id: EventId) {
+        let mut state = self.state();
+        debug_assert!(state.armed_event_id.is_none());
+        state.armed_event_id = Some(retrying_event_id);
+        state.fired = false;
+    }
+
+    fn wake(&self, command_id: String, retrying_event_id: &EventId) -> bool {
+        let fired = {
+            let mut state = self.state();
+            if !state.consumed_commands.insert(command_id)
+                || state.armed_event_id.as_ref() != Some(retrying_event_id)
+                || state.fired
+            {
+                false
+            } else {
+                state.fired = true;
+                true
+            }
+        };
+        if fired {
+            self.notify.notify_one();
+        }
+        fired
+    }
+
+    async fn fired(&self, retrying_event_id: &EventId) {
+        loop {
+            // Register before inspecting the latch so a concurrent wake
+            // cannot fall between the predicate check and waiter creation.
+            let notified = self.notify.notified();
+            let fired = {
+                let state = self.state();
+                state.armed_event_id.as_ref() == Some(retrying_event_id) && state.fired
+            };
+            if fired {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn disarm(&self, retrying_event_id: &EventId) {
+        let mut state = self.state();
+        if state.armed_event_id.as_ref() == Some(retrying_event_id) {
+            state.armed_event_id = None;
+            state.fired = false;
+        }
+    }
+}
+
 /// Single-session, single-writer run loop.
 pub struct HarnessActor {
     config: HarnessConfig,
@@ -861,6 +954,7 @@ pub struct HarnessActor {
     events: broadcast::Sender<RawEnvelope>,
     state: watch::Sender<Option<RunState>>,
     committed_menus: watch::Receiver<Option<RawEnvelope>>,
+    provider_retry_wake: Arc<ProviderRetryWake>,
     next_run: u64,
     event_ids: Arc<EventIdGenerator>,
     /// Actor start instant (ms) — embedded in event ids for global uniqueness.
@@ -914,11 +1008,13 @@ impl HarnessActor {
         let (events, _) = broadcast::channel(config.broadcast_capacity.max(1));
         let (state, state_receiver) = watch::channel(None);
         let (committed_menus, committed_menu_receiver) = watch::channel(None);
+        let provider_retry_wake = Arc::new(ProviderRetryWake::default());
         let handle = HarnessHandle {
             commands: command_sender,
             events: events.clone(),
             state: state_receiver,
             committed_menus,
+            provider_retry_wake: Arc::clone(&provider_retry_wake),
         };
         (
             Self {
@@ -930,6 +1026,7 @@ impl HarnessActor {
                 events,
                 state,
                 committed_menus: committed_menu_receiver,
+                provider_retry_wake,
                 next_run: 0,
                 event_ids,
                 started_at_ms,
@@ -3024,27 +3121,43 @@ impl HarnessActor {
         let delay_ms = error
             .retry_after_ms
             .unwrap_or_else(|| retry_jittered_backoff_ms(run_id, failed_attempt));
-        self.commit_state(
-            run_id,
-            RunState::Retrying {
-                attempt: u32::try_from(failed_attempt.saturating_add(1)).unwrap_or(u32::MAX),
-                max: u32::try_from(MAX_API_RETRIES).unwrap_or(u32::MAX),
-                delay_ms,
-                reason,
-            },
-        )
-        .await
-        .map_err(DriveError::Store)?;
+        let retrying = RunState::Retrying {
+            attempt: u32::try_from(failed_attempt.saturating_add(1)).unwrap_or(u32::MAX),
+            max: u32::try_from(MAX_API_RETRIES).unwrap_or(u32::MAX),
+            delay_ms,
+            reason,
+        };
+        // Arm against the actor-minted event id BEFORE the append becomes
+        // visible. A daemon can therefore never observe this durable
+        // `Retrying` fact in the small gap before its wake seam exists.
+        let mut envelopes = [self
+            .uncommitted_envelope(
+                run_id,
+                EventPayload::RunState(retrying.clone()),
+                prompt_omit_render(),
+            )
+            .map_err(DriveError::Store)?];
+        let retrying_event_id = envelopes[0].event_id.clone();
+        let retry_wake = Arc::clone(&self.provider_retry_wake);
+        retry_wake.arm(retrying_event_id.clone());
+        if let Err(error) = self.store.append(&mut envelopes).await {
+            retry_wake.disarm(&retrying_event_id);
+            return Err(DriveError::Store(error));
+        }
+        let [committed] = envelopes;
+        let _ = self.events.send(committed);
+        self.state.send_replace(Some(retrying));
         // Clone the sleeper Arc into a local so the pinned backoff future
         // borrows IT, not `self` — the loop below services commands through
         // `&mut self` while the same sleep deadline is still pending.
         let sleeper = Arc::clone(&self.config.retry_sleeper);
         let sleep = sleeper.sleep(delay_ms);
         tokio::pin!(sleep);
-        loop {
+        let wait_result = loop {
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                () = cancel.cancelled() => break Err(DriveError::Cancelled),
+                () = retry_wake.fired(&retrying_event_id) => break Ok(()),
                 // L1: a Stop (or a closed command channel) during a long
                 // Retry-After backoff must not block shutdown for the full
                 // delay — treat it as a cancel. Other commands are serviced and
@@ -3052,11 +3165,11 @@ impl HarnessActor {
                 // never restarts.
                 command = self.commands.recv() => {
                     match command {
-                        None => return Err(DriveError::Cancelled),
+                        None => break Err(DriveError::Cancelled),
                         Some(ActorCommand::Stop { completed }) => {
                             cancel.cancel();
                             let _ = completed.send(());
-                            return Err(DriveError::Cancelled);
+                            break Err(DriveError::Cancelled);
                         }
                         Some(other) => {
                             self.service_command_without_menu(other);
@@ -3064,9 +3177,14 @@ impl HarnessActor {
                         }
                     }
                 }
-                () = &mut sleep => break,
+                () = &mut sleep => break Ok(()),
             }
-        }
+        };
+        // Disarm synchronously before any await. A wake racing the natural
+        // timer after the selected branch is therefore either the one winner
+        // above or an idempotent no-op; it can never schedule another try.
+        retry_wake.disarm(&retrying_event_id);
+        wait_result?;
         if cancel.is_cancelled() {
             return Err(DriveError::Cancelled);
         }
@@ -6183,6 +6301,34 @@ mod usage_tests {
         assert_eq!(cumulative.output, u64::MAX);
         assert_eq!(cumulative.reasoning, u64::MAX);
         assert_eq!(cumulative.cached, u64::MAX);
+    }
+
+    /// MUTATION CHECK: replace the predicate loop in `fired` with one
+    /// notification await. Expected runtime failure: the stored permit from
+    /// the first pre-poll wake resolves the newly armed second event.
+    #[tokio::test]
+    async fn provider_retry_wake_discards_a_stale_notify_permit_between_events() {
+        let wake = ProviderRetryWake::default();
+        let first = EventId::new("retrying-first");
+        wake.arm(first.clone());
+        assert!(wake.wake("wake-first".into(), &first));
+        // Constructing `fired` only after the wake makes its fast predicate
+        // path leave Notify's stored permit untouched.
+        wake.fired(&first).await;
+        wake.disarm(&first);
+
+        let second = EventId::new("retrying-second");
+        wake.arm(second.clone());
+        let pending = wake.fired(&second);
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            () = &mut pending => panic!("stale permit resolved a different retry event"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(wake.wake("wake-second".into(), &second));
+        pending.await;
+        wake.disarm(&second);
     }
 
     /// CM2a — no-op session configuration keeps system/tool/model/auth/

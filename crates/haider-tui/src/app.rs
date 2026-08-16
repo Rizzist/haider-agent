@@ -4870,7 +4870,11 @@ impl AppModel {
         if self.retry_inflight {
             return;
         }
-        if !self.projection.run_errored() {
+        // Owner 2026-08-17: mid-BACKOFF is retryable too — the daemon's
+        // wake seam short-circuits the remaining delay (same run.retry
+        // command; attempt numbering preserved). Only idle-never-failed
+        // keeps the honest refusal.
+        if !self.projection.run_errored() && self.projection.retrying().is_none() {
             self.flash = Some("· /retry — the last run did not fail".to_owned());
             self.dirty = true;
             return;
