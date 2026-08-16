@@ -112,14 +112,29 @@ impl Drop for DaemonGuard {
 fn assert_daemon_serves(profile: &ResolvedProfile) {
     let endpoint = profile.endpoint_path.clone();
     let expected_profile = profile.profile_id.clone();
+    let daemon_log = profile
+        .store_dir
+        .join(haider_client::spawn::DAEMON_LOG_FILE);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test runtime");
     runtime.block_on(async move {
-        let connected = haider_client::connect(&endpoint, haider_client::ClientConfig::default())
-            .await
-            .expect("daemon endpoint must be serving");
+        let connected =
+            match haider_client::connect(&endpoint, haider_client::ClientConfig::default()).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    // CI-as-debugger: the spawned daemon dies before serving on
+                    // some runners — surface ITS OWN log so the failure names
+                    // the startup error instead of a bare connect refusal.
+                    let log = std::fs::read_to_string(&daemon_log)
+                        .unwrap_or_else(|_| "<no daemon.log written>".to_owned());
+                    panic!(
+                        "daemon endpoint must be serving: {error:?}\n--- {} ---\n{log}",
+                        daemon_log.display()
+                    );
+                }
+            };
         assert_eq!(connected.welcome.profile_id, expected_profile);
         assert!(
             connected

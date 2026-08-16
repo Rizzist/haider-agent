@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use haider_rpc::haider_protocol::ids::{RunId, SessionId};
 use haider_rpc::{CommandId, FEATURE_RUN_RETRY_V1, RequestBody, ResponseBody};
 
