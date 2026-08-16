@@ -3234,13 +3234,19 @@ fn render_session(
     // directly above the composer band — persistent at rest (the last
     // turn's rate), fixed-width rolling spark. A meter is the lowest-
     // priority ambient row: it sheds before every map of live work.
-    let throughput_readout = model.throughput_pill();
+    // Height floor for the ambient meter rows: on a very short terminal the
+    // transcript's visible tail outranks a meter — at 90x10 the persistent
+    // throughput row consumed the row the streamed REPLY needed (the live
+    // probe caught it). /retry stays reachable as a command below the floor.
+    let meters_fit = area.height >= 16;
+    let throughput_readout = model.throughput_pill().filter(|_| meters_fit);
     let mut throughput_height = u16::from(throughput_readout.is_some());
     // Owner 2026-08-16 (manual retry): an ACTIONABLE recovery row when the
     // last run terminal-failed and the daemon serves run.retry — click (or
     // /retry) re-runs the SAME turn. Outranks the throughput meter.
-    let retry_row =
-        model.projection.run_errored() && model.daemon_serves(haider_rpc::FEATURE_RUN_RETRY_V1);
+    let retry_row = meters_fit
+        && model.projection.run_errored()
+        && model.daemon_serves(haider_rpc::FEATURE_RUN_RETRY_V1);
     let mut retry_height = u16::from(retry_row);
     let mut todos_height = model
         .projection
