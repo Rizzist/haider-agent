@@ -207,13 +207,11 @@ sticky = "SKIP" if tall else None
 if tall and "testcontainers" not in sub_paint:
     # Every DISTINCT printable run painted since boot — names the script
     # variant the runner actually played (byte tails only showed diffs).
+    # ONE line: the ladder tails only 25 lines of a failing probe's output,
+    # so a multi-line dump gets cut by the verdict booleans (round 14).
     _runs = re.findall(r"[ -~]{8,}", sub_paint)
-    _uniq = list(dict.fromkeys(_runs))[-120:]
-    sys.stderr.write(
-        "\n--- amber-miss text runs ---\n"
-        + "\n".join(_uniq)
-        + "\n--- end runs ---\n"
-    )
+    _uniq = list(dict.fromkeys(_runs))[-60:]
+    sys.stderr.write("AMBER-MISS RUNS: " + " │ ".join(_uniq) + "\n")
 probelib.verdict(
     "PTY_PROBE_SUB",
     out,
