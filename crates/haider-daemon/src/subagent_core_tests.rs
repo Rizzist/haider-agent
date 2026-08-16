@@ -2312,14 +2312,12 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     // threshold, while retaining enough post-nudge room for the first
     // recovered heartbeat. The 120ms heartbeat train still outlasts a mutant
     // cancellation window measured from the nudge alone.
-    #[cfg(target_os = "linux")]
+    // ONE generous timing envelope for every platform: a fast host satisfies
+    // the same margins a deferred-scheduling CI runner needs, and a single
+    // choreography can't drift green-on-one-OS/red-on-the-other (the cfg-split
+    // round did exactly that).
     const STALL_DEADLINE: Duration = Duration::from_millis(100);
-    #[cfg(target_os = "linux")]
     const INITIAL_SILENCE_MS: u64 = 175;
-    #[cfg(not(target_os = "linux"))]
-    const STALL_DEADLINE: Duration = Duration::from_millis(35);
-    #[cfg(not(target_os = "linux"))]
-    const INITIAL_SILENCE_MS: u64 = 65;
 
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");

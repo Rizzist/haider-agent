@@ -69,6 +69,12 @@ fn haider_command(store: &Path) -> Command {
     command
         .env("HAIDER_PROFILE_DIR", store)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // The harness resolves its expected endpoint with
+        // `xdg_runtime_dir: None`; the CHILD must agree. On CI Linux the
+        // runner exports XDG_RUNTIME_DIR=/run/user/NNN, so an inheriting
+        // daemon binds there while the test watches the fallback path — the
+        // round-4 daemon.log finally named this split.
+        .env_remove("XDG_RUNTIME_DIR")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

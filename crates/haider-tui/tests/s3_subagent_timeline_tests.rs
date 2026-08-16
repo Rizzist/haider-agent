@@ -271,6 +271,10 @@ fn chip_view_shows_steer_messages() {
 #[test]
 fn chip_header_names_manifest_handoff_directory() {
     let mut model = launcher_model();
+    // Deterministic device: a long CI-runner hostname shifts the header's
+    // `· handoff` segment past the fixed 120-col draw (the host-dependent
+    // pin class — inject, never inherit).
+    model.identity.device = "test-mac".to_owned();
     model.mode = RuntimeMode::Live;
     model.sessions.clear();
     model.upsert_live_session(&sid());
