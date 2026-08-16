@@ -30,8 +30,15 @@ def since(pre):
 
 pump(4.5)  # boot -> launcher (cold-build tolerant)
 os.write(fd, b"use two subagents to split this work\r")
-pump(18.0)  # parent turn + both child scripts up to their cards (cold,
-# loaded CI runners need ~2x the local pacing — round-9's amber miss)
+# Poll up to 45s for the amber card: the demo's beat chain (parent
+# preamble → child scripts → the question) runs 3-4x slower on cold CI
+# runners — the round-11 frame dump showed WAITING still ticking at 18s.
+# Fast hosts exit the loop in a few seconds; the check itself is unchanged.
+_card_deadline = time.time() + 45.0
+while time.time() < _card_deadline:
+    pump(1.0)
+    if "testcontainers" in since(0):
+        break
 sub_paint = since(0)
 # The tests chip is holding its amber ? — the parent turn is idle by now.
 pre = mark()
