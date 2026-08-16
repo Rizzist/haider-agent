@@ -28,7 +28,15 @@ def since(pre):
     return sink[0][pre:].decode("utf-8", "replace")
 
 
-pump(4.5)  # boot -> launcher (cold-build tolerant)
+# Poll until the composer is READY before typing: a fixed boot pump let a
+# cold CI runner swallow the prompt's leading characters, so the truncated
+# text parsed to a DIFFERENT demo script (one generic child, no amber card —
+# rounds 9-12). The composer placeholder is the readiness truth.
+_boot_deadline = time.time() + 30.0
+while time.time() < _boot_deadline:
+    pump(0.5)
+    if "message haider" in since(0):
+        break
 os.write(fd, b"use two subagents to split this work\r")
 # Poll up to 45s for the amber card: the demo's beat chain (parent
 # preamble → child scripts → the question) runs 3-4x slower on cold CI
