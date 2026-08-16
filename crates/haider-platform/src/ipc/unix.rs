@@ -24,6 +24,12 @@ struct SocketIdentity {
     inode: u64,
 }
 
+#[cfg(target_os = "linux")]
+type SocketAnchor = OwnedFd;
+
+#[cfg(not(target_os = "linux"))]
+struct SocketAnchor;
+
 /// A bound, permission-verified listener plus the cleanup guard for exactly
 /// the socket inode it created.
 pub struct BoundEndpoint {
@@ -50,13 +56,14 @@ impl BoundEndpoint {
         let staging_path = runtime_dir.join(&staging);
         let listener = UnixListener::bind(&staging_path)
             .map_err(|error| EndpointError::io("bind Unix socket", &staging_path, error))?;
-        let identity = match stage_and_publish(&directory, &staging, &name, owner_uid) {
-            Ok(identity) => identity,
-            Err(error) => {
-                let _ = rustix::fs::unlinkat(&directory, staging.as_str(), AtFlags::empty());
-                return Err(error);
-            }
-        };
+        let (identity, inode_anchor) =
+            match stage_and_publish(&directory, &staging, &name, owner_uid) {
+                Ok(published) => published,
+                Err(error) => {
+                    let _ = rustix::fs::unlinkat(&directory, staging.as_str(), AtFlags::empty());
+                    return Err(error);
+                }
+            };
         Ok(Self {
             listener: Some(listener),
             cleanup: SocketCleanup {
@@ -64,6 +71,7 @@ impl BoundEndpoint {
                 name,
                 path: socket_path,
                 identity,
+                _inode_anchor: inode_anchor,
                 active: true,
             },
             owner_uid,
@@ -109,6 +117,10 @@ struct SocketCleanup {
     name: String,
     path: PathBuf,
     identity: SocketIdentity,
+    // Linux can immediately recycle a Unix socket's inode after its pathname
+    // is replaced. Keep the staged inode referenced so the device/inode
+    // cleanup identity cannot suffer an ABA collision with its replacement.
+    _inode_anchor: SocketAnchor,
     active: bool,
 }
 
@@ -189,7 +201,7 @@ fn stage_and_publish(
     staging: &str,
     name: &str,
     owner_uid: u32,
-) -> Result<SocketIdentity, EndpointError> {
+) -> Result<(SocketIdentity, SocketAnchor), EndpointError> {
     let stat =
         rustix::fs::statat(directory, staging, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
             EndpointError::io("lstat bound socket", Path::new(staging), error.into())
@@ -206,8 +218,53 @@ fn stage_and_publish(
         AtFlags::empty(),
     )
     .map_err(|error| EndpointError::io("chmod Unix socket", Path::new(staging), error.into()))?;
+    let identity = identity_of(&stat);
+    let inode_anchor = anchor_socket(directory, staging, identity)?;
     publish(directory, staging, name)?;
-    Ok(identity_of(&stat))
+    Ok((identity, inode_anchor))
+}
+
+#[cfg(target_os = "linux")]
+fn anchor_socket(
+    directory: &OwnedFd,
+    staging: &str,
+    identity: SocketIdentity,
+) -> Result<SocketAnchor, EndpointError> {
+    let anchor = rustix::fs::openat(
+        directory,
+        staging,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        EndpointError::io(
+            "anchor bound socket inode",
+            Path::new(staging),
+            error.into(),
+        )
+    })?;
+    let stat = rustix::fs::fstat(&anchor).map_err(|error| {
+        EndpointError::io(
+            "fstat bound socket inode anchor",
+            Path::new(staging),
+            error.into(),
+        )
+    })?;
+    if identity_of(&stat) != identity {
+        return Err(EndpointError::Endpoint {
+            message: format!("bound endpoint {staging} changed before publication"),
+        });
+    }
+    Ok(anchor)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn anchor_socket(
+    _directory: &OwnedFd,
+    _staging: &str,
+    _identity: SocketIdentity,
+) -> Result<SocketAnchor, EndpointError> {
+    Ok(SocketAnchor)
 }
 
 fn publish(directory: &OwnedFd, staging: &str, name: &str) -> Result<(), EndpointError> {
@@ -307,15 +364,11 @@ async fn preflight(
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
             remove_verified_stale(directory, socket_path, name, expected_uid).await
         }
-        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-            Err(EndpointError::Endpoint {
-                message: format!(
-                    "endpoint {} did not answer its liveness probe; treating it as live",
-                    socket_path.display()
-                ),
-            })
-        }
-        Err(error) => Err(EndpointError::io("probe Unix socket", socket_path, error)),
+        // Linux can report ECONNRESET when a listener is replaced or dropped
+        // while connect(2) is resolving the pathname. Only ENOENT or
+        // ECONNREFUSED proves staleness there; preserve every other platform's
+        // historical I/O error exactly.
+        Err(error) => Err(probe_failure("probe Unix socket", socket_path, error)),
     }
 }
 
@@ -380,24 +433,30 @@ async fn remove_verified_stale(
                 )),
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-            restore(directory, &claim, name)?;
-            Err(EndpointError::Endpoint {
-                message: format!(
-                    "claimed endpoint {} did not answer its liveness probe; treating it as live",
-                    socket_path.display()
-                ),
-            })
-        }
         Err(error) => {
             restore(directory, &claim, name)?;
-            Err(EndpointError::io(
+            Err(probe_failure(
                 "probe claimed Unix socket",
                 &claim_path,
                 error,
             ))
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_failure(operation: &'static str, path: &Path, error: std::io::Error) -> EndpointError {
+    EndpointError::Endpoint {
+        message: format!(
+            "{operation} for endpoint {} was ambiguous ({error}); treating it as live",
+            path.display()
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_failure(operation: &'static str, path: &Path, error: std::io::Error) -> EndpointError {
+    EndpointError::io(operation, path, error)
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);

@@ -1272,6 +1272,7 @@ async fn endpoint_replacement_racing_cleanup_is_never_deleted() {
     let stolen = Arc::new(AtomicUsize::new(0));
     let racer = std::thread::spawn({
         let path = socket_path.clone();
+        let runtime_dir = config.runtime_dir.clone();
         let stop = Arc::clone(&stop);
         let stolen = Arc::clone(&stolen);
         move || {
@@ -1285,14 +1286,18 @@ async fn endpoint_replacement_racing_cleanup_is_never_deleted() {
                 };
                 let mine = (metadata.dev(), metadata.ino());
                 // Watch my own node for a while: anything that removes or
-                // replaces it in this window is not me.
+                // replaces it in this window is not me. Cleanup is allowed to
+                // claim the node under a staging name while it verifies the
+                // inode, so disappearance from the public name is a violation
+                // only when the inode disappeared from the directory too.
                 for _ in 0..256 {
                     match fs::symlink_metadata(&path) {
                         Ok(found) if (found.dev(), found.ino()) == mine => {}
-                        _ => {
+                        _ if !inode_exists_in(&runtime_dir, mine) => {
                             stolen.fetch_add(1, AtomicOrdering::Relaxed);
                             break;
                         }
+                        _ => {}
                     }
                     std::thread::yield_now();
                 }

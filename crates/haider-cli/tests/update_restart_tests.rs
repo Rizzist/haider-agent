@@ -37,6 +37,10 @@ use tokio::time::{Instant, sleep};
 const DEADLINE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
 
+fn fixture_target() -> &'static str {
+    cli_main::update::discovery::compiled_target().unwrap_or("aarch64-apple-darwin")
+}
+
 struct DigestVerifier;
 
 impl InstalledPairVerifier for DigestVerifier {
@@ -196,7 +200,9 @@ async fn truncated_archive_http_leaves_pair_and_live_daemon_unchanged() {
         .expect("write truncated archive");
     });
 
-    let target = cli_main::update::discovery::compiled_target().expect("compiled target");
+    // The transaction remains worth exercising on Unix hosts where the
+    // packaged self-update command is intentionally unavailable.
+    let target = fixture_target();
     let selection = ReleaseSelection {
         version: SemVersion::parse("9.0.0").expect("target version"),
         archive_name: format!("haider-v9.0.0-{target}.tar.xz"),

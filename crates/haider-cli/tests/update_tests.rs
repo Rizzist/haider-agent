@@ -10,12 +10,15 @@ use cli_main::update::discovery::{
     CurlTransport, DiscoveryOutcome, ReleaseSelection, ReleaseSource, SemVersion, UpdateTransport,
     discover,
 };
+#[cfg(target_os = "macos")]
 use cli_main::update::stage_then_acquire;
 use cli_main::update::staging::{StageVerifier, sha256_file, stage_release};
 use cli_main::update::transaction::{
-    CommitBoundary, FaultInjector, InstallLayout, InstalledPairVerifier, NoFaults,
-    PreparedTransaction, TransactionPhase, commit_pair, marker_path,
+    CommitBoundary, FaultInjector, InstallLayout, InstalledPairVerifier, PreparedTransaction,
+    TransactionPhase,
 };
+#[cfg(target_os = "macos")]
+use cli_main::update::transaction::{NoFaults, commit_pair, marker_path};
 use cli_main::update::{UpdateAvailability, UpdateError, check_update_availability_with};
 use std::collections::BTreeMap;
 use std::fs;
@@ -61,6 +64,10 @@ fn source() -> ReleaseSource {
         repository: "owner/repo".into(),
         allow_http: true,
     }
+}
+
+fn fixture_target() -> &'static str {
+    cli_main::update::discovery::compiled_target().unwrap_or("aarch64-apple-darwin")
 }
 
 fn releases_url(page: usize) -> String {
@@ -548,7 +555,7 @@ fn selection_and_transport(
     checksum_override: Option<String>,
 ) -> (ReleaseSelection, FakeTransport) {
     let version = "9.0.0";
-    let target = cli_main::update::discovery::compiled_target().expect("macOS test target");
+    let target = fixture_target();
     let name = format!("haider-v{version}-{target}.tar.xz");
     let archive = archive_bytes(root, members);
     let archive_file = root.join("digest-input.tar.xz");
@@ -572,10 +579,12 @@ fn selection_and_transport(
 
 /// MUTATION CHECK: reject the workflow's `dist/NAME` spelling. Expected
 /// RUNTIME failure: a valid published checksum can no longer stage.
+// Packaged self-update and its BSD-tar normalization pipeline are macOS-only.
+#[cfg(target_os = "macos")]
 #[test]
 fn staging_accepts_exact_workflow_checksum_basename() {
     let install = install_fixture();
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let members = expected_members("9.0.0", target);
     let (selection, mut transport) = selection_and_transport(install.path(), &members, None);
     let verifier = FakeVerifier {
@@ -599,7 +608,7 @@ fn staging_accepts_exact_workflow_checksum_basename() {
 /// inode/bytes/mode snapshot can change.
 #[test]
 fn bad_checksums_stop_before_extraction_and_verification() {
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let members = expected_members("9.0.0", target);
     for checksum in [
         format!("{}  wrong.tar.xz\n", "0".repeat(64)),
@@ -629,7 +638,7 @@ fn bad_checksums_stop_before_extraction_and_verification() {
 /// succeeds, the verifier is called, or staging entries appear.
 #[test]
 fn wrong_content_digest_with_valid_checksum_refuses_before_extraction() {
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let members = expected_members("9.0.0", target);
     let install = install_fixture();
     let before = pair_snapshot(install.path());
@@ -654,9 +663,10 @@ fn wrong_content_digest_with_valid_checksum_refuses_before_extraction() {
 /// MUTATION CHECK: allow traversal/absolute/link/device/duplicate/extra,
 /// missing, oversized, or non-executable archive members. Expected RUNTIME
 /// failure: one malformed table row yields a verified capability.
+#[cfg(target_os = "macos")]
 #[test]
 fn strict_archive_rejects_every_forbidden_member_shape() {
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let top = format!("haider-v9.0.0-{target}");
     let valid = expected_members("9.0.0", target);
     let mut cases: Vec<(&str, Vec<Member>)> = Vec::new();
@@ -722,9 +732,10 @@ fn strict_archive_rejects_every_forbidden_member_shape() {
 /// MUTATION CHECK: ignore xattr/sign/signature/smoke failures. Expected
 /// RUNTIME failure: a failure category returns a capability or changes the
 /// byte/inode/mode snapshot of either canonical path.
+#[cfg(target_os = "macos")]
 #[test]
 fn every_staged_verification_failure_leaves_installed_pair_exact() {
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let members = expected_members("9.0.0", target);
     for failure in [
         VerifyFailure::Xattr,
@@ -766,7 +777,7 @@ impl UpdateTransport for PartialDownloadTransport {
 fn partial_download_cannot_escape_immutable_staging() {
     let install = install_fixture();
     let before = pair_snapshot(install.path());
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let selection = ReleaseSelection {
         version: SemVersion::parse("9.0.0").expect("version"),
         archive_name: format!("haider-v9.0.0-{target}.tar.xz"),
@@ -796,6 +807,7 @@ fn partial_download_cannot_escape_immutable_staging() {
 /// MUTATION CHECK: acquire/recover before immutable staging. Expected
 /// RUNTIME failure: the planted new/new pending transaction is rolled back
 /// even though the partial transfer cannot produce a staged capability.
+#[cfg(target_os = "macos")]
 #[test]
 fn failed_staging_cannot_enter_transaction_or_recover_a_pending_marker() {
     let install = install_fixture();
@@ -808,7 +820,7 @@ fn failed_staging_cannot_enter_transaction_or_recover_a_pending_marker() {
     let pending_pair = pair_snapshot(install.path());
     assert!(marker_path(&layout).exists());
 
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let selection = ReleaseSelection {
         version: SemVersion::parse("10.0.0").expect("version"),
         archive_name: format!("haider-v10.0.0-{target}.tar.xz"),
@@ -881,7 +893,7 @@ impl InstalledPairVerifier for FailingPairVerifier {
 }
 
 fn verified_pair(install: &Path) -> cli_main::update::staging::VerifiedStagedPair {
-    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let target = fixture_target();
     let members = expected_members("9.0.0", target);
     let (selection, mut transport) = selection_and_transport(install, &members, None);
     stage_release(
@@ -899,6 +911,7 @@ fn verified_pair(install: &Path) -> cli_main::update::staging::VerifiedStagedPai
 /// MUTATION CHECK: omit rollback or move a fault hook before its named
 /// boundary. Expected RUNTIME failure: one of all eight rows does not restore
 /// the exact old inode/bytes/mode pair, or a restart entry becomes possible.
+#[cfg(target_os = "macos")]
 #[test]
 fn every_commit_boundary_fault_restores_exact_old_pair() {
     for boundary in [
@@ -936,6 +949,7 @@ fn every_commit_boundary_fault_restores_exact_old_pair() {
 /// MUTATION CHECK: skip the pre-commit capability recheck. Expected RUNTIME
 /// failure: altered staged bytes create a marker/backup or transiently replace
 /// a canonical path instead of being refused before the transaction starts.
+#[cfg(target_os = "macos")]
 #[test]
 fn altered_staged_capability_is_refused_before_marker_or_backup() {
     let install = install_fixture();
@@ -958,6 +972,7 @@ fn altered_staged_capability_is_refused_before_marker_or_backup() {
 /// MUTATION CHECK: let a post-swap verifier failure produce a restart
 /// capability. Expected RUNTIME failure: commit returns `Ok`, or rollback
 /// does not restore the exact old pair before any restart call is possible.
+#[cfg(target_os = "macos")]
 #[test]
 fn installed_pair_verifier_failure_rolls_back_without_restart_capability() {
     let install = install_fixture();
@@ -973,6 +988,7 @@ fn installed_pair_verifier_failure_rolls_back_without_restart_capability() {
 /// MUTATION CHECK: accept a mixed canonical pair during recovery or make
 /// recovery depend on marker phase. Expected RUNTIME failure: one of every
 /// durable phase fixtures remains new/old after the next lock acquisition.
+#[cfg(target_os = "macos")]
 #[test]
 fn every_marker_phase_recovers_to_a_never_mixed_old_pair() {
     for phase in [
@@ -1102,6 +1118,7 @@ fn replace_from_backup(backup: &Path, canonical: &Path, label: &str) {
 /// MUTATION CHECK: require both backups to exist even when one canonical path
 /// was already restored before a crash. Expected RUNTIME failure: recovery
 /// refuses the valid old/new fixture or leaves it mixed.
+#[cfg(target_os = "macos")]
 #[test]
 fn recovery_completes_a_partially_restored_pair() {
     let install = install_fixture();
@@ -1122,6 +1139,7 @@ fn recovery_completes_a_partially_restored_pair() {
 /// MUTATION CHECK: consume a corrupt recovery backup or delete the marker on
 /// refusal. Expected RUNTIME failure: recovery succeeds or the durable marker
 /// disappears instead of retaining operator-recoverable evidence.
+#[cfg(target_os = "macos")]
 #[test]
 fn corrupt_recovery_backup_refuses_and_retains_marker() {
     let install = install_fixture();

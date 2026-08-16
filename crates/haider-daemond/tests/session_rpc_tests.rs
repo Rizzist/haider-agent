@@ -185,6 +185,12 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
 /// the no-lag assertion below trips.
 #[tokio::test]
 async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connection() {
+    // This must exceed the platform UDS send buffer so the first replay
+    // cannot finish before the server consumes the already-sent cold attach.
+    // Linux buffers the former 200 tiny frames in full, which never creates
+    // the two simultaneously active lanes whose fairness this test proves.
+    const HOT_EVENTS: usize = 2_000;
+
     let root = test_root("w3b2-rpc-");
     let mut config = DaemonConfig::new(
         "fair-attachments",
@@ -194,7 +200,7 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
     config.outbound_queue_capacity = 6;
     let hot = SessionId::new("hot-session");
     let cold = SessionId::new("cold-session");
-    seed(&config, &hot, 200);
+    seed(&config, &hot, HOT_EVENTS);
     seed(&config, &cold, 1);
     let task = ready(&config).await;
     let mut client = Client::connect_control(
@@ -242,10 +248,11 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
             WireFrame::AttachCaughtUp {
                 high_water_seq: 1, ..
             } => cold_caught_up = true,
-            WireFrame::AttachCaughtUp {
-                high_water_seq: 200,
-                ..
-            } => break,
+            WireFrame::AttachCaughtUp { high_water_seq, .. }
+                if high_water_seq == HOT_EVENTS as u64 =>
+            {
+                break;
+            }
             WireFrame::Lagged { .. } => {
                 panic!("a continuously reading client must never be lagged")
             }
@@ -254,13 +261,16 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
         }
         if !cold_caught_up {
             assert!(
-                hot_events < 200,
+                hot_events < HOT_EVENTS as u64,
                 "round-robin must serve the cold lane before the hot replay completes"
             );
         }
     }
     assert!(cold_caught_up, "cold attachment fully served");
-    assert_eq!(hot_events, 200, "hot attachment fully served, unlagged");
+    assert_eq!(
+        hot_events, HOT_EVENTS as u64,
+        "hot attachment fully served, unlagged"
+    );
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");

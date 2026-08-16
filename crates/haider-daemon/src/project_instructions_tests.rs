@@ -24,6 +24,7 @@ use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{CapabilityDoc, FinishReason};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::state::SessionState;
 use haider_provider::{
     FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderStream, TurnRequest,
 };
@@ -196,6 +197,45 @@ async fn wait_for_terminal(store: &SqliteStoreHandle, session_id: &SessionId, ru
     })
     .await
     .expect("turn terminalizes");
+}
+
+async fn wait_for_idle_after_run(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let events = store.read(session_id, 0, 512).await.expect("read events");
+            let terminal_seq = events.iter().rev().find_map(|event| {
+                (event.run_id.as_ref() == Some(run_id)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(payload, EventPayload::RunState(state) if state.is_terminal())
+                        },
+                    ))
+                .then_some(event.seq)
+            });
+            if terminal_seq.is_some_and(|terminal_seq| {
+                events.iter().any(|event| {
+                    event.seq > terminal_seq
+                        && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                            |payload| {
+                                matches!(
+                                    payload,
+                                    EventPayload::SessionState(SessionState::Idle { .. })
+                                )
+                            },
+                        )
+                })
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session settles idle");
 }
 
 fn project_facts(
@@ -833,7 +873,12 @@ async fn footprint_and_manual_compaction_fit_include_instruction_bytes() {
         Some(64_000),
     )
     .await;
-    worker.submit("before-compaction").await;
+    let first_run = worker.submit("before-compaction").await;
+    // A terminal RunState is committed by the harness before the worker
+    // supervisor clears its active slot and commits aggregate Idle. Manual
+    // compaction is intentionally idle-only, so synchronize on that durable
+    // fence rather than racing the supervisor tail.
+    wait_for_idle_after_run(&worker.store, &worker.session_id, &first_run).await;
     let first_request = fake.requests().into_iter().next().expect("seed request");
     let prompt = first_request
         .system_prompt

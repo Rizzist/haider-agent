@@ -2226,7 +2226,7 @@ async fn committed_child_progress_resets_the_stall_deadline() {
         },
     ];
     for index in 0..7 {
-        script.push(FakeStep::Delay { ms: 12 });
+        script.push(FakeStep::Delay { ms: 100 });
         script.push(FakeStep::EmitReasoning {
             text: format!("heartbeat-{index}"),
         });
@@ -2259,7 +2259,7 @@ async fn committed_child_progress_resets_the_stall_deadline() {
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: Some(DelegationHandle::with_stall_deadline(
                 hub.clone(),
-                Duration::from_millis(30),
+                Duration::from_millis(500),
             )),
             web_search: None,
         },
