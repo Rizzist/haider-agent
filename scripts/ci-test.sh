@@ -10,6 +10,9 @@
 set -o pipefail
 export HAIDER_DISCOVERY_DISABLED=1
 export CARGO_INCREMENTAL=0
+# Deterministic device for fixed-width render pins: CI hostnames run 60+
+# chars and shed row segments host-dependently.
+export HAIDER_TEST_DEVICE_NAME=test-mac
 
 crates="haider-platform haider-protocol haider-accounts haider-core haider-pdf \
 haider-provider haider-daemon haider-daemond haider-rpc haider-tui haider-cli \

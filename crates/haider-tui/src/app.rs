@@ -1345,7 +1345,15 @@ pub fn remove_chip(chips: &mut Vec<ChipModel>, agent: &str) -> bool {
 #[must_use]
 pub fn local_device_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NAME.get_or_init(|| haider_platform::local_device_name().unwrap_or_else(|| "this-mac".into()))
+    NAME.get_or_init(|| {
+        // HAIDER_TEST_DEVICE_NAME: the deterministic-device seam for test
+        // runners — CI hostnames run 60+ chars and shed fixed-width row
+        // segments, breaking every chip pin host-dependently (the round-5/6
+        // whack-a-mole). ci-test.sh exports it; production never sets it.
+        std::env::var("HAIDER_TEST_DEVICE_NAME").unwrap_or_else(|_| {
+            haider_platform::local_device_name().unwrap_or_else(|| "this-mac".into())
+        })
+    })
 }
 
 /// A render-resolved jump anchor (B2b-m3, research §Q3): the durable
