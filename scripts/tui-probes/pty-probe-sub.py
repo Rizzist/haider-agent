@@ -30,7 +30,8 @@ def since(pre):
 
 pump(4.5)  # boot -> launcher (cold-build tolerant)
 os.write(fd, b"use two subagents to split this work\r")
-pump(9.0)  # parent turn + both child scripts up to their cards
+pump(18.0)  # parent turn + both child scripts up to their cards (cold,
+# loaded CI runners need ~2x the local pacing — round-9's amber miss)
 sub_paint = since(0)
 # The tests chip is holding its amber ? — the parent turn is idle by now.
 pre = mark()
