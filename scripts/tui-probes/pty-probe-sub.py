@@ -186,6 +186,15 @@ aura_band = band_rules(aura_grid, "speak or type")
 session_band = band_rules(final_grid, "message haider")
 detail = "SKIP" if not tall else None
 sticky = "SKIP" if tall else None
+# CI-as-debugger: the amber card misses ONLY on CI runners (local passes at
+# every pacing/env parity tried) — on a miss, dump the captured frames so
+# the runner names what actually painted.
+if tall and "testcontainers" not in sub_paint:
+    sys.stderr.write(
+        "\n--- amber-miss frame dump (tail) ---\n"
+        + sub_paint[-2500:]
+        + "\n--- end dump ---\n"
+    )
 probelib.verdict(
     "PTY_PROBE_SUB",
     out,
