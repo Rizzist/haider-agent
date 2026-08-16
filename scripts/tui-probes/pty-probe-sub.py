@@ -12,6 +12,18 @@ import os, re, signal, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probelib
 
+def _visible(raw):
+    """Escape-stripped text: ratatui's cell-diff renderer can split any
+    needle across cursor-positioning escapes (round-15's dump caught
+    `testcontainer` + CUP + ` or mocks?`), so raw-stream substring checks
+    are unsound. Match on de-escaped text with a splittable-tail-tolerant
+    needle."""
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", raw)
+
+
+def amber_painted(raw):
+    return bool(re.search(r"testcontainer|or mocks\?", _visible(raw)))
+
 cols, rows = int(sys.argv[1]), int(sys.argv[2])
 binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
 
@@ -45,7 +57,7 @@ os.write(fd, b"use two subagents to split this work\r")
 _card_deadline = time.time() + 45.0
 while time.time() < _card_deadline:
     pump(1.0)
-    if "testcontainers" in since(0):
+    if amber_painted(since(0)):
         break
 sub_paint = since(0)
 # The tests chip is holding its amber ? — the parent turn is idle by now.
@@ -204,7 +216,7 @@ sticky = "SKIP" if tall else None
 # CI-as-debugger: the amber card misses ONLY on CI runners (local passes at
 # every pacing/env parity tried) — on a miss, dump the captured frames so
 # the runner names what actually painted.
-if tall and "testcontainers" not in sub_paint:
+if tall and not amber_painted(sub_paint):
     # Every DISTINCT printable run painted since boot — names the script
     # variant the runner actually played (byte tails only showed diffs).
     # ONE line: the ladder tails only 25 lines of a failing probe's output,
@@ -219,7 +231,7 @@ probelib.verdict(
     [
         ("subtree_header_painted", "subagents" in sub_paint),
         ("chip_glyph_painted", detail or (("├─" in sub_paint) or ("└─" in sub_paint))),
-        ("amber_question_painted", detail or ("testcontainers" in sub_paint)),
+        ("amber_question_painted", detail or amber_painted(sub_paint)),
         ("aura_bar_painted", "AURA" in aura_paint),
         # TUI6.1 fix 2 re-scope: at 90x10 the orb is OPTIONAL content and
         # now yields to the reserved closing rule (review r1's aura
