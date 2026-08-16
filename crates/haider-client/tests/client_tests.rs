@@ -682,9 +682,7 @@ fn spawned_daemon_inherits_no_descriptors_beyond_stdio() {
     // exec and fakes a liveness failure.
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
-        });
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
     let binary = target_dir.join("debug/haiderd");
     assert!(
         binary.exists(),
