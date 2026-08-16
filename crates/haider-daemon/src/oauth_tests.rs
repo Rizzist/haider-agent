@@ -2319,7 +2319,14 @@ async fn shutdown_and_cancel_interrupt_a_slow_accepted_callback_read() {
     let (coordinator, mut receiver) = coordinator_for(&server, Duration::from_secs(5)).await;
     let (_, _, port) = started_flow(&mut receiver).await;
     coordinator.shutdown().await;
-    tokio::time::timeout(Duration::from_millis(250), async {
+    #[cfg(unix)]
+    let listener_close_deadline = Duration::from_millis(250);
+    // Windows can retain a just-closed loopback listener in the connect path
+    // beyond one scheduler quantum. The assertion still requires refusal;
+    // only the platform observation window is wider.
+    #[cfg(windows)]
+    let listener_close_deadline = Duration::from_secs(2);
+    tokio::time::timeout(listener_close_deadline, async {
         loop {
             if TcpStream::connect((Ipv4Addr::LOCALHOST, port))
                 .await

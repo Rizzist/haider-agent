@@ -114,7 +114,14 @@ fn daemon_pid(profile: &Path) -> Option<u32> {
 
 fn terminate_daemon(profile: &Path) {
     if let Some(pid) = daemon_pid(profile) {
+        #[cfg(unix)]
         let _ = Command::new("kill").arg(pid.to_string()).status();
+        #[cfg(windows)]
+        let _ = Command::new("taskkill.exe")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .args(["/T", "/F"])
+            .status();
     }
 }
 
@@ -1342,7 +1349,13 @@ fn attach_text_loader_validates_utf8_and_sanitizes_the_name() {
 
     // Control characters are stripped from the display name and the length
     // is capped at 120 characters.
+    #[cfg(unix)]
     let weird = directory.path().join("a\u{7}b.txt");
+    // NTFS refuses C0 control characters in a file name. U+0085 is still a
+    // Rust control character, but it is a legal Windows filename, so this
+    // exercises the exact same sanitizer law through the real loader.
+    #[cfg(windows)]
+    let weird = directory.path().join("a\u{85}b.txt");
     std::fs::write(&weird, "x").expect("write control-name file");
     let loaded = haider_client::load_text_attachment(&weird).expect("loads");
     assert_eq!(loaded.name, "ab.txt", "control characters stripped");

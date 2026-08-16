@@ -41,8 +41,47 @@ const CRATES: [&str; 10] = [
     haider_tui::CRATE_NAME,
 ];
 
+#[cfg(not(windows))]
 #[tokio::main]
 async fn main() -> ExitCode {
+    dispatch().await
+}
+
+// The CLI dispatcher composes several large async command futures. Windows
+// gives the executable's main thread a much smaller stack than Unix, so poll
+// that dispatcher on an explicitly sized thread while retaining Tokio's
+// normal multi-thread runtime for all spawned work.
+#[cfg(windows)]
+fn main() -> ExitCode {
+    let launched = std::thread::Builder::new()
+        .name("haider-main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(dispatch()))
+        });
+    match launched {
+        Ok(thread) => match thread.join() {
+            Ok(Ok(code)) => code,
+            Ok(Err(error)) => {
+                eprintln!("haider: could not start async runtime: {error}");
+                ExitCode::from(EX_SOFTWARE)
+            }
+            Err(_) => {
+                eprintln!("haider: main runtime thread panicked");
+                ExitCode::from(EX_SOFTWARE)
+            }
+        },
+        Err(error) => {
+            eprintln!("haider: could not start main runtime thread: {error}");
+            ExitCode::from(EX_SOFTWARE)
+        }
+    }
+}
+
+async fn dispatch() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [version] if matches!(version.as_str(), "--version" | "-V" | "version") => {

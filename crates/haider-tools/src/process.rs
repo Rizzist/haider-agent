@@ -1894,7 +1894,15 @@ pub(crate) fn shell_command(script: &str) -> Command {
 
 #[cfg(windows)]
 pub(crate) fn shell_command(script: &str) -> Command {
-    let mut command = Command::new("cmd.exe");
+    // Resolve before the broker installs its reduced child environment.
+    // CreateProcess does not search the PATH supplied to the child process.
+    let interpreter = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("cmd.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+    let mut command = Command::new(interpreter);
     command.args(["/D", "/S", "/C"]).arg(script);
     command
 }

@@ -102,15 +102,28 @@ fn runtime_dir_is_never_env_overridable_and_defaults_to_tmp_uid() {
     // on Linux only a VERIFIED owner-private dir may.
     env.xdg_runtime_dir = Some(PathBuf::from("/definitely/not/private"));
     let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    #[cfg(unix)]
     let expected = PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()));
+    #[cfg(windows)]
+    let expected = std::env::temp_dir().join("haider");
     assert_eq!(profile.runtime_dir, expected);
-    assert!(profile.endpoint_path.starts_with(&expected));
-    let name = profile
-        .endpoint_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    assert!(name.starts_with("haider-") && name.ends_with(".sock"));
-    // Fixed-length socket name: "haider-" + 32 hex + ".sock".
-    assert_eq!(name.len(), "haider-".len() + 32 + ".sock".len());
+    #[cfg(unix)]
+    {
+        assert!(profile.endpoint_path.starts_with(&expected));
+        let name = profile
+            .endpoint_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(name.starts_with("haider-") && name.ends_with(".sock"));
+        // Fixed-length socket name: "haider-" + 32 hex + ".sock".
+        assert_eq!(name.len(), "haider-".len() + 32 + ".sock".len());
+    }
+    #[cfg(windows)]
+    {
+        let endpoint = profile.endpoint_path.to_string_lossy();
+        assert!(endpoint.starts_with(r"\\.\pipe\haider-"));
+        // Fixed-length pipe name: prefix + 32 hex.
+        assert_eq!(endpoint.len(), r"\\.\pipe\haider-".len() + 32);
+    }
 }

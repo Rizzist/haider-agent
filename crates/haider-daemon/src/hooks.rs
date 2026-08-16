@@ -43,7 +43,9 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -72,7 +74,21 @@ const MAX_USER_MESSAGE_TEXT_BYTES: usize = 32 * 1024;
 const SUBSCRIBE_QUEUE: usize = 64;
 const SUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_millis(200);
 const SUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const ENV_ALLOWLIST: [&str; 5] = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"];
+// `cmd.exe` and Windows system tools need these bootstrap variables even
+// when a hook otherwise receives the same deliberately empty environment.
+// None is a credential-bearing application variable.
+#[cfg(windows)]
+const ENV_ALLOWLIST: [&str; 7] = [
+    "PATH",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2407,7 +2423,16 @@ fn hook_command(script: &str) -> tokio::process::Command {
 
 #[cfg(windows)]
 fn hook_command(script: &str) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("cmd.exe");
+    // CreateProcess does not resolve a bare executable against the child
+    // environment installed below. Pin the interpreter before `env_clear`,
+    // using the system directory rather than relying on a runner's PATH.
+    let interpreter = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("cmd.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+    let mut command = tokio::process::Command::new(interpreter);
     command.args(["/D", "/S", "/C"]).arg(script);
     command
 }

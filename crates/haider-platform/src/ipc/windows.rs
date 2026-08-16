@@ -3,12 +3,12 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
+use tokio::sync::Mutex;
 
 pub type IpcReadHalf = tokio::io::ReadHalf<IpcStream>;
 pub type IpcWriteHalf = tokio::io::WriteHalf<IpcStream>;
@@ -106,31 +106,26 @@ impl BoundEndpoint {
     }
 
     pub async fn accept(&self) -> io::Result<(IpcStream, EndpointAddress)> {
-        let server = self
-            .listener
-            .lock()
-            .map_err(|_| io::Error::other("Windows named-pipe listener lock poisoned"))?
-            .take()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "daemon listener is closed")
-            })?;
+        // Borrow the pending instance across `connect` instead of taking it
+        // out. The daemon awaits `accept` inside `tokio::select!`; cancellation
+        // must leave the instance installed for the next loop iteration.
+        let mut listener = self.listener.lock().await;
+        let server = listener.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "daemon listener is closed")
+        })?;
         server.connect().await?;
 
         // Queue the next instance before handing this connected instance to
         // the daemon. This is the named-pipe equivalent of a reusable listener.
         let next = ServerOptions::new().create(pipe_name(&self.endpoint)?)?;
-        *self
-            .listener
-            .lock()
-            .map_err(|_| io::Error::other("Windows named-pipe listener lock poisoned"))? =
-            Some(next);
-        Ok((IpcStream::Server(server), ()))
+        let connected = listener.replace(next).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "daemon listener is closed")
+        })?;
+        Ok((IpcStream::Server(connected), ()))
     }
 
     pub fn close_listener(&mut self) {
-        if let Ok(slot) = self.listener.get_mut() {
-            slot.take();
-        }
+        self.listener.get_mut().take();
     }
 }
 
@@ -197,5 +192,44 @@ pub fn write_immediate(stream: &IpcStream, bytes: &[u8]) {
             Ok(0) | Err(_) => break,
             Ok(count) => written = written.saturating_add(count),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::{BoundEndpoint, connect};
+    use crate::ipc::Endpoint;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static NEXT_ENDPOINT: AtomicU64 = AtomicU64::new(1);
+
+    #[tokio::test]
+    async fn cancelled_accept_retains_the_pending_pipe_instance() {
+        let unique = NEXT_ENDPOINT.fetch_add(1, Ordering::Relaxed);
+        let endpoint = Endpoint::new(
+            "ignored",
+            &format!("cancelled-accept-{}-{unique}", std::process::id()),
+        );
+        let mut bound = BoundEndpoint::bind(&endpoint, std::path::Path::new("ignored"))
+            .await
+            .expect("bind named pipe");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), bound.accept())
+                .await
+                .is_err(),
+            "the first accept must be cancelled while no client exists"
+        );
+
+        let client = connect(endpoint.address()).await.expect("connect client");
+        let (server, ()) = tokio::time::timeout(Duration::from_secs(1), bound.accept())
+            .await
+            .expect("retained listener accepts before deadline")
+            .expect("retained listener accepts");
+        drop((client, server));
+        bound.close_listener();
     }
 }

@@ -44,9 +44,49 @@ use std::sync::Arc;
 /// exits 64 rather than degrading), and it announces itself loudly on
 /// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
+#[cfg(windows)]
+const EX_SOFTWARE: u8 = 70;
 
+#[cfg(not(windows))]
 #[tokio::main]
 async fn main() -> ExitCode {
+    dispatch().await
+}
+
+// `run_with_signals_and_dependencies` owns the whole daemon lifecycle and
+// produces a large debug future. Poll it on an explicitly sized Windows
+// entry thread; Unix retains its ordinary Tokio main path.
+#[cfg(windows)]
+fn main() -> ExitCode {
+    let launched = std::thread::Builder::new()
+        .name("haiderd-main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(dispatch()))
+        });
+    match launched {
+        Ok(thread) => match thread.join() {
+            Ok(Ok(code)) => code,
+            Ok(Err(error)) => {
+                eprintln!("haiderd: could not start async runtime: {error}");
+                ExitCode::from(EX_SOFTWARE)
+            }
+            Err(_) => {
+                eprintln!("haiderd: main runtime thread panicked");
+                ExitCode::from(EX_SOFTWARE)
+            }
+        },
+        Err(error) => {
+            eprintln!("haiderd: could not start main runtime thread: {error}");
+            ExitCode::from(EX_SOFTWARE)
+        }
+    }
+}
+
+async fn dispatch() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(args.as_slice(), [argument] if argument == "--version") {
         println!("haiderd {}", env!("CARGO_PKG_VERSION"));

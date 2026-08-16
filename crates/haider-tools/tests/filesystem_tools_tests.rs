@@ -352,6 +352,7 @@ fn restore_file_freshness(broker: &mut EffectBroker, workspace_root: &Path, path
         .expect("restore test freshness");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn fs_write_creates_and_overwrites_with_ledgered_four_phase_effects() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -408,6 +409,7 @@ async fn fs_write_creates_and_overwrites_with_ledgered_four_phase_effects() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -447,6 +449,7 @@ async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn ambiguous_preimage_returns_typed_conflict_without_writing() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -478,6 +481,7 @@ async fn ambiguous_preimage_returns_typed_conflict_without_writing() {
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn genuinely_unique_preimage_still_applies() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -512,6 +516,7 @@ async fn genuinely_unique_preimage_still_applies() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn ledger_attributes_successful_writes_to_the_exact_turn() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -569,6 +574,7 @@ async fn ledger_attributes_successful_writes_to_the_exact_turn() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn concurrent_patches_cannot_both_apply_the_same_stale_preimage() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -617,6 +623,7 @@ async fn concurrent_patches_cannot_both_apply_the_same_stale_preimage() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn applied_write_is_ledgered_before_a_failed_outcome_append() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -723,6 +730,7 @@ fn cancelling_before_the_blocking_worker_starts_is_clean() {
     });
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cancelling_apply_cannot_leave_a_write_without_ledger_evidence() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -769,6 +777,7 @@ async fn cancelling_apply_cannot_leave_a_write_without_ledger_evidence() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cancelling_apply_during_ledger_failure_still_journals_failed_outcome() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -829,6 +838,7 @@ async fn cancelling_apply_during_ledger_failure_still_journals_failed_outcome() 
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn caller_cancellation_cannot_sever_a_dispatched_terminal_append() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -954,6 +964,7 @@ async fn cancelled_terminal_caller_leaves_owned_append_for_close_to_drain() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn finalizer_and_unknown_race_forces_the_loser_before_the_winner_append() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -1017,6 +1028,7 @@ async fn finalizer_and_unknown_race_forces_the_loser_before_the_winner_append() 
     assert_eq!(terminal_completions.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn close_waits_for_a_cancelled_callers_failing_finalizer() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -1076,6 +1088,7 @@ async fn close_waits_for_a_cancelled_callers_failing_finalizer() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn mixed_close_error_keeps_successful_reconciliations_visible() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -1153,6 +1166,7 @@ async fn mixed_close_error_keeps_successful_reconciliations_visible() {
     }));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn failed_terminal_append_is_keyed_and_never_appends_a_fallback() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -1207,6 +1221,7 @@ async fn failed_terminal_append_is_keyed_and_never_appends_a_fallback() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn ledger_append_failure_becomes_a_failed_effect_outcome() {
     let directory = tempfile::tempdir().expect("temporary directory");
