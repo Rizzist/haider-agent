@@ -676,8 +676,16 @@ fn spawned_daemon_inherits_no_descriptors_beyond_stdio() {
     rustix::io::fcntl_setfd(&planted, rustix::io::FdFlags::empty()).expect("clear cloexec");
     drop(theirs);
 
-    let binary =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/haiderd");
+    // Honor CARGO_TARGET_DIR: under a redirected target (the Linux container
+    // verification uses target-linux/) the manifest-relative default would
+    // name the HOST's binary — a foreign-platform executable that dies on
+    // exec and fakes a liveness failure.
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+        });
+    let binary = target_dir.join("debug/haiderd");
     assert!(
         binary.exists(),
         "haiderd binary missing; build workspace binaries before the client suite"
