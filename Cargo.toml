@@ -23,7 +23,7 @@ members = [
 [workspace.package]
 version = "0.0.921"
 edition = "2024"
-license = "LicenseRef-Proprietary-Undecided"
+license = "LicenseRef-KOA-P-1.0"
 repository = "https://github.com/Rizzist/haider-agent"
 rust-version = "1.95"
 
