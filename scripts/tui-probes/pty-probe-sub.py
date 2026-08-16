@@ -205,10 +205,14 @@ sticky = "SKIP" if tall else None
 # every pacing/env parity tried) — on a miss, dump the captured frames so
 # the runner names what actually painted.
 if tall and "testcontainers" not in sub_paint:
+    # Every DISTINCT printable run painted since boot — names the script
+    # variant the runner actually played (byte tails only showed diffs).
+    _runs = re.findall(r"[ -~]{8,}", sub_paint)
+    _uniq = list(dict.fromkeys(_runs))[-120:]
     sys.stderr.write(
-        "\n--- amber-miss frame dump (tail) ---\n"
-        + sub_paint[-2500:]
-        + "\n--- end dump ---\n"
+        "\n--- amber-miss text runs ---\n"
+        + "\n".join(_uniq)
+        + "\n--- end runs ---\n"
     )
 probelib.verdict(
     "PTY_PROBE_SUB",
