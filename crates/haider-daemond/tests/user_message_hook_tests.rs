@@ -30,6 +30,32 @@ use std::time::Duration;
 use support::{UdsClient, ready_with_dependencies, test_root};
 use tokio::sync::mpsc;
 
+#[cfg(unix)]
+fn capture_hook_command(capture: &Path) -> String {
+    format!("(cat; printf '\\n') >> '{}'", capture.display())
+}
+
+#[cfg(windows)]
+fn capture_hook_command(capture: &Path) -> String {
+    let capture = capture.display().to_string().replace('\'', "''");
+    format!(
+        concat!(
+            "powershell.exe -NoProfile -NonInteractive -Command ",
+            "\"$i=[Console]::OpenStandardInput();",
+            "$f=[IO.File]::Open('{}',[IO.FileMode]::Append,",
+            "[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);",
+            "$i.CopyTo($f);$f.WriteByte(10);$f.Dispose()\""
+        ),
+        capture
+    )
+}
+
+#[cfg(unix)]
+const CAPTURE_HOOK_TIMEOUT_MS: u64 = 1_000;
+
+#[cfg(windows)]
+const CAPTURE_HOOK_TIMEOUT_MS: u64 = 5_000;
+
 #[derive(Clone)]
 struct FakeFactory {
     fake: Arc<FakeProvider>,
@@ -65,7 +91,7 @@ fn write_hook_configuration(store: &Path, workspace: &Path, capture: &Path) {
         .expect("profile hook config"),
     )
     .expect("write profile hook config");
-    let command = format!("(cat; printf '\\n') >> '{}'", capture.display());
+    let command = capture_hook_command(capture);
     fs::write(
         workspace.join("hooks.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -75,7 +101,7 @@ fn write_hook_configuration(store: &Path, workspace: &Path, capture: &Path) {
                     "matcher": {"event": "user_message"},
                     "kind": "exec",
                     "command": command,
-                    "timeout_ms": 1_000,
+                    "timeout_ms": CAPTURE_HOOK_TIMEOUT_MS,
                 }
             },
         }))

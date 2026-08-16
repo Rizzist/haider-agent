@@ -20,7 +20,7 @@ pub use directory::{
 };
 pub use fs::{
     configure_directory_mode, configure_file_mode, metadata_is_current_user, metadata_link_count,
-    metadata_mode, set_mode, sync_directory,
+    metadata_mode, replace_file, set_mode, sync_directory,
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcStream, IpcWriteHalf,

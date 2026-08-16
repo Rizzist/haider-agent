@@ -17,9 +17,6 @@ zeroize.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
-
 [dev-dependencies]
 tempfile.workspace = true
 

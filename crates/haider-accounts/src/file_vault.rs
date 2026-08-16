@@ -107,8 +107,10 @@ impl Vault for FileVault {
                 .and_then(|()| file.sync_all())
                 .map_err(|error| io_error("write vault secret", &error))?;
             drop(file);
-            commit_temp(&temp, &target).map_err(|error| io_error("commit vault secret", &error))?;
-            sync_directory(&self.root).map_err(|error| io_error("sync vault directory", &error))
+            haider_platform::replace_file(&temp, &target)
+                .map_err(|error| io_error("commit vault secret", &error))?;
+            haider_platform::sync_directory(&self.root)
+                .map_err(|error| io_error("sync vault directory", &error))
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
@@ -188,54 +190,6 @@ impl Vault for FileVault {
             }
         }
     }
-}
-
-#[cfg(unix)]
-fn commit_temp(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(temp, target)
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn commit_temp(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let temp = temp
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
-    let moved = unsafe {
-        MoveFileExW(
-            temp.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
-    haider_platform::sync_directory(path)
-}
-
-#[cfg(windows)]
-fn sync_directory(_path: &std::path::Path) -> std::io::Result<()> {
-    // MOVEFILE_WRITE_THROUGH above flushes the replacement before returning.
-    Ok(())
 }
 
 fn missing(alias: &CredentialAlias) -> haider_protocol::error::HaiderError {

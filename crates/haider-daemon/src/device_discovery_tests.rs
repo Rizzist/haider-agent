@@ -1,10 +1,11 @@
 //! Device-discovery laws (D1): metadata-only reports, silent skip of absent
 //! or malformed stores, and the honest disabled state.
 //!
-//! Discovery resolves store paths from `HOME` plus per-store env overrides,
-//! so every law body runs in a re-spawned child process whose `HOME` is a
-//! fixture directory and whose override variables are scrubbed. The parent
-//! arm of each test only builds fixtures and supervises the child.
+//! Discovery resolves store paths from the platform home variable plus
+//! per-store env overrides, so every law body runs in a re-spawned child
+//! process whose home is a fixture directory and whose override variables are
+//! scrubbed. The parent arm of each test only builds fixtures and supervises
+//! the child.
 #![allow(clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -17,7 +18,8 @@ use super::*;
 
 const ENV_CHILD: &str = "HAIDER_TEST_DEVICE_DISCOVERY_ENV_CHILD";
 
-/// Every environment variable discovery consults besides `HOME`. The child
+/// Every environment variable discovery consults besides the platform home
+/// variables. The child
 /// starts from a scrubbed set so a developer's real overrides (or real
 /// stores) can never leak into a law.
 const DISCOVERY_ENV_VARS: &[&str] = &[
@@ -41,6 +43,8 @@ fn run_in_isolated_home(test_name: &str, home: &Path, extra_env: &[(&str, &str)]
         .args(["--exact", test_name, "--nocapture"])
         .env(ENV_CHILD, "1")
         .env("HOME", home);
+    #[cfg(windows)]
+    command.env("USERPROFILE", home);
     for name in DISCOVERY_ENV_VARS {
         command.env_remove(name);
     }
@@ -59,10 +63,20 @@ fn run_in_isolated_home(test_name: &str, home: &Path, extra_env: &[(&str, &str)]
 }
 
 fn fixture_home() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("hddisc")
-        .tempdir_in("/tmp")
-        .unwrap_or_else(|error| panic!("tempdir: {error}"))
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new()
+            .prefix("hddisc")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|error| panic!("tempdir: {error}"))
+    }
+    #[cfg(windows)]
+    {
+        tempfile::Builder::new()
+            .prefix("hddisc")
+            .tempdir()
+            .unwrap_or_else(|error| panic!("tempdir: {error}"))
+    }
 }
 
 fn write_store(home: &Path, relative: &str, bytes: &[u8]) {
@@ -378,7 +392,11 @@ fn discovery_reports_metadata_never_token_bytes() {
     );
     assert_eq!(codex.wire.freshness, "fresh");
     assert_eq!(codex.wire.expires_at_ms, Some(4_102_444_800_000));
-    assert!(codex.wire.path.ends_with(".codex/auth.json"));
+    assert!(
+        Path::new(&codex.wire.path).ends_with(Path::new(".codex").join("auth.json")),
+        "Codex candidate path must end in the platform-native auth path: {}",
+        codex.wire.path
+    );
     assert!(codex.wire.import_supported);
     assert_eq!(codex.import_source, Some("codex"));
 

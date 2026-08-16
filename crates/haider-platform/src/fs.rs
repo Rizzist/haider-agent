@@ -86,3 +86,45 @@ pub fn sync_directory(path: &Path) -> std::io::Result<()> {
 pub fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
+
+/// Atomically publishes `source` at `target`, replacing an existing target.
+///
+/// Unix `rename(2)` already has replacement semantics. Windows'
+/// `std::fs::rename` does not replace an existing file, so use the native
+/// write-through replacement operation there.
+#[cfg(unix)]
+pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}

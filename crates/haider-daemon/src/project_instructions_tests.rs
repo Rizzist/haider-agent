@@ -311,9 +311,12 @@ async fn nearest_instructions_compose_last_and_haider_wins_within_directory() {
         .filter(|file| Path::new(&file.path).starts_with(&canonical_project))
         .collect::<Vec<_>>();
     assert_eq!(relevant.len(), 2);
-    assert!(relevant[0].path.ends_with("project/HAIDER.md"));
+    assert!(Path::new(&relevant[0].path).ends_with(Path::new("project").join("HAIDER.md")));
     assert_eq!(relevant[0].text, "parent-haider");
-    assert!(relevant[1].path.ends_with("project/child/AGENTS.md"));
+    assert!(
+        Path::new(&relevant[1].path)
+            .ends_with(Path::new("project").join("child").join("AGENTS.md"))
+    );
     assert_eq!(relevant[1].text, "nearest-agents");
     assert!(
         loaded
@@ -385,11 +388,20 @@ async fn total_cap_preserves_nearest_files_and_composes_them_last() {
         .filter(|file| Path::new(&file.path).starts_with(&canonical_grand))
         .collect::<Vec<_>>();
     assert_eq!(relevant.len(), 3);
-    assert!(relevant[0].path.ends_with("grand/HAIDER.md"));
+    assert!(Path::new(&relevant[0].path).ends_with(Path::new("grand").join("HAIDER.md")));
     assert!(relevant[0].truncated);
-    assert!(relevant[1].path.ends_with("grand/parent/HAIDER.md"));
+    assert!(
+        Path::new(&relevant[1].path).ends_with(Path::new("grand").join("parent").join("HAIDER.md"))
+    );
     assert!(!relevant[1].truncated);
-    assert!(relevant[2].path.ends_with("grand/parent/child/HAIDER.md"));
+    assert!(
+        Path::new(&relevant[2].path).ends_with(
+            Path::new("grand")
+                .join("parent")
+                .join("child")
+                .join("HAIDER.md")
+        )
+    );
     assert!(!relevant[2].truncated);
     assert!(
         loaded
@@ -438,6 +450,11 @@ struct EditingProvider {
     calls: Arc<AtomicUsize>,
 }
 
+#[cfg(unix)]
+const PINNED_EXEC_COMMAND: &str = "printf pinned";
+#[cfg(windows)]
+const PINNED_EXEC_COMMAND: &str = "echo|set /p=\"pinned\"";
+
 #[async_trait]
 impl Provider for EditingProvider {
     async fn capabilities(&self) -> CapabilityDoc {
@@ -465,7 +482,7 @@ async fn one_pinned_logical_turn_sees_one_snapshot_and_edits_apply_next_turn() {
         FakeStep::EmitToolCall {
             call_id: "pinning-exec".into(),
             name: "process_exec".into(),
-            args: serde_json::json!({"command":"printf pinned"}),
+            args: serde_json::json!({"command": PINNED_EXEC_COMMAND}),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,

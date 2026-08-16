@@ -1,7 +1,7 @@
 //! Durable provider-profile registry owned by the account/provider actor.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -140,10 +140,9 @@ impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
             .and_then(|()| file.sync_all())
             .map_err(|error| file_error("write", &temporary, error))?;
         drop(file);
-        fs::rename(&temporary, &self.path)
+        haider_platform::replace_file(&temporary, &self.path)
             .map_err(|error| file_error("replace", &self.path, error))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        haider_platform::sync_directory(parent)
             .map_err(|error| file_error("sync parent directory of", &self.path, error))
     }
 }

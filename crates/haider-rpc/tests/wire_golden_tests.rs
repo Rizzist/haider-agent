@@ -79,8 +79,11 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
         std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("mkdir fixtures");
         std::fs::write(&path, &serialized).expect("write fixture");
     }
-    let golden =
-        std::fs::read_to_string(path).expect("missing wire fixture; run with UPDATE_FIXTURES=1");
+    let golden = std::fs::read_to_string(path)
+        .expect("missing wire fixture; run with UPDATE_FIXTURES=1")
+        // Checked-out Windows text can be CRLF, but protocol bytes are frozen
+        // as canonical LF JSON independently of the host checkout policy.
+        .replace("\r\n", "\n");
     assert_eq!(serialized, golden);
 
     let pinned: Vec<GoldenWireBytes> = serde_json::from_str(&golden).expect("decode fixture");

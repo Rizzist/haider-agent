@@ -29,6 +29,90 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).expect("canonical path")
 }
 
+#[cfg(unix)]
+fn emit_command(value: &str) -> String {
+    format!("printf {value}")
+}
+
+#[cfg(windows)]
+fn emit_command(value: &str) -> String {
+    format!("echo|set /p=\"{value}\"")
+}
+
+#[cfg(unix)]
+fn write_command(value: &str, path: &Path) -> String {
+    format!("printf {value} > '{}'", path.display())
+}
+
+#[cfg(windows)]
+fn write_command(value: &str, path: &Path) -> String {
+    format!("(echo|set /p=\"{value}\")>\"{}\"", path.display())
+}
+
+#[cfg(unix)]
+fn capture_stdin_command(path: &Path) -> String {
+    format!("cat > '{}'", path.display())
+}
+
+#[cfg(windows)]
+fn capture_stdin_command(path: &Path) -> String {
+    format!("more > \"{}\"", path.display())
+}
+
+#[cfg(unix)]
+fn delayed_emit_command(value: &str) -> String {
+    format!("sleep 1; printf {value}")
+}
+
+#[cfg(windows)]
+fn delayed_emit_command(value: &str) -> String {
+    format!("ping -n 3 127.0.0.1 >nul & echo|set /p=\"{value}\"")
+}
+
+#[cfg(unix)]
+fn bounded_output_command() -> String {
+    "yes x | head -c 600000".into()
+}
+
+#[cfg(windows)]
+fn bounded_output_command() -> String {
+    concat!(
+        "powershell.exe -NoProfile -NonInteractive -Command ",
+        "\"$b=[Text.Encoding]::ASCII.GetBytes(('x'+[char]10)*300000);",
+        "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)\""
+    )
+    .into()
+}
+
+#[cfg(unix)]
+const BOUNDED_OUTPUT_TIMEOUT_MS: u64 = 2_000;
+
+#[cfg(windows)]
+const BOUNDED_OUTPUT_TIMEOUT_MS: u64 = 5_000;
+
+#[cfg(unix)]
+fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
+    format!(
+        "printf ready > '{}'; (sleep 1; printf survived > '{}') & cat >/dev/null",
+        ready.display(),
+        survived.display()
+    )
+}
+
+#[cfg(windows)]
+fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
+    let survived = survived.display().to_string().replace('\'', "''");
+    format!(
+        concat!(
+            "(echo|set /p=\"ready\")>\"{}\" & ",
+            "start \"\" /B powershell.exe -NoProfile -NonInteractive -Command ",
+            "\"Start-Sleep -Seconds 1;[IO.File]::WriteAllText('{}','survived')\" & more >nul"
+        ),
+        ready.display(),
+        survived
+    )
+}
+
 fn write_profile_policy(profile: &Path, policy: &str) {
     std::fs::write(
         profile.join("hooks.json"),
@@ -410,7 +494,7 @@ impl EngineFixture {
 async fn untrusted_hook_never_executes_and_notices_honestly() {
     let marker_dir = tempfile::tempdir().expect("marker dir");
     let marker = marker_dir.path().join("untrusted-fired");
-    let command = format!("printf forbidden > '{}'", marker.display());
+    let command = write_command("forbidden", &marker);
     let fixture = EngineFixture::start_untrusted(&command, 1_000).await;
     let mut event = [raw_event(
         &fixture.session_id,
@@ -818,8 +902,8 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
     let output = tempfile::tempdir().expect("hook output");
     let headless_path = output.path().join("headless.json");
     let rpc_path = output.path().join("rpc.json");
-    let headless_command = format!("cat > '{}'", headless_path.display());
-    let rpc_command = format!("cat > '{}'", rpc_path.display());
+    let headless_command = capture_stdin_command(&headless_path);
+    let rpc_command = capture_stdin_command(&rpc_path);
 
     // These fixtures begin at the shared daemon acceptance seam. Surface
     // clients have already converged before the canonical fact is committed.
@@ -1133,7 +1217,7 @@ fn malformed_user_message_filters_are_skipped_honestly() {
 /// or does not select the committed AllowOnce option.
 #[tokio::test]
 async fn decision_hook_allow_uses_existing_menu_cas_and_allow_once_only() {
-    let fixture = EngineFixture::start("printf allow", 1_000, true, "exec").await;
+    let fixture = EngineFixture::start(&emit_command("allow"), 1_000, true, "exec").await;
     fixture
         .append_permission(broker_permission_menu(&fixture.workspace).await)
         .await;
@@ -1166,7 +1250,7 @@ async fn decision_hook_allow_uses_existing_menu_cas_and_allow_once_only() {
 /// committed RejectOnce option, or malformed output resolves the second menu.
 #[tokio::test]
 async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
-    let deny = EngineFixture::start("printf deny", 1_000, true, "exec").await;
+    let deny = EngineFixture::start(&emit_command("deny"), 1_000, true, "exec").await;
     deny.append_permission(broker_permission_menu(&deny.workspace).await)
         .await;
     let events = wait_for(&deny, |events| {
@@ -1192,7 +1276,7 @@ async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
     assert_eq!(answer.via, AnswerVia::Hook);
     deny.close().await;
 
-    let malformed = EngineFixture::start("printf maybe", 1_000, true, "exec").await;
+    let malformed = EngineFixture::start(&emit_command("maybe"), 1_000, true, "exec").await;
     malformed
         .append_permission(broker_permission_menu(&malformed.workspace).await)
         .await;
@@ -1219,7 +1303,7 @@ async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
 /// answer appears even though the hook cannot grant that scope.
 #[tokio::test]
 async fn decision_hook_cannot_exceed_committed_ask_scope() {
-    let fixture = EngineFixture::start("printf allow", 1_000, true, "exec").await;
+    let fixture = EngineFixture::start(&emit_command("allow"), 1_000, true, "exec").await;
     fixture
         .append_permission(permission_menu(vec![MenuOption {
             key: "allow_always".into(),
@@ -1303,7 +1387,7 @@ async fn durable_ask_bytes_without_hooks(workspace: &Path, menu: Menu) -> Vec<u8
 /// no-hook journal, or the paired allow fixture above ceases to resolve.
 #[tokio::test]
 async fn decision_timeout_falls_through_to_byte_identical_ask() {
-    let fixture = EngineFixture::start("sleep 1; printf allow", 20, true, "exec").await;
+    let fixture = EngineFixture::start(&delayed_emit_command("allow"), 20, true, "exec").await;
     let baseline = durable_ask_bytes_without_hooks(
         &fixture.workspace,
         broker_permission_menu(&fixture.workspace).await,
@@ -1349,7 +1433,7 @@ async fn decision_timeout_falls_through_to_byte_identical_ask() {
 async fn matcher_fires_only_after_commit() {
     let marker_dir = tempfile::tempdir().expect("marker dir");
     let marker = marker_dir.path().join("fired");
-    let command = format!("printf fired > '{}'", marker.display());
+    let command = write_command("fired", &marker);
     let fixture = EngineFixture::start(&command, 1_000, false, "exec").await;
     let mut seed = [raw_event(
         &fixture.session_id,
@@ -1412,7 +1496,7 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
         &workspace,
         "recovery_hook",
         "run_started",
-        &format!("printf recovered > '{}'", marker.display()),
+        &write_command("recovered", &marker),
         1_000,
         false,
         "exec",
@@ -1507,7 +1591,7 @@ async fn run_scoped_hook_trust_is_reduced_before_recovery_dispatch() {
         &workspace,
         "run_trust_hook",
         "run_started",
-        &format!("printf scoped > '{}'", marker.display()),
+        &write_command("scoped", &marker),
         1_000,
         false,
         "exec",
@@ -1607,7 +1691,7 @@ async fn digest_change_revokes_trust_before_fire() {
         &fixture.workspace,
         "test_hook",
         "run_started",
-        &format!("printf changed > '{}'", marker.display()),
+        &write_command("changed", &marker),
         1_000,
         false,
         "exec",
@@ -1836,7 +1920,13 @@ fn hook_secret_child_probe() {
 /// differs from the asserted values.
 #[tokio::test]
 async fn exec_output_is_bounded_and_overflow_is_in_cas() {
-    let fixture = EngineFixture::start("yes x | head -c 600000", 2_000, false, "exec").await;
+    let fixture = EngineFixture::start(
+        &bounded_output_command(),
+        BOUNDED_OUTPUT_TIMEOUT_MS,
+        false,
+        "exec",
+    )
+    .await;
     let mut event = [raw_event(
         &fixture.session_id,
         &fixture.run_id,
@@ -1971,11 +2061,7 @@ async fn subscribe_revoke_kills_the_entire_process_group() {
     let marker_guard = tempfile::tempdir().expect("marker");
     let ready = marker_guard.path().join("ready");
     let survived = marker_guard.path().join("survived");
-    let command = format!(
-        "printf ready > '{}'; (sleep 1; printf survived > '{}') & cat >/dev/null",
-        ready.display(),
-        survived.display()
-    );
+    let command = subscriber_tree_command(&ready, &survived);
     let fixture = EngineFixture::start(&command, 2_000, false, "subscribe").await;
     let mut event = [raw_event(
         &fixture.session_id,
@@ -2018,11 +2104,7 @@ async fn run_scoped_trust_authorizes_subscribe_only_for_that_run() {
     let marker_guard = tempfile::tempdir().expect("marker");
     let ready = marker_guard.path().join("ready");
     let survived = marker_guard.path().join("survived");
-    let command = format!(
-        "printf ready > '{}'; (sleep 1; printf survived > '{}') & cat >/dev/null",
-        ready.display(),
-        survived.display()
-    );
+    let command = subscriber_tree_command(&ready, &survived);
     let fixture = EngineFixture::start_with_trust(&command, 2_000, false, "subscribe", false).await;
     let generation = fixture.store.worker_generation();
     let mut started = [

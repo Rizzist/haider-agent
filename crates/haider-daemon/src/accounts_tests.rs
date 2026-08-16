@@ -21,10 +21,20 @@ use crate::oauth::{
 };
 
 fn test_store_dir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("hacct")
-        .tempdir_in("/tmp")
-        .unwrap_or_else(|error| panic!("tempdir: {error}"))
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new()
+            .prefix("hacct")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|error| panic!("tempdir: {error}"))
+    }
+    #[cfg(windows)]
+    {
+        tempfile::Builder::new()
+            .prefix("hacct")
+            .tempdir()
+            .unwrap_or_else(|error| panic!("tempdir: {error}"))
+    }
 }
 
 fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
@@ -1637,6 +1647,12 @@ fn run_oauth_import_env_child(test_name: &str, overrides: &[(&str, &std::path::P
         .env(OAUTH_IMPORT_ENV_CHILD, "1");
     for (key, path) in overrides {
         command.env(key, path);
+        #[cfg(windows)]
+        if *key == "HOME" {
+            // Production prefers USERPROFILE on Windows. Keep the respawned
+            // fixture hermetic instead of inheriting the runner account.
+            command.env("USERPROFILE", path);
+        }
     }
     let output = command.output().expect("spawn isolated import test");
     let stdout = String::from_utf8_lossy(&output.stdout);

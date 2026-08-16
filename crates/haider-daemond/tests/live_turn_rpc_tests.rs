@@ -640,6 +640,85 @@ fn payloads_for_run<'a>(
         .filter_map(|envelope| serde_json::from_value(envelope.payload.clone()).ok())
 }
 
+#[cfg(unix)]
+fn short_live_test_root(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in("/tmp")
+        .expect("short temporary root")
+}
+
+#[cfg(windows)]
+fn short_live_test_root(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("native temporary root")
+}
+
+#[cfg(unix)]
+const EXACT_ONCE_SHELL_COMMAND: &str = "printf 'once\\n' >> shell-count.txt; printf 'héllo\\n'";
+
+#[cfg(windows)]
+const EXACT_ONCE_SHELL_COMMAND: &str = concat!(
+    "powershell.exe -NoProfile -NonInteractive -Command ",
+    "\"[IO.File]::AppendAllText('shell-count.txt',('once'+[char]10),",
+    "[Text.Encoding]::ASCII);",
+    "$b=[Text.Encoding]::UTF8.GetBytes(('héllo'+[char]10));",
+    "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)\""
+);
+
+#[cfg(unix)]
+const DENIED_EXEC_COMMAND: &str = "printf denied > denied.log";
+
+#[cfg(windows)]
+const DENIED_EXEC_COMMAND: &str = "(echo|set /p=\"denied\")>denied.log";
+
+#[cfg(unix)]
+const APPROVED_EXEC_COMMAND: &str =
+    "printf 'run\\n' >> runs.log; printf stdout-ok; printf stderr-ok >&2";
+
+#[cfg(windows)]
+const APPROVED_EXEC_COMMAND: &str = concat!(
+    "powershell.exe -NoProfile -NonInteractive -Command ",
+    "\"[IO.File]::AppendAllText('runs.log',('run'+[char]10),",
+    "[Text.Encoding]::ASCII);",
+    "[Console]::Out.Write('stdout-ok');[Console]::Error.Write('stderr-ok')\""
+);
+
+#[cfg(unix)]
+const DIFFERENT_EXEC_COMMAND: &str = "printf different > different.log";
+
+#[cfg(windows)]
+const DIFFERENT_EXEC_COMMAND: &str = "(echo|set /p=\"different\")>different.log";
+
+#[cfg(unix)]
+const RESTART_EXEC_COMMAND: &str = "printf 'attempt\\n' >> attempts.log; printf started; sleep 1";
+
+#[cfg(windows)]
+const RESTART_EXEC_COMMAND: &str = concat!(
+    "powershell.exe -NoProfile -NonInteractive -Command ",
+    "\"[IO.File]::AppendAllText('attempts.log',('attempt'+[char]10),",
+    "[Text.Encoding]::ASCII);",
+    "[Console]::Out.Write('started');[Console]::Out.Flush();",
+    "Start-Sleep -Seconds 1\""
+);
+
+#[cfg(unix)]
+const CANCELLABLE_EXEC_COMMAND: &str = concat!(
+    "printf x >> heartbeat.log; printf started; ",
+    "while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done"
+);
+
+#[cfg(windows)]
+const CANCELLABLE_EXEC_COMMAND: &str = concat!(
+    "powershell.exe -NoProfile -NonInteractive -Command ",
+    "\"[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
+    "[Console]::Out.Write('started');[Console]::Out.Flush();",
+    "while($true){[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
+    "[Console]::Out.Write('y');[Console]::Out.Flush();Start-Sleep -Milliseconds 10}\""
+);
+
 /// Scenario 1: the production runtime is constructed with an injected,
 /// deterministic provider factory; no live provider is reachable.
 ///
@@ -671,10 +750,7 @@ async fn scenario_1_production_runtime_accepts_an_injected_fake_provider_factory
 /// typed local `vision_unsupported` refusal naming the selected provider.
 #[tokio::test]
 async fn vision_unsupported_provider_refuses_locally_with_typed_error() {
-    let root = tempfile::Builder::new()
-        .prefix("b4av-")
-        .tempdir_in("/tmp")
-        .expect("short temporary root");
+    let root = short_live_test_root("b4av-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let config = DaemonConfig::new(
@@ -747,10 +823,7 @@ async fn vision_unsupported_provider_refuses_locally_with_typed_error() {
 /// durable post-compaction journal no longer carries the original CAS ref.
 #[tokio::test]
 async fn compaction_summary_request_carries_no_image_attachments() {
-    let root = tempfile::Builder::new()
-        .prefix("b4ac-")
-        .tempdir_in("/tmp")
-        .expect("short temporary root");
+    let root = short_live_test_root("b4ac-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let config = DaemonConfig::new(
@@ -892,10 +965,7 @@ async fn compaction_summary_request_carries_no_image_attachments() {
 /// assertions below.
 #[tokio::test]
 async fn file_attachment_is_inlined_with_header_and_never_reaches_the_provider() {
-    let root = tempfile::Builder::new()
-        .prefix("g2af-")
-        .tempdir_in("/tmp")
-        .expect("short temporary root");
+    let root = short_live_test_root("g2af-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let config = DaemonConfig::new(
@@ -2682,7 +2752,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
     )
     .await;
     let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
-    let command = "printf 'once\\n' >> shell-count.txt; printf 'héllo\\n'";
+    let command = EXACT_ONCE_SHELL_COMMAND;
 
     send_request(
         &mut client,
@@ -4830,9 +4900,9 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
     let denied_path = workspace.join("denied.log");
     let runs_path = workspace.join("runs.log");
     let different_path = workspace.join("different.log");
-    let denied_command = "printf denied > denied.log";
-    let approved_command = "printf 'run\\n' >> runs.log; printf stdout-ok; printf stderr-ok >&2";
-    let different_command = "printf different > different.log";
+    let denied_command = DENIED_EXEC_COMMAND;
+    let approved_command = APPROVED_EXEC_COMMAND;
+    let different_command = DIFFERENT_EXEC_COMMAND;
     let config = DaemonConfig::new(
         "w4a2-exec-approval",
         root.path().join("store"),
@@ -6321,7 +6391,7 @@ async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let attempts = workspace.join("attempts.log");
-    let command = "printf 'attempt\\n' >> attempts.log; printf started; sleep 1";
+    let command = RESTART_EXEC_COMMAND;
     let config = DaemonConfig::new(
         "w4a2-exec-restart",
         root.path().join("store"),
@@ -6476,7 +6546,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let heartbeat = workspace.join("heartbeat.log");
-    let command = "printf x >> heartbeat.log; printf started; while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done";
+    let command = CANCELLABLE_EXEC_COMMAND;
     let config = DaemonConfig::new(
         "w4a2-exec-cancel",
         root.path().join("store"),

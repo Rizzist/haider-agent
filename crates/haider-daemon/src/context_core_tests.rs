@@ -75,6 +75,11 @@ impl ProviderFactory for FixedWindowProviderFactory {
     }
 }
 
+#[cfg(unix)]
+const BRANCH_EXEC_COMMAND: &str = "printf branch";
+#[cfg(windows)]
+const BRANCH_EXEC_COMMAND: &str = "echo|set /p=\"branch\"";
+
 /// MUTATION CHECK: leave the selected branch out of worker startup,
 /// `HarnessConfig`, or terminal sinks. Expected RUNTIME failure: at least one
 /// non-aggregate envelope for `branch-run` below is written on main.
@@ -93,7 +98,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         FakeStep::EmitToolCall {
             call_id: "branch-exec".into(),
             name: "process_exec".into(),
-            args: serde_json::json!({"command":"printf branch"}),
+            args: serde_json::json!({"command": BRANCH_EXEC_COMMAND}),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,

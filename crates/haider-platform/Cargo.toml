@@ -17,6 +17,7 @@ rustix = { workspace = true, features = ["system"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Pipes",
     "Win32_System_Threading",

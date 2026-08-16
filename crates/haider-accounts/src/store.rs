@@ -106,14 +106,13 @@ impl StoreLike for JsonFileStore {
             .and_then(|()| temporary.sync_all())
             .map_err(|error| file_error("write", &temporary_path, error))?;
         drop(temporary);
-        fs::rename(&temporary_path, &self.path)
+        haider_platform::replace_file(&temporary_path, &self.path)
             .map_err(|error| file_error("replace", &self.path, error))?;
         // R10 hardening: the rename is durable only once the PARENT
         // DIRECTORY is synced — the pending-login receipt reconciliation
         // protocol relies on a post-crash descriptor file reflecting every
         // acknowledged save.
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        haider_platform::sync_directory(parent)
             .map_err(|error| file_error("sync parent directory of", &self.path, error))
     }
 }

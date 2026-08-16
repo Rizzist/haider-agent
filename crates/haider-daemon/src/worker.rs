@@ -7350,6 +7350,10 @@ fn request_input_definition() -> ToolDefinition {
 }
 
 fn process_exec_definition() -> ToolDefinition {
+    #[cfg(unix)]
+    let command_description = "Exact shell program passed to /bin/sh -c";
+    #[cfg(windows)]
+    let command_description = "Exact shell program passed to cmd.exe /D /S /C";
     ToolDefinition {
         name: "process_exec".into(),
         description: "Run one non-interactive shell command inside the session workspace. \
@@ -7365,7 +7369,7 @@ fn process_exec_definition() -> ToolDefinition {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 8192,
-                    "description": "Exact shell program passed to /bin/sh -c"
+                    "description": command_description
                 },
                 "cwd": {
                     "type": "string",

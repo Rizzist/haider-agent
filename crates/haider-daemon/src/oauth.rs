@@ -3167,6 +3167,12 @@ async fn run_callback_flow(
     redirect_uri: Zeroizing<String>,
     mut cancel: watch::Receiver<bool>,
 ) {
+    enum CallbackWait {
+        Expired,
+        Cancelled,
+        Complete(CallbackResult),
+    }
+
     let deadline = tokio::time::sleep(inner.config.flow_ttl);
     tokio::pin!(deadline);
     let mut invalid = 0_usize;
@@ -3191,7 +3197,7 @@ async fn run_callback_flow(
                     invalid = invalid.saturating_add(1);
                     continue;
                 }
-                let callback_result = {
+                let callback_wait = {
                     let callback = read_callback(
                         &mut stream,
                         callback_path.as_str(),
@@ -3200,19 +3206,31 @@ async fn run_callback_flow(
                     );
                     tokio::pin!(callback);
                     tokio::select! {
-                        _ = &mut deadline => {
-                            set_terminal(&inner, &flow_id, InternalFlowStatus::Expired);
-                            return;
-                        }
+                        _ = &mut deadline => CallbackWait::Expired,
                         changed = cancel.changed() => {
                             if changed.is_err() || *cancel.borrow() {
-                                set_terminal(&inner, &flow_id, InternalFlowStatus::Cancelled);
-                                return;
+                                CallbackWait::Cancelled
+                            } else {
+                                continue;
                             }
-                            continue;
                         }
-                        result = &mut callback => result,
+                        result = &mut callback => CallbackWait::Complete(result),
                     }
+                };
+                let callback_result = match callback_wait {
+                    CallbackWait::Expired => {
+                        // An explicit half-close wakes Windows peers promptly;
+                        // relying on handle drop alone can defer observable EOF.
+                        let _ = stream.shutdown().await;
+                        set_terminal(&inner, &flow_id, InternalFlowStatus::Expired);
+                        return;
+                    }
+                    CallbackWait::Cancelled => {
+                        let _ = stream.shutdown().await;
+                        set_terminal(&inner, &flow_id, InternalFlowStatus::Cancelled);
+                        return;
+                    }
+                    CallbackWait::Complete(result) => result,
                 };
                 match callback_result {
                     CallbackResult::Invalid(reason) => {

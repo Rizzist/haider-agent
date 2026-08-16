@@ -1195,7 +1195,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -1383,6 +1382,7 @@ name = "haider-store"
 version = "0.0.921"
 dependencies = [
  "blake3",
+ "haider-platform",
  "haider-protocol",
  "rusqlite",
  "serde",

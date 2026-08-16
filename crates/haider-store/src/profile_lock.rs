@@ -18,6 +18,15 @@ pub(crate) struct ProfileLock {
     _file: File,
 }
 
+impl Drop for ProfileLock {
+    fn drop(&mut self) {
+        // Make the release boundary synchronous and explicit. Relying only
+        // on handle close can leave a just-closed profile briefly contended
+        // on macOS and Windows, where recovery immediately reopens it.
+        let _ = self._file.unlock();
+    }
+}
+
 impl ProfileLock {
     /// Takes the exclusive profile lock, or fails with `StoreLocked` if
     /// another live process holds it.

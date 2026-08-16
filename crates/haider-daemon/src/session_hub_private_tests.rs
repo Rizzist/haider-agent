@@ -22,6 +22,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
+#[cfg(unix)]
+const CANCELLABLE_SHELL_COMMAND: &str = "printf started; sleep 30";
+#[cfg(unix)]
+const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"printf started; sleep 30"}"#;
+#[cfg(windows)]
+const CANCELLABLE_SHELL_COMMAND: &str = "echo|set /p=\"started\" & ping -n 31 127.0.0.1 >nul";
+#[cfg(windows)]
+const CANCELLABLE_SHELL_REQUEST_JSON: &str =
+    r#"{"command":"echo|set /p=\"started\" & ping -n 31 127.0.0.1 >nul"}"#;
+
 fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
         provider: provider.to_owned(),
@@ -609,12 +619,17 @@ fn run_payload_envelope(
 }
 
 fn create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand {
+    #[cfg(unix)]
+    let cwd = "/tmp".into();
+    #[cfg(windows)]
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+
     SessionCreateCommand {
         command_id: format!("create-{suffix}"),
         request_digest: format!("create-digest-{suffix}"),
         request_json: format!(r#"{{"fixture":"{suffix}"}}"#),
         session_id: session_id.clone(),
-        cwd: "/tmp".into(),
+        cwd,
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4_096,
@@ -1351,12 +1366,12 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
         .accept_shell_exec(ShellExecAcceptCommand {
             command_id: "direct-shell-cancel-command".into(),
             request_digest: "direct-shell-cancel-digest".into(),
-            request_json: r#"{"command":"printf started; sleep 30"}"#.into(),
+            request_json: CANCELLABLE_SHELL_REQUEST_JSON.into(),
             session_id: session_id.clone(),
             worker_generation: generation,
             run_id: run_id.clone(),
             item_id: item_id.clone(),
-            command: "printf started; sleep 30".into(),
+            command: CANCELLABLE_SHELL_COMMAND.into(),
             running_event_id: EventId::new("direct-shell-cancel-running"),
             item_event_id: EventId::new("direct-shell-cancel-started"),
             active_event_id: EventId::new("direct-shell-cancel-active"),
@@ -1378,7 +1393,7 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
         .shell_exec(
             accepted,
             "direct-shell-cancel-command".into(),
-            "printf started; sleep 30".into(),
+            CANCELLABLE_SHELL_COMMAND.into(),
             None,
         )
         .await
@@ -1534,12 +1549,12 @@ async fn direct_shell_manager_drain_cancels_process_before_join() {
         .accept_shell_exec(ShellExecAcceptCommand {
             command_id: "direct-shell-drain-command".into(),
             request_digest: "direct-shell-drain-digest".into(),
-            request_json: r#"{"command":"printf started; sleep 30"}"#.into(),
+            request_json: CANCELLABLE_SHELL_REQUEST_JSON.into(),
             session_id: session_id.clone(),
             worker_generation: generation,
             run_id: run_id.clone(),
             item_id: item_id.clone(),
-            command: "printf started; sleep 30".into(),
+            command: CANCELLABLE_SHELL_COMMAND.into(),
             running_event_id: EventId::new("direct-shell-drain-running"),
             item_event_id: EventId::new("direct-shell-drain-started"),
             active_event_id: EventId::new("direct-shell-drain-active"),
@@ -1561,7 +1576,7 @@ async fn direct_shell_manager_drain_cancels_process_before_join() {
         .shell_exec(
             accepted,
             "direct-shell-drain-command".into(),
-            "printf started; sleep 30".into(),
+            CANCELLABLE_SHELL_COMMAND.into(),
             None,
         )
         .await

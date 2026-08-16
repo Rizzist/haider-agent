@@ -273,7 +273,7 @@ fn terminal_turn_cleanup_race_defers_one_owned_shell_handoff() {
 /// warning. Expected runtime failure: this source-level seam assertion fails.
 #[test]
 fn active_supervisor_shell_arm_uses_owned_deferred_handoff() {
-    let source = include_str!("worker.rs");
+    let source = include_str!("worker.rs").replace("\r\n", "\n");
     let arm = source
         .split_once(
             "Some(SupervisorCommand::ShellExec(pending)) => {\n                            // Store admission",

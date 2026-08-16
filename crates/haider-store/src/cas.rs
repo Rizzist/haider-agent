@@ -374,9 +374,7 @@ fn corrupt_object(path: &Path) -> HaiderError {
 /// Fsyncs a directory so its entries (hard links, new subdirectories) survive a
 /// crash.
 fn sync_directory(path: &Path) -> StoreResult<()> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error("sync directory", path, error))
+    haider_platform::sync_directory(path).map_err(|error| io_error("sync directory", path, error))
 }
 
 fn io_error(action: &str, path: &Path, error: std::io::Error) -> HaiderError {

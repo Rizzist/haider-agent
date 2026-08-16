@@ -50,6 +50,14 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+fn read_fixture(name: &str) -> String {
+    std::fs::read_to_string(fixture_path(name))
+        .unwrap_or_else(|_| panic!("missing fixture {name} — run with UPDATE_FIXTURES=1"))
+        // Git may materialize text fixtures with CRLF on Windows. The frozen
+        // wire representation remains canonical LF JSON on every platform.
+        .replace("\r\n", "\n")
+}
+
 fn golden<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(name: &str, value: &T) {
     let serialized = serde_json::to_string_pretty(value).expect("serialize");
     let path = fixture_path(name);
@@ -57,8 +65,7 @@ fn golden<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(name: &
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, &serialized).expect("write fixture");
     }
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("missing fixture {name} — run with UPDATE_FIXTURES=1"));
+    let expected = read_fixture(name);
     assert_eq!(
         serialized, expected,
         "fixture drift in {name}: schema change requires the freeze process"
@@ -72,8 +79,7 @@ fn additive_golden<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug
     value: &T,
 ) {
     let serialized = serde_json::to_string_pretty(value).expect("serialize");
-    let expected = std::fs::read_to_string(fixture_path(name))
-        .unwrap_or_else(|_| panic!("missing additive fixture {name}"));
+    let expected = read_fixture(name);
     let expected = expected.strip_suffix('\n').unwrap_or(&expected);
     assert_eq!(serialized, expected, "additive fixture drift in {name}");
     let back: T = serde_json::from_str(expected).expect("round-trip additive fixture");
