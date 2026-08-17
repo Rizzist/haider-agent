@@ -659,14 +659,44 @@ fn short_live_test_root(prefix: &str) -> tempfile::TempDir {
 #[cfg(unix)]
 const EXACT_ONCE_SHELL_COMMAND: &str = "printf 'once\\n' >> shell-count.txt; printf 'héllo\\n'";
 
+#[cfg(unix)]
+fn exact_once_shell_command() -> String {
+    EXACT_ONCE_SHELL_COMMAND.into()
+}
+
 #[cfg(windows)]
-const EXACT_ONCE_SHELL_COMMAND: &str = concat!(
-    "powershell.exe -NoProfile -NonInteractive -Command ",
-    "\"[IO.File]::AppendAllText('shell-count.txt',('once'+[char]10),",
-    "[Text.Encoding]::ASCII);",
-    "$b=[Text.Encoding]::UTF8.GetBytes(('héllo'+[char]10));",
-    "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)\""
-);
+fn exact_once_shell_command() -> String {
+    let executable = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(std::path::PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        });
+    let script = concat!(
+        "[IO.File]::AppendAllText('shell-count.txt',('once'+[char]10),",
+        "[Text.Encoding]::ASCII);",
+        "$b=[Text.Encoding]::UTF8.GetBytes(('héllo'+[char]10));",
+        "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)"
+    );
+    let encoded = BASE64.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    format!(
+        "\"{executable}\" -NoProfile -NonInteractive -EncodedCommand {encoded}",
+        executable = executable.display(),
+        encoded = encoded,
+    )
+}
 
 #[cfg(unix)]
 const DENIED_EXEC_COMMAND: &str = "printf denied > denied.log";
@@ -2752,7 +2782,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
     )
     .await;
     let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
-    let command = EXACT_ONCE_SHELL_COMMAND;
+    let command = exact_once_shell_command();
 
     send_request(
         &mut client,
@@ -2762,7 +2792,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
             command_id: CommandId::new("shell-command"),
             session_id: session_id.clone(),
             worker_generation: generation,
-            command: command.into(),
+            command: command.clone(),
             cwd: None,
         },
     )
@@ -2859,7 +2889,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
             command_id: CommandId::new("shell-command"),
             session_id: session_id.clone(),
             worker_generation: generation,
-            command: command.into(),
+            command: command.clone(),
             cwd: None,
         },
     )
@@ -2940,7 +2970,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
                 EventPayload::Item(ItemEvent::Started {
                     item: TurnItem::CommandExecution { call_id, command: stored, .. },
                     ..
-                }) if call_id == "shell-command" && stored == command
+                }) if call_id == "shell-command" && stored == &command
             ))
             .count(),
         1
@@ -3003,7 +3033,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
                 exit_code: Some(0),
             },
             ..
-        }) if call_id == "shell-command" && stored == command
+        }) if call_id == "shell-command" && stored == &command
     )));
     assert_eq!(
         payloads.last(),
@@ -6099,6 +6129,26 @@ impl HeldPatchLedger {
     }
 }
 
+struct HeldPatchReleaseGuard(Option<HeldPatchLedger>);
+
+impl HeldPatchReleaseGuard {
+    fn new(ledger: HeldPatchLedger) -> Self {
+        Self(Some(ledger))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for HeldPatchReleaseGuard {
+    fn drop(&mut self) {
+        if let Some(ledger) = self.0.take() {
+            ledger.release();
+        }
+    }
+}
+
 impl ChangeLedgerSink for HeldPatchLedger {
     fn record_fs_write(
         &self,
@@ -6136,8 +6186,11 @@ impl TurnToolFactory for HeldRealPatchFactory {
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        #[cfg(unix)]
         let mut policy = PermissionPolicy::default();
+        #[cfg(unix)]
         policy.allow(EffectClass::FsWrite);
+        #[cfg(unix)]
         let broker = EffectBroker::new(
             Box::new(TestHubJournal {
                 context: context.clone(),
@@ -6148,7 +6201,9 @@ impl TurnToolFactory for HeldRealPatchFactory {
         )
         .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
         Ok(Some(Arc::new(HeldRealPatchDispatcher {
+            #[cfg(unix)]
             broker: tokio::sync::Mutex::new(Some(broker)),
+            #[cfg(unix)]
             policy,
             context,
             calls: self.calls.clone(),
@@ -6199,7 +6254,9 @@ impl JournalSink for TestHubJournal {
 }
 
 struct HeldRealPatchDispatcher {
+    #[cfg(unix)]
     broker: tokio::sync::Mutex<Option<EffectBroker>>,
+    #[cfg(unix)]
     policy: PermissionPolicy,
     context: WorkerToolContext,
     calls: Arc<AtomicUsize>,
@@ -6219,39 +6276,204 @@ impl ToolDispatcher for HeldRealPatchDispatcher {
     ) -> Result<ToolDispatchResult, HaiderError> {
         assert_eq!(name, "fs_edit");
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let path = args["path"].as_str().expect("path");
-        let old = args["edits"][0]["old"].as_str().expect("old anchor");
-        let new = args["edits"][0]["new"].as_str().expect("new text");
-        let mut broker = self.broker.lock().await;
-        let broker = broker.as_mut().expect("open broker");
-        let bytes = fs::read(std::path::Path::new(&self.context.metadata.cwd).join(path))
-            .expect("read edit baseline");
-        broker
-            .restore_freshness([FileFreshness {
-                path: path.into(),
-                digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
-            }])
-            .expect("restore edit baseline");
-        let result = broker
-            .fs_edit(
-                &FsEdit::new(path, old, new),
-                &self.policy,
-                &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
-                &self.ledger,
-            )
-            .await
-            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
-        Ok(ToolDispatchResult::Completed(result))
+        #[cfg(windows)]
+        {
+            return execute_held_windows_patch(&self.context, &self.ledger, run_id, args).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = args["path"].as_str().expect("path");
+            let old = args["edits"][0]["old"].as_str().expect("old anchor");
+            let new = args["edits"][0]["new"].as_str().expect("new text");
+            let mut broker = self.broker.lock().await;
+            let broker = broker.as_mut().expect("open broker");
+            let bytes = fs::read(std::path::Path::new(&self.context.metadata.cwd).join(path))
+                .expect("read edit baseline");
+            broker
+                .restore_freshness([FileFreshness {
+                    path: path.into(),
+                    digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+                }])
+                .expect("restore edit baseline");
+            let result = broker
+                .fs_edit(
+                    &FsEdit::new(path, old, new),
+                    &self.policy,
+                    &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
+                    &self.ledger,
+                )
+                .await
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+            Ok(ToolDispatchResult::Completed(result))
+        }
     }
 
     async fn close(&self) -> Result<(), HaiderError> {
-        let Some(broker) = self.broker.lock().await.take() else {
-            return Ok(());
-        };
-        broker.close().await.map(|_| ()).map_err(|error| {
-            HaiderError::new(ErrorCode::EffectUnknownOutcome, error.to_string(), false)
-        })
+        #[cfg(unix)]
+        {
+            let Some(broker) = self.broker.lock().await.take() else {
+                return Ok(());
+            };
+            broker.close().await.map(|_| ()).map_err(|error| {
+                HaiderError::new(ErrorCode::EffectUnknownOutcome, error.to_string(), false)
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
     }
+}
+
+/// Windows deliberately keeps the production `fs_edit` broker unavailable
+/// until it can provide the same handle-anchored race guarantees as Unix.
+/// This recovery test needs a narrower seam: durable, correctly ordered
+/// FsWrite phases followed by a real file change and a held post-apply ledger
+/// boundary. The hermetic fixture owns the only writer, so a path-based edit is
+/// sufficient here without misrepresenting product support.
+#[cfg(windows)]
+async fn execute_held_windows_patch(
+    context: &WorkerToolContext,
+    ledger: &HeldPatchLedger,
+    run_id: &RunId,
+    args: serde_json::Value,
+) -> Result<ToolDispatchResult, HaiderError> {
+    let path = args["path"].as_str().ok_or_else(|| {
+        HaiderError::new(ErrorCode::InvalidArgument, "missing fixture path", false)
+    })?;
+    let old = args["edits"][0]["old"].as_str().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "missing fixture old anchor",
+            false,
+        )
+    })?;
+    let new = args["edits"][0]["new"].as_str().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "missing fixture replacement",
+            false,
+        )
+    })?;
+    let workspace = fs::canonicalize(&context.metadata.cwd).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("canonicalize fixture workspace: {error}"),
+            false,
+        )
+    })?;
+    let target = fs::canonicalize(workspace.join(path)).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("canonicalize fixture target: {error}"),
+            false,
+        )
+    })?;
+    if !target.starts_with(&workspace) {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "fixture target escaped its workspace",
+            false,
+        ));
+    }
+
+    let effect = EffectId::new(format!("w4a1-held-patch-{run_id}"));
+    let args_bytes = serde_json::to_vec(&args).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("encode fixture arguments: {error}"),
+            false,
+        )
+    })?;
+    let intent = EffectIntent {
+        effect: effect.clone(),
+        class: EffectClass::FsWrite,
+        summary: format!("patch {path}"),
+        args_digest: format!("blake3:{}", blake3::hash(&args_bytes).to_hex()),
+        workspace_revision: None,
+    };
+    let mut journal = TestHubJournal {
+        context: context.clone(),
+    };
+    for payload in [
+        EventPayload::Effect(EffectPhase::Intent(intent)),
+        EventPayload::Effect(EffectPhase::Authorized {
+            effect: effect.clone(),
+            verdict: AuthorizationVerdict::Allow,
+        }),
+        EventPayload::Effect(EffectPhase::Dispatched {
+            effect: effect.clone(),
+        }),
+    ] {
+        journal
+            .append(payload)
+            .await
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+    }
+
+    let before = fs::read_to_string(&target).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("read fixture target: {error}"),
+            false,
+        )
+    })?;
+    let matches = before.matches(old).count();
+    if matches != 1 {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!("fixture edit anchor matched {matches} times"),
+            false,
+        ));
+    }
+    let after = before.replacen(old, new, 1);
+    fs::write(&target, after.as_bytes()).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("write fixture target: {error}"),
+            false,
+        )
+    })?;
+
+    let ledger = ledger.clone();
+    let session_id = context.store.session_id().clone();
+    let run_id = run_id.clone();
+    let effect_for_record = effect;
+    let target_for_record = target.clone();
+    let post_digest_for_record = format!("blake3:{}", blake3::hash(after.as_bytes()).to_hex());
+    tokio::task::spawn_blocking(move || {
+        ledger.record_fs_write(
+            session_id,
+            run_id,
+            FsWriteRecord {
+                effect: effect_for_record,
+                paths: vec![target_for_record],
+                summary: "patch held Windows fixture target".into(),
+                bytes_hash: post_digest_for_record,
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("join fixture ledger boundary: {error}"),
+            false,
+        )
+    })?
+    .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+
+    Ok(ToolDispatchResult::Completed(
+        haider_protocol::tool::BoundedResult {
+            preview: format!("edited {} (1 replacement)", target.display()),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        },
+    ))
 }
 
 /// MUTATION CHECK: remove startup Dispatched-without-Outcome reconciliation
@@ -6288,6 +6510,7 @@ async fn w4a1_dispatched_real_fs_edit_restarts_as_unknown_without_redispatch() {
         reached: Arc::new(Semaphore::new(0)),
         release: Arc::new((StdMutex::new(false), Condvar::new())),
     };
+    let mut release_on_unwind = HeldPatchReleaseGuard::new(ledger.clone());
     dependencies.tool_factory = Arc::new(HeldRealPatchFactory {
         calls: calls.clone(),
         ledger: ledger.clone(),
@@ -6329,6 +6552,7 @@ async fn w4a1_dispatched_real_fs_edit_restarts_as_unknown_without_redispatch() {
     drop(first);
     first_task.crash().await;
     ledger.release();
+    release_on_unwind.disarm();
 
     let second_task = ready_with_dependencies(&config, dependencies).await;
     let mut second = UdsClient::connect_control(

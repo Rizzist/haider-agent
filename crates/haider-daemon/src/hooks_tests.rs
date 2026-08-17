@@ -175,6 +175,24 @@ fn powershell_command(script: &str) -> String {
     )
 }
 
+#[cfg(unix)]
+const USER_MESSAGE_CAPTURE_TIMEOUT_MS: u64 = 1_000;
+
+#[cfg(windows)]
+const USER_MESSAGE_CAPTURE_TIMEOUT_MS: u64 = 5_000;
+
+#[cfg(unix)]
+const USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(windows)]
+const USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(unix)]
+const BOUNDED_OUTPUT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(windows)]
+const BOUNDED_OUTPUT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn write_profile_policy(profile: &Path, policy: &str) {
     std::fs::write(
         profile.join("hooks.json"),
@@ -354,7 +372,15 @@ impl EngineFixture {
     }
 
     async fn start_user_message(command: &str) -> Self {
-        Self::start_with_event_and_trust(command, 1_000, false, "exec", true, "user_message").await
+        Self::start_with_event_and_trust(
+            command,
+            USER_MESSAGE_CAPTURE_TIMEOUT_MS,
+            false,
+            "exec",
+            true,
+            "user_message",
+        )
+        .await
     }
 
     async fn start_untrusted(command: &str, timeout_ms: u64) -> Self {
@@ -776,7 +802,15 @@ async fn wait_for(
     fixture: &EngineFixture,
     predicate: impl Fn(&[RawEnvelope]) -> bool,
 ) -> Vec<RawEnvelope> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    wait_for_with_timeout(fixture, Duration::from_secs(5), predicate).await
+}
+
+async fn wait_for_with_timeout(
+    fixture: &EngineFixture,
+    timeout: Duration,
+    predicate: impl Fn(&[RawEnvelope]) -> bool,
+) -> Vec<RawEnvelope> {
+    tokio::time::timeout(timeout, async {
         loop {
             let events = fixture.events().await;
             if predicate(&events) {
@@ -978,12 +1012,16 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
             vec![],
         )
         .await;
-    let headless_events = wait_for(&headless, |events| {
-        events.iter().any(|event| {
-            HookEventPayload::from_payload_value(event.payload.clone())
-                .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
-        })
-    })
+    let headless_events = wait_for_with_timeout(
+        &headless,
+        USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT,
+        |events| {
+            events.iter().any(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone())
+                    .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+            })
+        },
+    )
     .await;
     assert_eq!(
         headless_events
@@ -1005,13 +1043,14 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         vec![],
     )
     .await;
-    let rpc_events = wait_for(&rpc, |events| {
-        events.iter().any(|event| {
-            HookEventPayload::from_payload_value(event.payload.clone())
-                .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+    let rpc_events =
+        wait_for_with_timeout(&rpc, USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT, |events| {
+            events.iter().any(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone())
+                    .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+            })
         })
-    })
-    .await;
+        .await;
     assert_eq!(
         rpc_events
             .iter()
@@ -1997,7 +2036,7 @@ async fn exec_output_is_bounded_and_overflow_is_in_cas() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut event).await.expect("commit fact");
-    let events = wait_for(&fixture, |events| {
+    let events = wait_for_with_timeout(&fixture, BOUNDED_OUTPUT_OBSERVATION_TIMEOUT, |events| {
         events.iter().any(|event| {
             matches!(
                 HookEventPayload::from_payload_value(event.payload.clone()),

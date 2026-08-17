@@ -62,7 +62,10 @@ pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
 
+    #[cfg(unix)]
     configure_daemon(&mut command);
+    #[cfg(windows)]
+    configure_daemon(&mut command).map_err(DaemonSpawnError::Spawn)?;
     command.spawn().map_err(DaemonSpawnError::Spawn)
 }
 
@@ -82,12 +85,96 @@ fn configure_daemon(command: &mut std::process::Command) {
 }
 
 #[cfg(windows)]
-fn configure_daemon(command: &mut std::process::Command) {
+#[allow(unsafe_code)]
+fn configure_daemon(command: &mut std::process::Command) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
-    // Rust's Command implementation builds an explicit inherited-handle list
-    // for redirected stdio on supported Windows versions. Only the three
-    // configured standard handles are therefore inherited by the daemon.
+    // Rust's stable `Command` duplicates the three configured child stdio
+    // handles as inheritable, but still calls `CreateProcessW` with
+    // `bInheritHandles=TRUE` and no explicit handle list. If this launcher was
+    // itself started with captured stdio, those original pipe handles are
+    // inheritable too. A daemon that outlives the launcher then keeps the
+    // capture pipes open forever, so `Command::output` never observes EOF.
+    //
+    // Clear inheritance on the launcher's standard handles permanently — the
+    // Windows equivalent of CLOEXEC. A later Rust child that intentionally
+    // uses `Stdio::inherit` still works: `Command` duplicates the selected
+    // handle with inheritance enabled for that one spawn.
+    for (kind, name) in [
+        (STD_INPUT_HANDLE, "stdin"),
+        (STD_OUTPUT_HANDLE, "stdout"),
+        (STD_ERROR_HANDLE, "stderr"),
+    ] {
+        let handle = unsafe { GetStdHandle(kind) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        clear_handle_inheritance(handle, name)?;
+    }
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn clear_handle_inheritance(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    name: &str,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+        return Ok(());
+    }
+    let source = std::io::Error::last_os_error();
+    Err(std::io::Error::new(
+        source.kind(),
+        format!("cannot clear inheritance on daemon launcher's {name}: {source}"),
+    ))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
+    };
+
+    use super::clear_handle_inheritance;
+
+    /// The daemon-spawn hygiene must clear the exact Win32 flag that would
+    /// otherwise let a long-lived daemon retain its launcher's capture pipe.
+    #[test]
+    #[allow(unsafe_code)]
+    fn daemon_spawn_hygiene_clears_an_inheritable_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "haider-platform-inheritance-{}.tmp",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("create inheritance fixture");
+        let handle = file.as_raw_handle().cast();
+        assert_ne!(
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) },
+            0,
+            "make fixture handle inheritable"
+        );
+
+        clear_handle_inheritance(handle, "fixture").expect("clear fixture inheritance");
+        let mut flags = 0;
+        assert_ne!(
+            unsafe { GetHandleInformation(handle, &mut flags) },
+            0,
+            "read fixture handle flags"
+        );
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+
+        drop(file);
+        std::fs::remove_file(path).expect("remove inheritance fixture");
+    }
 }

@@ -91,6 +91,10 @@ impl Drop for HaiderCommand {
 }
 
 fn ensure_haiderd_built() {
+    // Cargo is the freshness authority for the production sibling the CLI
+    // executes. The gate's compile phase normally makes this a cheap no-op;
+    // the Once keeps a focused or cold suite to one bounded build while
+    // ensuring an existing but stale daemon is never trusted by path alone.
     static BUILD: std::sync::Once = std::sync::Once::new();
     BUILD.call_once(|| {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -357,23 +361,28 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
     // miss the startup deadline (exit 69 = unavailable) before the
     // credential law is even reachable. The law under test is the 65
     // classification, not spawn latency.
+    let profile = profile_parent.path().join("profile");
+    let mut command = haider();
+    // `HaiderCommand` owns daemon cleanup. Keep its cleanup identity aligned
+    // with this test's explicit profile instead of leaking the real daemon
+    // while trying to terminate the helper's unused throwaway profile.
+    command.profile = profile.clone();
+    command
+        .env("HAIDER_PROFILE_DIR", &profile)
+        .args([
+            "run",
+            "--jsonl",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-5",
+            "hello",
+        ])
+        .env_remove("HAIDER_TEST_FAKE_PROVIDER")
+        .env_remove("HAIDER_ANTHROPIC_API_KEY");
     let mut out = None;
     for _ in 0..2 {
-        let attempt = haider()
-            .env("HAIDER_PROFILE_DIR", profile_parent.path().join("profile"))
-            .args([
-                "run",
-                "--jsonl",
-                "--provider",
-                "anthropic",
-                "--model",
-                "claude-sonnet-5",
-                "hello",
-            ])
-            .env_remove("HAIDER_TEST_FAKE_PROVIDER")
-            .env_remove("HAIDER_ANTHROPIC_API_KEY")
-            .output()
-            .expect("binary runs");
+        let attempt = command.output().expect("binary runs");
         let unavailable = attempt.status.code() == Some(69);
         out = Some(attempt);
         if !unavailable {
