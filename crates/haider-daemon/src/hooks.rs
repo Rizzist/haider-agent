@@ -57,7 +57,7 @@ use tokio::task::{JoinHandle, JoinSet};
 #[cfg(unix)]
 type DirectoryHandle = OwnedFd;
 #[cfg(windows)]
-type DirectoryHandle = PathBuf;
+type DirectoryHandle = haider_platform::WorkspaceDirectory;
 #[cfg(unix)]
 type DirectoryOpenError = rustix::io::Errno;
 #[cfg(windows)]
@@ -1678,41 +1678,61 @@ async fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    haider_platform::configure_process_environment(&mut command);
     for name in ENV_ALLOWLIST {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
     haider_platform::configure_process_group(&mut command);
+    #[cfg(unix)]
     configure_hook_cwd(&mut command, cwd_fd);
+    #[cfg(windows)]
+    configure_hook_cwd(&mut command, &cwd_fd);
     haider_platform::configure_background_process(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return failed_process_output(&format!("hook spawn failed: {error}")),
     };
-    let pid = child
-        .id()
-        .and_then(|pid| haider_platform::process_group(Some(pid)));
-    let process_group = ProcessGroupGuard { pid };
+    let Some(raw_pid) = child.id() else {
+        let _ = child.start_kill();
+        return failed_process_output("hook process did not expose a process id");
+    };
+    let pid = match haider_platform::register_process_group(raw_pid) {
+        Ok(group) => Some(group),
+        Err(error) => {
+            let _ = child.start_kill();
+            return failed_process_output(&format!(
+                "hook process-group registration failed: {error}"
+            ));
+        }
+    };
+    let leader_pid = haider_platform::process_id(Some(raw_pid));
+    let mut process_group = ProcessGroupGuard { pid };
     let mut stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let execution = async {
+    let Some(stdout) = child.stdout.take() else {
+        process_group.kill();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return failed_process_output("hook stdout unavailable");
+    };
+    let Some(stderr) = child.stderr.take() else {
+        process_group.kill();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return failed_process_output("hook stderr unavailable");
+    };
+    let stdout_task = tokio::spawn(read_limited(stdout, MAX_STREAM_OUTPUT_BYTES));
+    let stderr_task = tokio::spawn(read_limited(stderr, MAX_STREAM_OUTPUT_BYTES));
+    let leader = async {
         if let Some(mut stdin) = stdin.take() {
             stdin.write_all(input).await?;
             stdin.shutdown().await?;
         }
-        let stdout = stdout.ok_or_else(|| std::io::Error::other("hook stdout unavailable"))?;
-        let stderr = stderr.ok_or_else(|| std::io::Error::other("hook stderr unavailable"))?;
-        let (stdout, stderr, status) = tokio::join!(
-            read_limited(stdout, MAX_STREAM_OUTPUT_BYTES),
-            read_limited(stderr, MAX_STREAM_OUTPUT_BYTES),
-            child.wait(),
-        );
-        Ok::<_, std::io::Error>((stdout?, stderr?, status?))
+        observe_hook_leader_exit(&mut child, leader_pid).await
     };
     let outcome = tokio::select! {
-        outcome = tokio::time::timeout(definition.timeout, execution) => Some(outcome),
+        outcome = tokio::time::timeout(definition.timeout, leader) => Some(outcome),
         _ = shutdown.changed() => None,
     };
     match outcome {
@@ -1720,42 +1740,117 @@ async fn run_command(
             process_group.kill();
             let _ = child.start_kill();
             let _ = child.wait().await;
+            let _ = await_hook_capture(stdout_task).await;
+            let _ = await_hook_capture(stderr_task).await;
             cancelled_process_output()
         }
-        Some(Ok(Ok((stdout, stderr, status)))) => HookProcessResult {
-            exit_code: status.code(),
-            timed_out: false,
-            cancelled: false,
-            stdout: make_output(store, stdout).await,
-            stderr: make_output(store, stderr).await,
-            proposed_decision: None,
-        },
-        Some(Ok(Err(error))) => failed_process_output(&format!("hook execution failed: {error}")),
+        Some(Ok(Ok(status))) => {
+            // The leader is reaped, but a descendant can still own inherited
+            // output handles. Terminate the Job before draining so natural
+            // leader exit cannot park the hook until its wall timeout.
+            process_group.kill();
+            let status = match status {
+                Some(status) => status,
+                None => match child.wait().await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let _ = await_hook_capture(stdout_task).await;
+                        let _ = await_hook_capture(stderr_task).await;
+                        return failed_process_output(&format!("hook leader reap failed: {error}"));
+                    }
+                },
+            };
+            let stdout = await_hook_capture(stdout_task).await;
+            let stderr = await_hook_capture(stderr_task).await;
+            match (stdout, stderr) {
+                (Ok(stdout), Ok(stderr)) => HookProcessResult {
+                    exit_code: status.code(),
+                    timed_out: false,
+                    cancelled: false,
+                    stdout: make_output(store, stdout).await,
+                    stderr: make_output(store, stderr).await,
+                    proposed_decision: None,
+                },
+                (Err(error), _) | (_, Err(error)) => {
+                    failed_process_output(&format!("hook output capture failed: {error}"))
+                }
+            }
+        }
+        Some(Ok(Err(error))) => {
+            process_group.kill();
+            let _ = await_hook_capture(stdout_task).await;
+            let _ = await_hook_capture(stderr_task).await;
+            failed_process_output(&format!("hook execution failed: {error}"))
+        }
         Some(Err(_)) => {
             process_group.kill();
             let _ = child.start_kill();
             let _ = child.wait().await;
+            let stdout = await_hook_capture(stdout_task).await.ok();
+            let stderr = await_hook_capture(stderr_task).await.ok();
             HookProcessResult {
                 exit_code: None,
                 timed_out: true,
                 cancelled: false,
-                stdout: empty_output(),
-                stderr: empty_output(),
+                stdout: match stdout {
+                    Some(stdout) => make_output(store, stdout).await,
+                    None => empty_output(),
+                },
+                stderr: match stderr {
+                    Some(stderr) => make_output(store, stderr).await,
+                    None => empty_output(),
+                },
                 proposed_decision: None,
             }
         }
     }
 }
 
+#[cfg(windows)]
+async fn observe_hook_leader_exit(
+    child: &mut tokio::process::Child,
+    _pid: Option<haider_platform::ProcessId>,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    child.wait().await.map(Some)
+}
+
+#[cfg(unix)]
+async fn observe_hook_leader_exit(
+    _child: &mut tokio::process::Child,
+    pid: Option<haider_platform::ProcessId>,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let pid = pid.ok_or_else(|| std::io::Error::other("hook leader PID is unavailable"))?;
+    loop {
+        if haider_platform::process_leader_exited(pid)? {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn await_hook_capture(
+    task: tokio::task::JoinHandle<std::io::Result<CapturedBytes>>,
+) -> std::io::Result<CapturedBytes> {
+    task.await
+        .map_err(|error| std::io::Error::other(format!("output reader stopped: {error}")))?
+}
+
 async fn read_limited(
-    reader: impl AsyncRead + Unpin,
+    mut reader: impl AsyncRead + Unpin,
     cap: usize,
 ) -> std::io::Result<CapturedBytes> {
-    let limit = u64::try_from(cap.saturating_add(1)).unwrap_or(u64::MAX);
     let mut bytes = Vec::with_capacity(cap.min(INLINE_OUTPUT_BYTES));
-    reader.take(limit).read_to_end(&mut bytes).await?;
-    let truncated = bytes.len() > cap;
-    bytes.truncate(cap);
+    let mut chunk = [0_u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let retained = cap.saturating_sub(bytes.len()).min(read);
+        bytes.extend_from_slice(&chunk[..retained]);
+        truncated |= retained < read;
+    }
     Ok(CapturedBytes { bytes, truncated })
 }
 
@@ -1840,10 +1935,11 @@ struct ProcessGroupGuard {
 }
 
 impl ProcessGroupGuard {
-    fn kill(&self) {
-        if let Some(pid) = self.pid {
+    fn kill(&mut self) {
+        if let Some(pid) = self.pid.take() {
             let _ =
                 haider_platform::signal_process_group(pid, haider_platform::ProcessSignal::Kill);
+            haider_platform::release_process_group(pid);
         }
     }
 }
@@ -1869,7 +1965,7 @@ async fn run_subscriber(
         if *shutdown.borrow() || !definition_current(&service, &definition, run_override).await {
             break;
         }
-        let Some(mut child) = spawn_subscriber(&definition) else {
+        let Some((mut child, group)) = spawn_subscriber(&definition) else {
             service
                 .journal(
                     &cause,
@@ -1903,11 +1999,7 @@ async fn run_subscriber(
             backoff = next_subscriber_backoff(backoff);
             continue;
         };
-        let process_group = ProcessGroupGuard {
-            pid: child
-                .id()
-                .and_then(|pid| haider_platform::process_group(Some(pid))),
-        };
+        let mut process_group = ProcessGroupGuard { pid: Some(group) };
         let mut stdin = child.stdin.take();
         service
             .journal(
@@ -2028,7 +2120,9 @@ async fn subscriber_backoff(
     }
 }
 
-fn spawn_subscriber(definition: &HookDefinition) -> Option<tokio::process::Child> {
+fn spawn_subscriber(
+    definition: &HookDefinition,
+) -> Option<(tokio::process::Child, haider_platform::ProcessGroup)> {
     let cwd_fd = open_canonical_directory(&definition.workspace_cwd)?;
     let mut command = hook_command(&definition.command);
     command
@@ -2037,15 +2131,28 @@ fn spawn_subscriber(definition: &HookDefinition) -> Option<tokio::process::Child
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    haider_platform::configure_process_environment(&mut command);
     for name in ENV_ALLOWLIST {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
     haider_platform::configure_process_group(&mut command);
+    #[cfg(unix)]
     configure_hook_cwd(&mut command, cwd_fd);
+    #[cfg(windows)]
+    configure_hook_cwd(&mut command, &cwd_fd);
     haider_platform::configure_background_process(&mut command);
-    command.spawn().ok()
+    let mut child = command.spawn().ok()?;
+    let raw_pid = child.id()?;
+    let group = match haider_platform::register_process_group(raw_pid) {
+        Ok(group) => group,
+        Err(_) => {
+            let _ = child.start_kill();
+            return None;
+        }
+    };
+    Some((child, group))
 }
 
 async fn write_jsonl(
@@ -2338,15 +2445,36 @@ fn read_hook_bytes(
     path: &Path,
     notices: &mut Vec<HookNotice>,
 ) -> Option<Vec<u8>> {
-    let candidate = directory.join(HOOKS_FILE);
-    let metadata = match fs::symlink_metadata(&candidate) {
-        Ok(metadata) => metadata,
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let candidate = directory.path().join(HOOKS_FILE);
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&candidate)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             notices.push(notice(
                 None,
                 path,
                 format!("hook configuration was skipped: {error}"),
+            ));
+            return None;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            notices.push(notice(
+                None,
+                path,
+                format!("hook configuration metadata failed: {error}"),
             ));
             return None;
         }
@@ -2361,17 +2489,6 @@ fn read_hook_bytes(
     }
     let mut bytes = Vec::with_capacity(MAX_HOOK_CONFIG_BYTES.min(16 * 1024));
     let limit = u64::try_from(MAX_HOOK_CONFIG_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
-    let file = match fs::File::open(&candidate) {
-        Ok(file) => file,
-        Err(error) => {
-            notices.push(notice(
-                None,
-                path,
-                format!("hook configuration could not be read: {error}"),
-            ));
-            return None;
-        }
-    };
     if let Err(error) = file.take(limit).read_to_end(&mut bytes) {
         notices.push(notice(
             None,
@@ -2425,21 +2542,7 @@ fn hook_command(script: &str) -> tokio::process::Command {
 fn hook_command(script: &str) -> tokio::process::Command {
     use std::os::windows::process::CommandExt as _;
 
-    // CreateProcess does not resolve a bare executable against the child
-    // environment installed below. Pin the interpreter before `env_clear`,
-    // using the system directory rather than relying on a runner's PATH.
-    let interpreter = std::env::var_os("COMSPEC")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute() && path.is_file())
-        .or_else(|| {
-            std::env::var_os("SystemRoot")
-                .or_else(|| std::env::var_os("WINDIR"))
-                .map(PathBuf::from)
-                .map(|root| root.join("System32").join("cmd.exe"))
-                .filter(|path| path.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
-    let mut command = tokio::process::Command::new(interpreter);
+    let mut command = tokio::process::Command::new(haider_platform::windows_command_interpreter());
     command.args(["/D", "/S", "/C"]);
     command.as_std_mut().raw_arg(format!("\"{script}\""));
     command
@@ -2460,8 +2563,8 @@ fn configure_hook_cwd(command: &mut tokio::process::Command, directory: Director
 }
 
 #[cfg(windows)]
-fn configure_hook_cwd(command: &mut tokio::process::Command, directory: DirectoryHandle) {
-    command.current_dir(directory);
+fn configure_hook_cwd(command: &mut tokio::process::Command, directory: &DirectoryHandle) {
+    command.current_dir(directory.path());
 }
 
 #[cfg(unix)]
@@ -2511,10 +2614,7 @@ fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
     if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
         return None;
     }
-    fs::symlink_metadata(path)
-        .ok()
-        .filter(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())?;
-    Some(path.to_path_buf())
+    haider_platform::open_workspace_directory(path).ok()
 }
 
 #[cfg(windows)]
@@ -2522,16 +2622,21 @@ fn open_directory_at(
     directory: &DirectoryHandle,
     path: &Path,
 ) -> Result<DirectoryHandle, DirectoryOpenError> {
-    let candidate = directory.join(path);
-    let canonical = fs::canonicalize(&candidate)?;
-    let metadata = fs::symlink_metadata(&candidate)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(std::io::Error::other("path is not a real directory"));
+    if path == Path::new("..") {
+        let parent = directory.path().parent().unwrap_or(directory.path());
+        return haider_platform::open_workspace_directory(parent);
     }
-    Ok(canonical)
+    let duplicate = haider_platform::duplicate_workspace_directory(directory)?;
+    haider_platform::open_workspace_subdirectory(duplicate, path, false)
 }
 
 #[cfg(windows)]
 fn same_directory(left: &DirectoryHandle, right: &DirectoryHandle) -> bool {
-    left == right
+    matches!(
+        (
+            haider_platform::workspace_directory_identity(left),
+            haider_platform::workspace_directory_identity(right),
+        ),
+        (Ok(left), Ok(right)) if left == right
+    )
 }

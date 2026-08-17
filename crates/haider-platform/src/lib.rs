@@ -14,10 +14,17 @@ mod spawn;
 mod system;
 mod user;
 
+#[cfg(windows)]
+pub use directory::{
+    WindowsFileIdentity, open_workspace_subdirectory, windows_file_identity,
+    workspace_directory_contains_identity, workspace_directory_identity,
+};
 pub use directory::{
     WorkspaceDirectory, WorkspaceDirectoryError, duplicate_workspace_directory,
     open_workspace_directory,
 };
+#[cfg(windows)]
+pub use fs::replace_file_with_backup;
 pub use fs::{
     configure_directory_mode, configure_file_mode, metadata_is_current_user, metadata_link_count,
     metadata_mode, replace_file, set_mode, sync_directory,
@@ -27,11 +34,14 @@ pub use ipc::{
     PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner, split,
     write_immediate,
 };
+#[cfg(windows)]
+pub use process::windows_command_interpreter;
 pub use process::{
-    ProcessGroup, ProcessId, ProcessSignal, configure_background_process, configure_process_group,
-    exit_signal, kill_process_tree, process_error_is_missing, process_error_is_permission,
-    process_group, process_group_exists, process_id, process_leader_exited, signal_process,
-    signal_process_group, signal_process_group_id,
+    ProcessGroup, ProcessId, ProcessSignal, configure_background_process,
+    configure_process_environment, configure_process_group, exit_signal, kill_process_tree,
+    process_error_is_missing, process_error_is_permission, process_group, process_group_exists,
+    process_id, process_leader_exited, register_process_group, release_process_group,
+    signal_process, signal_process_group, signal_process_group_id,
 };
 pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdown_signal};
 pub use spawn::{DaemonSpawn, DaemonSpawnError, spawn_daemon};

@@ -50,6 +50,17 @@
 //!   check and preventable same-inode clobbers are typed refusals rather than
 //!   silent overwrites. The remaining non-cooperating races and filesystem
 //!   bounds are ledgered in `docs/OPTIMIZATIONS.md`.
+//! - Windows write/edit preserve the same freshness, blocking-critical-section,
+//!   atomic-publication, ledger, and finalizer laws through their native path
+//!   seam: component walks retain non-reparse directory handles without
+//!   delete-sharing, target file locks serialize cooperating Haider writers,
+//!   same-directory synced temporaries remain pinned and publish through
+//!   handle-based Windows rename, and both parent/file identities and source
+//!   bytes are revalidated immediately before publication. `fs_path` uses the
+//!   same retained-parent boundary and stages recursive copies before their
+//!   visible commit.
+//!   As on non-Apple Unix, a non-cooperating namespace swap in the final
+//!   userspace-check-to-rename gap remains an explicitly bounded limitation.
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
@@ -68,6 +79,8 @@ use std::ffi::CStr;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
@@ -1658,21 +1671,14 @@ fn read_path_at(
             "fs_read limit must be one or greater",
         ));
     }
-    let target = windows_anchored_path(&workspace_dir, relative, display_path)?;
-    let metadata = fs::symlink_metadata(&target)
+    let (_parent, target, mut entry) =
+        windows_anchored_entry(&workspace_dir, relative, display_path)?;
+    let metadata = entry
+        .handle
+        .metadata()
         .map_err(|error| ToolError::io("inspect", display_path, error))?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::PathChanged {
-            path: display_path.to_path_buf(),
-            message: "symbolic links are refused".into(),
-        });
-    }
     if metadata.is_file() {
-        let contents = read_utf8_file(
-            fs::File::open(&target)
-                .map_err(|error| ToolError::io("open for read", display_path, error))?,
-            display_path,
-        )?;
+        let contents = read_utf8_file(entry.handle, display_path)?;
         let digest = format!("blake3:{}", blake3::hash(contents.as_bytes()).to_hex());
         let contents = if offset.is_some() || limit.is_some() {
             select_numbered_lines(&contents, offset.unwrap_or(1), limit)
@@ -1723,9 +1729,9 @@ fn search_files_at(
             "fs_search query cannot be empty",
         ));
     }
-    let root = windows_anchored_path(&workspace_dir, relative, &operation.root)?;
+    let (_parent, root, entry) = windows_anchored_entry(&workspace_dir, relative, &operation.root)?;
     let mut matches = SearchCollector::new(max_preview_bytes)?;
-    windows_walk_files(&root, &mut |path| {
+    windows_walk_files(&root, entry, &mut |path, file| {
         let path_under_root = path.strip_prefix(&root).unwrap_or(path);
         let match_path = windows_relative_path(path_under_root)?;
         if operation
@@ -1735,7 +1741,10 @@ fn search_files_at(
         {
             return Ok(());
         }
-        let bytes = fs::read(path).map_err(|error| ToolError::io("read", path, error))?;
+        let mut bytes = Vec::new();
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_end(&mut bytes))
+            .map_err(|error| ToolError::io("read", path, error))?;
         let Ok(contents) = std::str::from_utf8(&bytes) else {
             return Ok(());
         };
@@ -1761,9 +1770,9 @@ fn glob_files_at(
             "fs_glob pattern cannot be empty",
         ));
     }
-    let root = windows_anchored_path(&workspace_dir, relative, &operation.root)?;
+    let (_parent, root, entry) = windows_anchored_entry(&workspace_dir, relative, &operation.root)?;
     let mut matches = GlobCollector::new();
-    windows_walk_files(&root, &mut |path| {
+    windows_walk_files(&root, entry, &mut |path, _file| {
         let path_under_root = path.strip_prefix(&root).unwrap_or(path);
         let candidate = windows_relative_path(path_under_root)?;
         if glob_matches(&operation.pattern, &candidate) {
@@ -1782,22 +1791,15 @@ fn glob_files_at(
 #[cfg(windows)]
 fn windows_walk_files(
     root: &Path,
-    visit: &mut impl FnMut(&Path) -> ToolResult<()>,
+    mut entry: WindowsPathEntry,
+    visit: &mut impl FnMut(&Path, &mut fs::File) -> ToolResult<()>,
 ) -> ToolResult<()> {
-    let metadata =
-        fs::symlink_metadata(root).map_err(|error| ToolError::io("inspect", root, error))?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::PathChanged {
-            path: root.to_path_buf(),
-            message: "symbolic links are refused".into(),
-        });
+    if !entry.identity.directory {
+        return visit(root, &mut entry.handle);
     }
-    if metadata.is_file() {
-        return visit(root);
-    }
-    if !metadata.is_dir() {
-        return Ok(());
-    }
+    // `entry.handle` omits FILE_SHARE_DELETE and remains live while read_dir
+    // opens the pathname, so the enumerated directory cannot be swapped for a
+    // junction after validation.
     let mut entries = fs::read_dir(root)
         .map_err(|error| ToolError::io("list", root, error))?
         .collect::<Result<Vec<_>, _>>()
@@ -1805,17 +1807,8 @@ fn windows_walk_files(
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
-        let kind = entry
-            .file_type()
-            .map_err(|error| ToolError::io("inspect", &path, error))?;
-        if kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            windows_walk_files(&path, visit)?;
-        } else if kind.is_file() {
-            visit(&path)?;
-        }
+        let child = open_windows_path_entry(&path, &path, false)?;
+        windows_walk_files(&path, child, visit)?;
     }
     Ok(())
 }
@@ -1826,11 +1819,11 @@ fn windows_relative_path(path: &Path) -> ToolResult<String> {
 }
 
 #[cfg(windows)]
-fn windows_anchored_path(
-    workspace_root: &Path,
+fn windows_anchored_entry(
+    workspace_root: &OwnedFd,
     relative: &Path,
     display_path: &Path,
-) -> ToolResult<PathBuf> {
+) -> ToolResult<(OwnedFd, PathBuf, WindowsPathEntry)> {
     if relative.is_absolute()
         || relative.components().any(|component| {
             !matches!(
@@ -1840,22 +1833,21 @@ fn windows_anchored_path(
         })
     {
         return Err(ToolError::WorkspaceBoundary {
-            workspace_root: workspace_root.to_path_buf(),
+            workspace_root: workspace_root.path().to_path_buf(),
             requested_path: display_path.to_path_buf(),
             resolved_path: None,
         });
     }
-    let candidate = workspace_root.join(relative);
-    let canonical = fs::canonicalize(&candidate)
-        .map_err(|error| ToolError::io("canonicalize", display_path, error))?;
-    if !canonical.starts_with(workspace_root) {
-        return Err(ToolError::WorkspaceBoundary {
-            workspace_root: workspace_root.to_path_buf(),
-            requested_path: display_path.to_path_buf(),
-            resolved_path: Some(canonical),
-        });
-    }
-    Ok(candidate)
+    let (parent, candidate) = if relative.as_os_str().is_empty() {
+        let parent = haider_platform::duplicate_workspace_directory(workspace_root)
+            .map_err(|error| ToolError::io("duplicate workspace root", display_path, error))?;
+        let candidate = parent.path().to_path_buf();
+        (parent, candidate)
+    } else {
+        windows_mutation_target(workspace_root, relative, display_path, false)?
+    };
+    let entry = open_windows_path_entry(&candidate, display_path, false)?;
+    Ok((parent, candidate, entry))
 }
 
 struct AppliedMutation {
@@ -1968,48 +1960,1463 @@ struct MutationRecordContext<'a, L> {
 
 #[cfg(windows)]
 fn apply_write_and_record<L>(
-    _workspace_dir: OwnedFd,
-    _relative: &Path,
-    _operation: &FsWrite,
-    _context: MutationRecordContext<'_, L>,
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsWrite,
+    context: MutationRecordContext<'_, L>,
 ) -> MutationWorkerOutcome
 where
     L: ChangeLedgerSink,
 {
-    MutationWorkerOutcome::ApplyFailed(ToolError::Runtime {
-        message: "fs_write is not yet available on Windows".into(),
-    })
+    let applied =
+        match apply_windows_write(&workspace_dir, relative, operation, context.expected_digest) {
+            Ok(applied) => applied,
+            Err(error) => return MutationWorkerOutcome::ApplyFailed(error),
+        };
+    record_windows_mutation(applied, context)
 }
 
 #[cfg(windows)]
 fn apply_edit_and_record<L>(
-    _workspace_dir: OwnedFd,
-    _relative: &Path,
-    _operation: &FsEdit,
-    _context: MutationRecordContext<'_, L>,
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsEdit,
+    context: MutationRecordContext<'_, L>,
 ) -> MutationWorkerOutcome
 where
     L: ChangeLedgerSink,
 {
-    MutationWorkerOutcome::ApplyFailed(ToolError::Runtime {
-        message: "fs_edit is not yet available on Windows".into(),
+    let applied =
+        match apply_windows_edit(&workspace_dir, relative, operation, context.expected_digest) {
+            Ok(applied) => applied,
+            Err(error) => return MutationWorkerOutcome::ApplyFailed(error),
+        };
+    record_windows_mutation(applied, context)
+}
+
+#[cfg(windows)]
+fn record_windows_mutation<L>(
+    applied: AppliedMutation,
+    context: MutationRecordContext<'_, L>,
+) -> MutationWorkerOutcome
+where
+    L: ChangeLedgerSink,
+{
+    let AppliedMutation {
+        result,
+        paths,
+        post_digest,
+    } = applied;
+    let effect = context.effect.clone();
+    match context.ledger.record_fs_write(
+        context.attribution.session,
+        context.attribution.turn,
+        FsWriteRecord {
+            effect: context.effect,
+            paths,
+            summary: context.summary,
+            bytes_hash: post_digest.clone(),
+        },
+    ) {
+        Ok(()) => MutationWorkerOutcome::Applied {
+            result,
+            effect,
+            post_digest,
+        },
+        Err(error) => MutationWorkerOutcome::LedgerFailed {
+            error,
+            written: true,
+            effect,
+            post_digest,
+        },
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_write(
+    workspace_root: &OwnedFd,
+    relative: &Path,
+    operation: &FsWrite,
+    expected_digest: Option<&str>,
+) -> ToolResult<AppliedMutation> {
+    let (parent, target) =
+        windows_mutation_target(workspace_root, relative, &operation.path, true)?;
+    let mut existing = match fs::symlink_metadata(&target) {
+        Ok(_) => {
+            let mut file = open_windows_locked_file(&target, &operation.path)?;
+            let source = windows_stable_snapshot(&mut file, &operation.path)?;
+            let current_digest = mutation_digest(&source.bytes);
+            let Some(expected_digest) = expected_digest else {
+                return Err(ToolError::UnreadFile {
+                    path: operation.path.clone(),
+                });
+            };
+            if current_digest != expected_digest {
+                return Err(ToolError::StaleRead {
+                    path: operation.path.clone(),
+                    recorded_digest: expected_digest.to_owned(),
+                    current_digest,
+                });
+            }
+            Some(WindowsSource {
+                _file: file,
+                identity: source.identity,
+                hash: blake3::hash(&source.bytes),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ToolError::io(
+                "inspect write target",
+                &operation.path,
+                error,
+            ));
+        }
+    };
+    let bytes = operation.content.as_bytes();
+    let permissions = existing
+        .as_ref()
+        .map(|source| {
+            source
+                ._file
+                .metadata()
+                .map(|metadata| metadata.permissions())
+        })
+        .transpose()
+        .map_err(|error| ToolError::io("inspect target permissions", &operation.path, error))?;
+    let temporary = stage_windows_content(parent.path(), &operation.path, bytes, permissions)?;
+    if let Some(source) = existing.as_ref()
+        && let Err(error) = copy_windows_dacl(&source._file, &temporary.file, &operation.path)
+    {
+        let _ = delete_windows_entry(temporary.file, &operation.path);
+        return Err(error);
+    }
+    let revalidated = match revalidate_windows_mutation(
+        workspace_root,
+        relative,
+        &parent,
+        &target,
+        &operation.path,
+        existing
+            .as_ref()
+            .map(|source| (source.identity, source.hash)),
+    ) {
+        Ok(revalidated) => revalidated,
+        Err(error) => {
+            let _ = delete_windows_entry(temporary.file, &operation.path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_windows_temporary(
+        temporary,
+        &target,
+        existing.is_some(),
+        blake3::hash(bytes),
+        &operation.path,
+    ) {
+        return Err(error);
+    }
+    drop(revalidated);
+    drop(existing.take());
+    Ok(AppliedMutation {
+        result: BoundedResult {
+            preview: format!(
+                "wrote {} bytes to {}",
+                bytes.len(),
+                operation.path.display()
+            ),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        },
+        paths: vec![operation.path.clone()],
+        post_digest: mutation_digest(bytes),
     })
 }
 
 #[cfg(windows)]
+fn apply_windows_edit(
+    workspace_root: &OwnedFd,
+    relative: &Path,
+    operation: &FsEdit,
+    expected_digest: Option<&str>,
+) -> ToolResult<AppliedMutation> {
+    if operation.edits.is_empty() {
+        return Err(ToolError::invalid_argument("fs_edit edits cannot be empty"));
+    }
+    if operation.edits.iter().any(|edit| edit.old.is_empty()) {
+        return Err(ToolError::invalid_argument(
+            "fs_edit old anchors cannot be empty",
+        ));
+    }
+    let (parent, target) =
+        windows_mutation_target(workspace_root, relative, &operation.path, false)?;
+    let mut source_file = open_windows_locked_file(&target, &operation.path)?;
+    let source = windows_stable_snapshot(&mut source_file, &operation.path)?;
+    let current_digest = mutation_digest(&source.bytes);
+    let Some(expected_digest) = expected_digest else {
+        return Err(ToolError::UnreadFile {
+            path: operation.path.clone(),
+        });
+    };
+    if current_digest != expected_digest {
+        return Err(ToolError::StaleRead {
+            path: operation.path.clone(),
+            recorded_digest: expected_digest.to_owned(),
+            current_digest,
+        });
+    }
+    let source_hash = blake3::hash(&source.bytes);
+    let mut edited =
+        String::from_utf8(source.bytes).map_err(|error| ToolError::InvalidArgument {
+            message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
+        })?;
+    let mut replacements = 0usize;
+    for edit in &operation.edits {
+        let matches = edited.match_indices(&edit.old).count();
+        if (!edit.replace_all && matches != 1) || (edit.replace_all && matches == 0) {
+            return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
+                path: operation.path.clone(),
+                matches,
+                replace_all: edit.replace_all,
+            }));
+        }
+        edited = if edit.replace_all {
+            edited.replace(&edit.old, &edit.new)
+        } else {
+            edited.replacen(&edit.old, &edit.new, 1)
+        };
+        replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
+    }
+    let bytes = edited.as_bytes();
+    let permissions = source_file
+        .metadata()
+        .map_err(|error| ToolError::io("inspect target permissions", &operation.path, error))?
+        .permissions();
+    let temporary =
+        stage_windows_content(parent.path(), &operation.path, bytes, Some(permissions))?;
+    if let Err(error) = copy_windows_dacl(&source_file, &temporary.file, &operation.path) {
+        let _ = delete_windows_entry(temporary.file, &operation.path);
+        return Err(error);
+    }
+    let revalidated = match revalidate_windows_mutation(
+        workspace_root,
+        relative,
+        &parent,
+        &target,
+        &operation.path,
+        Some((source.identity, source_hash)),
+    ) {
+        Ok(revalidated) => revalidated,
+        Err(error) => {
+            let _ = delete_windows_entry(temporary.file, &operation.path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_windows_temporary(
+        temporary,
+        &target,
+        true,
+        blake3::hash(bytes),
+        &operation.path,
+    ) {
+        return Err(error);
+    }
+    drop(revalidated);
+    drop(source_file);
+    Ok(AppliedMutation {
+        result: BoundedResult {
+            preview: format!(
+                "edited {} ({} replacement{})",
+                operation.path.display(),
+                replacements,
+                if replacements == 1 { "" } else { "s" }
+            ),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        },
+        paths: vec![operation.path.clone()],
+        post_digest: mutation_digest(bytes),
+    })
+}
+
+#[cfg(windows)]
+fn windows_mutation_target(
+    workspace_root: &OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+    create_parents: bool,
+) -> ToolResult<(OwnedFd, PathBuf)> {
+    if relative.is_absolute() {
+        return Err(ToolError::WorkspaceBoundary {
+            workspace_root: workspace_root.path().to_path_buf(),
+            requested_path: display_path.to_path_buf(),
+            resolved_path: None,
+        });
+    }
+    let leaf = relative
+        .file_name()
+        .ok_or_else(|| ToolError::invalid_argument("filesystem path has no leaf name"))?;
+    let root = haider_platform::duplicate_workspace_directory(workspace_root)
+        .map_err(|error| ToolError::io("duplicate workspace root", display_path, error))?;
+    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent =
+        haider_platform::open_workspace_subdirectory(root, relative_parent, create_parents)
+            .map_err(|error| ToolError::io("open anchored mutation parent", display_path, error))?;
+    let target = parent.path().join(leaf);
+    Ok((parent, target))
+}
+
+#[cfg(windows)]
+fn windows_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn require_windows_regular_file(
+    target: &Path,
+    display_path: &Path,
+    metadata: &fs::Metadata,
+) -> ToolResult<()> {
+    if metadata.is_file() && !windows_is_reparse_point(metadata) {
+        return Ok(());
+    }
+    Err(ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: format!("mutation target {} is not a real file", target.display()),
+    })
+}
+
+#[cfg(windows)]
+struct WindowsSnapshot {
+    bytes: Vec<u8>,
+    identity: haider_platform::WindowsFileIdentity,
+}
+
+#[cfg(windows)]
+struct WindowsSource {
+    _file: fs::File,
+    identity: haider_platform::WindowsFileIdentity,
+    hash: blake3::Hash,
+}
+
+#[cfg(windows)]
+fn open_windows_current(target: &Path, display_path: &Path) -> ToolResult<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(target)
+        .map_err(|error| ToolError::io("open mutation target", display_path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ToolError::io("inspect mutation target", display_path, error))?;
+    require_windows_regular_file(target, display_path, &metadata)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_windows_locked_file(target: &Path, display_path: &Path) -> ToolResult<fs::File> {
+    let file = open_windows_current(target, display_path)?;
+    file.lock()
+        .map_err(|error| ToolError::io("lock mutation target", display_path, error))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_stable_snapshot(
+    file: &mut fs::File,
+    display_path: &Path,
+) -> ToolResult<WindowsSnapshot> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        let before = file
+            .metadata()
+            .map_err(|error| ToolError::io("inspect mutation snapshot", display_path, error))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ToolError::io("seek mutation snapshot", display_path, error))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| ToolError::io("read mutation snapshot", display_path, error))?;
+        let after = file
+            .metadata()
+            .map_err(|error| ToolError::io("reinspect mutation snapshot", display_path, error))?;
+        if before.file_attributes() == after.file_attributes()
+            && before.creation_time() == after.creation_time()
+            && before.last_write_time() == after.last_write_time()
+            && before.file_size() == after.file_size()
+            && before.file_size() == bytes.len() as u64
+        {
+            let identity = haider_platform::windows_file_identity(file).map_err(|error| {
+                ToolError::io("identify mutation snapshot", display_path, error)
+            })?;
+            return Ok(WindowsSnapshot { bytes, identity });
+        }
+    }
+    Err(ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: format!(
+            "target content did not yield a stable snapshot after {SNAPSHOT_ATTEMPTS} attempts"
+        ),
+    })
+}
+
+#[cfg(windows)]
+struct WindowsStagedFile {
+    file: fs::File,
+}
+
+#[cfg(windows)]
+fn stage_windows_content(
+    parent: &Path,
+    display_path: &Path,
+    bytes: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> ToolResult<WindowsStagedFile> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const MAX_NAME_RETRIES: usize = 16;
+    for _ in 0..MAX_NAME_RETRIES {
+        let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".haider-write-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ToolError::io(
+                    "create mutation temporary",
+                    display_path,
+                    error,
+                ));
+            }
+        };
+        let staged = file
+            .write_all(bytes)
+            .and_then(|()| {
+                permissions
+                    .clone()
+                    .map_or(Ok(()), |permissions| file.set_permissions(permissions))
+            })
+            .and_then(|()| file.sync_all())
+            .map_err(|error| ToolError::io("write mutation temporary", display_path, error));
+        match staged {
+            Ok(()) => return Ok(WindowsStagedFile { file }),
+            Err(error) => {
+                let _ = delete_windows_entry(file, display_path);
+                return Err(error);
+            }
+        }
+    }
+    Err(ToolError::Runtime {
+        message: format!(
+            "could not allocate a unique mutation temporary for {}",
+            display_path.display()
+        ),
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn copy_windows_dacl(
+    source: &fs::File,
+    destination: &fs::File,
+    display_path: &Path,
+) -> ToolResult<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+    let mut needed = 0_u32;
+    let measured = unsafe {
+        GetKernelObjectSecurity(
+            source.as_raw_handle(),
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    let measurement_error = std::io::Error::last_os_error();
+    if measured == 0 && measurement_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER) {
+        return Err(ToolError::io(
+            "measure target security descriptor",
+            display_path,
+            measurement_error,
+        ));
+    }
+    let bytes = usize::try_from(needed)
+        .map_err(|_| ToolError::invalid_argument("Windows security descriptor is too large"))?;
+    let words = bytes.div_ceil(std::mem::size_of::<usize>());
+    let mut descriptor = vec![0_usize; words];
+    let descriptor_pointer = descriptor.as_mut_ptr().cast();
+    let read = unsafe {
+        GetKernelObjectSecurity(
+            source.as_raw_handle(),
+            DACL_SECURITY_INFORMATION,
+            descriptor_pointer,
+            needed,
+            &raw mut needed,
+        )
+    };
+    if read == 0 {
+        return Err(ToolError::io(
+            "read target security descriptor",
+            display_path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let inspected = unsafe {
+        GetSecurityDescriptorControl(descriptor_pointer, &raw mut control, &raw mut revision)
+    };
+    if inspected == 0 {
+        return Err(ToolError::io(
+            "inspect target DACL protection",
+            display_path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let protection = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    let extracted = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor_pointer,
+            &raw mut dacl_present,
+            &raw mut dacl,
+            &raw mut dacl_defaulted,
+        )
+    };
+    if extracted == 0 {
+        return Err(ToolError::io(
+            "extract target DACL",
+            display_path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if dacl_present == 0 {
+        dacl = std::ptr::null_mut();
+    }
+    let written = unsafe {
+        SetSecurityInfo(
+            destination.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if written != 0 {
+        Err(ToolError::io(
+            "copy target DACL to staged file",
+            display_path,
+            std::io::Error::from_raw_os_error(written as i32),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn revalidate_windows_mutation(
+    workspace_root: &OwnedFd,
+    relative: &Path,
+    expected_parent: &OwnedFd,
+    target: &Path,
+    display_path: &Path,
+    expected_source: Option<(haider_platform::WindowsFileIdentity, blake3::Hash)>,
+) -> ToolResult<Option<fs::File>> {
+    let (parent, current_target) =
+        windows_mutation_target(workspace_root, relative, display_path, false)?;
+    let parent_identity = haider_platform::workspace_directory_identity(&parent)
+        .map_err(|error| ToolError::io("identify mutation parent", display_path, error))?;
+    let expected_parent_identity = haider_platform::workspace_directory_identity(expected_parent)
+        .map_err(|error| {
+        ToolError::io("identify original mutation parent", display_path, error)
+    })?;
+    if parent_identity != expected_parent_identity || current_target != target {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "mutation path changed before atomic replacement".into(),
+        });
+    }
+    match expected_source {
+        Some((expected_identity, expected_hash)) => {
+            let mut current = open_windows_current(target, display_path)?;
+            let snapshot = windows_stable_snapshot(&mut current, display_path)?;
+            if snapshot.identity != expected_identity
+                || blake3::hash(&snapshot.bytes) != expected_hash
+            {
+                return Err(ToolError::PathChanged {
+                    path: display_path.to_path_buf(),
+                    message: "target identity or content changed before atomic replacement".into(),
+                });
+            }
+            Ok(Some(current))
+        }
+        None => match fs::symlink_metadata(target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(_) => Err(ToolError::PathChanged {
+                path: display_path.to_path_buf(),
+                message: "write target appeared before atomic creation".into(),
+            }),
+            Err(error) => Err(ToolError::io("reinspect write target", display_path, error)),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn publish_windows_temporary(
+    mut temporary: WindowsStagedFile,
+    target: &Path,
+    replace_existing: bool,
+    replacement_hash: blake3::Hash,
+    display_path: &Path,
+) -> ToolResult<()> {
+    let snapshot = windows_stable_snapshot(&mut temporary.file, display_path)?;
+    if blake3::hash(&snapshot.bytes) != replacement_hash {
+        let _ = delete_windows_entry(temporary.file, display_path);
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "staged file bytes differ from the approved content".into(),
+        });
+    }
+    if let Err(error) = rename_windows_entry(&temporary.file, target, replace_existing) {
+        let _ = delete_windows_entry(temporary.file, display_path);
+        return Err(ToolError::io("publish staged file", display_path, error));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn apply_path_and_record<L>(
-    _workspace_dir: OwnedFd,
-    _source_relative: &Path,
-    _destination_relative: Option<&Path>,
-    _operation: &FsPath,
-    _context: MutationRecordContext<'_, L>,
+    workspace_dir: OwnedFd,
+    source_relative: &Path,
+    destination_relative: Option<&Path>,
+    operation: &FsPath,
+    context: MutationRecordContext<'_, L>,
 ) -> MutationWorkerOutcome
 where
     L: ChangeLedgerSink,
 {
-    MutationWorkerOutcome::ApplyFailed(ToolError::Runtime {
-        message: "fs_path mutations are not yet available on Windows".into(),
+    let applied = match apply_windows_path(
+        &workspace_dir,
+        source_relative,
+        destination_relative,
+        operation,
+    ) {
+        Ok(applied) => applied,
+        Err(error) => return MutationWorkerOutcome::ApplyFailed(error),
+    };
+    record_windows_mutation(applied, context)
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsPathIdentity {
+    file: haider_platform::WindowsFileIdentity,
+    attributes: u32,
+    creation_time: u64,
+    last_write_time: u64,
+    size: u64,
+    directory: bool,
+}
+
+#[cfg(windows)]
+struct WindowsPathEntry {
+    identity: WindowsPathIdentity,
+    handle: fs::File,
+}
+
+#[cfg(windows)]
+fn open_windows_path_entry(
+    path: &Path,
+    display_path: &Path,
+    delete_access: bool,
+) -> ToolResult<WindowsPathEntry> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | if delete_access { DELETE } else { 0 })
+        // Omitting FILE_SHARE_DELETE pins the exact namespace entry through
+        // traversal. A checked directory cannot be renamed into a junction
+        // before read_dir or a child open.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| ToolError::io("open fs_path entry", display_path, error))?;
+    windows_path_entry_from_file(file, display_path)
+}
+
+#[cfg(windows)]
+fn windows_path_entry_from_file(
+    file: fs::File,
+    display_path: &Path,
+) -> ToolResult<WindowsPathEntry> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| ToolError::io("inspect fs_path entry", display_path, error))?;
+    if windows_is_reparse_point(&metadata) {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "fs_path refuses reparse points".into(),
+        });
+    }
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(ToolError::invalid_argument(format!(
+            "fs_path cannot mutate special path {}",
+            display_path.display()
+        )));
+    }
+    let identity = WindowsPathIdentity {
+        file: haider_platform::windows_file_identity(&file)
+            .map_err(|error| ToolError::io("identify fs_path entry", display_path, error))?,
+        attributes: metadata.file_attributes(),
+        creation_time: metadata.creation_time(),
+        last_write_time: metadata.last_write_time(),
+        size: metadata.file_size(),
+        directory: metadata.is_dir(),
+    };
+    Ok(WindowsPathEntry {
+        identity,
+        handle: file,
     })
+}
+
+#[cfg(windows)]
+fn open_windows_copy_directory(path: &Path, display_path: &Path) -> ToolResult<WindowsPathEntry> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| ToolError::io("open copy destination directory", display_path, error))?;
+    windows_path_entry_from_file(file, display_path)
+}
+
+#[cfg(windows)]
+fn windows_path_identity(path: &Path, display_path: &Path) -> ToolResult<WindowsPathIdentity> {
+    Ok(open_windows_path_entry(path, display_path, false)?.identity)
+}
+
+#[cfg(windows)]
+fn require_windows_path_identity(
+    path: &Path,
+    display_path: &Path,
+    expected: Option<WindowsPathIdentity>,
+) -> ToolResult<()> {
+    match expected {
+        Some(expected) => {
+            let current = windows_path_identity(path, display_path)?;
+            if current == expected {
+                Ok(())
+            } else {
+                Err(ToolError::PathChanged {
+                    path: display_path.to_path_buf(),
+                    message: "fs_path entry identity changed before mutation".into(),
+                })
+            }
+        }
+        None => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(ToolError::PathChanged {
+                path: display_path.to_path_buf(),
+                message: "fs_path destination appeared before mutation".into(),
+            }),
+            Err(error) => Err(ToolError::io(
+                "reinspect fs_path destination",
+                display_path,
+                error,
+            )),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_path(
+    workspace_dir: &OwnedFd,
+    source_relative: &Path,
+    destination_relative: Option<&Path>,
+    operation: &FsPath,
+) -> ToolResult<AppliedMutation> {
+    if source_relative.as_os_str().is_empty() {
+        return Err(ToolError::invalid_argument(
+            "fs_path refuses to mutate the workspace root",
+        ));
+    }
+    let (source_parent, source) =
+        windows_mutation_target(workspace_dir, source_relative, &operation.source, false)?;
+    let source_entry = open_windows_path_entry(
+        &source,
+        &operation.source,
+        operation.operation != FsPathOperation::Copy,
+    )?;
+    let source_identity = source_entry.identity;
+    let mut structural = Vec::new();
+    structural.extend_from_slice(operation.operation_name().as_bytes());
+    structural.push(0);
+    structural.extend_from_slice(relative_path_argument(source_relative)?.as_bytes());
+
+    let (result, paths) = match operation.operation {
+        FsPathOperation::Delete => {
+            let source_parent_check = haider_platform::workspace_directory_identity(&source_parent)
+                .map_err(|error| {
+                    ToolError::io("identify fs_path source parent", &operation.source, error)
+                })?;
+            let (fresh_parent, fresh_source) =
+                windows_mutation_target(workspace_dir, source_relative, &operation.source, false)?;
+            if haider_platform::workspace_directory_identity(&fresh_parent).map_err(|error| {
+                ToolError::io("reidentify fs_path source parent", &operation.source, error)
+            })? != source_parent_check
+                || fresh_source != source
+            {
+                return Err(ToolError::PathChanged {
+                    path: operation.source.clone(),
+                    message: "fs_path source parent changed before delete".into(),
+                });
+            }
+            remove_windows_entry_from_handle(&source, &operation.source, source_entry)?;
+            (
+                mutation_result(format!("deleted {}", operation.source.display())),
+                vec![operation.source.clone()],
+            )
+        }
+        FsPathOperation::Move | FsPathOperation::Copy => {
+            let destination = operation.destination.as_ref().ok_or_else(|| {
+                ToolError::invalid_argument("fs_path move/copy requires a destination")
+            })?;
+            let destination_relative = destination_relative.ok_or_else(|| {
+                ToolError::invalid_argument("fs_path move/copy requires a destination")
+            })?;
+            if destination_relative.as_os_str().is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "fs_path refuses to replace the workspace root",
+                ));
+            }
+            if source_relative == destination_relative {
+                return Err(ToolError::invalid_argument(
+                    "fs_path source and destination must differ",
+                ));
+            }
+            structural.push(0);
+            structural.extend_from_slice(relative_path_argument(destination_relative)?.as_bytes());
+            let (destination_parent, destination_path) =
+                windows_mutation_target(workspace_dir, destination_relative, destination, false)?;
+            if source_identity.directory
+                && haider_platform::workspace_directory_contains_identity(
+                    &destination_parent,
+                    source_identity.file,
+                )
+                .map_err(|error| {
+                    ToolError::io("inspect fs_path destination ancestry", destination, error)
+                })?
+            {
+                return Err(ToolError::invalid_argument(
+                    "fs_path destination cannot be inside the source directory",
+                ));
+            }
+            let destination_entry = match fs::symlink_metadata(&destination_path) {
+                Ok(_) => Some(open_windows_path_entry(
+                    &destination_path,
+                    destination,
+                    true,
+                )?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(ToolError::io(
+                        "inspect fs_path destination",
+                        destination,
+                        error,
+                    ));
+                }
+            };
+            let destination_identity = destination_entry.as_ref().map(|entry| entry.identity);
+            if destination_entry.is_some() && !operation.overwrite {
+                return Err(ToolError::invalid_argument(format!(
+                    "fs_path destination already exists: {}",
+                    destination.display()
+                )));
+            }
+            if destination_identity.is_some_and(|identity| identity.file == source_identity.file) {
+                return Err(ToolError::invalid_argument(
+                    "fs_path source and destination identify the same path",
+                ));
+            }
+
+            revalidate_windows_path_parents(
+                workspace_dir,
+                source_relative,
+                &source_parent,
+                &operation.source,
+                destination_relative,
+                &destination_parent,
+                destination,
+            )?;
+            match operation.operation {
+                FsPathOperation::Move => {
+                    commit_windows_move(
+                        source_entry.handle,
+                        &destination_path,
+                        &destination_parent,
+                        destination_entry,
+                        destination,
+                    )?;
+                    (
+                        mutation_result(format!(
+                            "moved {} to {}",
+                            operation.source.display(),
+                            destination.display()
+                        )),
+                        vec![operation.source.clone(), destination.clone()],
+                    )
+                }
+                FsPathOperation::Copy => {
+                    let staging = create_windows_path_staging(&destination_parent, destination)?;
+                    let staged_entry = staging.path.join("entry");
+                    let staged_entry_guard = match copy_windows_entry_from_handle(
+                        &source,
+                        &staged_entry,
+                        &operation.source,
+                        destination,
+                        &mut structural,
+                        source_entry,
+                    ) {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            cleanup_windows_path_staging(staging, destination);
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = commit_windows_staged_entry(
+                        staging,
+                        &destination_path,
+                        staged_entry_guard,
+                        destination_entry,
+                        destination,
+                    ) {
+                        return Err(error);
+                    }
+                    (
+                        mutation_result(format!(
+                            "copied {} to {}",
+                            operation.source.display(),
+                            destination.display()
+                        )),
+                        vec![destination.clone()],
+                    )
+                }
+                FsPathOperation::Delete => unreachable!("covered above"),
+            }
+        }
+    };
+    Ok(AppliedMutation {
+        result,
+        paths,
+        post_digest: mutation_digest(&structural),
+    })
+}
+
+#[cfg(windows)]
+fn revalidate_windows_path_parents(
+    workspace_dir: &OwnedFd,
+    source_relative: &Path,
+    source_parent: &OwnedFd,
+    source_display: &Path,
+    destination_relative: &Path,
+    destination_parent: &OwnedFd,
+    destination_display: &Path,
+) -> ToolResult<()> {
+    let (fresh_source_parent, _) =
+        windows_mutation_target(workspace_dir, source_relative, source_display, false)?;
+    let (fresh_destination_parent, _) = windows_mutation_target(
+        workspace_dir,
+        destination_relative,
+        destination_display,
+        false,
+    )?;
+    let identity = |directory: &OwnedFd, display: &Path| {
+        haider_platform::workspace_directory_identity(directory)
+            .map_err(|error| ToolError::io("identify fs_path parent", display, error))
+    };
+    if identity(&fresh_source_parent, source_display)? != identity(source_parent, source_display)?
+        || identity(&fresh_destination_parent, destination_display)?
+            != identity(destination_parent, destination_display)?
+    {
+        return Err(ToolError::PathChanged {
+            path: source_display.to_path_buf(),
+            message: "fs_path source or destination parent changed before mutation".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_windows_entry(path: &Path, display_path: &Path) -> ToolResult<()> {
+    let entry = open_windows_path_entry(path, display_path, true)?;
+    remove_windows_entry_from_handle(path, display_path, entry)
+}
+
+#[cfg(windows)]
+fn remove_windows_entry_from_handle(
+    path: &Path,
+    display_path: &Path,
+    entry: WindowsPathEntry,
+) -> ToolResult<()> {
+    let identity = entry.identity;
+    if identity.directory {
+        let mut entries = fs::read_dir(path)
+            .map_err(|error| ToolError::io("list delete directory", display_path, error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ToolError::io("list delete directory", display_path, error))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let child = entry.path();
+            remove_windows_entry(&child, &display_path.join(entry.file_name()))?;
+        }
+    }
+    delete_windows_entry(entry.handle, display_path)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn delete_windows_entry(handle: fs::File, display_path: &Path) -> ToolResult<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let deleted = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of_val(&disposition) as u32,
+        )
+    };
+    if deleted == 0 {
+        Err(ToolError::io(
+            "delete anchored filesystem entry",
+            display_path,
+            std::io::Error::last_os_error(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+struct WindowsPathStaging {
+    path: PathBuf,
+    _parent: OwnedFd,
+    entry: WindowsPathEntry,
+}
+
+#[cfg(windows)]
+fn create_windows_path_staging(
+    parent: &OwnedFd,
+    display_path: &Path,
+) -> ToolResult<WindowsPathStaging> {
+    const MAX_NAME_RETRIES: usize = 16;
+    for _ in 0..MAX_NAME_RETRIES {
+        let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
+        let path = parent.path().join(format!(
+            ".haider-path-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                let entry = match open_windows_path_entry(&path, display_path, true) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let _ = fs::remove_dir(&path);
+                        return Err(error);
+                    }
+                };
+                let parent =
+                    haider_platform::duplicate_workspace_directory(parent).map_err(|error| {
+                        ToolError::io("retain path staging parent", display_path, error)
+                    })?;
+                return Ok(WindowsPathStaging {
+                    path,
+                    _parent: parent,
+                    entry,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(ToolError::io(
+                    "create path staging directory",
+                    display_path,
+                    error,
+                ));
+            }
+        }
+    }
+    Err(ToolError::Runtime {
+        message: format!(
+            "could not allocate a unique path staging directory for {}",
+            display_path.display()
+        ),
+    })
+}
+
+#[cfg(windows)]
+fn cleanup_windows_path_staging(staging: WindowsPathStaging, display_path: &Path) {
+    let WindowsPathStaging {
+        path,
+        _parent,
+        entry,
+    } = staging;
+    let _ = remove_windows_entry_from_handle(&path, display_path, entry);
+}
+
+#[cfg(windows)]
+fn copy_windows_entry(
+    source: &Path,
+    destination: &Path,
+    source_display: &Path,
+    destination_display: &Path,
+    structural: &mut Vec<u8>,
+) -> ToolResult<WindowsPathEntry> {
+    let source_entry = open_windows_path_entry(source, source_display, false)?;
+    copy_windows_entry_from_handle(
+        source,
+        destination,
+        source_display,
+        destination_display,
+        structural,
+        source_entry,
+    )
+}
+
+#[cfg(windows)]
+fn copy_windows_entry_from_handle(
+    source: &Path,
+    destination: &Path,
+    source_display: &Path,
+    destination_display: &Path,
+    structural: &mut Vec<u8>,
+    mut source_entry: WindowsPathEntry,
+) -> ToolResult<WindowsPathEntry> {
+    let source_identity = source_entry.identity;
+    if source_identity.directory {
+        fs::create_dir(destination).map_err(|error| {
+            ToolError::io(
+                "create copy destination directory",
+                destination_display,
+                error,
+            )
+        })?;
+        let destination_guard = open_windows_copy_directory(destination, destination_display)?;
+        let mut entries = fs::read_dir(source)
+            .map_err(|error| ToolError::io("list copy source", source_display, error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ToolError::io("list copy source", source_display, error))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        structural.extend_from_slice(b"\0directory\0");
+        structural.extend_from_slice(destination.as_os_str().as_encoded_bytes());
+        for entry in entries {
+            let name = entry.file_name();
+            let _ = copy_windows_entry(
+                &entry.path(),
+                &destination.join(&name),
+                &source_display.join(&name),
+                &destination_display.join(&name),
+                structural,
+            )?;
+        }
+        destination_guard
+            .handle
+            .set_permissions(
+                source_entry
+                    .handle
+                    .metadata()
+                    .map_err(|error| {
+                        ToolError::io("inspect copy source permissions", source_display, error)
+                    })?
+                    .permissions(),
+            )
+            .map_err(|error| {
+                ToolError::io(
+                    "set copy destination permissions",
+                    destination_display,
+                    error,
+                )
+            })?;
+        let final_identity = haider_platform::windows_file_identity(&source_entry.handle)
+            .map_err(|error| ToolError::io("reidentify copy source", source_display, error))?;
+        if final_identity != source_identity.file {
+            return Err(ToolError::PathChanged {
+                path: source_display.to_path_buf(),
+                message: "copy source identity changed while traversing".into(),
+            });
+        }
+        return Ok(destination_guard);
+    } else {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        let snapshot = windows_stable_snapshot(&mut source_entry.handle, source_display)?;
+        if snapshot.identity != source_identity.file {
+            return Err(ToolError::PathChanged {
+                path: source_display.to_path_buf(),
+                message: "copy source identity changed while opening".into(),
+            });
+        }
+        let mut destination_file = fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .create_new(true)
+            .open(destination)
+            .map_err(|error| {
+                ToolError::io("create copy destination", destination_display, error)
+            })?;
+        destination_file
+            .write_all(&snapshot.bytes)
+            .and_then(|()| destination_file.sync_all())
+            .map_err(|error| ToolError::io("write copy destination", destination_display, error))?;
+        destination_file
+            .set_permissions(
+                source_entry
+                    .handle
+                    .metadata()
+                    .map_err(|error| {
+                        ToolError::io("inspect copy source permissions", source_display, error)
+                    })?
+                    .permissions(),
+            )
+            .map_err(|error| {
+                ToolError::io(
+                    "set copy destination permissions",
+                    destination_display,
+                    error,
+                )
+            })?;
+        structural.extend_from_slice(b"\0file\0");
+        structural.extend_from_slice(destination.as_os_str().as_encoded_bytes());
+        structural.push(0);
+        structural.extend_from_slice(&snapshot.bytes);
+        let destination_guard =
+            windows_path_entry_from_file(destination_file, destination_display)?;
+        let final_identity = haider_platform::windows_file_identity(&source_entry.handle)
+            .map_err(|error| ToolError::io("reidentify copy source", source_display, error))?;
+        if final_identity != source_identity.file {
+            return Err(ToolError::PathChanged {
+                path: source_display.to_path_buf(),
+                message: "copy source identity changed while traversing".into(),
+            });
+        }
+        return Ok(destination_guard);
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn rename_windows_entry(
+    handle: &fs::File,
+    destination: &Path,
+    replace_existing: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = destination
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| std::io::Error::other("rename destination is too long"))?;
+    let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .ok_or_else(|| std::io::Error::other("rename buffer size overflow"))?;
+    let words = buffer_bytes.div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = replace_existing;
+        (*information).RootDirectory = std::ptr::null_mut();
+        (*information).FileNameLength = u32::try_from(name_bytes)
+            .map_err(|_| std::io::Error::other("rename destination is too long"))?;
+        std::ptr::copy_nonoverlapping(
+            destination.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    let renamed = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle(),
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(buffer_bytes)
+                .map_err(|_| std::io::Error::other("rename buffer is too large"))?,
+        )
+    };
+    if renamed == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn commit_windows_move(
+    source: fs::File,
+    destination: &Path,
+    destination_parent: &OwnedFd,
+    destination_entry: Option<WindowsPathEntry>,
+    destination_display: &Path,
+) -> ToolResult<()> {
+    if destination_entry.is_none() {
+        return rename_windows_entry(&source, destination, false)
+            .map_err(|error| ToolError::io("move anchored path", destination_display, error));
+    }
+    let staging = create_windows_path_staging(destination_parent, destination_display)?;
+    let previous = staging.path.join("previous");
+    let Some(destination_entry) = destination_entry else {
+        return Err(ToolError::Runtime {
+            message: "move destination identity disappeared before staging".into(),
+        });
+    };
+    if let Err(error) = rename_windows_entry(&destination_entry.handle, &previous, false) {
+        cleanup_windows_path_staging(staging, destination_display);
+        return Err(ToolError::io(
+            "stage previous move destination",
+            destination_display,
+            error,
+        ));
+    }
+    if let Err(error) = rename_windows_entry(&source, destination, false) {
+        let rollback = rename_windows_entry(&destination_entry.handle, destination, false);
+        if rollback.is_ok() {
+            cleanup_windows_path_staging(staging, destination_display);
+            return Err(ToolError::io("move path", destination_display, error));
+        }
+        let rollback_error = rollback.err().ok_or_else(|| ToolError::Runtime {
+            message: "failed move rollback reported neither success nor an error".into(),
+        })?;
+        return Err(ToolError::PathChanged {
+            path: destination_display.to_path_buf(),
+            message: format!(
+                "move failed ({error}) and restoring the prior destination failed ({})",
+                rollback_error
+            ),
+        });
+    }
+    let _ = remove_windows_entry_from_handle(&previous, destination_display, destination_entry);
+    cleanup_windows_path_staging(staging, destination_display);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn commit_windows_staged_entry(
+    staging: WindowsPathStaging,
+    destination: &Path,
+    staged_entry: WindowsPathEntry,
+    destination_entry: Option<WindowsPathEntry>,
+    destination_display: &Path,
+) -> ToolResult<()> {
+    let previous = staging.path.join("previous");
+    if let Some(destination_entry) = destination_entry.as_ref()
+        && let Err(error) = rename_windows_entry(&destination_entry.handle, &previous, false)
+    {
+        cleanup_windows_path_staging(staging, destination_display);
+        return Err(ToolError::io(
+            "stage previous copy destination",
+            destination_display,
+            error,
+        ));
+    }
+    if let Err(error) = rename_windows_entry(&staged_entry.handle, destination, false) {
+        if let Some(destination_entry) = destination_entry.as_ref() {
+            let rollback = rename_windows_entry(&destination_entry.handle, destination, false);
+            if let Err(rollback_error) = rollback {
+                return Err(ToolError::PathChanged {
+                    path: destination_display.to_path_buf(),
+                    message: format!(
+                        "copy commit failed ({error}) and restoring the prior destination failed ({rollback_error})"
+                    ),
+                });
+            }
+        }
+        cleanup_windows_path_staging(staging, destination_display);
+        return Err(ToolError::io(
+            "commit staged copy",
+            destination_display,
+            error,
+        ));
+    }
+    if let Some(destination_entry) = destination_entry {
+        let _ = remove_windows_entry_from_handle(&previous, destination_display, destination_entry);
+    }
+    cleanup_windows_path_staging(staging, destination_display);
+    Ok(())
 }
 
 #[cfg(unix)]

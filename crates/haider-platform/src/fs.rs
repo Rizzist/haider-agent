@@ -90,8 +90,9 @@ pub fn sync_directory(_path: &Path) -> std::io::Result<()> {
 /// Atomically publishes `source` at `target`, replacing an existing target.
 ///
 /// Unix `rename(2)` already has replacement semantics. Windows'
-/// `std::fs::rename` does not replace an existing file, so use the native
-/// write-through replacement operation there.
+/// `std::fs::rename` does not replace an existing file, so use `ReplaceFileW`:
+/// unlike `MoveFileExW`, it merges the replaced file's ACLs, attributes,
+/// encryption/compression state, and named streams into the staged file.
 #[cfg(unix)]
 pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::rename(source, target)
@@ -100,10 +101,26 @@ pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    replace_file_impl(source, target, None)
+}
+
+/// Windows replacement with an explicit same-volume recovery name. When
+/// `ReplaceFileW` reports one of its documented partial failure states, the
+/// replaced file remains available at `backup` for caller reconciliation.
+#[cfg(windows)]
+pub fn replace_file_with_backup(
+    source: &Path,
+    target: &Path,
+    backup: &Path,
+) -> std::io::Result<()> {
+    replace_file_impl(source, target, Some(backup))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_file_impl(source: &Path, target: &Path, backup: Option<&Path>) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     let source = source
         .as_os_str()
@@ -115,14 +132,26 @@ pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
         .encode_wide()
         .chain([0])
         .collect::<Vec<_>>();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
+    let backup = backup.map(|backup| {
+        backup
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>()
+    });
+    let replaced = unsafe {
+        ReplaceFileW(
             target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            source.as_ptr(),
+            backup
+                .as_ref()
+                .map_or(std::ptr::null(), |backup| backup.as_ptr()),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
-    if moved == 0 {
+    if replaced == 0 {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())

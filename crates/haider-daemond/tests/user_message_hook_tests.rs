@@ -4,6 +4,10 @@
 mod support;
 
 use async_trait::async_trait;
+#[cfg(windows)]
+use base64::Engine as _;
+#[cfg(windows)]
+use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_client::{
     EnsureOptions, HeadlessEvent, HeadlessOutcome, HeadlessRunRequest, ResolvedProfile,
     required_headless_features, run_headless,
@@ -38,15 +42,31 @@ fn capture_hook_command(capture: &Path) -> String {
 #[cfg(windows)]
 fn capture_hook_command(capture: &Path) -> String {
     let capture = capture.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$i=[Console]::OpenStandardInput();$f=[IO.File]::Open('{capture}',[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);$i.CopyTo($f);$f.WriteByte(10);$f.Dispose()"
+    );
+    let encoded = BASE64.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let executable = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(std::path::PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        });
     format!(
-        concat!(
-            "powershell.exe -NoProfile -NonInteractive -Command ",
-            "\"$i=[Console]::OpenStandardInput();",
-            "$f=[IO.File]::Open('{}',[IO.FileMode]::Append,",
-            "[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);",
-            "$i.CopyTo($f);$f.WriteByte(10);$f.Dispose()\""
-        ),
-        capture
+        "\"{}\" -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}",
+        executable.display()
     )
 }
 

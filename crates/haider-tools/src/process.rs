@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_platform::WorkspaceDirectory as OwnedFd;
-use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
+use haider_platform::{ProcessGroup, ProcessId as Pid, ProcessSignal as Signal};
 use haider_protocol::effect::{EffectClass, EffectOutcome, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, EffectId, WorkspaceRevision};
 use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
@@ -46,7 +46,7 @@ use tokio::time::{Sleep, sleep};
 #[cfg(unix)]
 type DirectoryIdentity = rustix::fs::Stat;
 #[cfg(windows)]
-type DirectoryIdentity = PathBuf;
+type DirectoryIdentity = haider_platform::WindowsFileIdentity;
 
 /// Maximum raw payload retained by one pipe-read chunk.
 pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
@@ -331,8 +331,9 @@ impl EffectOperation for ProcessExec {
 
     fn approval_preview(&self) -> Vec<String> {
         vec![
+            format!("Exact command: {}", self.command),
             format!(
-                "Exact command: {}",
+                "Escaped command: {}",
                 serde_json::to_string(&self.command)
                     .unwrap_or_else(|_| format!("{:?}", self.command))
             ),
@@ -678,6 +679,7 @@ pub struct ProcessControlResult {
 struct ActiveProcess {
     effect: EffectId,
     pid: Pid,
+    group: ProcessGroup,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     cancel: watch::Sender<bool>,
     live: Arc<AtomicBool>,
@@ -875,12 +877,16 @@ impl EffectBroker {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        haider_platform::configure_process_environment(&mut command);
         for name in &operation.env_allowlist {
             if let Some(value) = env::var_os(name) {
                 command.env(name, value);
             }
         }
+        #[cfg(unix)]
         set_anchored_current_dir(&mut command, cwd_fd);
+        #[cfg(windows)]
+        set_anchored_current_dir(&mut command, &cwd_fd);
         haider_platform::configure_process_group(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -903,7 +909,28 @@ impl EffectBroker {
                 )
                 .await;
         };
+        let platform_group = match haider_platform::register_process_group(raw_pid) {
+            Ok(group) => group,
+            Err(error) => {
+                let _ = child.start_kill();
+                return self
+                    .finish(
+                        &intent,
+                        Err(ToolError::Runtime {
+                            message: format!(
+                                "attach process {raw_pid} to its platform process group: {error}"
+                            ),
+                        }),
+                    )
+                    .await;
+            }
+        };
         let Some(pid) = i32::try_from(raw_pid).ok().and_then(Pid::from_raw) else {
+            let _ = haider_platform::signal_process_group(
+                platform_group,
+                haider_platform::ProcessSignal::Kill,
+            );
+            haider_platform::release_process_group(platform_group);
             return self
                 .finish(
                     &intent,
@@ -924,6 +951,7 @@ impl EffectBroker {
             (Ok(stdout), Ok(stderr)) => (stdout, stderr),
             (Err(error), _) | (_, Err(error)) => {
                 let _ = signal_group(pid, Signal::KILL);
+                haider_platform::release_process_group(platform_group);
                 return self.finish(&intent, Err(error)).await;
             }
         };
@@ -933,6 +961,7 @@ impl EffectBroker {
         let active = ActiveProcess {
             effect: intent.effect.clone(),
             pid,
+            group: platform_group,
             stdin: Arc::clone(&stdin),
             cancel: cancel.clone(),
             live: Arc::clone(&live),
@@ -944,6 +973,7 @@ impl EffectBroker {
             .await
         {
             let _ = signal_group(pid, Signal::KILL);
+            haider_platform::release_process_group(platform_group);
             return self.finish(&intent, Err(error)).await;
         }
 
@@ -961,6 +991,7 @@ impl EffectBroker {
                 stderr,
                 stdin,
                 pid,
+                group: platform_group,
                 call_id: call_id.clone(),
                 effect: effect.clone(),
                 command_arg_digest,
@@ -1071,6 +1102,7 @@ struct Supervisor {
     stderr: tokio::process::ChildStderr,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     pid: Pid,
+    group: ProcessGroup,
     call_id: String,
     effect: EffectId,
     command_arg_digest: String,
@@ -1154,6 +1186,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         stderr,
         stdin,
         pid,
+        group,
         call_id,
         effect,
         command_arg_digest,
@@ -1205,6 +1238,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
 
     if cancelled {
         begin_group_termination(
+            group,
             pid,
             false,
             bounds.kill_grace,
@@ -1224,6 +1258,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                     Ok(()) if *cancel.borrow() => {
                         cancelled = true;
                         begin_group_termination(
+                            group,
                             pid,
                             false,
                             bounds.kill_grace,
@@ -1241,6 +1276,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                 wall_deadline_open = false;
                 limit_reached = Some(ProcessLimit::WallTimeout);
                 begin_group_termination(
+                    group,
                     pid,
                     false,
                     bounds.kill_grace,
@@ -1288,6 +1324,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                             ).await {
                                 fatal.get_or_insert(error);
                                 begin_group_termination(
+                                    group,
                                     pid,
                                     false,
                                     bounds.kill_grace,
@@ -1328,6 +1365,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         }
                         if transcript_failed {
                             begin_group_termination(
+                                group,
                                 pid,
                                 false,
                                 bounds.kill_grace,
@@ -1344,6 +1382,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                                 spill = None;
                                 transcript_failed = true;
                                 begin_group_termination(
+                                    group,
                                     pid,
                                     false,
                                     bounds.kill_grace,
@@ -1361,6 +1400,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         if reached_cap {
                             limit_reached = Some(ProcessLimit::OutputCap);
                             begin_group_termination(
+                                group,
                                 pid,
                                 false,
                                 bounds.kill_grace,
@@ -1376,6 +1416,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                             message: format!("read {stream:?} from process `{call_id}`: {error}"),
                         });
                         begin_group_termination(
+                            group,
                             pid,
                             false,
                             bounds.kill_grace,
@@ -1406,6 +1447,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                 };
                 if kill_deadline.is_none() {
                     begin_group_termination(
+                        group,
                         pid,
                         leader_is_zombie,
                         bounds.kill_grace,
@@ -1436,14 +1478,19 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                     deadline.await;
                 }
             }, if kill_deadline.is_some() => {
-                match process_group_exists(pid) {
+                match platform_group_exists(group, pid) {
                     Ok(false) => {
                         kill_deadline = None;
                         lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
                     }
                     Ok(true) => {
                         if let Err(error) =
-                            signal_group_for_sweep(pid, Signal::KILL, leader_is_zombie)
+                            signal_platform_group_for_sweep(
+                                group,
+                                pid,
+                                Signal::KILL,
+                                leader_is_zombie,
+                            )
                         {
                             let note = format!(
                                 "SIGKILL escalation failed for process group {}: {error}",
@@ -1621,7 +1668,9 @@ async fn apply_control(active: &ActiveProcess, control: &ProcessControl) -> Tool
         )));
     }
     match &control.action {
-        ProcessControlAction::SendSignal(signal) => signal_group(active.pid, signal.rustix()),
+        ProcessControlAction::SendSignal(signal) => {
+            signal_platform_group(active.group, active.pid, signal.rustix())
+        }
         ProcessControlAction::StdinWrite(bytes) => {
             let mut stdin = active.stdin.lock().await;
             let pipe = stdin.as_mut().ok_or_else(|| {
@@ -1647,7 +1696,18 @@ async fn apply_control(active: &ActiveProcess, control: &ProcessControl) -> Tool
 }
 
 pub(crate) fn signal_group(pid: Pid, signal: Signal) -> ToolResult<()> {
-    haider_platform::signal_process_group_id(pid, signal).map_err(|error| ToolError::Runtime {
+    let group =
+        haider_platform::process_group(Some(pid.id())).ok_or_else(|| ToolError::Runtime {
+            message: format!(
+                "process group {} is no longer registered",
+                pid.as_raw_nonzero()
+            ),
+        })?;
+    signal_platform_group(group, pid, signal)
+}
+
+fn signal_platform_group(group: ProcessGroup, pid: Pid, signal: Signal) -> ToolResult<()> {
+    haider_platform::signal_process_group(group, signal).map_err(|error| ToolError::Runtime {
         message: format!(
             "send signal {signal:?} to process group {}: {error}",
             pid.as_raw_nonzero()
@@ -1663,8 +1723,34 @@ pub(crate) fn signal_group_for_sweep(
     signal: Signal,
     leader_is_zombie: bool,
 ) -> ToolResult<bool> {
-    match haider_platform::signal_process_group_id(pid, signal) {
-        Ok(()) => Ok(true),
+    let Some(group) = haider_platform::process_group(Some(pid.id())) else {
+        #[cfg(windows)]
+        return Ok(false);
+        #[cfg(unix)]
+        return Err(ToolError::Runtime {
+            message: "signal process group: invalid process id".into(),
+        });
+    };
+    signal_platform_group_for_sweep(group, pid, signal, leader_is_zombie)
+}
+
+pub(crate) fn signal_platform_group_for_sweep(
+    group: ProcessGroup,
+    pid: Pid,
+    signal: Signal,
+    leader_is_zombie: bool,
+) -> ToolResult<bool> {
+    match haider_platform::signal_process_group(group, signal) {
+        Ok(()) => {
+            // A Windows KILL terminates the entire Job Object. Drop the exact
+            // token immediately so a terminal escalation cannot retain a
+            // stale job handle (or later act on a recycled PID).
+            #[cfg(windows)]
+            if signal == Signal::KILL {
+                haider_platform::release_process_group(group);
+            }
+            Ok(true)
+        }
         Err(error) if haider_platform::process_error_is_missing(&error) => Ok(false),
         // Darwin reports EPERM when a group contains only the caller's zombie
         // child. Since that zombie pins this exact PGID, no live member of the
@@ -1682,10 +1768,22 @@ pub(crate) fn signal_group_for_sweep(
 }
 
 pub(crate) fn process_group_exists(pid: Pid) -> ToolResult<bool> {
-    let group =
-        haider_platform::process_group(Some(pid.id())).ok_or_else(|| ToolError::Runtime {
+    let Some(group) = haider_platform::process_group(Some(pid.id())) else {
+        // Windows Job handles are process-owned authorities. If a daemon
+        // restarts, KILL_ON_JOB_CLOSE has already swept every old task and a
+        // missing token therefore means dead. Never reconstruct authority
+        // from the recyclable numeric PID.
+        #[cfg(windows)]
+        return Ok(false);
+        #[cfg(unix)]
+        return Err(ToolError::Runtime {
             message: "probe process group: invalid process id".into(),
-        })?;
+        });
+    };
+    platform_group_exists(group, pid)
+}
+
+pub(crate) fn platform_group_exists(group: ProcessGroup, pid: Pid) -> ToolResult<bool> {
     haider_platform::process_group_exists(group).map_err(|error| ToolError::Runtime {
         message: format!("probe process group {}: {error}", pid.as_raw_nonzero()),
     })
@@ -1738,7 +1836,9 @@ pub(crate) async fn reap_process_leader(
 /// that zombie unreaped until this sweep reaches `GroupSweepCompleted`. The
 /// zombie keeps the PGID allocated, so every probe/signal below is guaranteed
 /// to target the original group rather than a recycled one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_group_termination(
+    group: ProcessGroup,
     pid: Pid,
     leader_is_zombie: bool,
     grace: Duration,
@@ -1751,22 +1851,24 @@ pub(crate) fn begin_group_termination(
         return;
     }
     lifecycle_events.push(ProcessLifecycleEvent::GroupSweepStarted);
-    match process_group_exists(pid) {
+    match platform_group_exists(group, pid) {
         Ok(false) => lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted),
-        Ok(true) => match signal_group_for_sweep(pid, Signal::TERM, leader_is_zombie) {
-            Ok(true) => *deadline = Some(Box::pin(sleep(grace))),
-            Ok(false) => {
-                lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
+        Ok(true) => {
+            match signal_platform_group_for_sweep(group, pid, Signal::TERM, leader_is_zombie) {
+                Ok(true) => *deadline = Some(Box::pin(sleep(grace))),
+                Ok(false) => {
+                    lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
+                }
+                Err(error) => {
+                    notes.push(format!(
+                        "SIGTERM failed for process group {}: {error}",
+                        pid.as_raw_nonzero()
+                    ));
+                    fatal.get_or_insert(error);
+                    *deadline = Some(Box::pin(sleep(grace)));
+                }
             }
-            Err(error) => {
-                notes.push(format!(
-                    "SIGTERM failed for process group {}: {error}",
-                    pid.as_raw_nonzero()
-                ));
-                fatal.get_or_insert(error);
-                *deadline = Some(Box::pin(sleep(grace)));
-            }
-        },
+        }
         Err(error) => {
             notes.push(format!(
                 "process-group probe failed before SIGTERM: {error}"
@@ -1818,24 +1920,15 @@ fn open_directory_beneath(
             requested_path: cwd.to_path_buf(),
             resolved_path: Some(cwd.to_path_buf()),
         })?;
-    let candidate = directory.join(relative);
-    let canonical = std::fs::canonicalize(&candidate)
+    let anchored = haider_platform::open_workspace_subdirectory(directory, relative, false)
         .map_err(|error| ToolError::io("open anchored process cwd", cwd, error))?;
-    if canonical != cwd {
+    if anchored.path() != cwd {
         return Err(ToolError::PathChanged {
             path: cwd.to_path_buf(),
             message: "process cwd identity changed before spawn".into(),
         });
     }
-    let metadata = std::fs::symlink_metadata(&candidate)
-        .map_err(|error| ToolError::io("open anchored process cwd", cwd, error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ToolError::PathChanged {
-            path: cwd.to_path_buf(),
-            message: "process cwd is not a real directory".into(),
-        });
-    }
-    Ok(canonical)
+    Ok(anchored)
 }
 
 #[cfg(unix)]
@@ -1853,8 +1946,8 @@ pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd_fd: OwnedFd) {
 }
 
 #[cfg(windows)]
-pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd: OwnedFd) {
-    command.current_dir(cwd);
+pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd: &OwnedFd) {
+    command.current_dir(cwd.path());
 }
 
 #[cfg(unix)]
@@ -1872,7 +1965,8 @@ fn directory_identity(
     path: &Path,
     operation: &'static str,
 ) -> ToolResult<DirectoryIdentity> {
-    std::fs::canonicalize(directory).map_err(|error| ToolError::io(operation, path, error))
+    haider_platform::workspace_directory_identity(directory)
+        .map_err(|error| ToolError::io(operation, path, error))
 }
 
 #[cfg(unix)]
@@ -1896,20 +1990,7 @@ pub(crate) fn shell_command(script: &str) -> Command {
 pub(crate) fn shell_command(script: &str) -> Command {
     use std::os::windows::process::CommandExt as _;
 
-    // Resolve before the broker installs its reduced child environment.
-    // CreateProcess does not search the PATH supplied to the child process.
-    let interpreter = std::env::var_os("COMSPEC")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute() && path.is_file())
-        .or_else(|| {
-            std::env::var_os("SystemRoot")
-                .or_else(|| std::env::var_os("WINDIR"))
-                .map(PathBuf::from)
-                .map(|root| root.join("System32").join("cmd.exe"))
-                .filter(|path| path.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
-    let mut command = Command::new(interpreter);
+    let mut command = Command::new(haider_platform::windows_command_interpreter());
     command.args(["/D", "/S", "/C"]);
     command.as_std_mut().raw_arg(format!("\"{script}\""));
     command

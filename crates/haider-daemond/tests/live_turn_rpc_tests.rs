@@ -674,6 +674,16 @@ fn exact_once_shell_command() -> String {
 
 #[cfg(windows)]
 fn exact_once_shell_command() -> String {
+    windows_powershell_command(concat!(
+        "[IO.File]::AppendAllText('shell-count.txt',('once'+[char]10),",
+        "[Text.Encoding]::ASCII);",
+        "$b=[Text.Encoding]::UTF8.GetBytes(('héllo'+[char]10));",
+        "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)"
+    ))
+}
+
+#[cfg(windows)]
+fn windows_powershell_command(script: &str) -> String {
     let executable = std::env::var_os("SystemRoot")
         .or_else(|| std::env::var_os("WINDIR"))
         .map(std::path::PathBuf::from)
@@ -687,12 +697,6 @@ fn exact_once_shell_command() -> String {
         .unwrap_or_else(|| {
             std::path::PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
         });
-    let script = concat!(
-        "[IO.File]::AppendAllText('shell-count.txt',('once'+[char]10),",
-        "[Text.Encoding]::ASCII);",
-        "$b=[Text.Encoding]::UTF8.GetBytes(('héllo'+[char]10));",
-        "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)"
-    );
     let encoded = BASE64.encode(
         script
             .encode_utf16()
@@ -707,55 +711,72 @@ fn exact_once_shell_command() -> String {
 }
 
 #[cfg(unix)]
-const DENIED_EXEC_COMMAND: &str = "printf denied > denied.log";
+fn denied_exec_command() -> String {
+    "printf denied > denied.log".into()
+}
 
 #[cfg(windows)]
-const DENIED_EXEC_COMMAND: &str = "(echo|set /p=\"denied\")>denied.log";
+fn denied_exec_command() -> String {
+    ">denied.log echo denied".into()
+}
 
 #[cfg(unix)]
-const APPROVED_EXEC_COMMAND: &str =
-    "printf 'run\\n' >> runs.log; printf stdout-ok; printf stderr-ok >&2";
+fn approved_exec_command() -> String {
+    "printf 'run\\n' >> runs.log; printf stdout-ok; printf stderr-ok >&2".into()
+}
 
 #[cfg(windows)]
-const APPROVED_EXEC_COMMAND: &str = concat!(
-    "powershell.exe -NoProfile -NonInteractive -Command ",
-    "\"[IO.File]::AppendAllText('runs.log',('run'+[char]10),",
-    "[Text.Encoding]::ASCII);",
-    "[Console]::Out.Write('stdout-ok');[Console]::Error.Write('stderr-ok')\""
-);
+fn approved_exec_command() -> String {
+    windows_powershell_command(concat!(
+        "[IO.File]::AppendAllText('runs.log',('run'+[char]10),",
+        "[Text.Encoding]::ASCII);",
+        "[Console]::Out.Write('stdout-ok');[Console]::Error.Write('stderr-ok')"
+    ))
+}
 
 #[cfg(unix)]
-const DIFFERENT_EXEC_COMMAND: &str = "printf different > different.log";
+fn different_exec_command() -> String {
+    "printf different > different.log".into()
+}
 
 #[cfg(windows)]
-const DIFFERENT_EXEC_COMMAND: &str = "(echo|set /p=\"different\")>different.log";
+fn different_exec_command() -> String {
+    ">different.log echo different".into()
+}
 
 #[cfg(unix)]
-const RESTART_EXEC_COMMAND: &str = "printf 'attempt\\n' >> attempts.log; printf started; sleep 1";
+fn restart_exec_command() -> String {
+    "printf 'attempt\\n' >> attempts.log; printf started; sleep 1".into()
+}
 
 #[cfg(windows)]
-const RESTART_EXEC_COMMAND: &str = concat!(
-    "powershell.exe -NoProfile -NonInteractive -Command ",
-    "\"[IO.File]::AppendAllText('attempts.log',('attempt'+[char]10),",
-    "[Text.Encoding]::ASCII);",
-    "[Console]::Out.Write('started');[Console]::Out.Flush();",
-    "Start-Sleep -Seconds 1\""
-);
+fn restart_exec_command() -> String {
+    windows_powershell_command(concat!(
+        "[IO.File]::AppendAllText('attempts.log',('attempt'+[char]10),",
+        "[Text.Encoding]::ASCII);",
+        "[Console]::Out.Write('started');[Console]::Out.Flush();",
+        "Start-Sleep -Seconds 1"
+    ))
+}
 
 #[cfg(unix)]
-const CANCELLABLE_EXEC_COMMAND: &str = concat!(
-    "printf x >> heartbeat.log; printf started; ",
-    "while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done"
-);
+fn cancellable_exec_command() -> String {
+    concat!(
+        "printf x >> heartbeat.log; printf started; ",
+        "while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done"
+    )
+    .into()
+}
 
 #[cfg(windows)]
-const CANCELLABLE_EXEC_COMMAND: &str = concat!(
-    "powershell.exe -NoProfile -NonInteractive -Command ",
-    "\"[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
-    "[Console]::Out.Write('started');[Console]::Out.Flush();",
-    "while($true){[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
-    "[Console]::Out.Write('y');[Console]::Out.Flush();Start-Sleep -Milliseconds 10}\""
-);
+fn cancellable_exec_command() -> String {
+    windows_powershell_command(concat!(
+        "[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
+        "[Console]::Out.Write('started');[Console]::Out.Flush();",
+        "while($true){[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
+        "[Console]::Out.Write('y');[Console]::Out.Flush();Start-Sleep -Milliseconds 10}"
+    ))
+}
 
 /// Scenario 1: the production runtime is constructed with an injected,
 /// deterministic provider factory; no live provider is reachable.
@@ -4938,9 +4959,9 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
     let denied_path = workspace.join("denied.log");
     let runs_path = workspace.join("runs.log");
     let different_path = workspace.join("different.log");
-    let denied_command = DENIED_EXEC_COMMAND;
-    let approved_command = APPROVED_EXEC_COMMAND;
-    let different_command = DIFFERENT_EXEC_COMMAND;
+    let denied_command = denied_exec_command();
+    let approved_command = approved_exec_command();
+    let different_command = different_exec_command();
     let config = DaemonConfig::new(
         "w4a2-exec-approval",
         root.path().join("store"),
@@ -4950,7 +4971,7 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
         FakeStep::EmitToolCall {
             call_id: "exec-denied".into(),
             name: "exec".into(),
-            args: serde_json::json!({"command": denied_command}),
+            args: serde_json::json!({"command": denied_command.clone()}),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -4964,7 +4985,7 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
         FakeStep::EmitToolCall {
             call_id: "exec-approved".into(),
             name: "exec".into(),
-            args: serde_json::json!({"command": approved_command}),
+            args: serde_json::json!({"command": approved_command.clone()}),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -4978,7 +4999,7 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
         FakeStep::EmitToolCall {
             call_id: "exec-same-shape".into(),
             name: "exec".into(),
-            args: serde_json::json!({"command": approved_command}),
+            args: serde_json::json!({"command": approved_command.clone()}),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -4992,7 +5013,7 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
         FakeStep::EmitToolCall {
             call_id: "exec-different-shape".into(),
             name: "exec".into(),
-            args: serde_json::json!({"command": different_command}),
+            args: serde_json::json!({"command": different_command.clone()}),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -5034,7 +5055,7 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
         deny_menu
             .body
             .iter()
-            .any(|line| line.contains(denied_command)),
+            .any(|line| line.contains(&denied_command)),
         "the approval menu must show the exact command"
     );
     assert!(
@@ -5223,7 +5244,7 @@ async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape()
         different_menu
             .body
             .iter()
-            .any(|line| line.contains(different_command))
+            .any(|line| line.contains(&different_command))
     );
     answer_menu(
         &mut restarted,
@@ -6194,11 +6215,8 @@ impl TurnToolFactory for HeldRealPatchFactory {
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
-        #[cfg(unix)]
         let mut policy = PermissionPolicy::default();
-        #[cfg(unix)]
         policy.allow(EffectClass::FsWrite);
-        #[cfg(unix)]
         let broker = EffectBroker::new(
             Box::new(TestHubJournal {
                 context: context.clone(),
@@ -6209,9 +6227,7 @@ impl TurnToolFactory for HeldRealPatchFactory {
         )
         .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
         Ok(Some(Arc::new(HeldRealPatchDispatcher {
-            #[cfg(unix)]
             broker: tokio::sync::Mutex::new(Some(broker)),
-            #[cfg(unix)]
             policy,
             context,
             calls: self.calls.clone(),
@@ -6262,9 +6278,7 @@ impl JournalSink for TestHubJournal {
 }
 
 struct HeldRealPatchDispatcher {
-    #[cfg(unix)]
     broker: tokio::sync::Mutex<Option<EffectBroker>>,
-    #[cfg(unix)]
     policy: PermissionPolicy,
     context: WorkerToolContext,
     calls: Arc<AtomicUsize>,
@@ -6284,204 +6298,39 @@ impl ToolDispatcher for HeldRealPatchDispatcher {
     ) -> Result<ToolDispatchResult, HaiderError> {
         assert_eq!(name, "fs_edit");
         self.calls.fetch_add(1, Ordering::SeqCst);
-        #[cfg(windows)]
-        {
-            return execute_held_windows_patch(&self.context, &self.ledger, run_id, args).await;
-        }
-        #[cfg(unix)]
-        {
-            let path = args["path"].as_str().expect("path");
-            let old = args["edits"][0]["old"].as_str().expect("old anchor");
-            let new = args["edits"][0]["new"].as_str().expect("new text");
-            let mut broker = self.broker.lock().await;
-            let broker = broker.as_mut().expect("open broker");
-            let bytes = fs::read(std::path::Path::new(&self.context.metadata.cwd).join(path))
-                .expect("read edit baseline");
-            broker
-                .restore_freshness([FileFreshness {
-                    path: path.into(),
-                    digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
-                }])
-                .expect("restore edit baseline");
-            let result = broker
-                .fs_edit(
-                    &FsEdit::new(path, old, new),
-                    &self.policy,
-                    &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
-                    &self.ledger,
-                )
-                .await
-                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
-            Ok(ToolDispatchResult::Completed(result))
-        }
+        let path = args["path"].as_str().expect("path");
+        let old = args["edits"][0]["old"].as_str().expect("old anchor");
+        let new = args["edits"][0]["new"].as_str().expect("new text");
+        let mut broker = self.broker.lock().await;
+        let broker = broker.as_mut().expect("open broker");
+        let bytes = fs::read(std::path::Path::new(&self.context.metadata.cwd).join(path))
+            .expect("read edit baseline");
+        broker
+            .restore_freshness([FileFreshness {
+                path: path.into(),
+                digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+            }])
+            .expect("restore edit baseline");
+        let result = broker
+            .fs_edit(
+                &FsEdit::new(path, old, new),
+                &self.policy,
+                &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
+                &self.ledger,
+            )
+            .await
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        Ok(ToolDispatchResult::Completed(result))
     }
 
     async fn close(&self) -> Result<(), HaiderError> {
-        #[cfg(unix)]
-        {
-            let Some(broker) = self.broker.lock().await.take() else {
-                return Ok(());
-            };
-            broker.close().await.map(|_| ()).map_err(|error| {
-                HaiderError::new(ErrorCode::EffectUnknownOutcome, error.to_string(), false)
-            })
-        }
-        #[cfg(windows)]
-        {
-            Ok(())
-        }
+        let Some(broker) = self.broker.lock().await.take() else {
+            return Ok(());
+        };
+        broker.close().await.map(|_| ()).map_err(|error| {
+            HaiderError::new(ErrorCode::EffectUnknownOutcome, error.to_string(), false)
+        })
     }
-}
-
-/// Windows deliberately keeps the production `fs_edit` broker unavailable
-/// until it can provide the same handle-anchored race guarantees as Unix.
-/// This recovery test needs a narrower seam: durable, correctly ordered
-/// FsWrite phases followed by a real file change and a held post-apply ledger
-/// boundary. The hermetic fixture owns the only writer, so a path-based edit is
-/// sufficient here without misrepresenting product support.
-#[cfg(windows)]
-async fn execute_held_windows_patch(
-    context: &WorkerToolContext,
-    ledger: &HeldPatchLedger,
-    run_id: &RunId,
-    args: serde_json::Value,
-) -> Result<ToolDispatchResult, HaiderError> {
-    let path = args["path"].as_str().ok_or_else(|| {
-        HaiderError::new(ErrorCode::InvalidArgument, "missing fixture path", false)
-    })?;
-    let old = args["edits"][0]["old"].as_str().ok_or_else(|| {
-        HaiderError::new(
-            ErrorCode::InvalidArgument,
-            "missing fixture old anchor",
-            false,
-        )
-    })?;
-    let new = args["edits"][0]["new"].as_str().ok_or_else(|| {
-        HaiderError::new(
-            ErrorCode::InvalidArgument,
-            "missing fixture replacement",
-            false,
-        )
-    })?;
-    let workspace = fs::canonicalize(&context.metadata.cwd).map_err(|error| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            format!("canonicalize fixture workspace: {error}"),
-            false,
-        )
-    })?;
-    let target = fs::canonicalize(workspace.join(path)).map_err(|error| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            format!("canonicalize fixture target: {error}"),
-            false,
-        )
-    })?;
-    if !target.starts_with(&workspace) {
-        return Err(HaiderError::new(
-            ErrorCode::InvalidArgument,
-            "fixture target escaped its workspace",
-            false,
-        ));
-    }
-
-    let effect = EffectId::new(format!("w4a1-held-patch-{run_id}"));
-    let args_bytes = serde_json::to_vec(&args).map_err(|error| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            format!("encode fixture arguments: {error}"),
-            false,
-        )
-    })?;
-    let intent = EffectIntent {
-        effect: effect.clone(),
-        class: EffectClass::FsWrite,
-        summary: format!("patch {path}"),
-        args_digest: format!("blake3:{}", blake3::hash(&args_bytes).to_hex()),
-        workspace_revision: None,
-    };
-    let mut journal = TestHubJournal {
-        context: context.clone(),
-    };
-    for payload in [
-        EventPayload::Effect(EffectPhase::Intent(intent)),
-        EventPayload::Effect(EffectPhase::Authorized {
-            effect: effect.clone(),
-            verdict: AuthorizationVerdict::Allow,
-        }),
-        EventPayload::Effect(EffectPhase::Dispatched {
-            effect: effect.clone(),
-        }),
-    ] {
-        journal
-            .append(payload)
-            .await
-            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
-    }
-
-    let before = fs::read_to_string(&target).map_err(|error| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            format!("read fixture target: {error}"),
-            false,
-        )
-    })?;
-    let matches = before.matches(old).count();
-    if matches != 1 {
-        return Err(HaiderError::new(
-            ErrorCode::InvalidArgument,
-            format!("fixture edit anchor matched {matches} times"),
-            false,
-        ));
-    }
-    let after = before.replacen(old, new, 1);
-    fs::write(&target, after.as_bytes()).map_err(|error| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            format!("write fixture target: {error}"),
-            false,
-        )
-    })?;
-
-    let ledger = ledger.clone();
-    let session_id = context.store.session_id().clone();
-    let run_id = run_id.clone();
-    let effect_for_record = effect;
-    let target_for_record = target.clone();
-    let post_digest_for_record = format!("blake3:{}", blake3::hash(after.as_bytes()).to_hex());
-    tokio::task::spawn_blocking(move || {
-        ledger.record_fs_write(
-            session_id,
-            run_id,
-            FsWriteRecord {
-                effect: effect_for_record,
-                paths: vec![target_for_record],
-                summary: "patch held Windows fixture target".into(),
-                bytes_hash: post_digest_for_record,
-            },
-        )
-    })
-    .await
-    .map_err(|error| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            format!("join fixture ledger boundary: {error}"),
-            false,
-        )
-    })?
-    .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
-
-    Ok(ToolDispatchResult::Completed(
-        haider_protocol::tool::BoundedResult {
-            preview: format!("edited {} (1 replacement)", target.display()),
-            truncated: false,
-            artifact: None,
-            cursor: None,
-            status: haider_protocol::tool::ToolResultStatus::Completed,
-            reason: None,
-            presentation: None,
-        },
-    ))
 }
 
 /// MUTATION CHECK: remove startup Dispatched-without-Outcome reconciliation
@@ -6623,7 +6472,7 @@ async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let attempts = workspace.join("attempts.log");
-    let command = RESTART_EXEC_COMMAND;
+    let command = restart_exec_command();
     let config = DaemonConfig::new(
         "w4a2-exec-restart",
         root.path().join("store"),
@@ -6778,7 +6627,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let heartbeat = workspace.join("heartbeat.log");
-    let command = CANCELLABLE_EXEC_COMMAND;
+    let command = cancellable_exec_command();
     let config = DaemonConfig::new(
         "w4a2-exec-cancel",
         root.path().join("store"),

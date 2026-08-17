@@ -88,7 +88,7 @@ fn haider() -> HaiderCommand {
 
 impl Drop for HaiderCommand {
     fn drop(&mut self) {
-        terminate_daemon(&self.profile);
+        let _ = terminate_daemon_checked(&self.profile);
     }
 }
 
@@ -128,18 +128,39 @@ fn daemon_pid(profile: &Path) -> Option<u32> {
         .ok()
 }
 
-fn terminate_daemon(profile: &Path) {
-    if let Some(pid) = daemon_pid(profile) {
-        #[cfg(unix)]
-        let _ = Command::new("kill").arg(pid.to_string()).status();
-        #[cfg(windows)]
-        let _ = Command::new("taskkill.exe")
-            .arg("/PID")
+fn terminate_daemon_checked(profile: &Path) -> std::io::Result<()> {
+    let pid = daemon_pid(profile).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "daemon PID is missing from {}",
+                profile.join("lock").display()
+            ),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
             .arg(pid.to_string())
-            .args(["/T", "/F"])
-            .status();
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "kill reported {status} for daemon {pid}"
+            )));
+        }
     }
+    #[cfg(windows)]
+    haider_platform::kill_process_tree(pid, true)?;
+    Ok(())
 }
+
+#[cfg(unix)]
+const EXEC_WRITE_COMMAND: &str = "printf ok > exec-created.txt";
+
+#[cfg(windows)]
+const EXEC_WRITE_COMMAND: &str = r#">exec-created.txt <nul set /p "=ok" & exit /b 0"#;
 
 #[test]
 fn version_prints_workspace_version() {
@@ -443,7 +464,7 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
             .iter()
             .all(|envelope| envelope.worker_generation == first_generation)
     );
-    terminate_daemon(&profile);
+    terminate_daemon_checked(&profile).expect("terminate first daemon generation");
     // Endpoint removal precedes store close during an orderly drain. Waiting
     // for the endpoint therefore races the successor into the intentional
     // endpoint-gone/profile-lock-held interval, where it must exit 75. Prove
@@ -473,7 +494,7 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
         thread::sleep(Duration::from_millis(20));
     }
     let second_output = run("restarted process");
-    terminate_daemon(&profile);
+    terminate_daemon_checked(&profile).expect("terminate second daemon generation");
     assert!(
         second_output.status.success(),
         "stderr: {}",
@@ -686,7 +707,7 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
             "call_id": "exec-1",
             "name": "exec",
             "args": {
-                "command": "printf ok > exec-created.txt",
+                "command": EXEC_WRITE_COMMAND,
                 "cwd": exec_workspace.path().to_str().expect("UTF-8 exec workspace")
             }
         },
@@ -716,6 +737,15 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
         "ok"
     );
     let exec_envelopes = parse_jsonl(&exec.stdout);
+    // On the run surface an exec tool call completes as its `tool_call`
+    // item plus a bounded ToolResult whose preview carries the exit code —
+    // the CommandExecution item belongs to the direct-shell and live-turn
+    // RPC surfaces, not this stream.
+    assert!(exec_envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        Some(EventPayload::ToolResult { call_id, result })
+            if call_id == "exec-1" && result.preview.contains("\"exit_code\":0")
+    )));
     assert!(exec_envelopes.iter().any(|envelope| matches!(
         typed(envelope),
         Some(EventPayload::Effect(EffectPhase::Authorized {

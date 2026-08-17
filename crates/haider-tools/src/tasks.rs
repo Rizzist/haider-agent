@@ -16,12 +16,12 @@
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::process::{
     Captured, PreparedProcessExec, ProcessBounds, ProcessExec, begin_group_termination,
-    observe_process_leader_exit, process_arguments, process_group_exists, read_output,
-    reap_process_leader, set_anchored_current_dir, shell_command, signal_group,
-    signal_group_for_sweep,
+    observe_process_leader_exit, platform_group_exists, process_arguments, process_group_exists,
+    read_output, reap_process_leader, set_anchored_current_dir, shell_command, signal_group,
+    signal_group_for_sweep, signal_platform_group_for_sweep,
 };
 use crate::{ToolError, ToolResult};
-use haider_platform::{ProcessId as Pid, ProcessSignal as Signal};
+use haider_platform::{ProcessGroup, ProcessId as Pid, ProcessSignal as Signal};
 use haider_protocol::effect::WorkspaceMutation;
 use haider_protocol::ids::EffectId;
 use haider_protocol::item::OutputStream;
@@ -117,8 +117,9 @@ impl EffectOperation for BackgroundExec {
 
     fn approval_preview(&self) -> Vec<String> {
         vec![
+            format!("Exact command: {}", self.operation.command),
             format!(
-                "Exact command: {}",
+                "Escaped command: {}",
                 serde_json::to_string(&self.operation.command)
                     .unwrap_or_else(|_| format!("{:?}", self.operation.command))
             ),
@@ -159,8 +160,9 @@ impl EffectOperation for PreparedBackgroundExec<'_> {
 
     fn approval_preview(&self) -> Vec<String> {
         vec![
+            format!("Exact command: {}", self.prepared.operation.command),
             format!(
-                "Exact command: {}",
+                "Escaped command: {}",
                 serde_json::to_string(&self.prepared.operation.command)
                     .unwrap_or_else(|_| format!("{:?}", self.prepared.operation.command))
             ),
@@ -185,6 +187,7 @@ pub struct BackgroundSpawn {
     stdout: ChildStdout,
     stderr: ChildStderr,
     pid_handle: Pid,
+    process_group: ProcessGroup,
     workspace_root: PathBuf,
     workspace_digest_before: String,
 }
@@ -274,12 +277,16 @@ impl EffectBroker {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        haider_platform::configure_process_environment(&mut command);
         for name in &resolved.env_allowlist {
             if let Some(value) = env::var_os(name) {
                 command.env(name, value);
             }
         }
+        #[cfg(unix)]
         set_anchored_current_dir(&mut command, cwd_fd);
+        #[cfg(windows)]
+        set_anchored_current_dir(&mut command, &cwd_fd);
         haider_platform::configure_process_group(&mut command);
         haider_platform::configure_background_process(&mut command);
         let mut child = match command.spawn() {
@@ -293,13 +300,40 @@ impl EffectBroker {
                     .await;
             }
         };
+        let Some(raw_pid) = child.id() else {
+            let _ = child.start_kill();
+            return self
+                .finish(
+                    &intent,
+                    Err(ToolError::Runtime {
+                        message: "spawned background task did not expose a process id".into(),
+                    }),
+                )
+                .await;
+        };
+        let platform_group = match haider_platform::register_process_group(raw_pid) {
+            Ok(group) => group,
+            Err(error) => {
+                let _ = child.start_kill();
+                return self
+                    .finish(
+                        &intent,
+                        Err(ToolError::Runtime {
+                            message: format!(
+                                "attach background process {raw_pid} to its platform process group: {error}"
+                            ),
+                        }),
+                    )
+                    .await;
+            }
+        };
         let pid_raw = child.id().and_then(|raw| i32::try_from(raw).ok());
         let Some(pid_handle) = pid_raw.and_then(Pid::from_raw) else {
-            if let Some(id) = child.id().and_then(|raw| i32::try_from(raw).ok())
-                && let Some(pid) = Pid::from_raw(id)
-            {
-                let _ = signal_group(pid, Signal::KILL);
-            }
+            let _ = haider_platform::signal_process_group(
+                platform_group,
+                haider_platform::ProcessSignal::Kill,
+            );
+            haider_platform::release_process_group(platform_group);
             return self
                 .finish(
                     &intent,
@@ -313,6 +347,7 @@ impl EffectBroker {
         let stderr = child.stderr.take();
         let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
             let _ = signal_group(pid_handle, Signal::KILL);
+            haider_platform::release_process_group(platform_group);
             return self
                 .finish(
                     &intent,
@@ -330,6 +365,7 @@ impl EffectBroker {
             stdout,
             stderr,
             pid_handle,
+            process_group: platform_group,
             workspace_root,
             workspace_digest_before,
         };
@@ -484,6 +520,7 @@ pub async fn supervise_background(
         stdout,
         stderr,
         pid_handle: pid,
+        process_group: group,
         workspace_root,
         workspace_digest_before,
     } = spawn;
@@ -518,6 +555,7 @@ pub async fn supervise_background(
     if *kill.borrow() {
         killed = true;
         begin_group_termination(
+            group,
             pid,
             false,
             grace,
@@ -537,6 +575,7 @@ pub async fn supervise_background(
                     Ok(()) if *kill.borrow() => {
                         killed = !leader_exit_observed;
                         begin_group_termination(
+                            group,
                             pid,
                             leader_is_zombie,
                             grace,
@@ -592,6 +631,7 @@ pub async fn supervise_background(
                 };
                 if kill_deadline.is_none() {
                     begin_group_termination(
+                        group,
                         pid,
                         leader_is_zombie,
                         grace,
@@ -622,13 +662,18 @@ pub async fn supervise_background(
                     deadline.await;
                 }
             }, if kill_deadline.is_some() => {
-                match process_group_exists(pid) {
+                match platform_group_exists(group, pid) {
                     Ok(false) => {
                         kill_deadline = None;
                     }
                     Ok(true) => {
                         if let Err(error) =
-                            signal_group_for_sweep(pid, Signal::KILL, leader_is_zombie)
+                            signal_platform_group_for_sweep(
+                                group,
+                                pid,
+                                Signal::KILL,
+                                leader_is_zombie,
+                            )
                         {
                             escalation_notes.push(format!(
                                 "SIGKILL escalation failed for background task group {}: {error}",
@@ -662,6 +707,34 @@ pub async fn supervise_background(
                     if output_open {
                         pipe_drain_deadline = Some(Box::pin(sleep(grace)));
                     }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Even a query/signal failure must close the exact Job authority.
+        // KILL_ON_JOB_CLOSE is the final fail-safe and prevents an error path
+        // from returning while descendants remain alive behind a retained
+        // registry handle.
+        haider_platform::release_process_group(group);
+        if !leader_reaped {
+            match tokio::time::timeout(grace, child.wait()).await {
+                Ok(Ok(status)) => {
+                    exit_status = Some(status);
+                }
+                Ok(Err(error)) => {
+                    fatal.get_or_insert_with(|| ToolError::Runtime {
+                        message: format!("reap failed background task `{call_id}`: {error}"),
+                    });
+                }
+                Err(_) => {
+                    fatal.get_or_insert_with(|| ToolError::Runtime {
+                        message: format!(
+                            "background task `{call_id}` did not reap after closing its Job"
+                        ),
+                    });
                 }
             }
         }

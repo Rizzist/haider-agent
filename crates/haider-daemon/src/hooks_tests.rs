@@ -84,16 +84,13 @@ fn delayed_emit_command(value: &str) -> String {
 }
 
 #[cfg(unix)]
-fn bounded_output_command() -> String {
+fn bounded_output_command(_fixture: &Path) -> String {
     "yes x | head -c 600000".into()
 }
 
 #[cfg(windows)]
-fn bounded_output_command() -> String {
-    powershell_command(concat!(
-        "$b=[Text.Encoding]::ASCII.GetBytes(('x'+[char]10)*300000);",
-        "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)"
-    ))
+fn bounded_output_command(fixture: &Path) -> String {
+    format!("type \"{}\"", fixture.display())
 }
 
 #[cfg(unix)]
@@ -113,26 +110,68 @@ fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
 
 #[cfg(windows)]
 fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
-    let ready = powershell_literal(ready);
-    let survived = powershell_literal(survived);
-    let child_script =
-        format!("Start-Sleep -Seconds 1;[IO.File]::WriteAllText('{survived}','survived')");
-    let child_encoded = encode_powershell(&child_script);
-    let powershell = powershell_literal(&powershell_executable());
-    // Inline format captures cannot see through a concat!-produced string
-    // (the format string must be a literal) — pass explicit named args.
-    powershell_command(&format!(
-        concat!(
-            "[IO.File]::WriteAllText('{ready}','ready');",
-            "$child=Start-Process -PassThru -WindowStyle Hidden ",
-            "-FilePath '{powershell}' -ArgumentList ",
-            "'-NoProfile','-NonInteractive','-EncodedCommand','{child_encoded}';",
-            "[Console]::In.ReadToEnd()"
+    let directory = ready.parent().expect("ready marker parent");
+    let parent = directory.join("subscriber-parent.cmd");
+    let child = directory.join("subscriber-child.cmd");
+    let system32 = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .map(|root| root.join("System32"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+    std::fs::write(
+        &child,
+        format!(
+            "@echo off\r\n>\"{}\" <nul set /p \"=ready\"\r\n\"{}\" -n 2 127.0.0.1 >nul\r\n>\"{}\" <nul set /p \"=survived\"\r\n",
+            ready.display(),
+            system32.join("ping.exe").display(),
+            survived.display(),
         ),
-        ready = ready,
-        powershell = powershell,
-        child_encoded = child_encoded,
-    ))
+    )
+    .expect("write subscriber child fixture");
+    std::fs::write(
+        &parent,
+        format!(
+            "@echo off\r\nstart \"\" /b \"{}\" /d /s /c \"\"{}\"\"\r\n\"{}\" >nul\r\n",
+            system32.join("cmd.exe").display(),
+            child.display(),
+            system32.join("more.com").display(),
+        ),
+    )
+    .expect("write subscriber parent fixture");
+    format!("\"{}\"", parent.display())
+}
+
+#[cfg(windows)]
+fn exiting_leader_tree_command(directory: &Path, ready: &Path, survived: &Path) -> String {
+    let parent = directory.join("exiting-parent.cmd");
+    let child = directory.join("exiting-child.cmd");
+    let system32 = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .map(|root| root.join("System32"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+    std::fs::write(
+        &child,
+        format!(
+            "@echo off\r\n>\"{}\" <nul set /p \"=ready\"\r\n\"{}\" -n 3 127.0.0.1 >nul\r\n>\"{}\" <nul set /p \"=survived\"\r\n",
+            ready.display(),
+            system32.join("ping.exe").display(),
+            survived.display(),
+        ),
+    )
+    .expect("write exiting child fixture");
+    std::fs::write(
+        &parent,
+        format!(
+            "@echo off\r\nstart \"\" /b \"{}\" /d /s /c \"\"{}\"\"\r\n:wait_ready\r\nif exist \"{}\" exit /b 0\r\n\"{}\" -n 2 127.0.0.1 >nul\r\ngoto wait_ready\r\n",
+            system32.join("cmd.exe").display(),
+            child.display(),
+            ready.display(),
+            system32.join("ping.exe").display(),
+        ),
+    )
+    .expect("write exiting parent fixture");
+    format!("\"{}\"", parent.display())
 }
 
 #[cfg(windows)]
@@ -150,11 +189,6 @@ fn powershell_executable() -> PathBuf {
         .unwrap_or_else(|| {
             PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
         })
-}
-
-#[cfg(windows)]
-fn powershell_literal(path: &Path) -> String {
-    path.display().to_string().replace('\'', "''")
 }
 
 #[cfg(windows)]
@@ -1927,6 +1961,40 @@ fn standalone_definition(workspace: &Path, command: String) -> HookDefinition {
     }
 }
 
+/// Windows Job Objects must remain authoritative after the command
+/// interpreter exits. The descendant inherits the output handles, so waiting
+/// for pipe EOF before sweeping would also turn this into a multi-second hang.
+#[cfg(windows)]
+#[tokio::test]
+async fn hook_natural_leader_exit_sweeps_live_descendant_before_output_drain() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace_directory = tempfile::tempdir().expect("workspace");
+    let fixture_directory = workspace_directory.path().to_path_buf();
+    let workspace = canonical(&fixture_directory);
+    let ready = fixture_directory.join("descendant-ready.txt");
+    let survived = fixture_directory.join("escaped-descendant.txt");
+    let command = exiting_leader_tree_command(&fixture_directory, &ready, &survived);
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let result = run_command(
+        &standalone_definition(&workspace, command),
+        b"{}",
+        &store,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await;
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!result.timed_out);
+    assert!(ready.exists(), "fixture never launched its descendant");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !survived.exists(),
+        "leader descendant escaped its Job Object"
+    );
+    store.close().await.expect("store close");
+}
+
 /// MUTATION CHECK: remove the fd sweep or inherit the parent environment.
 /// Expected RUNTIME failure: the live hook observes descriptor 333, HOME, or
 /// another non-allowlisted variable.
@@ -2032,8 +2100,11 @@ fn hook_secret_child_probe() {
 /// differs from the asserted values.
 #[tokio::test]
 async fn exec_output_is_bounded_and_overflow_is_in_cas() {
+    let output_fixture = tempfile::tempdir().expect("bounded output fixture");
+    let output_path = output_fixture.path().join("output.bin");
+    std::fs::write(&output_path, b"x\n".repeat(300_000)).expect("write bounded output fixture");
     let fixture = EngineFixture::start(
-        &bounded_output_command(),
+        &bounded_output_command(&output_path),
         BOUNDED_OUTPUT_TIMEOUT_MS,
         false,
         "exec",

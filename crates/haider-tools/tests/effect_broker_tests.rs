@@ -8,6 +8,8 @@ use haider_tools::{
     EffectBroker, FsEdit, FsRead, FsWrite, JournalSink, PermissionPolicy, ProcessExec,
     ResultBounds, ToolResult,
 };
+#[cfg(windows)]
+use haider_tools::{FsPath, FsPathOperation};
 use std::fs;
 use std::path::Path;
 
@@ -646,6 +648,162 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     assert_eq!(fs::read_to_string(&path).expect("read file"), "before");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
     assert_eq!(broker.journal_snapshot().len(), 2);
+}
+
+/// Windows owns a distinct path-based atomic replacement backend. Keep one
+/// integration law on that cfg so an approval can never regress back to a
+/// successful tool result with no disk mutation.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_write_edit_and_overwrite_apply_and_ledger() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::FsWrite);
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+    let ledger = haider_tools::ChangeLedger::new();
+    let attribution = haider_tools::TurnAttribution::new(
+        haider_protocol::ids::SessionId::new("session"),
+        haider_protocol::ids::RunId::new("turn"),
+    );
+
+    broker
+        .fs_write(
+            &FsWrite::new("nested/windows-mutation.txt", "before"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("create Windows file");
+    let mutation_path = directory.path().join("nested/windows-mutation.txt");
+    broker
+        .fs_edit(
+            &FsEdit::new("nested/windows-mutation.txt", "before", "after"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("edit Windows file");
+    broker
+        .fs_write(
+            &FsWrite::new("nested/windows-mutation.txt", "final"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("overwrite Windows file");
+    broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Copy, "nested/windows-mutation.txt")
+                .with_destination("nested/windows-copy.txt"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("copy Windows file");
+    broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Move, "nested/windows-copy.txt")
+                .with_destination("nested/windows-moved.txt"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("move Windows file");
+    broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Delete, "nested/windows-moved.txt"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("delete Windows file");
+
+    assert_eq!(
+        fs::read_to_string(&mutation_path).expect("read final Windows file"),
+        "final"
+    );
+    assert!(!directory.path().join("nested/windows-copy.txt").exists());
+    assert!(!directory.path().join("nested/windows-moved.txt").exists());
+    let changes = ledger
+        .changes_for(&attribution.session, &attribution.turn)
+        .expect("Windows mutations are ledgered");
+    assert_eq!(changes.writes.len(), 6);
+}
+
+/// Windows path ancestry is identity-based, not case-sensitive lexical text.
+/// Otherwise staging `Dir` into `dir\child` recursively copies its own temp.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_copy_rejects_case_aliased_destination_inside_source() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("Dir")).expect("source directory");
+    fs::write(directory.path().join("Dir/source.txt"), "source").expect("source file");
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::FsWrite);
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+    let ledger = haider_tools::ChangeLedger::new();
+    let attribution = haider_tools::TurnAttribution::new(
+        haider_protocol::ids::SessionId::new("session"),
+        haider_protocol::ids::RunId::new("turn"),
+    );
+
+    let error = broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Copy, "Dir").with_destination("dir/recursive-child"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("case-aliased nested destination must be rejected");
+    assert!(matches!(
+        error,
+        haider_tools::ToolError::InvalidArgument { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(directory.path().join("Dir/source.txt")).expect("source survives"),
+        "source"
+    );
+    assert!(!directory.path().join("Dir/recursive-child").exists());
+}
+
+/// `cmd.exe` is resolved before `env_clear`, but Windows system commands also
+/// require a small non-secret bootstrap environment after that clear.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_process_exec_restores_the_system_bootstrap_environment() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::ProcessExec);
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+    let execution = broker
+        .process_exec(
+            &ProcessExec::new(
+                "windows-bootstrap",
+                "if defined SystemRoot (>bootstrap.txt echo ok) else exit /b 9",
+            ),
+            &policy,
+            UnusedCas,
+            haider_tools::NoopCommandOutputSink,
+            haider_tools::ProcessBounds::default(),
+        )
+        .await
+        .expect("spawn Windows command");
+    let result = execution.wait().await.expect("supervise Windows command");
+
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(
+        fs::read_to_string(directory.path().join("bootstrap.txt"))
+            .expect("read Windows bootstrap marker")
+            .trim(),
+        "ok"
+    );
 }
 
 #[tokio::test]
