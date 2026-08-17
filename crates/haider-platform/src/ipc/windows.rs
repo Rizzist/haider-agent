@@ -4,11 +4,16 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use tokio::sync::Mutex;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY};
+
+const BIND_RETRY_WINDOW: Duration = Duration::from_secs(3);
+const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 pub type IpcReadHalf = tokio::io::ReadHalf<IpcStream>;
 pub type IpcWriteHalf = tokio::io::WriteHalf<IpcStream>;
@@ -72,9 +77,8 @@ impl BoundEndpoint {
         let name = pipe_name(endpoint).map_err(|error| {
             EndpointError::io("resolve Windows named-pipe name", endpoint.address(), error)
         })?;
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(name)
+        let server = bind_first_instance(name, BIND_RETRY_WINDOW)
+            .await
             .map_err(|error| {
                 EndpointError::io("bind Windows named pipe", endpoint.address(), error)
             })?;
@@ -127,6 +131,35 @@ impl BoundEndpoint {
     pub fn close_listener(&mut self) {
         self.listener.get_mut().take();
     }
+}
+
+async fn bind_first_instance(name: &str, retry_window: Duration) -> io::Result<NamedPipeServer> {
+    let deadline = tokio::time::Instant::now() + retry_window;
+    loop {
+        // Keep FILE_FLAG_FIRST_PIPE_INSTANCE on every attempt: a live daemon
+        // remains exclusive. Windows can retain the prior generation's name
+        // briefly after its last server handle closes, so only the two pipe
+        // rollover errors receive this bounded Unix-rebind analogue.
+        match ServerOptions::new().first_pipe_instance(true).create(name) {
+            Ok(server) => return Ok(server),
+            Err(error)
+                if retryable_bind_error(&error) && tokio::time::Instant::now() < deadline =>
+            {
+                let wake = (tokio::time::Instant::now() + BIND_RETRY_INTERVAL).min(deadline);
+                tokio::time::sleep_until(wake).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn retryable_bind_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_ACCESS_DENIED.cast_signed()
+                || code == ERROR_PIPE_BUSY.cast_signed()
+    )
 }
 
 fn pipe_name(endpoint: &Endpoint) -> io::Result<&str> {
@@ -199,20 +232,106 @@ pub fn write_immediate(stream: &IpcStream, bytes: &[u8]) {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{BoundEndpoint, connect};
+    use super::{
+        BIND_RETRY_INTERVAL, BIND_RETRY_WINDOW, BoundEndpoint, bind_first_instance, connect,
+        pipe_name, retryable_bind_error,
+    };
     use crate::ipc::Endpoint;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     static NEXT_ENDPOINT: AtomicU64 = AtomicU64::new(1);
 
+    fn unique_endpoint(label: &str) -> Endpoint {
+        let unique = NEXT_ENDPOINT.fetch_add(1, Ordering::Relaxed);
+        Endpoint::new(
+            "ignored",
+            &format!("{label}-{}-{unique}", std::process::id()),
+        )
+    }
+
+    #[tokio::test]
+    async fn dropped_listener_can_be_rebound_immediately() {
+        let endpoint = unique_endpoint("drop-rebind");
+        let bound = BoundEndpoint::bind(&endpoint, Path::new("ignored"))
+            .await
+            .expect("bind first named-pipe generation");
+
+        drop(bound);
+
+        let rebound = tokio::time::timeout(
+            BIND_RETRY_WINDOW + Duration::from_secs(1),
+            BoundEndpoint::bind(&endpoint, Path::new("ignored")),
+        )
+        .await
+        .expect("immediate rebind finishes within the retry window")
+        .expect("immediate rebind succeeds after listener drop");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn bind_retries_until_held_name_is_released_within_window() {
+        let endpoint = unique_endpoint("retry-window");
+        let held = BoundEndpoint::bind(&endpoint, Path::new("ignored"))
+            .await
+            .expect("bind held named-pipe generation");
+        let mut retrying = Box::pin(BoundEndpoint::bind(&endpoint, Path::new("ignored")));
+
+        assert!(
+            tokio::time::timeout(BIND_RETRY_INTERVAL / 2, &mut retrying)
+                .await
+                .is_err(),
+            "the polled competing bind must wait while the first instance is held"
+        );
+        drop(held);
+
+        let rebound = tokio::time::timeout(BIND_RETRY_WINDOW, retrying)
+            .await
+            .expect("retrying bind finishes within its bounded window")
+            .expect("retrying bind succeeds after the held name is released");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn bind_retry_window_expires_while_name_remains_held() {
+        let endpoint = unique_endpoint("retry-deadline");
+        let held = BoundEndpoint::bind(&endpoint, Path::new("ignored"))
+            .await
+            .expect("bind held named-pipe generation");
+        let retry_window = Duration::from_millis(125);
+        let started = tokio::time::Instant::now();
+
+        let result = tokio::time::timeout(
+            retry_window + Duration::from_secs(1),
+            bind_first_instance(
+                pipe_name(&endpoint).expect("resolve retry test pipe name"),
+                retry_window,
+            ),
+        )
+        .await
+        .expect("competing bind returns after its bounded retry window");
+        let error = match result {
+            Ok(server) => {
+                drop(server);
+                panic!("a held first pipe instance must exclude a competing bind");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            retryable_bind_error(&error),
+            "unexpected bind error: {error}"
+        );
+        assert!(
+            started.elapsed() >= retry_window,
+            "a retryable bind error must not escape before the retry window"
+        );
+        drop(held);
+    }
+
     #[tokio::test]
     async fn cancelled_accept_retains_the_pending_pipe_instance() {
-        let unique = NEXT_ENDPOINT.fetch_add(1, Ordering::Relaxed);
-        let endpoint = Endpoint::new(
-            "ignored",
-            &format!("cancelled-accept-{}-{unique}", std::process::id()),
-        );
+        let endpoint = unique_endpoint("cancelled-accept");
         let mut bound = BoundEndpoint::bind(&endpoint, std::path::Path::new("ignored"))
             .await
             .expect("bind named pipe");

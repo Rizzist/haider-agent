@@ -103,7 +103,11 @@ impl tracing::Subscriber for TraceCapture {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
-fn assert_tree_secret_free(root: &std::path::Path, sentinels: &[&str]) -> (usize, bool) {
+fn assert_tree_secret_free(
+    root: &std::path::Path,
+    _profile_lock: &std::path::Path,
+    sentinels: &[&str],
+) -> (usize, bool) {
     let mut scanned = 0_usize;
     let mut saw_wal = false;
     let mut stack = vec![root.to_path_buf()];
@@ -117,6 +121,20 @@ fn assert_tree_secret_free(root: &std::path::Path, sentinels: &[&str]) -> (usize
                 continue;
             }
             if !file_type.is_file() {
+                continue;
+            }
+            #[cfg(windows)]
+            if path == _profile_lock {
+                // The singleton authority is a deliberately empty lock target;
+                // diagnostics live in `lock.owner`. Windows mandatory locking
+                // forbids reading it while the daemon is Ready, so exclude only
+                // this exact sentinel and keep every readable artifact in the
+                // secret-hygiene sweep.
+                assert_eq!(
+                    entry.metadata().expect("profile lock metadata").len(),
+                    0,
+                    "profile lock must remain empty during secret sweep"
+                );
                 continue;
             }
             saw_wal |= path
@@ -1040,7 +1058,8 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
         }
     }
     // Sweep WHILE Ready, before orderly checkpoint/WAL cleanup.
-    let (live_scanned, saw_live_wal) = assert_tree_secret_free(root.path(), &sentinels);
+    let (live_scanned, saw_live_wal) =
+        assert_tree_secret_free(root.path(), &store_dir.join("lock"), &sentinels);
     assert!(
         live_scanned >= 3,
         "must scan SQLite, WAL, and accounts.json"
@@ -1052,7 +1071,8 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
 
     task.shutdown_handle().request("OAuth secret sweep");
     let _ = task.join().await;
-    let (stopped_scanned, _) = assert_tree_secret_free(root.path(), &sentinels);
+    let (stopped_scanned, _) =
+        assert_tree_secret_free(root.path(), &store_dir.join("lock"), &sentinels);
     assert!(stopped_scanned >= 2, "post-shutdown sweep remains clean");
 
     // A daemon instance never adopts an old flow id/reference.
@@ -1099,7 +1119,17 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     let root = test_root("haoB");
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    let mut config = DaemonConfig::new("oauth-barrier", root.path().join("store"), root.path());
+    // Windows derives named-pipe names solely from singleton profile identity,
+    // while Unix also gets isolation from each fixture's runtime directory. Keep the two
+    // parameterizations distinct on Windows so the parallel test runner does
+    // not manufacture a live-profile collision; each case still restarts its
+    // own exact profile below.
+    let profile_id = if cfg!(windows) && inject_worker_shutdown_error {
+        "oauth-barrier-worker-error"
+    } else {
+        "oauth-barrier"
+    };
+    let mut config = DaemonConfig::new(profile_id, root.path().join("store"), root.path());
     config.discovery_disabled = true; // hermetic: direct spawns bypass support::ready
     config.drain_timeout = Duration::from_millis(100);
     config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
@@ -1168,7 +1198,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     };
     let stored = vault
         .resolve(&haider_daemon::scoped_vault_alias(
-            "oauth-barrier",
+            profile_id,
             &descriptor.alias,
         ))
         .expect("initial bundle");
@@ -1198,7 +1228,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     .expect("expiring bundle");
     vault
         .put(
-            &haider_daemon::scoped_vault_alias("oauth-barrier", &descriptor.alias),
+            &haider_daemon::scoped_vault_alias(profile_id, &descriptor.alias),
             &expiring.encode().expect("encode expiring"),
         )
         .expect("seed expiring");
@@ -1333,7 +1363,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     assert!(
         vault
             .resolve(&haider_daemon::scoped_vault_alias(
-                "oauth-barrier",
+                profile_id,
                 &descriptor.alias
             ))
             .is_err(),
