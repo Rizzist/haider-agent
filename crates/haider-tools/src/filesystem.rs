@@ -3291,22 +3291,49 @@ fn rename_windows_entry(
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+        FILE_RENAME_INFO, FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle,
     };
 
-    let destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+    let mut destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    if destination.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rename destination is empty",
+        ));
+    }
+    if destination.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rename destination contains a NUL",
+        ));
+    }
     let name_bytes = destination
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .ok_or_else(|| std::io::Error::other("rename destination is too long"))?;
+    destination.push(0);
     let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
         .checked_add(name_bytes)
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
         .ok_or_else(|| std::io::Error::other("rename buffer size overflow"))?;
     let words = buffer_bytes.div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0_usize; words];
     let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let information_class = if replace_existing {
+        FileRenameInfoEx
+    } else {
+        FileRenameInfo
+    };
     unsafe {
-        (*information).Anonymous.ReplaceIfExists = replace_existing;
+        if replace_existing {
+            (*information).Anonymous.Flags =
+                FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        } else {
+            (*information).Anonymous.ReplaceIfExists = false;
+        }
         (*information).RootDirectory = std::ptr::null_mut();
         (*information).FileNameLength = u32::try_from(name_bytes)
             .map_err(|_| std::io::Error::other("rename destination is too long"))?;
@@ -3319,7 +3346,7 @@ fn rename_windows_entry(
     let renamed = unsafe {
         SetFileInformationByHandle(
             handle.as_raw_handle(),
-            FileRenameInfo,
+            information_class,
             information.cast(),
             u32::try_from(buffer_bytes)
                 .map_err(|_| std::io::Error::other("rename buffer is too large"))?,
@@ -5659,5 +5686,65 @@ mod tests {
             "inside replacement"
         );
         assert!(!destination.exists());
+    }
+}
+
+#[cfg(all(test, windows))]
+#[allow(clippy::expect_used)]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+    #[test]
+    fn staged_publish_terminates_an_exactly_sized_verbatim_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let parent = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        assert!(
+            parent.to_string_lossy().starts_with(r"\\?\"),
+            "Windows canonical paths should exercise the verbatim-path rename route"
+        );
+
+        let target = (0_usize..)
+            .map(|padding| parent.join(format!("windows-publish-{padding:x}.txt")))
+            .find(|candidate| {
+                let name_bytes =
+                    candidate.as_os_str().encode_wide().count() * std::mem::size_of::<u16>();
+                (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name_bytes)
+                    % std::mem::size_of::<usize>()
+                    == 0
+            })
+            .expect("find an exactly word-sized rename buffer");
+
+        let created = b"created through the staged publish primitive";
+        let temporary =
+            stage_windows_content(&parent, &target, created, None).expect("stage created content");
+        publish_windows_temporary(temporary, &target, false, blake3::hash(created), &target)
+            .expect("publish created content");
+        assert_eq!(fs::read(&target).expect("read created target"), created);
+
+        let mut existing =
+            open_windows_locked_file(&target, &target).expect("lock existing target");
+        let replaced = b"replaced through the staged publish primitive";
+        let temporary = stage_windows_content(&parent, &target, replaced, None)
+            .expect("stage replacement content");
+        publish_windows_temporary(temporary, &target, true, blake3::hash(replaced), &target)
+            .expect("publish replacement content");
+        assert_eq!(fs::read(&target).expect("read replaced target"), replaced);
+        let mut old_bytes = Vec::new();
+        existing
+            .read_to_end(&mut old_bytes)
+            .expect("read held old target");
+        assert_eq!(old_bytes, created);
+        drop(existing);
+
+        let entries = fs::read_dir(&parent)
+            .expect("list staging parent")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![target.file_name().expect("target name").to_owned()]
+        );
     }
 }
