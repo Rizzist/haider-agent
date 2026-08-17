@@ -8,6 +8,7 @@ use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorSco
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
+use std::fs::{OpenOptions, TryLockError};
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ const DEFAULT_FAKE_SCRIPT: &str = concat!(
     r#"{"step":"emit_text","text":"fake response: hello"},{"step":"finish","reason":"end_turn"},"#,
     r#"{"step":"emit_text","text":"fake response: hello"},{"step":"finish","reason":"end_turn"}]"#,
 );
+const PREBUILT_DAEMON_ENV: &str = "HAIDER_TEST_SIBLINGS_PREBUILT";
 
 struct HaiderCommand {
     command: Command,
@@ -60,7 +62,7 @@ impl DerefMut for HaiderCommand {
 }
 
 fn haider() -> HaiderCommand {
-    ensure_haiderd_built();
+    ensure_haiderd_present();
     let profile_root = tempfile::tempdir().expect("temporary CLI profile parent");
     let profile = profile_root.path().join("profile");
     let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
@@ -90,20 +92,30 @@ impl Drop for HaiderCommand {
     }
 }
 
-fn ensure_haiderd_built() {
-    // Cargo is the freshness authority for the production sibling the CLI
-    // executes. The gate's compile phase normally makes this a cheap no-op;
-    // the Once keeps a focused or cold suite to one bounded build while
-    // ensuring an existing but stale daemon is never trusted by path alone.
-    static BUILD: std::sync::Once = std::sync::Once::new();
-    BUILD.call_once(|| {
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let status = Command::new(cargo)
-            .args(["build", "-p", "haider-daemond", "--bin", "haiderd"])
-            .status()
-            .expect("build haiderd for run tests");
-        assert!(status.success(), "haiderd build failed");
-    });
+fn ensure_haiderd_present() {
+    // Integration tests must not recursively enter Cargo while their parent
+    // `cargo test` is holding build/artifact state. Besides being unbounded
+    // fixture work, that can deadlock the first Windows test at this shared
+    // helper and park every concurrent caller behind a process-local Once.
+    // The gate prebuilds the workspace and then exports an explicit proof;
+    // focused invocations must do the same. Existence alone is insufficient
+    // because a persistent target directory may contain a stale sibling.
+    assert_eq!(
+        std::env::var(PREBUILT_DAEMON_ENV).as_deref(),
+        Ok("1"),
+        "CLI subprocess fixtures require a fresh sibling; run \
+         `cargo build -p haider-daemond --bin haiderd` first, then set \
+         {PREBUILT_DAEMON_ENV}=1 for the test command"
+    );
+    let sibling = PathBuf::from(env!("CARGO_BIN_EXE_haider"))
+        .parent()
+        .expect("haider binary parent")
+        .join(format!("haiderd{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        sibling.is_file(),
+        "haiderd sibling missing at {}; prebuild with `cargo build -p haider-daemond --bin haiderd`",
+        sibling.display()
+    );
 }
 
 fn daemon_pid(profile: &Path) -> Option<u32> {
@@ -405,7 +417,7 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
 
 #[test]
 fn sequential_cli_runs_use_profile_owned_worker_generations() {
-    ensure_haiderd_built();
+    ensure_haiderd_present();
     let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
     let profile = profile_parent.path().join("profile");
     let run = |prompt: &str| {
@@ -432,15 +444,32 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
             .all(|envelope| envelope.worker_generation == first_generation)
     );
     terminate_daemon(&profile);
-    let resolved = haider_client::resolve_profile(&haider_client::ProfileEnv {
-        profile_dir: Some(profile.clone()),
-        home: None,
-        model: None,
-        xdg_runtime_dir: None,
-    })
-    .expect("resolve profile");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while resolved.endpoint_path.exists() && Instant::now() < deadline {
+    // Endpoint removal precedes store close during an orderly drain. Waiting
+    // for the endpoint therefore races the successor into the intentional
+    // endpoint-gone/profile-lock-held interval, where it must exit 75. Prove
+    // release of the actual singleton authority instead. Acquiring and
+    // releasing this non-mutating probe does not open the store, rewrite the
+    // lock's diagnostic PID, or consume a worker generation.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(profile.join("lock"))
+        .expect("profile lock file");
+    // The product's five-second drain barrier bounds the reported outcome,
+    // but an already-started blocking close may release the OS lock just
+    // after it. Use the existing startup observation bound so this fixture
+    // waits beyond that honest forced-close edge without changing the law.
+    let deadline = Instant::now() + haider_client::STARTUP_DEADLINE;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => {
+                lock.unlock().expect("release profile lock probe");
+                break;
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => panic!("profile lock proof failed: {error}"),
+        }
+        assert!(Instant::now() < deadline, "profile lock release deadline");
         thread::sleep(Duration::from_millis(20));
     }
     let second_output = run("restarted process");

@@ -2318,15 +2318,34 @@ async fn shutdown_and_cancel_interrupt_a_slow_accepted_callback_read() {
 
     let (coordinator, mut receiver) = coordinator_for(&server, Duration::from_secs(5)).await;
     let (_, _, port) = started_flow(&mut receiver).await;
-    coordinator.shutdown().await;
+    let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("slow shutdown callback");
+    slow.write_all(b"GET /incomplete HTTP/1.1\r\n")
+        .await
+        .expect("partial shutdown callback");
+    assert!(
+        coordinator.shutdown().await,
+        "shutdown joins the callback listener owner"
+    );
+    let mut response = Vec::new();
+    let read_result =
+        tokio::time::timeout(Duration::from_millis(250), slow.read_to_end(&mut response))
+            .await
+            .expect("shutdown interrupts read");
+    assert!(
+        read_result.is_ok()
+            || read_result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset),
+        "shutdown must close the slow callback connection: {read_result:?}"
+    );
+
+    // Unix listener drop has a synchronous connect-refusal observation. Keep
+    // that extra platform oracle; Windows' pending AcceptEx state makes
+    // refusal timing a kernel artifact even after the sole owner task joined.
     #[cfg(unix)]
-    let listener_close_deadline = Duration::from_millis(250);
-    // Windows can retain a just-closed loopback listener in the connect path
-    // beyond one scheduler quantum. The assertion still requires refusal;
-    // only the platform observation window is wider.
-    #[cfg(windows)]
-    let listener_close_deadline = Duration::from_secs(2);
-    tokio::time::timeout(listener_close_deadline, async {
+    tokio::time::timeout(Duration::from_millis(250), async {
         loop {
             if TcpStream::connect((Ipv4Addr::LOCALHOST, port))
                 .await

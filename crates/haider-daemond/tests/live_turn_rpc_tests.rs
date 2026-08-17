@@ -32,6 +32,7 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer};
@@ -544,6 +545,12 @@ async fn events_until_terminal(
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
+            // Hook-engine facts are documented additive journal extensions,
+            // not turn-state payloads. Ignore only that named family while
+            // retaining strict decoding for every other run-scoped frame.
+            if HookEventPayload::is_engine_fact(&envelope.payload) {
+                continue;
+            }
             let payload =
                 serde_json::from_value::<EventPayload>(envelope.payload).expect("typed event");
             let terminal = matches!(
@@ -650,10 +657,11 @@ fn short_live_test_root(prefix: &str) -> tempfile::TempDir {
 
 #[cfg(windows)]
 fn short_live_test_root(prefix: &str) -> tempfile::TempDir {
+    let temporary_base = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary base");
     tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir()
-        .expect("native temporary root")
+        .tempdir_in(temporary_base)
+        .expect("canonical native temporary root")
 }
 
 #[cfg(unix)]

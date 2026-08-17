@@ -52,22 +52,22 @@ fn write_command(value: &str, path: &Path) -> String {
 }
 
 #[cfg(unix)]
-fn capture_stdin_command(path: &Path) -> String {
-    format!("cat > '{}'", path.display())
+fn echo_stdin_command() -> String {
+    "cat".into()
 }
 
 #[cfg(windows)]
-fn capture_stdin_command(path: &Path) -> String {
-    let path = powershell_literal(path);
-    // Inline captures cannot see through concat! — explicit named arg.
-    powershell_command(&format!(
-        concat!(
-            "$stdinStream=[Console]::OpenStandardInput();",
-            "$outputStream=[IO.File]::Create('{path}');",
-            "try {{$stdinStream.CopyTo($outputStream)}} finally {{$outputStream.Dispose()}}"
-        ),
-        path = path,
-    ))
+fn echo_stdin_command() -> String {
+    // `more.com` is the native byte-stream passthrough here. It avoids a
+    // cold PowerShell startup and a separate output-file observation while
+    // still exercising the real Windows hook subprocess boundary.
+    let executable = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("more.com"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\more.com"));
+    format!("\"{}\"", executable.display())
 }
 
 #[cfg(unix)]
@@ -995,15 +995,11 @@ fn matcher_filters_use_fact_specific_provider_outcome_and_parked_kind() {
 /// byte strings differ.
 #[tokio::test]
 async fn committed_user_message_hook_projection_is_surface_neutral() {
-    let output = tempfile::tempdir().expect("hook output");
-    let headless_path = output.path().join("headless.json");
-    let rpc_path = output.path().join("rpc.json");
-    let headless_command = capture_stdin_command(&headless_path);
-    let rpc_command = capture_stdin_command(&rpc_path);
+    let command = echo_stdin_command();
 
     // These fixtures begin at the shared daemon acceptance seam. Surface
     // clients have already converged before the canonical fact is committed.
-    let headless = EngineFixture::start_user_message(&headless_command).await;
+    let headless = EngineFixture::start_user_message(&command).await;
     headless
         .accept_user_message(
             "headless-user-message",
@@ -1035,7 +1031,7 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
     );
     headless.close().await;
 
-    let rpc = EngineFixture::start_user_message(&rpc_command).await;
+    let rpc = EngineFixture::start_user_message(&command).await;
     rpc.accept_user_message(
         "rpc-user-message",
         "surface-neutral text",
@@ -1063,8 +1059,23 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
     );
     rpc.close().await;
 
-    let headless_json = std::fs::read(&headless_path).expect("headless hook JSON");
-    let rpc_json = std::fs::read(&rpc_path).expect("RPC hook JSON");
+    let captured_json = |events: &[RawEnvelope], surface: &str| {
+        let fired = events
+            .iter()
+            .find_map(|event| {
+                match HookEventPayload::from_payload_value(event.payload.clone()).ok()? {
+                    HookEventPayload::HookFired(fired) => Some(fired),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| panic!("{surface} hook fired"));
+        assert_eq!(fired.exit_code, Some(0), "{surface} hook exit");
+        assert!(!fired.timed_out, "{surface} hook timeout");
+        assert!(!fired.stdout.truncated, "{surface} hook output truncation");
+        fired.stdout.preview.into_bytes()
+    };
+    let headless_json = captured_json(&headless_events, "headless");
+    let rpc_json = captured_json(&rpc_events, "RPC");
     assert_eq!(headless_json, rpc_json);
     let value: serde_json::Value = serde_json::from_slice(&headless_json).expect("hook input");
     assert_eq!(value["event"], "user_message");

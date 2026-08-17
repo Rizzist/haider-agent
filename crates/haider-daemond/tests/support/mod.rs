@@ -41,10 +41,20 @@ pub fn test_root(prefix: &str) -> tempfile::TempDir {
         .tempdir_in(SHORT_TMP_ROOT)
         .expect("short temporary root");
     #[cfg(windows)]
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .expect("temporary root")
+    {
+        // Hosted runners commonly expose TEMP through an 8.3 alias such as
+        // RUNNER~1. The config store path later becomes the hook engine's
+        // profile root at its strict canonical-path boundary; preserving that
+        // alias manufactures a durable hook_notice in otherwise hook-free
+        // tests. Build beneath the canonical base so every derived fixture
+        // path is canonical from creation onward.
+        let temporary_base =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary base");
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(temporary_base)
+            .expect("canonical temporary root")
+    }
 }
 
 /// Hermeticity law for every black-box daemon: integration tests must NEVER

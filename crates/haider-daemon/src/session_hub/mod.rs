@@ -428,6 +428,10 @@ pub enum HubObservation {
         session_id: SessionId,
     },
     ShutdownGuarded,
+    /// After ordered `Stop` delivery, every session actor task has ended and
+    /// dropped its attachment senders; replay tasks now solely own the final
+    /// broadcast grace.
+    ShutdownActorsStopped,
     ReceiverRegistered {
         attachment_id: AttachmentId,
     },
@@ -2844,6 +2848,9 @@ impl SessionHub {
             let _ = actor.commands.send(ActorCommand::Stop).await;
         }
         let _ = actor_tasks.join_all().await;
+        self.inner
+            .observer
+            .observe(HubObservation::ShutdownActorsStopped);
         // Actor death drops every catch-up sender; each replay task drains
         // what was already buffered, streams it into its sink, and exits on
         // the closed channel. Join WITHOUT aborting so those final committed

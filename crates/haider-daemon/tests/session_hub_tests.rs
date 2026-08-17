@@ -410,6 +410,21 @@ impl ObserverControl {
         .await
         .expect("shutdown guard observation deadline");
     }
+
+    async fn observed_shutdown_actors_stopped(&mut self) {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                if matches!(
+                    self.observed.recv().await,
+                    Some(HubObservation::ShutdownActorsStopped)
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("shutdown actor-stop observation deadline");
+    }
 }
 
 fn gated_observer(targets: Vec<GateTarget>) -> (Arc<GateObserver>, ObserverControl) {
@@ -4937,6 +4952,11 @@ async fn final_suffix_store_read_failure_forces_the_shutdown_outcome() {
         async move { hub.shutdown().await }
     });
     control.observed_shutdown_guarded().await;
+    // The actor must be gone before releasing the parked replay; otherwise a
+    // fast replay may still re-register and take the ordinary replay path.
+    // This lifecycle observation supplies the same happens-before edge on
+    // every runtime and OS without extending the product drain deadline.
+    control.observed_shutdown_actors_stopped().await;
     control.release();
     assert!(matches!(
         control.reached().await,

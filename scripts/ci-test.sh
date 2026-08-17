@@ -26,6 +26,9 @@ haider-store haider-tools haider-client haider-verify"
 echo "::group::compile all test binaries"
 cargo test --workspace --no-run --locked || exit 1
 echo "::endgroup::"
+# Subprocess-based CLI tests may now trust the sibling next to the freshly
+# compiled CLI without recursively entering Cargo from a running test binary.
+export HAIDER_TEST_SIBLINGS_PREBUILT=1
 
 # Per-crate execution cap (15 min — generous for RUNNING tests).
 T="$(command -v timeout || command -v gtimeout || true)"
