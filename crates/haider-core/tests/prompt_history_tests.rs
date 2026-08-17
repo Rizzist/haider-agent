@@ -1,9 +1,11 @@
 #![allow(clippy::expect_used)]
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_core::{
     ArtifactReader, MemoryStore, PromptHistoryCompiler, SessionCreateCommand, SqliteStoreHandle,
-    StoreHandle,
+    StoreHandle, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -11,8 +13,13 @@ use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHE
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
-use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
-use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::ids::{
+    ArtifactRef, BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId,
+};
+use haider_protocol::item::{
+    CommandExecutionOrigin, ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem,
+    USER_COMMAND_ORIGIN_EXTENSION_KIND, UserCommandOriginV1,
+};
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{AttachmentBlock, BoundedResult};
@@ -141,6 +148,520 @@ async fn current_run_recovery_keeps_every_durable_steer_message() {
             "also reproduce the Unicode boundary failure"
         ]
     );
+}
+
+/// Direct user commands are prior user actions, not assistant tool calls. The
+/// committed marker, mixed byte output, and terminal CommandExecution must
+/// become one labeled user-role record before the next accepted user turn.
+/// MUTATION CHECK: omit the origin marker, command-output collector, or
+/// user-role shaping. Expected RUNTIME failure: the first prompt record is
+/// absent, loses stderr, or is no longer labeled `origin: user_command`.
+#[tokio::test]
+async fn user_command_and_output_reach_the_next_turn_as_one_labeled_record() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("user-command-history-session");
+    let shell_run = RunId::new("user-command-shell-run");
+    let current_run = RunId::new("user-command-current-run");
+    let command_item = ItemId::new("user-command-item");
+    let origin = UserCommandOriginV1 {
+        origin: CommandExecutionOrigin::UserCommand,
+        command_item_id: command_item.clone(),
+        call_id: "shell-command".into(),
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-origin",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("user-command-origin-item"),
+                item: origin.extension_item().expect("origin item"),
+            }),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-stdout",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: command_item.clone(),
+                delta: ItemDelta::CommandOutput {
+                    stream: OutputStream::Stdout,
+                    chunk_b64: BASE64.encode("héllo\n"),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-stderr",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: command_item.clone(),
+                delta: ItemDelta::CommandOutput {
+                    stream: OutputStream::Stderr,
+                    chunk_b64: BASE64.encode("warning\n"),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-completed",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: command_item,
+                item: TurnItem::CommandExecution {
+                    call_id: "shell-command".into(),
+                    command: "printf héllo; printf warning >&2".into(),
+                    status: ToolStatus::Completed,
+                    exit_code: Some(0),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current_run,
+            "user-command-next-turn",
+            EventPayload::UserMessage {
+                text: "explain that result".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append user-command history");
+
+    let messages = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current_run)
+        .await
+        .expect("compile next-turn history");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, haider_provider::MessageRole::User);
+    let Block::Text { text } = &messages[0].blocks[0] else {
+        panic!("user command must be provider-portable text")
+    };
+    assert!(text.contains("origin: user_command"));
+    assert!(text.contains("printf héllo; printf warning >&2"));
+    assert!(text.contains("[stdout]\\nhéllo\\n\\n[stderr]\\nwarning\\n"));
+    assert!(text.contains("status: completed"));
+    assert!(text.contains("exit_code: 0"));
+    assert_eq!(
+        messages[1],
+        haider_provider::Message::user_text("explain that result")
+    );
+}
+
+/// Known provenance is authority metadata, so malformed or duplicate markers
+/// must fail closed instead of silently reclassifying a direct command as a
+/// model tool execution.
+#[tokio::test]
+async fn malformed_and_duplicate_user_command_origins_are_store_corruption() {
+    for duplicate in [false, true] {
+        let store = MemoryStore::new();
+        let session_id = SessionId::new(if duplicate {
+            "duplicate-command-origin-session"
+        } else {
+            "malformed-command-origin-session"
+        });
+        let shell_run = RunId::new("origin-shell-run");
+        let current_run = RunId::new("origin-current-run");
+        let origin = UserCommandOriginV1 {
+            origin: CommandExecutionOrigin::UserCommand,
+            command_item_id: ItemId::new("origin-command-item"),
+            call_id: "origin-call".into(),
+        };
+        let origin_item = if duplicate {
+            origin.extension_item().expect("origin item")
+        } else {
+            TurnItem::Extension {
+                kind: USER_COMMAND_ORIGIN_EXTENSION_KIND.into(),
+                data: serde_json::json!({"origin": "user_command"}),
+            }
+        };
+        let mut events = vec![
+            envelope(
+                &session_id,
+                &shell_run,
+                "origin-marker-one",
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new("origin-marker-one-item"),
+                    item: origin_item,
+                }),
+                PromptRender::Omit,
+            ),
+            envelope(
+                &session_id,
+                &shell_run,
+                "origin-shell-done",
+                EventPayload::RunState(RunState::Done),
+                PromptRender::Omit,
+            ),
+            envelope(
+                &session_id,
+                &current_run,
+                "origin-current-user",
+                EventPayload::UserMessage {
+                    text: "continue".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+        ];
+        if duplicate {
+            events.insert(
+                1,
+                envelope(
+                    &session_id,
+                    &shell_run,
+                    "origin-marker-two",
+                    EventPayload::Item(ItemEvent::Completed {
+                        item_id: ItemId::new("origin-marker-two-item"),
+                        item: origin.extension_item().expect("duplicate origin item"),
+                    }),
+                    PromptRender::Omit,
+                ),
+            );
+        }
+        StoreHandle::append(&store, &mut events)
+            .await
+            .expect("append corrupt origin fixture");
+        let error = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current_run)
+            .await
+            .expect_err("known corrupt origin must fail closed");
+        assert_eq!(error.code, haider_protocol::error::ErrorCode::StoreCorrupt);
+    }
+}
+
+/// The provider-context cap is independent of the process hard cap. Every
+/// omitted byte is disclosed, while a model-origin CommandExecution with no
+/// user-command marker remains absent instead of being mislabeled.
+#[tokio::test]
+async fn user_command_context_is_bounded_and_model_exec_is_not_reclassified() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("bounded-user-command-session");
+    let shell_run = RunId::new("bounded-user-command-shell");
+    let current_run = RunId::new("bounded-user-command-current");
+    let command_item = ItemId::new("bounded-user-command-item");
+    let output = vec![b'x'; USER_COMMAND_OUTPUT_PREVIEW_BYTES + 1_024];
+    let origin = UserCommandOriginV1 {
+        origin: CommandExecutionOrigin::UserCommand,
+        command_item_id: command_item.clone(),
+        call_id: "bounded-shell".into(),
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &shell_run,
+            "bounded-origin",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("bounded-origin-item"),
+                item: origin.extension_item().expect("origin item"),
+            }),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "bounded-output",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: command_item.clone(),
+                delta: ItemDelta::CommandOutput {
+                    stream: OutputStream::Stdout,
+                    chunk_b64: BASE64.encode(&output),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "bounded-completed",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: command_item,
+                item: TurnItem::CommandExecution {
+                    call_id: "bounded-shell".into(),
+                    command: "produce output".into(),
+                    status: ToolStatus::Completed,
+                    exit_code: Some(0),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "model-exec-completed",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("model-exec-item"),
+                item: TurnItem::CommandExecution {
+                    call_id: "model-exec".into(),
+                    command: "must stay hidden".into(),
+                    status: ToolStatus::Completed,
+                    exit_code: Some(0),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "bounded-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current_run,
+            "bounded-current",
+            EventPayload::UserMessage {
+                text: "continue".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append bounded command history");
+
+    let messages = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current_run)
+        .await
+        .expect("compile bounded command history");
+    let Block::Text { text } = &messages[0].blocks[0] else {
+        panic!("bounded command must be text")
+    };
+    assert!(text.contains("output_bytes: 9216"));
+    assert!(text.contains("model-context output preview truncated"));
+    assert!(!text.contains("must stay hidden"));
+    assert!(text.len() < USER_COMMAND_OUTPUT_PREVIEW_BYTES + 1_024);
+}
+
+#[tokio::test]
+async fn cancelled_and_failed_user_commands_reach_later_context_in_their_exact_scope() {
+    for (suffix, status, terminal) in [
+        ("cancelled", ToolStatus::Cancelled, RunState::Cancelled),
+        ("failed", ToolStatus::Failed, RunState::Errored),
+    ] {
+        let store = MemoryStore::new();
+        let session_id = SessionId::new(format!("scoped-{suffix}-command-session"));
+        let shell_run = RunId::new(format!("scoped-{suffix}-command-shell"));
+        let current_run = RunId::new(format!("scoped-{suffix}-command-current"));
+        let branch = BranchId::new("command-branch");
+        let agent = haider_protocol::ids::AgentId::new("command-agent");
+        let command_item = ItemId::new(format!("scoped-{suffix}-command-item"));
+        let origin = UserCommandOriginV1 {
+            origin: CommandExecutionOrigin::UserCommand,
+            command_item_id: command_item.clone(),
+            call_id: format!("scoped-{suffix}-command"),
+        };
+        let scoped = |mut raw: haider_protocol::envelope::RawEnvelope| {
+            raw.branch_id = Some(branch.clone());
+            raw.agent_id = Some(agent.clone());
+            raw
+        };
+        let mut events = vec![
+            scoped(envelope(
+                &session_id,
+                &shell_run,
+                &format!("scoped-{suffix}-origin"),
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new(format!("scoped-{suffix}-origin-item")),
+                    item: origin.extension_item().expect("origin item"),
+                }),
+                PromptRender::Omit,
+            )),
+            scoped(envelope(
+                &session_id,
+                &shell_run,
+                &format!("scoped-{suffix}-output"),
+                EventPayload::Item(ItemEvent::Delta {
+                    item_id: command_item.clone(),
+                    delta: ItemDelta::CommandOutput {
+                        stream: OutputStream::Stderr,
+                        chunk_b64: BASE64.encode(format!("{suffix} output")),
+                    },
+                }),
+                PromptRender::Verbatim,
+            )),
+            scoped(envelope(
+                &session_id,
+                &shell_run,
+                &format!("scoped-{suffix}-completed"),
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: command_item,
+                    item: TurnItem::CommandExecution {
+                        call_id: format!("scoped-{suffix}-command"),
+                        command: format!("produce {suffix} result"),
+                        status,
+                        exit_code: None,
+                    },
+                }),
+                PromptRender::Verbatim,
+            )),
+            scoped(envelope(
+                &session_id,
+                &shell_run,
+                &format!("scoped-{suffix}-terminal"),
+                EventPayload::RunState(terminal),
+                PromptRender::Omit,
+            )),
+            scoped(envelope(
+                &session_id,
+                &current_run,
+                &format!("scoped-{suffix}-current"),
+                EventPayload::UserMessage {
+                    text: "continue in scope".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            )),
+        ];
+        StoreHandle::append(&store, &mut events)
+            .await
+            .expect("append scoped terminal command");
+
+        let messages = PromptHistoryCompiler::compile(
+            &store,
+            &session_id,
+            Some(&branch),
+            Some(&agent),
+            &current_run,
+        )
+        .await
+        .expect("compile scoped terminal command");
+        let Block::Text { text } = &messages[0].blocks[0] else {
+            panic!("terminal command is user text")
+        };
+        assert!(text.contains(&format!("status: {suffix}")));
+        assert!(text.contains(&format!("{suffix} output")));
+        assert_eq!(
+            messages[1],
+            haider_provider::Message::user_text("continue in scope")
+        );
+    }
+}
+
+#[tokio::test]
+async fn idle_compaction_input_includes_completed_user_command_after_the_tree_head() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let session_id = SessionId::new("idle-command-tail-session");
+    let prior_run = RunId::new("idle-command-tail-prior");
+    let shell_run = RunId::new("idle-command-tail-shell");
+    let command_item = ItemId::new("idle-command-tail-item");
+    let origin = UserCommandOriginV1 {
+        origin: CommandExecutionOrigin::UserCommand,
+        command_item_id: command_item.clone(),
+        call_id: "idle-command-tail-call".into(),
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior_run,
+            "idle-command-prior-user",
+            EventPayload::UserMessage {
+                text: "prior question".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior_run,
+            "idle-command-prior-node",
+            None,
+            NodeKind::UserTurn {
+                text: "prior question".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior_run,
+            "idle-command-prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "idle-command-tail-origin",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("idle-command-tail-origin-item"),
+                item: origin.extension_item().expect("origin item"),
+            }),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "idle-command-tail-output",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: command_item.clone(),
+                delta: ItemDelta::CommandOutput {
+                    stream: OutputStream::Stdout,
+                    chunk_b64: BASE64.encode("tail output"),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "idle-command-tail-completed",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: command_item,
+                item: TurnItem::CommandExecution {
+                    call_id: "idle-command-tail-call".into(),
+                    command: "printf tail output".into(),
+                    status: ToolStatus::Completed,
+                    exit_code: Some(0),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "idle-command-tail-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append idle command tail");
+
+    let messages = PromptHistoryCompiler::compile_idle_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+    )
+    .await
+    .expect("compile idle command tail");
+    assert_eq!(messages.len(), 2);
+    let Block::Text { text } = &messages[1].blocks[0] else {
+        panic!("idle command tail is text")
+    };
+    assert!(text.contains("printf tail output"));
+    assert!(text.contains("tail output"));
 }
 
 /// Cache law: advancing the durable head by an append must produce the exact

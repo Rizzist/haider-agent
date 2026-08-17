@@ -23,6 +23,7 @@ pub mod graph;
 pub mod headless;
 pub mod observe;
 pub mod profile;
+pub mod shell;
 pub mod spawn;
 pub mod transcription;
 
@@ -51,6 +52,10 @@ pub use profile::{
     PROFILE_DIR_ENV, ProfileEnv, ProfileError, ResolvedProfile, effective_uid, endpoint_path_for,
     resolve_default_model_for, resolve_profile,
 };
+pub use shell::{
+    AcceptedShellExec, CancelledShellExec, ShellExecError, ShellExecRequest, cancel_shell_exec,
+    required_user_command_features, shell_exec,
+};
 pub use spawn::{
     DAEMON_LOG_FILE, EnsureError, EnsureOptions, EnsuredDaemon, RACE_LOSER_EXIT_CODE,
     STARTUP_DEADLINE, ensure_daemon, required_live_features, signal_authenticated_peer,
@@ -59,3 +64,6 @@ pub use spawn::{
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-client";
+
+#[cfg(test)]
+mod shell_tests;

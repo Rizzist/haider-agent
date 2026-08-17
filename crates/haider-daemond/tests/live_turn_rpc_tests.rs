@@ -34,7 +34,7 @@ use haider_protocol::envelope::{
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, RunId, SessionId};
-use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
@@ -684,30 +684,7 @@ fn exact_once_shell_command() -> String {
 
 #[cfg(windows)]
 fn windows_powershell_command(script: &str) -> String {
-    let executable = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("WINDIR"))
-        .map(std::path::PathBuf::from)
-        .map(|root| {
-            root.join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe")
-        })
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        });
-    let encoded = BASE64.encode(
-        script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
-    format!(
-        "\"{executable}\" -NoProfile -NonInteractive -EncodedCommand {encoded}",
-        executable = executable.display(),
-        encoded = encoded,
-    )
+    script.into()
 }
 
 #[cfg(unix)]
@@ -717,7 +694,7 @@ fn denied_exec_command() -> String {
 
 #[cfg(windows)]
 fn denied_exec_command() -> String {
-    ">denied.log echo denied".into()
+    "[IO.File]::WriteAllText('denied.log','denied',[Text.Encoding]::ASCII)".into()
 }
 
 #[cfg(unix)]
@@ -741,7 +718,7 @@ fn different_exec_command() -> String {
 
 #[cfg(windows)]
 fn different_exec_command() -> String {
-    ">different.log echo different".into()
+    "[IO.File]::WriteAllText('different.log','different',[Text.Encoding]::ASCII)".into()
 }
 
 #[cfg(unix)]
@@ -762,6 +739,7 @@ fn restart_exec_command() -> String {
 #[cfg(unix)]
 fn cancellable_exec_command() -> String {
     concat!(
+        "(sleep 0.35; printf survived > descendant-survived.log) & ",
         "printf x >> heartbeat.log; printf started; ",
         "while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done"
     )
@@ -771,6 +749,9 @@ fn cancellable_exec_command() -> String {
 #[cfg(windows)]
 fn cancellable_exec_command() -> String {
     windows_powershell_command(concat!(
+        "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
+        "Start-Process -FilePath $cmd -ArgumentList '/D','/S','/C',",
+        "'ping -n 2 127.0.0.1 >nul & echo survived>descendant-survived.log';",
         "[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
         "[Console]::Out.Write('started');[Console]::Out.Flush();",
         "while($true){[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
@@ -796,7 +777,9 @@ async fn scenario_1_production_runtime_accepts_an_injected_fake_provider_factory
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (dependencies, fake) = fake_dependencies(Vec::new());
+    let (dependencies, fake) = fake_dependencies(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]);
     let task = ready_with_dependencies(&config, dependencies).await;
     assert!(fake.requests().is_empty());
     task.shutdown_handle().request("test complete");
@@ -2800,7 +2783,9 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (dependencies, fake) = fake_dependencies(Vec::new());
+    let (dependencies, fake) = fake_dependencies(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]);
     let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
     let mut client = UdsClient::connect_control(
         &config.endpoint_path(),
@@ -2923,10 +2908,11 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
         },
     )
     .await;
-    let (item_id, accepted_seq) = match next_response(&mut client).await {
+    let (receipt_run_id, item_id, accepted_seq) = match next_response(&mut client).await {
         WireFrame::Response {
             body:
                 ResponseBody::ShellExec {
+                    run_id: Some(run_id),
                     item_id,
                     accepted_seq,
                     worker_generation,
@@ -2935,7 +2921,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
             ..
         } => {
             assert_eq!(worker_generation, generation);
-            (item_id, accepted_seq)
+            (run_id, item_id, accepted_seq)
         }
         other => panic!("expected shell receipt replay, got {other:?}"),
     };
@@ -2983,6 +2969,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
                 .flatten()
         })
         .expect("shell item has a durable run");
+    assert_eq!(receipt_run_id, run_id);
     let payloads = payloads_for_run(&durable, &run_id).collect::<Vec<_>>();
     assert_eq!(
         payloads
@@ -3004,6 +2991,18 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
             .count(),
         1
     );
+    let origins = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                UserCommandOriginV1::from_extension_item(item)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(origins.len(), 1, "one durable user-command origin marker");
+    assert_eq!(origins[0].command_item_id, item_id);
+    assert_eq!(origins[0].call_id, "shell-command");
     let phases = payloads
         .iter()
         .filter_map(|payload| match payload {
@@ -3093,6 +3092,249 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
         ),
         other => panic!("expected post-shell inventory, got {other:?}"),
     }
+
+    let current_generation = current_generation(
+        &mut client,
+        &config,
+        &session_id,
+        "shell-next-turn-generation",
+    )
+    .await;
+    send_request(
+        &mut client,
+        &config,
+        "shell-next-turn-submit",
+        submit_body(
+            "shell-next-turn-command",
+            session_id.clone(),
+            current_generation,
+            "explain the command result",
+        ),
+    )
+    .await;
+    let (next_run, _) = next_submit_response(&mut client).await;
+    let _ = events_until_terminal(&mut client, &next_run).await;
+    let requests = fake.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "direct shell itself never calls a provider"
+    );
+    let text_blocks = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let command_record = text_blocks
+        .iter()
+        .position(|text| text.contains("[user-initiated shell command]"))
+        .expect("next provider turn contains the committed shell record");
+    let current_prompt = text_blocks
+        .iter()
+        .position(|text| *text == "explain the command result")
+        .expect("current user prompt reaches provider");
+    assert!(command_record < current_prompt);
+    let command_record = text_blocks[command_record];
+    assert!(command_record.contains("origin: user_command"));
+    // The record JSON-encodes command and output (json_string_fields_v1 —
+    // the anti-forgery framing law pinned in haider-provider), so raw
+    // containment can never match a command with escape sequences.
+    let command_json = serde_json::to_string(&command).expect("command encodes");
+    assert!(command_record.contains(&command_json));
+    let output_json = serde_json::to_string("héllo\n").expect("output encodes");
+    assert!(command_record.contains(output_json.trim_matches('"')));
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// Direct `shell.exec` owns a cancellable synthetic run. Cancelling that run
+/// through the public RPC must settle its open item and stop the complete
+/// supervised process tree before interrupted Idle is published.
+#[tokio::test]
+async fn w8a_shell_exec_cancel_kills_the_process_tree() {
+    let root = test_root("w8a-shell-cancel-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let heartbeat = workspace.join("heartbeat.log");
+    let config = DaemonConfig::new(
+        "w8a-shell-cancel",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w8a-shell-cancel-test",
+        "shell-cancel-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "shell-cancel-start",
+        RequestBody::ShellExec {
+            command_id: CommandId::new("shell-cancel-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            command: cancellable_exec_command(),
+            cwd: None,
+        },
+    )
+    .await;
+    let (run_id, item_id) = match next_response(&mut client).await {
+        WireFrame::Response {
+            body:
+                ResponseBody::ShellExec {
+                    run_id: Some(run_id),
+                    item_id,
+                    ..
+                },
+            ..
+        } => (run_id, item_id),
+        other => panic!("expected cancellable shell receipt, got {other:?}"),
+    };
+    tokio::time::timeout(support::DEADLINE, async {
+        loop {
+            if fs::metadata(&heartbeat).is_ok_and(|metadata| metadata.len() > 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("direct shell process tree starts");
+
+    send_request(
+        &mut client,
+        &config,
+        "shell-cancel-request",
+        RequestBody::TurnCancel {
+            command_id: CommandId::new("shell-cancel-rpc-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: run_id.clone(),
+        },
+    )
+    .await;
+    tokio::time::timeout(support::DEADLINE, async {
+        let mut response_seen = false;
+        let mut terminal_seen = false;
+        let mut interrupted_idle_seen = false;
+        while !(response_seen && terminal_seen && interrupted_idle_seen) {
+            match client.next().await {
+                WireFrame::Response {
+                    body:
+                        ResponseBody::TurnCancel {
+                            run_id: cancelled,
+                            status: CancelStatus::Accepted,
+                            ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(cancelled, run_id);
+                    response_seen = true;
+                }
+                WireFrame::Event { envelope, .. } => {
+                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload)
+                    else {
+                        continue;
+                    };
+                    if envelope.run_id.as_ref() == Some(&run_id)
+                        && payload == EventPayload::RunState(RunState::Cancelled)
+                    {
+                        terminal_seen = true;
+                    }
+                    if payload
+                        == EventPayload::SessionState(SessionState::Idle { interrupted: true })
+                    {
+                        interrupted_idle_seen = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("direct shell cancellation reaches response, terminal, and Idle");
+    let durable = read_session(
+        &mut client,
+        &config,
+        session_id.clone(),
+        "shell-cancel-durable-read",
+    )
+    .await;
+    assert!(payloads_for_run(&durable, &run_id).any(|payload| matches!(
+        payload,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: completed,
+            item: TurnItem::CommandExecution {
+                status: haider_protocol::item::ToolStatus::Cancelled,
+                ..
+            },
+        }) if completed == item_id
+    )));
+    let stopped_size = fs::metadata(&heartbeat).expect("heartbeat metadata").len();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        fs::metadata(&heartbeat).expect("heartbeat metadata").len(),
+        stopped_size,
+        "cancelled direct-shell child or descendant kept running"
+    );
+    #[cfg(unix)]
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    assert!(
+        !workspace.join("descendant-survived.log").exists(),
+        "cancelled direct-shell descendant survived its process tree"
+    );
+    assert!(fake.requests().is_empty());
+
+    let current_generation = current_generation(
+        &mut client,
+        &config,
+        &session_id,
+        "shell-cancel-next-turn-generation",
+    )
+    .await;
+    send_request(
+        &mut client,
+        &config,
+        "shell-cancel-next-turn-submit",
+        submit_body(
+            "shell-cancel-next-turn-command",
+            session_id.clone(),
+            current_generation,
+            "explain the cancelled command",
+        ),
+    )
+    .await;
+    let (next_run, _) = next_submit_response(&mut client).await;
+    let _ = events_until_terminal(&mut client, &next_run).await;
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1);
+    let command_record = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .find_map(|block| match block {
+            Block::Text { text } if text.contains("[user-initiated shell command]") => Some(text),
+            _ => None,
+        })
+        .expect("next provider turn contains the cancelled shell record");
+    assert!(command_record.contains("origin: user_command"));
+    assert!(command_record.contains("status: cancelled"));
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");

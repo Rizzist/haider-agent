@@ -837,7 +837,7 @@ async fn windows_copy_rejects_case_aliased_destination_inside_source() {
     assert!(!directory.path().join("Dir/recursive-child").exists());
 }
 
-/// `cmd.exe` is resolved before `env_clear`, but Windows system commands also
+/// PowerShell is resolved before `env_clear`, but Windows system commands also
 /// require a small non-secret bootstrap environment after that clear.
 #[cfg(windows)]
 #[tokio::test]
@@ -850,7 +850,7 @@ async fn windows_process_exec_restores_the_system_bootstrap_environment() {
         .process_exec(
             &ProcessExec::new(
                 "windows-bootstrap",
-                "if defined SystemRoot (>bootstrap.txt echo ok) else exit /b 9",
+                "if ($env:SystemRoot) {[IO.File]::WriteAllText('bootstrap.txt','ok')} else {exit 9}",
             ),
             &policy,
             UnusedCas,

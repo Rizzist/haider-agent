@@ -6,7 +6,7 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 fn ordinary(bytes: &[u8]) -> QueuedFrame {
@@ -32,9 +32,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// failure: clients cannot discover the served `session.compact` method.
 /// Verified by revert on 2026-07-30.
 ///
-/// MUTATION CHECK: remove `FEATURE_SHELL_EXEC_V1` or
-/// `FEATURE_TOOL_INVENTORY_V1`. Expected runtime failure: the exact feature
-/// set no longer advertises one of the W8a RPC methods the daemon serves.
+/// MUTATION CHECK: remove `FEATURE_SHELL_EXEC_V1`, `FEATURE_USER_COMMAND_V1`,
+/// or `FEATURE_TOOL_INVENTORY_V1`. Expected runtime failure: the exact feature
+/// set no longer advertises the W8a RPC or its context/cancel semantics.
 ///
 /// MUTATION CHECK: remove `FEATURE_SESSION_PERMISSION_OVERRIDES_V1`.
 /// Expected RUNTIME failure: headless clients cannot discover the durable
@@ -114,6 +114,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),
+            haider_rpc::FEATURE_USER_COMMAND_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
             haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
@@ -121,6 +122,50 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
     );
+}
+
+/// MUTATION CHECK: enqueue the full T4 Welcome without the tight-limit
+/// fallback. Expected runtime failure: the second encode is rejected instead
+/// of preserving the shipped handshake surface. Removing any feature other
+/// than `user_command_v1` fails the exact decoded set assertion.
+#[test]
+fn tight_welcome_omits_only_the_additive_user_command_feature() {
+    let welcome = Welcome {
+        protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
+        instance_id: "instance".into(),
+        daemon_generation: 7,
+        frame_limit: 1_024,
+        profile_id: "profile".into(),
+        daemon_version: "test".into(),
+        lifecycle_phase: LifecyclePhase::Ready,
+        capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
+        features: welcome_features(),
+    };
+    let full = uds_codec::encode(&WireFrame::Welcome(welcome.clone()), usize::MAX)
+        .expect("full Welcome encodes");
+    let full_body_len = full.len() - 4;
+
+    let ample = encode_welcome_for_peer(welcome.clone(), full_body_len)
+        .expect("exact full limit carries every feature");
+    let mut ample_decoder = uds_codec::Decoder::new(full_body_len);
+    let ample_frames = ample_decoder.push(&ample).frames;
+    assert!(matches!(
+        ample_frames.as_slice(),
+        [WireFrame::Welcome(Welcome { features, .. })]
+            if features == &welcome.features
+    ));
+
+    let tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+        .expect("tight peer retains the pre-T4 handshake");
+    let mut tight_decoder = uds_codec::Decoder::new(full_body_len - 1);
+    let tight_frames = tight_decoder.push(&tight).frames;
+    let mut expected = welcome.features;
+    assert!(expected.remove(FEATURE_USER_COMMAND_V1));
+    assert!(matches!(
+        tight_frames.as_slice(),
+        [WireFrame::Welcome(Welcome { features, .. })]
+            if features == &expected
+    ));
 }
 
 /// MUTATION CHECK: replace the round-robin ring with one FIFO/hot-lane drain.
@@ -580,6 +625,13 @@ fn liveness_context(hub: crate::session_hub::SessionHub) -> ConnectionContext {
     // Leak the receiver so writer registration succeeds; the test joins the
     // connection task itself.
     std::mem::forget(receiver);
+    connection_context(hub, writers)
+}
+
+fn connection_context(
+    hub: crate::session_hub::SessionHub,
+    writers: WriterRegistry,
+) -> ConnectionContext {
     ConnectionContext {
         profile_id: "profile-liveness".into(),
         instance_id: "instance-liveness".into(),
@@ -658,6 +710,352 @@ async fn liveness_hub() -> (tempfile::TempDir, crate::session_hub::SessionHub) {
         crate::session_hub::SessionHub::new(store, crate::session_hub::SessionHubConfig::default())
             .expect("hub");
     (dir, hub)
+}
+
+/// No-bind client for end-to-end connection laws. `UnixStream::pair` keeps
+/// the real platform split, framing, bounded writer, hub connection, and
+/// liveness loop while avoiding the filesystem listener that sandboxed test
+/// environments cannot create.
+struct PairedClient {
+    stream: UnixStream,
+    decoder: uds_codec::Decoder,
+    pending: VecDeque<WireFrame>,
+}
+
+impl PairedClient {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            decoder: uds_codec::Decoder::new(1024 * 1024),
+            pending: VecDeque::new(),
+        }
+    }
+
+    async fn send(&mut self, frame: &WireFrame) {
+        let bytes = uds_codec::encode(frame, 1024 * 1024).expect("paired frame encodes");
+        self.stream
+            .write_all(&bytes)
+            .await
+            .expect("paired frame writes");
+    }
+
+    async fn next(&mut self) -> Option<WireFrame> {
+        if let Some(frame) = self.pending.pop_front() {
+            return Some(frame);
+        }
+        loop {
+            let mut buffer = [0_u8; 4096];
+            let read = self.stream.read(&mut buffer).await.expect("paired read");
+            if read == 0 {
+                return None;
+            }
+            let batch = self.decoder.push(&buffer[..read]);
+            assert!(batch.error.is_none(), "server sent an invalid paired frame");
+            self.pending.extend(batch.frames);
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(frame);
+            }
+        }
+    }
+
+    async fn handshake(&mut self) {
+        self.send(&WireFrame::Hello(haider_rpc::Hello {
+            protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
+            protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
+            client_name: "paired-connection-test".into(),
+            client_version: "test".into(),
+            client_instance_id: "paired-client".into(),
+            client_kind: haider_rpc::ClientKind::Headless,
+            capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+            max_receive_frame: 1024 * 1024,
+        }))
+        .await;
+        assert!(matches!(self.next().await, Some(WireFrame::Welcome(_))));
+    }
+
+    async fn request(&mut self, request: &str, body: haider_rpc::RequestBody) {
+        self.send(&WireFrame::Request {
+            request_id: RequestId::new(request),
+            body,
+        })
+        .await;
+    }
+}
+
+struct PairedFakeFactory {
+    provider: Arc<haider_provider::FakeProvider>,
+}
+
+#[async_trait::async_trait]
+impl crate::worker::ProviderFactory for PairedFakeFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> Result<crate::worker::ResolvedTurnProvider, haider_protocol::error::HaiderError> {
+        Ok(crate::worker::ResolvedTurnProvider {
+            provider: self.provider.clone(),
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            context_window: None,
+            account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
+        })
+    }
+}
+
+struct PairedTurnFixture {
+    _root: tempfile::TempDir,
+    hub: crate::session_hub::SessionHub,
+    manager: crate::worker::WorkerManager,
+    fake: Arc<haider_provider::FakeProvider>,
+    serve_task: tokio::task::JoinHandle<Result<ConnectionExit, DaemonError>>,
+    writer_registry: tokio::task::JoinHandle<()>,
+    _drain_tx: watch::Sender<Option<DrainNotice>>,
+    client: PairedClient,
+    session_id: haider_protocol::ids::SessionId,
+    worker_generation: u64,
+}
+
+impl PairedTurnFixture {
+    async fn start(script: Vec<haider_provider::FakeStep>) -> Self {
+        let (root, hub) = liveness_hub().await;
+        hub.install_creatable_providers(BTreeSet::from(["fake".to_owned()]))
+            .expect("install fake provider name");
+        let fake = Arc::new(haider_provider::FakeProvider::new(script));
+        let manager = crate::worker::WorkerManager::start(
+            hub.clone(),
+            crate::worker::WorkerDependencies {
+                provider_factory: Arc::new(PairedFakeFactory {
+                    provider: fake.clone(),
+                }),
+                tool_factory: Arc::new(crate::worker::BrokerToolFactory),
+                delegation: None,
+                web_search: None,
+            },
+            false,
+        );
+        hub.install_worker_manager(manager.handle())
+            .expect("install worker manager");
+
+        let (server, client) = UnixStream::pair().expect("socketless stream pair");
+        let (writers, mut registered_writers) = mpsc::unbounded_channel();
+        let context = connection_context(hub.clone(), writers);
+        let writer_registry = tokio::spawn(async move {
+            while let Some(writer) = registered_writers.recv().await {
+                let _ = writer.await;
+            }
+        });
+        let (drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+        let serve_task = tokio::spawn(serve(server, context, drain_rx));
+        let mut client = PairedClient::new(client);
+        client.handshake().await;
+
+        client
+            .request(
+                "create",
+                haider_rpc::RequestBody::SessionCreate {
+                    command_id: haider_rpc::CommandId::new("paired-create"),
+                    cwd: root.path().to_string_lossy().into_owned(),
+                    provider: "fake".into(),
+                    model: "fake-v1".into(),
+                    max_tokens: 4096,
+                },
+            )
+            .await;
+        let (session_id, worker_generation) = loop {
+            if let WireFrame::Response {
+                body:
+                    haider_rpc::ResponseBody::SessionCreate {
+                        session_id,
+                        worker_generation,
+                        ..
+                    },
+                ..
+            } = client.next().await.expect("create response")
+            {
+                break (session_id, worker_generation);
+            }
+        };
+        client
+            .request(
+                "attach",
+                haider_rpc::RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                },
+            )
+            .await;
+        let mut attached = false;
+        let mut caught_up = false;
+        while !(attached && caught_up) {
+            match client.next().await.expect("attach completes") {
+                WireFrame::Response {
+                    body: haider_rpc::ResponseBody::SessionAttach { .. },
+                    ..
+                } => attached = true,
+                WireFrame::AttachCaughtUp { .. } => caught_up = true,
+                _ => {}
+            }
+        }
+
+        Self {
+            _root: root,
+            hub,
+            manager,
+            fake,
+            serve_task,
+            writer_registry,
+            _drain_tx: drain_tx,
+            client,
+            session_id,
+            worker_generation,
+        }
+    }
+
+    async fn submit(&mut self, text: &str) {
+        self.client
+            .request(
+                "submit",
+                haider_rpc::RequestBody::TurnSubmit {
+                    command_id: haider_rpc::CommandId::new("paired-submit"),
+                    session_id: self.session_id.clone(),
+                    worker_generation: self.worker_generation,
+                    text: text.into(),
+                    attachments: Vec::new(),
+                    mode: haider_protocol::DeliveryMode::Queue,
+                },
+            )
+            .await;
+    }
+
+    async fn shutdown(self) {
+        let Self {
+            _root: root,
+            hub,
+            manager,
+            serve_task,
+            writer_registry,
+            client,
+            ..
+        } = self;
+        drop(client);
+        // Peer-initiated teardown can race writer shutdown into NotConnected
+        // on macOS. The task must join; either inner result closes this pair.
+        let _ = serve_task.await.expect("serve task joins");
+        writer_registry.await.expect("writer registry joins");
+        manager.shutdown().await.expect("manager shutdown");
+        hub.shutdown().await.expect("hub shutdown");
+        drop(root);
+    }
+}
+
+/// Regression for the misleading symptom seen in the W8a tail: an accepted
+/// turn backed by an empty fake script is not a successful empty response.
+/// It is a pre-content EOF, so core enters retry backoff; because this raw
+/// harness intentionally sends no Ping, the production connection eventually
+/// reports `idle_timeout` and closes before retry exhaustion.
+#[tokio::test]
+async fn empty_fake_turn_retries_until_the_paired_connection_hits_read_idle() {
+    let mut fixture = PairedTurnFixture::start(Vec::new()).await;
+    tokio::time::pause();
+    fixture
+        .submit("this fixture has no terminal provider step")
+        .await;
+
+    let mut accepted = false;
+    let mut retrying = false;
+    let mut idle_timeout = false;
+    while let Some(frame) = fixture.client.next().await {
+        match frame {
+            WireFrame::Response {
+                body: haider_rpc::ResponseBody::TurnSubmit { .. },
+                ..
+            } => accepted = true,
+            WireFrame::Event { envelope, .. }
+                if serde_json::from_value::<haider_protocol::EventPayload>(
+                    envelope.payload.clone(),
+                )
+                .is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        haider_protocol::EventPayload::RunState(
+                            haider_protocol::state::RunState::Retrying { .. }
+                        )
+                    )
+                }) =>
+            {
+                retrying = true;
+            }
+            WireFrame::ProtocolError(error) if error.code == "idle_timeout" => {
+                idle_timeout = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(accepted, "turn was accepted before the secondary close");
+    assert!(retrying, "empty fake stream entered provider retry backoff");
+    assert!(idle_timeout, "production liveness caused the observed EOF");
+    assert!(
+        !fixture.fake.requests().is_empty(),
+        "the injected fake was reached; prompt setup did not deadlock"
+    );
+    fixture.shutdown().await;
+}
+
+/// The repaired W8a fixture shape: one explicit provider terminal ends the
+/// accepted turn exactly once, and the same connection remains usable.
+#[tokio::test]
+async fn terminal_fake_turn_finishes_over_the_paired_connection() {
+    let mut fixture = PairedTurnFixture::start(vec![haider_provider::FakeStep::Finish {
+        reason: haider_protocol::provider::FinishReason::EndTurn,
+    }])
+    .await;
+    fixture.submit("terminal fixture").await;
+
+    let mut accepted = false;
+    let mut done = false;
+    while !(accepted && done) {
+        match fixture.client.next().await.expect("turn reaches terminal") {
+            WireFrame::Response {
+                body: haider_rpc::ResponseBody::TurnSubmit { .. },
+                ..
+            } => accepted = true,
+            WireFrame::Event { envelope, .. }
+                if serde_json::from_value::<haider_protocol::EventPayload>(
+                    envelope.payload.clone(),
+                )
+                .is_ok_and(|payload| {
+                    payload
+                        == haider_protocol::EventPayload::RunState(
+                            haider_protocol::state::RunState::Done,
+                        )
+                }) =>
+            {
+                done = true;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(fixture.fake.requests().len(), 1);
+
+    fixture.client.send(&WireFrame::Ping { nonce: 7 }).await;
+    loop {
+        if matches!(
+            fixture
+                .client
+                .next()
+                .await
+                .expect("connection stays open through Pong"),
+            WireFrame::Pong { nonce: 7 }
+        ) {
+            break;
+        }
+    }
+    fixture.shutdown().await;
 }
 
 // MUTATION CHECK (R9 server read deadline): remove the liveness tick arm (or

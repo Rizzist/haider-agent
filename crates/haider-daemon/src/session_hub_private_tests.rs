@@ -27,9 +27,10 @@ const CANCELLABLE_SHELL_COMMAND: &str = "printf started; sleep 30";
 #[cfg(unix)]
 const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"printf started; sleep 30"}"#;
 #[cfg(windows)]
-const CANCELLABLE_SHELL_COMMAND: &str = "echo started & set /p wait=";
+const CANCELLABLE_SHELL_COMMAND: &str =
+    "[Console]::Out.Write('started');[Console]::Out.Flush();while($true){Start-Sleep -Seconds 1}";
 #[cfg(windows)]
-const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"echo started & set /p wait="}"#;
+const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"powershell-wait"}"#;
 
 fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
@@ -1368,6 +1369,8 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
             request_json: CANCELLABLE_SHELL_REQUEST_JSON.into(),
             session_id: session_id.clone(),
             worker_generation: generation,
+            branch_id: None,
+            agent_id: None,
             run_id: run_id.clone(),
             item_id: item_id.clone(),
             command: CANCELLABLE_SHELL_COMMAND.into(),
@@ -1392,6 +1395,8 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
         .shell_exec(
             accepted,
             "direct-shell-cancel-command".into(),
+            None,
+            None,
             CANCELLABLE_SHELL_COMMAND.into(),
             None,
         )
@@ -1551,6 +1556,8 @@ async fn direct_shell_manager_drain_cancels_process_before_join() {
             request_json: CANCELLABLE_SHELL_REQUEST_JSON.into(),
             session_id: session_id.clone(),
             worker_generation: generation,
+            branch_id: None,
+            agent_id: None,
             run_id: run_id.clone(),
             item_id: item_id.clone(),
             command: CANCELLABLE_SHELL_COMMAND.into(),
@@ -1575,6 +1582,8 @@ async fn direct_shell_manager_drain_cancels_process_before_join() {
         .shell_exec(
             accepted,
             "direct-shell-drain-command".into(),
+            None,
+            None,
             CANCELLABLE_SHELL_COMMAND.into(),
             None,
         )
@@ -1663,6 +1672,148 @@ async fn direct_shell_manager_drain_cancels_process_before_join() {
         .expect("run terminal");
     assert!(cancelling < completed && completed < terminal);
 
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// An accepted direct command can outlive the in-memory handoff that would
+/// normally start it. Manager drain must recognize its durable origin marker,
+/// close the command as prompt-visible Cancelled, and only then settle Idle.
+#[tokio::test]
+async fn accepted_shell_without_handoff_drains_with_prompt_visible_completion() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("direct-shell-unhanded-drain");
+    let run_id = RunId::new("direct-shell-unhanded-drain-run");
+    let item_id = ItemId::new("direct-shell-unhanded-drain-item");
+    let generation = store.worker_generation();
+    hub.create_session(create_command(&session_id, "direct-shell-unhanded-drain"))
+        .await
+        .expect("typed session commits");
+    hub.accept_shell_exec(ShellExecAcceptCommand {
+        command_id: "direct-shell-unhanded-drain-command".into(),
+        request_digest: "direct-shell-unhanded-drain-digest".into(),
+        request_json: r#"{"command":"printf never-started"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        branch_id: None,
+        agent_id: None,
+        run_id: run_id.clone(),
+        item_id: item_id.clone(),
+        command: "printf never-started".into(),
+        running_event_id: EventId::new("direct-shell-unhanded-drain-running"),
+        item_event_id: EventId::new("direct-shell-unhanded-drain-started"),
+        active_event_id: EventId::new("direct-shell-unhanded-drain-active"),
+        device_id: DeviceId::new("worker-law-test"),
+    })
+    .await
+    .expect("shell acceptance commits");
+
+    crate::worker::WorkerManager::start(
+        hub.clone(),
+        crate::worker::WorkerDependencies::unconfigured_for_tests(),
+        false,
+    )
+    .shutdown()
+    .await
+    .expect("manager drains accepted work");
+
+    let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+        .await
+        .expect("history reads");
+    let completed = history
+        .iter()
+        .find(|envelope| {
+            envelope.run_id.as_ref() == Some(&run_id)
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::Item(ItemEvent::Completed {
+                                item_id: ref candidate,
+                                item: TurnItem::CommandExecution {
+                                    status: ToolStatus::Cancelled,
+                                    ..
+                                },
+                            }) if candidate == &item_id
+                        )
+                    },
+                )
+        })
+        .expect("drain closes the command");
+    assert_eq!(completed.render.prompt, PromptRender::Verbatim);
+    assert!(completed.branch_id.is_none() && completed.agent_id.is_none());
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Supervisor failure recovery shares the same durable-origin discriminator:
+/// marked direct commands expose their Failed completion, while existing
+/// unmarked model-turn recovery remains prompt-omitted.
+#[tokio::test]
+async fn shell_supervisor_exit_keeps_failed_completion_prompt_visible() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("direct-shell-panic-exit");
+    let run_id = RunId::new("direct-shell-panic-exit-run");
+    let item_id = ItemId::new("direct-shell-panic-exit-item");
+    let generation = store.worker_generation();
+    hub.create_session(create_command(&session_id, "direct-shell-panic-exit"))
+        .await
+        .expect("typed session commits");
+    hub.accept_shell_exec(ShellExecAcceptCommand {
+        command_id: "direct-shell-panic-exit-command".into(),
+        request_digest: "direct-shell-panic-exit-digest".into(),
+        request_json: r#"{"command":"printf never-started"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        branch_id: None,
+        agent_id: None,
+        run_id: run_id.clone(),
+        item_id: item_id.clone(),
+        command: "printf never-started".into(),
+        running_event_id: EventId::new("direct-shell-panic-exit-running"),
+        item_event_id: EventId::new("direct-shell-panic-exit-started"),
+        active_event_id: EventId::new("direct-shell-panic-exit-active"),
+        device_id: DeviceId::new("worker-law-test"),
+    })
+    .await
+    .expect("shell acceptance commits");
+
+    crate::worker::terminalize_supervisor_exit(&hub, &session_id, 1)
+        .await
+        .expect("supervisor exit terminalizes shell");
+    let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+        .await
+        .expect("history reads");
+    let completed = history
+        .iter()
+        .find(|envelope| {
+            envelope.run_id.as_ref() == Some(&run_id)
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::Item(ItemEvent::Completed {
+                                item_id: ref candidate,
+                                item: TurnItem::CommandExecution {
+                                    status: ToolStatus::Failed,
+                                    ..
+                                },
+                            }) if candidate == &item_id
+                        )
+                    },
+                )
+        })
+        .expect("failure closes the command");
+    assert_eq!(completed.render.prompt, PromptRender::Verbatim);
+    assert!(completed.branch_id.is_none() && completed.agent_id.is_none());
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }

@@ -3,23 +3,26 @@
 
 use crate::StoreHandle;
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
 use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
 use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, MenuId, NodeId, RunId, SessionId};
-use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
 use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState};
 use haider_protocol::tool::BoundedResult;
-use haider_provider::{Message, MessageRole};
+use haider_provider::{Message, MessageRole, UserCommandRecord};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
 
 const HISTORY_PAGE: usize = 256;
+pub const USER_COMMAND_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
 
 /// Read-only CAS port used only when a durable compaction node is projected.
 ///
@@ -260,9 +263,19 @@ impl PromptHistoryCompiler {
                     false,
                 )
             })?;
-        compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None)
-            .await
-            .map(|projection| projection.messages)
+        let tree_head_seq = ancestry.last().map_or(0, |entry| entry.seq);
+        let mut projection =
+            compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None).await?;
+        let tail = envelopes
+            .iter()
+            .filter(|envelope| {
+                envelope.seq > tree_head_seq && scoped(envelope, branch_id, agent_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let rendered = render_journal(&tail, &envelopes, branch_id, agent_id, None, false)?;
+        projection.messages.extend(rendered.messages);
+        Ok(projection.messages)
     }
 
     /// Returns the latest committed tree head in one branch/agent scope.
@@ -807,6 +820,75 @@ struct RenderedJournal {
     current_user_start: Option<usize>,
 }
 
+#[derive(Default)]
+struct UserCommandOutput {
+    chunks: Vec<UserCommandOutputChunk>,
+    retained_bytes: usize,
+    total_bytes: u64,
+}
+
+struct UserCommandOutputChunk {
+    stream: OutputStream,
+    bytes: Vec<u8>,
+}
+
+impl UserCommandOutput {
+    fn push(&mut self, stream: OutputStream, bytes: &[u8]) {
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let remaining = USER_COMMAND_OUTPUT_PREVIEW_BYTES.saturating_sub(self.retained_bytes);
+        let retained = bytes.len().min(remaining);
+        if retained == 0 {
+            return;
+        }
+        if let Some(last) = self.chunks.last_mut()
+            && last.stream == stream
+        {
+            last.bytes.extend_from_slice(&bytes[..retained]);
+        } else {
+            self.chunks.push(UserCommandOutputChunk {
+                stream,
+                bytes: bytes[..retained].to_vec(),
+            });
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained);
+    }
+
+    fn finish(self) -> (String, bool, bool, u64) {
+        let mut preview = String::new();
+        let mut truncated = self.total_bytes > self.retained_bytes as u64;
+        let mut lossy_utf8 = false;
+        for (index, chunk) in self.chunks.into_iter().enumerate() {
+            let label = match (index, chunk.stream) {
+                (0, OutputStream::Stdout) => "[stdout]\n",
+                (0, OutputStream::Stderr) => "[stderr]\n",
+                (_, OutputStream::Stdout) => "\n[stdout]\n",
+                (_, OutputStream::Stderr) => "\n[stderr]\n",
+            };
+            truncated |= !append_bounded_utf8(&mut preview, label);
+            let decoded = String::from_utf8_lossy(&chunk.bytes);
+            lossy_utf8 |= matches!(decoded, std::borrow::Cow::Owned(_));
+            truncated |= !append_bounded_utf8(&mut preview, &decoded);
+        }
+        (preview, truncated, lossy_utf8, self.total_bytes)
+    }
+}
+
+fn append_bounded_utf8(target: &mut String, value: &str) -> bool {
+    let remaining = USER_COMMAND_OUTPUT_PREVIEW_BYTES.saturating_sub(target.len());
+    if value.len() <= remaining {
+        target.push_str(value);
+        return true;
+    }
+    let mut end = remaining.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&value[..end]);
+    false
+}
+
 async fn compile_ancestry(
     envelopes: &[RawEnvelope],
     ancestry: &[TreeEntry],
@@ -973,6 +1055,8 @@ fn render_journal(
     let mut terminal = HashMap::<RunId, RunState>::new();
     let mut partial_menus = HashMap::<MenuId, (haider_protocol::ids::ItemId, String, u32)>::new();
     let mut continued_partial_items = HashSet::new();
+    let mut user_command_origins =
+        HashMap::<haider_protocol::ids::ItemId, UserCommandOriginV1>::new();
     for envelope in all_envelopes {
         if !scoped(envelope, branch_id, agent_id) {
             continue;
@@ -1020,6 +1104,19 @@ fn render_journal(
                         continued_partial_items.insert(item_id.clone());
                     }
                 }
+                EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                    let origin =
+                        UserCommandOriginV1::try_from_extension_item(&item).map_err(|error| {
+                            corrupt(format!("malformed user-command origin marker: {error}"))
+                        })?;
+                    if let Some(origin) = origin
+                        && user_command_origins
+                            .insert(origin.command_item_id.clone(), origin)
+                            .is_some()
+                    {
+                        return Err(corrupt("duplicate user-command origin marker"));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1027,6 +1124,8 @@ fn render_journal(
 
     let mut messages = Vec::new();
     let mut pending_tool_results = HashMap::<String, BoundedResult>::new();
+    let mut user_command_outputs =
+        HashMap::<haider_protocol::ids::ItemId, UserCommandOutput>::new();
     let mut current_user_seen = false;
     let mut current_user_start = None;
     for envelope in selected {
@@ -1049,11 +1148,12 @@ fn render_journal(
             continue;
         };
         let is_current = current_run.is_some_and(|current| run_id == *current);
-        if !is_current
-            && !terminal
-                .get(&run_id)
-                .is_some_and(|state| *state == RunState::Done)
-        {
+        let prior_state = terminal.get(&run_id);
+        let ordinary_visible =
+            is_current || prior_state.is_some_and(|state| *state == RunState::Done);
+        let terminal_user_command_visible =
+            !is_current && prior_state.is_some_and(RunState::is_terminal);
+        if !ordinary_visible && !terminal_user_command_visible {
             continue;
         }
         if envelope.render.prompt == PromptRender::Omit {
@@ -1062,6 +1162,54 @@ fn render_journal(
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
             continue;
         };
+        if let EventPayload::Item(ItemEvent::Delta {
+            item_id,
+            delta: ItemDelta::CommandOutput { stream, chunk_b64 },
+        }) = &payload
+            && user_command_origins.contains_key(item_id)
+        {
+            let bytes = BASE64.decode(chunk_b64).map_err(|error| {
+                corrupt(format!(
+                    "user command output for item {item_id} is not valid base64: {error}"
+                ))
+            })?;
+            user_command_outputs
+                .entry(item_id.clone())
+                .or_default()
+                .push(*stream, &bytes);
+            continue;
+        }
+        if !ordinary_visible {
+            if let EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item:
+                    TurnItem::CommandExecution {
+                        call_id,
+                        command,
+                        status,
+                        exit_code,
+                    },
+            }) = payload
+                && user_command_origins
+                    .get(&item_id)
+                    .is_some_and(|origin| origin.call_id == call_id)
+            {
+                let output = user_command_outputs.remove(&item_id).unwrap_or_default();
+                let (output_preview, output_truncated, output_lossy_utf8, output_bytes) =
+                    output.finish();
+                messages.push(Message::user_command(UserCommandRecord {
+                    call_id,
+                    command,
+                    status,
+                    exit_code,
+                    output_preview,
+                    output_bytes,
+                    output_truncated,
+                    output_lossy_utf8,
+                }));
+            }
+            continue;
+        }
         match payload {
             EventPayload::UserMessage {
                 text, attachments, ..
@@ -1086,6 +1234,29 @@ fn render_journal(
                     if continued_partial_items.contains(&item_id) =>
                 {
                     messages.push(Message::assistant(vec![Block::Text { text }]));
+                }
+                TurnItem::CommandExecution {
+                    call_id,
+                    command,
+                    status,
+                    exit_code,
+                } if user_command_origins
+                    .get(&item_id)
+                    .is_some_and(|origin| origin.call_id == call_id) =>
+                {
+                    let output = user_command_outputs.remove(&item_id).unwrap_or_default();
+                    let (output_preview, output_truncated, output_lossy_utf8, output_bytes) =
+                        output.finish();
+                    messages.push(Message::user_command(UserCommandRecord {
+                        call_id,
+                        command,
+                        status,
+                        exit_code,
+                        output_preview,
+                        output_bytes,
+                        output_truncated,
+                        output_lossy_utf8,
+                    }));
                 }
                 TurnItem::ToolCall {
                     call_id,

@@ -49,7 +49,7 @@ use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId,
     MenuId, NodeId, RunId, SessionId, WorkspaceRevision,
 };
-use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::item::{CommandExecutionOrigin, ItemEvent, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::retry::RunRetryEventPayload;
@@ -1067,6 +1067,8 @@ pub struct ShellExecAcceptCommand {
     pub request_json: String,
     pub session_id: SessionId,
     pub worker_generation: u64,
+    pub branch_id: Option<BranchId>,
+    pub agent_id: Option<AgentId>,
     pub run_id: RunId,
     pub item_id: ItemId,
     pub command: String,
@@ -5318,6 +5320,29 @@ impl Store {
             return Ok(ShellExecAcceptOutcome::IdempotentReplay { accepted });
         }
         require_typed_session(&transaction, &command.session_id)?;
+        if let Some(branch_id) = command.branch_id.as_ref()
+            && branch_descriptor(&transaction, &command.session_id, branch_id)?.is_none()
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("branch {branch_id} does not exist"),
+                false,
+            ));
+        }
+        let expected_agent = lookup_delegation_by_child_session(&transaction, &command.session_id)?
+            .map(|delegation| delegation.agent_id);
+        if command.agent_id != expected_agent {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                match expected_agent {
+                    Some(agent_id) => format!(
+                        "direct shell scope must use delegated agent {agent_id} for this child session"
+                    ),
+                    None => "direct shell scope must not name an agent for a root session".into(),
+                },
+                false,
+            ));
+        }
         if latest_run_states(&transaction, &command.session_id)?
             .values()
             .any(|(state, _, _)| !state.is_terminal())
@@ -5343,11 +5368,41 @@ impl Store {
             status: haider_protocol::item::ToolStatus::InProgress,
             exit_code: None,
         };
+        let origin = UserCommandOriginV1 {
+            origin: CommandExecutionOrigin::UserCommand,
+            command_item_id: command.item_id.clone(),
+            call_id: command.command_id.clone(),
+        }
+        .extension_item()
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize user-command origin: {error}"),
+                false,
+            )
+        })?;
+        let origin_item_id = ItemId::new(format!("user-command-origin-{}", command.item_id));
+        let mut origin_envelope = unstamped_command_envelope(
+            EventId::new(format!("user-command-origin-{}", command.item_event_id)),
+            &command.session_id,
+            command.branch_id.clone(),
+            Some(command.run_id.clone()),
+            command.device_id.clone(),
+            self.worker_generation,
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: origin_item_id,
+                item: origin,
+            }),
+            PromptRender::Omit,
+        )?;
+        // Provenance is durable prompt metadata, not a second transcript row.
+        origin_envelope.render.ui = false;
+        origin_envelope.agent_id = command.agent_id.clone();
         let mut envelopes = vec![
             unstamped_command_envelope(
                 command.running_event_id.clone(),
                 &command.session_id,
-                None,
+                command.branch_id.clone(),
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -5357,7 +5412,7 @@ impl Store {
             unstamped_command_envelope(
                 command.item_event_id.clone(),
                 &command.session_id,
-                None,
+                command.branch_id.clone(),
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -5367,10 +5422,11 @@ impl Store {
                 }),
                 PromptRender::Omit,
             )?,
+            origin_envelope,
             unstamped_command_envelope(
                 command.active_event_id.clone(),
                 &command.session_id,
-                None,
+                command.branch_id.clone(),
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -5378,6 +5434,9 @@ impl Store {
                 PromptRender::Omit,
             )?,
         ];
+        for envelope in &mut envelopes {
+            envelope.agent_id = command.agent_id.clone();
+        }
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let accepted = AcceptedShellExec {
             session_id: command.session_id.clone(),

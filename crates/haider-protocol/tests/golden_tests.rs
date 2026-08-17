@@ -817,6 +817,18 @@ fn golden_item_lifecycle() {
             },
         },
     );
+    let origin = UserCommandOriginV1 {
+        origin: CommandExecutionOrigin::UserCommand,
+        command_item_id: ItemId::new("it-user-command"),
+        call_id: "shell-command-1".into(),
+    };
+    additive_golden(
+        "item_completed_user_command_origin",
+        &ItemEvent::Completed {
+            item_id: ItemId::new("it-user-command-origin"),
+            item: origin.extension_item().expect("serialize origin marker"),
+        },
+    );
     // ADDITIVE (TUI3b): compaction items may carry the before/after token
     // footprint — optional fields, absent = old shape (fixtures above are
     // untouched; this is a NEW fixture).

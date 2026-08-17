@@ -1981,18 +1981,36 @@ fn same_directory_identity(left: &DirectoryIdentity, right: &DirectoryIdentity) 
 
 #[cfg(unix)]
 pub(crate) fn shell_command(script: &str) -> Command {
-    let mut command = Command::new("/bin/sh");
+    let executable = unix_shell_executable(is_executable_file(Path::new("/bin/zsh")));
+    let mut command = Command::new(executable);
     command.arg("-c").arg(script);
     command
 }
 
+#[cfg(unix)]
+fn unix_shell_executable(zsh_available: bool) -> &'static str {
+    if zsh_available { "/bin/zsh" } else { "/bin/sh" }
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 #[cfg(windows)]
 pub(crate) fn shell_command(script: &str) -> Command {
-    use std::os::windows::process::CommandExt as _;
-
-    let mut command = Command::new(haider_platform::windows_command_interpreter());
-    command.args(["/D", "/S", "/C"]);
-    command.as_std_mut().raw_arg(format!("\"{script}\""));
+    let mut command = Command::new(haider_platform::windows_powershell());
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]);
     command
 }
 
@@ -2012,4 +2030,55 @@ pub(crate) fn process_arguments(
         "cwd": cwd,
         "env_allowlist": env_allowlist,
     }))
+}
+
+#[cfg(test)]
+mod shell_command_tests {
+    use super::shell_command;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_command_prefers_zsh_with_sh_fallback_and_preserves_script_bytes() {
+        let script = "printf ' exact bytes é\n'";
+        let command = shell_command(script);
+        let command = command.as_std();
+        let expected = super::unix_shell_executable(super::is_executable_file(
+            std::path::Path::new("/bin/zsh"),
+        ));
+        assert_eq!(command.get_program(), expected);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(script)]
+        );
+        assert_eq!(super::unix_shell_executable(true), "/bin/zsh");
+        assert_eq!(super::unix_shell_executable(false), "/bin/sh");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_command_is_absolute_system32_powershell_and_preserves_script_bytes() {
+        let script = "[Console]::Out.Write(' exact bytes ')";
+        let command = shell_command(script);
+        let command = command.as_std();
+        let program = std::path::Path::new(command.get_program());
+        assert!(program.is_absolute());
+        assert!(
+            program
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(r"\system32\windowspowershell\v1.0\powershell.exe")
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                std::ffi::OsStr::new("-NoLogo"),
+                std::ffi::OsStr::new("-NoProfile"),
+                std::ffi::OsStr::new("-NonInteractive"),
+                std::ffi::OsStr::new("-ExecutionPolicy"),
+                std::ffi::OsStr::new("Bypass"),
+                std::ffi::OsStr::new("-Command"),
+                std::ffi::OsStr::new(script),
+            ]
+        );
+    }
 }

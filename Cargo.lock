@@ -1242,6 +1242,7 @@ name = "haider-core"
 version = "0.0.922"
 dependencies = [
  "async-trait",
+ "base64",
  "blake3",
  "haider-protocol",
  "haider-provider",

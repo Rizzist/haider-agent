@@ -70,7 +70,7 @@ use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EffectId, EventId, GraphId, ItemId, MenuId, NodeId, RunId,
     SessionId,
 };
-use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, effect_recovery_menu};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{
@@ -847,8 +847,16 @@ enum SupervisorCommand {
 pub(crate) struct PendingShellExec {
     pub(crate) accepted: AcceptedShellExec,
     pub(crate) command_id: String,
+    pub(crate) branch_id: Option<BranchId>,
+    pub(crate) agent_id: Option<AgentId>,
     pub(crate) command: String,
     pub(crate) cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableUserCommandScope {
+    branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
 }
 
 /// Owns a shell handoff that raced a durably-terminal provider turn's
@@ -1160,6 +1168,8 @@ impl WorkerManagerHandle {
         &self,
         accepted: AcceptedShellExec,
         command_id: String,
+        branch_id: Option<BranchId>,
+        agent_id: Option<AgentId>,
         command: String,
         cwd: Option<String>,
     ) -> Result<(), HaiderError> {
@@ -1169,6 +1179,8 @@ impl WorkerManagerHandle {
                 pending: Box::new(PendingShellExec {
                     accepted,
                     command_id,
+                    branch_id,
+                    agent_id,
                     command,
                     cwd,
                 }),
@@ -1663,18 +1675,32 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
         for ((run_id, state, _, branch_id, _), effect_scan) in
             candidates.into_iter().zip(effect_scans)
         {
+            let user_command_scope = durable_user_command_scope(&lease, run_id).await?;
             // P3-4 (park, don't cancel): request-input, permission, and local
             // child checkpoints were excluded from this sweep above.
             if *state != RunState::Cancelling {
-                append_run_state(
-                    &lease,
-                    &device_id,
-                    run_id,
-                    branch_id.as_ref(),
-                    &event_ids,
-                    RunState::Cancelling,
-                )
-                .await?;
+                if let Some(scope) = user_command_scope.as_ref() {
+                    append_shell_payloads(
+                        &lease,
+                        &device_id,
+                        run_id,
+                        scope.branch_id.as_ref(),
+                        scope.agent_id.as_ref(),
+                        &event_ids,
+                        vec![EventPayload::RunState(RunState::Cancelling)],
+                    )
+                    .await?;
+                } else {
+                    append_run_state(
+                        &lease,
+                        &device_id,
+                        run_id,
+                        branch_id.as_ref(),
+                        &event_ids,
+                        RunState::Cancelling,
+                    )
+                    .await?;
+                }
             }
             let _ = append_unknown_effect_scan(
                 &lease,
@@ -1688,15 +1714,28 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             .await?;
             let mut payloads = cancelled_resumption_payloads(&lease, &session_id, run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-            append_payloads(
-                &lease,
-                &device_id,
-                run_id,
-                branch_id.as_ref(),
-                &event_ids,
-                payloads,
-            )
-            .await?;
+            if let Some(scope) = user_command_scope {
+                append_shell_payloads(
+                    &lease,
+                    &device_id,
+                    run_id,
+                    scope.branch_id.as_ref(),
+                    scope.agent_id.as_ref(),
+                    &event_ids,
+                    payloads,
+                )
+                .await?;
+            } else {
+                append_payloads(
+                    &lease,
+                    &device_id,
+                    run_id,
+                    branch_id.as_ref(),
+                    &event_ids,
+                    payloads,
+                )
+                .await?;
+            }
             terminalized = true;
         }
         if terminalized {
@@ -1791,6 +1830,7 @@ pub(crate) async fn terminalize_supervisor_exit(
     let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
     let mut terminalized = false;
     for ((run_id, state, _, branch_id, _), effect_scan) in runs.iter().zip(effect_scans) {
+        let user_command_scope = durable_user_command_scope(&lease, run_id).await?;
         // Panic can strand a dispatched effect regardless of the run state.
         // Reconcile before either cancellation-shaped or failure-shaped
         // terminalization; a reconciliation error fences every terminal.
@@ -1812,15 +1852,28 @@ pub(crate) async fn terminalize_supervisor_exit(
         if *state == RunState::Cancelling {
             let mut payloads = cancelled_resumption_payloads(&lease, session_id, run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-            append_payloads(
-                &lease,
-                &device_id,
-                run_id,
-                branch_id.as_ref(),
-                &event_ids,
-                payloads,
-            )
-            .await?;
+            if let Some(scope) = user_command_scope {
+                append_shell_payloads(
+                    &lease,
+                    &device_id,
+                    run_id,
+                    scope.branch_id.as_ref(),
+                    scope.agent_id.as_ref(),
+                    &event_ids,
+                    payloads,
+                )
+                .await?;
+            } else {
+                append_payloads(
+                    &lease,
+                    &device_id,
+                    run_id,
+                    branch_id.as_ref(),
+                    &event_ids,
+                    payloads,
+                )
+                .await?;
+            }
             terminalized = true;
             continue;
         }
@@ -1831,15 +1884,28 @@ pub(crate) async fn terminalize_supervisor_exit(
         );
         let mut payloads = failed_resumption_payloads(&lease, session_id, run_id, &error).await?;
         payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-        append_payloads(
-            &lease,
-            &device_id,
-            run_id,
-            branch_id.as_ref(),
-            &event_ids,
-            payloads,
-        )
-        .await?;
+        if let Some(scope) = user_command_scope {
+            append_shell_payloads(
+                &lease,
+                &device_id,
+                run_id,
+                scope.branch_id.as_ref(),
+                scope.agent_id.as_ref(),
+                &event_ids,
+                payloads,
+            )
+            .await?;
+        } else {
+            append_payloads(
+                &lease,
+                &device_id,
+                run_id,
+                branch_id.as_ref(),
+                &event_ids,
+                payloads,
+            )
+            .await?;
+        }
         terminalized = true;
     }
     if terminalized {
@@ -2802,18 +2868,49 @@ async fn reconcile_durable_cancellations(
             }
             continue;
         }
-        if append_run_state(
-            store,
-            device_id,
-            &run_id,
-            branch_id.as_ref(),
-            event_ids,
-            RunState::Cancelled,
-        )
-        .await
-        .is_ok()
-        {
-            terminalized.push(run_id);
+        match durable_user_command_scope(store, &run_id).await {
+            Ok(Some(scope)) => {
+                let payloads = cancelled_resumption_payloads(store, store.session_id(), &run_id)
+                    .await
+                    .map(|mut payloads| {
+                        payloads
+                            .retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+                        payloads
+                    });
+                if let Ok(payloads) = payloads
+                    && append_shell_payloads(
+                        store,
+                        device_id,
+                        &run_id,
+                        scope.branch_id.as_ref(),
+                        scope.agent_id.as_ref(),
+                        event_ids,
+                        payloads,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    terminalized.push(run_id);
+                }
+            }
+            Ok(None) => {
+                if append_run_state(
+                    store,
+                    device_id,
+                    &run_id,
+                    branch_id.as_ref(),
+                    event_ids,
+                    RunState::Cancelled,
+                )
+                .await
+                .is_ok()
+                {
+                    terminalized.push(run_id);
+                }
+            }
+            Err(error) => {
+                tracing::error!(%run_id, ?error, "direct shell cancellation scope is corrupt");
+            }
         }
     }
     queue.retain(|pending| !terminalized.contains(&pending.accepted.run_id));
@@ -2923,6 +3020,95 @@ async fn durable_runs(
         .collect::<Vec<_>>();
     runs.sort_by_key(|(_, _, accepted, _, _)| accepted.unwrap_or(u64::MAX));
     Ok(runs)
+}
+
+/// Returns the daemon-minted prompt scope for a direct user command run.
+/// Model tool runs also use `RunningTool`, so only the hidden, item-linked
+/// origin marker may select shell-specific recovery shaping.
+async fn durable_user_command_scope(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+) -> Result<Option<DurableUserCommandScope>, HaiderError> {
+    let mut cursor = 0;
+    let mut marker = None::<(UserCommandOriginV1, Option<BranchId>, Option<AgentId>)>;
+    let mut command_items = HashMap::<ItemId, (String, Option<BranchId>, Option<AgentId>)>::new();
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let Ok(EventPayload::Item(item_event)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            match item_event {
+                ItemEvent::Started {
+                    item_id,
+                    item: TurnItem::CommandExecution { call_id, .. },
+                } => {
+                    let previous = command_items
+                        .insert(item_id, (call_id, envelope.branch_id, envelope.agent_id));
+                    if previous.is_some() {
+                        return Err(HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("run {run_id} starts the same command item twice"),
+                            false,
+                        ));
+                    }
+                }
+                ItemEvent::Completed { item, .. } => {
+                    let origin =
+                        UserCommandOriginV1::try_from_extension_item(&item).map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("run {run_id} has malformed user-command origin: {error}"),
+                                false,
+                            )
+                        })?;
+                    if let Some(origin) = origin
+                        && marker
+                            .replace((origin, envelope.branch_id, envelope.agent_id))
+                            .is_some()
+                    {
+                        return Err(HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("run {run_id} has duplicate user-command origins"),
+                            false,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some((origin, branch_id, agent_id)) = marker else {
+        return Ok(None);
+    };
+    let Some((call_id, item_branch_id, item_agent_id)) = command_items.get(&origin.command_item_id)
+    else {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("run {run_id} user-command origin points to a missing command item"),
+            false,
+        ));
+    };
+    if call_id != &origin.call_id || item_branch_id != &branch_id || item_agent_id != &agent_id {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("run {run_id} user-command origin does not match its command item"),
+            false,
+        ));
+    }
+    Ok(Some(DurableUserCommandScope {
+        branch_id,
+        agent_id,
+    }))
 }
 
 async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64>, HaiderError> {
@@ -3691,7 +3877,15 @@ async fn perform_shell_exec(
         return Ok(());
     }
     if state == Some(RunState::Cancelling) {
-        return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+        return cancel_shell_exec(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
+        )
+        .await;
     }
     if state != Some(RunState::RunningTool) {
         return Err(HaiderError::new(
@@ -3701,14 +3895,39 @@ async fn perform_shell_exec(
         ));
     }
     if *drain_wakes.borrow() {
-        begin_shell_cancellation(lease, device_id, &event_ids, &run_id).await?;
-        return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+        begin_shell_cancellation(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
+        )
+        .await?;
+        return cancel_shell_exec(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
+        )
+        .await;
     }
 
     let shell = match ShellSession::new(&metadata.cwd, Vec::new()) {
         Ok(shell) => shell,
         Err(error) => {
-            return fail_shell_exec(lease, device_id, &event_ids, &run_id, tool_error(error)).await;
+            return fail_shell_exec(
+                lease,
+                device_id,
+                &event_ids,
+                &run_id,
+                pending.branch_id.as_ref(),
+                pending.agent_id.as_ref(),
+                tool_error(error),
+            )
+            .await;
         }
     };
     let operation = match shell.prepare_user_process(
@@ -3718,13 +3937,22 @@ async fn perform_shell_exec(
     ) {
         Ok(operation) => operation,
         Err(error) => {
-            return fail_shell_exec(lease, device_id, &event_ids, &run_id, tool_error(error)).await;
+            return fail_shell_exec(
+                lease,
+                device_id,
+                &event_ids,
+                &run_id,
+                pending.branch_id.as_ref(),
+                pending.agent_id.as_ref(),
+                tool_error(error),
+            )
+            .await;
         }
     };
     let journal = HubJournalSink {
         store: lease.clone(),
         run_id: run_id.clone(),
-        branch_id: None,
+        branch_id: pending.branch_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     };
@@ -3736,12 +3964,22 @@ async fn perform_shell_exec(
     ) {
         Ok(broker) => broker,
         Err(error) => {
-            return fail_shell_exec(lease, device_id, &event_ids, &run_id, tool_error(error)).await;
+            return fail_shell_exec(
+                lease,
+                device_id,
+                &event_ids,
+                &run_id,
+                pending.branch_id.as_ref(),
+                pending.agent_id.as_ref(),
+                tool_error(error),
+            )
+            .await;
         }
     };
     let output_context = HubCommandOutputContext {
         store: lease.clone(),
-        branch_id: None,
+        branch_id: pending.branch_id.clone(),
+        agent_id: pending.agent_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     };
@@ -3749,6 +3987,7 @@ async fn perform_shell_exec(
         run_id.clone(),
         pending.accepted.item_id.clone(),
         pending.command_id,
+        PromptRender::Verbatim,
     );
     let execution = match broker
         .process_exec_user(
@@ -3765,7 +4004,16 @@ async fn perform_shell_exec(
         Err(error) => {
             let error = tool_error(error);
             let _ = broker.close().await;
-            return fail_shell_exec(lease, device_id, &event_ids, &run_id, error).await;
+            return fail_shell_exec(
+                lease,
+                device_id,
+                &event_ids,
+                &run_id,
+                pending.branch_id.as_ref(),
+                pending.agent_id.as_ref(),
+                error,
+            )
+            .await;
         }
     };
     // Wait stays owned by the supervisor task so forced supervisor teardown
@@ -3787,7 +4035,15 @@ async fn perform_shell_exec(
                 }
                 let draining = *drain_wakes.borrow_and_update();
                 if draining {
-                    begin_shell_cancellation(lease, device_id, &event_ids, &run_id).await?;
+                    begin_shell_cancellation(
+                        lease,
+                        device_id,
+                        &event_ids,
+                        &run_id,
+                        pending.branch_id.as_ref(),
+                        pending.agent_id.as_ref(),
+                    )
+                    .await?;
                     process_cancel.cancel();
                     let _ = wait.await;
                     if let Err(error) = broker.close().await {
@@ -3797,7 +4053,15 @@ async fn perform_shell_exec(
                             "direct shell broker close reported an error during daemon drain"
                         );
                     }
-                    return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+                    return cancel_shell_exec(
+                        lease,
+                        device_id,
+                        &event_ids,
+                        &run_id,
+                        pending.branch_id.as_ref(),
+                        pending.agent_id.as_ref(),
+                    )
+                    .await;
                 }
             }
             changed = cancellation_wakes.changed(), if cancellation_channel_open => {
@@ -3815,7 +4079,15 @@ async fn perform_shell_exec(
                             "direct shell broker close reported an error during cancellation"
                         );
                     }
-                    return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+                    return cancel_shell_exec(
+                        lease,
+                        device_id,
+                        &event_ids,
+                        &run_id,
+                        pending.branch_id.as_ref(),
+                        pending.agent_id.as_ref(),
+                    )
+                    .await;
                 }
             }
             result = &mut wait => {
@@ -3824,7 +4096,16 @@ async fn perform_shell_exec(
                     Err(error) => {
                         let error = tool_error(error);
                         let _ = broker.close().await;
-                        return fail_shell_exec(lease, device_id, &event_ids, &run_id, error).await;
+                        return fail_shell_exec(
+                            lease,
+                            device_id,
+                            &event_ids,
+                            &run_id,
+                            pending.branch_id.as_ref(),
+                            pending.agent_id.as_ref(),
+                            error,
+                        )
+                        .await;
                     }
                 };
             }
@@ -3836,6 +4117,8 @@ async fn perform_shell_exec(
             device_id,
             &event_ids,
             &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
             HaiderError::new(
                 ErrorCode::EffectUnknownOutcome,
                 format!("direct shell broker close reported unfinished work: {error}"),
@@ -3845,29 +4128,43 @@ async fn perform_shell_exec(
         .await;
     }
     if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
-        return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+        return cancel_shell_exec(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
+        )
+        .await;
     }
     output_context
         .record_process_signal(&run_id, &result)
         .await?;
-    let completed = append_payloads(
+    let completed = append_shell_completion(
         lease,
         device_id,
         &run_id,
-        None,
         &event_ids,
-        vec![
-            EventPayload::Item(ItemEvent::Completed {
-                item_id: pending.accepted.item_id,
-                item: result.completed_item(pending.command),
-            }),
-            EventPayload::RunState(RunState::Done),
-        ],
+        pending.branch_id.as_ref(),
+        pending.agent_id.as_ref(),
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: pending.accepted.item_id,
+            item: result.completed_item(pending.command),
+        }),
     )
     .await;
     if let Err(error) = completed {
         if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
-            return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+            return cancel_shell_exec(
+                lease,
+                device_id,
+                &event_ids,
+                &run_id,
+                pending.branch_id.as_ref(),
+                pending.agent_id.as_ref(),
+            )
+            .await;
         }
         return Err(error);
     }
@@ -3879,16 +4176,19 @@ async fn begin_shell_cancellation(
     device_id: &DeviceId,
     event_ids: &EventIdGenerator,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
 ) -> Result<(), HaiderError> {
     match durable_run_state(lease, run_id).await {
         Some(RunState::RunningTool) => {
-            append_run_state(
+            append_shell_payloads(
                 lease,
                 device_id,
                 run_id,
-                None,
+                branch_id,
+                agent_id,
                 event_ids,
-                RunState::Cancelling,
+                vec![EventPayload::RunState(RunState::Cancelling)],
             )
             .await
         }
@@ -3907,19 +4207,24 @@ async fn cancel_shell_exec(
     device_id: &DeviceId,
     event_ids: &EventIdGenerator,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
 ) -> Result<(), HaiderError> {
     let _ = reconcile_unknown_effects(
         lease,
         device_id,
         run_id,
-        None,
+        branch_id,
         event_ids,
         UnknownReconcile::EvidenceOnly,
     )
     .await?;
     let mut payloads = cancelled_resumption_payloads(lease, lease.session_id(), run_id).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-    append_payloads(lease, device_id, run_id, None, event_ids, payloads).await?;
+    append_shell_payloads(
+        lease, device_id, run_id, branch_id, agent_id, event_ids, payloads,
+    )
+    .await?;
     append_session_idle(lease, device_id, event_ids, true).await
 }
 
@@ -3928,16 +4233,18 @@ async fn fail_shell_exec(
     device_id: &DeviceId,
     event_ids: &EventIdGenerator,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
     error: HaiderError,
 ) -> Result<(), HaiderError> {
     if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
-        return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
+        return cancel_shell_exec(lease, device_id, event_ids, run_id, branch_id, agent_id).await;
     }
     let _ = reconcile_unknown_effects(
         lease,
         device_id,
         run_id,
-        None,
+        branch_id,
         event_ids,
         UnknownReconcile::EvidenceOnly,
     )
@@ -3945,11 +4252,14 @@ async fn fail_shell_exec(
     let mut payloads =
         failed_resumption_payloads(lease, lease.session_id(), run_id, &error).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-    if let Err(append_error) =
-        append_payloads(lease, device_id, run_id, None, event_ids, payloads).await
+    if let Err(append_error) = append_shell_payloads(
+        lease, device_id, run_id, branch_id, agent_id, event_ids, payloads,
+    )
+    .await
     {
         if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
-            return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
+            return cancel_shell_exec(lease, device_id, event_ids, run_id, branch_id, agent_id)
+                .await;
         }
         return Err(append_error);
     }
@@ -5044,6 +5354,72 @@ async fn append_payloads(
     Ok(())
 }
 
+/// Commits the terminal direct-command item as prompt-visible immediately
+/// before the ordinary omitted `Done` state. Output deltas use the same
+/// visibility, so the prompt compiler can reconstruct exactly one bounded
+/// user-command record without making model-initiated process output visible.
+async fn append_shell_completion(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    event_ids: &EventIdGenerator,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    completed: EventPayload,
+) -> Result<(), HaiderError> {
+    append_shell_payloads(
+        store,
+        device_id,
+        run_id,
+        branch_id,
+        agent_id,
+        event_ids,
+        vec![completed, EventPayload::RunState(RunState::Done)],
+    )
+    .await
+}
+
+/// Shell terminalization is the only recovery closure that exposes its
+/// completed command item to later prompts. Every other recovery payload
+/// remains omitted, so cancelled/failed model turns cannot leak partial tool
+/// history through this direct-user seam.
+async fn append_shell_payloads(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    event_ids: &EventIdGenerator,
+    payloads: Vec<EventPayload>,
+) -> Result<(), HaiderError> {
+    let mut envelopes = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let prompt = matches!(
+            payload,
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::CommandExecution { .. },
+                ..
+            })
+        )
+        .then_some(PromptRender::Verbatim);
+        let mut envelope = supervisor_envelope(
+            store,
+            device_id,
+            branch_id.cloned(),
+            Some(run_id.clone()),
+            event_ids.next(),
+            payload,
+        )?;
+        envelope.agent_id = agent_id.cloned();
+        if let Some(prompt) = prompt {
+            envelope.render.prompt = prompt;
+        }
+        envelopes.push(envelope);
+    }
+    StoreHandle::append(store, &mut envelopes).await?;
+    Ok(())
+}
+
 /// Journals the effective instruction semantics only when they change. A
 /// prior unchanged non-empty fact remains the proof for later turns; an empty
 /// fact is emitted when files disappear so recovery does not inherit stale
@@ -6021,6 +6397,7 @@ impl TurnToolFactory for BrokerToolFactory {
         let output = HubCommandOutputContext {
             store: context.store.clone(),
             branch_id: context.branch_id.clone(),
+            agent_id: context.agent_id.clone(),
             device_id: context.device_id.clone(),
             event_ids: Arc::clone(&context.event_ids),
         };
@@ -6671,9 +7048,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         operation = operation.with_cwd(cwd);
                     }
                     let cas = self.cas.lock().await.clone();
-                    let output =
-                        self.output
-                            .sink(run_id.clone(), item_id.clone(), call_id.to_owned());
+                    let output = self.output.sink(
+                        run_id.clone(),
+                        item_id.clone(),
+                        call_id.to_owned(),
+                        PromptRender::Omit,
+                    );
                     match broker
                         .process_exec(&operation, &policy, cas, output, ProcessBounds::default())
                         .await
@@ -7450,9 +7830,11 @@ fn request_input_definition() -> ToolDefinition {
 
 fn process_exec_definition() -> ToolDefinition {
     #[cfg(unix)]
-    let command_description = "Exact shell program passed to /bin/sh -c";
+    let command_description =
+        "Exact shell program passed to /bin/zsh -c when available, otherwise /bin/sh -c";
     #[cfg(windows)]
-    let command_description = "Exact shell program passed to cmd.exe /D /S /C";
+    let command_description =
+        "Exact PowerShell program passed to the absolute System32 Windows PowerShell";
     ToolDefinition {
         name: "process_exec".into(),
         description: "Run one non-interactive shell command inside the session workspace. \
@@ -7683,18 +8065,27 @@ impl CasSink for HubArtifactStore {
 struct HubCommandOutputContext {
     store: HubStoreHandle,
     branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
 }
 
 impl HubCommandOutputContext {
-    fn sink(&self, run_id: RunId, item_id: ItemId, call_id: String) -> HubCommandOutputSink {
+    fn sink(
+        &self,
+        run_id: RunId,
+        item_id: ItemId,
+        call_id: String,
+        prompt: PromptRender,
+    ) -> HubCommandOutputSink {
         HubCommandOutputSink {
             store: self.store.clone(),
             branch_id: self.branch_id.clone(),
+            agent_id: self.agent_id.clone(),
             run_id,
             item_id,
             call_id,
+            prompt,
             device_id: self.device_id.clone(),
             event_ids: Arc::clone(&self.event_ids),
         }
@@ -7749,9 +8140,11 @@ fn process_signal_from_result(run_id: &RunId, result: &ProcessResult) -> Process
 struct HubCommandOutputSink {
     store: HubStoreHandle,
     branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
     run_id: RunId,
     item_id: ItemId,
     call_id: String,
+    prompt: PromptRender,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
 }
@@ -7774,7 +8167,7 @@ impl CommandOutputSink for HubCommandOutputSink {
             session_id: self.store.session_id().clone(),
             branch_id: self.branch_id.clone(),
             run_id: Some(self.run_id.clone()),
-            agent_id: None,
+            agent_id: self.agent_id.clone(),
             device_id: self.device_id.clone(),
             authority_epoch: 0,
             worker_generation: self.store.worker_generation(),
@@ -7784,7 +8177,7 @@ impl CommandOutputSink for HubCommandOutputSink {
             render: RenderTargets {
                 ui: true,
                 durable: true,
-                prompt: PromptRender::Omit,
+                prompt: self.prompt,
             },
             payload: serde_json::to_value(EventPayload::Item(ItemEvent::Delta {
                 item_id: self.item_id.clone(),

@@ -136,6 +136,47 @@ fn the_tools_screen_renders_committed_snapshot_or_says_fetching() {
     assert_eq!(model.screen, Screen::Session);
 }
 
+/// MUTATION CHECK: render a live `!` draft with the ordinary `❯` sigil, or
+/// leak the `$` glyph into demo mode. Expected runtime failure: the sigil
+/// assertions below — command mode promises the exact `$` row the
+/// transcript will commit, and only where the escape actually runs.
+#[test]
+fn live_bang_draft_flips_the_sigil_to_the_command_glyph() {
+    let mut model = session_model();
+    model.mode = haider_tui::app::RuntimeMode::Live;
+    model.handle(key(KeyCode::Char('!')));
+    let (rows, _) = draw(&model, 118, 40);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("$ !") && row.contains("workspace shell · ⏎ run")),
+        "bare ! shows the $ sigil and says where it runs"
+    );
+    for c in "cargo test".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (rows, _) = draw(&model, 118, 40);
+    assert!(
+        rows.iter().any(|row| row.contains("$ !cargo test")),
+        "the command draft keeps the $ sigil"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("workspace shell · ⏎ run")),
+        "the hint yields once the command exists"
+    );
+    // Demo keeps the ordinary prompt — the escape only flashes there.
+    let mut demo = session_model();
+    for c in "!ls".chars() {
+        demo.handle(key(KeyCode::Char(c)));
+    }
+    let (rows, _) = draw(&demo, 118, 40);
+    assert!(
+        rows.iter().any(|row| row.contains("❯ !ls")),
+        "demo drafts keep ❯"
+    );
+}
+
 /// MUTATION CHECK: let demo mode route `!` to the live escape. Expected
 /// runtime failure: the flash assertion below (demo has no daemon; the
 /// six bare VFS commands remain its only shell).

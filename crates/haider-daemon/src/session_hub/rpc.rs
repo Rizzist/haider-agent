@@ -19,6 +19,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
+use haider_protocol::ids::AgentId;
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::MenuKind;
 use haider_protocol::state::RunState;
@@ -1946,6 +1947,48 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::ShellExecScoped {
+                command_id,
+                session_id,
+                worker_generation,
+                branch_id,
+                agent_id,
+                command,
+                cwd,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "direct shell execution requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.shell_exec(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    branch_id,
+                    agent_id,
+                    command,
+                    cwd,
+                )
+                .await
+            }
             RequestBody::ShellExec {
                 command_id,
                 session_id,
@@ -1979,6 +2022,8 @@ impl HubConnection {
                     command_id,
                     session_id,
                     worker_generation,
+                    None,
+                    None,
                     command,
                     cwd,
                 )
@@ -4900,6 +4945,8 @@ impl HubConnection {
         command_id: CommandId,
         session_id: SessionId,
         worker_generation: u64,
+        branch_id: Option<BranchId>,
+        agent_id: Option<AgentId>,
         command: String,
         cwd: Option<String>,
     ) -> Result<(), SessionHubError> {
@@ -4912,13 +4959,34 @@ impl HubConnection {
                 None,
             );
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
+        let mut request_coordinates = serde_json::json!({
             "session_id": &session_id,
             "worker_generation": worker_generation,
             "command": &command,
             "cwd": &cwd,
-        }))
-        .map_err(|error| {
+        });
+        let Some(request_coordinates) = request_coordinates.as_object_mut() else {
+            return Err(SessionHubError::Task(
+                "cannot construct shell-exec coordinates".into(),
+            ));
+        };
+        if let Some(branch_id) = branch_id.as_ref() {
+            request_coordinates.insert(
+                "branch_id".into(),
+                serde_json::to_value(branch_id).map_err(|error| {
+                    SessionHubError::Task(format!("cannot encode shell branch: {error}"))
+                })?,
+            );
+        }
+        if let Some(agent_id) = agent_id.as_ref() {
+            request_coordinates.insert(
+                "agent_id".into(),
+                serde_json::to_value(agent_id).map_err(|error| {
+                    SessionHubError::Task(format!("cannot encode shell agent: {error}"))
+                })?,
+            );
+        }
+        let request_json = serde_json::to_string(&request_coordinates).map_err(|error| {
             SessionHubError::Task(format!("cannot encode shell-exec coordinates: {error}"))
         })?;
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
@@ -4932,7 +5000,14 @@ impl HubConnection {
                     && let Err(error) = self
                         .hub
                         .worker_manager()?
-                        .shell_exec(accepted.clone(), command_id.0.clone(), command, cwd)
+                        .shell_exec(
+                            accepted.clone(),
+                            command_id.0.clone(),
+                            branch_id.clone(),
+                            agent_id.clone(),
+                            command,
+                            cwd,
+                        )
                         .await
                 {
                     return self.respond_shell_error(request_id, error);
@@ -4978,6 +5053,8 @@ impl HubConnection {
                 request_json,
                 session_id: session_id.clone(),
                 worker_generation,
+                branch_id: branch_id.clone(),
+                agent_id: agent_id.clone(),
                 run_id: RunId::new(random_id("shell-run")?),
                 item_id: haider_protocol::ids::ItemId::new(random_id("shell-item")?),
                 command: command.clone(),
@@ -4998,7 +5075,14 @@ impl HubConnection {
         if let Err(error) = self
             .hub
             .worker_manager()?
-            .shell_exec(accepted.clone(), command_id.0, command, cwd)
+            .shell_exec(
+                accepted.clone(),
+                command_id.0,
+                branch_id,
+                agent_id,
+                command,
+                cwd,
+            )
             .await
         {
             return self.respond_shell_error(request_id, error);
@@ -5307,6 +5391,7 @@ impl HubConnection {
             request_id,
             body: ResponseBody::ShellExec {
                 session_id: accepted.session_id,
+                run_id: Some(accepted.run_id),
                 item_id: accepted.item_id,
                 accepted_seq: accepted.accepted_seq,
                 worker_generation: accepted.worker_generation,

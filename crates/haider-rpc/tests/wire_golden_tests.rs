@@ -665,6 +665,72 @@ fn turn_submit_and_cancel_ignore_unknown_additive_fields() {
     assert!(matches!(body, RequestBody::TurnCancel { .. }));
 }
 
+#[test]
+fn shell_exec_run_id_is_additive_in_both_decode_directions() {
+    let old_request: RequestBody = serde_json::from_str(
+        r#"{
+            "method":"shell.exec",
+            "command_id":"shell-command-1",
+            "session_id":"session-1",
+            "worker_generation":7,
+            "command":"printf ok"
+        }"#,
+    )
+    .expect("pre-scope shell request decodes");
+    assert!(matches!(
+        old_request,
+        RequestBody::ShellExecScoped {
+            branch_id: None,
+            agent_id: None,
+            ..
+        }
+    ));
+
+    let old: ResponseBody = serde_json::from_str(
+        r#"{
+            "method":"shell.exec",
+            "session_id":"session-1",
+            "item_id":"shell-item-1",
+            "accepted_seq":51,
+            "worker_generation":7
+        }"#,
+    )
+    .expect("pre-run-id shell response decodes");
+    assert!(matches!(old, ResponseBody::ShellExec { run_id: None, .. }));
+
+    let current = ResponseBody::ShellExec {
+        session_id: haider_protocol::ids::SessionId::new("session-1"),
+        run_id: Some(haider_protocol::ids::RunId::new("shell-run-1")),
+        item_id: haider_protocol::ids::ItemId::new("shell-item-1"),
+        accepted_seq: 51,
+        worker_generation: 7,
+    };
+    #[derive(Deserialize)]
+    #[serde(tag = "method")]
+    enum LegacyResponse {
+        #[serde(rename = "shell.exec")]
+        ShellExec {
+            session_id: haider_protocol::ids::SessionId,
+            item_id: haider_protocol::ids::ItemId,
+            accepted_seq: u64,
+            worker_generation: u64,
+        },
+    }
+    let legacy: LegacyResponse =
+        serde_json::from_value(serde_json::to_value(current).expect("current shell response JSON"))
+            .expect("legacy client ignores additive run id");
+    let LegacyResponse::ShellExec {
+        session_id,
+        item_id,
+        accepted_seq,
+        worker_generation,
+    } = legacy;
+    assert_eq!(session_id.as_str(), "session-1");
+    assert_eq!(item_id.as_str(), "shell-item-1");
+    assert_eq!(accepted_seq, 51);
+    assert_eq!(worker_generation, 7);
+}
+
 /// MUTATION CHECK: serialize run-scoped trust as an ordinary turn (changing
 /// old receipt bytes) or drop the additive hooks RPC methods. Expected RUNTIME
 /// failure: one of these exact discriminants/coordinates changes.

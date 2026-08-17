@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
+use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{Block, FinishReason, PrefixDigests, StreamEvent};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -22,7 +23,7 @@ use crate::gemini::{
 use crate::origin::FixedDnsResolver;
 use crate::{
     GEMINI_PROVIDER_NAME, Message, PromptCacheMetadata, ProviderError, ProviderErrorKind,
-    ToolDefinition, TurnRequest,
+    ToolDefinition, TurnRequest, UserCommandRecord,
 };
 
 struct StubFixedResolver {
@@ -356,6 +357,32 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
             reuse_gap_ms: None,
         }),
     }
+}
+
+#[test]
+fn user_command_record_reaches_gemini_as_labeled_user_text() {
+    let mut request = gemini_cache_request("gemini-2.5-flash");
+    request.cache_metadata = None;
+    request.messages = vec![Message::user_command(UserCommandRecord {
+        call_id: "user-command-gemini".into(),
+        command: "printf gemini-user-command".into(),
+        status: ToolStatus::Completed,
+        exit_code: Some(0),
+        output_preview: "[stdout]\ngemini-user-command".into(),
+        output_bytes: 19,
+        output_truncated: false,
+        output_lossy_utf8: false,
+    })];
+
+    let payload = gemini_request_json(&request, None, false).expect("Gemini user-command payload");
+    assert_eq!(payload["contents"][0]["role"], "user");
+    let text = payload["contents"][0]["parts"][0]["text"]
+        .as_str()
+        .expect("Gemini text part");
+    assert!(text.contains("[user-initiated shell command]"));
+    assert!(text.contains("origin: user_command"));
+    assert!(text.contains("printf gemini-user-command"));
+    assert!(text.contains("gemini-user-command"));
 }
 
 /// CM2e — an eligible epoch creates once, reuses the returned resource name,

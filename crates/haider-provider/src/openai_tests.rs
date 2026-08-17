@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::{Message, PromptCacheMetadata, ToolDefinition};
+use crate::{Message, PromptCacheMetadata, ToolDefinition, UserCommandRecord};
 use haider_accounts::{MemoryVault, Vault};
+use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::PrefixDigests;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -927,6 +928,54 @@ fn probe_request(model: &str) -> TurnRequest {
         attachments: Vec::new(),
         cache_metadata: None,
     }
+}
+
+#[test]
+fn user_command_record_reaches_both_openai_wires_as_labeled_user_text() {
+    let mut request = probe_request("gpt-5.6-sol");
+    request.messages = vec![Message::user_command(UserCommandRecord {
+        call_id: "user-command-openai".into(),
+        command: "printf openai-user-command".into(),
+        status: ToolStatus::Completed,
+        exit_code: Some(0),
+        output_preview: "[stdout]\nopenai-user-command".into(),
+        output_bytes: 19,
+        output_truncated: false,
+        output_lossy_utf8: false,
+    })];
+
+    let responses = responses_request_json(&request, false, None, false)
+        .expect("OpenAI Responses user-command payload");
+    let responses_user = responses["input"]
+        .as_array()
+        .expect("Responses input")
+        .iter()
+        .find(|entry| entry["role"] == "user")
+        .expect("Responses user entry");
+    let responses_text = responses_user["content"][0]["text"]
+        .as_str()
+        .expect("Responses text block");
+    assert_user_command_wire_text(responses_text, "openai-user-command");
+
+    let chat = chat_request_json(&request, CompatibleDialect::Generic, None, None)
+        .expect("OpenAI-compatible user-command payload");
+    let chat_user = chat["messages"]
+        .as_array()
+        .expect("chat messages")
+        .iter()
+        .find(|entry| entry["role"] == "user")
+        .expect("chat user entry");
+    let chat_text = chat_user["content"][0]["text"]
+        .as_str()
+        .expect("chat text content");
+    assert_user_command_wire_text(chat_text, "openai-user-command");
+}
+
+fn assert_user_command_wire_text(text: &str, output: &str) {
+    assert!(text.contains("[user-initiated shell command]"));
+    assert!(text.contains("origin: user_command"));
+    assert!(text.contains("printf openai-user-command"));
+    assert!(text.contains(output));
 }
 
 fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetadata {

@@ -1,0 +1,13 @@
+{
+  "event": "completed",
+  "item_id": "it-user-command-origin",
+  "item": {
+    "item": "extension",
+    "kind": "user_command_origin_v1",
+    "data": {
+      "call_id": "shell-command-1",
+      "command_item_id": "it-user-command",
+      "origin": "user_command"
+    }
+  }
+}

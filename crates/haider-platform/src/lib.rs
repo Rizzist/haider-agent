@@ -34,8 +34,6 @@ pub use ipc::{
     PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner, split,
     write_immediate,
 };
-#[cfg(windows)]
-pub use process::windows_command_interpreter;
 pub use process::{
     ProcessGroup, ProcessId, ProcessSignal, configure_background_process,
     configure_process_environment, configure_process_group, exit_signal, kill_process_tree,
@@ -43,6 +41,8 @@ pub use process::{
     process_id, process_leader_exited, register_process_group, release_process_group,
     signal_process, signal_process_group, signal_process_group_id,
 };
+#[cfg(windows)]
+pub use process::{windows_command_interpreter, windows_powershell};
 pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdown_signal};
 pub use spawn::{DaemonSpawn, DaemonSpawnError, spawn_daemon};
 pub use system::local_device_name;

@@ -254,6 +254,9 @@ pub const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 /// Daemon implements receipt-backed direct user shell execution.
 pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
+/// Daemon commits direct shell provenance/output into later model context and
+/// returns an immediate synthetic-run cancellation coordinate.
+pub const FEATURE_USER_COMMAND_V1: &str = "user_command_v1";
 /// Daemon implements the canonical read-only tool inventory snapshot.
 pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 /// Daemon persists and applies typed per-session write/exec permission overrides.
@@ -1433,10 +1436,25 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "is_false")]
         confirm_new_epoch: bool,
     },
-    /// Executes exact user-supplied shell program bytes on the session daemon.
-    /// The command creates no user message and no provider request. `cwd`, when
-    /// present, is workspace-relative and applies only to this invocation.
+    /// Scope-capable decode form of `shell.exec`. `branch_id`/`agent_id` bind
+    /// the durable command record to the composer whose next turn consumes it.
     #[serde(rename = "shell.exec")]
+    ShellExecScoped {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<AgentId>,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Encode-only source-compatible unscoped direct shell request. Decoders
+    /// normalize old JSON into [`Self::ShellExecScoped`].
+    #[serde(rename = "shell.exec")]
+    #[serde(skip_deserializing)]
     ShellExec {
         command_id: CommandId,
         session_id: SessionId,
@@ -1872,6 +1890,11 @@ pub enum ResponseBody {
     #[serde(rename = "shell.exec")]
     ShellExec {
         session_id: SessionId,
+        /// Synthetic run owned by this direct command. Additive cancellation
+        /// coordinate: clients may pass it straight to `turn.cancel` without
+        /// racing event-stream discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<RunId>,
         item_id: ItemId,
         accepted_seq: u64,
         worker_generation: u64,

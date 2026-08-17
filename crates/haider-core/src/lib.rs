@@ -61,7 +61,7 @@ pub use haider_store::{
 };
 pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptHistoryCache, PromptHistoryCompiler,
-    task_event_notice,
+    USER_COMMAND_OUTPUT_PREVIEW_BYTES, task_event_notice,
 };
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};
 pub use sqlite_store::{ProfileStoreFault, SqliteStoreHandle};

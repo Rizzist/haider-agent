@@ -39,7 +39,11 @@ async fn background_exec_restores_windows_bootstrap_environment() {
     .expect("broker");
     let mut policy = PermissionPolicy::default();
     policy.allow(EffectClass::ProcessExec);
-    let command = "if defined SystemRoot (>background-bootstrap.txt echo ok) else exit /b 9";
+    let command = concat!(
+        "if ($env:SystemRoot) {",
+        "[IO.File]::WriteAllText('background-bootstrap.txt','ok')",
+        "} else {exit 9}"
+    );
     let operation = BackgroundExec::new(
         ProcessExec::new("windows-background-bootstrap", command),
         default_task_name(command),
@@ -111,7 +115,7 @@ async fn background_kill_sweeps_windows_descendants() {
     .expect("broker");
     let mut policy = PermissionPolicy::default();
     policy.allow(EffectClass::ProcessExec);
-    let command = format!("\"{}\"", parent.display());
+    let command = format!("& '{}'", parent.display());
     let operation = BackgroundExec::new(
         ProcessExec::new("windows-background-kill", &command),
         default_task_name(&command),

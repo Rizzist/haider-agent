@@ -50,8 +50,9 @@ use haider_rpc::{
     FEATURE_PROVIDER_REMOVE_V1, FEATURE_RUN_RETRY_V1, FEATURE_SESSION_FLEET_V1,
     FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError,
-    RequestId, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
+    FEATURE_TURN_CONTROL_V1, FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome, WireFrame, negotiate,
+    uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -1361,21 +1362,19 @@ fn negotiate_hello(
     } else {
         LifecyclePhase::Ready
     };
-    enqueue(
-        lane,
-        &WireFrame::Welcome(Welcome {
-            protocol: negotiated.protocol,
-            instance_id: context.instance_id.clone(),
-            daemon_generation: context.daemon_generation,
-            frame_limit,
-            profile_id: context.profile_id.clone(),
-            daemon_version: env!("CARGO_PKG_VERSION").into(),
-            lifecycle_phase,
-            capabilities_granted: negotiated.capabilities_granted.clone(),
-            features: welcome_features(),
-        }),
-        outbound_limit,
-    )?;
+    let welcome = Welcome {
+        protocol: negotiated.protocol,
+        instance_id: context.instance_id.clone(),
+        daemon_generation: context.daemon_generation,
+        frame_limit,
+        profile_id: context.profile_id.clone(),
+        daemon_version: env!("CARGO_PKG_VERSION").into(),
+        lifecycle_phase,
+        capabilities_granted: negotiated.capabilities_granted.clone(),
+        features: welcome_features(),
+    };
+    let bytes = encode_welcome_for_peer(welcome, outbound_limit)?;
+    lane.try_push(LaneKey::System, QueuedFrame::ordinary(bytes))?;
     // Retained, not discarded: the grant is what later frames are authorized
     // against (W3b2 reads it through `ConnectionGrant`).
     *grant = Some(ConnectionGrant {
@@ -1416,12 +1415,39 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
         FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
         FEATURE_SHELL_EXEC_V1.to_owned(),
+        FEATURE_USER_COMMAND_V1.to_owned(),
         FEATURE_TOOL_INVENTORY_V1.to_owned(),
         haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
         FEATURE_TURN_CONTROL_V1.to_owned(),
         haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
         FEATURE_VAULT_STAGE_V1.to_owned(),
     ])
+}
+
+/// Encodes the handshake without letting one additive feature make the whole
+/// pre-existing connection surface unavailable to a tightly bounded peer.
+///
+/// `user_command_v1` is the only feature added with the T4 shell semantics.
+/// If that one advertisement is exactly what crosses the peer's receive
+/// limit, omit it and retry the otherwise unchanged Welcome. The connection
+/// then conservatively reports those semantics unavailable, so a typed client
+/// rejects before sending a mutating `shell.exec`. Every other encode failure
+/// remains fatal, and ordinary peers receive the full feature set.
+fn encode_welcome_for_peer(
+    mut welcome: Welcome,
+    outbound_limit: usize,
+) -> Result<Zeroizing<Vec<u8>>, DaemonError> {
+    match uds_codec::encode_zeroizing(&WireFrame::Welcome(welcome.clone()), outbound_limit) {
+        Ok(bytes) => Ok(bytes),
+        Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+            if welcome.features.remove(FEATURE_USER_COMMAND_V1) =>
+        {
+            encode_outbound(&WireFrame::Welcome(welcome), outbound_limit)
+        }
+        Err(error) => Err(DaemonError::Protocol {
+            message: format!("outbound frame rejected by peer limit: {error}"),
+        }),
+    }
 }
 
 fn enqueue_fatal(

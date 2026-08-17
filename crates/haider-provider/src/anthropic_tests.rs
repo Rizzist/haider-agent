@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
+use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{Block, PrefixDigests, StreamEvent};
 use reqwest::header::AUTHORIZATION;
 use tokio::sync::mpsc;
@@ -21,7 +22,7 @@ use crate::anthropic::{
 use crate::origin::FixedDnsResolver;
 use crate::{
     AnthropicCacheTtl, Message, PromptCacheMetadata, Provider as _, ProviderError,
-    ProviderErrorKind, ToolDefinition, TurnRequest, select_anthropic_cache_ttl,
+    ProviderErrorKind, ToolDefinition, TurnRequest, UserCommandRecord, select_anthropic_cache_ttl,
 };
 
 struct HangingFixture {
@@ -273,6 +274,34 @@ fn payload_request(system_prompt: Option<&str>) -> TurnRequest {
         attachments: Vec::new(),
         cache_metadata: None,
     }
+}
+
+#[test]
+fn user_command_record_reaches_anthropic_as_labeled_user_text() {
+    let mut request = payload_request(None);
+    request.messages = vec![Message::user_command(UserCommandRecord {
+        call_id: "user-command-a".into(),
+        command: "printf anthropic-user-command".into(),
+        status: ToolStatus::Completed,
+        exit_code: Some(0),
+        output_preview: "[stdout]\nanthropic-user-command".into(),
+        output_bytes: 22,
+        output_truncated: true,
+        output_lossy_utf8: false,
+    })];
+
+    let payload = payload_provider(false)
+        .request_payload(&request)
+        .expect("Anthropic user-command payload");
+    assert_eq!(payload["messages"][0]["role"], "user");
+    let text = payload["messages"][0]["content"][0]["text"]
+        .as_str()
+        .expect("Anthropic text block");
+    assert!(text.contains("[user-initiated shell command]"));
+    assert!(text.contains("origin: user_command"));
+    assert!(text.contains("printf anthropic-user-command"));
+    assert!(text.contains("anthropic-user-command"));
+    assert!(text.contains("model-context output preview truncated"));
 }
 
 fn cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetadata {

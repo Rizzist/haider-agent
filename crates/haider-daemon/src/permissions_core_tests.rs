@@ -245,6 +245,8 @@ fn pending_shell(run_id: &str) -> PendingShellExec {
             worker_generation: 1,
         },
         command_id: format!("command-{run_id}"),
+        branch_id: None,
+        agent_id: None,
         command: "printf deferred".into(),
         cwd: None,
     }

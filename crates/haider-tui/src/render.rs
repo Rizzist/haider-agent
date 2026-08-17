@@ -7755,8 +7755,15 @@ fn composer_lines<'a>(
         lines.truncate(usize::from(allocated).max(1));
         return (lines, None, Vec::new());
     }
+    // W8b command mode: a draft opening with `!` IS the shell escape on a
+    // live session — the sigil flips to the `$` the transcript will render
+    // this row with, so the promise and the record share one glyph. Demo
+    // mode keeps `❯` (the escape only flashes a notice there).
+    let bang_mode = model.screen == Screen::Session
+        && !model.mode.fabricates_locally()
+        && model.composer.text().starts_with('!');
     let sigil = Span::styled(
-        "❯ ",
+        if bang_mode { "$ " } else { "❯ " },
         theme
             .gold_style()
             .add_modifier(ratatui::style::Modifier::BOLD),
@@ -7917,6 +7924,10 @@ fn composer_lines<'a>(
             if let Some(ghost) = model.ghost() {
                 spans.push(Span::styled(ghost, theme.dim_style()));
                 spans.push(Span::styled(" ⇥ tab", theme.faint_style()));
+            } else if bang_mode && text[1..].trim().is_empty() {
+                // Command mode, command still empty: say where it runs
+                // before the first keystroke commits the intent.
+                spans.push(Span::styled(" workspace shell · ⏎ run", theme.dim_style()));
             }
         }
         windows.push(ComposerRowWindow {

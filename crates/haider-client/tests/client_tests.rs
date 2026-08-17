@@ -15,11 +15,14 @@ use std::time::Duration;
 
 use haider_client::{
     ClientConfig, ConnectError, ConnectionState, DisconnectReason, EnsureError, EnsureOptions,
-    ProfileEnv, connect, ensure_daemon, resolve_profile,
+    ProfileEnv, ShellExecError, ShellExecRequest, connect, ensure_daemon, resolve_profile,
+    shell_exec,
 };
+use haider_protocol::ids::SessionId;
 use haider_rpc::{
-    Capability, CapabilitySet, DEFAULT_FRAME_LIMIT, LifecyclePhase, ProtocolError, RequestBody,
-    ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
+    Capability, CapabilitySet, CommandId, DEFAULT_FRAME_LIMIT, FEATURE_SHELL_EXEC_V1,
+    FEATURE_TURN_CONTROL_V1, LifecyclePhase, ProtocolError, RequestBody, ResponseBody,
+    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -160,6 +163,82 @@ fn list_body() -> RequestBody {
         cursor: None,
         limit: 1,
     }
+}
+
+/// MUTATION CHECK: move the user-command feature gate after `request()`.
+/// Expected runtime failure: the feature-deficient peer observes one
+/// mutating shell request even though the typed helper returns unavailable.
+#[tokio::test]
+async fn user_command_feature_failure_sends_zero_rpc_requests() {
+    let dir = short_dir();
+    let probe = dir.path().join("user-command-feature-probe.sock");
+    match std::os::unix::net::UnixListener::bind(&probe) {
+        Ok(listener) => {
+            drop(listener);
+            std::fs::remove_file(&probe).expect("remove socket capability probe");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("bind socket capability probe: {error}"),
+    }
+
+    let endpoint = dir.path().join("user-command-feature.sock");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed_requests = Arc::clone(&requests);
+    let _daemon = spawn_fake_daemon(
+        &endpoint,
+        accepted,
+        HelloReply::Welcome(welcome(
+            "profile-x",
+            BTreeSet::from([
+                FEATURE_SHELL_EXEC_V1.to_owned(),
+                FEATURE_TURN_CONTROL_V1.to_owned(),
+            ]),
+        )),
+        move |mut stream, mut decoder| {
+            let observed_requests = Arc::clone(&observed_requests);
+            async move {
+                loop {
+                    let frames = read_frames(&mut stream, &mut decoder).await;
+                    if frames.is_empty() {
+                        return;
+                    }
+                    for frame in frames {
+                        match frame {
+                            WireFrame::Ping { nonce } => {
+                                write_frame(&mut stream, &WireFrame::Pong { nonce }).await;
+                            }
+                            WireFrame::Request { .. } => {
+                                observed_requests.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        },
+    );
+    let connected = connect(&endpoint, ClientConfig::default())
+        .await
+        .expect("connect feature-deficient daemon");
+    let error = shell_exec(
+        &connected.client,
+        &ShellExecRequest {
+            command_id: CommandId::new("must-not-send"),
+            session_id: SessionId::new("session"),
+            worker_generation: 1,
+            branch_id: None,
+            agent_id: None,
+            command: "printf should-not-run".into(),
+            cwd: None,
+        },
+    )
+    .await
+    .expect_err("missing user-command semantics must reject before mutation");
+    assert!(matches!(error, ShellExecError::FeatureUnavailable { .. }));
+    tokio::task::yield_now().await;
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    connected.client.close();
 }
 
 #[tokio::test]

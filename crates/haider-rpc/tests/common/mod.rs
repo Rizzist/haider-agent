@@ -820,10 +820,12 @@ pub fn transcript() -> Vec<WireFrame> {
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-shell-exec"),
-            body: RequestBody::ShellExec {
+            body: RequestBody::ShellExecScoped {
                 command_id: CommandId::new("command-shell-1"),
                 session_id: SessionId::new("session-1"),
                 worker_generation: 7,
+                branch_id: None,
+                agent_id: None,
                 command: "printf 'exact bytes\\n'".into(),
                 cwd: Some("crates/haider-tools".into()),
             },
@@ -832,6 +834,7 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-shell-exec"),
             body: ResponseBody::ShellExec {
                 session_id: SessionId::new("session-1"),
+                run_id: Some(RunId::new("shell-run-1")),
                 item_id: ItemId::new("shell-item-1"),
                 accepted_seq: 51,
                 worker_generation: 7,

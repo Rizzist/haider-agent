@@ -289,6 +289,28 @@ pub fn windows_command_interpreter() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"))
 }
 
+/// Absolute inbox PowerShell used by the shared shell-execution engine.
+/// Resolving through `SystemRoot` happens before child `env_clear`; the fixed
+/// fallback preserves an absolute trusted-system coordinate when the
+/// inherited environment is incomplete.
+#[cfg(windows)]
+#[must_use]
+pub fn windows_powershell() -> std::path::PathBuf {
+    std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(std::path::PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_absolute() && path.is_file())
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        })
+}
+
 /// Adds the close-sweep required for a child that outlives its launcher.
 #[cfg(unix)]
 pub fn configure_background_process(command: &mut tokio::process::Command) {
