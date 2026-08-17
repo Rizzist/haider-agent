@@ -120,7 +120,10 @@ pub fn replace_file_with_backup(
 #[allow(unsafe_code)]
 fn replace_file_impl(source: &Path, target: &Path, backup: Option<&Path>) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
+    };
 
     let source = source
         .as_os_str()
@@ -151,7 +154,28 @@ fn replace_file_impl(source: &Path, target: &Path, backup: Option<&Path>) -> std
             std::ptr::null_mut(),
         )
     };
-    if replaced == 0 {
+    if replaced != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // `ReplaceFileW` demands an existing target, so first-time publishes
+    // (vault secrets, fresh registries) reach here with FILE/PATH_NOT_FOUND.
+    // `MoveFileExW` covers creation and, via REPLACE_EXISTING, the race
+    // where the target appears between the two calls.
+    if !matches!(
+        error.raw_os_error(),
+        Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32
+    ) {
+        return Err(error);
+    }
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
