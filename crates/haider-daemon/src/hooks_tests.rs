@@ -59,11 +59,15 @@ fn capture_stdin_command(path: &Path) -> String {
 #[cfg(windows)]
 fn capture_stdin_command(path: &Path) -> String {
     let path = powershell_literal(path);
-    powershell_command(&format!(concat!(
-        "$stdinStream=[Console]::OpenStandardInput();",
-        "$outputStream=[IO.File]::Create('{path}');",
-        "try {{$stdinStream.CopyTo($outputStream)}} finally {{$outputStream.Dispose()}}"
-    ),))
+    // Inline captures cannot see through concat! — explicit named arg.
+    powershell_command(&format!(
+        concat!(
+            "$stdinStream=[Console]::OpenStandardInput();",
+            "$outputStream=[IO.File]::Create('{path}');",
+            "try {{$stdinStream.CopyTo($outputStream)}} finally {{$outputStream.Dispose()}}"
+        ),
+        path = path,
+    ))
 }
 
 #[cfg(unix)]
@@ -115,13 +119,20 @@ fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
         format!("Start-Sleep -Seconds 1;[IO.File]::WriteAllText('{survived}','survived')");
     let child_encoded = encode_powershell(&child_script);
     let powershell = powershell_literal(&powershell_executable());
-    powershell_command(&format!(concat!(
-        "[IO.File]::WriteAllText('{ready}','ready');",
-        "$child=Start-Process -PassThru -WindowStyle Hidden ",
-        "-FilePath '{powershell}' -ArgumentList ",
-        "'-NoProfile','-NonInteractive','-EncodedCommand','{child_encoded}';",
-        "[Console]::In.ReadToEnd()"
-    ),))
+    // Inline format captures cannot see through a concat!-produced string
+    // (the format string must be a literal) — pass explicit named args.
+    powershell_command(&format!(
+        concat!(
+            "[IO.File]::WriteAllText('{ready}','ready');",
+            "$child=Start-Process -PassThru -WindowStyle Hidden ",
+            "-FilePath '{powershell}' -ArgumentList ",
+            "'-NoProfile','-NonInteractive','-EncodedCommand','{child_encoded}';",
+            "[Console]::In.ReadToEnd()"
+        ),
+        ready = ready,
+        powershell = powershell,
+        child_encoded = child_encoded,
+    ))
 }
 
 #[cfg(windows)]
