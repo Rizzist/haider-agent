@@ -1236,10 +1236,11 @@ fn shutdown_without_store(
 
 /// Best-effort description of whoever holds the profile lock. Read-only and
 /// advisory (R1): nothing here is probed for liveness or trusted for
-/// decisions — the lock itself already decided.
+/// decisions — the lock itself already decided. Diagnostics live beside the
+/// empty lock file so Windows' mandatory lock cannot block this read.
 fn incumbent_diagnostics(config: &DaemonConfig, endpoint_path: &Path) -> IncumbentDiagnostics {
-    let lock_path = config.store_dir.join("lock");
-    let lock_contents = fs::read_to_string(lock_path)
+    let owner_path = config.store_dir.join("lock.owner");
+    let lock_contents = fs::read_to_string(owner_path)
         .ok()
         .map(|contents| contents.chars().take(4_096).collect());
     IncumbentDiagnostics {

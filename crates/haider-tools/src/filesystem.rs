@@ -2404,7 +2404,10 @@ fn stage_windows_content(
             ".haider-write-{}-{sequence}.tmp",
             std::process::id()
         ));
+        // `.write(true)` satisfies std's create/truncate validity check; the
+        // explicit access_mode below still overrides the actual access bits.
         let mut file = match fs::OpenOptions::new()
+            .write(true)
             .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC)
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -3228,7 +3231,10 @@ fn copy_windows_entry_from_handle(
                 message: "copy source identity changed while opening".into(),
             });
         }
+        // `.write(true)` satisfies std's create/truncate validity check; the
+        // explicit access_mode below still overrides the actual access bits.
         let mut destination_file = fs::OpenOptions::new()
+            .write(true)
             .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
             .share_mode(FILE_SHARE_READ)
             .create_new(true)

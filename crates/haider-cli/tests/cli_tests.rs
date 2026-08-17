@@ -119,7 +119,7 @@ fn ensure_haiderd_present() {
 }
 
 fn daemon_pid(profile: &Path) -> Option<u32> {
-    std::fs::read_to_string(profile.join("lock"))
+    std::fs::read_to_string(profile.join("lock.owner"))
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("pid="))?
@@ -134,7 +134,7 @@ fn terminate_daemon_checked(profile: &Path) -> std::io::Result<()> {
             std::io::ErrorKind::NotFound,
             format!(
                 "daemon PID is missing from {}",
-                profile.join("lock").display()
+                profile.join("lock.owner").display()
             ),
         )
     })?;
@@ -470,7 +470,7 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
     // endpoint-gone/profile-lock-held interval, where it must exit 75. Prove
     // release of the actual singleton authority instead. Acquiring and
     // releasing this non-mutating probe does not open the store, rewrite the
-    // lock's diagnostic PID, or consume a worker generation.
+    // sibling owner diagnostics, or consume a worker generation.
     let lock = OpenOptions::new()
         .read(true)
         .write(true)

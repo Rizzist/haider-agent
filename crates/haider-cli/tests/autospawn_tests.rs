@@ -81,15 +81,15 @@ fn haider_command(store: &Path) -> Command {
     command
 }
 
-/// Kills the profile's daemon (via the advisory pid in the lock file) when
-/// the test ends, so failed assertions cannot leak daemons.
+/// Kills the profile's daemon (via the advisory pid in the readable owner
+/// diagnostics) when the test ends, so failed assertions cannot leak daemons.
 struct DaemonGuard {
     store: PathBuf,
 }
 
 impl DaemonGuard {
     fn pid(&self) -> Option<u32> {
-        let contents = std::fs::read_to_string(self.store.join("lock")).ok()?;
+        let contents = std::fs::read_to_string(self.store.join("lock.owner")).ok()?;
         contents
             .lines()
             .find_map(|line| line.strip_prefix("pid="))

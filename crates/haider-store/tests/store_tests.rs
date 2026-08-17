@@ -278,17 +278,35 @@ fn malformed_and_traversal_artifact_refs_are_rejected() {
 #[test]
 fn profile_lock_is_exclusive_and_released_on_drop() {
     let root = test_root();
+    must(std::fs::write(
+        root.path().join("lock"),
+        b"pid=1\ncreated_at_ms=1\n",
+    ));
     let first = must(Store::open(root.path()));
+    let owner = must(std::fs::read_to_string(root.path().join("lock.owner")));
+    assert!(owner.contains(&format!("pid={}", std::process::id())));
+    assert!(owner.lines().any(|line| line.starts_with("created_at_ms=")));
 
     let Err(error) = Store::open(root.path()) else {
         panic!("second profile opener unexpectedly acquired the lock");
     };
     assert_eq!(error.code, ErrorCode::StoreLocked);
     assert!(error.retryable);
+    assert_eq!(
+        must(std::fs::read_to_string(root.path().join("lock.owner"))),
+        owner,
+        "the losing opener must not replace incumbent diagnostics"
+    );
     drop(first);
+    assert!(!root.path().join("lock.owner").exists());
+    assert_eq!(must(std::fs::read(root.path().join("lock"))), b"");
 
     let reopened = must(Store::open(root.path()));
     assert_eq!(reopened.root(), root.path());
+    assert!(root.path().join("lock.owner").is_file());
+    drop(reopened);
+    assert_eq!(must(std::fs::read(root.path().join("lock"))), b"");
+    assert!(!root.path().join("lock.owner").exists());
 }
 
 #[test]

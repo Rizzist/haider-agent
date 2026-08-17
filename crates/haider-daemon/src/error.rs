@@ -11,7 +11,7 @@ pub struct IncumbentDiagnostics {
     pub profile_id: String,
     /// Where the incumbent's endpoint would live; not probed, not verified.
     pub endpoint_path: PathBuf,
-    /// Truncated contents of the store's lock file, if readable.
+    /// Truncated contents of the store's owner-diagnostics file, if readable.
     pub lock_contents: Option<String>,
 }
 

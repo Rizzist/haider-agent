@@ -229,7 +229,7 @@ async fn responses_correlate_by_request_id_even_out_of_order() {
 }
 
 /// MUTATION CHECK: capture peer credentials after `UnixStream::into_split`
-/// or substitute the profile lock's diagnostic PID. Expected RUNTIME
+/// or substitute the profile owner diagnostic PID. Expected RUNTIME
 /// failure: the retained kernel PID/UID no longer identify this fake server
 /// process exactly.
 #[tokio::test]

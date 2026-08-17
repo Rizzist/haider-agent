@@ -192,8 +192,8 @@ pub struct Connected {
     /// Kernel-authenticated credentials for the process serving this UDS.
     ///
     /// Update uses these credentials while retaining this connection: the
-    /// PID comes from the socket peer, never the profile lock's diagnostic
-    /// text. Platforms supported by Haider expose a PID; keeping it optional
+    /// PID comes from the socket peer, never the profile owner diagnostics.
+    /// Platforms supported by Haider expose a PID; keeping it optional
     /// makes an unavailable credential a typed update refusal rather than a
     /// regression for ordinary RPC clients.
     pub peer_credentials: PeerCredentials,

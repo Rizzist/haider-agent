@@ -456,11 +456,12 @@ async fn stale_pid_reuse_is_diagnostic_only_and_does_not_block_start() {
     let config = test_config(&root, "stale-pid");
     fs::create_dir_all(&config.store_dir).expect("store root");
     fs::write(
-        config.store_dir.join("lock"),
+        config.store_dir.join("lock.owner"),
         format!("pid={}\ncreated_at_ms=1\n", std::process::id()),
     )
     .expect("stale diagnostics");
 
+    let store_dir = config.store_dir.clone();
     let task = spawn(config);
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
     task.shutdown_handle().request("test complete");
@@ -468,6 +469,11 @@ async fn stale_pid_reuse_is_diagnostic_only_and_does_not_block_start() {
         task.join().await.expect("daemon joins"),
         ShutdownOutcome::Graceful
     );
+    assert_eq!(
+        fs::read(store_dir.join("lock")).expect("read released pure lock file"),
+        b""
+    );
+    assert!(!store_dir.join("lock.owner").exists());
 }
 
 #[tokio::test]
@@ -476,6 +482,11 @@ async fn already_running_error_carries_incumbent_diagnostics() {
     let config = test_config(&root, "diagnostics");
     let incumbent = spawn(config.clone());
     wait_for_state(incumbent.readiness(), |state| *state == DaemonState::Ready).await;
+    assert!(
+        fs::read_to_string(config.store_dir.join("lock.owner"))
+            .expect("read owner diagnostics")
+            .contains("pid=")
+    );
 
     let loser = spawn(config);
     match loser.join().await {
@@ -495,6 +506,11 @@ async fn already_running_error_carries_incumbent_diagnostics() {
         incumbent.join().await.expect("incumbent joins"),
         ShutdownOutcome::Graceful
     );
+    assert_eq!(
+        fs::read(root.path().join("store/lock")).expect("read released pure lock file"),
+        b""
+    );
+    assert!(!root.path().join("store/lock.owner").exists());
 }
 
 #[tokio::test]
