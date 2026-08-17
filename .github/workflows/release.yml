@@ -24,6 +24,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +38,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: tag matches workspace version (tag builds only)
         if: github.event_name == 'push'
+        shell: bash
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
@@ -47,10 +50,12 @@ jobs:
           codesign --force -s - target/${{ matrix.target }}/release/haider
           codesign --force -s - target/${{ matrix.target }}/release/haiderd
       - name: smoke (binary runs + self-test; strict version match on tag builds)
+        shell: bash
         run: |
-          BIN=target/${{ matrix.target }}/release/haider
+          EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
+          BIN=target/${{ matrix.target }}/release/haider$EXE
           "$BIN" self-test | grep '"ok":true'
-          file "$BIN"
+          if [ "$RUNNER_OS" != "Windows" ]; then file "$BIN"; fi
           if [ "${{ github.event_name }}" = "push" ]; then
             TAG="${GITHUB_REF_NAME#v}"
             test "$("$BIN" --version)" = "haider $TAG"
@@ -58,9 +63,11 @@ jobs:
             "$BIN" --version
           fi
       - name: package
+        shell: bash
         run: |
-          BIN=target/${{ matrix.target }}/release/haider
-          DBIN=target/${{ matrix.target }}/release/haiderd
+          EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
+          BIN=target/${{ matrix.target }}/release/haider$EXE
+          DBIN=target/${{ matrix.target }}/release/haiderd$EXE
           REF="${GITHUB_REF_NAME:-manual}"
           NAME=haider-${REF}-${{ matrix.target }}
           mkdir -p dist/$NAME
@@ -68,12 +75,21 @@ jobs:
           # current_exe() (haider-client/src/spawn.rs) — a bundle without the
           # daemon cannot enter live mode (v0.0.12 first-cut gap).
           cp "$BIN" "$DBIN" dist/$NAME/
-          tar -C dist -cJf dist/$NAME.tar.xz $NAME
-          shasum -a 256 dist/$NAME.tar.xz > dist/$NAME.tar.xz.sha256
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Zip is the native Windows archive expectation; Explorer opens it
+            # without extra tooling and sha256sum ships with Git Bash.
+            (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
+            (cd dist && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
+          else
+            tar -C dist -cJf dist/$NAME.tar.xz $NAME
+            shasum -a 256 dist/$NAME.tar.xz > dist/$NAME.tar.xz.sha256
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/*.tar.*
+          path: |
+            dist/*.tar.*
+            dist/*.zip*
 
   publish:
     needs: build
@@ -89,7 +105,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTES="Cross-platform scaffold-train release (macOS aarch64/x86_64, Linux x86_64/arm64). Unsigned binaries — verify the sha256. macOS: allow via System Settings → Privacy & Security → Open Anyway. Linux: chmod +x."
+          NOTES="Cross-platform release (macOS aarch64/x86_64, Linux x86_64/arm64, Windows x86_64). Unsigned binaries — verify the sha256. macOS: allow via System Settings → Privacy & Security → Open Anyway. Linux: chmod +x. Windows: unzip and allow via SmartScreen → More info → Run anyway."
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
