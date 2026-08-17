@@ -1671,8 +1671,7 @@ fn read_path_at(
             "fs_read limit must be one or greater",
         ));
     }
-    let (_parent, target, mut entry) =
-        windows_anchored_entry(&workspace_dir, relative, display_path)?;
+    let (_parent, target, entry) = windows_anchored_entry(&workspace_dir, relative, display_path)?;
     let metadata = entry
         .handle
         .metadata()
@@ -2398,6 +2397,7 @@ fn stage_windows_content(
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const MAX_NAME_RETRIES: usize = 16;
+    static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
     for _ in 0..MAX_NAME_RETRIES {
         let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
@@ -3078,6 +3078,7 @@ fn create_windows_path_staging(
     display_path: &Path,
 ) -> ToolResult<WindowsPathStaging> {
     const MAX_NAME_RETRIES: usize = 16;
+    static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
     for _ in 0..MAX_NAME_RETRIES {
         let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
         let path = parent.path().join(format!(
