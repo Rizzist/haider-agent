@@ -47,10 +47,11 @@ fn golden(name: &str, actual: &str) {
         std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
         std::fs::write(&path, actual).expect("write fixture");
     }
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read observe fixture"),
-        actual
-    );
+    let expected = std::fs::read_to_string(&path).expect("read observe fixture");
+    #[cfg(windows)]
+    assert_eq!(expected.replace("\r\n", "\n"), actual.replace("\r\n", "\n"));
+    #[cfg(not(windows))]
+    assert_eq!(expected, actual);
 }
 
 fn digest(
@@ -378,9 +379,14 @@ fn observe_parsers_and_stream_help_are_explicit() {
 /// creates daemon state or exits with a code other than literal 69.
 #[test]
 fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
+    #[cfg(unix)]
+    let temporary_base = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let temporary_base =
+        std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary base");
     let root = tempfile::Builder::new()
         .prefix("hobs-cli")
-        .tempdir_in("/tmp")
+        .tempdir_in(temporary_base)
         .expect("short temp profile");
     let profile_dir = root.path().join("profile");
     for command in [

@@ -11,6 +11,8 @@ use haider_tools::{
 #[cfg(windows)]
 use haider_tools::{FsPath, FsPathOperation};
 use std::fs;
+#[cfg(windows)]
+use std::io::Read as _;
 use std::path::Path;
 
 // Each JournalSink double here is a distinct value moved exactly once into one
@@ -648,6 +650,68 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     assert_eq!(fs::read_to_string(&path).expect("read file"), "before");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
     assert_eq!(broker.journal_snapshot().len(), 2);
+}
+
+/// Windows byte-range locks are mandatory even between handles in one process.
+/// Publication must release every staged/validation handle before the broker
+/// reports success, while subsequent mutations must re-read through the handle
+/// that owns the source lock.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_published_mutations_are_readable_while_broker_is_alive() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::FsWrite);
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+    let ledger = haider_tools::ChangeLedger::new();
+    let attribution = haider_tools::TurnAttribution::new(
+        haider_protocol::ids::SessionId::new("session"),
+        haider_protocol::ids::RunId::new("turn"),
+    );
+    let target = directory.path().join("published.txt");
+
+    broker
+        .fs_write(
+            &FsWrite::new("published.txt", "before"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("publish Windows write");
+    let mut independent = fs::File::open(&target).expect("independently open published write");
+    let mut contents = String::new();
+    independent
+        .read_to_string(&mut contents)
+        .expect("independently read published write");
+    assert_eq!(contents, "before");
+    drop(independent);
+
+    broker
+        .fs_edit(
+            &FsEdit::new("published.txt", "before", "after"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("publish Windows edit through locked-source revalidation");
+    let mut independent = fs::File::open(&target).expect("independently open published edit");
+    contents.clear();
+    independent
+        .read_to_string(&mut contents)
+        .expect("independently read published edit");
+    assert_eq!(contents, "after");
+
+    assert_eq!(
+        ledger
+            .changes_for(&attribution.session, &attribution.turn)
+            .expect("published mutations are ledgered")
+            .writes
+            .len(),
+        2
+    );
+    assert_eq!(broker.journal_snapshot().len(), 8);
 }
 
 /// Windows owns a distinct path-based atomic replacement backend. Keep one

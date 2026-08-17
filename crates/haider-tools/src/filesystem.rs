@@ -2097,8 +2097,8 @@ fn apply_windows_write(
         &target,
         &operation.path,
         existing
-            .as_ref()
-            .map(|source| (source.identity, source.hash)),
+            .as_mut()
+            .map(|source| (&mut source._file, source.identity, source.hash)),
     ) {
         Ok(revalidated) => revalidated,
         Err(error) => {
@@ -2207,7 +2207,7 @@ fn apply_windows_edit(
         &parent,
         &target,
         &operation.path,
-        Some((source.identity, source_hash)),
+        Some((&mut source_file, source.identity, source_hash)),
     ) {
         Ok(revalidated) => revalidated,
         Err(error) => {
@@ -2571,7 +2571,11 @@ fn revalidate_windows_mutation(
     expected_parent: &OwnedFd,
     target: &Path,
     display_path: &Path,
-    expected_source: Option<(haider_platform::WindowsFileIdentity, blake3::Hash)>,
+    expected_source: Option<(
+        &mut fs::File,
+        haider_platform::WindowsFileIdentity,
+        blake3::Hash,
+    )>,
 ) -> ToolResult<Option<fs::File>> {
     let (parent, current_target) =
         windows_mutation_target(workspace_root, relative, display_path, false)?;
@@ -2588,10 +2592,20 @@ fn revalidate_windows_mutation(
         });
     }
     match expected_source {
-        Some((expected_identity, expected_hash)) => {
-            let mut current = open_windows_current(target, display_path)?;
-            let snapshot = windows_stable_snapshot(&mut current, display_path)?;
-            if snapshot.identity != expected_identity
+        Some((locked_source, expected_identity, expected_hash)) => {
+            let current = open_windows_current(target, display_path)?;
+            let current_identity =
+                haider_platform::windows_file_identity(&current).map_err(|error| {
+                    ToolError::io("identify current mutation target", display_path, error)
+                })?;
+            // LockFileEx byte-range locks are mandatory on Windows. Reading
+            // `current` here would conflict with our own exclusive lock even
+            // though both handles belong to this process. Re-read through the
+            // handle that owns the lock, and use the independently opened
+            // handle only to prove that the anchored path still names it.
+            let snapshot = windows_stable_snapshot(locked_source, display_path)?;
+            if current_identity != expected_identity
+                || snapshot.identity != expected_identity
                 || blake3::hash(&snapshot.bytes) != expected_hash
             {
                 return Err(ToolError::PathChanged {
@@ -2632,6 +2646,10 @@ fn publish_windows_temporary(
         let _ = delete_windows_entry(temporary.file, display_path);
         return Err(ToolError::io("publish staged file", display_path, error));
     }
+    // Close the handle that now names the published file before reporting the
+    // mutation complete. This keeps subsequent independent opens independent
+    // of both validation and publication handle lifetimes.
+    drop(temporary.file);
     Ok(())
 }
 
