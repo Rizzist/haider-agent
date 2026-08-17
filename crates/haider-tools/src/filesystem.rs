@@ -1674,9 +1674,11 @@ fn read_path_at(
             display_path,
         )?;
         let digest = format!("blake3:{}", blake3::hash(contents.as_bytes()).to_hex());
-        let contents = offset.map_or(contents.clone(), |offset| {
-            select_numbered_lines(&contents, offset, limit)
-        });
+        let contents = if offset.is_some() || limit.is_some() {
+            select_numbered_lines(&contents, offset.unwrap_or(1), limit)
+        } else {
+            contents
+        };
         Ok(ReadPathOutput {
             contents,
             digest: Some(digest),
@@ -1724,11 +1726,12 @@ fn search_files_at(
     let root = windows_anchored_path(&workspace_dir, relative, &operation.root)?;
     let mut matches = SearchCollector::new(max_preview_bytes)?;
     windows_walk_files(&root, &mut |path| {
-        let relative = path.strip_prefix(&root).unwrap_or(path);
+        let path_under_root = path.strip_prefix(&root).unwrap_or(path);
+        let match_path = windows_relative_path(path_under_root)?;
         if operation
             .glob
             .as_deref()
-            .is_some_and(|glob| !glob_matches(glob, &relative.to_string_lossy().replace('\\', "/")))
+            .is_some_and(|glob| !glob_matches(glob, &match_path))
         {
             return Ok(());
         }
@@ -1738,7 +1741,8 @@ fn search_files_at(
         };
         for (index, line) in contents.lines().enumerate() {
             if search_line_matches(line, operation) {
-                matches.push(format!("{}:{}:{}", path.display(), index + 1, line))?;
+                let display_path = windows_relative_path(&relative.join(path_under_root))?;
+                matches.push(format!("{display_path}:{}:{line}", index + 1))?;
             }
         }
         Ok(())
@@ -1760,10 +1764,10 @@ fn glob_files_at(
     let root = windows_anchored_path(&workspace_dir, relative, &operation.root)?;
     let mut matches = GlobCollector::new();
     windows_walk_files(&root, &mut |path| {
-        let relative = path.strip_prefix(&root).unwrap_or(path);
-        let candidate = relative.to_string_lossy().replace('\\', "/");
+        let path_under_root = path.strip_prefix(&root).unwrap_or(path);
+        let candidate = windows_relative_path(path_under_root)?;
         if glob_matches(&operation.pattern, &candidate) {
-            matches.push(path.display().to_string());
+            matches.push(windows_relative_path(&relative.join(path_under_root))?);
         }
         Ok(())
     })?;
@@ -1814,6 +1818,11 @@ fn windows_walk_files(
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_relative_path(path: &Path) -> ToolResult<String> {
+    Ok(path_argument(path)?.replace('\\', "/"))
 }
 
 #[cfg(windows)]

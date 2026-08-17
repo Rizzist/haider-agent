@@ -6,6 +6,8 @@ use super::{
     next_subscriber_backoff, prepare_hook_input, run_command,
 };
 use crate::session_hub::{SessionHub, SessionHubConfig};
+#[cfg(windows)]
+use base64::Engine as _;
 use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -36,7 +38,7 @@ fn emit_command(value: &str) -> String {
 
 #[cfg(windows)]
 fn emit_command(value: &str) -> String {
-    format!("echo|set /p=\"{value}\"")
+    format!("echo {value}")
 }
 
 #[cfg(unix)]
@@ -46,7 +48,7 @@ fn write_command(value: &str, path: &Path) -> String {
 
 #[cfg(windows)]
 fn write_command(value: &str, path: &Path) -> String {
-    format!("(echo|set /p=\"{value}\")>\"{}\"", path.display())
+    format!(">\"{}\" echo {value}", path.display())
 }
 
 #[cfg(unix)]
@@ -56,7 +58,12 @@ fn capture_stdin_command(path: &Path) -> String {
 
 #[cfg(windows)]
 fn capture_stdin_command(path: &Path) -> String {
-    format!("more > \"{}\"", path.display())
+    let path = powershell_literal(path);
+    powershell_command(&format!(concat!(
+        "$stdinStream=[Console]::OpenStandardInput();",
+        "$outputStream=[IO.File]::Create('{path}');",
+        "try {{$stdinStream.CopyTo($outputStream)}} finally {{$outputStream.Dispose()}}"
+    ),))
 }
 
 #[cfg(unix)]
@@ -66,7 +73,10 @@ fn delayed_emit_command(value: &str) -> String {
 
 #[cfg(windows)]
 fn delayed_emit_command(value: &str) -> String {
-    format!("ping -n 3 127.0.0.1 >nul & echo|set /p=\"{value}\"")
+    let value = value.replace('\'', "''");
+    powershell_command(&format!(
+        "Start-Sleep -Seconds 1;[Console]::Out.Write('{value}')"
+    ))
 }
 
 #[cfg(unix)]
@@ -76,12 +86,10 @@ fn bounded_output_command() -> String {
 
 #[cfg(windows)]
 fn bounded_output_command() -> String {
-    concat!(
-        "powershell.exe -NoProfile -NonInteractive -Command ",
-        "\"$b=[Text.Encoding]::ASCII.GetBytes(('x'+[char]10)*300000);",
-        "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)\""
-    )
-    .into()
+    powershell_command(concat!(
+        "$b=[Text.Encoding]::ASCII.GetBytes(('x'+[char]10)*300000);",
+        "$s=[Console]::OpenStandardOutput();$s.Write($b,0,$b.Length)"
+    ))
 }
 
 #[cfg(unix)]
@@ -101,15 +109,58 @@ fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
 
 #[cfg(windows)]
 fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
-    let survived = survived.display().to_string().replace('\'', "''");
+    let ready = powershell_literal(ready);
+    let survived = powershell_literal(survived);
+    let child_script =
+        format!("Start-Sleep -Seconds 1;[IO.File]::WriteAllText('{survived}','survived')");
+    let child_encoded = encode_powershell(&child_script);
+    let powershell = powershell_literal(&powershell_executable());
+    powershell_command(&format!(concat!(
+        "[IO.File]::WriteAllText('{ready}','ready');",
+        "$child=Start-Process -PassThru -WindowStyle Hidden ",
+        "-FilePath '{powershell}' -ArgumentList ",
+        "'-NoProfile','-NonInteractive','-EncodedCommand','{child_encoded}';",
+        "[Console]::In.ReadToEnd()"
+    ),))
+}
+
+#[cfg(windows)]
+fn powershell_executable() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| {
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        })
+}
+
+#[cfg(windows)]
+fn powershell_literal(path: &Path) -> String {
+    path.display().to_string().replace('\'', "''")
+}
+
+#[cfg(windows)]
+fn encode_powershell(script: &str) -> String {
+    let utf16 = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
+#[cfg(windows)]
+fn powershell_command(script: &str) -> String {
     format!(
-        concat!(
-            "(echo|set /p=\"ready\")>\"{}\" & ",
-            "start \"\" /B powershell.exe -NoProfile -NonInteractive -Command ",
-            "\"Start-Sleep -Seconds 1;[IO.File]::WriteAllText('{}','survived')\" & more >nul"
-        ),
-        ready.display(),
-        survived
+        "\"{}\" -NoProfile -NonInteractive -EncodedCommand {}",
+        powershell_executable().display(),
+        encode_powershell(script)
     )
 }
 

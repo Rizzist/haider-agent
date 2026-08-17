@@ -27,10 +27,9 @@ const CANCELLABLE_SHELL_COMMAND: &str = "printf started; sleep 30";
 #[cfg(unix)]
 const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"printf started; sleep 30"}"#;
 #[cfg(windows)]
-const CANCELLABLE_SHELL_COMMAND: &str = "echo|set /p=\"started\" & ping -n 31 127.0.0.1 >nul";
+const CANCELLABLE_SHELL_COMMAND: &str = "echo started & set /p wait=";
 #[cfg(windows)]
-const CANCELLABLE_SHELL_REQUEST_JSON: &str =
-    r#"{"command":"echo|set /p=\"started\" & ping -n 31 127.0.0.1 >nul"}"#;
+const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"echo started & set /p wait="}"#;
 
 fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {

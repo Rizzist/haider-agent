@@ -2423,17 +2423,25 @@ fn hook_command(script: &str) -> tokio::process::Command {
 
 #[cfg(windows)]
 fn hook_command(script: &str) -> tokio::process::Command {
+    use std::os::windows::process::CommandExt as _;
+
     // CreateProcess does not resolve a bare executable against the child
     // environment installed below. Pin the interpreter before `env_clear`,
     // using the system directory rather than relying on a runner's PATH.
-    let interpreter = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("WINDIR"))
+    let interpreter = std::env::var_os("COMSPEC")
         .map(PathBuf::from)
-        .map(|root| root.join("System32").join("cmd.exe"))
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+        .filter(|path| path.is_absolute() && path.is_file())
+        .or_else(|| {
+            std::env::var_os("SystemRoot")
+                .or_else(|| std::env::var_os("WINDIR"))
+                .map(PathBuf::from)
+                .map(|root| root.join("System32").join("cmd.exe"))
+                .filter(|path| path.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
     let mut command = tokio::process::Command::new(interpreter);
-    command.args(["/D", "/S", "/C"]).arg(script);
+    command.args(["/D", "/S", "/C"]);
+    command.as_std_mut().raw_arg(format!("\"{script}\""));
     command
 }
 

@@ -6688,6 +6688,22 @@ struct ValidatedWorkspace {
     descriptor: std::fs::File,
 }
 
+#[cfg(unix)]
+fn open_workspace_descriptor(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(windows)]
+fn open_workspace_descriptor(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
 async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
     if !std::path::Path::new(&cwd).is_absolute() {
         return Err("session cwd must be an absolute path".into());
@@ -6704,7 +6720,7 @@ async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
         if !metadata.is_dir() {
             return Err("session cwd must identify a directory".into());
         }
-        let descriptor = std::fs::File::open(&canonical)
+        let descriptor = open_workspace_descriptor(&canonical)
             .map_err(|error| format!("cannot open session cwd: {error}"))?;
         Ok(ValidatedWorkspace {
             canonical: canonical_text,
@@ -6719,6 +6735,29 @@ async fn validate_workspace(cwd: String) -> Result<ValidatedWorkspace, String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod error_wave3_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_workspace_validation_keeps_an_open_directory_handle() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let requested = workspace.path().display().to_string();
+        let validated = validate_workspace(requested)
+            .await
+            .expect("directory workspace validates");
+        assert_eq!(
+            validated.canonical,
+            std::fs::canonicalize(workspace.path())
+                .expect("canonical workspace")
+                .to_str()
+                .expect("UTF-8 workspace")
+        );
+        assert!(
+            validated
+                .descriptor
+                .metadata()
+                .expect("open directory metadata")
+                .is_dir()
+        );
+    }
 
     #[tokio::test]
     async fn e6a_probe_reexecutes_the_filesystem_check() {

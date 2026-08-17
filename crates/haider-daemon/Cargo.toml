@@ -45,7 +45,7 @@ security-framework = "3.7"
 rustix.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem"] }
 
 [lints]
 workspace = true

@@ -1561,3 +1561,26 @@ async fn directory_read_and_search_are_sorted_bounded_read_effects() {
     );
     assert!(cas.writes.is_empty());
 }
+
+#[tokio::test]
+async fn file_read_limit_without_offset_starts_at_the_first_numbered_line() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("lines.txt");
+    fs::write(&path, "one\ntwo\nthree\n").expect("seed lines");
+    let policy = allow(EffectClass::FsRead);
+    let mut cas = RecordingCas::default();
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+
+    let result = broker
+        .fs_read(
+            &FsRead::new(path).with_line_range(None, Some(2)),
+            &policy,
+            &mut cas,
+            ResultBounds::default(),
+        )
+        .await
+        .expect("limit-only read");
+
+    assert_eq!(result.preview, "1: one\n2: two\n");
+    assert!(cas.writes.is_empty());
+}

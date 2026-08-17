@@ -338,7 +338,24 @@ pub fn kill_process_tree(pid: u32, force: bool) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt as _;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-    let mut command = std::process::Command::new("taskkill.exe");
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "SystemRoot is unavailable while resolving taskkill.exe",
+            )
+        })?;
+    let taskkill = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("taskkill.exe");
+    if !taskkill.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("taskkill.exe is unavailable at {}", taskkill.display()),
+        ));
+    }
+    let mut command = std::process::Command::new(taskkill);
     command.arg("/PID").arg(pid.to_string()).arg("/T");
     if force {
         command.arg("/F");
