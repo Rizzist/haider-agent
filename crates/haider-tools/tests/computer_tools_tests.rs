@@ -59,10 +59,11 @@ fn computer_manifest_matches_additive_golden_and_parameter_schemas_are_live() {
         [EffectClass::ScreenObserve, EffectClass::ScreenControl]
     );
     let serialized = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
-    assert_eq!(
-        serialized,
-        include_str!("fixtures/computer_manifest.json").trim_end()
-    );
+    // `include_str!` embeds the fixture with its on-disk line endings; a
+    // Windows autocrlf checkout gives it CRLF while serde emits LF. Compare
+    // on normalized endings so the golden is content, not whitespace.
+    let golden = include_str!("fixtures/computer_manifest.json").replace("\r\n", "\n");
+    assert_eq!(serialized, golden.trim_end());
     let schema_text = manifest.input_schema.to_string();
     for unsupported in [
         "oneOf",

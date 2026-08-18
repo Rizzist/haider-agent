@@ -1,0 +1,6 @@
+# Golden/fixture files are byte-exact records compared against LF-emitting
+# serializers (serde_json, etc.). Force LF on checkout everywhere so a
+# Windows autocrlf clone never rewrites them to CRLF and breaks a golden.
+*.json text eol=lf
+crates/**/tests/fixtures/** text eol=lf
+crates/**/tests/goldens/** text eol=lf
