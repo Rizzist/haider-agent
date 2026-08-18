@@ -313,6 +313,9 @@ pub const FEATURE_CONVERGENCE_GRAPH_V3: &str = "convergence_graph_v3";
 /// Daemon implements M2d todo run-sets, independently reduced child graphs,
 /// aggregate telemetry, and receipted `graph.run_set.open`.
 pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
+/// Daemon implements the Loom registry: agent types + pipe-source workflows
+/// (`loom.list`, `loom.register_agent_type`, `loom.register_workflow`).
+pub const FEATURE_LOOM_V1: &str = "loom_v1";
 
 /// One todo child returned by `graph.run_set.open`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1241,6 +1244,20 @@ pub enum RequestBody {
     },
     #[serde(rename = "graph.status")]
     GraphStatus { session_id: SessionId },
+    /// B1 — read the Loom registry (agent types + compiled workflows).
+    #[serde(rename = "loom.list")]
+    LoomList {},
+    /// B1 — register/revise one agent type. The registry owns revs: identical
+    /// content no-ops, changed content advances by one.
+    #[serde(rename = "loom.register_agent_type")]
+    LoomRegisterAgentType {
+        record: haider_protocol::loom::LoomAgentType,
+    },
+    /// B1 — register/revise one workflow FROM PIPE SOURCE; the daemon
+    /// compiles it against the current agent-type registry and rejects a bad
+    /// pipe with the full error list.
+    #[serde(rename = "loom.register_workflow")]
+    LoomRegisterWorkflow { source: String },
     #[serde(rename = "graph.inspect")]
     GraphInspect {
         session_id: SessionId,
@@ -1745,6 +1762,19 @@ pub enum ResponseBody {
     GraphStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ConvergenceGraphStatus>,
+    },
+    /// B1 — the Loom registry contents.
+    #[serde(rename = "loom.list")]
+    LoomList {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agent_types: Vec<haider_protocol::loom::LoomAgentType>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+    },
+    /// B1 — a committed (or no-op) registration.
+    #[serde(rename = "loom.registered")]
+    LoomRegistered {
+        registration: haider_protocol::loom::LoomRegistration,
     },
     #[serde(rename = "graph.inspect")]
     GraphInspect {

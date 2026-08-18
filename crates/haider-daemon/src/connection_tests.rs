@@ -100,6 +100,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V3.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
+            haider_rpc::FEATURE_LOOM_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),

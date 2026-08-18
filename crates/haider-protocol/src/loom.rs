@@ -58,7 +58,8 @@ pub struct LoomAgentType {
 }
 
 impl LoomAgentType {
-    /// Stable content digest over the identity-bearing fields.
+    /// Stable CONTENT digest — the registry's rev counter is deliberately
+    /// excluded, so re-registering identical content is detectable as a no-op.
     #[must_use]
     pub fn digest(&self) -> String {
         let mut hasher = blake3::Hasher::new();
@@ -79,7 +80,6 @@ impl LoomAgentType {
             }
             hasher.update(b"\x1f");
         }
-        hasher.update(&self.rev.to_le_bytes());
         hasher.finalize().to_hex()[..16].to_string()
     }
 
@@ -175,6 +175,16 @@ pub struct LoomWorkflow {
     pub meta: Vec<LoomNodeMeta>,
     pub rev: u32,
     pub digest: String,
+}
+
+/// Registry outcome for one register call (agent type or workflow).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRegistration {
+    pub id: String,
+    pub rev: u32,
+    pub digest: String,
+    /// False when the call was an idempotent same-content no-op.
+    pub updated: bool,
 }
 
 /// Parse pipe source into an AST. Total: never panics, never throws — every
@@ -566,7 +576,6 @@ fn workflow_digest(workflow: &LoomWorkflow) -> String {
         hasher.update(meta.out_type.as_deref().unwrap_or("").as_bytes());
         hasher.update(b"\x1f");
     }
-    hasher.update(&workflow.rev.to_le_bytes());
     hasher.finalize().to_hex()[..16].to_string()
 }
 
@@ -767,9 +776,11 @@ publish              "you approve the cut"               :human
             glyph: "✦".into(),
             rev: 1,
         };
+        // The registry rev is a counter, NOT content identity: same content
+        // at a bumped rev keeps its digest (that is the no-op detection law).
         let mut bumped = base.clone();
         bumped.rev = 2;
-        assert_ne!(base.digest(), bumped.digest());
+        assert_eq!(base.digest(), bumped.digest());
         let mut regranted = base.clone();
         regranted.apis.push("elevenlabs".into());
         assert_ne!(base.digest(), regranted.digest());

@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 13;
 
 struct Migration {
     version: u32,
@@ -272,6 +272,27 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE command_receipts_v12 RENAME TO command_receipts;
             ALTER TABLE account_alias_reservations_v12
                 RENAME TO account_alias_reservations;
+        ",
+    },
+    Migration {
+        version: 13,
+        sql: "
+            CREATE TABLE loom_agent_types (
+                id             TEXT PRIMARY KEY,
+                rev            INTEGER NOT NULL CHECK (rev > 0),
+                digest         TEXT NOT NULL,
+                record_json    TEXT NOT NULL,
+                created_at_ms  INTEGER NOT NULL,
+                updated_at_ms  INTEGER NOT NULL
+            );
+            CREATE TABLE loom_workflows (
+                id             TEXT PRIMARY KEY,
+                rev            INTEGER NOT NULL CHECK (rev > 0),
+                digest         TEXT NOT NULL,
+                record_json    TEXT NOT NULL,
+                created_at_ms  INTEGER NOT NULL,
+                updated_at_ms  INTEGER NOT NULL
+            );
         ",
     },
 ];

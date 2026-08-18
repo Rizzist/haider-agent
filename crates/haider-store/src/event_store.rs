@@ -53,6 +53,9 @@ use haider_protocol::ids::{
     MenuId, NodeId, RunId, SessionId, WorkspaceRevision,
 };
 use haider_protocol::item::{CommandExecutionOrigin, ItemEvent, TurnItem, UserCommandOriginV1};
+use haider_protocol::loom::{
+    LoomAgentType, LoomRegistration, LoomWorkflow, compile_pipe, parse_pipe,
+};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
@@ -1429,6 +1432,247 @@ impl Store {
             "management_revision",
             "management revision",
         )
+    }
+
+    /// B1 — every registered Loom agent type, ordered by id.
+    pub fn loom_agent_types(&self) -> StoreResult<Vec<LoomAgentType>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT record_json FROM loom_agent_types ORDER BY id")
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let json = row.map_err(map_sqlite_error)?;
+            records.push(
+                serde_json::from_str(&json)
+                    .map_err(|_| corrupt("loom agent type record is not decodable"))?,
+            );
+        }
+        Ok(records)
+    }
+
+    /// B1 — every registered Loom workflow (compiled records), ordered by id.
+    pub fn loom_workflows(&self) -> StoreResult<Vec<LoomWorkflow>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT record_json FROM loom_workflows ORDER BY id")
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let json = row.map_err(map_sqlite_error)?;
+            records.push(
+                serde_json::from_str(&json)
+                    .map_err(|_| corrupt("loom workflow record is not decodable"))?,
+            );
+        }
+        Ok(records)
+    }
+
+    /// B1 — register (or revise) one agent type. The registry rev law:
+    /// a NEW id lands at rev 1 regardless of the caller's counter; identical
+    /// CONTENT (digest) is an idempotent no-op; changed content advances the
+    /// rev by exactly one. Callers never pick revs — the registry does.
+    pub fn loom_register_agent_type(
+        &self,
+        record: &LoomAgentType,
+    ) -> StoreResult<LoomRegistration> {
+        validate_agent_type(record)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let existing = transaction
+            .query_row(
+                "SELECT rev, digest FROM loom_agent_types WHERE id = ?1",
+                [record.id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let digest = record.digest();
+        let now = now_ms()?;
+        let outcome = match existing {
+            Some((rev, ref current)) if *current == digest => LoomRegistration {
+                id: record.id.clone(),
+                rev: u32::try_from(rev)
+                    .map_err(|_| corrupt("loom agent type rev is out of range"))?,
+                digest,
+                updated: false,
+            },
+            Some((rev, _)) => {
+                let next = u32::try_from(rev)
+                    .ok()
+                    .and_then(|rev| rev.checked_add(1))
+                    .ok_or_else(|| corrupt("loom agent type rev is out of range"))?;
+                let mut stored = record.clone();
+                stored.rev = next;
+                let json = serde_json::to_string(&stored)
+                    .map_err(|_| corrupt("loom agent type record is not encodable"))?;
+                transaction
+                    .execute(
+                        "UPDATE loom_agent_types
+                         SET rev = ?2, digest = ?3, record_json = ?4, updated_at_ms = ?5
+                         WHERE id = ?1",
+                        params![
+                            record.id.as_str(),
+                            i64::from(next),
+                            digest.as_str(),
+                            json.as_str(),
+                            to_sqlite_integer(now)?
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+                LoomRegistration {
+                    id: record.id.clone(),
+                    rev: next,
+                    digest,
+                    updated: true,
+                }
+            }
+            None => {
+                let mut stored = record.clone();
+                stored.rev = 1;
+                let json = serde_json::to_string(&stored)
+                    .map_err(|_| corrupt("loom agent type record is not encodable"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO loom_agent_types(
+                             id, rev, digest, record_json, created_at_ms, updated_at_ms)
+                         VALUES (?1, 1, ?2, ?3, ?4, ?4)",
+                        params![
+                            record.id.as_str(),
+                            digest.as_str(),
+                            json.as_str(),
+                            to_sqlite_integer(now)?
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+                LoomRegistration {
+                    id: record.id.clone(),
+                    rev: 1,
+                    digest,
+                    updated: true,
+                }
+            }
+        };
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(outcome)
+    }
+
+    /// B1 — register (or revise) one workflow FROM PIPE SOURCE. The store is
+    /// the compiler authority: callers send source, the registry compiles it
+    /// against the CURRENT agent-type table inside this transaction, and a
+    /// rejected pipe never leaves a half-written record. Rev law as above.
+    pub fn loom_register_workflow(&self, source: &str) -> StoreResult<LoomRegistration> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        // Resolve @agent-type references against the registry AS OF this
+        // transaction.
+        let mut signatures = std::collections::HashMap::new();
+        {
+            let mut statement = transaction
+                .prepare("SELECT record_json FROM loom_agent_types")
+                .map_err(map_sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            for row in rows {
+                let json = row.map_err(map_sqlite_error)?;
+                let record: LoomAgentType = serde_json::from_str(&json)
+                    .map_err(|_| corrupt("loom agent type record is not decodable"))?;
+                signatures.insert(record.id.clone(), record.signature());
+            }
+        }
+        let ast = parse_pipe(source);
+        let mut workflow =
+            compile_pipe(&ast, |id| signatures.get(id).cloned()).map_err(|errors| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("pipe rejected: {}", errors.join("; ")),
+                    false,
+                )
+            })?;
+        let existing = transaction
+            .query_row(
+                "SELECT rev, digest FROM loom_workflows WHERE id = ?1",
+                [workflow.id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let now = now_ms()?;
+        let outcome = match existing {
+            Some((rev, ref current)) if *current == workflow.digest => LoomRegistration {
+                id: workflow.id.clone(),
+                rev: u32::try_from(rev)
+                    .map_err(|_| corrupt("loom workflow rev is out of range"))?,
+                digest: workflow.digest.clone(),
+                updated: false,
+            },
+            Some((rev, _)) => {
+                let next = u32::try_from(rev)
+                    .ok()
+                    .and_then(|rev| rev.checked_add(1))
+                    .ok_or_else(|| corrupt("loom workflow rev is out of range"))?;
+                workflow.rev = next;
+                let json = serde_json::to_string(&workflow)
+                    .map_err(|_| corrupt("loom workflow record is not encodable"))?;
+                transaction
+                    .execute(
+                        "UPDATE loom_workflows
+                         SET rev = ?2, digest = ?3, record_json = ?4, updated_at_ms = ?5
+                         WHERE id = ?1",
+                        params![
+                            workflow.id.as_str(),
+                            i64::from(next),
+                            workflow.digest.as_str(),
+                            json.as_str(),
+                            to_sqlite_integer(now)?
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+                LoomRegistration {
+                    id: workflow.id.clone(),
+                    rev: next,
+                    digest: workflow.digest.clone(),
+                    updated: true,
+                }
+            }
+            None => {
+                workflow.rev = 1;
+                let json = serde_json::to_string(&workflow)
+                    .map_err(|_| corrupt("loom workflow record is not encodable"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO loom_workflows(
+                             id, rev, digest, record_json, created_at_ms, updated_at_ms)
+                         VALUES (?1, 1, ?2, ?3, ?4, ?4)",
+                        params![
+                            workflow.id.as_str(),
+                            workflow.digest.as_str(),
+                            json.as_str(),
+                            to_sqlite_integer(now)?
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+                LoomRegistration {
+                    id: workflow.id.clone(),
+                    rev: 1,
+                    digest: workflow.digest.clone(),
+                    updated: true,
+                }
+            }
+        };
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(outcome)
     }
 
     /// Reads a provider's last-known model catalog.
@@ -12580,6 +12824,45 @@ fn map_sqlite_error(error: SqliteError) -> HaiderError {
             false,
         ),
     }
+}
+
+/// B1 registration bounds: identifiers, non-empty semantics, bounded lists.
+fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
+    let ident = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    };
+    let reject = |message: &str| {
+        Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            message.to_string(),
+            false,
+        ))
+    };
+    if !ident(&record.id) {
+        return reject("agent type id must be a bounded identifier");
+    }
+    if record.name.trim().is_empty() || record.name.len() > 120 {
+        return reject("agent type name must be 1..=120 bytes");
+    }
+    if record.job.trim().is_empty() || record.job.len() > 4096 {
+        return reject("agent type job must be 1..=4096 bytes");
+    }
+    if record.in_type.trim().is_empty() || record.out_type.trim().is_empty() {
+        return reject("agent type must declare its typed I/O");
+    }
+    for list in [&record.clis, &record.apis, &record.skills, &record.scripts] {
+        if list.len() > 32 {
+            return reject("agent type capability lists are bounded to 32 entries");
+        }
+        if list.iter().any(|item| item.is_empty() || item.len() > 128) {
+            return reject("agent type capability entries must be 1..=128 bytes");
+        }
+    }
+    Ok(())
 }
 
 fn corrupt(message: impl Into<String>) -> HaiderError {

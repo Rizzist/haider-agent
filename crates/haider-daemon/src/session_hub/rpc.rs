@@ -1256,6 +1256,42 @@ impl HubConnection {
                 }
                 self.graph_status(request_id, session_id).await
             }
+            RequestBody::LoomList {} => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_list(request_id).await
+            }
+            RequestBody::LoomRegisterAgentType { record } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_register_agent_type(request_id, record).await
+            }
+            RequestBody::LoomRegisterWorkflow { source } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_register_workflow(request_id, source).await
+            }
             RequestBody::GraphInspect {
                 session_id,
                 cursor,
@@ -3936,6 +3972,83 @@ impl HubConnection {
             request_id,
             body: ResponseBody::GraphStatus { status },
         })
+    }
+
+    /// B1 — the Loom registry read.
+    async fn loom_list(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let agent_types = match self.hub.inner.store.loom_agent_types().await {
+            Ok(records) => records,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        let workflows = match self.hub.inner.store.loom_workflows().await {
+            Ok(records) => records,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomList {
+                agent_types,
+                workflows,
+            },
+        })
+    }
+
+    /// B1 — agent-type registration (registry-owned rev law).
+    async fn loom_register_agent_type(
+        &self,
+        request_id: RequestId,
+        record: haider_protocol::loom::LoomAgentType,
+    ) -> Result<(), SessionHubError> {
+        match self.hub.inner.store.loom_register_agent_type(record).await {
+            Ok(registration) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::LoomRegistered { registration },
+            }),
+            Err(error) => self.respond_error(
+                request_id,
+                error.code.as_str(),
+                &error.message,
+                error.retryable,
+                None,
+            ),
+        }
+    }
+
+    /// B1 — workflow registration from pipe source; the daemon compiles.
+    async fn loom_register_workflow(
+        &self,
+        request_id: RequestId,
+        source: String,
+    ) -> Result<(), SessionHubError> {
+        match self.hub.inner.store.loom_register_workflow(source).await {
+            Ok(registration) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::LoomRegistered { registration },
+            }),
+            Err(error) => self.respond_error(
+                request_id,
+                error.code.as_str(),
+                &error.message,
+                error.retryable,
+                None,
+            ),
+        }
     }
 
     async fn graph_inspect(

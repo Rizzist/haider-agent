@@ -1012,6 +1012,38 @@ impl SqliteStoreHandle {
     }
 
     /// Reads a provider's durable last-known model catalog.
+    /// B1 — Loom registry reads/writes (table-backed, run on the blocking pool).
+    pub async fn loom_agent_types(
+        &self,
+    ) -> Result<Vec<haider_protocol::loom::LoomAgentType>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.loom_agent_types())).await
+    }
+
+    pub async fn loom_workflows(
+        &self,
+    ) -> Result<Vec<haider_protocol::loom::LoomWorkflow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.loom_workflows())).await
+    }
+
+    pub async fn loom_register_agent_type(
+        &self,
+        record: haider_protocol::loom::LoomAgentType,
+    ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.loom_register_agent_type(&record)))
+            .await
+    }
+
+    pub async fn loom_register_workflow(
+        &self,
+        source: String,
+    ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.loom_register_workflow(&source))).await
+    }
+
     pub async fn provider_models(
         &self,
         provider: String,
