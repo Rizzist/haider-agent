@@ -1020,7 +1020,9 @@ async fn effect_probe_observation(
         EffectClass::ProcessExec
         | EffectClass::GitOp
         | EffectClass::CredentialAccess
-        | EffectClass::GuiAct => {
+        | EffectClass::GuiAct
+        | EffectClass::ScreenObserve
+        | EffectClass::ScreenControl => {
             "inconclusive — no safe automatic probe exists for this effect class".into()
         }
     }

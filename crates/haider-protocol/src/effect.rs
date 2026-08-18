@@ -44,6 +44,10 @@ pub enum EffectClass {
     CredentialAccess,
     /// Reserved (§9.3) — the computer-use pack lands post-0.1.
     GuiAct,
+    /// Read pixels or the pointer location without actuating the desktop.
+    ScreenObserve,
+    /// Actuate the pointer, keyboard, scroll wheel, or an interactive wait.
+    ScreenControl,
 }
 
 /// Journaled BEFORE dispatch — the durable pre-image of every side effect.

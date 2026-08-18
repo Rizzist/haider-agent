@@ -12,6 +12,7 @@ use haider_protocol::agent::{
     AgentUsageMetrics, ChipState,
 };
 use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
+use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
 use haider_protocol::graph::{
@@ -1045,6 +1046,58 @@ fn golden_effect_phases() {
             }),
             workspace_mutation: None,
         },
+    );
+}
+
+/// CU-2 additive wire law: every computer action keeps its exact top-level
+/// tagged JSON shape so native provider adapters need no second envelope.
+#[test]
+fn golden_computer_actions() {
+    additive_golden(
+        "computer_actions",
+        &vec![
+            ComputerAction::Screenshot,
+            ComputerAction::CursorPosition,
+            ComputerAction::LeftClick { x: 120, y: 240 },
+            ComputerAction::RightClick,
+            ComputerAction::MiddleClick,
+            ComputerAction::DoubleClick,
+            ComputerAction::LeftMouseDown,
+            ComputerAction::LeftMouseUp,
+            ComputerAction::MouseMove { x: 320, y: 180 },
+            ComputerAction::LeftClickDrag {
+                from: ScreenPoint { x: 10, y: 20 },
+                to: ScreenPoint { x: 300, y: 400 },
+            },
+            ComputerAction::Type {
+                text: "Hello, Haider".into(),
+            },
+            ComputerAction::Key {
+                keys: "cmd+shift+4".into(),
+            },
+            ComputerAction::Scroll {
+                x: 640,
+                y: 360,
+                direction: ScrollDirection::Down,
+                amount: 3,
+            },
+            ComputerAction::Wait { ms: 250 },
+        ],
+    );
+}
+
+/// The historical reserved class remains readable while CU-2 appends the
+/// separately grantable observe/control keys.
+#[test]
+fn golden_computer_effect_classes() {
+    use haider_protocol::effect::EffectClass;
+    additive_golden(
+        "computer_effect_classes",
+        &vec![
+            EffectClass::GuiAct,
+            EffectClass::ScreenObserve,
+            EffectClass::ScreenControl,
+        ],
     );
 }
 

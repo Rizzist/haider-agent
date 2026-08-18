@@ -1,0 +1,63 @@
+[
+  {
+    "action": "screenshot"
+  },
+  {
+    "action": "cursor_position"
+  },
+  {
+    "action": "left_click",
+    "x": 120,
+    "y": 240
+  },
+  {
+    "action": "right_click"
+  },
+  {
+    "action": "middle_click"
+  },
+  {
+    "action": "double_click"
+  },
+  {
+    "action": "left_mouse_down"
+  },
+  {
+    "action": "left_mouse_up"
+  },
+  {
+    "action": "mouse_move",
+    "x": 320,
+    "y": 180
+  },
+  {
+    "action": "left_click_drag",
+    "from": {
+      "x": 10,
+      "y": 20
+    },
+    "to": {
+      "x": 300,
+      "y": 400
+    }
+  },
+  {
+    "action": "type",
+    "text": "Hello, Haider"
+  },
+  {
+    "action": "key",
+    "keys": "cmd+shift+4"
+  },
+  {
+    "action": "scroll",
+    "x": 640,
+    "y": 360,
+    "direction": "down",
+    "amount": 3
+  },
+  {
+    "action": "wait",
+    "ms": 250
+  }
+]

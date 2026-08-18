@@ -72,6 +72,7 @@ pub enum ToolError {
     Runtime {
         message: String,
     },
+    Computer(crate::ComputerError),
     Lifecycle {
         message: String,
     },
@@ -182,9 +183,16 @@ impl std::fmt::Display for ToolError {
             Self::Cas { message } => write!(formatter, "artifact storage failed: {message}"),
             Self::Ledger { message } => write!(formatter, "change ledger failed: {message}"),
             Self::Runtime { message } => write!(formatter, "tool runtime failed: {message}"),
+            Self::Computer(error) => write!(formatter, "computer tool failed: {error}"),
             Self::Lifecycle { message } => write!(formatter, "invalid effect lifecycle: {message}"),
         }
     }
 }
 
 impl std::error::Error for ToolError {}
+
+impl From<crate::ComputerError> for ToolError {
+    fn from(error: crate::ComputerError) -> Self {
+        Self::Computer(error)
+    }
+}

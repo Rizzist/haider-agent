@@ -1,0 +1,11 @@
+[
+  {
+    "class": "gui_act"
+  },
+  {
+    "class": "screen_observe"
+  },
+  {
+    "class": "screen_control"
+  }
+]

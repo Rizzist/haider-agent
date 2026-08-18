@@ -49,6 +49,7 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert_eq!(advertised, registered);
     assert!(advertised.contains(&"process_exec"));
     assert!(advertised.contains(&"message_subagent"));
+    assert!(advertised.contains(&"computer"));
     assert!(!advertised.contains(&"exec"));
     assert!(
         advertised
@@ -79,6 +80,10 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert_eq!(
         registered_tool_route("message_subagent"),
         Some(RegisteredToolRoute::MessageSubagent)
+    );
+    assert_eq!(
+        registered_tool_route("computer"),
+        Some(RegisteredToolRoute::Computer)
     );
 }
 
@@ -207,6 +212,14 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         decision(&baseline, EffectClass::ProcessExec),
         ToolPermissionDefault::Ask
     );
+    assert_eq!(
+        decision(&baseline, EffectClass::ScreenObserve),
+        ToolPermissionDefault::Ask
+    );
+    assert_eq!(
+        decision(&baseline, EffectClass::ScreenControl),
+        ToolPermissionDefault::Ask
+    );
 
     let writes = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: true,
@@ -232,6 +245,16 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
     assert_eq!(
         decision(&exec, EffectClass::ProcessExec),
         ToolPermissionDefault::Allow
+    );
+    assert_eq!(
+        decision(&exec, EffectClass::ScreenObserve),
+        ToolPermissionDefault::Ask,
+        "allow_exec must never imply screen observation"
+    );
+    assert_eq!(
+        decision(&exec, EffectClass::ScreenControl),
+        ToolPermissionDefault::Ask,
+        "allow_exec must never imply screen control"
     );
 }
 
@@ -411,6 +434,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "task_kill",
             "web_fetch",
             "web_search",
+            "computer",
         ]
     );
     // M2e: `workflow_author` is a GATED child capability, excluded from the
@@ -435,6 +459,16 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
         snapshot.remembered_grants[0].scope,
         RememberedGrantScope::Class
     );
+}
+
+/// CU-2 root/child law: screen authority never enters the default delegated
+/// grant. A parent must explicitly grant the tool and both dynamic effects.
+#[test]
+fn computer_is_absent_from_default_child_grant() {
+    let grant = crate::worker::default_child_grant();
+    assert!(!grant.tools.iter().any(|tool| tool == "computer"));
+    assert!(!grant.effect_ceiling.contains(&EffectClass::ScreenObserve));
+    assert!(!grant.effect_ceiling.contains(&EffectClass::ScreenControl));
 }
 
 /// MUTATION CHECK: ignore terminal freshness or use first-write-wins during

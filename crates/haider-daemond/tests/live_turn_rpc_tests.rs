@@ -3425,6 +3425,9 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             // advertisement seam is what narrows them per resolved pair.
             "web_fetch",
             "web_search",
+            // CU-2: the computer-use tool — ScreenObserve/ScreenControl
+            // effects, default-deny (allow_screen / allow_screen_control).
+            "computer",
         ]
     );
     assert!(!names.contains(&"exec"));

@@ -6,6 +6,7 @@
 //! [`ChangeLedger`] for the later verification gate.
 
 mod broker;
+mod computer;
 mod error;
 mod filesystem;
 mod graph_evidence;
@@ -21,9 +22,13 @@ mod webfetch;
 mod workflow_author;
 
 pub use broker::{
-    AlwaysAllowRule, EffectBroker, EffectBrokerCloseError, EffectBrokerCloseReport,
-    EffectOperation, JournalSink, PermissionPolicy, PolicyDecision, SessionGrant,
-    SessionGrantScope,
+    ALLOW_SCREEN_CONTROL_SESSION_GRANT, ALLOW_SCREEN_SESSION_GRANT, AlwaysAllowRule, EffectBroker,
+    EffectBrokerCloseError, EffectBrokerCloseReport, EffectOperation, JournalSink,
+    PermissionPolicy, PolicyDecision, SessionGrant, SessionGrantScope,
+};
+pub use computer::{
+    ComputerBackend, ComputerCancelToken, ComputerError, ComputerOperation, ComputerOutput,
+    ComputerResult, UnavailableComputerBackend, computer_manifest, platform_computer_backend,
 };
 pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};
 pub use filesystem::{
@@ -32,6 +37,7 @@ pub use filesystem::{
     fs_path_manifest, fs_read_manifest, fs_search_manifest, fs_write_manifest,
 };
 pub use graph_evidence::{GraphEvidence, graph_evidence_manifest};
+pub use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 pub use message_subagent::{MessageSubagent, message_subagent_manifest};
 pub use process::{

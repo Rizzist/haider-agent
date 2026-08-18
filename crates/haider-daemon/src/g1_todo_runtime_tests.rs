@@ -564,8 +564,8 @@ fn todo_write_is_registered_advertised_and_routable() {
 }
 
 /// L5/CG-M1 (advertisement seam): the root pack keeps `todo_write` and
-/// `graph_evidence`; a delegated child's pack removes exactly those two
-/// root-authority tools.
+/// `graph_evidence`; CU-2 also keeps native computer control out of the
+/// default delegated pack, so a child loses exactly these three authorities.
 /// MUTATION CHECK: stop filtering (or filter the wrong name) in
 /// `advertised_tool_definitions`. Expected RUNTIME failure: the child pack
 /// below still advertises todo_write, or loses a second tool.
@@ -593,7 +593,8 @@ fn child_tool_pack_excludes_root_authority_tools() {
             .iter()
             .any(|definition| definition.name == "graph_evidence")
     );
-    assert_eq!(root.len(), child.len() + 2, "exactly two tools removed");
+    assert!(!child.iter().any(|definition| definition.name == "computer"));
+    assert_eq!(root.len(), child.len() + 3, "exactly three tools removed");
     for definition in &child {
         assert!(
             root.iter().any(|other| other.name == definition.name),

@@ -44,7 +44,7 @@
 //!   same session-scoped outcomes before the next turn creates its dispatcher.
 
 use crate::process::ProcessRegistry;
-use crate::{ToolError, ToolResult};
+use crate::{ComputerCancelToken, ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
@@ -175,6 +175,11 @@ pub struct SessionGrant {
     pub scope: SessionGrantScope,
 }
 
+/// Public names used by clients when describing the two menu-minted class
+/// grants. Authority still comes only from durable permission-menu facts.
+pub const ALLOW_SCREEN_SESSION_GRANT: &str = "allow_screen";
+pub const ALLOW_SCREEN_CONTROL_SESSION_GRANT: &str = "allow_screen_control";
+
 impl SessionGrant {
     pub fn for_effect(class: EffectClass, args_digest: impl Into<String>) -> Self {
         let scope = if class == EffectClass::ProcessExec {
@@ -185,6 +190,37 @@ impl SessionGrant {
             SessionGrantScope::Class
         };
         Self { class, scope }
+    }
+
+    /// Resolves the stable CU-2 grant names used by clients and policy
+    /// configuration. These still enter authority only after the daemon has
+    /// reduced a durable permission-menu answer.
+    pub fn for_computer_name(name: &str) -> ToolResult<Self> {
+        let class = match name {
+            ALLOW_SCREEN_SESSION_GRANT => EffectClass::ScreenObserve,
+            ALLOW_SCREEN_CONTROL_SESSION_GRANT => EffectClass::ScreenControl,
+            _ => {
+                return Err(ToolError::invalid_argument(format!(
+                    "unknown computer session grant `{name}`"
+                )));
+            }
+        };
+        Ok(Self {
+            class,
+            scope: SessionGrantScope::Class,
+        })
+    }
+
+    #[must_use]
+    pub fn computer_name(&self) -> Option<&'static str> {
+        if self.scope != SessionGrantScope::Class {
+            return None;
+        }
+        match self.class {
+            EffectClass::ScreenObserve => Some(ALLOW_SCREEN_SESSION_GRANT),
+            EffectClass::ScreenControl => Some(ALLOW_SCREEN_CONTROL_SESSION_GRANT),
+            _ => None,
+        }
     }
 
     fn matches(&self, intent: &EffectIntent) -> bool {
@@ -295,7 +331,20 @@ impl PermissionPolicy {
             ));
         }
         if !self.session_allow.contains(&grant) {
-            self.session_allow.push(grant);
+            self.session_allow.push(grant.clone());
+        }
+        // A durable control grant necessarily permits the harmless
+        // observations needed to operate against the current screen. Keep the
+        // implication on the ALLOW path only: explicit deny rules are checked
+        // first and ScreenObserve never widens to ScreenControl.
+        if grant.class == EffectClass::ScreenControl {
+            let observe = SessionGrant {
+                class: EffectClass::ScreenObserve,
+                scope: SessionGrantScope::Class,
+            };
+            if !self.session_allow.contains(&observe) {
+                self.session_allow.push(observe);
+            }
         }
         Ok(())
     }
@@ -827,6 +876,7 @@ pub struct EffectBroker {
     next_finalizer: u64,
     finalizers: tokio::task::JoinSet<(u64, Option<ToolError>)>,
     observed_finalizers: Arc<Mutex<HashSet<u64>>>,
+    computer_cancellations: HashMap<EffectId, ComputerCancelToken>,
     pub(crate) processes: ProcessRegistry,
 }
 
@@ -891,6 +941,7 @@ impl EffectBroker {
             next_finalizer: 0,
             finalizers: tokio::task::JoinSet::new(),
             observed_finalizers: Arc::new(Mutex::new(HashSet::new())),
+            computer_cancellations: HashMap::new(),
             processes: ProcessRegistry::default(),
         })
     }
@@ -975,8 +1026,16 @@ impl EffectBroker {
             let Some(claim) = claim else {
                 continue;
             };
-            let (id, result) =
-                self.register_terminal_append(claim, EffectOutcome::Unknown, None, None);
+            let outcome = if self
+                .computer_cancellations
+                .get(&intent.effect)
+                .is_some_and(ComputerCancelToken::is_cancelled)
+            {
+                EffectOutcome::Cancelled
+            } else {
+                EffectOutcome::Unknown
+            };
+            let (id, result) = self.register_terminal_append(claim, outcome, None, None);
             match result.await {
                 Ok(Ok(())) => {
                     self.observe_finalizer(id);
@@ -1227,6 +1286,19 @@ impl EffectBroker {
         self.dispatch_terminal(intent, outcome, None, None).await
     }
 
+    /// Terminalizes a computer effect after relinquishing cancellation
+    /// ownership. Removing before the first terminal append poll is
+    /// intentional: once the backend returned, a dropped/failed outcome
+    /// journal is an honest `Unknown`, not a fabricated action cancellation.
+    pub async fn journal_computer_outcome(
+        &mut self,
+        intent: &EffectIntent,
+        outcome: EffectOutcome,
+    ) -> ToolResult<()> {
+        self.computer_cancellations.remove(&intent.effect);
+        self.dispatch_terminal(intent, outcome, None, None).await
+    }
+
     /// Reconciles a dispatch/outcome recovery window explicitly.
     ///
     /// `Unknown` is reserved for orderly-shutdown and startup reconciliation;
@@ -1246,6 +1318,31 @@ impl EffectBroker {
         policy: &PermissionPolicy,
     ) -> ToolResult<EffectIntent> {
         self.begin(operation, policy).await
+    }
+
+    /// Begins one native computer action and transfers its cancellation token
+    /// to broker ownership immediately after `Dispatched`. If core drops the
+    /// dispatcher future on ESC, [`Self::close`] cancels the backend and
+    /// terminalizes this exact effect as `Cancelled`, never `Unknown`.
+    pub async fn begin_computer(
+        &mut self,
+        operation: &crate::ComputerOperation,
+        policy: &PermissionPolicy,
+        cancel: ComputerCancelToken,
+    ) -> ToolResult<EffectIntent> {
+        let intent = self.begin(operation, policy).await?;
+        self.computer_cancellations
+            .insert(intent.effect.clone(), cancel);
+        Ok(intent)
+    }
+
+    /// Signals only genuinely user-cancelled in-flight computer actions.
+    /// Dispatcher close calls this when its turn's core cancellation token is
+    /// set; ordinary close leaves abandoned effects for `Unknown` recovery.
+    pub fn cancel_computer_actions(&mut self) {
+        for cancel in self.computer_cancellations.values() {
+            cancel.cancel();
+        }
     }
 
     /// Begins the short `AgentSpawn` effect. The caller must establish the

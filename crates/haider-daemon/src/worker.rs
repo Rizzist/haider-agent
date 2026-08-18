@@ -26,6 +26,9 @@
 #[path = "cu1_image_runtime_tests.rs"]
 mod cu1_image_runtime_tests;
 #[cfg(test)]
+#[path = "cu2_computer_runtime_tests.rs"]
+mod cu2_computer_runtime_tests;
+#[cfg(test)]
 #[path = "g1_todo_runtime_tests.rs"]
 mod g1_todo_runtime_tests;
 #[cfg(test)]
@@ -96,11 +99,12 @@ use haider_provider::{
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
-    CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsCaseMode, FsEdit, FsEditChange,
-    FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence,
-    JournalSink, MessageSubagent, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
-    ResultBounds, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent, ToolError,
-    ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
+    CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
+    ComputerOperation, ComputerOutput, EffectBroker, FsCaseMode, FsEdit, FsEditChange, FsGlob,
+    FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink,
+    MessageSubagent, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
+    SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult,
+    TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -6076,6 +6080,22 @@ mod manager_law_tests {
 
 pub(crate) struct BrokerToolFactory;
 
+#[cfg(test)]
+pub(crate) struct InjectedComputerBrokerToolFactory {
+    backend: Arc<dyn ComputerBackend>,
+}
+
+#[cfg(test)]
+impl BrokerToolFactory {
+    /// Test/integration seam for deterministic computer actions. Production
+    /// continues to use the unit factory and the cfg-selected platform backend.
+    pub(crate) fn with_computer_backend(
+        backend: Arc<dyn ComputerBackend>,
+    ) -> InjectedComputerBrokerToolFactory {
+        InjectedComputerBrokerToolFactory { backend }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
@@ -6095,6 +6115,7 @@ pub(crate) enum RegisteredToolRoute {
     TaskKill,
     WebFetch,
     WebSearch,
+    Computer,
 }
 
 #[derive(Debug, Clone)]
@@ -6273,6 +6294,17 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::WebSearch,
             }
         },
+        {
+            // CU-2: observation and control are independently brokered. Ask
+            // is fail-closed while preserving the existing permission-menu
+            // path; neither class is lifted by `allow_exec`.
+            let manifest = haider_tools::computer_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::Ask,
+                route: RegisteredToolRoute::Computer,
+            }
+        },
     ]
 }
 
@@ -6290,6 +6322,7 @@ pub(crate) fn default_child_grant() -> Grant {
                     RegisteredToolRoute::TodoWrite
                         | RegisteredToolRoute::GraphEvidence
                         | RegisteredToolRoute::WorkflowAuthor
+                        | RegisteredToolRoute::Computer
                 )
             })
             .map(|entry| entry.manifest.name.clone())
@@ -6302,6 +6335,7 @@ pub(crate) fn default_child_grant() -> Grant {
                     RegisteredToolRoute::TodoWrite
                         | RegisteredToolRoute::GraphEvidence
                         | RegisteredToolRoute::WorkflowAuthor
+                        | RegisteredToolRoute::Computer
                 )
             })
             .flat_map(|entry| entry.manifest.effects.iter().cloned())
@@ -6490,61 +6524,86 @@ impl TurnToolFactory for BrokerToolFactory {
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
-        let durable_permissions =
-            durable_session_tool_state(&context.store, context.store.session_id()).await?;
-        let session_id = context.store.session_id().clone();
-        let journal = HubJournalSink::new(&context);
-        let mut broker = EffectBroker::new(
-            Box::new(journal),
-            &context.metadata.cwd,
-            context.store.session_id().clone(),
-            context.store.worker_generation(),
-        )
-        .map_err(tool_error)?;
-        broker
-            .restore_freshness(durable_permissions.freshness.clone().into_values())
-            .map_err(tool_error)?;
-        let mut policy = PermissionPolicy::default();
-        for (class, default) in effective_permission_defaults(&context.metadata) {
-            match default {
-                ToolPermissionDefault::Allow => policy.allow(class),
-                ToolPermissionDefault::Ask => policy.ask(class),
-                ToolPermissionDefault::Deny => {
-                    policy.deny(class, "denied by daemon default policy")
-                }
-                ToolPermissionDefault::NotApplicable => {}
-            }
-        }
-        for grant in durable_permissions.grants {
-            policy.allow_session_grant(grant).map_err(tool_error)?;
-        }
-        let output = HubCommandOutputContext {
-            store: context.store.clone(),
-            branch_id: context.branch_id.clone(),
-            agent_id: context.agent_id.clone(),
-            device_id: context.device_id.clone(),
-            event_ids: Arc::clone(&context.event_ids),
-        };
-        Ok(Some(Arc::new(BrokerToolDispatcher {
-            broker: Mutex::new(Some(broker)),
-            web_search: context.web_search.clone(),
-            policy: Mutex::new(policy),
-            cas: Mutex::new(HubArtifactStore {
-                store: context.store,
-            }),
-            ledger: ChangeLedger::new(),
-            session_id,
-            branch_id: context.branch_id,
-            output,
-            durable_permission_bindings: durable_permissions.bindings,
-            metadata: context.metadata,
-            parent_agent_id: context.agent_id,
-            delegation: context.delegation,
-            tasks: context.tasks,
-            grant: context.grant,
-            deferred: Mutex::new(HashMap::new()),
-        })))
+        create_broker_tool_dispatcher(context, haider_tools::platform_computer_backend()).await
     }
+}
+
+#[async_trait]
+#[cfg(test)]
+impl TurnToolFactory for InjectedComputerBrokerToolFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        registered_tools()
+            .into_iter()
+            .map(|entry| provider_definition(entry.manifest))
+            .collect()
+    }
+
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        create_broker_tool_dispatcher(context, Arc::clone(&self.backend)).await
+    }
+}
+
+async fn create_broker_tool_dispatcher(
+    context: WorkerToolContext,
+    computer: Arc<dyn ComputerBackend>,
+) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+    let durable_permissions =
+        durable_session_tool_state(&context.store, context.store.session_id()).await?;
+    let session_id = context.store.session_id().clone();
+    let journal = HubJournalSink::new(&context);
+    let mut broker = EffectBroker::new(
+        Box::new(journal),
+        &context.metadata.cwd,
+        context.store.session_id().clone(),
+        context.store.worker_generation(),
+    )
+    .map_err(tool_error)?;
+    broker
+        .restore_freshness(durable_permissions.freshness.clone().into_values())
+        .map_err(tool_error)?;
+    let mut policy = PermissionPolicy::default();
+    for (class, default) in effective_permission_defaults(&context.metadata) {
+        match default {
+            ToolPermissionDefault::Allow => policy.allow(class),
+            ToolPermissionDefault::Ask => policy.ask(class),
+            ToolPermissionDefault::Deny => policy.deny(class, "denied by daemon default policy"),
+            ToolPermissionDefault::NotApplicable => {}
+        }
+    }
+    for grant in durable_permissions.grants {
+        policy.allow_session_grant(grant).map_err(tool_error)?;
+    }
+    let output = HubCommandOutputContext {
+        store: context.store.clone(),
+        branch_id: context.branch_id.clone(),
+        agent_id: context.agent_id.clone(),
+        device_id: context.device_id.clone(),
+        event_ids: Arc::clone(&context.event_ids),
+    };
+    Ok(Some(Arc::new(BrokerToolDispatcher {
+        broker: Mutex::new(Some(broker)),
+        web_search: context.web_search.clone(),
+        computer,
+        active_computer_turn_cancel: Mutex::new(None),
+        policy: Mutex::new(policy),
+        cas: Mutex::new(HubArtifactStore {
+            store: context.store,
+        }),
+        ledger: ChangeLedger::new(),
+        session_id,
+        branch_id: context.branch_id,
+        output,
+        durable_permission_bindings: durable_permissions.bindings,
+        metadata: context.metadata,
+        parent_agent_id: context.agent_id,
+        delegation: context.delegation,
+        tasks: context.tasks,
+        grant: context.grant,
+        deferred: Mutex::new(HashMap::new()),
+    })))
 }
 
 pub(crate) fn effective_permission_defaults(
@@ -6577,6 +6636,12 @@ pub(crate) fn effective_permission_defaults(
 struct BrokerToolDispatcher {
     broker: Mutex<Option<EffectBroker>>,
     web_search: Option<Arc<dyn WebSearchExecutor>>,
+    computer: Arc<dyn ComputerBackend>,
+    /// Core's authoritative turn cancellation signal for the currently
+    /// dispatched computer action. It survives cancellation dropping the
+    /// execute future, allowing `close` to distinguish ESC from a panic or
+    /// transport failure and preserve honest Cancelled vs Unknown outcomes.
+    active_computer_turn_cancel: Mutex<Option<CancelToken>>,
     policy: Mutex<PermissionPolicy>,
     cas: Mutex<HubArtifactStore>,
     ledger: ChangeLedger,
@@ -7439,6 +7504,122 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     }
                 }
             }
+            RegisteredToolRoute::Computer => {
+                async {
+                    let operation = ComputerOperation::from_tool_args(args)?;
+                    let action_cancel = ComputerCancelToken::new();
+                    let intent = broker
+                        .begin_computer(&operation, &policy, action_cancel.clone())
+                        .await?;
+                    *self.active_computer_turn_cancel.lock().await = Some(cancel.clone());
+                    match self
+                        .computer
+                        .execute(operation.action(), &action_cancel)
+                        .await
+                    {
+                        Ok(ComputerOutput::ScreenshotPng(png)) => {
+                            let stored = {
+                                let mut cas = self.cas.lock().await;
+                                cas.put_image(&png, "image/png").await
+                            };
+                            match stored {
+                                Ok(image) => {
+                                    if let Err(error) =
+                                        self.computer.set_viewport(image.width, image.height)
+                                    {
+                                        let tool_error = ToolError::Computer(error.clone());
+                                        broker
+                                            .journal_computer_outcome(
+                                                &intent,
+                                                EffectOutcome::Failed {
+                                                    error: tool_error.to_string(),
+                                                },
+                                            )
+                                            .await?;
+                                        Ok(computer_failure_result(&error))
+                                    } else {
+                                        broker
+                                            .journal_computer_outcome(&intent, EffectOutcome::Ok)
+                                            .await?;
+                                        Ok(BoundedResult {
+                                            preview: format!(
+                                                "screenshot captured ({}x{})",
+                                                image.width, image.height
+                                            ),
+                                            truncated: false,
+                                            artifact: None,
+                                            images: vec![image],
+                                            cursor: None,
+                                            status: ToolResultStatus::Completed,
+                                            reason: None,
+                                            presentation: None,
+                                        })
+                                    }
+                                }
+                                Err(error) => {
+                                    broker
+                                        .journal_computer_outcome(
+                                            &intent,
+                                            EffectOutcome::Failed {
+                                                error: error.to_string(),
+                                            },
+                                        )
+                                        .await?;
+                                    Err(error)
+                                }
+                            }
+                        }
+                        Ok(ComputerOutput::CursorPosition { x, y }) => {
+                            broker
+                                .journal_computer_outcome(&intent, EffectOutcome::Ok)
+                                .await?;
+                            Ok(BoundedResult {
+                                preview: serde_json::json!({"x": x, "y": y}).to_string(),
+                                truncated: false,
+                                artifact: None,
+                                images: Vec::new(),
+                                cursor: None,
+                                status: ToolResultStatus::Completed,
+                                reason: None,
+                                presentation: None,
+                            })
+                        }
+                        Ok(ComputerOutput::Confirmed { action }) => {
+                            broker
+                                .journal_computer_outcome(&intent, EffectOutcome::Ok)
+                                .await?;
+                            Ok(BoundedResult {
+                                preview: format!("{action} completed"),
+                                truncated: false,
+                                artifact: None,
+                                images: Vec::new(),
+                                cursor: None,
+                                status: ToolResultStatus::Completed,
+                                reason: None,
+                                presentation: None,
+                            })
+                        }
+                        Err(ComputerError::Cancelled) => {
+                            broker
+                                .journal_computer_outcome(&intent, EffectOutcome::Cancelled)
+                                .await?;
+                            Err(ToolError::Computer(ComputerError::Cancelled))
+                        }
+                        Err(error) => {
+                            broker
+                                .journal_computer_outcome(
+                                    &intent,
+                                    EffectOutcome::Failed {
+                                        error: error.to_string(),
+                                    },
+                                )
+                                .await?;
+                            Ok(computer_failure_result(&error))
+                        }
+                    }
+                }
+                .await
+            }
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::GraphEvidence
@@ -7585,17 +7766,32 @@ impl ToolDispatcher for BrokerToolDispatcher {
     }
 
     async fn close(&self) -> Result<(), HaiderError> {
-        let broker = self.broker.lock().await.take();
+        let emergency_stop = self.computer.emergency_stop().await;
+        let mut broker_guard = self.broker.lock().await;
+        if self
+            .active_computer_turn_cancel
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+            && let Some(broker) = broker_guard.as_mut()
+        {
+            broker.cancel_computer_actions();
+        }
+        let broker = broker_guard.take();
+        drop(broker_guard);
         let Some(broker) = broker else {
-            return Ok(());
+            return emergency_stop.map_err(computer_error);
         };
-        broker.close().await.map(|_| ()).map_err(|error| {
+        let closed = broker.close().await.map(|_| ()).map_err(|error| {
             HaiderError::new(
                 ErrorCode::EffectUnknownOutcome,
                 format!("effect broker close reported unfinished work: {error}"),
                 false,
             )
-        })
+        });
+        closed?;
+        emergency_stop.map_err(computer_error)
     }
 }
 
@@ -7727,6 +7923,9 @@ fn selected_menu_option<'a>(
 }
 
 pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<BoundedResult> {
+    if let haider_tools::ToolError::Computer(error) = error {
+        return Some(computer_failure_result(error));
+    }
     if let haider_tools::ToolError::StaleRead {
         recorded_digest,
         current_digest,
@@ -7766,6 +7965,7 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::Io { .. } => ("failed", "io"),
         haider_tools::ToolError::Cas { .. } => ("failed", "output_store"),
         haider_tools::ToolError::Runtime { .. } => ("failed", "runtime"),
+        haider_tools::ToolError::Computer(_) => unreachable!("handled above"),
         haider_tools::ToolError::StaleRead { .. } => ("conflict", "stale_read"),
         haider_tools::ToolError::AuthorizationRequired { .. }
         | haider_tools::ToolError::Journal { .. }
@@ -7778,6 +7978,62 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         error,
         serde_json::Value::Null,
     ))
+}
+
+fn computer_failure_result(error: &ComputerError) -> BoundedResult {
+    let (status, reason, presentation) = match error {
+        ComputerError::InvalidAction { message } => {
+            (ToolResultStatus::Rejected, message.clone(), None)
+        }
+        ComputerError::PermissionRequired {
+            permission,
+            settings_pane,
+            message,
+            ..
+        } => (
+            ToolResultStatus::Failed,
+            message.clone(),
+            Some(ErrorPresentation::new(
+                format!("computer-{permission}-required"),
+                format!("Grant {permission} permission"),
+                format!("{message}. Open {settings_pane}."),
+                ErrorScope::Tool,
+                [ErrorAction::None],
+            )),
+        ),
+        ComputerError::Cancelled => (
+            ToolResultStatus::Cancelled,
+            "computer action was cancelled".into(),
+            None,
+        ),
+        ComputerError::Unavailable { message, .. } | ComputerError::Backend { message } => {
+            (ToolResultStatus::Failed, message.clone(), None)
+        }
+    };
+    let error_json = serde_json::to_value(error).unwrap_or_else(|_| {
+        serde_json::json!({
+            "kind": "backend",
+            "message": error.to_string(),
+        })
+    });
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": match status {
+                ToolResultStatus::Rejected => "rejected",
+                ToolResultStatus::Cancelled => "cancelled",
+                _ => "failed",
+            },
+            "error": error_json,
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status,
+        reason: Some(bounded_failure_reason(&reason)),
+        presentation,
+    }
 }
 
 fn typed_error_result(
@@ -8408,5 +8664,9 @@ impl JournalSink for HubJournalSink {
 }
 
 fn tool_error(error: haider_tools::ToolError) -> HaiderError {
+    HaiderError::new(ErrorCode::ProviderError, error.to_string(), false)
+}
+
+fn computer_error(error: ComputerError) -> HaiderError {
     HaiderError::new(ErrorCode::ProviderError, error.to_string(), false)
 }

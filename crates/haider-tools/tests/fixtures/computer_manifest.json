@@ -1,0 +1,106 @@
+{
+  "name": "computer",
+  "description": "Observe and control the local macOS desktop. Call screenshot before cursor_position or any action with screenshot coordinates.",
+  "effects": [
+    {
+      "class": "screen_observe"
+    },
+    {
+      "class": "screen_control"
+    }
+  ],
+  "dispatch": "await",
+  "input_schema": {
+    "properties": {
+      "action": {
+        "description": "Computer action to perform",
+        "enum": [
+          "screenshot",
+          "cursor_position",
+          "left_click",
+          "right_click",
+          "middle_click",
+          "double_click",
+          "left_mouse_down",
+          "left_mouse_up",
+          "mouse_move",
+          "left_click_drag",
+          "type",
+          "key",
+          "scroll",
+          "wait"
+        ],
+        "type": "string"
+      },
+      "amount": {
+        "description": "Positive scroll-line count",
+        "type": "integer"
+      },
+      "direction": {
+        "enum": [
+          "up",
+          "down",
+          "left",
+          "right"
+        ],
+        "type": "string"
+      },
+      "from": {
+        "description": "Drag start pixel in the latest delivered screenshot",
+        "properties": {
+          "x": {
+            "type": "integer"
+          },
+          "y": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "keys": {
+        "description": "Shortcut such as cmd+shift+4",
+        "type": "string"
+      },
+      "ms": {
+        "description": "Wait duration from 0 through 60000 milliseconds",
+        "type": "integer"
+      },
+      "text": {
+        "description": "Text to type",
+        "type": "string"
+      },
+      "to": {
+        "description": "Drag end pixel in the latest delivered screenshot",
+        "properties": {
+          "x": {
+            "type": "integer"
+          },
+          "y": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "x": {
+        "description": "X pixel in the latest delivered screenshot",
+        "type": "integer"
+      },
+      "y": {
+        "description": "Y pixel in the latest delivered screenshot",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "action"
+    ],
+    "type": "object"
+  }
+}

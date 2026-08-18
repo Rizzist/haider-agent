@@ -1422,6 +1422,7 @@ dependencies = [
  "blake3",
  "haider-platform",
  "haider-protocol",
+ "image",
  "rustix 1.1.4",
  "serde",
  "serde_json",
