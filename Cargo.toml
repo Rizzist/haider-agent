@@ -58,6 +58,7 @@ tracing = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
+x11rb = { version = "0.13.2", default-features = false, features = ["xtest"] }
 zeroize = "1"
 
 [workspace.dependencies.windows-sys]

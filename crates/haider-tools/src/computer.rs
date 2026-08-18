@@ -10,6 +10,10 @@
 #[path = "computer/macos.rs"]
 mod macos;
 
+#[cfg(target_os = "linux")]
+#[path = "computer/linux.rs"]
+mod linux;
+
 use crate::broker::EffectOperation;
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
@@ -159,7 +163,7 @@ impl ComputerBackend for UnavailableComputerBackend {
     }
 }
 
-/// Constructs one dispatcher-local real macOS backend or typed CU-3/CU-4 stub.
+/// Constructs one dispatcher-local real macOS/Linux backend or typed stub.
 ///
 /// The state cannot be process-global: each instance retains the exact CU-1
 /// viewport delivered to one turn and any mouse button held by that turn.
@@ -171,7 +175,11 @@ pub fn platform_computer_backend() -> Arc<dyn ComputerBackend> {
     {
         Arc::new(macos::MacOsComputerBackend::new())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(linux::LinuxComputerBackend::new())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Arc::new(UnavailableComputerBackend::new(std::env::consts::OS))
     }
@@ -248,10 +256,17 @@ impl EffectOperation for ComputerOperation {
     fn approval_preview(&self) -> Vec<String> {
         vec![match &self.action {
             ComputerAction::Type { text } => {
-                format!(
+                #[cfg(target_os = "linux")]
+                let preview = format!(
+                    "Type {} character(s) into the active Linux X11 app",
+                    text.chars().count()
+                );
+                #[cfg(not(target_os = "linux"))]
+                let preview = format!(
                     "Type {} character(s) into the active macOS app",
                     text.chars().count()
-                )
+                );
+                preview
             }
             ComputerAction::Key { keys } => format!("Press keyboard shortcut `{keys}`"),
             ComputerAction::LeftClick { x, y } | ComputerAction::MouseMove { x, y } => {
@@ -316,9 +331,13 @@ fn action_name(action: &ComputerAction) -> &'static str {
 /// each parsed action is brokered under exactly one dynamic class.
 #[must_use]
 pub fn computer_manifest() -> ToolManifest {
+    #[cfg(target_os = "linux")]
+    let description = "Observe and control the local Linux X11 desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
+    #[cfg(not(target_os = "linux"))]
+    let description = "Observe and control the local macOS desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
     ToolManifest {
         name: "computer".into(),
-        description: "Observe and control the local macOS desktop. Call screenshot before cursor_position or any action with screenshot coordinates.".into(),
+        description: description.into(),
         effects: vec![EffectClass::ScreenObserve, EffectClass::ScreenControl],
         dispatch: DispatchMode::Await,
         // Keep provider advertisement within the common OpenAI/Anthropic/

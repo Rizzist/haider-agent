@@ -58,6 +58,20 @@ fn computer_manifest_matches_additive_golden_and_parameter_schemas_are_live() {
         manifest.effects,
         [EffectClass::ScreenObserve, EffectClass::ScreenControl]
     );
+    // The checked-in golden predates the additive Linux backend and remains
+    // the byte-for-byte macOS contract. Linux advertises its real platform at
+    // runtime, then normalizes only this platform-dependent field for the
+    // cross-platform schema golden below.
+    #[cfg(target_os = "linux")]
+    let manifest = {
+        let mut manifest = manifest;
+        assert_eq!(
+            manifest.description,
+            "Observe and control the local Linux X11 desktop. Call screenshot before cursor_position or any action with screenshot coordinates."
+        );
+        manifest.description = "Observe and control the local macOS desktop. Call screenshot before cursor_position or any action with screenshot coordinates.".into();
+        manifest
+    };
     let serialized = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
     // `include_str!` embeds the fixture with its on-disk line endings; a
     // Windows autocrlf checkout gives it CRLF while serde emits LF. Compare

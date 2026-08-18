@@ -57,3 +57,21 @@ jobs:
       # profile is already warm from the ladder build above.
       - name: render benchmark (release — ledger row 17's two-way gate)
         run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked
+
+  computer-x11-e2e:
+    name: computer use (Linux X11 + Xvfb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: install Xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb xauth
+      - name: real screenshot, pixel, pointer, click, type, and key round trip
+        run: >-
+          HAIDER_CU_E2E=1 xvfb-run --auto-servernum
+          --server-args="-screen 0 320x240x24 -nolisten tcp"
+          cargo test -p haider-tools --test linux_computer_e2e --locked --
+          --ignored --test-threads=1

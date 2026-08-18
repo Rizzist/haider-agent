@@ -29,7 +29,7 @@ jobs:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: install Linux system deps (ALSA for the audio/STT stack)
+      - name: install Linux system deps (ALSA)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: check (all targets — lib + bins + tests compile)
