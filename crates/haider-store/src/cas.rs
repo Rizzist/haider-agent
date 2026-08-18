@@ -14,8 +14,13 @@
 use crate::{Cas, StoreResult, store_error};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::ArtifactRef;
+use haider_protocol::tool::{
+    ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES, TOOL_RESULT_IMAGE_MAX_DIMENSION,
+};
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageFormat, ImageReader, Limits};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,6 +30,13 @@ mod cas_tests;
 
 /// Process-wide counter making temp-file names unique across threads.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Input bytes are bounded before format probing or decoding. The larger
+/// source allowance lets ordinary lossless screenshots be recompressed and
+/// downscaled into the existing 5 MiB artifact ceiling.
+pub const TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS: u64 = 40_000_000;
+const TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
 
 /// Filesystem content-addressed storage rooted at `<profile>/cas`.
 #[derive(Debug, Clone)]
@@ -144,6 +156,130 @@ impl FileCas {
             }
         }
     }
+
+    fn bound_image(&self, bytes: &[u8], media_type: &str) -> StoreResult<(Vec<u8>, u32, u32)> {
+        if bytes.len() > TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES {
+            return Err(invalid_image(format!(
+                "tool image source is {} bytes; the source limit is {TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES}",
+                bytes.len()
+            )));
+        }
+        let format = image_format(media_type)?;
+        let (source_width, source_height, decoded) = match format {
+            ToolImageFormat::Png => {
+                let detected = image::guess_format(bytes).map_err(|error| {
+                    invalid_image(format!("tool image format is invalid: {error}"))
+                })?;
+                if detected != ImageFormat::Png {
+                    return Err(invalid_image(format!(
+                        "tool image declares `{media_type}` but its encoded format is not PNG"
+                    )));
+                }
+                let dimensions = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png)
+                    .into_dimensions()
+                    .map_err(|error| {
+                        invalid_image(format!("tool image dimensions are invalid: {error}"))
+                    })?;
+                validate_source_dimensions(dimensions.0, dimensions.1)?;
+                let decoded = decode_png(bytes)?;
+                (dimensions.0, dimensions.1, Some(decoded))
+            }
+            ToolImageFormat::Jpeg => {
+                let (width, height) = jpeg_dimensions(bytes)?;
+                (width, height, None)
+            }
+        };
+        validate_source_dimensions(source_width, source_height)?;
+        if source_width <= TOOL_RESULT_IMAGE_MAX_DIMENSION
+            && source_height <= TOOL_RESULT_IMAGE_MAX_DIMENSION
+            && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= TOOL_RESULT_IMAGE_MAX_BYTES
+        {
+            return Ok((bytes.to_vec(), source_width, source_height));
+        }
+
+        if format == ToolImageFormat::Jpeg {
+            return Err(invalid_image(format!(
+                "oversized JPEG tool image is {source_width}x{source_height} / {} bytes; encode it within {}x{} and {TOOL_RESULT_IMAGE_MAX_BYTES} bytes before storage",
+                bytes.len(),
+                TOOL_RESULT_IMAGE_MAX_DIMENSION,
+                TOOL_RESULT_IMAGE_MAX_DIMENSION
+            )));
+        }
+        let decoded = decoded.ok_or_else(|| {
+            invalid_image("oversized JPEG tool images require a bounded JPEG decoder")
+        })?;
+        let mut target_dimension = TOOL_RESULT_IMAGE_MAX_DIMENSION;
+        loop {
+            let bounded = resize_to_fit(&decoded, target_dimension);
+            let width = bounded.width();
+            let height = bounded.height();
+            let encoded = encode_image(&bounded)?;
+            if u64::try_from(encoded.len()).unwrap_or(u64::MAX) <= TOOL_RESULT_IMAGE_MAX_BYTES {
+                return Ok((encoded, width, height));
+            }
+            if target_dimension <= 256 {
+                return Err(invalid_image(format!(
+                    "tool image cannot be encoded within {TOOL_RESULT_IMAGE_MAX_BYTES} bytes"
+                )));
+            }
+            target_dimension = target_dimension.saturating_mul(3) / 4;
+        }
+    }
+}
+
+/// Verifies that a durable image ref describes the exact bounded CAS bytes.
+/// This is also used at the tool-result journal boundary so callers cannot
+/// bypass [`Cas::put_image`] with an arbitrary generic artifact ref.
+pub fn validate_image_block(bytes: &[u8], image: &ImageBlockRef) -> StoreResult<()> {
+    if artifact_for(bytes) != image.artifact {
+        return Err(invalid_image(format!(
+            "tool image {} does not address the supplied bytes",
+            image.artifact
+        )));
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != image.byte_len
+        || image.byte_len == 0
+        || image.byte_len > TOOL_RESULT_IMAGE_MAX_BYTES
+    {
+        return Err(invalid_image(format!(
+            "tool image {} byte length disagrees with its bounded metadata",
+            image.artifact
+        )));
+    }
+    let (width, height) = match image_format(&image.media_type)? {
+        ToolImageFormat::Png => {
+            let dimensions = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png)
+                .into_dimensions()
+                .map_err(|error| {
+                    invalid_image(format!("tool image dimensions are invalid: {error}"))
+                })?;
+            if dimensions != (image.width, image.height)
+                || dimensions.0 > TOOL_RESULT_IMAGE_MAX_DIMENSION
+                || dimensions.1 > TOOL_RESULT_IMAGE_MAX_DIMENSION
+            {
+                return Err(invalid_image(format!(
+                    "tool image {} dimensions disagree with its bounded metadata",
+                    image.artifact
+                )));
+            }
+            let decoded = decode_png(bytes)?;
+            (decoded.width(), decoded.height())
+        }
+        ToolImageFormat::Jpeg => jpeg_dimensions(bytes)?,
+    };
+    if width == 0
+        || height == 0
+        || width > TOOL_RESULT_IMAGE_MAX_DIMENSION
+        || height > TOOL_RESULT_IMAGE_MAX_DIMENSION
+        || width != image.width
+        || height != image.height
+    {
+        return Err(invalid_image(format!(
+            "tool image {} dimensions disagree with its bounded metadata",
+            image.artifact
+        )));
+    }
+    Ok(())
 }
 
 impl Cas for FileCas {
@@ -211,6 +347,21 @@ impl Cas for FileCas {
         self.put_reader(source, source_path)
     }
 
+    fn put_image(&self, bytes: &[u8], media_type: &str) -> StoreResult<ImageBlockRef> {
+        let (bounded, width, height) = self.bound_image(bytes, media_type)?;
+        let byte_len = u64::try_from(bounded.len()).map_err(|_| {
+            invalid_image("bounded tool image length does not fit the protocol counter")
+        })?;
+        let artifact = Cas::put(self, &bounded)?;
+        Ok(ImageBlockRef {
+            artifact,
+            media_type: media_type.to_owned(),
+            width,
+            height,
+            byte_len,
+        })
+    }
+
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>> {
         let path = self.path_for(artifact)?;
         let bytes = fs::read(&path).map_err(|error| {
@@ -237,6 +388,472 @@ impl Cas for FileCas {
             .and_then(|path| self.verify_existing(artifact, &path).ok())
             .unwrap_or(false)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolImageFormat {
+    Png,
+    Jpeg,
+}
+
+fn image_format(media_type: &str) -> StoreResult<ToolImageFormat> {
+    match media_type {
+        "image/png" => Ok(ToolImageFormat::Png),
+        "image/jpeg" => Ok(ToolImageFormat::Jpeg),
+        _ => Err(invalid_image(format!(
+            "unsupported tool image media type `{media_type}`; use image/png or image/jpeg"
+        ))),
+    }
+}
+
+fn validate_source_dimensions(width: u32, height: u32) -> StoreResult<()> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0 || height == 0 || pixels > TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS {
+        return Err(invalid_image(format!(
+            "tool image dimensions {width}x{height} exceed the safe decode limit"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_png(bytes: &[u8]) -> StoreResult<DynamicImage> {
+    validate_png_container(bytes)?;
+    let detected = image::guess_format(bytes)
+        .map_err(|error| invalid_image(format!("tool image format is invalid: {error}")))?;
+    if detected != ImageFormat::Png {
+        return Err(invalid_image(
+            "tool image declares `image/png` but its encoded format is not PNG",
+        ));
+    }
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png);
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|error| invalid_image(format!("tool image could not be decoded: {error}")))
+}
+
+fn validate_png_container(bytes: &[u8]) -> StoreResult<()> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if !bytes.starts_with(SIGNATURE) {
+        return Err(invalid_image(
+            "tool image declares `image/png` but has no PNG signature",
+        ));
+    }
+    let mut cursor = SIGNATURE.len();
+    let mut saw_header = false;
+    let mut saw_data = false;
+    while cursor < bytes.len() {
+        let header = bytes
+            .get(cursor..cursor.saturating_add(8))
+            .ok_or_else(|| invalid_image("tool image PNG has a truncated chunk header"))?;
+        let data_len = usize::try_from(u32::from_be_bytes([
+            header[0], header[1], header[2], header[3],
+        ]))
+        .map_err(|_| invalid_image("tool image PNG chunk length is invalid"))?;
+        let chunk_type = &header[4..8];
+        let data_start = cursor.saturating_add(8);
+        let data_end = data_start
+            .checked_add(data_len)
+            .ok_or_else(|| invalid_image("tool image PNG chunk length overflows"))?;
+        let chunk_end = data_end
+            .checked_add(4)
+            .ok_or_else(|| invalid_image("tool image PNG chunk length overflows"))?;
+        let data = bytes
+            .get(data_start..data_end)
+            .ok_or_else(|| invalid_image("tool image PNG has truncated chunk data"))?;
+        let crc_bytes = bytes
+            .get(data_end..chunk_end)
+            .ok_or_else(|| invalid_image("tool image PNG has a truncated chunk CRC"))?;
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(chunk_type);
+        hasher.update(data);
+        let expected_crc =
+            u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        if hasher.finalize() != expected_crc {
+            return Err(invalid_image("tool image PNG has an invalid chunk CRC"));
+        }
+
+        match chunk_type {
+            b"IHDR" if !saw_header && cursor == SIGNATURE.len() && data_len == 13 => {
+                saw_header = true;
+            }
+            b"IHDR" => return Err(invalid_image("tool image PNG has an invalid IHDR chunk")),
+            b"IDAT" if saw_header => saw_data = true,
+            b"IEND" if saw_header && saw_data && data_len == 0 => {
+                if chunk_end != bytes.len() {
+                    return Err(invalid_image(
+                        "tool image PNG has bytes after its IEND chunk",
+                    ));
+                }
+                return Ok(());
+            }
+            b"IEND" => return Err(invalid_image("tool image PNG has an invalid IEND chunk")),
+            _ if !saw_header => {
+                return Err(invalid_image("tool image PNG does not begin with IHDR"));
+            }
+            _ => {}
+        }
+        cursor = chunk_end;
+    }
+    Err(invalid_image(
+        "tool image PNG is missing a complete terminal IEND chunk",
+    ))
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> StoreResult<(u32, u32)> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return Err(invalid_image(
+            "tool image declares `image/jpeg` but has no JPEG signature",
+        ));
+    }
+    let mut cursor = 2_usize;
+    let mut dimensions = None;
+    let mut frame_components = Vec::new();
+    let mut frame_quantization_tables = Vec::new();
+    let mut scanned_components = Vec::new();
+    let mut frame_marker = None;
+    let mut quantization_tables = [false; 4];
+    let mut dc_huffman_tables = [false; 4];
+    let mut ac_huffman_tables = [false; 4];
+    let mut saw_scan = false;
+    let mut in_scan = false;
+    let mut current_scan_has_data = false;
+    let mut restart_interval = 0_u16;
+    let mut expected_restart = 0_u8;
+    while cursor < bytes.len() {
+        if in_scan {
+            if bytes[cursor] != 0xff {
+                current_scan_has_data = true;
+                cursor = cursor.saturating_add(1);
+                continue;
+            }
+            let Some(&next) = bytes.get(cursor.saturating_add(1)) else {
+                break;
+            };
+            if next == 0x00 {
+                current_scan_has_data = true;
+                cursor = cursor.saturating_add(2);
+                continue;
+            }
+            if next == 0xff {
+                cursor = cursor.saturating_add(1);
+                continue;
+            }
+            if (0xd0..=0xd7).contains(&next) {
+                if restart_interval == 0
+                    || !current_scan_has_data
+                    || next != 0xd0 + expected_restart
+                {
+                    return Err(invalid_image(
+                        "tool image JPEG has an invalid restart-marker sequence",
+                    ));
+                }
+                expected_restart = (expected_restart + 1) % 8;
+                current_scan_has_data = false;
+                cursor = cursor.saturating_add(2);
+                continue;
+            }
+            if !current_scan_has_data {
+                return Err(invalid_image(
+                    "tool image declares `image/jpeg` but has an empty scan",
+                ));
+            }
+            in_scan = false;
+        }
+        if bytes.get(cursor) != Some(&0xff) {
+            return Err(invalid_image(
+                "tool image declares `image/jpeg` but contains bytes outside a scan",
+            ));
+        }
+        while cursor < bytes.len() && bytes[cursor] == 0xff {
+            cursor = cursor.saturating_add(1);
+        }
+        let Some(&marker) = bytes.get(cursor) else {
+            break;
+        };
+        cursor = cursor.saturating_add(1);
+        if marker == 0xd9 {
+            let Some(dimensions) = dimensions else {
+                break;
+            };
+            if cursor != bytes.len() || !saw_scan {
+                break;
+            }
+            if frame_components
+                .iter()
+                .any(|component| !scanned_components.contains(component))
+            {
+                break;
+            }
+            return Ok(dimensions);
+        }
+        if marker == 0xd8 || marker == 0x00 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            return Err(invalid_image(
+                "tool image declares `image/jpeg` but has an invalid marker order",
+            ));
+        }
+        let Some(length_bytes) = bytes.get(cursor..cursor.saturating_add(2)) else {
+            break;
+        };
+        let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if length < 2 || cursor.saturating_add(length) > bytes.len() {
+            break;
+        }
+        let segment = &bytes[cursor + 2..cursor + length];
+        match marker {
+            0xc0 => {
+                if dimensions.is_some() || segment.len() < 6 || segment[0] != 8 {
+                    break;
+                }
+                let component_count = usize::from(segment[5]);
+                if component_count == 0
+                    || component_count > 4
+                    || segment.len() != 6 + component_count * 3
+                {
+                    break;
+                }
+                let components = &segment[6..];
+                if components.chunks_exact(3).any(|component| {
+                    let horizontal = component[1] >> 4;
+                    let vertical = component[1] & 0x0f;
+                    horizontal == 0
+                        || horizontal > 4
+                        || vertical == 0
+                        || vertical > 4
+                        || component[2] > 3
+                }) {
+                    break;
+                }
+                let sampling_blocks = components
+                    .chunks_exact(3)
+                    .map(|component| u16::from(component[1] >> 4) * u16::from(component[1] & 0x0f))
+                    .sum::<u16>();
+                if sampling_blocks > 10 {
+                    break;
+                }
+                frame_components = components
+                    .chunks_exact(3)
+                    .map(|component| component[0])
+                    .collect();
+                frame_quantization_tables = components
+                    .chunks_exact(3)
+                    .map(|component| usize::from(component[2]))
+                    .collect();
+                frame_components.sort_unstable();
+                frame_components.dedup();
+                if frame_components.len() != component_count {
+                    break;
+                }
+                let height = u32::from(u16::from_be_bytes([segment[1], segment[2]]));
+                let width = u32::from(u16::from_be_bytes([segment[3], segment[4]]));
+                if width == 0 || height == 0 {
+                    break;
+                }
+                dimensions = Some((width, height));
+                frame_marker = Some(marker);
+            }
+            0xc1..=0xc3 | 0xc5..=0xcf if marker != 0xc4 && marker != 0xc8 && marker != 0xcc => {
+                return Err(invalid_image(
+                    "tool image JPEG uses an unsupported frame coding",
+                ));
+            }
+            0xdb => {
+                let mut table_cursor = 0;
+                while table_cursor < segment.len() {
+                    let Some(&table_info) = segment.get(table_cursor) else {
+                        break;
+                    };
+                    let table_bytes = match table_info >> 4 {
+                        0 => 64,
+                        _ => break,
+                    };
+                    if table_info & 0x0f > 3
+                        || table_cursor.saturating_add(1 + table_bytes) > segment.len()
+                    {
+                        break;
+                    }
+                    let values = &segment[table_cursor + 1..table_cursor + 1 + table_bytes];
+                    if values.contains(&0) {
+                        break;
+                    }
+                    quantization_tables[usize::from(table_info & 0x0f)] = true;
+                    table_cursor += 1 + table_bytes;
+                }
+                if table_cursor != segment.len() || segment.is_empty() {
+                    break;
+                }
+            }
+            0xc4 => {
+                let mut table_cursor = 0;
+                while table_cursor < segment.len() {
+                    let Some(&table_info) = segment.get(table_cursor) else {
+                        break;
+                    };
+                    if table_info >> 4 > 1 || table_info & 0x0f > 1 {
+                        break;
+                    }
+                    let counts_start = table_cursor.saturating_add(1);
+                    let Some(counts) = segment.get(counts_start..counts_start.saturating_add(16))
+                    else {
+                        break;
+                    };
+                    let symbol_count = counts
+                        .iter()
+                        .map(|count| usize::from(*count))
+                        .sum::<usize>();
+                    if symbol_count == 0 || symbol_count > 256 {
+                        break;
+                    }
+                    let mut available_codes = 1_i32;
+                    let mut canonical = true;
+                    for count in counts {
+                        available_codes = available_codes
+                            .saturating_mul(2)
+                            .saturating_sub(i32::from(*count));
+                        if available_codes < 0 {
+                            canonical = false;
+                            break;
+                        }
+                    }
+                    if !canonical {
+                        break;
+                    }
+                    let symbols_start = counts_start.saturating_add(16);
+                    table_cursor = symbols_start.saturating_add(symbol_count);
+                    let Some(symbols) = segment.get(symbols_start..table_cursor) else {
+                        break;
+                    };
+                    let valid_symbols = if table_info >> 4 == 0 {
+                        symbols.iter().all(|symbol| *symbol <= 11)
+                    } else {
+                        symbols.iter().all(|symbol| {
+                            let run = symbol >> 4;
+                            let size = symbol & 0x0f;
+                            size <= 10 && (size != 0 || matches!(run, 0 | 15))
+                        })
+                    };
+                    if !valid_symbols || available_codes == 0 {
+                        break;
+                    }
+                    let table_id = usize::from(table_info & 0x0f);
+                    if table_info >> 4 == 0 {
+                        dc_huffman_tables[table_id] = true;
+                    } else {
+                        ac_huffman_tables[table_id] = true;
+                    }
+                }
+                if table_cursor != segment.len() || segment.is_empty() {
+                    break;
+                }
+            }
+            0xda => {
+                if dimensions.is_none()
+                    || frame_quantization_tables
+                        .iter()
+                        .any(|table| !quantization_tables[*table])
+                {
+                    break;
+                }
+                let Some(&component_count) = segment.first() else {
+                    break;
+                };
+                let component_count = usize::from(component_count);
+                if component_count == 0
+                    || component_count > 4
+                    || component_count > frame_components.len()
+                    || segment.len() != 4 + component_count * 2
+                {
+                    break;
+                }
+                let scan_component_bytes = &segment[1..1 + component_count * 2];
+                let mut scan_components = scan_component_bytes
+                    .chunks_exact(2)
+                    .map(|component| component[0])
+                    .collect::<Vec<_>>();
+                if scan_components
+                    .iter()
+                    .any(|component| !frame_components.contains(component))
+                {
+                    break;
+                }
+                scan_components.sort_unstable();
+                scan_components.dedup();
+                if scan_components.len() != component_count {
+                    break;
+                }
+                if scan_components
+                    .iter()
+                    .any(|component| scanned_components.contains(component))
+                {
+                    break;
+                }
+                for component in &scan_components {
+                    scanned_components.push(*component);
+                }
+                let spectral_start = segment[1 + component_count * 2];
+                let spectral_end = segment[2 + component_count * 2];
+                let approximation = segment[3 + component_count * 2];
+                if spectral_start > spectral_end || spectral_end > 63 {
+                    break;
+                }
+                if frame_marker == Some(0xc0)
+                    && (spectral_start != 0 || spectral_end != 63 || approximation != 0)
+                {
+                    break;
+                }
+                if scan_component_bytes.chunks_exact(2).any(|component| {
+                    let selector = component[1];
+                    let dc_table = usize::from(selector >> 4);
+                    let ac_table = usize::from(selector & 0x0f);
+                    dc_table > 1
+                        || ac_table > 1
+                        || (spectral_start == 0 && !dc_huffman_tables[dc_table])
+                        || (spectral_end > 0 && !ac_huffman_tables[ac_table])
+                }) {
+                    break;
+                }
+                saw_scan = true;
+                in_scan = true;
+                current_scan_has_data = false;
+                expected_restart = 0;
+            }
+            0xdd if segment.len() == 2 => {
+                restart_interval = u16::from_be_bytes([segment[0], segment[1]]);
+            }
+            0xe0..=0xef | 0xfe => {}
+            _ => {
+                return Err(invalid_image(format!(
+                    "tool image JPEG contains unsupported marker 0xff{marker:02x}"
+                )));
+            }
+        }
+        cursor = cursor.saturating_add(length);
+    }
+    Err(invalid_image(
+        "tool image declares `image/jpeg` but is truncated or has no complete scan",
+    ))
+}
+
+fn resize_to_fit(image: &DynamicImage, max_dimension: u32) -> DynamicImage {
+    if image.width() <= max_dimension && image.height() <= max_dimension {
+        image.clone()
+    } else {
+        image.resize(max_dimension, max_dimension, FilterType::Triangle)
+    }
+}
+
+fn encode_image(image: &DynamicImage) -> StoreResult<Vec<u8>> {
+    let mut encoded = Cursor::new(Vec::new());
+    image
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| invalid_image(format!("tool image could not be encoded: {error}")))?;
+    Ok(encoded.into_inner())
+}
+
+fn invalid_image(message: impl Into<String>) -> HaiderError {
+    store_error(ErrorCode::InvalidArgument, message, false)
 }
 
 /// Computes the canonical address for a byte string.

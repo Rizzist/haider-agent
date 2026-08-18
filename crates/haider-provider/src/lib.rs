@@ -38,6 +38,9 @@ use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{
     Block, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
 };
+use haider_protocol::tool::{
+    ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
+};
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
 use std::fmt;
@@ -293,6 +296,15 @@ impl Message {
         preview: impl Into<String>,
         truncated: bool,
     ) -> Self {
+        Self::tool_result_with_images(call_id, preview, truncated, Vec::new())
+    }
+
+    pub fn tool_result_with_images(
+        call_id: impl Into<String>,
+        preview: impl Into<String>,
+        truncated: bool,
+        images: Vec<ImageBlockRef>,
+    ) -> Self {
         let call_id = call_id.into();
         Self {
             role: MessageRole::Tool,
@@ -300,6 +312,7 @@ impl Message {
                 call_id,
                 preview: preview.into(),
                 truncated,
+                images,
             }],
         }
     }
@@ -316,6 +329,132 @@ impl Message {
                 })
             })
     }
+}
+
+/// Applies the logical-turn image context budget to a provider-bound message
+/// clone. Selection walks newest to oldest, so over-budget images are always
+/// dropped oldest-first. Durable messages and CAS objects remain untouched.
+///
+/// Every affected tool result receives a bounded, honest text note. The note
+/// names the first omitted artifact and reports any additional count without
+/// allowing an untrusted result vector to grow prompt text without bound.
+pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
+    let mut retained_count = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolResult { images, .. } => Some(images.len()),
+            _ => None,
+        })
+        .fold(0_usize, usize::saturating_add);
+    let mut retained_bytes = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolResult { images, .. } => Some(
+                images
+                    .iter()
+                    .map(|image| image.byte_len)
+                    .fold(0_u64, u64::saturating_add),
+            ),
+            _ => None,
+        })
+        .fold(0_u64, u64::saturating_add);
+    for message in messages {
+        for block in &mut message.blocks {
+            let Block::ToolResult {
+                preview, images, ..
+            } = block
+            else {
+                continue;
+            };
+            if images.is_empty() {
+                continue;
+            }
+            let mut omitted_count = 0_usize;
+            let mut first_omitted = None;
+            *images = std::mem::take(images)
+                .into_iter()
+                .filter_map(|image| {
+                    if retained_count > TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
+                        || retained_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN
+                    {
+                        retained_count = retained_count.saturating_sub(1);
+                        retained_bytes = retained_bytes.saturating_sub(image.byte_len);
+                        if first_omitted.is_none() {
+                            first_omitted = Some(image.artifact.clone());
+                        }
+                        omitted_count = omitted_count.saturating_add(1);
+                        None
+                    } else {
+                        Some(image)
+                    }
+                })
+                .collect();
+            if omitted_count == 0 {
+                continue;
+            }
+            let Some(first_omitted) = first_omitted else {
+                continue;
+            };
+            let additional = omitted_count.saturating_sub(1);
+            let first_omitted = bounded_context_field(first_omitted.as_str(), 96);
+            preview.push_str(&format!(
+                "\n[tool images omitted from model context by the per-turn image budget (oldest first): {first_omitted}; {additional} additional; limit {TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN} images / {TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN} bytes]"
+            ));
+        }
+    }
+}
+
+/// Explicit capability degradation for a provider/model that cannot accept
+/// images. Callers apply this only to a provider-bound clone after budgeting;
+/// durable image refs remain unchanged.
+pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
+    for message in messages {
+        for block in &mut message.blocks {
+            let Block::ToolResult {
+                preview, images, ..
+            } = block
+            else {
+                continue;
+            };
+            for image in std::mem::take(images) {
+                preview.push('\n');
+                preview.push_str(&tool_image_placeholder(&image));
+            }
+        }
+    }
+}
+
+fn tool_image_placeholder(image: &ImageBlockRef) -> String {
+    let artifact = bounded_context_field(image.artifact.as_str(), 96);
+    let media_type = bounded_context_field(&image.media_type, 32);
+    format!(
+        "[tool image unavailable to this provider: artifact {} ({}; {}x{}; {} bytes)]",
+        artifact, media_type, image.width, image.height, image.byte_len
+    )
+}
+
+fn bounded_context_field(value: &str, max_chars: usize) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let mut bounded = sanitized.chars().take(max_chars).collect::<String>();
+    if value.chars().nth(max_chars).is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn tool_image_media_type_supported(media_type: &str) -> bool {
+    matches!(media_type, "image/png" | "image/jpeg")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

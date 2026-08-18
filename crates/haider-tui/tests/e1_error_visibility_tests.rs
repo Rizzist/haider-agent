@@ -33,6 +33,7 @@ fn apply_tool(
             preview: "{}".into(),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status,
             reason: reason.map(str::to_owned),

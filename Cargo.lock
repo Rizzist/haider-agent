@@ -1276,6 +1276,7 @@ dependencies = [
  "haider-store",
  "haider-tools",
  "http",
+ "image",
  "jsonwebtoken",
  "reqwest",
  "rustix 1.1.4",
@@ -1382,9 +1383,12 @@ dependencies = [
 name = "haider-store"
 version = "0.0.922"
 dependencies = [
+ "base64",
  "blake3",
+ "crc32fast",
  "haider-platform",
  "haider-protocol",
+ "image",
  "rusqlite",
  "serde",
  "serde_json",

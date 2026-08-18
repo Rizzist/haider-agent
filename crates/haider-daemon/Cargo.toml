@@ -20,6 +20,7 @@ haider-accounts = { path = "../haider-accounts" }
 haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }
 haider-rpc = { path = "../haider-rpc" }
+haider-store = { path = "../haider-store" }
 haider-tools = { path = "../haider-tools" }
 jsonwebtoken.workspace = true
 reqwest.workspace = true
@@ -34,8 +35,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 futures-util = "0.3"
-haider-store = { path = "../haider-store" }
 http = "1"
+image.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

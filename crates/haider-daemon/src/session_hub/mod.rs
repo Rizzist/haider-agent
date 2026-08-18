@@ -3227,6 +3227,14 @@ impl HubStoreHandle {
         self.hub.inner.store.put_file(path).await
     }
 
+    pub(crate) async fn put_image_artifact(
+        &self,
+        bytes: Vec<u8>,
+        media_type: String,
+    ) -> Result<haider_protocol::tool::ImageBlockRef, HaiderError> {
+        self.hub.inner.store.put_image(bytes, media_type).await
+    }
+
     pub(crate) async fn get_artifact(
         &self,
         artifact: haider_protocol::ids::ArtifactRef,

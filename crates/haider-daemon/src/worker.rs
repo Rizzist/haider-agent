@@ -23,6 +23,9 @@
 //! buffer.
 
 #[cfg(test)]
+#[path = "cu1_image_runtime_tests.rs"]
+mod cu1_image_runtime_tests;
+#[cfg(test)]
 #[path = "g1_todo_runtime_tests.rs"]
 mod g1_todo_runtime_tests;
 #[cfg(test)]
@@ -88,7 +91,8 @@ use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
     OPENAI_OAUTH_PROVIDER_NAME, ProviderCredentialSurface, ResolvedAttachment,
-    canonical_tool_definitions_digest,
+    apply_tool_result_image_budget, canonical_tool_definitions_digest,
+    degrade_tool_result_images_to_placeholders,
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
@@ -318,6 +322,8 @@ impl ContextCompactor for DaemonContextCompactor {
                 )
             });
         }
+        let artifact_store = self.store.clone();
+        prepare_tool_images_for_text_only_request(&artifact_store, &mut covered_messages).await?;
         let immutable_history_digest = digest_json(&covered_messages);
         covered_messages.push(Message::user_text(
             "Summarize the preceding conversation for lossless continuation. Preserve decisions, constraints, exact identifiers, unresolved work, and tool outcomes. Return only the summary.",
@@ -4501,9 +4507,13 @@ async fn start_turn(
         compile_micros = prompt_compile_started.elapsed().as_micros(),
         "prompt history compiled"
     );
-    let attachments =
-        resolve_prompt_attachments(lease, &mut messages, provider_capabilities.pdf_documents)
-            .await?;
+    let attachments = resolve_prompt_attachments(
+        lease,
+        &mut messages,
+        provider_capabilities.vision,
+        provider_capabilities.pdf_documents,
+    )
+    .await?;
     // Dynamic graph state is deliberately outside durable prompt history and
     // the stable system/tool prefix. Root sessions receive one bounded,
     // turn-scoped user-role tail; delegated children receive no parent graph.
@@ -4543,6 +4553,8 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    config.tool_result_images_supported =
+        provider_capabilities.vision != FeatureResolve::Unsupported;
     config.cached_input_is_subset = cached_input_is_subset_for_provider(&resolved.provider_name);
     config.context_compaction_v1 = true;
     config.model = resolved.model;
@@ -4688,11 +4700,12 @@ async fn start_turn(
         }
         return Err(cancellation_fenced_start());
     }
-    let (actor, harness) = HarnessActor::new_with_dispatcher(
+    let (actor, harness) = HarnessActor::new_with_dispatcher_and_artifacts(
         config,
         resolved.provider,
         Arc::new(lease.clone()),
         dispatcher.clone(),
+        Some(Arc::new(lease.clone())),
     );
     match (checkpoint.as_ref(), partial_stream.as_ref()) {
         (Some(checkpoint), None) => {
@@ -5007,12 +5020,39 @@ async fn extract_pdf_attachment(
 async fn resolve_prompt_attachments(
     store: &dyn haider_core::ArtifactReader,
     messages: &mut [Message],
+    vision: FeatureResolve,
     pdf_documents: FeatureResolve,
 ) -> Result<Vec<ResolvedAttachment>, HaiderError> {
+    validate_durable_tool_images(store, messages).await?;
+    apply_tool_result_image_budget(messages);
     let mut resolved = Vec::<ResolvedAttachment>::new();
-    for message in messages {
+    for message in &mut *messages {
         for block in &mut message.blocks {
             match block {
+                haider_protocol::provider::Block::ToolResult { images, .. } => {
+                    for image in images {
+                        if vision == FeatureResolve::Unsupported {
+                            continue;
+                        }
+                        if resolved
+                            .iter()
+                            .any(|attachment| attachment.artifact == image.artifact)
+                        {
+                            continue;
+                        }
+                        let bytes = store.read_artifact(&image.artifact).await.map_err(|_| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("tool image {} is missing from the CAS", image.artifact),
+                                false,
+                            )
+                        })?;
+                        resolved.push(ResolvedAttachment {
+                            artifact: image.artifact.clone(),
+                            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        });
+                    }
+                }
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::Image { artifact, .. },
                 ) => {
@@ -5126,7 +5166,91 @@ async fn resolve_prompt_attachments(
             }
         }
     }
+    if vision == FeatureResolve::Unsupported {
+        degrade_tool_result_images_to_placeholders(messages);
+    }
     Ok(resolved)
+}
+
+async fn validate_durable_tool_images<R>(store: &R, messages: &[Message]) -> Result<(), HaiderError>
+where
+    R: haider_core::ArtifactReader + ?Sized,
+{
+    let mut validated = Vec::<haider_protocol::tool::ImageBlockRef>::new();
+    let images = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            haider_protocol::provider::Block::ToolResult { images, .. } => Some(images.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    for image in images {
+        if !matches!(image.media_type.as_str(), "image/png" | "image/jpeg")
+            || image.width == 0
+            || image.height == 0
+            || image.width > haider_protocol::tool::TOOL_RESULT_IMAGE_MAX_DIMENSION
+            || image.height > haider_protocol::tool::TOOL_RESULT_IMAGE_MAX_DIMENSION
+            || image.byte_len == 0
+            || image.byte_len > haider_protocol::tool::TOOL_RESULT_IMAGE_MAX_BYTES
+        {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "tool image {} carries invalid bounded metadata",
+                    image.artifact
+                ),
+                false,
+            ));
+        }
+        if let Some(existing) = validated
+            .iter()
+            .find(|existing| existing.artifact == image.artifact)
+        {
+            if existing != &image {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("tool image {} has conflicting metadata", image.artifact),
+                    false,
+                ));
+            }
+            continue;
+        }
+        let bytes = store.read_artifact(&image.artifact).await.map_err(|_| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("tool image {} is missing from the CAS", image.artifact),
+                false,
+            )
+        })?;
+        haider_store::validate_image_block(&bytes, &image).map_err(|_| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "tool image {} does not match its bounded CAS metadata",
+                    image.artifact
+                ),
+                false,
+            )
+        })?;
+        validated.push(image);
+    }
+    Ok(())
+}
+
+async fn prepare_tool_images_for_text_only_request<R>(
+    store: &R,
+    messages: &mut [Message],
+) -> Result<(), HaiderError>
+where
+    R: haider_core::ArtifactReader + ?Sized,
+{
+    validate_durable_tool_images(store, messages).await?;
+    apply_tool_result_image_budget(messages);
+    degrade_tool_result_images_to_placeholders(messages);
+    Ok(())
 }
 
 async fn prepare_compaction_messages(
@@ -6644,6 +6768,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 preview,
                 truncated: false,
                 artifact: None,
+                images: Vec::new(),
                 cursor: None,
                 status: ToolResultStatus::Completed,
                 reason: None,
@@ -6674,6 +6799,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .to_string(),
                     truncated: false,
                     artifact: None,
+                    images: Vec::new(),
                     cursor: None,
                     status: ToolResultStatus::Rejected,
                     reason: Some("delegated workflows cannot contain a human-confirm gate".into()),
@@ -6738,6 +6864,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .to_string(),
                 truncated: false,
                 artifact: None,
+                images: Vec::new(),
                 cursor: None,
                 status: ToolResultStatus::Completed,
                 reason: None,
@@ -6895,6 +7022,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         .to_string(),
                         truncated: false,
                         artifact: None,
+                        images: Vec::new(),
                         cursor: None,
                         status: ToolResultStatus::Rejected,
                         reason: Some(error.message.clone()),
@@ -6914,6 +7042,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 preview,
                 truncated: false,
                 artifact: None,
+                images: Vec::new(),
                 cursor: None,
                 status: ToolResultStatus::Completed,
                 reason: None,
@@ -7129,6 +7258,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     ),
                                     truncated: outcome.truncated,
                                     artifact: None,
+                                    images: Vec::new(),
                                     cursor: None,
                                     status: ToolResultStatus::Completed,
                                     reason: retried.then(|| {
@@ -7152,6 +7282,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     preview: format!("web_fetch failed: {message}"),
                                     truncated: false,
                                     artifact: None,
+                                    images: Vec::new(),
                                     cursor: None,
                                     status: ToolResultStatus::Failed,
                                     reason: Some(if retried {
@@ -7262,6 +7393,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .into(),
                         truncated: false,
                         artifact: None,
+                        images: Vec::new(),
                         cursor: None,
                         status: ToolResultStatus::Failed,
                         reason: Some("web_search is unavailable in this session".into()),
@@ -7278,6 +7410,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     preview,
                                     truncated,
                                     artifact: None,
+                                    images: Vec::new(),
                                     cursor: None,
                                     status: ToolResultStatus::Completed,
                                     reason: None,
@@ -7295,6 +7428,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     preview: format!("web_search failed: {}", failure.message),
                                     truncated: false,
                                     artifact: None,
+                                    images: Vec::new(),
                                     cursor: None,
                                     status: ToolResultStatus::Failed,
                                     reason: Some(bounded_failure_reason(&failure.message)),
@@ -7666,6 +7800,7 @@ fn typed_error_result(
         preview: body.to_string(),
         truncated: false,
         artifact: None,
+        images: Vec::new(),
         cursor: None,
         status: match status {
             "denied" | "rejected" => ToolResultStatus::Rejected,
@@ -7693,6 +7828,7 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
         .to_string(),
         truncated: false,
         artifact: None,
+        images: Vec::new(),
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(bounded_failure_reason(&refusal.message())),
@@ -7713,6 +7849,7 @@ fn recursion_limit_result() -> BoundedResult {
         .to_string(),
         truncated: false,
         artifact: None,
+        images: Vec::new(),
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(crate::delegation::RECURSION_LIMIT_MESSAGE.into()),
@@ -7738,6 +7875,7 @@ fn subagent_limit_result(error: &HaiderError) -> BoundedResult {
         .to_string(),
         truncated: false,
         artifact: None,
+        images: Vec::new(),
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(bounded_failure_reason(&error.message)),
@@ -7761,6 +7899,7 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         .to_string(),
         truncated: false,
         artifact: None,
+        images: Vec::new(),
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(reason),
@@ -7785,6 +7924,7 @@ fn graph_evidence_rejection(
         .to_string(),
         truncated: false,
         artifact: None,
+        images: Vec::new(),
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(reason.clone()),
@@ -7989,6 +8129,7 @@ fn process_result_with_signal(
         .to_string(),
         truncated,
         artifact,
+        images: Vec::new(),
         cursor: None,
         status: match result.status {
             haider_protocol::item::ToolStatus::Completed => ToolResultStatus::Completed,
@@ -8054,6 +8195,19 @@ impl CasSink for HubArtifactStore {
     async fn put_file(&mut self, path: &Path) -> ToolResult<haider_protocol::ids::ArtifactRef> {
         self.store
             .put_artifact_file(path.to_path_buf())
+            .await
+            .map_err(|error| haider_tools::ToolError::Runtime {
+                message: error.message,
+            })
+    }
+
+    async fn put_image(
+        &mut self,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> ToolResult<haider_protocol::tool::ImageBlockRef> {
+        self.store
+            .put_image_artifact(bytes.to_vec(), media_type.to_owned())
             .await
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,

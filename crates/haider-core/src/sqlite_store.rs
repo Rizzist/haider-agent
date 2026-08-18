@@ -1241,6 +1241,20 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.put_file(&path))).await
     }
 
+    /// Validates, bounds, and durably stores one PNG/JPEG on the blocking
+    /// pool, returning only ref metadata to the caller.
+    pub async fn put_image(
+        &self,
+        bytes: Vec<u8>,
+        media_type: String,
+    ) -> Result<haider_protocol::tool::ImageBlockRef, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| haider_store::Cas::put_image(store, &bytes, &media_type))
+        })
+        .await
+    }
+
     /// Reads and verifies an artifact on the blocking pool.
     pub async fn get(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, HaiderError> {
         let owner = Arc::clone(&self.owner);
@@ -1348,6 +1362,16 @@ impl CasSink for SqliteStoreHandle {
 
     async fn put_file(&mut self, path: &std::path::Path) -> ToolResult<ArtifactRef> {
         SqliteStoreHandle::put_file(self, path.to_path_buf())
+            .await
+            .map_err(|error| haider_tools::ToolError::cas(error.message))
+    }
+
+    async fn put_image(
+        &mut self,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> ToolResult<haider_protocol::tool::ImageBlockRef> {
+        SqliteStoreHandle::put_image(self, bytes.to_vec(), media_type.to_owned())
             .await
             .map_err(|error| haider_tools::ToolError::cas(error.message))
     }

@@ -94,6 +94,18 @@ pub trait CasSink: Send {
     async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef>;
     /// Streams a staged file into CAS without rebuilding it as one buffer.
     async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef>;
+
+    /// Validates, bounds, and stores one tool-produced PNG/JPEG. Lightweight
+    /// test sinks may keep the honest unsupported default.
+    async fn put_image(
+        &mut self,
+        _bytes: &[u8],
+        _media_type: &str,
+    ) -> ToolResult<haider_protocol::tool::ImageBlockRef> {
+        Err(ToolError::cas(
+            "this artifact sink does not support bounded image ingestion",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2126,6 +2138,7 @@ fn apply_windows_write(
             ),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
@@ -2236,6 +2249,7 @@ fn apply_windows_edit(
             ),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
@@ -3624,6 +3638,7 @@ fn apply_write_at(
             ),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
@@ -3836,6 +3851,7 @@ fn apply_edit_at_with_commit_hooks(
             ),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
@@ -4235,6 +4251,7 @@ fn mutation_result(preview: String) -> BoundedResult {
         preview,
         truncated: false,
         artifact: None,
+        images: Vec::new(),
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
@@ -5173,6 +5190,7 @@ where
             preview: contents,
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
@@ -5189,6 +5207,7 @@ where
         preview: contents[..preview_end].to_owned(),
         truncated: true,
         artifact: Some(artifact),
+        images: Vec::new(),
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
@@ -5211,6 +5230,7 @@ where
             preview: output.preview,
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
@@ -5222,6 +5242,7 @@ where
         preview: output.preview,
         truncated: true,
         artifact: Some(artifact),
+        images: Vec::new(),
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
@@ -5250,6 +5271,7 @@ where
         preview: utf8_prefix(&contents, bounds.max_preview_bytes).to_owned(),
         truncated: true,
         artifact,
+        images: Vec::new(),
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,

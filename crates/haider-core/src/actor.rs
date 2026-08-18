@@ -33,8 +33,10 @@
 //! the [`EventIdGenerator`] namespace: supervisor-installed and shared with
 //! the effect journal in the daemon, self-minted in standalone use.
 
-use crate::{PromptHistoryCompiler, StoreHandle, unix_time_ms};
+use crate::{ArtifactReader, PromptHistoryCompiler, StoreHandle, unix_time_ms};
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerification};
@@ -49,7 +51,8 @@ use haider_protocol::history::{
     CompactionResume, ContinuationCheckpoint, NodeKind, TodoState, TreeNode,
 };
 use haider_protocol::ids::{
-    AgentId, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, NodeId,
+    RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
@@ -61,11 +64,15 @@ use haider_protocol::provider::{
     UsageScope, WEB_SOURCES_EXTENSION_KIND, WebSource,
 };
 use haider_protocol::state::{RunState, WaitReason};
-use haider_protocol::tool::{BoundedResult, ToolResultStatus};
+use haider_protocol::tool::{
+    BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES, TOOL_RESULT_IMAGE_MAX_DIMENSION,
+    ToolResultStatus,
+};
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment,
-    ToolDefinition, TurnRequest, canonical_tool_definitions_digest,
+    ToolDefinition, TurnRequest, apply_tool_result_image_budget, canonical_tool_definitions_digest,
+    degrade_tool_result_images_to_placeholders,
 };
 use haider_tools::{RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -131,6 +138,9 @@ pub struct HarnessConfig {
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
     /// CAS-backed attachments resolved before crossing the provider boundary.
     pub attachments: Vec<ResolvedAttachment>,
+    /// Whether the resolved provider/model accepts vision inputs. Unsupported
+    /// providers receive artifact-naming placeholders for tool images.
+    pub tool_result_images_supported: bool,
     /// Account pinned by the turn-scoped provider resolver.
     pub usage_account: Option<CredentialAlias>,
     /// Non-secret provider/model/auth/cache-domain coordinates attached to
@@ -209,6 +219,7 @@ impl HarnessConfig {
             tools: Vec::new(),
             provider_tool_fallback_tools: Vec::new(),
             attachments: Vec::new(),
+            tool_result_images_supported: false,
             usage_account: None,
             usage_scope: UsageScope::default(),
             cache_stable_history_end: None,
@@ -950,6 +961,9 @@ pub struct HarnessActor {
     provider: Arc<dyn Provider>,
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     store: Arc<dyn StoreHandle>,
+    artifact_reader: Option<Arc<dyn ArtifactReader>>,
+    resolved_tool_images: HashMap<ArtifactRef, ResolvedAttachment>,
+    validated_tool_image_refs: HashMap<ArtifactRef, ImageBlockRef>,
     commands: mpsc::Receiver<ActorCommand>,
     events: broadcast::Sender<RawEnvelope>,
     state: watch::Sender<Option<RunState>>,
@@ -997,6 +1011,18 @@ impl HarnessActor {
         store: Arc<dyn StoreHandle>,
         dispatcher: Option<Arc<dyn ToolDispatcher>>,
     ) -> (Self, HarnessHandle) {
+        Self::new_with_dispatcher_and_artifacts(config, provider, store, dispatcher, None)
+    }
+
+    /// Additive daemon seam for resolving CAS-backed images that appear only
+    /// after a tool runs. Existing embedders retain the text/placeholder path.
+    pub fn new_with_dispatcher_and_artifacts(
+        config: HarnessConfig,
+        provider: Arc<dyn Provider>,
+        store: Arc<dyn StoreHandle>,
+        dispatcher: Option<Arc<dyn ToolDispatcher>>,
+        artifact_reader: Option<Arc<dyn ArtifactReader>>,
+    ) -> (Self, HarnessHandle) {
         let started_at_ms = config.started_at_ms.unwrap_or_else(unix_time_ms);
         let event_ids = config.event_ids.clone().unwrap_or_else(|| {
             Arc::new(EventIdGenerator::new(format!(
@@ -1022,6 +1048,9 @@ impl HarnessActor {
                 provider,
                 dispatcher,
                 store,
+                artifact_reader,
+                resolved_tool_images: HashMap::new(),
+                validated_tool_image_refs: HashMap::new(),
                 commands,
                 events,
                 state,
@@ -1042,6 +1071,202 @@ impl HarnessActor {
             },
             handle,
         )
+    }
+
+    async fn resolve_tool_result_images(
+        &mut self,
+        messages: &mut [Message],
+    ) -> Result<Vec<ResolvedAttachment>, HaiderError> {
+        let mut attachments = self.config.attachments.clone();
+        let images_supported = self.config.tool_result_images_supported;
+
+        let mut all_requested = Vec::<ImageBlockRef>::new();
+        for image in messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::ToolResult { images, .. } => Some(images.as_slice()),
+                _ => None,
+            })
+            .flatten()
+        {
+            if !matches!(image.media_type.as_str(), "image/png" | "image/jpeg")
+                || image.width == 0
+                || image.height == 0
+                || image.width > TOOL_RESULT_IMAGE_MAX_DIMENSION
+                || image.height > TOOL_RESULT_IMAGE_MAX_DIMENSION
+                || image.byte_len == 0
+                || image.byte_len > TOOL_RESULT_IMAGE_MAX_BYTES
+            {
+                return Err(tool_image_corrupt(format!(
+                    "tool image {} carries invalid bounded metadata",
+                    image.artifact
+                )));
+            }
+            if let Some(existing) = all_requested
+                .iter()
+                .find(|existing| existing.artifact == image.artifact)
+            {
+                if existing != image {
+                    return Err(tool_image_corrupt(format!(
+                        "tool image {} has conflicting metadata",
+                        image.artifact
+                    )));
+                }
+            } else {
+                all_requested.push(image.clone());
+            }
+        }
+
+        let reader = self.artifact_reader.as_ref().map(Arc::clone);
+        if let Some(reader) = &reader {
+            for image in &all_requested {
+                if let Some(existing) = self.validated_tool_image_refs.get(&image.artifact) {
+                    if existing != image {
+                        return Err(tool_image_corrupt(format!(
+                            "tool image {} has conflicting metadata",
+                            image.artifact
+                        )));
+                    }
+                    continue;
+                }
+                let bytes = reader.read_artifact(&image.artifact).await.map_err(|_| {
+                    tool_image_corrupt(format!(
+                        "tool image {} is missing from the CAS",
+                        image.artifact
+                    ))
+                })?;
+                haider_store::validate_image_block(&bytes, image).map_err(|_| {
+                    tool_image_corrupt(format!(
+                        "tool image {} does not match its bounded CAS metadata",
+                        image.artifact
+                    ))
+                })?;
+                self.validated_tool_image_refs
+                    .insert(image.artifact.clone(), image.clone());
+            }
+        } else if images_supported && !all_requested.is_empty() {
+            return Err(tool_image_corrupt(
+                "image-bearing provider context has no CAS artifact reader",
+            ));
+        }
+
+        apply_tool_result_image_budget(messages);
+        if !images_supported {
+            degrade_tool_result_images_to_placeholders(messages);
+            return Ok(attachments);
+        }
+
+        let mut requested = Vec::<ImageBlockRef>::new();
+        for image in messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::ToolResult { images, .. } => Some(images.as_slice()),
+                _ => None,
+            })
+            .flatten()
+        {
+            if !requested
+                .iter()
+                .any(|requested| requested.artifact == image.artifact)
+            {
+                requested.push(image.clone());
+            }
+        }
+        if requested.is_empty() {
+            self.resolved_tool_images.clear();
+            return Ok(attachments);
+        }
+        let Some(reader) = reader else {
+            return Err(tool_image_corrupt(
+                "image-bearing provider context has no CAS artifact reader",
+            ));
+        };
+        self.resolved_tool_images
+            .retain(|artifact, _| requested.iter().any(|image| image.artifact == *artifact));
+        for image in &requested {
+            if self.resolved_tool_images.contains_key(&image.artifact) {
+                continue;
+            }
+            let bytes = reader.read_artifact(&image.artifact).await.map_err(|_| {
+                tool_image_corrupt(format!(
+                    "tool image {} is missing from the CAS",
+                    image.artifact
+                ))
+            })?;
+            haider_store::validate_image_block(&bytes, image).map_err(|_| {
+                tool_image_corrupt(format!(
+                    "tool image {} does not match its bounded CAS metadata",
+                    image.artifact
+                ))
+            })?;
+            self.validated_tool_image_refs
+                .insert(image.artifact.clone(), image.clone());
+            self.resolved_tool_images.insert(
+                image.artifact.clone(),
+                ResolvedAttachment {
+                    artifact: image.artifact.clone(),
+                    data_base64: BASE64.encode(bytes),
+                },
+            );
+        }
+        for image in requested {
+            if attachments
+                .iter()
+                .any(|attachment| attachment.artifact == image.artifact)
+            {
+                continue;
+            }
+            if let Some(resolved) = self.resolved_tool_images.get(&image.artifact) {
+                attachments.push(resolved.clone());
+            }
+        }
+        Ok(attachments)
+    }
+
+    /// Validates every tool-produced image before its ref can enter the
+    /// journal. This is capability- and context-budget-independent: even an
+    /// image omitted from the next provider request must be an honest CAS
+    /// object with exact metadata.
+    async fn admit_tool_result_images(
+        &mut self,
+        images: &[ImageBlockRef],
+    ) -> Result<(), DriveError> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        let Some(reader) = self.artifact_reader.as_ref().map(Arc::clone) else {
+            return Err(DriveError::Store(tool_image_corrupt(
+                "an image-bearing tool result has no CAS artifact reader",
+            )));
+        };
+        for image in images {
+            if let Some(existing) = self.validated_tool_image_refs.get(&image.artifact) {
+                if existing != image {
+                    return Err(DriveError::Store(tool_image_corrupt(format!(
+                        "tool image {} has conflicting metadata",
+                        image.artifact
+                    ))));
+                }
+                continue;
+            }
+            let bytes = reader.read_artifact(&image.artifact).await.map_err(|_| {
+                DriveError::Store(tool_image_corrupt(format!(
+                    "tool image {} is missing from the CAS",
+                    image.artifact
+                )))
+            })?;
+            haider_store::validate_image_block(&bytes, image).map_err(|_| {
+                DriveError::Store(tool_image_corrupt(format!(
+                    "tool image {} does not match its bounded CAS metadata",
+                    image.artifact
+                )))
+            })?;
+            self.validated_tool_image_refs
+                .insert(image.artifact.clone(), image.clone());
+        }
+        Ok(())
     }
 
     /// Spawns [`run`](Self::run) detached; the loop exits (and the task ends)
@@ -1500,13 +1725,28 @@ impl HarnessActor {
             if let Some(tail) = &volatile_user_tail {
                 request_messages.push(Message::user_text(tail.clone()));
             }
+            let request_attachments =
+                match self.resolve_tool_result_images(&mut request_messages).await {
+                    Ok(attachments) => attachments,
+                    Err(error) => {
+                        return self
+                            .errored_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                error,
+                            )
+                            .await;
+                    }
+                };
             let mut provider_request = TurnRequest {
                 messages: request_messages,
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
                 system_prompt: self.config.system_prompt.clone(),
                 tools: self.config.tools.clone(),
-                attachments: self.config.attachments.clone(),
+                attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
             if let Some(rendered) = provider.rendered_cache_prefix_digests(&provider_request) {
@@ -2191,6 +2431,7 @@ impl HarnessActor {
                                         preview,
                                         truncated: false,
                                         artifact: None,
+                                        images: Vec::new(),
                                         cursor: None,
                                         status: if is_error {
                                             ToolResultStatus::Failed
@@ -3341,6 +3582,7 @@ impl HarnessActor {
             preview: safe_detail.clone(),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: ToolResultStatus::Failed,
             reason: Some("malformed JSON — repair attempt 1/1".into()),
@@ -3421,6 +3663,7 @@ impl HarnessActor {
                 .to_string(),
                 truncated: false,
                 artifact: None,
+                images: Vec::new(),
                 cursor: None,
                 status: ToolResultStatus::Rejected,
                 reason: Some(reason),
@@ -3507,6 +3750,7 @@ impl HarnessActor {
                     return Ok(None);
                 }
             };
+            self.admit_tool_result_images(&result.images).await?;
             let call_id = tools[index].call_id.clone();
             self.commit_payload(
                 run_id,
@@ -3524,10 +3768,11 @@ impl HarnessActor {
             self.commit_state(run_id, RunState::Streaming)
                 .await
                 .map_err(DriveError::Store)?;
-            return Ok(Some(Message::tool_result(
+            return Ok(Some(Message::tool_result_with_images(
                 call_id,
                 result.preview,
                 result.truncated,
+                result.images,
             )));
         }
         self.commit_tool_completed(run_id, &tools[index], ToolStatus::Pending)
@@ -3857,6 +4102,7 @@ impl HarnessActor {
                     preview: request.result_echo().to_string(),
                     truncated: false,
                     artifact: None,
+                    images: Vec::new(),
                     cursor: None,
                     status: ToolResultStatus::Completed,
                     reason: None,
@@ -3874,6 +4120,7 @@ impl HarnessActor {
                 .to_string(),
                 truncated: false,
                 artifact: None,
+                images: Vec::new(),
                 cursor: None,
                 status: ToolResultStatus::Rejected,
                 reason: Some(sanitized_failure_message(&error.to_string())),
@@ -3899,10 +4146,11 @@ impl HarnessActor {
         self.commit_tool_completed(run_id, &tools[index], result.status.item_status())
             .await?;
         tools.remove(index);
-        Ok(Message::tool_result(
+        Ok(Message::tool_result_with_images(
             call_id,
             result.preview,
             result.truncated,
+            result.images,
         ))
     }
 
@@ -4052,6 +4300,7 @@ impl HarnessActor {
                 false,
             )));
         };
+        self.admit_tool_result_images(&result.images).await?;
         let call_id = tools[index].call_id.clone();
         self.commit_payload(
             run_id,
@@ -4069,10 +4318,11 @@ impl HarnessActor {
         self.commit_state(run_id, RunState::Streaming)
             .await
             .map_err(DriveError::Store)?;
-        Ok(Message::tool_result(
+        Ok(Message::tool_result_with_images(
             call_id,
             result.preview,
             result.truncated,
+            result.images,
         ))
     }
 
@@ -4389,6 +4639,7 @@ impl HarnessActor {
                             preview: result.clone(),
                             truncated: false,
                             artifact: None,
+                            images: Vec::new(),
                             cursor: None,
                             status: ToolResultStatus::Completed,
                             reason: None,
@@ -4484,6 +4735,7 @@ impl HarnessActor {
                 ),
                 truncated: completion.truncated,
                 artifact: None,
+                images: Vec::new(),
                 cursor: None,
                 status: if completion.chip == ChipState::Error {
                     ToolResultStatus::Failed
@@ -5941,12 +6193,8 @@ fn prompt_cache_metadata(
         "reasoning_digest": prefix_digests.reasoning_settings,
         "compaction_epoch": compaction_epoch,
     }));
-    let stable_prefix_tokens = estimate_provider_request_input_tokens(
-        &messages[..stable_history_end],
-        &config.system_prompt,
-        &config.tools,
-        &[],
-    );
+    let stable_prefix_tokens =
+        estimated_request_input_tokens(config, &messages[..stable_history_end]);
     PromptCacheMetadata {
         stable_history_end,
         current_user_start,
@@ -6222,8 +6470,13 @@ fn context_footprint(
 /// provider-reported request-local usage is available. It remains separate
 /// from cumulative billing usage.
 fn estimated_request_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
-    estimate_provider_request_input_tokens(
-        messages,
+    let mut projection = messages.to_vec();
+    apply_tool_result_image_budget(&mut projection);
+    if !config.tool_result_images_supported {
+        degrade_tool_result_images_to_placeholders(&mut projection);
+    }
+    estimate_provider_request_input_tokens_raw(
+        &projection,
         &config.system_prompt,
         &config.tools,
         &config.attachments,
@@ -6241,6 +6494,17 @@ pub fn estimate_provider_request_input_tokens(
     messages: &[Message],
     system_prompt: &Option<String>,
     tools: &[ToolDefinition],
+    attachments: &[ResolvedAttachment],
+) -> u64 {
+    let mut projection = messages.to_vec();
+    apply_tool_result_image_budget(&mut projection);
+    estimate_provider_request_input_tokens_raw(&projection, system_prompt, tools, attachments)
+}
+
+fn estimate_provider_request_input_tokens_raw(
+    messages: &[Message],
+    system_prompt: &Option<String>,
+    tools: &[ToolDefinition],
     _attachments: &[ResolvedAttachment],
 ) -> u64 {
     let bytes = serde_json::to_vec(&(messages, system_prompt, tools))
@@ -6249,15 +6513,14 @@ pub fn estimate_provider_request_input_tokens(
     let image_count = messages
         .iter()
         .flat_map(|message| &message.blocks)
-        .filter(|block| {
-            matches!(
-                block,
-                haider_protocol::provider::Block::Attachment(
-                    haider_protocol::tool::AttachmentBlock::Image { .. }
-                )
-            )
+        .map(|block| match block {
+            haider_protocol::provider::Block::Attachment(
+                haider_protocol::tool::AttachmentBlock::Image { .. },
+            ) => 1,
+            haider_protocol::provider::Block::ToolResult { images, .. } => images.len(),
+            _ => 0,
         })
-        .count();
+        .fold(0_usize, usize::saturating_add);
     let image_tokens = u64::try_from(image_count)
         .unwrap_or(u64::MAX)
         .saturating_mul(VISION_IMAGE_ESTIMATE_TOKENS);
@@ -6444,6 +6707,10 @@ fn tool_error_presentation(subcode: &str, title: &str, detail: &str) -> ErrorPre
     )
 }
 
+fn tool_image_corrupt(message: impl Into<String>) -> HaiderError {
+    HaiderError::new(ErrorCode::StoreCorrupt, message, false)
+}
+
 /// E2 normalization point: every tool result passes through the actor before
 /// it is journaled, so legacy dispatchers cannot accidentally omit the typed
 /// presentation on a non-success result.
@@ -6552,5 +6819,147 @@ fn hidden_prompt_omit_render() -> RenderTargets {
         ui: false,
         durable: true,
         prompt: PromptRender::Omit,
+    }
+}
+
+#[cfg(test)]
+mod cu1_actor_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::MemoryStore;
+    use haider_protocol::tool::TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN;
+    use haider_provider::{FakeProvider, Message};
+    use std::collections::HashMap;
+
+    struct ImageReaderFixture {
+        objects: HashMap<ArtifactRef, Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl ArtifactReader for ImageReaderFixture {
+        async fn read_artifact(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, HaiderError> {
+            self.objects.get(artifact).cloned().ok_or_else(|| {
+                HaiderError::new(ErrorCode::InvalidArgument, "missing fixture image", false)
+            })
+        }
+    }
+
+    fn actor_config(images_supported: bool) -> HarnessConfig {
+        let mut config = HarnessConfig::for_session(
+            SessionId::new("cu1-actor-unit"),
+            DeviceId::new("cu1-device"),
+            1,
+            1,
+        );
+        config.tool_result_images_supported = images_supported;
+        config
+    }
+
+    #[tokio::test]
+    async fn unsupported_actor_without_reader_degrades_refs_before_provider_projection() {
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(Vec::new()));
+        let store: Arc<dyn StoreHandle> = Arc::new(MemoryStore::new());
+        let (mut actor, _handle) = HarnessActor::new(actor_config(false), provider, store);
+        let mut messages = vec![Message::tool_result_with_images(
+            "call-image",
+            "captured",
+            false,
+            (0..=TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN)
+                .map(|index| ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:unresolved-image-{index}")),
+                    media_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 1,
+                })
+                .collect(),
+        )];
+
+        let attachments = actor
+            .resolve_tool_result_images(&mut messages)
+            .await
+            .expect("unsupported provider projection");
+
+        assert!(attachments.is_empty());
+        let Block::ToolResult {
+            preview, images, ..
+        } = &messages[0].blocks[0]
+        else {
+            panic!("expected tool result")
+        };
+        assert!(images.is_empty());
+        assert!(preview.contains("blake3:unresolved-image-0"));
+        assert!(preview.contains("oldest first"));
+        assert_eq!(
+            preview.matches("unavailable to this provider").count(),
+            TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_validates_all_refs_without_caching_then_resolution_caches_only_budget() {
+        let base = BASE64
+            .decode("/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMgD/2wBDAAgoKC8oLzc3Nzc3N0E8QUNDQ0FBQUFDQ0NISEhVVVVISEhDQ0hIUFBVVVxfXFdXVVdfX2RkZHh4c3OMjJGsrM//xABMAAEBAAAAAAAAAAAAAAAAAAAABwEBAQAAAAAAAAAAAAAAAAAABQcQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCAAIABADASIAAhEAAxEA/9oADAMBAAIRAxEAPwCOAL+Kf//Z")
+            .expect("valid JPEG fixture");
+        let mut objects = HashMap::new();
+        let mut images = Vec::new();
+        for index in 0_u8..=TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN as u8 {
+            let mut bytes = base[..base.len() - 2].to_vec();
+            bytes.extend_from_slice(&[0xff, 0xfe, 0x00, 0x03, index]);
+            bytes.extend_from_slice(&[0xff, 0xd9]);
+            let artifact = ArtifactRef::new(format!("blake3:{}", blake3::hash(&bytes).to_hex()));
+            images.push(ImageBlockRef {
+                artifact: artifact.clone(),
+                media_type: "image/jpeg".into(),
+                width: 16,
+                height: 8,
+                byte_len: bytes.len() as u64,
+            });
+            objects.insert(artifact, bytes);
+        }
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(Vec::new()));
+        let store: Arc<dyn StoreHandle> = Arc::new(MemoryStore::new());
+        let reader: Arc<dyn ArtifactReader> = Arc::new(ImageReaderFixture { objects });
+        let (mut actor, _handle) = HarnessActor::new_with_dispatcher_and_artifacts(
+            actor_config(true),
+            provider,
+            store,
+            None,
+            Some(reader),
+        );
+
+        actor
+            .admit_tool_result_images(&images)
+            .await
+            .expect("pre-journal image admission");
+        assert!(actor.resolved_tool_images.is_empty());
+        assert_eq!(actor.validated_tool_image_refs.len(), images.len());
+
+        let mut messages = vec![Message::tool_result_with_images(
+            "call-many-images",
+            "captured",
+            false,
+            images.clone(),
+        )];
+        let attachments = actor
+            .resolve_tool_result_images(&mut messages)
+            .await
+            .expect("budgeted provider resolution");
+        assert_eq!(attachments.len(), TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN);
+        assert_eq!(
+            actor.resolved_tool_images.len(),
+            TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
+        );
+        let Block::ToolResult {
+            preview,
+            images: retained,
+            ..
+        } = &messages[0].blocks[0]
+        else {
+            panic!("expected tool result")
+        };
+        assert_eq!(retained, &images[1..]);
+        assert!(preview.contains(images[0].artifact.as_str()));
     }
 }

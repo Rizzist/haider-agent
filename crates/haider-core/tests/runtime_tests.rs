@@ -2,10 +2,11 @@
 
 use async_trait::async_trait;
 use haider_core::{
-    CommittedRange, ContextCompactor, FinalizationGuard, FinalizationGuardDecision, HarnessActor,
-    HarnessConfig, HarnessHandle, MemoryStore, ProviderAttemptDecision, ProviderAttemptResolver,
-    ResolvedProviderAttempt, StoreHandle, SubmitCommittedTurn, SubmitTurn, ToolDispatchResult,
-    ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
+    ArtifactReader, CommittedRange, ContextCompactor, FinalizationGuard, FinalizationGuardDecision,
+    HarnessActor, HarnessConfig, HarnessHandle, MemoryStore, ProviderAttemptDecision,
+    ProviderAttemptResolver, ResolvedProviderAttempt, StoreHandle, SubmitCommittedTurn, SubmitTurn,
+    ToolDispatchResult, ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS,
+    estimate_provider_request_input_tokens,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -25,7 +26,9 @@ use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
-use haider_protocol::tool::{AttachmentBlock, BoundedResult};
+use haider_protocol::tool::{
+    AttachmentBlock, BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
+};
 use haider_provider::{
     FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderErrorKind, ProviderStream,
     ResolvedAttachment, TurnRequest,
@@ -646,6 +649,35 @@ fn image_footprint_uses_fixed_vision_estimate_not_base64_length() {
     assert_eq!(VISION_IMAGE_ESTIMATE_TOKENS, 1_600);
     assert!(tiny_estimate >= baseline + 1_600);
     assert!(tiny_estimate < baseline + 1_600 + 128);
+}
+
+#[test]
+fn tool_image_footprint_uses_the_same_oldest_first_budget_as_the_request() {
+    let messages = (0..=TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN)
+        .map(|index| {
+            Message::tool_result_with_images(
+                format!("call-{index}"),
+                "capture",
+                false,
+                vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(format!("blake3:image-{index}")),
+                    media_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 1,
+                }],
+            )
+        })
+        .collect::<Vec<_>>();
+    let newest_suffix = messages[1..].to_vec();
+
+    let over_budget = estimate_provider_request_input_tokens(&messages, &None, &[], &[]);
+    let retained = estimate_provider_request_input_tokens(&newest_suffix, &None, &[], &[]);
+
+    assert!(
+        over_budget < retained + 256,
+        "only the bounded omission note differs"
+    );
 }
 
 /// MUTATION CHECK: ignore the reserved output budget when deriving the soft
@@ -1281,6 +1313,7 @@ impl ToolDispatcher for CompletingDispatcher {
             preview: "done".into(),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
@@ -1308,12 +1341,126 @@ impl ToolDispatcher for LargeResultDispatcher {
             preview: self.preview.clone(),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,
             presentation: None,
         }))
     }
+}
+
+struct ForgedImageDispatcher {
+    image: ImageBlockRef,
+}
+
+#[async_trait]
+impl ToolDispatcher for ForgedImageDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: "forged image".into(),
+            truncated: false,
+            artifact: None,
+            images: vec![self.image.clone()],
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        }))
+    }
+}
+
+struct GenericArtifactReader {
+    artifact: ArtifactRef,
+    bytes: Vec<u8>,
+}
+
+#[async_trait]
+impl ArtifactReader for GenericArtifactReader {
+    async fn read_artifact(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, HaiderError> {
+        if artifact == &self.artifact {
+            Ok(self.bytes.clone())
+        } else {
+            Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "missing artifact fixture",
+                false,
+            ))
+        }
+    }
+}
+
+#[tokio::test]
+async fn forged_generic_image_ref_fails_before_any_tool_result_is_journaled() {
+    let bytes = b"generic CAS bytes, not an image".to_vec();
+    let artifact = ArtifactRef::new(format!("blake3:{}", blake3::hash(&bytes).to_hex()));
+    let image = ImageBlockRef {
+        artifact: artifact.clone(),
+        media_type: "image/png".into(),
+        width: 1,
+        height: 1,
+        byte_len: bytes.len() as u64,
+    };
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "forged-image-call".into(),
+            name: "forged_image".into(),
+            args: serde_json::json!({}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let mut harness_config = config();
+    harness_config.tool_result_images_supported = true;
+    let (actor, handle) = HarnessActor::new_with_dispatcher_and_artifacts(
+        harness_config,
+        provider,
+        store.clone(),
+        Some(Arc::new(ForgedImageDispatcher { image })),
+        Some(Arc::new(GenericArtifactReader { artifact, bytes })),
+    );
+    let actor_task = tokio::spawn(actor.run());
+
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("forged-image-run"),
+            messages: vec![Message::user_text("capture")],
+        })
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn terminates");
+
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::StoreCorrupt)
+    );
+    assert!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .all(|event| {
+                !matches!(
+                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    Ok(EventPayload::ToolResult { .. })
+                )
+            })
+    );
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
 }
 
 /// MUTATION CHECK: run the soft check only at logical-turn start. Expected
@@ -2690,6 +2837,7 @@ impl ToolDispatcher for BoundaryRecordingDispatcher {
             preview: "done".into(),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: haider_protocol::tool::ToolResultStatus::Completed,
             reason: None,

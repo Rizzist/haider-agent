@@ -945,6 +945,7 @@ pub(crate) fn gemini_request_json(
                     call_id,
                     preview,
                     truncated,
+                    images,
                 } if matches!(message.role, MessageRole::User | MessageRole::Tool) => {
                     let name = tool_names.get(call_id).ok_or_else(|| {
                         invalid_request(format!(
@@ -960,6 +961,21 @@ pub(crate) fn gemini_request_json(
                             }
                         }
                     }));
+                    for image in images {
+                        if !crate::tool_image_media_type_supported(&image.media_type) {
+                            return Err(invalid_request(format!(
+                                "tool image {} has unsupported media type",
+                                image.artifact
+                            )));
+                        }
+                        let data = resolved_attachment(&attachments, &image.artifact)?;
+                        parts.push(serde_json::json!({
+                            "inlineData": {
+                                "mimeType": image.media_type,
+                                "data": data,
+                            }
+                        }));
+                    }
                 }
                 Block::ToolResult { .. } => {
                     return Err(invalid_request(

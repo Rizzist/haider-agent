@@ -37,8 +37,9 @@ use haider_protocol::project_instructions::{
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, VerifyStep, WaitReason};
 use haider_protocol::tool::{
-    BoundedResult, DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
-    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault, ToolResultStatus,
+    BoundedResult, DispatchMode, ImageBlockRef, RememberedGrantScope, RememberedSessionGrant,
+    ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+    ToolResultStatus,
 };
 use haider_protocol::verify::{Diagnostic, GateReport, Severity, VerifyVerdict};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -481,6 +482,7 @@ fn golden_error_presentation_contract() {
                 preview: "tool failed".into(),
                 truncated: false,
                 artifact: None,
+                images: Vec::new(),
                 cursor: None,
                 status: ToolResultStatus::Failed,
                 reason: Some("legacy safe fallback".into()),
@@ -545,6 +547,45 @@ fn golden_error_presentation_contract() {
                 ),
             },
         }),
+    );
+}
+
+#[test]
+fn golden_image_bearing_tool_result_is_additive_and_legacy_decodes_empty() {
+    additive_golden(
+        "tool_result_with_image",
+        &EventPayload::ToolResult {
+            call_id: "call-screenshot".into(),
+            result: BoundedResult {
+                preview: "captured dashboard".into(),
+                truncated: false,
+                artifact: None,
+                images: vec![ImageBlockRef {
+                    artifact: ArtifactRef::new(
+                        "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ),
+                    media_type: "image/png".into(),
+                    width: 1280,
+                    height: 720,
+                    byte_len: 42_000,
+                }],
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            },
+        },
+    );
+
+    let legacy: BoundedResult = serde_json::from_value(serde_json::json!({
+        "preview": "legacy text-only result",
+        "truncated": false
+    }))
+    .expect("pre-CU-1 bounded result decodes");
+    assert!(legacy.images.is_empty());
+    assert_eq!(
+        serde_json::to_value(&legacy).expect("legacy result encodes"),
+        serde_json::json!({"preview": "legacy text-only result", "truncated": false})
     );
 }
 

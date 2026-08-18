@@ -3,7 +3,7 @@
 //! envelopes; capability documents make degradation explicit, never silent.
 
 use crate::ids::{AgentId, CredentialAlias, RunId};
-use crate::tool::AttachmentBlock;
+use crate::tool::{AttachmentBlock, ImageBlockRef};
 use serde::{Deserialize, Serialize};
 
 /// Stable durable-extension kind used for provider-native continuation state.
@@ -41,6 +41,10 @@ pub enum Block {
         call_id: String,
         preview: String,
         truncated: bool,
+        /// CAS-backed images attached to this exact tool result. Provider
+        /// adapters shape them without moving bytes into the durable message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageBlockRef>,
     },
     Attachment(AttachmentBlock),
     /// Provider-native continuation state, opaque and provider-keyed —

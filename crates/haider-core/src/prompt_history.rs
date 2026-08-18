@@ -1275,10 +1275,11 @@ fn render_journal(
                         args,
                     }]));
                     if let Some(result) = pending_tool_results.remove(&call_id) {
-                        messages.push(Message::tool_result(
+                        messages.push(Message::tool_result_with_images(
                             call_id,
                             result.preview,
                             result.truncated,
+                            result.images,
                         ));
                     }
                 }

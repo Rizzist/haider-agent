@@ -349,12 +349,47 @@ fn content_block(
             "Anthropic tool_use blocks are only valid in assistant messages",
         )),
         Block::ToolResult {
-            call_id, preview, ..
-        } if matches!(role, MessageRole::User | MessageRole::Tool) => Ok(serde_json::json!({
-            "type": "tool_result",
-            "tool_use_id": call_id,
-            "content": preview,
-        })),
+            call_id,
+            preview,
+            images,
+            ..
+        } if matches!(role, MessageRole::User | MessageRole::Tool) => {
+            if images.is_empty() {
+                return Ok(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": preview,
+                }));
+            }
+            let mut content = vec![serde_json::json!({"type": "text", "text": preview})];
+            for image in images {
+                if !crate::tool_image_media_type_supported(&image.media_type) {
+                    return Err(invalid_request(format!(
+                        "tool image {} has unsupported media type",
+                        image.artifact
+                    )));
+                }
+                let data = attachments.get(image.artifact.as_str()).ok_or_else(|| {
+                    invalid_request(format!(
+                        "tool image {} was not resolved before Anthropic shaping",
+                        image.artifact
+                    ))
+                })?;
+                content.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type,
+                        "data": data,
+                    }
+                }));
+            }
+            Ok(serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": content,
+            }))
+        }
         Block::ToolResult { .. } => Err(invalid_request(
             "Anthropic tool_result blocks are only valid in user/tool messages",
         )),

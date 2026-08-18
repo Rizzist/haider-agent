@@ -2615,7 +2615,10 @@ fn responses_request_json(
                     ));
                 }
                 Block::ToolResult {
-                    call_id, preview, ..
+                    call_id,
+                    preview,
+                    images,
+                    ..
                 } if matches!(message.role, MessageRole::User | MessageRole::Tool) => {
                     flush_response_message(&mut input, message.role, &mut content);
                     input.push(serde_json::json!({
@@ -2623,6 +2626,34 @@ fn responses_request_json(
                         "call_id": call_id,
                         "output": preview,
                     }));
+                    if !images.is_empty() {
+                        let image_content = images
+                            .iter()
+                            .map(|image| {
+                                if !crate::tool_image_media_type_supported(&image.media_type) {
+                                    return Err(invalid_request(format!(
+                                        "tool image {} has unsupported media type",
+                                        image.artifact
+                                    )));
+                                }
+                                let data =
+                                    resolved_attachment(&attachments, image.artifact.as_str())?;
+                                Ok(serde_json::json!({
+                                    "type": "input_image",
+                                    "image_url": format!(
+                                        "data:{};base64,{data}",
+                                        image.media_type
+                                    ),
+                                    "detail": "auto",
+                                }))
+                            })
+                            .collect::<Result<Vec<_>, ProviderError>>()?;
+                        input.push(serde_json::json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": image_content,
+                        }));
+                    }
                 }
                 Block::ToolResult { .. } => {
                     return Err(invalid_request(
@@ -2974,8 +3005,11 @@ fn chat_request_json(
                             )));
                         }
                         Block::ToolResult {
-                            call_id, preview, ..
-                        } => results.push((call_id, preview)),
+                            call_id,
+                            preview,
+                            images,
+                            ..
+                        } => results.push((call_id, preview, images)),
                         Block::ProviderOpaque { provider, data }
                             if provider == OPENAI_COMPATIBLE_PROVIDER_NAME && data.is_object() =>
                         {
@@ -2996,24 +3030,31 @@ fn chat_request_json(
                 if !content.is_empty() {
                     messages.push(serde_json::json!({"role": "user", "content": content}));
                 }
-                for (call_id, preview) in results {
+                for (call_id, preview, images) in results {
                     messages.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": preview,
                     }));
+                    append_chat_tool_images(&mut messages, &attachments, images)?;
                 }
             }
             MessageRole::Tool => {
                 for block in &message.blocks {
                     match block {
                         Block::ToolResult {
-                            call_id, preview, ..
-                        } => messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": preview,
-                        })),
+                            call_id,
+                            preview,
+                            images,
+                            ..
+                        } => {
+                            messages.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": preview,
+                            }));
+                            append_chat_tool_images(&mut messages, &attachments, images)?;
+                        }
                         _ => {
                             return Err(invalid_request(
                                 "OpenAI-compatible tool messages require tool-result blocks",
@@ -3086,6 +3127,40 @@ fn chat_request_json(
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
     Ok(payload)
+}
+
+/// OpenAI-compatible ordering law: the tool-role result is immediately
+/// followed by one user-role multimodal image message for that exact result.
+/// No unrelated message may be interposed between the pair.
+fn append_chat_tool_images(
+    messages: &mut Vec<serde_json::Value>,
+    attachments: &HashMap<&str, &str>,
+    images: &[haider_protocol::tool::ImageBlockRef],
+) -> Result<(), ProviderError> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let content = images
+        .iter()
+        .map(|image| {
+            if !crate::tool_image_media_type_supported(&image.media_type) {
+                return Err(invalid_request(format!(
+                    "tool image {} has unsupported media type",
+                    image.artifact
+                )));
+            }
+            let data = resolved_attachment(attachments, image.artifact.as_str())?;
+            Ok(serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{data}", image.media_type),
+                    "detail": "auto",
+                }
+            }))
+        })
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    messages.push(serde_json::json!({"role": "user", "content": content}));
+    Ok(())
 }
 
 fn derive_kimi_session_prompt_cache_key(

@@ -20,7 +20,7 @@ mod event_store;
 mod migrations;
 mod profile_lock;
 
-pub use cas::FileCas;
+pub use cas::{FileCas, validate_image_block};
 pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AccountAddClaim,
@@ -49,6 +49,7 @@ pub use event_store::{
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 
 use haider_protocol::ids::ArtifactRef;
+use haider_protocol::tool::ImageBlockRef;
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-store";
@@ -63,6 +64,15 @@ pub trait Cas: Send + Sync {
 
     /// Durably streams a file into the CAS without loading it as one buffer.
     fn put_file(&self, path: &std::path::Path) -> StoreResult<ArtifactRef>;
+
+    /// Validates, bounds, and durably stores one PNG/JPEG image.
+    fn put_image(&self, _bytes: &[u8], _media_type: &str) -> StoreResult<ImageBlockRef> {
+        Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "this CAS implementation does not admit tool images",
+            false,
+        ))
+    }
 
     /// Reads and verifies bytes. Hash mismatch is reported as store corruption.
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>>;

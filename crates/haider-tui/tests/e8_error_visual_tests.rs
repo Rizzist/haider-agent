@@ -544,6 +544,7 @@ fn e8e_web_fetch_retry_note_on_completed_row_is_dim() {
                     preview: "{}".into(),
                     truncated: false,
                     artifact: None,
+                    images: Vec::new(),
                     cursor: None,
                     status,
                     reason: Some(reason.into()),

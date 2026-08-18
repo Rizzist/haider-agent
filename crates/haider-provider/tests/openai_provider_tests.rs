@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
+use haider_protocol::ids::ArtifactRef;
 use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent};
+use haider_protocol::tool::ImageBlockRef;
 use haider_provider::{
     Message, MessageRole, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, Provider,
-    ProviderError, ProviderErrorKind, ProviderStreamItem, ToolDefinition, TurnRequest,
-    openai_http_client_build_count, replay_deepseek_chat_sse, replay_openai_chat_sse,
-    replay_openai_http_error, replay_openai_models_response, replay_openai_responses_sse,
+    ProviderError, ProviderErrorKind, ProviderStreamItem, ResolvedAttachment, ToolDefinition,
+    TurnRequest, degrade_tool_result_images_to_placeholders, openai_http_client_build_count,
+    replay_deepseek_chat_sse, replay_openai_chat_sse, replay_openai_http_error,
+    replay_openai_models_response, replay_openai_responses_sse,
 };
 use serde::Deserialize;
 
@@ -490,6 +493,203 @@ fn compatible_payload_uses_chat_completions_lingua_franca() {
     assert_eq!(payload["messages"][0]["role"], "system");
     assert_eq!(payload["messages"][1]["role"], "user");
     assert_eq!(payload["stream_options"]["include_usage"], true);
+}
+
+fn image_tool_request(artifact: ArtifactRef) -> TurnRequest {
+    TurnRequest {
+        messages: vec![
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "call_capture".into(),
+                name: "capture".into(),
+                args: serde_json::json!({}),
+            }]),
+            Message::tool_result_with_images(
+                "call_capture",
+                "captured",
+                false,
+                vec![ImageBlockRef {
+                    artifact: artifact.clone(),
+                    media_type: "image/png".into(),
+                    width: 800,
+                    height: 600,
+                    byte_len: 12,
+                }],
+            ),
+        ],
+        model: "image-test".into(),
+        max_tokens: 64,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: vec![ResolvedAttachment {
+            artifact,
+            data_base64: "iVBORw0KGgo=".into(),
+        }],
+        cache_metadata: None,
+    }
+}
+
+#[test]
+fn responses_image_result_is_an_immediately_following_input_image_or_placeholder() {
+    let artifact = ArtifactRef::new("blake3:openai-tool-capture");
+    let mut request = image_tool_request(artifact.clone());
+    request.model = "gpt-5-test".into();
+
+    let payload = native_provider("gpt-5-test")
+        .request_payload(&request)
+        .expect("native image result");
+    assert_eq!(payload["input"][0]["type"], "function_call");
+    assert_eq!(payload["input"][1]["type"], "function_call_output");
+    assert_eq!(payload["input"][2]["type"], "message");
+    assert_eq!(payload["input"][2]["role"], "user");
+    assert_eq!(payload["input"][2]["content"][0]["type"], "input_image");
+    assert_eq!(
+        payload["input"][2]["content"][0]["image_url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
+    assert_eq!(payload["input"][2]["content"][0]["detail"], "auto");
+
+    request.attachments.clear();
+    assert!(
+        native_provider("gpt-5-test")
+            .request_payload(&request)
+            .is_err(),
+        "native missing resolution must fail closed"
+    );
+    degrade_tool_result_images_to_placeholders(&mut request.messages);
+    let payload = native_provider("gpt-5-test")
+        .request_payload(&request)
+        .expect("unsupported image degrades honestly");
+    let placeholder = payload["input"][1]["output"]
+        .as_str()
+        .expect("placeholder text");
+    assert!(placeholder.contains(artifact.as_str()));
+}
+
+#[test]
+fn compatible_chat_orders_tool_then_user_image_or_named_placeholder() {
+    let artifact = ArtifactRef::new("blake3:chat-tool-capture");
+    let request = image_tool_request(artifact.clone());
+    let provider = compatible_provider("image-test", "http://127.0.0.1:12345/v1");
+
+    let payload = provider
+        .request_payload(&request)
+        .expect("compatible image result");
+    assert_eq!(payload["messages"][0]["role"], "assistant");
+    assert_eq!(payload["messages"][1]["role"], "tool");
+    assert_eq!(payload["messages"][1]["tool_call_id"], "call_capture");
+    assert_eq!(payload["messages"][2]["role"], "user");
+    assert_eq!(payload["messages"][2]["content"][0]["type"], "image_url");
+    assert_eq!(
+        payload["messages"][2]["content"][0]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
+    assert_eq!(
+        payload["messages"][2]["content"][0]["image_url"]["detail"],
+        "auto"
+    );
+
+    let mut unsupported = request;
+    unsupported.attachments.clear();
+    assert!(
+        provider.request_payload(&unsupported).is_err(),
+        "native missing resolution must fail closed"
+    );
+    degrade_tool_result_images_to_placeholders(&mut unsupported.messages);
+    let payload = provider
+        .request_payload(&unsupported)
+        .expect("unsupported image degrades honestly");
+    assert_eq!(payload["messages"][1]["role"], "tool");
+    let placeholder = payload["messages"][1]["content"]
+        .as_str()
+        .expect("placeholder text");
+    assert!(placeholder.contains(artifact.as_str()));
+}
+
+#[test]
+fn two_image_results_keep_each_image_message_adjacent_to_its_result() {
+    let first = ArtifactRef::new("blake3:chat-tool-first");
+    let second = ArtifactRef::new("blake3:chat-tool-second");
+    let mut request = image_tool_request(first);
+    request
+        .messages
+        .push(Message::assistant(vec![Block::ToolCall {
+            call_id: "call_capture_2".into(),
+            name: "capture".into(),
+            args: serde_json::json!({}),
+        }]));
+    request.messages.push(Message::tool_result_with_images(
+        "call_capture_2",
+        "captured again",
+        false,
+        vec![ImageBlockRef {
+            artifact: second.clone(),
+            media_type: "image/jpeg".into(),
+            width: 320,
+            height: 200,
+            byte_len: 3,
+        }],
+    ));
+    request.attachments.push(ResolvedAttachment {
+        artifact: second,
+        data_base64: "/9j/".into(),
+    });
+
+    request.model = "gpt-5-test".into();
+    let responses = native_provider("gpt-5-test")
+        .request_payload(&request)
+        .expect("two Responses image results");
+    let response_types = responses["input"]
+        .as_array()
+        .expect("Responses input")
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_types,
+        [
+            "function_call",
+            "function_call_output",
+            "message",
+            "function_call",
+            "function_call_output",
+            "message",
+        ]
+    );
+    assert_eq!(responses["input"][1]["call_id"], "call_capture");
+    assert_eq!(
+        responses["input"][2]["content"][0]["image_url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
+    assert_eq!(responses["input"][4]["call_id"], "call_capture_2");
+    assert_eq!(
+        responses["input"][5]["content"][0]["image_url"],
+        "data:image/jpeg;base64,/9j/"
+    );
+
+    request.model = "image-test".into();
+    let chat = compatible_provider("image-test", "http://127.0.0.1:12345/v1")
+        .request_payload(&request)
+        .expect("two compatible image results");
+    let roles = chat["messages"]
+        .as_array()
+        .expect("chat messages")
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        ["assistant", "tool", "user", "assistant", "tool", "user"]
+    );
+    assert_eq!(chat["messages"][1]["tool_call_id"], "call_capture");
+    assert_eq!(
+        chat["messages"][2]["content"][0]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
+    assert_eq!(chat["messages"][4]["tool_call_id"], "call_capture_2");
+    assert_eq!(
+        chat["messages"][5]["content"][0]["image_url"]["url"],
+        "data:image/jpeg;base64,/9j/"
+    );
 }
 
 #[test]

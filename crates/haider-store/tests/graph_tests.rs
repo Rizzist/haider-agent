@@ -3366,6 +3366,7 @@ fn append_tool_attempt(
                     preview: format!("{tool_name} result"),
                     truncated: false,
                     artifact: None,
+                    images: Vec::new(),
                     cursor: None,
                     status: result_status,
                     reason: (!result_status.is_completed()).then(|| "typed rejection".into()),

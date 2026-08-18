@@ -67,9 +67,14 @@ async fn capability_split_keeps_native_pdf_bytes_and_extracts_elsewhere() {
         artifact.clone(),
         PdfDeliveryMode::NativeDocument,
     )];
-    let resolved = resolve_prompt_attachments(&store, &mut native, FeatureResolve::Native)
-        .await
-        .expect("native shaping");
+    let resolved = resolve_prompt_attachments(
+        &store,
+        &mut native,
+        FeatureResolve::Unsupported,
+        FeatureResolve::Native,
+    )
+    .await
+    .expect("native shaping");
     assert!(matches!(
         native[0].blocks.as_slice(),
         [Block::Attachment(AttachmentBlock::Pdf { .. })]
@@ -83,10 +88,14 @@ async fn capability_split_keeps_native_pdf_bytes_and_extracts_elsewhere() {
     );
 
     let mut emulated = vec![pdf_message(artifact, PdfDeliveryMode::ExtractedText)];
-    let resolved =
-        resolve_prompt_attachments(&store, &mut emulated, FeatureResolve::ExplicitlyEmulated)
-            .await
-            .expect("text shaping");
+    let resolved = resolve_prompt_attachments(
+        &store,
+        &mut emulated,
+        FeatureResolve::Unsupported,
+        FeatureResolve::ExplicitlyEmulated,
+    )
+    .await
+    .expect("text shaping");
     assert!(resolved.is_empty(), "extracted PDFs do not ship base64");
     let Block::Text { text } = &emulated[0].blocks[0] else {
         panic!("fallback must become provider-neutral text");
@@ -106,18 +115,27 @@ async fn image_only_pdf_is_typed_for_extraction_but_valid_natively() {
         artifact.clone(),
         PdfDeliveryMode::ExtractedText,
     )];
-    let error =
-        resolve_prompt_attachments(&store, &mut emulated, FeatureResolve::ExplicitlyEmulated)
-            .await
-            .expect_err("image-only extraction fails");
+    let error = resolve_prompt_attachments(
+        &store,
+        &mut emulated,
+        FeatureResolve::Unsupported,
+        FeatureResolve::ExplicitlyEmulated,
+    )
+    .await
+    .expect_err("image-only extraction fails");
     let presentation = error.presentation.expect("typed presentation");
     assert_eq!(presentation.subcode.as_str(), "pdf-no-extractable-text");
     assert!(presentation.detail.contains("scanned images"));
 
     let mut native = vec![pdf_message(artifact, PdfDeliveryMode::NativeDocument)];
-    let resolved = resolve_prompt_attachments(&store, &mut native, FeatureResolve::Native)
-        .await
-        .expect("native image-only PDF remains valid");
+    let resolved = resolve_prompt_attachments(
+        &store,
+        &mut native,
+        FeatureResolve::Unsupported,
+        FeatureResolve::Native,
+    )
+    .await
+    .expect("native image-only PDF remains valid");
     assert_eq!(resolved.len(), 1);
 }
 

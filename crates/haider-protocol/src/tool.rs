@@ -7,6 +7,20 @@ use crate::ids::ArtifactRef;
 use crate::item::ToolStatus;
 use serde::{Deserialize, Serialize};
 
+/// Maximum encoded size of one image produced by a tool.
+///
+/// This deliberately matches the existing composer attachment ceiling: one
+/// image has one storage and provider-ingress law regardless of its origin.
+pub const TOOL_RESULT_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Maximum width or height retained for a tool-produced image. Larger source
+/// screenshots are downscaled before they enter the CAS.
+pub const TOOL_RESULT_IMAGE_MAX_DIMENSION: u32 = 2_048;
+/// Maximum tool-result images admitted to one provider request.
+pub const TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN: usize = 5;
+/// Maximum encoded tool-result image bytes admitted to one provider request.
+/// This matches the existing composer turn aggregate ceiling.
+pub const TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolManifest {
     pub name: String,
@@ -87,6 +101,10 @@ pub struct BoundedResult {
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
+    /// Bounded image artifacts produced by the tool. The journal stores only
+    /// these metadata refs; provider-bound bytes are resolved from the CAS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageBlockRef>,
     /// Opaque continuation for paging the full result on demand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
@@ -101,6 +119,19 @@ pub struct BoundedResult {
     /// only for backward-compatible decoding of pre-E2 journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ErrorPresentation>,
+}
+
+/// One validated, bounded image in the artifact store.
+///
+/// All fields describe the exact encoded CAS object. Image bytes never ride
+/// this protocol value or any journal envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageBlockRef {
+    pub artifact: ArtifactRef,
+    pub media_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u64,
 }
 
 /// Terminal result status carried independently of the tool-call lifecycle.

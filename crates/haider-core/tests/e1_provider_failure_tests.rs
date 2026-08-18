@@ -40,6 +40,7 @@ impl ToolDispatcher for StatusDispatcher {
             preview: "tool result".into(),
             truncated: false,
             artifact: None,
+            images: Vec::new(),
             cursor: None,
             status: self.status,
             reason: self.reason.clone(),

@@ -11443,6 +11443,14 @@ impl Cas for Store {
         self.cas.put_file(path)
     }
 
+    fn put_image(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> StoreResult<haider_protocol::tool::ImageBlockRef> {
+        self.cas.put_image(bytes, media_type)
+    }
+
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>> {
         self.cas.get(artifact)
     }

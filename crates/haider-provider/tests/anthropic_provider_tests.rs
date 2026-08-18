@@ -11,12 +11,12 @@ use std::time::Duration;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent};
-use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
+use haider_protocol::tool::{AttachmentBlock, ImageBlockRef, PdfDeliveryMode};
 use haider_provider::{
     AnthropicProvider, AnthropicRetryPolicy, BUILTIN_PROVIDER_NAMES, Message, MessageRole,
     Provider, ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
-    anthropic_http_client_build_count, pdf_document_capability, replay_anthropic_http_error,
-    replay_anthropic_sse,
+    anthropic_http_client_build_count, degrade_tool_result_images_to_placeholders,
+    pdf_document_capability, replay_anthropic_http_error, replay_anthropic_sse,
 };
 
 use provider_manifest::Manifest;
@@ -234,6 +234,7 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
                     call_id: "toolu_sanitized".into(),
                     preview: "sunny".into(),
                     truncated: false,
+                    images: Vec::new(),
                 }],
             },
         ],
@@ -273,6 +274,64 @@ fn request_payload_maps_system_tools_tool_results_and_a2_images() {
     assert_eq!(payload["messages"][1]["content"][0]["type"], "tool_use");
     assert_eq!(payload["messages"][2]["role"], "user");
     assert_eq!(payload["messages"][2]["content"][0]["type"], "tool_result");
+}
+
+#[test]
+fn image_bearing_tool_result_uses_native_nested_content_or_named_placeholder() {
+    let provider = provider("claude-sonnet-5");
+    let artifact = ArtifactRef::new("blake3:tool-capture");
+    let result = ImageBlockRef {
+        artifact: artifact.clone(),
+        media_type: "image/png".into(),
+        width: 800,
+        height: 600,
+        byte_len: 12,
+    };
+    let mut request = TurnRequest {
+        messages: vec![
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "toolu_capture".into(),
+                name: "capture".into(),
+                args: serde_json::json!({}),
+            }]),
+            Message::tool_result_with_images("toolu_capture", "captured", false, vec![result]),
+        ],
+        model: "claude-sonnet-5".into(),
+        max_tokens: 64,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: vec![ResolvedAttachment {
+            artifact: artifact.clone(),
+            data_base64: "iVBORw0KGgo=".into(),
+        }],
+        cache_metadata: None,
+    };
+
+    let payload = provider
+        .request_payload(&request)
+        .expect("native image result");
+    let content = &payload["messages"][1]["content"][0]["content"];
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "text", "text": "captured"})
+    );
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["data"], "iVBORw0KGgo=");
+
+    request.attachments.clear();
+    assert!(
+        provider.request_payload(&request).is_err(),
+        "native missing resolution must fail closed"
+    );
+    degrade_tool_result_images_to_placeholders(&mut request.messages);
+    let payload = provider
+        .request_payload(&request)
+        .expect("unsupported image degrades honestly");
+    let placeholder = payload["messages"][1]["content"][0]["content"]
+        .as_str()
+        .expect("placeholder text");
+    assert!(placeholder.contains(artifact.as_str()));
+    assert!(placeholder.contains("unavailable"));
 }
 
 #[test]

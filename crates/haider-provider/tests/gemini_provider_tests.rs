@@ -11,11 +11,12 @@ use std::time::Duration;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent};
-use haider_protocol::tool::AttachmentBlock;
+use haider_protocol::tool::{AttachmentBlock, ImageBlockRef};
 use haider_provider::{
     GeminiProvider, GeminiRetryPolicy, Message, MessageRole, Provider, ProviderError,
     ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
-    gemini_model_http_client_build_count, replay_gemini_http_error, replay_gemini_sse,
+    degrade_tool_result_images_to_placeholders, gemini_model_http_client_build_count,
+    replay_gemini_http_error, replay_gemini_sse,
 };
 
 use provider_manifest::Manifest;
@@ -330,6 +331,67 @@ fn request_payload_maps_system_tools_results_and_inline_images() {
         payload["tools"][0]["functionDeclarations"][0]["parameters"]["required"][0],
         "city"
     );
+}
+
+#[test]
+fn image_bearing_function_response_appends_inline_data_or_named_placeholder() {
+    let artifact = ArtifactRef::new("blake3:gemini-tool-capture");
+    let mut request = TurnRequest {
+        messages: vec![
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "gemini-call-0000000000000009".into(),
+                name: "capture".into(),
+                args: serde_json::json!({}),
+            }]),
+            Message::tool_result_with_images(
+                "gemini-call-0000000000000009",
+                "captured",
+                false,
+                vec![ImageBlockRef {
+                    artifact: artifact.clone(),
+                    media_type: "image/png".into(),
+                    width: 800,
+                    height: 600,
+                    byte_len: 12,
+                }],
+            ),
+        ],
+        model: "gemini-2.5-flash".into(),
+        max_tokens: 64,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: vec![ResolvedAttachment {
+            artifact: artifact.clone(),
+            data_base64: "iVBORw0KGgo=".into(),
+        }],
+        cache_metadata: None,
+    };
+
+    let payload = provider("gemini-2.5-flash")
+        .request_payload(&request)
+        .expect("native image result");
+    let parts = payload["contents"][1]["parts"]
+        .as_array()
+        .expect("tool result parts");
+    assert_eq!(parts[0]["functionResponse"]["name"], "capture");
+    assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+    assert_eq!(parts[1]["inlineData"]["data"], "iVBORw0KGgo=");
+
+    request.attachments.clear();
+    assert!(
+        provider("gemini-2.5-flash")
+            .request_payload(&request)
+            .is_err(),
+        "native missing resolution must fail closed"
+    );
+    degrade_tool_result_images_to_placeholders(&mut request.messages);
+    let payload = provider("gemini-2.5-flash")
+        .request_payload(&request)
+        .expect("unsupported image degrades honestly");
+    let placeholder = payload["contents"][1]["parts"][0]["functionResponse"]["response"]["result"]
+        .as_str()
+        .expect("placeholder text");
+    assert!(placeholder.contains(artifact.as_str()));
 }
 
 #[test]
