@@ -46,16 +46,16 @@ use async_trait::async_trait;
 use base64::Engine;
 use haider_core::{
     AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint,
-    CompiledPromptProjection, ContextCompactionClaim, ContextCompactionReceiptResponse,
-    ContextCompactor, DeferredTicket, DeferredToolResult, EventIdGenerator, FinalizationGuard,
-    FinalizationGuardDecision, GraphEvidenceCommand, GraphEvidenceOutcome,
-    GraphFinalizationCommand, GraphFinalizationOutcome, GraphSwitchCommand, GraphSwitchOutcome,
-    HarnessActor, HarnessConfig, PartialStreamCheckpoint, ProcessSignalCommand,
-    ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
-    estimate_provider_request_input_tokens, presentation_for_haider_error,
-    sanitized_failure_message,
+    CompiledPromptProjection, ComputerEvidenceCommand, ComputerEvidenceOutcome,
+    ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
+    DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
+    GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
+    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
+    presentation_for_haider_error, sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
@@ -67,7 +67,8 @@ use haider_protocol::effect::{
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
-    ProcessSignalRecorded, ProcessSignalRef, WorkspaceMutationRef, process_signal_subject_digest,
+    ComputerObservationKind, GraphNodeName, GraphPhase, ProcessSignalRecorded, ProcessSignalRef,
+    WorkspaceMutationRef, process_signal_subject_digest,
 };
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -87,8 +88,9 @@ use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{
-    BoundedResult, DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
-    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault, ToolResultStatus,
+    BoundedResult, DispatchMode, ImageBlockRef, RememberedGrantScope, RememberedSessionGrant,
+    ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+    ToolResultStatus,
 };
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
@@ -103,13 +105,13 @@ use haider_tools::{
     ComputerOperation, ComputerOutput, EffectBroker, FsCaseMode, FsEdit, FsEditChange, FsGlob,
     FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink,
     MessageSubagent, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
-    SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult,
-    TurnAttribution, WebFetch, WorkflowAuthor,
+    ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent,
+    ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -6083,6 +6085,7 @@ pub(crate) struct BrokerToolFactory;
 #[cfg(test)]
 pub(crate) struct InjectedComputerBrokerToolFactory {
     backend: Arc<dyn ComputerBackend>,
+    screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
 }
 
 #[cfg(test)]
@@ -6092,7 +6095,23 @@ impl BrokerToolFactory {
     pub(crate) fn with_computer_backend(
         backend: Arc<dyn ComputerBackend>,
     ) -> InjectedComputerBrokerToolFactory {
-        InjectedComputerBrokerToolFactory { backend }
+        InjectedComputerBrokerToolFactory {
+            backend,
+            screenshot_redaction: Arc::new(haider_tools::PassthroughScreenshotRedaction),
+        }
+    }
+
+    /// Test seam that pins the production ordering: redact before CU-1 image
+    /// admission, then reuse that exact admitted reference for provider context
+    /// and daemon-authored convergence-graph evidence.
+    pub(crate) fn with_computer_backend_and_redaction(
+        backend: Arc<dyn ComputerBackend>,
+        screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
+    ) -> InjectedComputerBrokerToolFactory {
+        InjectedComputerBrokerToolFactory {
+            backend,
+            screenshot_redaction,
+        }
     }
 }
 
@@ -6524,7 +6543,14 @@ impl TurnToolFactory for BrokerToolFactory {
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
-        create_broker_tool_dispatcher(context, haider_tools::platform_computer_backend()).await
+        let redaction = haider_tools::configured_screenshot_redaction_policy()
+            .map_err(|error| tool_error(ToolError::Computer(error)))?;
+        create_broker_tool_dispatcher(
+            context,
+            haider_tools::platform_computer_backend(),
+            redaction,
+        )
+        .await
     }
 }
 
@@ -6542,13 +6568,19 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
-        create_broker_tool_dispatcher(context, Arc::clone(&self.backend)).await
+        create_broker_tool_dispatcher(
+            context,
+            Arc::clone(&self.backend),
+            Arc::clone(&self.screenshot_redaction),
+        )
+        .await
     }
 }
 
 async fn create_broker_tool_dispatcher(
     context: WorkerToolContext,
     computer: Arc<dyn ComputerBackend>,
+    screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
 ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
     let durable_permissions =
         durable_session_tool_state(&context.store, context.store.session_id()).await?;
@@ -6587,7 +6619,8 @@ async fn create_broker_tool_dispatcher(
         broker: Mutex::new(Some(broker)),
         web_search: context.web_search.clone(),
         computer,
-        active_computer_turn_cancel: Mutex::new(None),
+        screenshot_redaction,
+        active_computer_turn_cancel: StdMutex::new(None),
         policy: Mutex::new(policy),
         cas: Mutex::new(HubArtifactStore {
             store: context.store,
@@ -6637,11 +6670,12 @@ struct BrokerToolDispatcher {
     broker: Mutex<Option<EffectBroker>>,
     web_search: Option<Arc<dyn WebSearchExecutor>>,
     computer: Arc<dyn ComputerBackend>,
+    screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
     /// Core's authoritative turn cancellation signal for the currently
     /// dispatched computer action. It survives cancellation dropping the
     /// execute future, allowing `close` to distinguish ESC from a panic or
     /// transport failure and preserve honest Cancelled vs Unknown outcomes.
-    active_computer_turn_cancel: Mutex<Option<CancelToken>>,
+    active_computer_turn_cancel: StdMutex<Option<CancelToken>>,
     policy: Mutex<PermissionPolicy>,
     cas: Mutex<HubArtifactStore>,
     ledger: ChangeLedger,
@@ -6655,6 +6689,143 @@ struct BrokerToolDispatcher {
     tasks: crate::tasks::TaskFacade,
     grant: Option<Grant>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
+}
+
+#[derive(Debug, Clone)]
+struct ComputerGraphTarget {
+    graph_id: GraphId,
+    node: GraphNodeName,
+    attempt: u32,
+}
+
+struct ComputerObservationRecord<'a> {
+    run_id: &'a RunId,
+    call_id: &'a str,
+    intent: &'a EffectIntent,
+    target: Option<ComputerGraphTarget>,
+    observation: ComputerObservationKind,
+    image: &'a ImageBlockRef,
+    detail: String,
+}
+
+impl BrokerToolDispatcher {
+    async fn computer_graph_target(&self) -> ToolResult<Option<ComputerGraphTarget>> {
+        let status = self
+            .output
+            .store
+            .hub()
+            .graph_status(&self.session_id)
+            .await
+            .map_err(|error| ToolError::Runtime {
+                message: format!("cannot snapshot computer graph target: {error}"),
+            })?;
+        Ok(status.and_then(|status| {
+            let node = status.current_node.clone()?;
+            (status.phase == GraphPhase::Active && status.node_is_ready(&node)).then_some(
+                ComputerGraphTarget {
+                    graph_id: status.graph_id,
+                    node,
+                    attempt: status.attempt,
+                },
+            )
+        }))
+    }
+
+    async fn admit_computer_screenshot(
+        &self,
+        png: Vec<u8>,
+        cancel: &ComputerCancelToken,
+    ) -> ToolResult<ImageBlockRef> {
+        cancel.check().map_err(ToolError::Computer)?;
+        let policy = Arc::clone(&self.screenshot_redaction);
+        let redacted = tokio::task::spawn_blocking(move || {
+            policy.redact_png(&png).map(std::borrow::Cow::into_owned)
+        })
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: format!("screenshot redaction worker failed: {error}"),
+        })?
+        .map_err(ToolError::Computer)?;
+        cancel.check().map_err(ToolError::Computer)?;
+        let mut cas = self.cas.lock().await;
+        cas.put_image(&redacted, "image/png").await
+    }
+
+    async fn record_computer_observation(
+        &self,
+        record: ComputerObservationRecord<'_>,
+    ) -> ToolResult<()> {
+        let ComputerObservationRecord {
+            run_id,
+            call_id,
+            intent,
+            target,
+            observation,
+            image,
+            detail,
+        } = record;
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let request_json = serde_json::json!({
+            "run_id": run_id,
+            "call_id": call_id,
+            "effect_id": intent.effect,
+            "effect_args_digest": intent.args_digest,
+            "graph_id": target.graph_id,
+            "node": target.node,
+            "attempt": target.attempt,
+            "observation": observation,
+            "image": image,
+        })
+        .to_string();
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let mut identity = blake3::Hasher::new();
+        for part in [
+            self.session_id.as_str(),
+            run_id.as_str(),
+            call_id,
+            intent.effect.as_str(),
+        ] {
+            identity.update(&(part.len() as u64).to_be_bytes());
+            identity.update(part.as_bytes());
+        }
+        let command = ComputerEvidenceCommand {
+            command_id: format!("computer-evidence-{}", identity.finalize().to_hex()),
+            request_digest,
+            request_json,
+            session_id: self.session_id.clone(),
+            worker_generation: self.output.store.worker_generation(),
+            run_id: run_id.clone(),
+            call_id: call_id.to_owned(),
+            effect_id: intent.effect.clone(),
+            effect_args_digest: intent.args_digest.clone(),
+            graph_id: target.graph_id,
+            node: target.node,
+            attempt: target.attempt,
+            observation,
+            image: image.clone(),
+            detail,
+            device_id: self.output.device_id.clone(),
+        };
+        match self
+            .output
+            .store
+            .hub()
+            .record_computer_evidence(command)
+            .await
+        {
+            Ok(ComputerEvidenceOutcome::Committed { .. })
+            | Ok(ComputerEvidenceOutcome::IdempotentReplay { .. })
+            | Ok(ComputerEvidenceOutcome::StaleGraph) => Ok(()),
+            Err(SessionHubError::Store(error)) => Err(ToolError::Runtime {
+                message: error.message,
+            }),
+            Err(error) => Err(ToolError::Runtime {
+                message: error.to_string(),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -7511,17 +7682,43 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     let intent = broker
                         .begin_computer(&operation, &policy, action_cancel.clone())
                         .await?;
-                    *self.active_computer_turn_cancel.lock().await = Some(cancel.clone());
+                    *self
+                        .active_computer_turn_cancel
+                        .lock()
+                        .map_err(|_| ToolError::Runtime {
+                            message: "computer cancellation state lock is poisoned".into(),
+                        })? = Some(cancel.clone());
+                    let graph_target = if matches!(
+                        operation.action(),
+                        haider_protocol::computer::ComputerAction::Screenshot
+                            | haider_protocol::computer::ComputerAction::Inspect { .. }
+                    ) {
+                        match self.computer_graph_target().await {
+                            Ok(target) => target,
+                            Err(error) => {
+                                broker
+                                    .journal_computer_outcome(
+                                        &intent,
+                                        EffectOutcome::Failed {
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     match self
                         .computer
                         .execute(operation.action(), &action_cancel)
                         .await
                     {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
-                            let stored = {
-                                let mut cas = self.cas.lock().await;
-                                cas.put_image(&png, "image/png").await
-                            };
+                            let stored = self
+                                .admit_computer_screenshot(png, &action_cancel)
+                                .await;
                             match stored {
                                 Ok(image) => {
                                     if let Err(error) =
@@ -7541,6 +7738,21 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         broker
                                             .journal_computer_outcome(&intent, EffectOutcome::Ok)
                                             .await?;
+                                        self.record_computer_observation(
+                                            ComputerObservationRecord {
+                                                run_id,
+                                                call_id,
+                                                intent: &intent,
+                                                target: graph_target,
+                                                observation: ComputerObservationKind::Screenshot,
+                                                image: &image,
+                                                detail: format!(
+                                                "computer screenshot captured ({}x{})",
+                                                image.width, image.height
+                                                ),
+                                            },
+                                        )
+                                        .await?;
                                         Ok(BoundedResult {
                                             preview: format!(
                                                 "screenshot captured ({}x{})",
@@ -7584,26 +7796,90 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 presentation: None,
                             })
                         }
-                        Ok(ComputerOutput::Inspection(inspection)) => {
-                            broker
-                                .journal_computer_outcome(&intent, EffectOutcome::Ok)
-                                .await?;
-                            Ok(BoundedResult {
-                                preview: serde_json::to_string(&inspection).map_err(|error| {
-                                    ToolError::Runtime {
-                                        message: format!(
-                                            "could not encode computer accessibility inspection: {error}"
-                                        ),
+                        Ok(ComputerOutput::Inspection {
+                            inspection,
+                            screenshot_png,
+                        }) => {
+                            let stored = self
+                                .admit_computer_screenshot(screenshot_png, &action_cancel)
+                                .await;
+                            match stored {
+                                Ok(image) => {
+                                    if let Err(error) =
+                                        self.computer.set_viewport(image.width, image.height)
+                                    {
+                                        let tool_error = ToolError::Computer(error.clone());
+                                        broker
+                                            .journal_computer_outcome(
+                                                &intent,
+                                                EffectOutcome::Failed {
+                                                    error: tool_error.to_string(),
+                                                },
+                                            )
+                                            .await?;
+                                        Ok(computer_failure_result(&error))
+                                    } else {
+                                        let preview = match serde_json::to_string(&inspection) {
+                                            Ok(preview) => preview,
+                                            Err(error) => {
+                                                let error = ToolError::Runtime {
+                                                message: format!(
+                                                    "could not encode computer accessibility inspection: {error}"
+                                                ),
+                                                };
+                                                broker
+                                                    .journal_computer_outcome(
+                                                        &intent,
+                                                        EffectOutcome::Failed {
+                                                            error: error.to_string(),
+                                                        },
+                                                    )
+                                                    .await?;
+                                                return Err(error);
+                                            }
+                                        };
+                                        broker
+                                            .journal_computer_outcome(&intent, EffectOutcome::Ok)
+                                            .await?;
+                                        self.record_computer_observation(
+                                            ComputerObservationRecord {
+                                                run_id,
+                                                call_id,
+                                                intent: &intent,
+                                                target: graph_target,
+                                                observation: ComputerObservationKind::Inspect,
+                                                image: &image,
+                                                detail: format!(
+                                                "computer inspection captured with screenshot ({}x{})",
+                                                image.width, image.height
+                                                ),
+                                            },
+                                        )
+                                        .await?;
+                                        Ok(BoundedResult {
+                                            preview,
+                                            truncated: false,
+                                            artifact: None,
+                                            images: vec![image],
+                                            cursor: None,
+                                            status: ToolResultStatus::Completed,
+                                            reason: None,
+                                            presentation: None,
+                                        })
                                     }
-                                })?,
-                                truncated: false,
-                                artifact: None,
-                                images: Vec::new(),
-                                cursor: None,
-                                status: ToolResultStatus::Completed,
-                                reason: None,
-                                presentation: None,
-                            })
+                                }
+                                Err(error) => {
+                                    broker
+                                        .journal_computer_outcome(
+                                            &intent,
+                                            EffectOutcome::Failed {
+                                                error: error.to_string(),
+                                            },
+                                        )
+                                        .await?;
+                                    Err(error)
+                                }
+                            }
                         }
                         Ok(ComputerOutput::Confirmed { action }) => {
                             broker
@@ -7789,14 +8065,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
     async fn close(&self) -> Result<(), HaiderError> {
         let emergency_stop = self.computer.emergency_stop().await;
         let mut broker_guard = self.broker.lock().await;
-        if self
+        let computer_turn_cancelled = self
             .active_computer_turn_cancel
             .lock()
-            .await
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "computer cancellation state lock is poisoned",
+                    false,
+                )
+            })?
             .as_ref()
-            .is_some_and(CancelToken::is_cancelled)
-            && let Some(broker) = broker_guard.as_mut()
-        {
+            .is_some_and(CancelToken::is_cancelled);
+        if computer_turn_cancelled && let Some(broker) = broker_guard.as_mut() {
             broker.cancel_computer_actions();
         }
         let broker = broker_guard.take();

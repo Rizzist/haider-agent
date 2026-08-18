@@ -126,6 +126,11 @@ pub struct PeerCredentials {
     pub pid: Option<u32>,
     pub uid: u32,
     pub gid: u32,
+    /// Windows has no Unix UID on a pipe. The platform backend compares the
+    /// peer process TokenUser SID with the daemon process SID and stores only
+    /// the authenticated equality result.
+    #[cfg(windows)]
+    pub(crate) same_user: bool,
 }
 
 #[cfg(unix)]
@@ -136,8 +141,8 @@ pub fn peer_credentials_are_owner(credentials: &PeerCredentials, owner_uid: u32)
 
 #[cfg(windows)]
 #[must_use]
-pub fn peer_credentials_are_owner(_credentials: &PeerCredentials, _owner_uid: u32) -> bool {
-    true
+pub fn peer_credentials_are_owner(credentials: &PeerCredentials, _owner_uid: u32) -> bool {
+    credentials.same_user
 }
 
 #[cfg(test)]
@@ -168,5 +173,17 @@ mod tests {
             Endpoint::new("ignored", profile).address(),
             Path::new(&format!(r"\\.\pipe\haider-{}", &digest.as_str()[..32]))
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_owner_predicate_fails_closed_on_a_mismatched_sid() {
+        let credentials = super::PeerCredentials {
+            pid: Some(7),
+            uid: u32::MAX,
+            gid: u32::MAX,
+            same_user: false,
+        };
+        assert!(!super::peer_credentials_are_owner(&credentials, u32::MAX));
     }
 }

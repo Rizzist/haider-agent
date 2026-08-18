@@ -881,16 +881,21 @@ pub(crate) async fn serve(
     context: ConnectionContext,
     drain: watch::Receiver<Option<DrainNotice>>,
 ) -> Result<ConnectionExit, DaemonError> {
-    let credentials = haider_platform::peer_credentials(&stream).map_err(|error| {
-        DaemonError::io("read Unix peer credentials", &context.endpoint_path, error)
-    })?;
+    #[cfg(unix)]
+    let peer_operation = "read Unix peer credentials";
+    #[cfg(windows)]
+    let peer_operation = "authenticate Windows named-pipe peer token";
+    let credentials = haider_platform::peer_credentials(&stream)
+        .map_err(|error| DaemonError::io(peer_operation, &context.endpoint_path, error))?;
     if !haider_platform::peer_credentials_are_owner(&credentials, context.owner_uid) {
-        return Err(DaemonError::Protocol {
-            message: format!(
-                "refusing peer uid {}, endpoint owner is {}",
-                credentials.uid, context.owner_uid
-            ),
-        });
+        #[cfg(unix)]
+        let message = format!(
+            "refusing peer uid {}, endpoint owner is {}",
+            credentials.uid, context.owner_uid
+        );
+        #[cfg(windows)]
+        let message = "refusing named-pipe peer not owned by the daemon user".into();
+        return Err(DaemonError::Protocol { message });
     }
 
     let (reader, writer) = haider_platform::split(stream);

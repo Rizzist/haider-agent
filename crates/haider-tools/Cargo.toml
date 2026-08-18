@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "haider-wayland-portal"
+path = "src/bin/haider-wayland-portal.rs"
+test = false
+bench = false
+
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
@@ -40,6 +46,11 @@ windows-sys = { workspace = true, features = [
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true, features = ["mm"] }
+
+[dev-dependencies]
+# Compile the Linux backend (including Wayland selection) in host unit-test
+# builds even when the Linux standard library target is unavailable locally.
+x11rb.workspace = true
 
 [lints]
 workspace = true

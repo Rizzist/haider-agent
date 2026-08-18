@@ -15,7 +15,9 @@ use crate::{Cas, StoreResult, store_error};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::tool::{
-    ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES, TOOL_RESULT_IMAGE_MAX_DIMENSION,
+    ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES, TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC,
+    TOOL_RESULT_IMAGE_MAX_DIMENSION, TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES,
+    TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat, ImageReader, Limits};
@@ -34,10 +36,6 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Input bytes are bounded before format probing or decoding. The larger
 /// source allowance lets ordinary lossless screenshots be recompressed and
 /// downscaled into the existing 5 MiB artifact ceiling.
-pub const TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-const TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS: u64 = 40_000_000;
-const TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
-
 /// Filesystem content-addressed storage rooted at `<profile>/cas`.
 #[derive(Debug, Clone)]
 pub struct FileCas {

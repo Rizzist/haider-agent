@@ -15,17 +15,18 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
     AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
     CancelledTurn, Cas, ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
-    ChildTemplateObservation, ChildTemplateObservationCommand, ContextCompactionClaim,
-    ContextCompactionReceiptResponse, DelegationCreateOutcome, DelegationRecord, EventStore,
-    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
-    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
-    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
-    GraphSwitchOutcome, HookTrustChange, HookTrustCommand, MenuResolutionCommand,
-    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
-    RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
-    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    ChildTemplateObservation, ChildTemplateObservationCommand, ComputerEvidenceCommand,
+    ComputerEvidenceOutcome, ContextCompactionClaim, ContextCompactionReceiptResponse,
+    DelegationCreateOutcome, DelegationRecord, EventStore, GraphAbandonCommand,
+    GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand,
+    GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand, GraphPinOutcome,
+    GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome,
+    HookTrustChange, HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome,
+    ProcessSignalCommand, ProcessSignalOutcome, ProfileLease, RunRetryCommand, RunRetryOutcome,
+    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -388,6 +389,15 @@ impl SqliteStoreHandle {
     ) -> Result<GraphEvidenceOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.record_graph_evidence(&command))).await
+    }
+
+    pub async fn record_computer_evidence(
+        &self,
+        command: ComputerEvidenceCommand,
+    ) -> Result<ComputerEvidenceOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.record_computer_evidence(&command)))
+            .await
     }
 
     pub async fn record_process_signal(

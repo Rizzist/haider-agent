@@ -10,7 +10,15 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use tokio::sync::Mutex;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE,
+};
+use windows_sys::Win32::Security::{
+    EqualSid, GetTokenInformation, IsValidSid, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 const BIND_RETRY_WINDOW: Duration = Duration::from_secs(3);
 const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -201,17 +209,194 @@ pub fn peer_credentials(stream: &IpcStream) -> io::Result<PeerCredentials> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Windows named-pipe peer reported process id zero",
+        ));
+    }
+    let same_user = peer_process_has_current_user_sid(pid)?;
     Ok(PeerCredentials {
-        pid: (pid != 0).then_some(pid),
+        pid: Some(pid),
         uid: u32::MAX,
         gid: u32::MAX,
+        same_user,
     })
 }
 
-pub fn peer_is_owner(_stream: &IpcStream, _owner_uid: u32) -> io::Result<bool> {
-    // Access is enforced by the named pipe's token-derived DACL. A future
-    // hardening pass can compare peer process tokens explicitly.
-    Ok(true)
+pub fn peer_is_owner(stream: &IpcStream, _owner_uid: u32) -> io::Result<bool> {
+    peer_credentials(stream).map(|credentials| credentials.same_user)
+}
+
+struct OwnedHandle(HANDLE);
+
+impl OwnedHandle {
+    fn new(handle: HANDLE, operation: &'static str) -> io::Result<Self> {
+        if handle.is_null() {
+            let error = io::Error::last_os_error();
+            Err(io::Error::new(
+                error.kind(),
+                format!("{operation}: {error}"),
+            ))
+        } else {
+            Ok(Self(handle))
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: OwnedHandle is constructed only for real owned process or
+        // token handles and never wraps the GetCurrentProcess pseudo-handle.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+struct TokenUserBuffer {
+    // TOKEN_USER contains pointer-aligned fields. usize storage preserves the
+    // alignment required before casting the returned bytes.
+    words: Vec<usize>,
+}
+
+impl TokenUserBuffer {
+    #[allow(unsafe_code)]
+    fn sid(&self) -> io::Result<PSID> {
+        if self.words.len().saturating_mul(size_of::<usize>()) < size_of::<TOKEN_USER>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows token returned a truncated TokenUser record",
+            ));
+        }
+        // SAFETY: storage is usize-aligned, GetTokenInformation initialized at
+        // least TOKEN_USER bytes, and storage remains alive for the SID use.
+        let sid = unsafe { (*(self.words.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        if sid.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows token returned a null user SID",
+            ));
+        }
+        // SAFETY: the pointer is owned by the live TokenUser buffer.
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows token returned an invalid user SID",
+            ));
+        }
+        Ok(sid)
+    }
+}
+
+#[allow(unsafe_code)]
+fn open_process_token(process: HANDLE) -> io::Result<OwnedHandle> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: process is a live process handle or the documented current
+    // process pseudo-handle, and token is a writable out pointer.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    OwnedHandle::new(token, "open Windows process token")
+}
+
+#[allow(unsafe_code)]
+fn token_user(token: HANDLE) -> io::Result<TokenUserBuffer> {
+    let mut required = 0_u32;
+    // SAFETY: the null/zero first call is the documented size query.
+    let first =
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required) };
+    if first != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows TokenUser size query unexpectedly succeeded without a buffer",
+        ));
+    }
+    let size_error = io::Error::last_os_error();
+    if size_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed())
+        || usize::try_from(required).unwrap_or(0) < size_of::<TOKEN_USER>()
+    {
+        return Err(size_error);
+    }
+    let required = usize::try_from(required).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows TokenUser size does not fit memory",
+        )
+    })?;
+    let word_count = required.div_ceil(size_of::<usize>());
+    let mut buffer = TokenUserBuffer {
+        words: vec![0; word_count],
+    };
+    let byte_len = u32::try_from(buffer.words.len().saturating_mul(size_of::<usize>()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TokenUser buffer is too large"))?;
+    let mut returned = 0_u32;
+    // SAFETY: the aligned buffer is writable for byte_len bytes; the token is
+    // live and queried only for TOKEN_QUERY information.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.words.as_mut_ptr().cast(),
+            byte_len,
+            &mut returned,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if returned < u32::try_from(size_of::<TOKEN_USER>()).unwrap_or(u32::MAX) || returned > byte_len
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows token returned an inconsistent TokenUser size",
+        ));
+    }
+    buffer.sid()?;
+    Ok(buffer)
+}
+
+#[allow(unsafe_code)]
+fn token_user_sids_equal(left: &TokenUserBuffer, right: &TokenUserBuffer) -> io::Result<bool> {
+    sids_equal(left.sid()?, right.sid()?)
+}
+
+#[allow(unsafe_code)]
+fn sids_equal(left: PSID, right: PSID) -> io::Result<bool> {
+    if left.is_null() || right.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cannot compare a null Windows SID",
+        ));
+    }
+    if unsafe { IsValidSid(left) } == 0 || unsafe { IsValidSid(right) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cannot compare an invalid Windows SID",
+        ));
+    }
+    // SAFETY: both pointers name valid SIDs kept alive by their callers.
+    Ok(unsafe { EqualSid(left, right) } != 0)
+}
+
+#[allow(unsafe_code)]
+fn peer_process_has_current_user_sid(pid: u32) -> io::Result<bool> {
+    // There is a narrow PID-exit/reuse window before OpenProcess succeeds.
+    // Once acquired, this handle pins the process identity for token lookup.
+    // SAFETY: OpenProcess receives a concrete kernel-reported peer PID and no
+    // inherited handle is requested.
+    let peer_process = OwnedHandle::new(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) },
+        "open Windows named-pipe peer process",
+    )?;
+    let peer_token = open_process_token(peer_process.0)?;
+    // SAFETY: GetCurrentProcess returns the documented pseudo-handle. It is
+    // passed through but never wrapped or closed.
+    let current_token = open_process_token(unsafe { GetCurrentProcess() })?;
+    let peer_user = token_user(peer_token.0)?;
+    let current_user = token_user(current_token.0)?;
+    token_user_sids_equal(&peer_user, &current_user)
 }
 
 pub fn write_immediate(stream: &IpcStream, bytes: &[u8]) {
@@ -234,12 +419,16 @@ mod tests {
 
     use super::{
         BIND_RETRY_INTERVAL, BIND_RETRY_WINDOW, BoundEndpoint, bind_first_instance, connect,
-        pipe_name, retryable_bind_error,
+        peer_credentials, peer_is_owner, pipe_name, retryable_bind_error, sids_equal,
     };
-    use crate::ipc::Endpoint;
+    use crate::ipc::{Endpoint, peer_credentials_are_owner};
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, PSID, SECURITY_MAX_SID_SIZE, WELL_KNOWN_SID_TYPE, WinLocalServiceSid,
+        WinLocalSystemSid,
+    };
 
     static NEXT_ENDPOINT: AtomicU64 = AtomicU64::new(1);
 
@@ -350,5 +539,57 @@ mod tests {
             .expect("retained listener accepts");
         drop((client, server));
         bound.close_listener();
+    }
+
+    #[allow(unsafe_code)]
+    fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Vec<usize> {
+        let words = usize::try_from(SECURITY_MAX_SID_SIZE)
+            .expect("SID ceiling fits usize")
+            .div_ceil(size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let mut bytes = SECURITY_MAX_SID_SIZE;
+        // SAFETY: storage is aligned and writable for SECURITY_MAX_SID_SIZE;
+        // a null domain SID is documented for well-known absolute SIDs.
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    kind,
+                    std::ptr::null_mut(),
+                    storage.as_mut_ptr().cast(),
+                    &mut bytes,
+                )
+            },
+            0,
+            "create well-known SID"
+        );
+        storage
+    }
+
+    #[test]
+    fn sid_compare_accepts_same_sid_and_rejects_different_sid() {
+        let system = well_known_sid(WinLocalSystemSid);
+        let service = well_known_sid(WinLocalServiceSid);
+        let system_sid: PSID = system.as_ptr().cast_mut().cast();
+        let service_sid: PSID = service.as_ptr().cast_mut().cast();
+        assert!(sids_equal(system_sid, system_sid).expect("same SID comparison"));
+        assert!(!sids_equal(system_sid, service_sid).expect("different SID comparison"));
+    }
+
+    #[tokio::test]
+    async fn same_process_pipe_peers_pass_token_owner_check_in_both_directions() {
+        let endpoint = unique_endpoint("same-token-owner");
+        let bound = BoundEndpoint::bind(&endpoint, Path::new("ignored"))
+            .await
+            .expect("bind named pipe");
+        let (client, accepted) = tokio::join!(connect(endpoint.address()), bound.accept());
+        let client = client.expect("connect same-process client");
+        let (server, ()) = accepted.expect("accept same-process client");
+
+        for stream in [&client, &server] {
+            let credentials = peer_credentials(stream).expect("query peer token");
+            assert_eq!(credentials.pid, Some(std::process::id()));
+            assert!(peer_credentials_are_owner(&credentials, u32::MAX));
+            assert!(peer_is_owner(stream, u32::MAX).expect("compare peer owner"));
+        }
     }
 }

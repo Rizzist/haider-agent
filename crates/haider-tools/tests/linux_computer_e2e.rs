@@ -78,6 +78,15 @@ async fn xvfb_real_pixels_pointer_click_and_keyboard_round_trip() {
         Ok("1"),
         "the ignored Linux computer e2e must only run when HAIDER_CU_E2E=1"
     );
+    assert!(
+        std::env::var_os("WAYLAND_DISPLAY").is_none_or(|value| value.is_empty()),
+        "the Xvfb harness must exercise X11, not the Wayland portal path"
+    );
+    assert_ne!(
+        std::env::var("XDG_SESSION_TYPE").as_deref(),
+        Ok("wayland"),
+        "the Xvfb harness must explicitly select an X11 session"
+    );
     let display = match std::env::var("DISPLAY") {
         Ok(display) => display,
         Err(error) => panic!("Xvfb must provide DISPLAY: {error}"),

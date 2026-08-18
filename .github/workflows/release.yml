@@ -33,9 +33,9 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
-      - name: install Linux system deps (ALSA)
+      - name: install Linux system deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libglib2.0-dev pkg-config
       - name: tag matches workspace version (tag builds only)
         if: github.event_name == 'push'
         shell: bash
@@ -44,6 +44,9 @@ jobs:
           grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
       - name: build
         run: cargo build --release --locked -p haider-cli -p haider-daemond --target ${{ matrix.target }}
+      - name: build Wayland portal companion (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked -p haider-tools --bin haider-wayland-portal --target ${{ matrix.target }}
       - name: ad-hoc codesign (macOS only — quarantine-friendly unsigned distribution)
         if: runner.os == 'macOS'
         run: |
@@ -68,6 +71,7 @@ jobs:
           EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
           BIN=target/${{ matrix.target }}/release/haider$EXE
           DBIN=target/${{ matrix.target }}/release/haiderd$EXE
+          WBIN=target/${{ matrix.target }}/release/haider-wayland-portal
           REF="${GITHUB_REF_NAME:-manual}"
           NAME=haider-${REF}-${{ matrix.target }}
           mkdir -p dist/$NAME
@@ -75,6 +79,7 @@ jobs:
           # current_exe() (haider-client/src/spawn.rs) — a bundle without the
           # daemon cannot enter live mode (v0.0.12 first-cut gap).
           cp "$BIN" "$DBIN" dist/$NAME/
+          if [ "$RUNNER_OS" = "Linux" ]; then cp "$WBIN" dist/$NAME/; fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             # Zip is the native Windows archive expectation; Explorer opens it
             # without extra tooling and sha256sum ships with Git Bash.

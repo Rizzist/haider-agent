@@ -12,6 +12,13 @@ use serde::{Deserialize, Serialize};
 /// This deliberately matches the existing composer attachment ceiling: one
 /// image has one storage and provider-ingress law regardless of its origin.
 pub const TOOL_RESULT_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Maximum encoded bytes accepted from a native screenshot before any image
+/// decoder runs. Redaction and CAS admission share this preflight ceiling.
+pub const TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum decoded source pixels accepted before redaction/downscaling.
+pub const TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS: u64 = 40_000_000;
+/// Maximum allocation permitted to a PNG decoder at either boundary.
+pub const TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
 /// Maximum width or height retained for a tool-produced image. Larger source
 /// screenshots are downscaled before they enter the CAS.
 pub const TOOL_RESULT_IMAGE_MAX_DIMENSION: u32 = 2_048;

@@ -269,6 +269,19 @@ pub enum GraphEvidenceSource {
         run_id: RunId,
         effect_id: EffectId,
     },
+    /// A screen observation produced and admitted by the daemon-owned
+    /// computer backend. This source is never accepted from the
+    /// model-callable `graph_evidence` tool: the daemon stamps the current
+    /// workspace revision only after the redacted image has entered the CAS.
+    ComputerObservation {
+        run_id: RunId,
+        call_id: String,
+        effect_id: EffectId,
+        effect_args_digest: String,
+        observation: ComputerObservationKind,
+        image: crate::tool::ImageBlockRef,
+        workspace_revision: WorkspaceRevision,
+    },
     /// One terminal delegated workflow collapsed at the parent graph
     /// boundary. The daemon validates these coordinates against both the
     /// delegation record and [`ChildGraphAttached`] before accepting it.
@@ -280,6 +293,54 @@ pub enum GraphEvidenceSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_revision: Option<WorkspaceRevision>,
     },
+}
+
+/// The two computer observations that can carry daemon-authenticated screen
+/// evidence. This is graph provenance, not an extension of `ComputerAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerObservationKind {
+    Screenshot,
+    Inspect,
+}
+
+/// Binds the exact redacted CAS image and observation coordinates to the
+/// daemon-observed workspace revision. Length-prefixing keeps this digest
+/// domain independent from process and workspace-mutation subjects.
+#[must_use]
+pub fn computer_observation_subject_digest(
+    run_id: &RunId,
+    call_id: &str,
+    effect_id: &EffectId,
+    effect_args_digest: &str,
+    observation: ComputerObservationKind,
+    image: &crate::tool::ImageBlockRef,
+    workspace_revision: &WorkspaceRevision,
+) -> String {
+    let observation = match observation {
+        ComputerObservationKind::Screenshot => "screenshot",
+        ComputerObservationKind::Inspect => "inspect",
+    };
+    let dimensions = format!("{}x{}", image.width, image.height);
+    let byte_len = image.byte_len.to_string();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.computer-observation.subject.v1");
+    for value in [
+        run_id.as_str(),
+        call_id,
+        effect_id.as_str(),
+        effect_args_digest,
+        observation,
+        image.artifact.as_str(),
+        image.media_type.as_str(),
+        dimensions.as_str(),
+        byte_len.as_str(),
+        workspace_revision.as_str(),
+    ] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 /// Stable coordinates submitted by `graph_evidence` for daemon-verified
@@ -1429,7 +1490,15 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 {
                     continue;
                 }
-                if let Some(node) = status.node_mut(&recorded.node) {
+                // Computer observations are durable provenance attached to
+                // the active node, not gate testimony. A screenshot must
+                // never complete BUILD, replace a declared slot, or consume
+                // the evidence-round budget merely because capture worked.
+                let gate_eligible = !matches!(
+                    &recorded.source,
+                    GraphEvidenceSource::ComputerObservation { .. }
+                );
+                if gate_eligible && let Some(node) = status.node_mut(&recorded.node) {
                     if node.evidence_slots.is_empty() {
                         // Exact M1 compatibility branch for legacy pinned
                         // instances that predate evidence slot declarations.

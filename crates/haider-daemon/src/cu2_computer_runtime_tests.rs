@@ -20,7 +20,10 @@ use haider_protocol::effect::{
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::graph::{
+    ComputerObservationKind, EvidenceAuthority, GraphEvidenceSource, SHIP_LOOP_TEMPLATE,
+};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, GraphId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
@@ -28,10 +31,13 @@ use haider_protocol::menu::{
 use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider, TurnRequest};
-use haider_store::{SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand};
+use haider_store::{
+    GraphPinCommand, MenuResolutionCommand, SessionCreateCommand, TurnAcceptCommand,
+    TurnCancelCommand,
+};
 use haider_tools::{
     ComputerBackend, ComputerCancelToken, ComputerInspection, ComputerInspectionBounds,
-    ComputerOutput, ComputerResult,
+    ComputerOutput, ComputerResult, ExcludeRegionScreenshotRedaction, ScreenshotRedactionRegion,
 };
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
@@ -65,6 +71,7 @@ impl ProviderFactory for FixedProviderFactory {
 
 struct FakeComputerBackend {
     screenshot: Vec<u8>,
+    inspect_screenshot: Vec<u8>,
     actions: Mutex<Vec<ComputerAction>>,
     viewports: Mutex<Vec<(u32, u32)>>,
     block_wait: bool,
@@ -77,6 +84,7 @@ impl FakeComputerBackend {
     fn new(screenshot: Vec<u8>) -> Self {
         Self {
             screenshot,
+            inspect_screenshot: inspect_png_fixture(),
             actions: Mutex::new(Vec::new()),
             viewports: Mutex::new(Vec::new()),
             block_wait: false,
@@ -111,18 +119,21 @@ impl ComputerBackend for FakeComputerBackend {
                 Ok(ComputerOutput::ScreenshotPng(self.screenshot.clone()))
             }
             ComputerAction::CursorPosition => Ok(ComputerOutput::CursorPosition { x: 5, y: 7 }),
-            ComputerAction::Inspect { .. } => Ok(ComputerOutput::Inspection(ComputerInspection {
-                role: Some("button".into()),
-                label: Some("Send message".into()),
-                title: Some("Send".into()),
-                bounds: Some(ComputerInspectionBounds {
-                    x: 980,
-                    y: 320,
-                    width: 88,
-                    height: 42,
-                }),
-                value: None,
-            })),
+            ComputerAction::Inspect { .. } => Ok(ComputerOutput::Inspection {
+                inspection: ComputerInspection {
+                    role: Some("button".into()),
+                    label: Some("Send message".into()),
+                    title: Some("Send".into()),
+                    bounds: Some(ComputerInspectionBounds {
+                        x: 980,
+                        y: 320,
+                        width: 88,
+                        height: 42,
+                    }),
+                    value: None,
+                },
+                screenshot_png: self.inspect_screenshot.clone(),
+            }),
             ComputerAction::Wait { .. } if self.block_wait => {
                 *self.active_cancel.lock().expect("cancel lock") = Some(cancel.clone());
                 self.entered.notify_one();
@@ -166,6 +177,15 @@ fn large_png_fixture() -> Vec<u8> {
     DynamicImage::ImageRgba8(pixels)
         .write_to(&mut encoded, ImageFormat::Png)
         .expect("encode PNG fixture");
+    encoded.into_inner()
+}
+
+fn inspect_png_fixture() -> Vec<u8> {
+    let pixels = image::RgbaImage::from_pixel(1_500, 700, image::Rgba([181, 43, 79, 255]));
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(pixels)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .expect("encode inspect PNG fixture");
     encoded.into_inner()
 }
 
@@ -350,6 +370,74 @@ async fn wait_for_run_state(
     .expect("run reaches expected state")
 }
 
+async fn abandon_active_graph_and_wait_for_done(
+    hub: &SessionHub,
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    device_id: DeviceId,
+) -> Vec<haider_protocol::envelope::RawEnvelope> {
+    let pending_menu = timeout(Duration::from_secs(12), async {
+        loop {
+            let events = store.read(session_id, 0, 4096).await.expect("journal");
+            if let Some(opening) = events.into_iter().find(|event| {
+                event.run_id.as_ref() == Some(run_id)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(
+                                payload,
+                                EventPayload::MenuOpened(ref menu)
+                                    if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. })
+                            )
+                        },
+                    )
+            }) {
+                let EventPayload::MenuOpened(menu) =
+                    serde_json::from_value(opening.payload).expect("typed graph menu")
+                else {
+                    unreachable!();
+                };
+                break (menu, opening.seq);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let (menu, request_seq) = match pending_menu {
+        Ok(menu) => menu,
+        Err(_) => {
+            let events = store
+                .read(session_id, 0, 4096)
+                .await
+                .expect("diagnostic journal");
+            let payloads = events
+                .iter()
+                .map(|event| (event.seq, event.run_id.clone(), event.payload.clone()))
+                .collect::<Vec<_>>();
+            panic!("graph finalization did not open abandonment confirmation: {payloads:#?}");
+        }
+    };
+    hub.resolve_hook_menu(MenuResolutionCommand {
+        command_id: format!("abandon-{run_id}"),
+        session_id: session_id.clone(),
+        request_seq,
+        worker_generation: store.worker_generation(),
+        allow_prior_generation: false,
+        answer: MenuAnswer {
+            menu: menu.id,
+            option_key: Some("abandon-and-finish".into()),
+            option_index: 1,
+            value: None,
+            via: AnswerVia::Rpc,
+        },
+        device_id,
+        input_is_secret_reference: false,
+    })
+    .await
+    .expect("abandon graph after computer evidence");
+    wait_for_run_state(store, session_id, run_id, RunState::Done).await
+}
+
 #[tokio::test]
 async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post_cu1() {
     let root = tempfile::tempdir().expect("profile");
@@ -395,14 +483,30 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
             FakeStep::Finish {
                 reason: FinishReason::EndTurn,
             },
+            FakeStep::EmitText {
+                text: "computer complete; graph remains intentionally active".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
         ])
         .with_vision_native(),
     );
     let backend = Arc::new(FakeComputerBackend::new(large_png_fixture()));
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
-    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory::with_computer_backend(
-        Arc::clone(&backend) as Arc<dyn ComputerBackend>,
-    ));
+    let factory: Arc<dyn TurnToolFactory> =
+        Arc::new(BrokerToolFactory::with_computer_backend_and_redaction(
+            Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+            Arc::new(
+                ExcludeRegionScreenshotRedaction::new(vec![ScreenshotRedactionRegion {
+                    x: 0,
+                    y: 0,
+                    width: 3_000,
+                    height: 1_000,
+                }])
+                .expect("redaction policy"),
+            ),
+        ));
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
@@ -421,6 +525,18 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
     let run_id = RunId::new("cu2-roundtrip-run");
     let device_id = DeviceId::new("cu2-roundtrip-device");
     create_session(&hub, &session_id, &device_id).await;
+    hub.pin_graph(GraphPinCommand {
+        command_id: "pin-cu6-computer-evidence".into(),
+        request_digest: "pin-cu6-computer-evidence-digest".into(),
+        request_json: r#"{"template":"ship-loop"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        graph_id: GraphId::new("cu6-computer-evidence"),
+        template: SHIP_LOOP_TEMPLATE.into(),
+        device_id: device_id.clone(),
+    })
+    .await
+    .expect("pin graph for computer evidence");
     append_screen_control_grant(&store, &session_id).await;
     submit_turn(
         &hub,
@@ -428,11 +544,18 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
         &store,
         &session_id,
         &run_id,
-        device_id,
+        device_id.clone(),
     )
     .await;
 
-    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    let events = abandon_active_graph_and_wait_for_done(
+        &hub,
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
     let (journal_json, image) = events
         .iter()
         .find_map(|event| {
@@ -447,16 +570,12 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
         .expect("computer screenshot result");
     assert_eq!(image.width, 2048);
     assert!(image.height < 1_000);
-    assert_eq!(
-        backend.viewports.lock().expect("viewport lock").as_slice(),
-        &[(image.width, image.height)]
-    );
     assert!(!journal_json.contains("data_base64"));
     let cas_bytes = store.get(&image.artifact).await.expect("screenshot CAS");
     assert!(!journal_json.contains(&base64::engine::general_purpose::STANDARD.encode(&cas_bytes)));
 
     let requests: Vec<TurnRequest> = provider.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert!(requests[1].messages.iter().any(|message| {
         matches!(message.blocks.as_slice(), [Block::ToolResult { call_id, images, .. }]
             if call_id == "cu2-screenshot" && images == std::slice::from_ref(&image))
@@ -470,12 +589,45 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
         .decode(&provider_attachment.data_base64)
         .expect("provider attachment base64");
     assert_eq!(provider_bytes, cas_bytes);
-    assert!(requests[2].messages.iter().any(|message| {
-        matches!(message.blocks.as_slice(), [Block::ToolResult { call_id, preview, images, .. }]
-            if call_id == "cu2-inspect"
-                && preview == "{\"role\":\"button\",\"label\":\"Send message\",\"title\":\"Send\",\"bounds\":{\"x\":980,\"y\":320,\"width\":88,\"height\":42},\"value\":null}"
-                && images.is_empty())
-    }));
+    let redacted = image::load_from_memory(&cas_bytes)
+        .expect("decode redacted CAS image")
+        .to_rgba8();
+    assert!(redacted.pixels().all(|pixel| pixel.0 == [0, 0, 0, 255]));
+    let inspect_image = requests[2]
+        .messages
+        .iter()
+        .find_map(|message| match message.blocks.as_slice() {
+            [Block::ToolResult {
+                call_id,
+                preview,
+                images,
+                ..
+            }] if call_id == "cu2-inspect"
+                && preview == "{\"role\":\"button\",\"label\":\"Send message\",\"title\":\"Send\",\"bounds\":{\"x\":980,\"y\":320,\"width\":88,\"height\":42},\"value\":null}" => images.first().cloned(),
+            _ => None,
+        })
+        .expect("provider inspect image");
+    assert_ne!(inspect_image.artifact, image.artifact);
+    assert_eq!((inspect_image.width, inspect_image.height), (1_500, 700));
+    assert_eq!(
+        backend.viewports.lock().expect("viewport lock").as_slice(),
+        &[
+            (image.width, image.height),
+            (inspect_image.width, inspect_image.height),
+        ]
+    );
+    let inspect_cas = store
+        .get(&inspect_image.artifact)
+        .await
+        .expect("inspect screenshot CAS");
+    let inspect_redacted = image::load_from_memory(&inspect_cas)
+        .expect("decode redacted inspect image")
+        .to_rgba8();
+    assert!(
+        inspect_redacted
+            .pixels()
+            .all(|pixel| pixel.0 == [0, 0, 0, 255])
+    );
     assert!(requests[3].messages.iter().any(|message| {
         matches!(message.blocks.as_slice(), [Block::ToolResult { call_id, preview, images, .. }]
             if call_id == "cu2-click" && preview == "left_click completed" && images.is_empty())
@@ -516,6 +668,40 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
     assert!(phases.iter().any(|phase| matches!(phase,
         EffectPhase::Outcome { effect, outcome: EffectOutcome::Ok, .. }
             if effect == &control_effect)));
+
+    let graph = hub
+        .graph_inspect(&session_id, None, u32::MAX)
+        .await
+        .expect("inspect computer evidence graph");
+    assert_eq!(graph.snapshot.evidence.len(), 2);
+    assert!(graph.snapshot.evidence.iter().all(|recorded| {
+        recorded.authority == EvidenceAuthority::DaemonVerified
+            && matches!(
+                &recorded.source,
+                GraphEvidenceSource::ComputerObservation {
+                    observation,
+                    image: evidence_image,
+                    workspace_revision,
+                    ..
+                } if workspace_revision.as_str() == "workspace-revision:0"
+                    && match observation {
+                        ComputerObservationKind::Screenshot => evidence_image == &image,
+                        ComputerObservationKind::Inspect => evidence_image == &inspect_image,
+                    }
+            )
+    }));
+    let status = hub
+        .graph_status(&session_id)
+        .await
+        .expect("graph status")
+        .expect("active graph");
+    let build = status
+        .nodes
+        .iter()
+        .find(|node| node.node.as_str() == "BUILD")
+        .expect("BUILD node");
+    assert_eq!(build.evidence, Default::default());
+    assert!(!build.satisfied);
 }
 
 #[tokio::test]

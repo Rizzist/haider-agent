@@ -67,11 +67,11 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
-      - name: install Xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb xauth
+      - name: install Xvfb and Wayland helper link dependencies
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev xvfb xauth
       - name: real screenshot, pixel, pointer, click, type, and key round trip
         run: >-
-          HAIDER_CU_E2E=1 xvfb-run --auto-servernum
+          HAIDER_CU_E2E=1 XDG_SESSION_TYPE=x11 WAYLAND_DISPLAY= xvfb-run --auto-servernum
           --server-args="-screen 0 320x240x24 -nolisten tcp"
           cargo test -p haider-tools --test linux_computer_e2e --locked --
           --ignored --test-threads=1

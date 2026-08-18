@@ -26,10 +26,14 @@ pub use broker::{
     EffectBrokerCloseError, EffectBrokerCloseReport, EffectOperation, JournalSink,
     PermissionPolicy, PolicyDecision, SessionGrant, SessionGrantScope,
 };
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub use computer::ExcludeRegionScreenshotRedaction;
 pub use computer::{
     ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
     ComputerInspectionBounds, ComputerOperation, ComputerOutput, ComputerResult,
-    UnavailableComputerBackend, computer_manifest, platform_computer_backend,
+    PassthroughScreenshotRedaction, ScreenshotRedactionPolicy, ScreenshotRedactionRegion,
+    UnavailableComputerBackend, computer_manifest, configured_screenshot_redaction_policy,
+    platform_computer_backend,
 };
 pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};
 pub use filesystem::{

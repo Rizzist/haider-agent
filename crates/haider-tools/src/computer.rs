@@ -10,9 +10,15 @@
 #[path = "computer/macos.rs"]
 mod macos;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 #[path = "computer/linux.rs"]
 mod linux;
+
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
+#[path = "computer/wayland.rs"]
+mod wayland;
 
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
@@ -24,14 +30,19 @@ use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::computer::ComputerAction;
 use haider_protocol::effect::EffectClass;
-use haider_protocol::tool::{DispatchMode, ToolManifest};
+use haider_protocol::tool::{
+    DispatchMode, TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC, TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES,
+    TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS, ToolManifest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const COMPUTER_WAIT_MAX_MS: u64 = 60_000;
 pub const COMPUTER_TEXT_MAX_CHARS: usize = 100_000;
+pub const COMPUTER_REDACT_REGIONS_ENV: &str = "HAIDER_COMPUTER_REDACT_REGIONS";
 
 /// Typed native-computer failure. Platform/TCC failures stay distinguishable
 /// across the backend seam instead of collapsing into a silent empty capture.
@@ -77,6 +88,181 @@ impl std::fmt::Display for ComputerError {
 impl std::error::Error for ComputerError {}
 
 pub type ComputerResult<T> = Result<T, ComputerError>;
+
+/// Policy boundary applied to native PNG bytes before CU-1 image admission.
+/// The returned bytes are therefore the only bytes available to both the
+/// model attachment path and convergence-graph evidence.
+pub trait ScreenshotRedactionPolicy: Send + Sync {
+    fn redact_png<'a>(&self, png: &'a [u8]) -> ComputerResult<Cow<'a, [u8]>>;
+}
+
+/// Default policy. Borrowing the input preserves byte-identical admission
+/// behavior when screenshot redaction is not configured.
+#[derive(Debug, Default)]
+pub struct PassthroughScreenshotRedaction;
+
+impl ScreenshotRedactionPolicy for PassthroughScreenshotRedaction {
+    fn redact_png<'a>(&self, png: &'a [u8]) -> ComputerResult<Cow<'a, [u8]>> {
+        Ok(Cow::Borrowed(png))
+    }
+}
+
+/// One source-image pixel rectangle replaced with opaque black before the
+/// screenshot reaches CU-1. Rectangles are clipped to the captured image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenshotRedactionRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Concrete configurable redaction policy used by production when
+/// `HAIDER_COMPUTER_REDACT_REGIONS` is set. Its value is a semicolon-separated
+/// list of `x,y,width,height` source-pixel rectangles.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[derive(Debug, Clone)]
+pub struct ExcludeRegionScreenshotRedaction {
+    regions: Vec<ScreenshotRedactionRegion>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+impl ExcludeRegionScreenshotRedaction {
+    pub fn new(regions: Vec<ScreenshotRedactionRegion>) -> ComputerResult<Self> {
+        if regions.is_empty()
+            || regions
+                .iter()
+                .any(|region| region.width == 0 || region.height == 0)
+        {
+            return Err(ComputerError::InvalidAction {
+                message: "screenshot redaction requires at least one non-empty region".into(),
+            });
+        }
+        Ok(Self { regions })
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+impl ScreenshotRedactionPolicy for ExcludeRegionScreenshotRedaction {
+    fn redact_png<'a>(&self, png: &'a [u8]) -> ComputerResult<Cow<'a, [u8]>> {
+        use image::{DynamicImage, ImageFormat, ImageReader, Limits};
+        use std::io::Cursor;
+
+        if png.len() > TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES {
+            return Err(ComputerError::Backend {
+                message: format!(
+                    "screenshot source is {} bytes; redaction limit is {TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES}",
+                    png.len()
+                ),
+            });
+        }
+        let dimensions = ImageReader::with_format(Cursor::new(png), ImageFormat::Png)
+            .into_dimensions()
+            .map_err(|error| ComputerError::Backend {
+                message: format!("could not read screenshot dimensions for redaction: {error}"),
+            })?;
+        let pixels = u64::from(dimensions.0).saturating_mul(u64::from(dimensions.1));
+        if dimensions.0 == 0 || dimensions.1 == 0 || pixels > TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS {
+            return Err(ComputerError::Backend {
+                message: format!(
+                    "screenshot dimensions {}x{} exceed the safe redaction limit",
+                    dimensions.0, dimensions.1
+                ),
+            });
+        }
+        let mut reader = ImageReader::with_format(Cursor::new(png), ImageFormat::Png);
+        let mut limits = Limits::default();
+        limits.max_alloc = Some(TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC);
+        reader.limits(limits);
+        let mut image = reader
+            .decode()
+            .map_err(|error| ComputerError::Backend {
+                message: format!("could not decode screenshot for redaction: {error}"),
+            })?
+            .into_rgba8();
+        for region in &self.regions {
+            let right = region.x.saturating_add(region.width).min(image.width());
+            let bottom = region.y.saturating_add(region.height).min(image.height());
+            for y in region.y.min(image.height())..bottom {
+                for x in region.x.min(image.width())..right {
+                    image.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+                }
+            }
+        }
+        let mut redacted = Vec::new();
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut redacted), ImageFormat::Png)
+            .map_err(|error| ComputerError::Backend {
+                message: format!("could not encode redacted screenshot as PNG: {error}"),
+            })?;
+        Ok(Cow::Owned(redacted))
+    }
+}
+
+/// Resolves the process/session launch policy once for a dispatcher. Missing
+/// or empty configuration selects the no-op policy. Malformed opt-in
+/// configuration fails closed before a screenshot can be admitted.
+pub fn configured_screenshot_redaction_policy() -> ComputerResult<Arc<dyn ScreenshotRedactionPolicy>>
+{
+    let Some(value) = std::env::var_os(COMPUTER_REDACT_REGIONS_ENV) else {
+        return Ok(Arc::new(PassthroughScreenshotRedaction));
+    };
+    if value.is_empty() {
+        return Ok(Arc::new(PassthroughScreenshotRedaction));
+    }
+    let value = value
+        .into_string()
+        .map_err(|_| ComputerError::InvalidAction {
+            message: format!("{COMPUTER_REDACT_REGIONS_ENV} must be valid UTF-8"),
+        })?;
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let regions = parse_redaction_regions(&value)?;
+        Ok(Arc::new(ExcludeRegionScreenshotRedaction::new(regions)?))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = value;
+        Err(ComputerError::Unavailable {
+            platform: std::env::consts::OS.into(),
+            message: "screenshot redaction is unavailable on this platform".into(),
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn parse_redaction_regions(value: &str) -> ComputerResult<Vec<ScreenshotRedactionRegion>> {
+    value
+        .split(';')
+        .map(|encoded| {
+            let fields = encoded.split(',').collect::<Vec<_>>();
+            let [x, y, width, height] = fields.as_slice() else {
+                return Err(ComputerError::InvalidAction {
+                    message: format!(
+                        "{COMPUTER_REDACT_REGIONS_ENV} entries must use x,y,width,height"
+                    ),
+                });
+            };
+            let parse = |field: &str| {
+                field
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| ComputerError::InvalidAction {
+                        message: format!(
+                            "{COMPUTER_REDACT_REGIONS_ENV} entries must contain unsigned integers"
+                        ),
+                    })
+            };
+            Ok(ScreenshotRedactionRegion {
+                x: parse(x)?,
+                y: parse(y)?,
+                width: parse(width)?,
+                height: parse(height)?,
+            })
+        })
+        .collect()
+}
 
 /// Cooperative cancellation owned by the effect broker. Broker close flips
 /// every registered token before terminalizing an abandoned computer dispatch
@@ -132,9 +318,20 @@ pub struct ComputerInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputerOutput {
     ScreenshotPng(Vec<u8>),
-    CursorPosition { x: u32, y: u32 },
-    Inspection(ComputerInspection),
-    Confirmed { action: String },
+    CursorPosition {
+        x: u32,
+        y: u32,
+    },
+    /// Accessibility metadata and a fresh screenshot captured by the same
+    /// daemon-observed action. Keeping them together prevents graph evidence
+    /// from ever relabeling a stale prior screenshot as a fresh inspection.
+    Inspection {
+        inspection: ComputerInspection,
+        screenshot_png: Vec<u8>,
+    },
+    Confirmed {
+        action: String,
+    },
 }
 
 /// Injectable OS boundary. Tests use a deterministic fake and never touch
@@ -382,7 +579,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
 #[must_use]
 pub fn computer_manifest() -> ToolManifest {
     #[cfg(target_os = "linux")]
-    let description = "Observe and control the local Linux X11 desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
+    let description = "Observe and control the local Linux desktop through X11 or consented Wayland desktop portals. Call screenshot before cursor_position or any action with screenshot coordinates.";
     #[cfg(target_os = "macos")]
     let description = "Observe and control the local macOS desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
     #[cfg(target_os = "windows")]
@@ -443,8 +640,22 @@ pub fn computer_manifest() -> ToolManifest {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn png_fixture() -> Vec<u8> {
+        use image::{DynamicImage, ImageFormat, RgbaImage};
+        use std::io::Cursor;
+
+        let pixels = RgbaImage::from_pixel(4, 3, image::Rgba([9, 40, 90, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode screenshot fixture");
+        encoded.into_inner()
+    }
 
     #[tokio::test]
     async fn unavailable_backend_is_typed_on_every_platform() {
@@ -474,5 +685,54 @@ mod tests {
             !Arc::ptr_eq(&first, &second),
             "viewport and held-button state must never be shared across dispatchers"
         );
+    }
+
+    #[test]
+    fn passthrough_redaction_borrows_exact_original_bytes() {
+        let png = b"not decoded by the no-op policy";
+        let output = PassthroughScreenshotRedaction
+            .redact_png(png)
+            .expect("passthrough");
+        assert!(matches!(output, Cow::Borrowed(bytes) if bytes == png));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn exclude_region_blacks_only_the_clipped_source_pixels() {
+        let policy = ExcludeRegionScreenshotRedaction::new(vec![ScreenshotRedactionRegion {
+            x: 2,
+            y: 1,
+            width: 8,
+            height: 1,
+        }])
+        .expect("region policy");
+        let redacted = policy
+            .redact_png(&png_fixture())
+            .expect("redact fixture")
+            .into_owned();
+        let image = image::load_from_memory_with_format(&redacted, image::ImageFormat::Png)
+            .expect("decode redacted PNG")
+            .into_rgba8();
+        assert_eq!(image.get_pixel(1, 1).0, [9, 40, 90, 255]);
+        assert_eq!(image.get_pixel(2, 1).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(3, 1).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(2, 2).0, [9, 40, 90, 255]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn redaction_rejects_source_bytes_before_decoding() {
+        let policy = ExcludeRegionScreenshotRedaction::new(vec![ScreenshotRedactionRegion {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }])
+        .expect("region policy");
+        let oversized = vec![0_u8; TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES + 1];
+        let error = policy
+            .redact_png(&oversized)
+            .expect_err("oversized bytes fail before decode");
+        assert!(error.to_string().contains("redaction limit"));
     }
 }

@@ -35,6 +35,21 @@ pub struct GraphEvidence {
 
 impl GraphEvidence {
     pub fn from_tool_args(args: Value) -> ToolResult<Self> {
+        if args.as_object().is_some_and(|object| {
+            [
+                "source",
+                "authority",
+                "image",
+                "workspace_revision",
+                "computer_observation",
+            ]
+            .iter()
+            .any(|reserved| object.contains_key(*reserved))
+        }) {
+            return Err(ToolError::invalid_argument(
+                "graph_evidence cannot supply daemon-owned evidence provenance",
+            ));
+        }
         let request: Self = serde_json::from_value(args).map_err(|error| {
             ToolError::invalid_argument(format!("invalid graph_evidence arguments: {error}"))
         })?;
@@ -185,5 +200,38 @@ mod tests {
         );
         assert_eq!(request.verdict, EvidenceVerdict::Green);
         assert_eq!(graph_evidence_manifest().name, "graph_evidence");
+    }
+
+    #[test]
+    fn model_cannot_claim_computer_observation_or_daemon_authority() {
+        for (field, value) in [
+            (
+                "source",
+                serde_json::json!({"kind": "computer_observation"}),
+            ),
+            ("authority", serde_json::json!("daemon_verified")),
+            ("image", serde_json::json!({"artifact": "blake3:fake"})),
+            (
+                "workspace_revision",
+                serde_json::json!("workspace-revision:999"),
+            ),
+            ("computer_observation", serde_json::json!("screenshot")),
+        ] {
+            let mut args = serde_json::json!({
+                "graph_id": "graph",
+                "node": "BUILD",
+                "verdict": "green",
+                "detail": "fabricated screenshot"
+            });
+            args.as_object_mut()
+                .expect("object")
+                .insert(field.into(), value);
+            assert!(
+                GraphEvidence::from_tool_args(args)
+                    .expect_err("daemon provenance must be reserved")
+                    .to_string()
+                    .contains("daemon-owned")
+            );
+        }
     }
 }

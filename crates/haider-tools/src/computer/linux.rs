@@ -1,4 +1,4 @@
-//! Linux X11 backend.
+//! Linux desktop backend: Wayland portals when positively detected, otherwise X11.
 //!
 //! The pure-Rust `x11rb` connection captures the root drawable with
 //! `GetImage` and injects input through XTEST. CU-1 still owns image admission
@@ -8,6 +8,7 @@
 //! `floor(model_pixel * root_extent / admitted_extent)` (cursor reporting
 //! applies the inverse mapping).
 
+use super::wayland::{WaylandComputerBackend, wayland_session_requested};
 use super::{ComputerBackend, ComputerCancelToken, ComputerError, ComputerOutput, ComputerResult};
 use async_trait::async_trait;
 use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
@@ -156,6 +157,7 @@ struct CaptureFrame {
 }
 
 pub(crate) struct LinuxComputerBackend {
+    wayland: Option<WaylandComputerBackend>,
     input_owner: u64,
     state: Arc<Mutex<BackendState>>,
     connect_gate: tokio::sync::Mutex<()>,
@@ -163,8 +165,10 @@ pub(crate) struct LinuxComputerBackend {
 
 impl LinuxComputerBackend {
     pub(crate) fn new() -> Self {
+        let input_owner = NEXT_INPUT_OWNER.fetch_add(1, Ordering::Relaxed);
         Self {
-            input_owner: NEXT_INPUT_OWNER.fetch_add(1, Ordering::Relaxed),
+            wayland: wayland_session_requested().then(|| WaylandComputerBackend::new(input_owner)),
+            input_owner,
             state: Arc::new(Mutex::new(BackendState::default())),
             connect_gate: tokio::sync::Mutex::new(()),
         }
@@ -854,6 +858,12 @@ impl ComputerBackend for LinuxComputerBackend {
         action: &ComputerAction,
         cancel: &ComputerCancelToken,
     ) -> ComputerResult<ComputerOutput> {
+        // A positive Wayland session selection never falls through to X11:
+        // doing so would bypass portal consent and typically target a stale or
+        // unrelated compatibility display.
+        if let Some(wayland) = &self.wayland {
+            return wayland.execute(action, cancel).await;
+        }
         cancel.check()?;
         if matches!(action, ComputerAction::Inspect { .. }) {
             return Err(ComputerError::InspectUnsupported {
@@ -886,6 +896,9 @@ impl ComputerBackend for LinuxComputerBackend {
     }
 
     fn set_viewport(&self, width: u32, height: u32) -> ComputerResult<()> {
+        if let Some(wayland) = &self.wayland {
+            return wayland.set_viewport(width, height);
+        }
         if width == 0 || height == 0 {
             return Err(ComputerError::InvalidAction {
                 message: "CU-1 returned an empty computer screenshot viewport".into(),
@@ -908,6 +921,9 @@ impl ComputerBackend for LinuxComputerBackend {
     }
 
     async fn emergency_stop(&self) -> ComputerResult<()> {
+        if let Some(wayland) = &self.wayland {
+            return wayland.emergency_stop().await;
+        }
         let _input_gate = INPUT_GATE.lock().await;
         if Self::held_left_owner()? == Some(self.input_owner) {
             self.post_left_up()?;

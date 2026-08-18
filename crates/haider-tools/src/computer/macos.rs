@@ -484,7 +484,7 @@ impl MacOsComputerBackend {
         x: u32,
         y: u32,
         cancel: &ComputerCancelToken,
-    ) -> ComputerResult<ComputerOutput> {
+    ) -> ComputerResult<ComputerInspection> {
         cancel.check()?;
         self.preflight_accessibility()?;
         let viewport = self.viewport()?;
@@ -545,7 +545,7 @@ impl MacOsComputerBackend {
         // SAFETY: the successful copy-at-position call returned this retained
         // accessibility element exactly once.
         unsafe { CFRelease(element) };
-        inspection.map(ComputerOutput::Inspection)
+        inspection
     }
 
     fn post_mouse(
@@ -1181,7 +1181,14 @@ impl ComputerBackend for MacOsComputerBackend {
                 let (x, y) = self.model_cursor_position()?;
                 Ok(ComputerOutput::CursorPosition { x, y })
             }
-            ComputerAction::Inspect { x, y } => self.inspect(*x, *y, cancel),
+            ComputerAction::Inspect { x, y } => {
+                let inspection = self.inspect(*x, *y, cancel)?;
+                let screenshot_png = self.capture_png(cancel).await?;
+                Ok(ComputerOutput::Inspection {
+                    inspection,
+                    screenshot_png,
+                })
+            }
             ComputerAction::Wait { ms } => {
                 self.preflight_accessibility()?;
                 self.viewport()?;

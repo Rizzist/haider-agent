@@ -6,22 +6,22 @@ use std::collections::HashSet;
 
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
-    EffectClass, EffectIntent, EffectOutcome, EffectPhase, WorkspaceMutation,
+    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, WorkspaceMutation,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
-    ChildWorkflowSelector, EvidenceAuthority, EvidenceRecorded, EvidenceVerdict,
-    GraphAttemptOpened, GraphBlockReason, GraphCompleted, GraphEvidenceSource, GraphExecutorShape,
-    GraphFinalizationDeferred, GraphGateKind, GraphInspectSnapshot, GraphNodeName, GraphNodeSpec,
-    GraphPhase, GraphPinned, GraphRunScope, GraphRunSetOpened, GraphSuperseded, GraphTemplateSpec,
-    ParentGraphAttempt, ProcessSignalRecorded, ProcessSignalRef, SHIP_LOOP_TEMPLATE,
-    STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE, SubjectSelector, TodoGraphAttached,
-    WorkspaceMutationRef, build_node, child_contract_subject_digest, child_gate_structure,
-    evidence_fingerprint, graph_template, graph_template_catalog, graph_template_digest,
-    implement_verify_child_template, process_signal_subject_digest, reduce_graph_telemetry,
-    ship_loop_nodes,
+    ChildWorkflowSelector, ComputerObservationKind, EvidenceAuthority, EvidenceRecorded,
+    EvidenceVerdict, GraphAttemptOpened, GraphBlockReason, GraphCompleted, GraphEvidenceSource,
+    GraphExecutorShape, GraphFinalizationDeferred, GraphGateKind, GraphInspectSnapshot,
+    GraphNodeName, GraphNodeSpec, GraphPhase, GraphPinned, GraphRunScope, GraphRunSetOpened,
+    GraphSuperseded, GraphTemplateSpec, ParentGraphAttempt, ProcessSignalRecorded,
+    ProcessSignalRef, SHIP_LOOP_TEMPLATE, STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE,
+    SubjectSelector, TodoGraphAttached, WorkspaceMutationRef, build_node,
+    child_contract_subject_digest, child_gate_structure, evidence_fingerprint, graph_template,
+    graph_template_catalog, graph_template_digest, implement_verify_child_template,
+    process_signal_subject_digest, reduce_graph_telemetry, ship_loop_nodes,
 };
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{
@@ -36,11 +36,12 @@ use haider_protocol::task::{
 };
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_store::{
-    ChildTemplateObservationCommand, EventStore, GraphAbandonCommand, GraphAbandonOutcome,
-    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
-    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
-    GraphSwitchCommand, GraphSwitchOutcome, MenuResolutionCommand, MenuResolutionOutcome,
-    ProcessSignalCommand, ProcessSignalOutcome, SessionCreateCommand, Store,
+    Cas, ChildTemplateObservationCommand, ComputerEvidenceCommand, ComputerEvidenceOutcome,
+    EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
+    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphPinCommand,
+    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
+    GraphSwitchOutcome, MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand,
+    ProcessSignalOutcome, SessionCreateCommand, Store,
 };
 
 fn create_session(store: &Store, name: &str) -> SessionId {
@@ -165,6 +166,18 @@ fn raw_envelope(
         },
         payload: serde_json::to_value(payload).expect("serialize test payload"),
     }
+}
+
+fn computer_png_fixture() -> Vec<u8> {
+    use image::{DynamicImage, ImageFormat};
+    use std::io::Cursor;
+
+    let pixels = image::RgbaImage::from_pixel(3, 2, image::Rgba([18, 91, 203, 255]));
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(pixels)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .expect("encode computer PNG");
+    encoded.into_inner()
 }
 
 fn append_plan(
@@ -494,6 +507,157 @@ fn exhaust_verify_epoch(store: &Store, session_id: &SessionId, serial: &mut usiz
         );
         *serial += 1;
     }
+}
+
+#[test]
+fn computer_observation_is_daemon_verified_revision_stamped_and_non_gating() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = create_session(&store, "computer-evidence");
+    let graph_id = pin(&store, &session_id, "computer-evidence");
+    let before = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let node = before.current_node.clone().expect("active node");
+    let run_id = RunId::new("computer-evidence-run");
+    let effect_id = EffectId::new("computer-evidence-effect");
+    let args_digest = "blake3:computer-screenshot-args";
+    let mut lifecycle = vec![
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "computer-evidence-intent",
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect_id.clone(),
+                class: EffectClass::ScreenObserve,
+                summary: "computer screenshot".into(),
+                args_digest: args_digest.into(),
+                workspace_revision: None,
+            })),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "computer-evidence-authorized",
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect: effect_id.clone(),
+                verdict: AuthorizationVerdict::Allow,
+            }),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "computer-evidence-dispatched",
+            EventPayload::Effect(EffectPhase::Dispatched {
+                effect: effect_id.clone(),
+            }),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "computer-evidence-outcome",
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: effect_id.clone(),
+                outcome: EffectOutcome::Ok,
+                freshness: None,
+                workspace_mutation: None,
+            }),
+        ),
+    ];
+    store
+        .append(&mut lifecycle)
+        .expect("append effect lifecycle");
+    let image =
+        Cas::put_image(&store, &computer_png_fixture(), "image/png").expect("admit screenshot");
+    let command = ComputerEvidenceCommand {
+        command_id: "computer-evidence-command".into(),
+        request_digest: "computer-evidence-digest".into(),
+        request_json: r#"{"observation":"screenshot"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: run_id.clone(),
+        call_id: "computer-evidence-call".into(),
+        effect_id: effect_id.clone(),
+        effect_args_digest: args_digest.into(),
+        graph_id: graph_id.clone(),
+        node: node.clone(),
+        attempt: before.attempt,
+        observation: ComputerObservationKind::Screenshot,
+        image: image.clone(),
+        detail: "computer screenshot captured (3x2)".into(),
+        device_id: DeviceId::new("graph-test"),
+    };
+    assert!(matches!(
+        store
+            .record_computer_evidence(&command)
+            .expect("record computer evidence"),
+        ComputerEvidenceOutcome::Committed { .. }
+    ));
+
+    let after = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(after.current_node, before.current_node);
+    assert_eq!(after.attempt, before.attempt);
+    let build = after
+        .nodes
+        .iter()
+        .find(|status| status.node == node)
+        .expect("BUILD node");
+    assert_eq!(build.evidence, Default::default());
+    assert!(!build.satisfied);
+
+    let inspected = store
+        .graph_inspect(&session_id, None, u32::MAX)
+        .expect("inspect graph");
+    let [recorded] = inspected.snapshot.evidence.as_slice() else {
+        panic!("expected one computer evidence row");
+    };
+    assert_eq!(recorded.authority, EvidenceAuthority::DaemonVerified);
+    assert_eq!(
+        recorded.subject_selector,
+        Some(SubjectSelector::WorkspaceRevision)
+    );
+    assert!(
+        recorded
+            .subject_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("blake3:"))
+    );
+    assert!(matches!(
+        &recorded.source,
+        GraphEvidenceSource::ComputerObservation {
+            run_id: source_run,
+            call_id,
+            effect_id: source_effect,
+            effect_args_digest,
+            observation: ComputerObservationKind::Screenshot,
+            image: source_image,
+            workspace_revision,
+        } if source_run == &run_id
+            && call_id == "computer-evidence-call"
+            && source_effect == &effect_id
+            && effect_args_digest == args_digest
+            && source_image == &image
+            && workspace_revision.as_str() == "workspace-revision:0"
+    ));
+
+    assert!(matches!(
+        store
+            .record_computer_evidence(&command)
+            .expect("replay computer evidence"),
+        ComputerEvidenceOutcome::IdempotentReplay { .. }
+    ));
+    let replayed = store
+        .graph_inspect(&session_id, None, u32::MAX)
+        .expect("inspect replay");
+    assert_eq!(replayed.snapshot.evidence.len(), 1);
 }
 
 #[test]

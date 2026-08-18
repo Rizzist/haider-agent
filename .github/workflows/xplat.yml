@@ -30,9 +30,9 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: install Linux system deps (ALSA)
+      - name: install Linux system deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libglib2.0-dev pkg-config
       - name: check (all targets — lib + bins + tests compile)
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
       - name: clippy (all targets)

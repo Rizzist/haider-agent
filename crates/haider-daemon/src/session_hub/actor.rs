@@ -498,6 +498,28 @@ pub(super) async fn run_session_actor(
                 );
                 let _ = completed.send(result);
             }
+            ActorCommand::RecordComputerEvidence { command, completed } => {
+                let result = store.record_computer_evidence(command).await;
+                let envelopes = match &result {
+                    Ok(ComputerEvidenceOutcome::Committed { envelopes, .. }) => {
+                        Some(envelopes.as_slice())
+                    }
+                    _ => None,
+                };
+                publish_graph_commit(
+                    envelopes,
+                    worker.as_ref(),
+                    &session_id,
+                    &mut head,
+                    &mut authority_epoch,
+                    &mut attachments,
+                    catch_up_byte_budget,
+                    &observer,
+                    &metrics,
+                    &hooks,
+                );
+                let _ = completed.send(result);
+            }
             ActorCommand::GuardGraphFinalization { command, completed } => {
                 let result = store.guard_graph_finalization(command).await;
                 let envelopes = match &result {

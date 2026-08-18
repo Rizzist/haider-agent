@@ -15,19 +15,22 @@
 use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
-use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
+use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_image_block};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::credential::CredentialDescriptor;
-use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation};
+use haider_protocol::effect::{
+    AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
+};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
-    ChildTemplatePromoted, EvidenceAuthority, EvidenceRecorded, EvidenceSlotSpec, EvidenceVerdict,
-    GRAPH_INSPECT_MAX_RUNS, GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_TODO_CHILDREN,
+    ChildTemplatePromoted, ComputerObservationKind, EvidenceAuthority, EvidenceRecorded,
+    EvidenceSlotSpec, EvidenceVerdict, GRAPH_INSPECT_MAX_RUNS,
+    GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_TODO_CHILDREN,
     GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS, GRAPH_TELEMETRY_MAX_RUN_ROWS,
     GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
     GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
@@ -38,10 +41,10 @@ use haider_protocol::graph::{
     GraphTemplateRejection, GraphTemplateRollup, GraphTemplateSpec,
     GraphWorkspaceMutationProvenance, ProcessSignalRecorded, ProcessSignalRef, SubjectSelector,
     TodoGraphAttached, WorkspaceMutationRef, build_node, child_contract_subject_digest,
-    child_gate_structure, evidence_fingerprint, graph_template, graph_template_digest,
-    graph_template_rollups, normalize_evidence_detail, process_signal_subject_digest,
-    reduce_graph_telemetry, reduce_graphs, todo_child_graph_id, todo_run_set_id,
-    validate_graph_template, workspace_mutation_subject_digest,
+    child_gate_structure, computer_observation_subject_digest, evidence_fingerprint,
+    graph_template, graph_template_digest, graph_template_rollups, normalize_evidence_detail,
+    process_signal_subject_digest, reduce_graph_telemetry, reduce_graphs, todo_child_graph_id,
+    todo_run_set_id, validate_graph_template, workspace_mutation_subject_digest,
 };
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
@@ -59,7 +62,7 @@ use haider_protocol::session::{
 };
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::task::TaskEventPayload;
-use haider_protocol::tool::AttachmentBlock;
+use haider_protocol::tool::{AttachmentBlock, ImageBlockRef};
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
@@ -380,6 +383,32 @@ pub struct GraphEvidenceCommand {
     pub device_id: DeviceId,
 }
 
+/// Daemon-internal command for attaching an admitted computer observation to
+/// the graph node that is active when the store serializes this command.
+/// Unlike `GraphEvidenceCommand`, no graph, node, authority, verdict, subject,
+/// or workspace revision is caller-selectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerEvidenceCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub run_id: RunId,
+    pub call_id: String,
+    pub effect_id: EffectId,
+    pub effect_args_digest: String,
+    /// Graph coordinates snapshotted before native observation begins. The
+    /// store requires this exact attempt to remain current at commit time.
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    pub attempt: u32,
+    pub observation: ComputerObservationKind,
+    pub image: ImageBlockRef,
+    pub detail: String,
+    pub device_id: DeviceId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSignalCommand {
     pub session_id: SessionId,
@@ -432,6 +461,21 @@ pub enum GraphEvidenceOutcome {
     IdempotentReplay {
         recorded: RecordedGraphEvidence,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComputerEvidenceOutcome {
+    Committed {
+        recorded: RecordedGraphEvidence,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        recorded: RecordedGraphEvidence,
+    },
+    /// The exact graph attempt observed before backend execution is no longer
+    /// active. Computer tool success is unchanged and no cross-epoch evidence
+    /// fact is emitted.
+    StaleGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3171,6 +3215,178 @@ impl Store {
         self.extend_graph_reduction(&command.session_id, &envelopes);
         Ok(GraphAbandonOutcome::Committed {
             abandoned,
+            envelopes,
+        })
+    }
+
+    /// Records one daemon-produced screen observation on the node that is
+    /// snapshotted before backend execution. The observation is deliberately
+    /// supplemental: it uses the ordinary `EvidenceRecorded` event channel
+    /// and graph provenance read model, but cannot satisfy or exhaust a gate.
+    ///
+    /// Models cannot call this path. The store validates all supplied
+    /// coordinates against the durable effect lifecycle and graph attempt,
+    /// and it alone selects authority, subject, verdict, and revision.
+    pub fn record_computer_evidence(
+        &self,
+        command: &ComputerEvidenceCommand,
+    ) -> StoreResult<ComputerEvidenceOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(recorded) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "graph.computer-evidence",
+            &command.request_digest,
+            &command.request_json,
+            "computer-evidence",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ComputerEvidenceOutcome::IdempotentReplay { recorded });
+        }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        if command.call_id.trim().is_empty()
+            || command.effect_args_digest.trim().is_empty()
+            || command.image.media_type != "image/png"
+            || command.image.width == 0
+            || command.image.height == 0
+            || command.image.byte_len == 0
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "computer graph evidence requires an exact admitted PNG artifact",
+                false,
+            ));
+        }
+        let image_bytes = self.cas.get(&command.image.artifact)?;
+        validate_image_block(&image_bytes, &command.image)?;
+        let effect_outcome_seq =
+            validate_computer_observation_effect(&transaction, &command.session_id, command)?;
+
+        let reductions = self.graph_reductions(&transaction, &command.session_id)?;
+        let Some(reduction) = reductions.active() else {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ComputerEvidenceOutcome::StaleGraph);
+        };
+        let Some(status) = reduction
+            .status
+            .as_ref()
+            .filter(|status| status.phase == GraphPhase::Active)
+        else {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ComputerEvidenceOutcome::StaleGraph);
+        };
+        if status.graph_id != command.graph_id
+            || status.attempt != command.attempt
+            || status.current_node.as_ref() != Some(&command.node)
+            || !status.node_is_ready(&command.node)
+        {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ComputerEvidenceOutcome::StaleGraph);
+        }
+        let epoch_seq = graph_attempt_opened_seq(
+            &transaction,
+            &command.session_id,
+            &command.graph_id,
+            command.node.clone(),
+            command.attempt,
+        )?;
+        if effect_outcome_seq < epoch_seq {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ComputerEvidenceOutcome::StaleGraph);
+        }
+
+        let graph_id = command.graph_id.clone();
+        let node = command.node.clone();
+        let attempt = command.attempt;
+        let workspace_revision =
+            workspace_revision_at_or_before(&transaction, &command.session_id, effect_outcome_seq)?;
+        let subject_digest = computer_observation_subject_digest(
+            &command.run_id,
+            &command.call_id,
+            &command.effect_id,
+            &command.effect_args_digest,
+            command.observation,
+            &command.image,
+            &workspace_revision,
+        );
+        let detail = normalize_evidence_detail(&command.detail);
+        if detail.is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "computer evidence detail is empty after normalization",
+                false,
+            ));
+        }
+        let fingerprint = evidence_fingerprint(&detail);
+        let evidence = EvidenceRecorded {
+            graph_id: graph_id.clone(),
+            node: node.clone(),
+            attempt,
+            verdict: EvidenceVerdict::Green,
+            detail,
+            fingerprint: fingerprint.clone(),
+            slot: None,
+            subject_digest: Some(subject_digest),
+            source: GraphEvidenceSource::ComputerObservation {
+                run_id: command.run_id.clone(),
+                call_id: command.call_id.clone(),
+                effect_id: command.effect_id.clone(),
+                effect_args_digest: command.effect_args_digest.clone(),
+                observation: command.observation,
+                image: command.image.clone(),
+                workspace_revision,
+            },
+        };
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "graph.computer-evidence",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let mut envelopes =
+            graph_command_envelopes(command, vec![EventPayload::EvidenceRecorded(evidence)])?;
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let recorded = RecordedGraphEvidence {
+            graph_id,
+            node,
+            attempt,
+            fingerprint,
+            evidence_seq: envelopes[0].seq,
+            through_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            Some(command.run_id.as_str()),
+            Some(recorded.evidence_seq),
+            &recorded,
+            now,
+            "computer-evidence",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        self.extend_graph_reduction(&command.session_id, &envelopes);
+        Ok(ComputerEvidenceOutcome::Committed {
+            recorded,
             envelopes,
         })
     }
@@ -7590,6 +7806,7 @@ fn graph_evidence_provenance(
             } => Some((run_id.clone(), call_id.clone(), effect_id.clone())),
             GraphEvidenceSource::Model { .. }
             | GraphEvidenceSource::WorkspaceMutation { .. }
+            | GraphEvidenceSource::ComputerObservation { .. }
             | GraphEvidenceSource::ChildContract { .. } => None,
         })
         .collect::<HashSet<_>>();
@@ -7727,6 +7944,7 @@ fn graph_evidence_provenance(
                     }),
                 GraphEvidenceSource::Model { .. }
                 | GraphEvidenceSource::WorkspaceMutation { .. }
+                | GraphEvidenceSource::ComputerObservation { .. }
                 | GraphEvidenceSource::ChildContract { .. } => None,
             };
             let workspace_mutation = match &evidence.source {
@@ -7735,6 +7953,10 @@ fn graph_evidence_provenance(
                 }
                 _ => None,
             };
+            let computer_observation = matches!(
+                &evidence.source,
+                GraphEvidenceSource::ComputerObservation { .. }
+            );
             Ok(GraphEvidenceProvenanceRow {
                 seq: envelope.seq,
                 committed_at_ms: envelope.committed_at_ms,
@@ -7742,9 +7964,16 @@ fn graph_evidence_provenance(
                 node: evidence.node,
                 attempt: evidence.attempt,
                 slot: evidence.slot,
-                authority: slot_spec
-                    .map_or(EvidenceAuthority::ModelAttested, |slot| slot.authority),
-                subject_selector: slot_spec.map(|slot| slot.subject_selector),
+                authority: if computer_observation {
+                    EvidenceAuthority::DaemonVerified
+                } else {
+                    slot_spec.map_or(EvidenceAuthority::ModelAttested, |slot| slot.authority)
+                },
+                subject_selector: if computer_observation {
+                    Some(SubjectSelector::WorkspaceRevision)
+                } else {
+                    slot_spec.map(|slot| slot.subject_selector)
+                },
                 verdict: evidence.verdict,
                 fingerprint: evidence.fingerprint,
                 subject_digest: evidence.subject_digest,
@@ -7942,6 +8171,21 @@ impl GraphCommandCoordinates for GraphAbandonCommand {
 }
 
 impl GraphCommandCoordinates for GraphEvidenceCommand {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+    fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+}
+
+impl GraphCommandCoordinates for ComputerEvidenceCommand {
     fn command_id(&self) -> &str {
         &self.command_id
     }
@@ -8465,6 +8709,134 @@ fn validate_graph_evidence_authority(
             })
         }
     }
+}
+
+// Keeping each duplicate/mismatch diagnostic beside its lifecycle arm makes
+// this security validator auditable; folding mutation into match guards would
+// obscure which phase advanced the local proof state.
+#[allow(clippy::collapsible_match, clippy::result_large_err)]
+fn validate_computer_observation_effect(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    command: &ComputerEvidenceCommand,
+) -> StoreResult<u64> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND instr(envelope_json, '\"type\":\"effect\"') > 0
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?;
+    let mut intent_seq = None;
+    let mut authorized_seq = None;
+    let mut dispatched_seq = None;
+    let mut outcome_seq = None;
+    let expected_summary = match command.observation {
+        ComputerObservationKind::Screenshot => "computer screenshot",
+        ComputerObservationKind::Inspect => "computer inspect",
+    };
+
+    for json in rows {
+        let json = json.map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid effect envelope in session {session_id}: {error}"
+            ))
+        })?;
+        if envelope.run_id.as_ref() != Some(&command.run_id) {
+            continue;
+        }
+        let Ok(EventPayload::Effect(phase)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        else {
+            continue;
+        };
+        match phase {
+            EffectPhase::Intent(intent) if intent.effect == command.effect_id => {
+                if intent_seq.replace(envelope.seq).is_some()
+                    || intent.class != EffectClass::ScreenObserve
+                    || intent.summary != expected_summary
+                    || intent.args_digest != command.effect_args_digest
+                {
+                    return Err(store_error(
+                        ErrorCode::InvalidArgument,
+                        "computer evidence does not match one ScreenObserve intent",
+                        false,
+                    ));
+                }
+            }
+            EffectPhase::Authorized { effect, verdict }
+                if effect == command.effect_id
+                    && matches!(
+                        verdict,
+                        AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. }
+                    ) =>
+            {
+                if authorized_seq.replace(envelope.seq).is_some() {
+                    return Err(store_error(
+                        ErrorCode::InvalidArgument,
+                        "computer evidence has duplicate authorization provenance",
+                        false,
+                    ));
+                }
+            }
+            EffectPhase::Dispatched { effect } if effect == command.effect_id => {
+                if dispatched_seq.replace(envelope.seq).is_some() {
+                    return Err(store_error(
+                        ErrorCode::InvalidArgument,
+                        "computer evidence has duplicate dispatch provenance",
+                        false,
+                    ));
+                }
+            }
+            EffectPhase::Outcome {
+                effect,
+                outcome: EffectOutcome::Ok,
+                ..
+            } if effect == command.effect_id => {
+                if outcome_seq.replace(envelope.seq).is_some() {
+                    return Err(store_error(
+                        ErrorCode::InvalidArgument,
+                        "computer evidence has duplicate outcome provenance",
+                        false,
+                    ));
+                }
+            }
+            EffectPhase::Outcome { effect, .. } if effect == command.effect_id => {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "computer evidence requires a successful daemon-observed effect outcome",
+                    false,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let (Some(intent_seq), Some(authorized_seq), Some(dispatched_seq), Some(outcome_seq)) =
+        (intent_seq, authorized_seq, dispatched_seq, outcome_seq)
+    else {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "computer evidence has incomplete effect lifecycle provenance",
+            false,
+        ));
+    };
+    if !(intent_seq < authorized_seq
+        && authorized_seq < dispatched_seq
+        && dispatched_seq < outcome_seq)
+    {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "computer evidence effect lifecycle is out of order",
+            false,
+        ));
+    }
+    Ok(outcome_seq)
 }
 
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]

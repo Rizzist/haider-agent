@@ -103,19 +103,19 @@ use haider_core::{
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, BranchCreateCommand,
     BranchCreateOutcome, CancelledTurn, ChildGraphAttachCommand, ChildGraphAttachOutcome,
     ChildTemplateCacheEntry, ChildTemplateObservation, ChildTemplateObservationCommand,
-    CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
-    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
-    GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand,
-    MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand,
-    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, RunRetryCommand,
-    RunRetryOutcome, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
-    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSelectEffortCommand,
-    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    ComputerEvidenceCommand, ComputerEvidenceOutcome, CreatedBranch, CreatedSession,
+    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
+    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
+    GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
+    OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
+    PromptHistoryCache, RenamedSession, RunRetryCommand, RunRetryOutcome, SelectedEffort,
+    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
+    SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -827,6 +827,10 @@ enum ActorCommand {
     RecordGraphEvidence {
         command: GraphEvidenceCommand,
         completed: oneshot::Sender<Result<GraphEvidenceOutcome, HaiderError>>,
+    },
+    RecordComputerEvidence {
+        command: ComputerEvidenceCommand,
+        completed: oneshot::Sender<Result<ComputerEvidenceOutcome, HaiderError>>,
     },
     GuardGraphFinalization {
         command: GraphFinalizationCommand,
@@ -1922,6 +1926,23 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::RecordGraphEvidence { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn record_computer_evidence(
+        &self,
+        command: ComputerEvidenceCommand,
+    ) -> Result<ComputerEvidenceOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RecordComputerEvidence { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result
