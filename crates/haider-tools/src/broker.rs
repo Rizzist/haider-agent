@@ -1330,10 +1330,39 @@ impl EffectBroker {
         policy: &PermissionPolicy,
         cancel: ComputerCancelToken,
     ) -> ToolResult<EffectIntent> {
-        let intent = self.begin(operation, policy).await?;
+        let intent = self.authorize_computer(operation, policy).await?;
+        self.dispatch_computer(&intent, cancel).await?;
+        Ok(intent)
+    }
+
+    /// Journals and authorizes a computer intent without crossing the
+    /// `Dispatched` boundary. The daemon uses this seam to run native TCC
+    /// preflight/prompt recovery only after Haider authorization, while
+    /// keeping a parked OS grant restart-safe and honestly undispatched.
+    pub async fn authorize_computer(
+        &mut self,
+        operation: &crate::ComputerOperation,
+        policy: &PermissionPolicy,
+    ) -> ToolResult<EffectIntent> {
+        let intent = self.normalize(operation).await?;
+        match self.authorize(&intent, policy).await? {
+            AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => Ok(intent),
+            AuthorizationVerdict::Ask { menu } => Err(ToolError::AuthorizationRequired { menu }),
+            AuthorizationVerdict::Deny { reason } => Err(ToolError::PermissionDenied { reason }),
+        }
+    }
+
+    /// Crosses the computer effect's durable dispatch boundary only after
+    /// the platform preflight reports that its OS permission gate is open.
+    pub async fn dispatch_computer(
+        &mut self,
+        intent: &EffectIntent,
+        cancel: ComputerCancelToken,
+    ) -> ToolResult<()> {
+        self.journal_dispatched(intent).await?;
         self.computer_cancellations
             .insert(intent.effect.clone(), cancel);
-        Ok(intent)
+        Ok(())
     }
 
     /// Signals only genuinely user-cancelled in-flight computer actions.

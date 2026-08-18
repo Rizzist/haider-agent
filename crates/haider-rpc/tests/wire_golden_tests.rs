@@ -2246,6 +2246,41 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
     ));
 }
 
+#[test]
+fn computer_permission_action_wire_is_typed_and_url_free() {
+    use haider_protocol::permission::SystemPermission;
+    use haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1;
+
+    assert_eq!(
+        FEATURE_COMPUTER_PERMISSION_ACTIONS_V1,
+        "computer_permission_actions_v1"
+    );
+    let request = RequestBody::ComputerPermissionOpenSettings {
+        session_id: haider_protocol::ids::SessionId::new("session-permission"),
+        request_id: "grant-screen-1".into(),
+        permission: SystemPermission::ScreenRecording,
+    };
+    assert_eq!(
+        serde_json::to_value(&request).expect("request JSON"),
+        serde_json::json!({
+            "method": "computer.permission_open_settings",
+            "session_id": "session-permission",
+            "request_id": "grant-screen-1",
+            "permission": "screen_recording"
+        })
+    );
+    let response = ResponseBody::ComputerPermissionOpenSettings {
+        permission: SystemPermission::ScreenRecording,
+    };
+    assert_eq!(
+        serde_json::to_value(response).expect("response JSON"),
+        serde_json::json!({
+            "method": "computer.permission_open_settings",
+            "permission": "screen_recording"
+        })
+    );
+}
+
 /// G3 goldens: the two session-tuning pairs pin their exact v1 bytes — an
 /// effort request/response with the value present, the ABSENT-`effort`
 /// revert shape (no `"effort"` key at all, mirroring the select_model

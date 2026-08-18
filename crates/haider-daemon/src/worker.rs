@@ -78,7 +78,14 @@ use haider_protocol::ids::{
     SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem, UserCommandOriginV1};
-use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, effect_recovery_menu};
+use haider_protocol::menu::{
+    AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
+    effect_recovery_menu,
+};
+use haider_protocol::permission::{
+    PermissionEventPayload, PermissionGrantAction, PermissionGrantNeeded,
+    PermissionGrantResolution, PermissionGrantResolved,
+};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{
     AccountUsage, CacheBoundaryIdentity, FeatureResolve, FinishReason, PrefixDigests, StreamEvent,
@@ -100,24 +107,27 @@ use haider_provider::{
     degrade_tool_result_images_to_placeholders,
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
+use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
-    ComputerOperation, ComputerOutput, EffectBroker, FsCaseMode, FsEdit, FsEditChange, FsGlob,
-    FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink,
-    MessageSubagent, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
-    ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent,
-    ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
+    ComputerOperation, ComputerOutput, ComputerPermissionPoll, EffectBroker, FsCaseMode, FsEdit,
+    FsEditChange, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite,
+    GraphEvidence, JournalSink, MessageSubagent, PermissionPolicy, ProcessBounds, ProcessExec,
+    ProcessResult, ResultBounds, ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope,
+    ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 const MANAGER_CAPACITY: usize = 128;
 const SUPERVISOR_CAPACITY: usize = 64;
+const COMPUTER_PERMISSION_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+const COMPUTER_PERMISSION_MENU_ORIGIN: &str = "computer-os-permission";
 
 /// A provider resolved and pinned for one logical turn (R6).
 pub struct ResolvedTurnProvider {
@@ -2041,9 +2051,9 @@ impl<T> FutureTurn for T where
 /// from the journal, active token cancelled), and the active turn's outcome
 /// (dispatcher closed, harness stopped and joined, then the store-side
 /// conditional Idle settle — `Store::settle_session_idle` owns that law).
-/// Shutdown cancels the active turn, terminalizes durable queued runs, and
-/// exits only after the last turn settles; the supervisor deregisters its
-/// lease on the way out.
+/// Shutdown cancels ordinary active turns, but silently parks a durable input,
+/// permission, or local-child checkpoint for startup recovery. Queued runs are
+/// terminalized and the supervisor deregisters its lease on the way out.
 async fn run_supervisor(
     dependencies: WorkerDependencies,
     metadata: SessionMetadataV1,
@@ -2068,6 +2078,7 @@ async fn run_supervisor(
         incarnation,
     )));
     let mut stopping = false;
+    let mut parked_checkpoint = false;
     let mut rescan_needed = false;
     let mut deferred_shell = VecDeque::<PendingShellExec>::new();
     // A nudge's accepted user-message sequence is its process-stable delivery
@@ -2360,6 +2371,7 @@ async fn run_supervisor(
                             ) {
                                 if let Some(parked) = active.take() {
                                     park_request_input_checkpoint(parked).await;
+                                    parked_checkpoint = true;
                                 }
                             } else {
                                 active_cancel.cancel();
@@ -2679,7 +2691,7 @@ async fn run_supervisor(
         }
     }
     let _ = lease.unregister_worker().await;
-    true
+    !parked_checkpoint
 }
 
 /// Chooses the one `Idle { interrupted }` meaning after a live outcome.
@@ -6621,6 +6633,9 @@ async fn create_broker_tool_dispatcher(
         computer,
         screenshot_redaction,
         active_computer_turn_cancel: StdMutex::new(None),
+        os_permission_menus: Mutex::new(HashMap::new()),
+        pending_computer_permissions: Mutex::new(HashMap::new()),
+        permission_pollers: StdMutex::new(HashMap::new()),
         policy: Mutex::new(policy),
         cas: Mutex::new(HubArtifactStore {
             store: context.store,
@@ -6676,6 +6691,9 @@ struct BrokerToolDispatcher {
     /// execute future, allowing `close` to distinguish ESC from a panic or
     /// transport failure and preserve honest Cancelled vs Unknown outcomes.
     active_computer_turn_cancel: StdMutex<Option<CancelToken>>,
+    os_permission_menus: Mutex<HashMap<MenuId, Menu>>,
+    pending_computer_permissions: Mutex<HashMap<MenuId, PendingComputerPermission>>,
+    permission_pollers: StdMutex<HashMap<MenuId, JoinHandle<()>>>,
     policy: Mutex<PermissionPolicy>,
     cas: Mutex<HubArtifactStore>,
     ledger: ChangeLedger,
@@ -6698,6 +6716,15 @@ struct ComputerGraphTarget {
     attempt: u32,
 }
 
+#[derive(Debug, Clone)]
+struct PendingComputerPermission {
+    effect_id: EffectId,
+    permission: haider_protocol::permission::SystemPermission,
+    pane_name: String,
+    settings_url: String,
+    restart_required: bool,
+}
+
 struct ComputerObservationRecord<'a> {
     run_id: &'a RunId,
     call_id: &'a str,
@@ -6709,6 +6736,338 @@ struct ComputerObservationRecord<'a> {
 }
 
 impl BrokerToolDispatcher {
+    fn permission_menu(
+        intent: &EffectIntent,
+        permission: haider_protocol::permission::SystemPermission,
+        pane_name: &str,
+    ) -> Menu {
+        Menu {
+            id: MenuId::new(format!(
+                "computer-os-permission-{}-{}",
+                intent.effect,
+                permission.as_str()
+            )),
+            kind: MenuKind::Permission {
+                effect_summary: format!("{} requires {pane_name}", intent.summary),
+            },
+            title: format!("Allow {pane_name}"),
+            body: vec![
+                "macOS requires a real user grant. Haider opened the native prompt and will continue automatically when the permission is usable."
+                    .into(),
+            ],
+            options: vec![MenuOption {
+                key: "retry".into(),
+                label: "Retry".into(),
+                detail: Some("Recheck the macOS permission now.".into()),
+                decision: Some(DecisionKind::AllowOnce),
+            }],
+            blocking: true,
+            scope: MenuScope::Session,
+            origin: COMPUTER_PERMISSION_MENU_ORIGIN.into(),
+            ttl_ms: None,
+            timeout_option: None,
+        }
+    }
+
+    fn pending_permission(
+        intent: &EffectIntent,
+        error: &ComputerError,
+    ) -> Option<PendingComputerPermission> {
+        let ComputerError::PermissionRequired {
+            permission,
+            settings_pane,
+            settings_url,
+            restart_required,
+            ..
+        } = error
+        else {
+            return None;
+        };
+        Some(PendingComputerPermission {
+            effect_id: intent.effect.clone(),
+            permission: *permission,
+            pane_name: settings_pane.clone(),
+            settings_url: settings_url.clone(),
+            restart_required: *restart_required,
+        })
+    }
+
+    fn permission_needed(
+        checkpoint: &RequestInputCheckpoint,
+        pending: &PendingComputerPermission,
+    ) -> PermissionGrantNeeded {
+        PermissionGrantNeeded {
+            request_id: checkpoint.menu.id.to_string(),
+            menu_id: checkpoint.menu.id.clone(),
+            request_seq: checkpoint.request_seq,
+            opening_generation: checkpoint.opening_generation,
+            call_id: checkpoint.call_id.clone(),
+            effect_id: pending.effect_id.clone(),
+            permission: pending.permission,
+            pane_name: pending.pane_name.clone(),
+            settings_url: pending.settings_url.clone(),
+            actions: vec![
+                PermissionGrantAction::OpenSettings,
+                PermissionGrantAction::Retry,
+                PermissionGrantAction::RestartDaemon,
+            ],
+            auto_restart_pending: pending.restart_required,
+            poll_timeout_ms: u64::try_from(COMPUTER_PERMISSION_POLL_TIMEOUT.as_millis())
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    async fn durable_pending_permission(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingComputerPermission>, HaiderError> {
+        let mut cursor = 0;
+        let mut found = None;
+        loop {
+            let page = self
+                .output
+                .store
+                .read(&self.session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                return Ok(found);
+            }
+            cursor = page.last().map_or(cursor, |event| event.seq);
+            for event in page {
+                let Ok(PermissionEventPayload::PermissionGrantNeeded(needed)) =
+                    PermissionEventPayload::from_payload_value(event.payload)
+                else {
+                    continue;
+                };
+                if needed.request_id == request_id {
+                    found = Some(PendingComputerPermission {
+                        effect_id: needed.effect_id,
+                        permission: needed.permission,
+                        pane_name: needed.pane_name,
+                        settings_url: needed.settings_url,
+                        restart_required: needed.auto_restart_pending,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn resolve_os_permission_menu(
+        output: &HubCommandOutputContext,
+        checkpoint: &RequestInputCheckpoint,
+    ) -> Result<MenuResolutionOutcome, HaiderError> {
+        output
+            .store
+            .hub()
+            .resolve_hook_menu(MenuResolutionCommand {
+                command_id: format!("computer-os-permission-auto-{}", checkpoint.menu.id),
+                session_id: output.store.session_id().clone(),
+                request_seq: checkpoint.request_seq,
+                // Menu CAS identifies the generation that opened the card;
+                // the hub elevates this exact registered recovery coordinate
+                // when the live lease belongs to a fresh daemon generation.
+                worker_generation: checkpoint.opening_generation,
+                allow_prior_generation: checkpoint.opening_generation
+                    != output.store.worker_generation(),
+                answer: MenuAnswer {
+                    menu: checkpoint.menu.id.clone(),
+                    option_key: Some("retry".into()),
+                    option_index: 0,
+                    value: None,
+                    via: AnswerVia::Hook,
+                },
+                device_id: output.device_id.clone(),
+                input_is_secret_reference: false,
+            })
+            .await
+    }
+
+    async fn activate_computer_permission(
+        &self,
+        run_id: &RunId,
+        checkpoint: &RequestInputCheckpoint,
+    ) -> Result<(), HaiderError> {
+        if checkpoint.menu.origin != COMPUTER_PERMISSION_MENU_ORIGIN {
+            return Ok(());
+        }
+        if self
+            .permission_pollers
+            .lock()
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "computer permission poller lock is poisoned",
+                    false,
+                )
+            })?
+            .contains_key(&checkpoint.menu.id)
+        {
+            return Ok(());
+        }
+
+        let operation_value: serde_json::Value =
+            serde_json::from_str(&checkpoint.args).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("recovered computer arguments could not decode: {error}"),
+                    false,
+                )
+            })?;
+        let operation = ComputerOperation::from_tool_args(operation_value).map_err(tool_error)?;
+        let mut pending = self
+            .pending_computer_permissions
+            .lock()
+            .await
+            .get(&checkpoint.menu.id)
+            .cloned();
+        let recovered = pending.is_none();
+        if pending.is_none() {
+            pending = self
+                .durable_pending_permission(checkpoint.menu.id.as_str())
+                .await?;
+        }
+        let Some(mut pending) = pending else {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                format!(
+                    "computer OS-permission checkpoint {} has no durable grant descriptor",
+                    checkpoint.menu.id
+                ),
+                false,
+            ));
+        };
+
+        if recovered {
+            let cancel = ComputerCancelToken::new();
+            match self.computer.prepare(operation.action(), &cancel).await {
+                Ok(()) => {
+                    self.output
+                        .append_permission_payload(
+                            run_id,
+                            PermissionEventPayload::PermissionGrantResolved(
+                                PermissionGrantResolved {
+                                    request_id: checkpoint.menu.id.to_string(),
+                                    permission: pending.permission,
+                                    resolution: PermissionGrantResolution::Granted,
+                                    retrying_parked_action: true,
+                                },
+                            ),
+                        )
+                        .await
+                        .map_err(tool_error)?;
+                    Self::resolve_os_permission_menu(&self.output, checkpoint).await?;
+                    return Ok(());
+                }
+                Err(error @ ComputerError::PermissionRequired { .. }) => {
+                    let ComputerError::PermissionRequired {
+                        permission,
+                        settings_pane,
+                        settings_url,
+                        restart_required,
+                        ..
+                    } = error
+                    else {
+                        unreachable!("permission error matched above");
+                    };
+                    pending.permission = permission;
+                    pending.pane_name = settings_pane;
+                    pending.settings_url = settings_url;
+                    pending.restart_required = restart_required;
+                }
+                Err(error) => return Err(computer_error(error)),
+            }
+        }
+
+        self.output
+            .append_permission_payload(
+                run_id,
+                PermissionEventPayload::PermissionGrantNeeded(Self::permission_needed(
+                    checkpoint, &pending,
+                )),
+            )
+            .await
+            .map_err(tool_error)?;
+
+        let backend = Arc::clone(&self.computer);
+        let output = self.output.clone();
+        let run_id = run_id.clone();
+        let checkpoint = checkpoint.clone();
+        let menu_id = checkpoint.menu.id.clone();
+        let task = tokio::spawn(async move {
+            let cancel = ComputerCancelToken::new();
+            match backend
+                .poll_permission(
+                    pending.permission,
+                    &cancel,
+                    COMPUTER_PERMISSION_POLL_TIMEOUT,
+                )
+                .await
+            {
+                Ok(ComputerPermissionPoll::Granted) => {
+                    let appended = output
+                        .append_permission_payload(
+                            &run_id,
+                            PermissionEventPayload::PermissionGrantResolved(
+                                PermissionGrantResolved {
+                                    request_id: checkpoint.menu.id.to_string(),
+                                    permission: pending.permission,
+                                    resolution: PermissionGrantResolution::Granted,
+                                    retrying_parked_action: true,
+                                },
+                            ),
+                        )
+                        .await;
+                    if appended.is_ok() {
+                        let _ = Self::resolve_os_permission_menu(&output, &checkpoint).await;
+                    }
+                }
+                Ok(ComputerPermissionPoll::RestartRequired) => {
+                    pending.restart_required = true;
+                    let _ = output
+                        .append_permission_payload(
+                            &run_id,
+                            PermissionEventPayload::PermissionGrantNeeded(Self::permission_needed(
+                                &checkpoint,
+                                &pending,
+                            )),
+                        )
+                        .await;
+                }
+                Ok(ComputerPermissionPoll::TimedOut) => {
+                    // Deliberately leave the durable menu unanswered. Its
+                    // Open Settings, Retry, and Restart actions remain live.
+                }
+                Err(ComputerError::Cancelled) => {
+                    let _ = output
+                        .append_permission_payload(
+                            &run_id,
+                            PermissionEventPayload::PermissionGrantResolved(
+                                PermissionGrantResolved {
+                                    request_id: checkpoint.menu.id.to_string(),
+                                    permission: pending.permission,
+                                    resolution: PermissionGrantResolution::Cancelled,
+                                    retrying_parked_action: false,
+                                },
+                            ),
+                        )
+                        .await;
+                }
+                Err(_) => {}
+            }
+        });
+        self.permission_pollers
+            .lock()
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "computer permission poller lock is poisoned",
+                    false,
+                )
+            })?
+            .insert(menu_id, task);
+        Ok(())
+    }
+
     async fn computer_graph_target(&self) -> ToolResult<Option<ComputerGraphTarget>> {
         let status = self
             .output
@@ -7680,8 +8039,38 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     let operation = ComputerOperation::from_tool_args(args)?;
                     let action_cancel = ComputerCancelToken::new();
                     let intent = broker
-                        .begin_computer(&operation, &policy, action_cancel.clone())
+                        .authorize_computer(&operation, &policy)
                         .await?;
+                    match self
+                        .computer
+                        .prepare(operation.action(), &action_cancel)
+                        .await
+                    {
+                        Ok(()) => {
+                            broker
+                                .dispatch_computer(&intent, action_cancel.clone())
+                                .await?;
+                        }
+                        Err(error @ ComputerError::PermissionRequired { .. }) => {
+                            let pending = Self::pending_permission(&intent, &error)
+                                .expect("permission error has a grant descriptor");
+                            let menu = Self::permission_menu(
+                                &intent,
+                                pending.permission,
+                                &pending.pane_name,
+                            );
+                            self.pending_computer_permissions
+                                .lock()
+                                .await
+                                .insert(menu.id.clone(), pending);
+                            self.os_permission_menus
+                                .lock()
+                                .await
+                                .insert(menu.id.clone(), menu.clone());
+                            return Err(ToolError::AuthorizationRequired { menu: menu.id });
+                        }
+                        Err(error) => return Err(ToolError::Computer(error)),
+                    }
                     *self
                         .active_computer_turn_cancel
                         .lock()
@@ -7710,11 +8099,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     } else {
                         None
                     };
-                    match self
-                        .computer
-                        .execute(operation.action(), &action_cancel)
-                        .await
-                    {
+                    match self.computer.execute(operation.action(), &action_cancel).await {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
                             let stored = self
                                 .admit_computer_screenshot(png, &action_cancel)
@@ -7986,13 +8371,22 @@ impl ToolDispatcher for BrokerToolDispatcher {
         match result {
             Ok(result) => Ok(ToolDispatchResult::Completed(result)),
             Err(haider_tools::ToolError::AuthorizationRequired { menu }) => {
-                let menu = broker.permission_menu(&menu).cloned().ok_or_else(|| {
-                    HaiderError::new(
-                        ErrorCode::Internal,
-                        "broker authorization menu disappeared before publication",
-                        false,
-                    )
-                })?;
+                let menu = match broker.permission_menu(&menu).cloned() {
+                    Some(menu) => menu,
+                    None => self
+                        .os_permission_menus
+                        .lock()
+                        .await
+                        .get(&menu)
+                        .cloned()
+                        .ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::Internal,
+                                "authorization menu disappeared before publication",
+                                false,
+                            )
+                        })?,
+                };
                 Ok(ToolDispatchResult::ApprovalRequired(menu))
             }
             Err(error) => match typed_tool_result(&error) {
@@ -8030,7 +8424,25 @@ impl ToolDispatcher for BrokerToolDispatcher {
         Ok(())
     }
 
+    async fn activate_approval(
+        &self,
+        run_id: &RunId,
+        checkpoint: &RequestInputCheckpoint,
+    ) -> Result<(), HaiderError> {
+        self.activate_computer_permission(run_id, checkpoint).await
+    }
+
     async fn resolve_approval(&self, menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
+        if menu.origin == COMPUTER_PERMISSION_MENU_ORIGIN {
+            if answer.option_key.as_deref() != Some("retry") && answer.option_index != 0 {
+                return Err(HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "computer OS-permission menu accepts only Retry",
+                    false,
+                ));
+            }
+            return Ok(());
+        }
         let mut broker = self.broker.lock().await;
         let broker = broker.as_mut().ok_or_else(|| {
             HaiderError::new(
@@ -8063,6 +8475,22 @@ impl ToolDispatcher for BrokerToolDispatcher {
     }
 
     async fn close(&self) -> Result<(), HaiderError> {
+        let pollers = self
+            .permission_pollers
+            .lock()
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "computer permission poller lock is poisoned",
+                    false,
+                )
+            })?
+            .drain()
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in pollers {
+            task.abort();
+        }
         let emergency_stop = self.computer.emergency_stop().await;
         let mut broker_guard = self.broker.lock().await;
         let computer_turn_cancelled = self
@@ -8103,6 +8531,47 @@ pub(crate) struct DurableToolState {
     pub(crate) freshness: HashMap<String, FileFreshness>,
 }
 
+/// Set to `0`, `false`, `no`, or `off` to keep every computer effect on the
+/// ordinary Ask path even after an explicit user computer-use command.
+pub const EXPLICIT_COMPUTER_AUTO_GRANT_ENV: &str = "HAIDER_EXPLICIT_COMPUTER_AUTO_GRANT";
+
+fn explicit_computer_auto_grant_enabled() -> bool {
+    let value = std::env::var(EXPLICIT_COMPUTER_AUTO_GRANT_ENV).ok();
+    explicit_computer_auto_grant_value(value.as_deref())
+}
+
+pub(crate) fn explicit_computer_auto_grant_value(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// Conservative user-authored opt-in classifier. Consent is the explicit
+/// command-like `computer-use` marker, never an inference from prose that may
+/// merely discuss or quote computer control.
+pub(crate) fn explicit_computer_use_intent(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    let command = normalized.strip_prefix('/').unwrap_or(&normalized);
+    command
+        .strip_prefix("computer-use")
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+}
+
+fn add_explicit_computer_session_grants(grants: &mut Vec<SessionGrant>) {
+    for class in [EffectClass::ScreenObserve, EffectClass::ScreenControl] {
+        let grant = SessionGrant::for_effect(class, "explicit-user-computer-use");
+        if !grants.contains(&grant) {
+            grants.push(grant);
+        }
+    }
+}
+
 pub(crate) async fn durable_session_tool_state(
     store: &dyn StoreHandle,
     session_id: &SessionId,
@@ -8113,9 +8582,13 @@ pub(crate) async fn durable_session_tool_state(
     let mut grants = Vec::new();
     let mut bindings = HashMap::new();
     let mut freshness = HashMap::new();
+    let mut explicit_computer_intent = false;
     loop {
         let page = store.read(session_id, cursor, 256).await?;
         if page.is_empty() {
+            if explicit_computer_intent && explicit_computer_auto_grant_enabled() {
+                add_explicit_computer_session_grants(&mut grants);
+            }
             return Ok(DurableToolState {
                 grants,
                 bindings,
@@ -8168,6 +8641,11 @@ pub(crate) async fn durable_session_tool_state(
                     if !grants.contains(&grant) {
                         grants.push(grant);
                     }
+                }
+                EventPayload::UserMessage { text, .. }
+                    if envelope.agent_id.is_none() && explicit_computer_use_intent(&text) =>
+                {
+                    explicit_computer_intent = true;
                 }
                 _ => {}
             }
@@ -8296,11 +8774,11 @@ fn computer_failure_result(error: &ComputerError) -> BoundedResult {
             ToolResultStatus::Failed,
             message.clone(),
             Some(ErrorPresentation::new(
-                format!("computer-{permission}-required"),
-                format!("Grant {permission} permission"),
-                format!("{message}. Open {settings_pane}."),
+                format!("computer-{}-required", permission.as_str()),
+                format!("Grant {} permission", permission.as_str()),
+                format!("{message}. The in-session grant card opens {settings_pane}."),
                 ErrorScope::Tool,
-                [ErrorAction::None],
+                [ErrorAction::Retry],
             )),
         ),
         ComputerError::Cancelled => (
@@ -8801,6 +9279,44 @@ impl HubCommandOutputContext {
             device_id: self.device_id.clone(),
             event_ids: Arc::clone(&self.event_ids),
         }
+    }
+
+    async fn append_permission_payload(
+        &self,
+        run_id: &RunId,
+        payload: PermissionEventPayload,
+    ) -> ToolResult<()> {
+        let mut envelopes = [EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: self.event_ids.next(),
+            seq: 0,
+            session_id: self.store.session_id().clone(),
+            branch_id: self.branch_id.clone(),
+            run_id: Some(run_id.clone()),
+            agent_id: self.agent_id.clone(),
+            device_id: self.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: self.store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: payload
+                .to_payload_value()
+                .map_err(|error| ToolError::Runtime {
+                    message: format!("cannot serialize computer permission envelope: {error}"),
+                })?,
+        }];
+        StoreHandle::append(&self.store, &mut envelopes)
+            .await
+            .map_err(|error| ToolError::Runtime {
+                message: error.message,
+            })?;
+        Ok(())
     }
 
     async fn record_process_signal(

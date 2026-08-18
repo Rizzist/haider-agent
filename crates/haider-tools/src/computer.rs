@@ -30,6 +30,7 @@ use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::computer::ComputerAction;
 use haider_protocol::effect::EffectClass;
+use haider_protocol::permission::SystemPermission;
 use haider_protocol::tool::{
     DispatchMode, TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC, TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES,
     TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS, ToolManifest,
@@ -54,9 +55,14 @@ pub enum ComputerError {
         message: String,
     },
     PermissionRequired {
-        permission: String,
+        permission: SystemPermission,
         settings_pane: String,
         settings_url: String,
+        /// The live process should normally consume a newly granted TCC
+        /// permission. This becomes true only when the backend has evidence
+        /// that a fresh process is required.
+        #[serde(default)]
+        restart_required: bool,
         message: String,
     },
     InvalidAction {
@@ -334,15 +340,52 @@ pub enum ComputerOutput {
     },
 }
 
+/// Result of the backend's bounded, side-effect-free OS-permission poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputerPermissionPoll {
+    /// The current process can retry the parked action immediately.
+    Granted,
+    /// The permission is still absent when the bounded poll expires.
+    TimedOut,
+    /// The OS reports the grant, but this process cannot consume it.
+    RestartRequired,
+}
+
 /// Injectable OS boundary. Tests use a deterministic fake and never touch
 /// real input devices or TCC-protected APIs.
 #[async_trait]
 pub trait ComputerBackend: Send + Sync {
+    /// Performs only the platform permission preflight for `action`.
+    /// Implementations may trigger an OS-owned consent prompt, but must not
+    /// observe the screen or post input. The effect broker has authorized the
+    /// intent at this point but deliberately has not journaled `Dispatched`.
+    async fn prepare(
+        &self,
+        _action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<()> {
+        cancel.check()
+    }
+
     async fn execute(
         &self,
         action: &ComputerAction,
         cancel: &ComputerCancelToken,
     ) -> ComputerResult<ComputerOutput>;
+
+    /// Waits for a previously surfaced native permission to change. The
+    /// default is an immediate timeout: only a backend that emitted
+    /// `PermissionRequired` needs to implement this, keeping Linux/Windows
+    /// behavior byte-for-byte unchanged.
+    async fn poll_permission(
+        &self,
+        _permission: SystemPermission,
+        cancel: &ComputerCancelToken,
+        _timeout: std::time::Duration,
+    ) -> ComputerResult<ComputerPermissionPoll> {
+        cancel.check()?;
+        Ok(ComputerPermissionPoll::TimedOut)
+    }
 
     /// Updates the coordinate space to the exact image dimensions returned by
     /// CU-1. Backends without a screen keep the harmless default.
@@ -415,6 +458,25 @@ pub fn platform_computer_backend() -> Arc<dyn ComputerBackend> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Arc::new(UnavailableComputerBackend::new(std::env::consts::OS))
+    }
+}
+
+/// Opens the exact macOS System Settings pane for one advertised TCC gate.
+/// The caller supplies an enum, never an arbitrary URL.
+pub fn open_system_permission_settings(permission: SystemPermission) -> ComputerResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::open_system_permission_settings(permission)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(ComputerError::Unavailable {
+            platform: std::env::consts::OS.into(),
+            message: format!(
+                "opening {} settings is supported only on macOS",
+                permission.as_str()
+            ),
+        })
     }
 }
 

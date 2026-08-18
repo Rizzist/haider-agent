@@ -1,0 +1,7 @@
+{
+  "type": "permission_grant_resolved",
+  "request_id": "computer-permission-effect-7-screen_recording",
+  "permission": "screen_recording",
+  "resolution": "granted",
+  "retrying_parked_action": true
+}

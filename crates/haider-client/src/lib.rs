@@ -22,6 +22,7 @@ pub mod client;
 pub mod graph;
 pub mod headless;
 pub mod observe;
+pub mod permission;
 pub mod profile;
 pub mod shell;
 pub mod spawn;
@@ -47,6 +48,10 @@ pub use headless::{
     run_headless,
 };
 pub use observe::{ObserveClient, ObserveError, observe_stream_all, observe_stream_session};
+pub use permission::{
+    ComputerPermissionClientError, open_permission_settings, open_permission_settings_request,
+    restart_daemon_for_permission,
+};
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,
     PROFILE_DIR_ENV, ProfileEnv, ProfileError, ResolvedProfile, effective_uid, endpoint_path_for,

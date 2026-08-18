@@ -32,6 +32,10 @@ use haider_protocol::menu::{
     AnswerVia, ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption,
     MenuScope,
 };
+use haider_protocol::permission::{
+    PermissionEventPayload, PermissionGrantAction, PermissionGrantNeeded,
+    PermissionGrantResolution, PermissionGrantResolved, SystemPermission,
+};
 use haider_protocol::project_instructions::{
     ProjectInstructionFileFact, ProjectInstructionsEventPayload, ProjectInstructionsLoaded,
 };
@@ -2116,4 +2120,44 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
         .expect("pinned graph reduces");
     let brief = status.graph_brief().expect("active graph brief");
     assert!(brief.len() <= haider_protocol::graph::GRAPH_BRIEF_MAX_BYTES);
+}
+
+#[test]
+fn additive_permission_grant_needed_event_shape() {
+    additive_golden(
+        "permission_grant_needed",
+        &PermissionEventPayload::PermissionGrantNeeded(PermissionGrantNeeded {
+            request_id: "computer-permission-effect-7-screen_recording".into(),
+            menu_id: MenuId::new("computer-permission-effect-7-screen_recording"),
+            request_seq: 41,
+            opening_generation: 3,
+            call_id: "call-screen-1".into(),
+            effect_id: EffectId::new("effect-7"),
+            permission: SystemPermission::ScreenRecording,
+            pane_name: "System Settings > Privacy & Security > Screen Recording".into(),
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                    .into(),
+            actions: vec![
+                PermissionGrantAction::OpenSettings,
+                PermissionGrantAction::Retry,
+                PermissionGrantAction::RestartDaemon,
+            ],
+            auto_restart_pending: false,
+            poll_timeout_ms: 120_000,
+        }),
+    );
+}
+
+#[test]
+fn additive_permission_grant_resolved_event_shape() {
+    additive_golden(
+        "permission_grant_resolved",
+        &PermissionEventPayload::PermissionGrantResolved(PermissionGrantResolved {
+            request_id: "computer-permission-effect-7-screen_recording".into(),
+            permission: SystemPermission::ScreenRecording,
+            resolution: PermissionGrantResolution::Granted,
+            retrying_parked_action: true,
+        }),
+    );
 }

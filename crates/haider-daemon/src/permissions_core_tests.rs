@@ -4,8 +4,9 @@ use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
     WebCapabilityDegrade, advertised_tool_definitions, defer_shell_handoff,
-    durable_session_tool_state, effective_permission_defaults, registered_tool_route,
-    registered_tools, tool_inventory_snapshot, typed_tool_result,
+    durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
+    explicit_computer_use_intent, registered_tool_route, registered_tools, tool_inventory_snapshot,
+    typed_tool_result,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -30,6 +31,68 @@ use haider_tools::{FsEditAnchorMismatch, ToolError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[test]
+fn explicit_computer_intent_is_positive_bounded_and_negation_safe() {
+    for text in [
+        "computer-use my chrome and click Sign in",
+        "/computer-use take a screenshot",
+    ] {
+        assert!(explicit_computer_use_intent(text), "must opt in: {text}");
+    }
+    for text in [
+        "do not use my computer",
+        "Never control my screen",
+        "Explain what the computer-use tool does",
+        "The documentation contains `computer-use my chrome` as an example",
+        "Please use my computer to open Chrome",
+        "Can you control my screen and close that dialog?",
+        "computer vision is useful",
+    ] {
+        assert!(
+            !explicit_computer_use_intent(text),
+            "must not opt in: {text}"
+        );
+    }
+}
+
+#[test]
+fn explicit_computer_auto_grant_has_a_documented_fail_closed_opt_out() {
+    assert!(explicit_computer_auto_grant_value(None));
+    assert!(explicit_computer_auto_grant_value(Some("yes")));
+    for disabled in ["0", "false", "NO", " off "] {
+        assert!(!explicit_computer_auto_grant_value(Some(disabled)));
+    }
+}
+
+#[tokio::test]
+async fn explicit_computer_command_reconstructs_only_session_screen_grants() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("explicit-computer-session");
+    let mut event = envelope(
+        &session_id,
+        "explicit-computer-user",
+        EventPayload::UserMessage {
+            text: "computer-use my chrome".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Steer,
+        },
+    );
+    event.run_id = Some(RunId::new("explicit-computer-run"));
+    store.append(&mut [event]).await.expect("append opt-in");
+    let state = durable_session_tool_state(&store, &session_id)
+        .await
+        .expect("reconstruct grants");
+    assert_eq!(state.grants.len(), 2);
+    assert!(state.grants.iter().any(|grant| {
+        grant.class == EffectClass::ScreenObserve
+            && grant.scope == haider_tools::SessionGrantScope::Class
+    }));
+    assert!(state.grants.iter().any(|grant| {
+        grant.class == EffectClass::ScreenControl
+            && grant.scope == haider_tools::SessionGrantScope::Class
+    }));
+}
 
 /// MUTATION CHECK: advertise a name that has no typed registry route, or add
 /// legacy `exec` to the manifests. Expected runtime failure: advertised and

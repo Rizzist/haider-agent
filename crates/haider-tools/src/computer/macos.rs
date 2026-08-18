@@ -7,13 +7,15 @@
 
 use super::{
     ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
-    ComputerInspectionBounds, ComputerOutput, ComputerResult,
+    ComputerInspectionBounds, ComputerOutput, ComputerPermissionPoll, ComputerResult,
 };
 use async_trait::async_trait;
 use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
+use haider_protocol::permission::SystemPermission;
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use std::ffi::{CStr, c_char, c_void};
 use std::io::Cursor;
+use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -25,6 +27,23 @@ const SCREEN_RECORDING_URL: &str =
 const ACCESSIBILITY_PANE: &str = "System Settings > Privacy & Security > Accessibility";
 const ACCESSIBILITY_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+pub(crate) fn open_system_permission_settings(permission: SystemPermission) -> ComputerResult<()> {
+    let url = match permission {
+        SystemPermission::ScreenRecording => SCREEN_RECORDING_URL,
+        SystemPermission::Accessibility => ACCESSIBILITY_URL,
+    };
+    Command::new("/usr/bin/open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| ComputerError::Backend {
+            message: format!("could not open macOS System Settings: {error}"),
+        })
+}
 
 const CG_EVENT_TAP_HID: u32 = 0;
 const CG_MOUSE_LEFT: u32 = 0;
@@ -251,11 +270,12 @@ impl MacOsComputerBackend {
             return Ok(());
         }
         Err(ComputerError::PermissionRequired {
-            permission: "screen_recording".into(),
+            permission: SystemPermission::ScreenRecording,
             settings_pane: SCREEN_RECORDING_PANE.into(),
             settings_url: SCREEN_RECORDING_URL.into(),
+            restart_required: false,
             message: format!(
-                "grant Screen Recording to haiderd in {SCREEN_RECORDING_PANE}, then restart haiderd"
+                "macOS Screen Recording permission is waiting in {SCREEN_RECORDING_PANE}"
             ),
         })
     }
@@ -301,12 +321,11 @@ impl MacOsComputerBackend {
             return Ok(());
         }
         Err(ComputerError::PermissionRequired {
-            permission: "accessibility".into(),
+            permission: SystemPermission::Accessibility,
             settings_pane: ACCESSIBILITY_PANE.into(),
             settings_url: ACCESSIBILITY_URL.into(),
-            message: format!(
-                "grant Accessibility to haiderd in {ACCESSIBILITY_PANE}, then restart haiderd"
-            ),
+            restart_required: false,
+            message: format!("macOS Accessibility permission is waiting in {ACCESSIBILITY_PANE}"),
         })
     }
 
@@ -318,8 +337,12 @@ impl MacOsComputerBackend {
         let bounds = unsafe { CGDisplayBounds(display) };
         let image = unsafe { CGDisplayCreateImage(display) };
         if image.is_null() {
-            return Err(ComputerError::Backend {
-                message: "macOS screen capture returned no image".into(),
+            return Err(ComputerError::PermissionRequired {
+                permission: SystemPermission::ScreenRecording,
+                settings_pane: SCREEN_RECORDING_PANE.into(),
+                settings_url: SCREEN_RECORDING_URL.into(),
+                restart_required: true,
+                message: "macOS granted Screen Recording, but this haiderd process cannot capture until it restarts".into(),
             });
         }
         // SAFETY: `image` remains live until the guarded release below.
@@ -1166,6 +1189,35 @@ fn map_accessibility_bounds(
 
 #[async_trait]
 impl ComputerBackend for MacOsComputerBackend {
+    async fn prepare(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<()> {
+        cancel.check()?;
+        match action {
+            ComputerAction::Screenshot | ComputerAction::CursorPosition => {
+                self.preflight_screen_recording()
+            }
+            ComputerAction::Inspect { .. } => {
+                self.preflight_screen_recording()?;
+                self.preflight_accessibility()
+            }
+            ComputerAction::Wait { .. }
+            | ComputerAction::LeftClick { .. }
+            | ComputerAction::RightClick
+            | ComputerAction::MiddleClick
+            | ComputerAction::DoubleClick
+            | ComputerAction::LeftMouseDown
+            | ComputerAction::LeftMouseUp
+            | ComputerAction::MouseMove { .. }
+            | ComputerAction::LeftClickDrag { .. }
+            | ComputerAction::Type { .. }
+            | ComputerAction::Key { .. }
+            | ComputerAction::Scroll { .. } => self.preflight_accessibility(),
+        }
+    }
+
     async fn execute(
         &self,
         action: &ComputerAction,
@@ -1200,6 +1252,46 @@ impl ComputerBackend for MacOsComputerBackend {
                 }
             }
             _ => self.control(action, cancel).await,
+        }
+    }
+
+    async fn poll_permission(
+        &self,
+        permission: SystemPermission,
+        cancel: &ComputerCancelToken,
+        timeout: Duration,
+    ) -> ComputerResult<ComputerPermissionPoll> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            cancel.check()?;
+            let granted = match permission {
+                SystemPermission::ScreenRecording => {
+                    // SAFETY: parameterless CoreGraphics TCC preflight; no
+                    // pointer ownership crosses this call.
+                    unsafe { CGPreflightScreenCaptureAccess() }
+                }
+                SystemPermission::Accessibility => Self::accessibility_trusted(false)?,
+            };
+            if granted {
+                return Ok(match permission {
+                    // A Screen Recording toggle granted after this process's
+                    // failed preflight is not consumed speculatively. Leave
+                    // the action undispatched and resume it in a fresh daemon.
+                    SystemPermission::ScreenRecording => ComputerPermissionPoll::RestartRequired,
+                    SystemPermission::Accessibility => ComputerPermissionPoll::Granted,
+                });
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(ComputerPermissionPoll::TimedOut);
+            }
+            let delay = POLL_INTERVAL.min(deadline.saturating_duration_since(now));
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = wait_for_cancel(cancel) => return Err(ComputerError::Cancelled),
+            }
         }
     }
 

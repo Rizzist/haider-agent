@@ -119,6 +119,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
+            haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
     );

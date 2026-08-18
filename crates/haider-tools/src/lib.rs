@@ -30,9 +30,10 @@ pub use broker::{
 pub use computer::ExcludeRegionScreenshotRedaction;
 pub use computer::{
     ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
-    ComputerInspectionBounds, ComputerOperation, ComputerOutput, ComputerResult,
-    PassthroughScreenshotRedaction, ScreenshotRedactionPolicy, ScreenshotRedactionRegion,
-    UnavailableComputerBackend, computer_manifest, configured_screenshot_redaction_policy,
+    ComputerInspectionBounds, ComputerOperation, ComputerOutput, ComputerPermissionPoll,
+    ComputerResult, PassthroughScreenshotRedaction, ScreenshotRedactionPolicy,
+    ScreenshotRedactionRegion, UnavailableComputerBackend, computer_manifest,
+    configured_screenshot_redaction_policy, open_system_permission_settings,
     platform_computer_backend,
 };
 pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};

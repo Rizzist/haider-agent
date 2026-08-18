@@ -54,6 +54,7 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{CommandExecutionOrigin, ItemEvent, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
+use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
@@ -11722,28 +11723,30 @@ fn validate_worker_run_transitions(
     for envelope in envelopes {
         let supplemental_project_instructions =
             ProjectInstructionsLoaded::from_payload_value(&envelope.payload).is_some();
+        let supplemental_computer_permission =
+            PermissionEventPayload::from_payload_value(envelope.payload.clone()).is_ok();
         let Some(run_id) = envelope.run_id.as_ref() else {
-            if supplemental_project_instructions {
+            if supplemental_project_instructions || supplemental_computer_permission {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
-                    "project-instruction worker fact has no logical-turn run id",
+                    "supplemental worker fact has no logical-turn run id",
                     false,
                 ));
             }
             continue;
         };
-        if supplemental_project_instructions
+        if (supplemental_project_instructions || supplemental_computer_permission)
             && (!envelope.render.durable || envelope.render.prompt != PromptRender::Omit)
         {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
-                "project-instruction worker fact must be durable and omitted from prompt replay",
+                "supplemental worker fact must be durable and omitted from prompt replay",
                 false,
             ));
         }
         let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
             Ok(payload) => Some(payload),
-            Err(_) if supplemental_project_instructions => None,
+            Err(_) if supplemental_project_instructions || supplemental_computer_permission => None,
             Err(error) => {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,

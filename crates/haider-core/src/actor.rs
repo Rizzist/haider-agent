@@ -533,6 +533,21 @@ pub trait ToolDispatcher: Send + Sync {
         Ok(None)
     }
 
+    /// Activates work owned by a newly committed approval checkpoint.
+    ///
+    /// The menu and `PermissionRequired` state are durable before this hook is
+    /// called. Implementations may therefore poll an external gate and answer
+    /// the menu through the ordinary CAS without creating an in-flight tool
+    /// effect. The same hook is called after restart with the reconstructed
+    /// checkpoint, so activation must be idempotent.
+    async fn activate_approval(
+        &self,
+        _run_id: &RunId,
+        _checkpoint: &RequestInputCheckpoint,
+    ) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
     /// Applies a permission answer only after the actor has observed the
     /// daemon CAS's committed `MenuAnswered` envelope.
     async fn resolve_approval(
@@ -1421,7 +1436,7 @@ impl HarnessActor {
         let mut deferred = Vec::<DeferredAccumulator>::new();
         if let Some(checkpoint) = checkpoint {
             tools.push(ToolAccumulator {
-                item_id: checkpoint.tool_item_id,
+                item_id: checkpoint.tool_item_id.clone(),
                 call_id: checkpoint.call_id.clone(),
                 name: checkpoint.tool_name.clone(),
                 args: checkpoint.args.clone(),
@@ -1444,7 +1459,7 @@ impl HarnessActor {
                 self.resume_request_input(&run_id, &mut tools, 0, &cancel, checkpoint.menu)
                     .await
             } else {
-                self.resume_tool_approval(&run_id, &mut tools, 0, &cancel, checkpoint.menu)
+                self.resume_tool_approval(&run_id, &mut tools, 0, &cancel, checkpoint)
                     .await
             };
             match resumed {
@@ -3823,13 +3838,14 @@ impl HarnessActor {
                     return Ok(GeneralToolOutcome::Deferred(Box::new(ticket)));
                 }
                 ToolDispatchResult::ApprovalRequired(menu) => {
-                    self.commit_payload(
-                        run_id,
-                        EventPayload::MenuOpened(menu.clone()),
-                        prompt_omit_render(),
-                    )
-                    .await
-                    .map_err(DriveError::Store)?;
+                    let opened = self
+                        .commit_payload(
+                            run_id,
+                            EventPayload::MenuOpened(menu.clone()),
+                            prompt_omit_render(),
+                        )
+                        .await
+                        .map_err(DriveError::Store)?;
                     self.commit_state(
                         run_id,
                         RunState::PermissionRequired {
@@ -3838,6 +3854,25 @@ impl HarnessActor {
                     )
                     .await
                     .map_err(DriveError::Store)?;
+                    let checkpoint = RequestInputCheckpoint {
+                        menu: menu.clone(),
+                        request_seq: opened.seq,
+                        opening_generation: opened.worker_generation,
+                        tool_item_id: tool.item_id.clone(),
+                        call_id: tool.call_id.clone(),
+                        tool_name: tool.name.clone(),
+                        args: serde_json::to_string(&args).map_err(|error| {
+                            DriveError::Store(HaiderError::new(
+                                ErrorCode::Internal,
+                                format!("tool approval arguments could not serialize: {error}"),
+                                false,
+                            ))
+                        })?,
+                    };
+                    dispatcher
+                        .activate_approval(run_id, &checkpoint)
+                        .await
+                        .map_err(DriveError::Store)?;
                     let answer = self
                         .wait_for_permission_answer(run_id, cancel, &menu)
                         .await?;
@@ -4270,7 +4305,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         index: usize,
         cancel: &CancelToken,
-        menu: Menu,
+        checkpoint: RequestInputCheckpoint,
     ) -> Result<Message, DriveError> {
         let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) else {
             return Err(DriveError::Store(HaiderError::new(
@@ -4279,11 +4314,15 @@ impl HarnessActor {
                 false,
             )));
         };
+        dispatcher
+            .activate_approval(run_id, &checkpoint)
+            .await
+            .map_err(DriveError::Store)?;
         let answer = self
-            .wait_for_permission_answer(run_id, cancel, &menu)
+            .wait_for_permission_answer(run_id, cancel, &checkpoint.menu)
             .await?;
         dispatcher
-            .resolve_approval(&menu, &answer)
+            .resolve_approval(&checkpoint.menu, &answer)
             .await
             .map_err(DriveError::Store)?;
         self.commit_state(run_id, RunState::RunningTool)

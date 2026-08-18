@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use crate::session_hub::{SessionHub, SessionHubConfig};
+use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, TurnToolFactory, WorkerDependencies,
     WorkerManager,
@@ -28,6 +29,9 @@ use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
 };
+use haider_protocol::permission::{
+    PermissionEventPayload, PermissionGrantAction, PermissionGrantResolution, SystemPermission,
+};
 use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider, TurnRequest};
@@ -36,12 +40,13 @@ use haider_store::{
     TurnCancelCommand,
 };
 use haider_tools::{
-    ComputerBackend, ComputerCancelToken, ComputerInspection, ComputerInspectionBounds,
-    ComputerOutput, ComputerResult, ExcludeRegionScreenshotRedaction, ScreenshotRedactionRegion,
+    ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
+    ComputerInspectionBounds, ComputerOutput, ComputerPermissionPoll, ComputerResult,
+    ExcludeRegionScreenshotRedaction, ScreenshotRedactionRegion,
 };
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
@@ -159,6 +164,76 @@ impl ComputerBackend for FakeComputerBackend {
             cancel.cancel();
         }
         Ok(())
+    }
+}
+
+struct PermissionFlipBackend {
+    screenshot: Vec<u8>,
+    permission: SystemPermission,
+    poll_result: ComputerPermissionPoll,
+    granted: AtomicBool,
+    prompts: AtomicUsize,
+    attempts: AtomicUsize,
+    polls: AtomicUsize,
+}
+
+#[async_trait]
+impl ComputerBackend for PermissionFlipBackend {
+    async fn prepare(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<()> {
+        cancel.check()?;
+        assert_eq!(action, &ComputerAction::Screenshot);
+        if self.granted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.prompts.fetch_add(1, Ordering::AcqRel);
+        let (settings_pane, settings_url) = match self.permission {
+            SystemPermission::ScreenRecording => (
+                "System Settings > Privacy & Security > Screen Recording",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            ),
+            SystemPermission::Accessibility => (
+                "System Settings > Privacy & Security > Accessibility",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            ),
+        };
+        Err(ComputerError::PermissionRequired {
+            permission: self.permission,
+            settings_pane: settings_pane.into(),
+            settings_url: settings_url.into(),
+            restart_required: false,
+            message: "native prompt is waiting for Accessibility".into(),
+        })
+    }
+
+    async fn execute(
+        &self,
+        action: &ComputerAction,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<ComputerOutput> {
+        cancel.check()?;
+        assert_eq!(action, &ComputerAction::Screenshot);
+        assert!(self.granted.load(Ordering::Acquire));
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        Ok(ComputerOutput::ScreenshotPng(self.screenshot.clone()))
+    }
+
+    async fn poll_permission(
+        &self,
+        permission: SystemPermission,
+        cancel: &ComputerCancelToken,
+        _timeout: Duration,
+    ) -> ComputerResult<ComputerPermissionPoll> {
+        cancel.check()?;
+        assert_eq!(permission, self.permission);
+        self.polls.fetch_add(1, Ordering::AcqRel);
+        if self.poll_result == ComputerPermissionPoll::Granted {
+            self.granted.store(true, Ordering::Release);
+        }
+        Ok(self.poll_result)
     }
 }
 
@@ -333,7 +408,7 @@ async fn submit_turn(
             run_id: run_id.clone(),
             agent_id: None,
             branch_id: None,
-            text: "use the computer".into(),
+            text: "computer-use my screen".into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Steer,
             queued_event_id: EventId::new(format!("{run_id}-queued")),
@@ -353,7 +428,7 @@ async fn wait_for_run_state(
     run_id: &RunId,
     expected: RunState,
 ) -> Vec<haider_protocol::envelope::RawEnvelope> {
-    timeout(Duration::from_secs(12), async {
+    match timeout(Duration::from_secs(12), async {
         loop {
             let events = store.read(session_id, 0, 4096).await.expect("journal");
             if events.iter().any(|event| {
@@ -367,7 +442,16 @@ async fn wait_for_run_state(
         }
     })
     .await
-    .expect("run reaches expected state")
+    {
+        Ok(events) => events,
+        Err(_) => {
+            let events = store
+                .read(session_id, 0, 4096)
+                .await
+                .expect("diagnostic journal");
+            panic!("run did not reach {expected:?}: {events:#?}");
+        }
+    }
 }
 
 async fn abandon_active_graph_and_wait_for_done(
@@ -436,6 +520,463 @@ async fn abandon_active_graph_and_wait_for_done(
     .await
     .expect("abandon graph after computer evidence");
     wait_for_run_state(store, session_id, run_id, RunState::Done).await
+}
+
+#[tokio::test]
+async fn explicit_intent_auto_grants_and_tcc_flip_retries_the_parked_action() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitToolCall {
+                call_id: "permission-screenshot".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "permission-screenshot".into(),
+            },
+            FakeStep::EmitText {
+                text: "capture complete".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_vision_native(),
+    );
+    let backend = Arc::new(PermissionFlipBackend {
+        screenshot: inspect_png_fixture(),
+        permission: SystemPermission::Accessibility,
+        poll_result: ComputerPermissionPoll::Granted,
+        granted: AtomicBool::new(false),
+        prompts: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+    });
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory::with_computer_backend(
+        Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+    ));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("permission-retry-session");
+    let run_id = RunId::new("permission-retry-run");
+    let device_id = DeviceId::new("permission-retry-device");
+    create_session(&hub, &session_id, &device_id).await;
+    // `submit_turn` commits the explicit `computer-use` opt-in. No
+    // permission-menu answer or preconfigured screen grant is installed.
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id,
+    )
+    .await;
+
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    assert_eq!(backend.prompts.load(Ordering::Acquire), 1);
+    assert_eq!(backend.attempts.load(Ordering::Acquire), 1);
+    assert_eq!(backend.polls.load(Ordering::Acquire), 1);
+
+    let mut needed = None;
+    let mut resolved = None;
+    let mut permission_menu = None;
+    let mut tool_result_seq = None;
+    let mut observe_effect = None;
+    let mut observe_authorized = false;
+    for event in &events {
+        match PermissionEventPayload::from_payload_value(event.payload.clone()) {
+            Ok(PermissionEventPayload::PermissionGrantNeeded(event_payload)) => {
+                needed = Some((event.seq, event_payload));
+                continue;
+            }
+            Ok(PermissionEventPayload::PermissionGrantResolved(event_payload)) => {
+                resolved = Some((event.seq, event_payload));
+                continue;
+            }
+            Err(_) => {}
+        }
+        match serde_json::from_value::<EventPayload>(event.payload.clone()) {
+            Ok(EventPayload::ToolResult { call_id, result })
+                if call_id == "permission-screenshot" && !result.images.is_empty() =>
+            {
+                tool_result_seq = Some(event.seq);
+            }
+            Ok(EventPayload::MenuOpened(menu))
+                if menu.origin == super::COMPUTER_PERMISSION_MENU_ORIGIN =>
+            {
+                permission_menu = Some((event.seq, event.worker_generation, menu));
+            }
+            Ok(EventPayload::Effect(EffectPhase::Intent(intent)))
+                if intent.class == EffectClass::ScreenObserve =>
+            {
+                observe_effect = Some(intent.effect);
+            }
+            Ok(EventPayload::Effect(EffectPhase::Authorized {
+                effect,
+                verdict: AuthorizationVerdict::Allow,
+            })) if observe_effect.as_ref() == Some(&effect) => observe_authorized = true,
+            _ => {}
+        }
+    }
+    let (needed_seq, needed) = needed.expect("grant-needed event");
+    assert_eq!(needed.call_id, "permission-screenshot");
+    assert_eq!(needed.permission, SystemPermission::Accessibility);
+    assert_eq!(
+        needed.actions,
+        vec![
+            PermissionGrantAction::OpenSettings,
+            PermissionGrantAction::Retry,
+            PermissionGrantAction::RestartDaemon,
+        ]
+    );
+    assert!(!needed.auto_restart_pending);
+    let (menu_seq, menu_generation, menu) = permission_menu.expect("durable OS permission menu");
+    assert_eq!(needed.menu_id, menu.id);
+    assert_eq!(needed.request_seq, menu_seq);
+    assert_eq!(needed.opening_generation, menu_generation);
+    assert_eq!(menu.origin, super::COMPUTER_PERMISSION_MENU_ORIGIN);
+    let (resolved_seq, resolved) = resolved.expect("grant resolution event");
+    assert_eq!(resolved.request_id, needed.request_id);
+    assert_eq!(resolved.resolution, PermissionGrantResolution::Granted);
+    assert!(resolved.retrying_parked_action);
+    assert!(needed_seq < resolved_seq);
+    assert!(resolved_seq < tool_result_seq.expect("successful screenshot result"));
+    assert!(!events.iter().any(|event| {
+        event.seq < resolved_seq
+            && matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+            )
+    }));
+    assert!(
+        observe_authorized,
+        "explicit intent must authorize without Ask"
+    );
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn permission_poll_timeout_leaves_the_card_actionable_and_undispatched() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitToolCall {
+                call_id: "timeout-screenshot".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "timeout-screenshot".into(),
+            },
+            FakeStep::EmitText {
+                text: "capture resumed after manual retry".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_vision_native(),
+    );
+    let backend = Arc::new(PermissionFlipBackend {
+        screenshot: inspect_png_fixture(),
+        permission: SystemPermission::Accessibility,
+        poll_result: ComputerPermissionPoll::TimedOut,
+        granted: AtomicBool::new(false),
+        prompts: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+    });
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory { provider }),
+            tool_factory: Arc::new(BrokerToolFactory::with_computer_backend(
+                Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+            )),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("permission-timeout-session");
+    let run_id = RunId::new("permission-timeout-run");
+    let device_id = DeviceId::new("permission-timeout-device");
+    create_session(&hub, &session_id, &device_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+    let events = timeout(Duration::from_secs(12), async {
+        loop {
+            if backend.polls.load(Ordering::Acquire) == 1 {
+                break store.read(&session_id, 0, 4096).await.expect("journal");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded fake poll finishes");
+    assert!(events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::RunState(RunState::PermissionRequired { .. }))
+    )));
+    assert!(events.iter().any(|event| matches!(
+        PermissionEventPayload::from_payload_value(event.payload.clone()),
+        Ok(PermissionEventPayload::PermissionGrantNeeded(_))
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        PermissionEventPayload::from_payload_value(event.payload.clone()),
+        Ok(PermissionEventPayload::PermissionGrantResolved(_))
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+    )));
+
+    let (request_seq, worker_generation, menu) = events
+        .iter()
+        .find_map(
+            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
+                Ok(EventPayload::MenuOpened(menu))
+                    if menu.origin == super::COMPUTER_PERMISSION_MENU_ORIGIN =>
+                {
+                    Some((event.seq, event.worker_generation, menu))
+                }
+                _ => None,
+            },
+        )
+        .expect("durable retry menu");
+    backend.granted.store(true, Ordering::Release);
+    hub.resolve_hook_menu(MenuResolutionCommand {
+        command_id: "manual-computer-permission-retry".into(),
+        session_id: session_id.clone(),
+        request_seq,
+        worker_generation,
+        allow_prior_generation: false,
+        answer: MenuAnswer {
+            menu: menu.id,
+            option_key: Some("retry".into()),
+            option_index: 0,
+            value: None,
+            via: AnswerVia::Rpc,
+        },
+        device_id,
+        input_is_secret_reference: false,
+    })
+    .await
+    .expect("manual retry is accepted");
+    let resumed = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    assert_eq!(backend.attempts.load(Ordering::Acquire), 1);
+    assert!(resumed.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::ToolResult { ref call_id, .. }) if call_id == "timeout-screenshot"
+    )));
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitToolCall {
+                call_id: "restart-screenshot".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "restart-screenshot".into(),
+            },
+            FakeStep::EmitText {
+                text: "capture resumed".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_vision_native(),
+    );
+    let first_backend = Arc::new(PermissionFlipBackend {
+        screenshot: inspect_png_fixture(),
+        permission: SystemPermission::ScreenRecording,
+        poll_result: ComputerPermissionPoll::RestartRequired,
+        granted: AtomicBool::new(false),
+        prompts: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+    });
+    let first_hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let first_manager = WorkerManager::start(
+        first_hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory::with_computer_backend(Arc::clone(
+                &first_backend,
+            )
+                as Arc<dyn ComputerBackend>)),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    first_hub
+        .install_worker_manager(first_manager.handle())
+        .expect("install first manager");
+    let session_id = SessionId::new("permission-restart-session");
+    let run_id = RunId::new("permission-restart-run");
+    let device_id = DeviceId::new("permission-restart-device");
+    create_session(&first_hub, &session_id, &device_id).await;
+    submit_turn(
+        &first_hub,
+        &first_manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id.clone(),
+    )
+    .await;
+
+    let before_restart = timeout(Duration::from_secs(12), async {
+        loop {
+            let events = store.read(&session_id, 0, 4096).await.expect("journal");
+            if events.iter().any(|event| {
+                matches!(
+                    PermissionEventPayload::from_payload_value(event.payload.clone()),
+                    Ok(PermissionEventPayload::PermissionGrantNeeded(ref needed))
+                        if needed.auto_restart_pending
+                )
+            }) {
+                break events;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restart-required grant card");
+    assert_eq!(first_backend.prompts.load(Ordering::Acquire), 1);
+    assert_eq!(first_backend.polls.load(Ordering::Acquire), 1);
+    assert_eq!(first_backend.attempts.load(Ordering::Acquire), 0);
+    assert!(!before_restart.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+    )));
+
+    first_manager.shutdown().await.expect("drain first manager");
+    first_hub.shutdown().await.expect("shutdown first hub");
+    store.close().await.expect("close first store");
+
+    let recovered_store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store");
+    let mut recovered = recover_interrupted_turns(&recovered_store, &device_id)
+        .await
+        .expect("recover parked permission");
+    if recovered.len() != 1 {
+        let events = recovered_store
+            .read(&session_id, 0, 4096)
+            .await
+            .expect("recovery diagnostics");
+        panic!("expected one recovered permission checkpoint: {events:#?}");
+    }
+    let RecoveredWork::Checkpoint(recovered) = recovered.remove(0) else {
+        panic!("screen permission wait must recover as a checkpoint");
+    };
+    assert_eq!(
+        recovered.checkpoint.menu.origin,
+        super::COMPUTER_PERMISSION_MENU_ORIGIN
+    );
+
+    let fresh_backend = Arc::new(PermissionFlipBackend {
+        screenshot: inspect_png_fixture(),
+        permission: SystemPermission::ScreenRecording,
+        poll_result: ComputerPermissionPoll::TimedOut,
+        granted: AtomicBool::new(true),
+        prompts: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+    });
+    let fresh_hub =
+        SessionHub::new(recovered_store.clone(), SessionHubConfig::default()).expect("fresh hub");
+    let fresh_manager = WorkerManager::start(
+        fresh_hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory { provider }),
+            tool_factory: Arc::new(BrokerToolFactory::with_computer_backend(Arc::clone(
+                &fresh_backend,
+            )
+                as Arc<dyn ComputerBackend>)),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    fresh_hub
+        .install_worker_manager(fresh_manager.handle())
+        .expect("install fresh manager");
+    fresh_manager
+        .handle()
+        .recover_checkpoint(
+            recovered.accepted,
+            recovered.checkpoint,
+            recovered.committed_answer,
+        )
+        .await
+        .expect("resume parked permission");
+    let events = wait_for_run_state(&recovered_store, &session_id, &run_id, RunState::Done).await;
+    assert_eq!(fresh_backend.prompts.load(Ordering::Acquire), 0);
+    assert_eq!(fresh_backend.polls.load(Ordering::Acquire), 0);
+    assert_eq!(fresh_backend.attempts.load(Ordering::Acquire), 1);
+    assert!(events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::ToolResult { ref call_id, .. }) if call_id == "restart-screenshot"
+    )));
+
+    fresh_manager.shutdown().await.expect("manager shutdown");
+    fresh_hub.shutdown().await.expect("hub shutdown");
+    recovered_store.close().await.expect("store close");
 }
 
 #[tokio::test]

@@ -22,6 +22,7 @@ use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
 use haider_protocol::ids::AgentId;
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::MenuKind;
+use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, VecDeque};
@@ -2376,6 +2377,40 @@ impl HubConnection {
                     );
                 }
                 self.usage_report(request_id).await
+            }
+            RequestBody::ComputerPermissionOpenSettings {
+                session_id,
+                request_id: permission_request_id,
+                permission,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "opening computer permission settings requires a control attachment",
+                        false,
+                        None,
+                    );
+                }
+                self.computer_permission_open_settings(
+                    request_id,
+                    session_id,
+                    permission_request_id,
+                    permission,
+                )
+                .await
             }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
@@ -5137,6 +5172,63 @@ impl HubConnection {
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::UsageReport { report },
+        })
+    }
+
+    async fn computer_permission_open_settings(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        permission_request_id: String,
+        permission: SystemPermission,
+    ) -> Result<(), SessionHubError> {
+        let mut cursor = 0;
+        let mut matching_needed = false;
+        let mut resolved = false;
+        loop {
+            let page = self.hub.inner.store.read(&session_id, cursor, 256).await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |event| event.seq);
+            for event in page {
+                match PermissionEventPayload::from_payload_value(event.payload) {
+                    Ok(PermissionEventPayload::PermissionGrantNeeded(needed))
+                        if needed.request_id == permission_request_id
+                            && needed.permission == permission =>
+                    {
+                        matching_needed = true;
+                    }
+                    Ok(PermissionEventPayload::PermissionGrantResolved(done))
+                        if done.request_id == permission_request_id =>
+                    {
+                        resolved = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !matching_needed || resolved {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "unresolved computer permission request was not found",
+                false,
+                None,
+            );
+        }
+        if let Err(error) = haider_tools::open_system_permission_settings(permission) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &error.to_string(),
+                false,
+                None,
+            );
+        }
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::ComputerPermissionOpenSettings { permission },
         })
     }
 

@@ -1,0 +1,19 @@
+{
+  "type": "permission_grant_needed",
+  "request_id": "computer-permission-effect-7-screen_recording",
+  "menu_id": "computer-permission-effect-7-screen_recording",
+  "request_seq": 41,
+  "opening_generation": 3,
+  "call_id": "call-screen-1",
+  "effect_id": "effect-7",
+  "permission": "screen_recording",
+  "pane_name": "System Settings > Privacy & Security > Screen Recording",
+  "settings_url": "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+  "actions": [
+    "open_settings",
+    "retry",
+    "restart_daemon"
+  ],
+  "auto_restart_pending": false,
+  "poll_timeout_ms": 120000
+}

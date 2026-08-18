@@ -299,6 +299,9 @@ pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
 /// per-account OAuth meters (normalized 0–1 utilization) plus journal-derived
 /// local counters. Never carries secret material.
 pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+/// Daemon can open allow-listed macOS TCC panes for a durable in-session
+/// computer permission card.
+pub const FEATURE_COMPUTER_PERMISSION_ACTIONS_V1: &str = "computer_permission_actions_v1";
 /// Daemon implements Convergence Graph M1 pin/evidence/status/abandon.
 pub const FEATURE_CONVERGENCE_GRAPH_V1: &str = "convergence_graph_v1";
 /// Daemon implements M2b general templates, dependency-ready sets, retained
@@ -1647,6 +1650,14 @@ pub enum RequestBody {
     /// and parameterless in v1.
     #[serde(rename = "usage.report")]
     UsageReport,
+    /// Opens the server-known System Settings pane for an unresolved durable
+    /// computer permission request. No caller-provided URL is accepted.
+    #[serde(rename = "computer.permission_open_settings")]
+    ComputerPermissionOpenSettings {
+        session_id: SessionId,
+        request_id: String,
+        permission: haider_protocol::permission::SystemPermission,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -2035,6 +2046,10 @@ pub enum ResponseBody {
     #[serde(rename = "usage.report")]
     UsageReport {
         report: haider_protocol::usage::UsageReportV1,
+    },
+    #[serde(rename = "computer.permission_open_settings")]
+    ComputerPermissionOpenSettings {
+        permission: haider_protocol::permission::SystemPermission,
     },
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives
