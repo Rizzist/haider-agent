@@ -687,13 +687,18 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             provider,
             model,
             max_tokens,
-            // OWNER DIRECTIVE: the interactive surface runs in AUTO mode
-            // (like pi) — writes/exec never open approval menus. The W8
-            // machinery stays for request_input and future policy modes.
+            // OWNER DIRECTIVE: the interactive surface runs in full AUTO-ALLOW
+            // mode (the Codex --full-auto analogue) — writes, exec, web fetch,
+            // task-kill, and computer control never open approval menus. The
+            // W8 menu machinery stays for request_input and future policy
+            // modes; deny rules still win, every effect is still journaled,
+            // computer actions still pass the macOS TCC gate, and the
+            // "controlling your screen" banner still shows.
             permission_overrides: Some(
                 haider_rpc::haider_protocol::session::SessionPermissionOverridesV1 {
                     allow_writes: true,
                     allow_exec: true,
+                    auto_allow: true,
                 },
             ),
             cache_policy: None,

@@ -233,6 +233,7 @@ impl WebWorld {
             permission_overrides: Some(SessionPermissionOverridesV1 {
                 allow_writes: false,
                 allow_exec: true,
+                auto_allow: false,
             }),
             effort: None,
             fast: false,

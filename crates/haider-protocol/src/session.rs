@@ -16,13 +16,27 @@ pub struct SessionPermissionOverridesV1 {
     /// Allow model-initiated process execution without a menu.
     #[serde(default)]
     pub allow_exec: bool,
+    /// Auto-allow mode (the Codex `--full-auto` analogue): resolve EVERY
+    /// effect class the model can reach to `Allow` for the session, not just
+    /// writes/exec — computer control, web fetch, task-kill, and any future
+    /// class included. It is a policy default flip, never a `PreAuthorized`
+    /// credential and never a suppression of the deny path: an explicit deny
+    /// rule still wins (the broker checks the denylist first), every effect is
+    /// still journaled, the macOS TCC gate still applies to computer actions
+    /// (auto-allow only lifts Haider's own menu — the OS grant flow is
+    /// unchanged), and the "controlling your screen" banner still shows.
+    ///
+    /// Omitted from the wire while `false` so a pre-auto-allow overrides value
+    /// keeps its exact historical bytes; the field only appears when enabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_allow: bool,
 }
 
 impl SessionPermissionOverridesV1 {
     /// Whether this value grants no permissions and is equivalent to absence.
     #[must_use]
     pub fn is_empty(self) -> bool {
-        !self.allow_writes && !self.allow_exec
+        !self.allow_writes && !self.allow_exec && !self.auto_allow
     }
 }
 

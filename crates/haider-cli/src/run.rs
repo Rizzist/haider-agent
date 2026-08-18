@@ -55,6 +55,7 @@ pub(crate) struct RunOptions {
     pub timeout: Option<Duration>,
     pub allow_writes: bool,
     pub allow_exec: bool,
+    pub auto_allow: bool,
     pub trust_hooks: bool,
     pub provider: Option<ProviderSelection>,
     pub model: Option<String>,
@@ -67,6 +68,7 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
     let mut timeout = None;
     let mut allow_writes = false;
     let mut allow_exec = false;
+    let mut auto_allow = false;
     let mut trust_hooks = false;
     let mut provider = None;
     let mut model = None;
@@ -103,6 +105,10 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
             "--allow-writes" => return Err("duplicate --allow-writes flag".into()),
             "--allow-exec" if !allow_exec => allow_exec = true,
             "--allow-exec" => return Err("duplicate --allow-exec flag".into()),
+            // Full auto-allow (Codex --full-auto analogue): every effect class
+            // resolves to Allow, including computer control and web fetch.
+            "--auto-allow" if !auto_allow => auto_allow = true,
+            "--auto-allow" => return Err("duplicate --auto-allow flag".into()),
             "--trust-hooks" if !trust_hooks => trust_hooks = true,
             "--trust-hooks" => return Err("duplicate --trust-hooks flag".into()),
             "--provider" if provider.is_none() => {
@@ -157,6 +163,7 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
         timeout,
         allow_writes,
         allow_exec,
+        auto_allow,
         trust_hooks,
         provider,
         model,
@@ -262,6 +269,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         permission_overrides: SessionPermissionOverridesV1 {
             allow_writes: options.allow_writes,
             allow_exec: options.allow_exec,
+            auto_allow: options.auto_allow,
         },
         trust_hooks: options.trust_hooks,
         timeout: options.timeout,

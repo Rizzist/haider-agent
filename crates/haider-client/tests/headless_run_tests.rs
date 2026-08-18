@@ -2456,6 +2456,7 @@ fn override_feature_is_required_only_when_a_flag_is_present() {
     let flags = haider_client::required_headless_features(SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: false,
+        auto_allow: false,
     });
     assert_eq!(no_flags, haider_client::required_live_features());
     assert_eq!(

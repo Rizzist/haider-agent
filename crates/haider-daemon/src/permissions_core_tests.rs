@@ -287,6 +287,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
     let writes = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: false,
+        auto_allow: false,
     }));
     assert_eq!(
         decision(&writes, EffectClass::FsWrite),
@@ -300,6 +301,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
     let exec = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: false,
         allow_exec: true,
+        auto_allow: false,
     }));
     assert_eq!(
         decision(&exec, EffectClass::FsWrite),
@@ -319,6 +321,75 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         ToolPermissionDefault::Ask,
         "allow_exec must never imply screen control"
     );
+}
+
+/// MUTATION CHECK: make `auto_allow` a no-op, scope it to only writes/exec, or
+/// let it promote a `NotApplicable` class into an effect. Expected RUNTIME
+/// failure: a class still on `Ask` under auto-allow (computer/screen/fetch), or
+/// a non-effect class fabricated as `Allow`.
+#[test]
+fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
+    let metadata = |permission_overrides| SessionMetadataV1 {
+        cwd: "/tmp".into(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides,
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        created_at_ms: 1,
+    };
+    let defaults = effective_permission_defaults(&metadata(Some(SessionPermissionOverridesV1 {
+        allow_writes: false,
+        allow_exec: false,
+        auto_allow: true,
+    })));
+    let decision = |class: EffectClass| {
+        defaults
+            .iter()
+            .find_map(|(candidate, default)| (*candidate == class).then_some(*default))
+            .expect("registered effect class")
+    };
+
+    // The blanket auto-allow flip lifts the classes that allow_writes/allow_exec
+    // deliberately never touch — computer observation and control above all.
+    assert_eq!(
+        decision(EffectClass::ScreenObserve),
+        ToolPermissionDefault::Allow
+    );
+    assert_eq!(
+        decision(EffectClass::ScreenControl),
+        ToolPermissionDefault::Allow
+    );
+    assert_eq!(decision(EffectClass::FsWrite), ToolPermissionDefault::Allow);
+    assert_eq!(
+        decision(EffectClass::ProcessExec),
+        ToolPermissionDefault::Allow
+    );
+    // Web fetch is a Network effect (class-family, host-agnostic here).
+    let network_allowed = defaults.iter().any(|(class, default)| {
+        matches!(class, EffectClass::Network { .. }) && *default == ToolPermissionDefault::Allow
+    });
+    let network_present = defaults
+        .iter()
+        .any(|(class, _)| matches!(class, EffectClass::Network { .. }));
+    assert!(
+        !network_present || network_allowed,
+        "auto-allow must promote the network/fetch class to Allow"
+    );
+
+    // Auto-allow only ever promotes `Ask`: it leaves no class on the Ask path,
+    // while `NotApplicable` non-effects are neither promoted nor removed.
+    for (_, default) in &defaults {
+        assert_ne!(
+            *default,
+            ToolPermissionDefault::Ask,
+            "auto-allow must leave no class on the Ask path"
+        );
+    }
 }
 
 fn pending_shell(run_id: &str) -> PendingShellExec {

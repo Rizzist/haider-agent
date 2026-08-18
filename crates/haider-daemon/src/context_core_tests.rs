@@ -159,6 +159,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         permission_overrides: Some(haider_protocol::session::SessionPermissionOverridesV1 {
             allow_writes: false,
             allow_exec: true,
+            auto_allow: false,
         }),
         effort: None,
         fast: false,

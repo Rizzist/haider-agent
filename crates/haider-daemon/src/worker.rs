@@ -6662,7 +6662,7 @@ pub(crate) fn effective_permission_defaults(
         .into_iter()
         .flat_map(|entry| {
             entry.manifest.effects.into_iter().map(move |class| {
-                let default = if (overrides.allow_writes && class == EffectClass::FsWrite)
+                let base = if (overrides.allow_writes && class == EffectClass::FsWrite)
                     || (overrides.allow_exec && class == EffectClass::ProcessExec)
                     // W-B: the exec override is the honest auto-mode gate for
                     // network fetches too — an allowed process can already
@@ -6674,6 +6674,20 @@ pub(crate) fn effective_permission_defaults(
                     ToolPermissionDefault::Allow
                 } else {
                     entry.default
+                };
+                // Auto-allow mode is the blanket superset: any class still on
+                // the Ask path (computer's ScreenObserve/ScreenControl, web
+                // fetch, task-kill, and any class a future tool adds) resolves
+                // to Allow. A daemon-level fail-closed `Deny` default is NOT
+                // lifted, and `NotApplicable` stays a non-effect — auto-allow
+                // only ever promotes `Ask` to `Allow`. Deny RULES still win at
+                // the broker (denylist is checked before any allow), the OS
+                // TCC gate for computer actions is untouched, and every effect
+                // is still journaled.
+                let default = if overrides.auto_allow && base == ToolPermissionDefault::Ask {
+                    ToolPermissionDefault::Allow
+                } else {
+                    base
                 };
                 (class, default)
             })

@@ -1149,6 +1149,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             timeout: None,
             allow_writes: false,
             allow_exec: false,
+            auto_allow: false,
             trust_hooks: false,
             provider: None,
             model: None,
@@ -1163,6 +1164,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
         "1500ms".into(),
         "--allow-writes".into(),
         "--allow-exec".into(),
+        "--auto-allow".into(),
         "--trust-hooks".into(),
         "--provider".into(),
         "fake".into(),
@@ -1176,7 +1178,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
     .expect("full options");
     assert_eq!(parsed.output, RunOutput::Json);
     assert_eq!(parsed.timeout, Some(Duration::from_millis(1500)));
-    assert!(parsed.allow_writes && parsed.allow_exec && parsed.trust_hooks);
+    assert!(parsed.allow_writes && parsed.allow_exec && parsed.auto_allow && parsed.trust_hooks);
     assert_eq!(
         parsed.provider.as_ref().map(ProviderSelection::as_str),
         Some("fake")

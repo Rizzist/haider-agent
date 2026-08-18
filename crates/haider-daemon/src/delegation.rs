@@ -314,6 +314,11 @@ impl DelegationHandle {
         let child_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
             allow_writes: crate::worker::effect_within_grant(&grant, &EffectClass::FsWrite),
             allow_exec: crate::worker::effect_within_grant(&grant, &EffectClass::ProcessExec),
+            // A child's pre-allow is bounded per-class by its grant ceiling, so
+            // it never gets the blanket auto-allow flip: computer/screen access
+            // for a subagent must flow deliberately through the grant, not ride
+            // in on the parent's auto-allow mode.
+            auto_allow: false,
         });
         let create_json = serde_json::to_string(&serde_json::json!({
             "cwd": coordinates.metadata.cwd,

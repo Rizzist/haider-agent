@@ -4963,6 +4963,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
     let expected = SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: false,
+        auto_allow: false,
     };
     let body = |overrides| RequestBody::SessionCreateWithPermissionOverrides {
         command_id: CommandId::new("override-command"),
