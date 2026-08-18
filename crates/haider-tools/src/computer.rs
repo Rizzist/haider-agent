@@ -14,6 +14,11 @@ mod macos;
 #[path = "computer/linux.rs"]
 mod linux;
 
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+#[path = "computer/windows.rs"]
+mod windows;
+
 use crate::broker::EffectOperation;
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
@@ -130,7 +135,8 @@ pub trait ComputerBackend: Send + Sync {
 }
 
 /// Explicit portable stub, public so the unavailable law is testable even on
-/// macOS. The platform constructor selects this on CU-3/CU-4 targets.
+/// supported hosts. The platform constructor selects it only on unsupported
+/// targets.
 #[derive(Debug, Clone)]
 pub struct UnavailableComputerBackend {
     platform: String,
@@ -163,7 +169,7 @@ impl ComputerBackend for UnavailableComputerBackend {
     }
 }
 
-/// Constructs one dispatcher-local real macOS/Linux backend or typed stub.
+/// Constructs one dispatcher-local real macOS/Linux/Windows backend or typed stub.
 ///
 /// The state cannot be process-global: each instance retains the exact CU-1
 /// viewport delivered to one turn and any mouse button held by that turn.
@@ -179,7 +185,11 @@ pub fn platform_computer_backend() -> Arc<dyn ComputerBackend> {
     {
         Arc::new(linux::LinuxComputerBackend::new())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(windows::WindowsComputerBackend::new())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Arc::new(UnavailableComputerBackend::new(std::env::consts::OS))
     }
@@ -261,9 +271,19 @@ impl EffectOperation for ComputerOperation {
                     "Type {} character(s) into the active Linux X11 app",
                     text.chars().count()
                 );
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
                 let preview = format!(
                     "Type {} character(s) into the active macOS app",
+                    text.chars().count()
+                );
+                #[cfg(target_os = "windows")]
+                let preview = format!(
+                    "Type {} character(s) into the active Windows app",
+                    text.chars().count()
+                );
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                let preview = format!(
+                    "Type {} character(s) into the active app",
                     text.chars().count()
                 );
                 preview
@@ -333,8 +353,12 @@ fn action_name(action: &ComputerAction) -> &'static str {
 pub fn computer_manifest() -> ToolManifest {
     #[cfg(target_os = "linux")]
     let description = "Observe and control the local Linux X11 desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     let description = "Observe and control the local macOS desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
+    #[cfg(target_os = "windows")]
+    let description = "Observe and control the local Windows desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let description = "Observe and control the local desktop. Call screenshot before cursor_position or any action with screenshot coordinates.";
     ToolManifest {
         name: "computer".into(),
         description: description.into(),

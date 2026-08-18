@@ -28,12 +28,15 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: install Linux system deps (ALSA)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: check (all targets — lib + bins + tests compile)
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
+      - name: clippy (all targets)
+        run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
       # The cross-platform TEST loop (owner bar: tests green on every OS
       # before the next release). Per-crate for the same load-isolation
       # reasons as ci.yml; Git Bash serves this script on Windows.
