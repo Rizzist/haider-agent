@@ -453,7 +453,7 @@ struct EditingProvider {
 #[cfg(unix)]
 const PINNED_EXEC_COMMAND: &str = "printf pinned";
 #[cfg(windows)]
-const PINNED_EXEC_COMMAND: &str = "[Console]::Out.Write('pinned')";
+const PINNED_EXEC_COMMAND: &str = "echo|set /p=\"pinned\"";
 
 #[async_trait]
 impl Provider for EditingProvider {

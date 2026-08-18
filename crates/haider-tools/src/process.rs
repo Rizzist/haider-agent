@@ -2001,16 +2001,17 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(windows)]
 pub(crate) fn shell_command(script: &str) -> Command {
-    let mut command = Command::new(haider_platform::windows_powershell());
-    command.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        script,
-    ]);
+    use std::os::windows::process::CommandExt as _;
+
+    // The Windows shell is cmd, not PowerShell. Both the model `exec` tool
+    // and the user `!` escape run many commands per session behind per-turn
+    // deadlines; a cold PowerShell spawn costs ~1–2s each (vs cmd's tens of
+    // ms) and blew the daemond suite past 13 minutes with worker-turn
+    // timeouts. `/D` skips AutoRun, `/S /C` keeps the script's own quotes
+    // intact through one raw arg — the pre-T4 behavior that ran green.
+    let mut command = Command::new(haider_platform::windows_command_interpreter());
+    command.args(["/D", "/S", "/C"]);
+    command.as_std_mut().raw_arg(format!("\"{script}\""));
     command
 }
 
@@ -2056,8 +2057,8 @@ mod shell_command_tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_shell_command_is_absolute_system32_powershell_and_preserves_script_bytes() {
-        let script = "[Console]::Out.Write(' exact bytes ')";
+    fn windows_shell_command_is_absolute_system32_cmd_and_preserves_script_bytes() {
+        let script = ">exec-created.txt <nul set /p \"=ok\"";
         let command = shell_command(script);
         let command = command.as_std();
         let program = std::path::Path::new(command.get_program());
@@ -2066,19 +2067,19 @@ mod shell_command_tests {
             program
                 .to_string_lossy()
                 .to_ascii_lowercase()
-                .ends_with(r"\system32\windowspowershell\v1.0\powershell.exe")
+                .ends_with(r"\system32\cmd.exe")
         );
+        // /D /S /C, then the script wrapped in one raw quoted arg so cmd's
+        // own quotes survive.
+        let args = command.get_args().collect::<Vec<_>>();
         assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
+            args[..3],
             [
-                std::ffi::OsStr::new("-NoLogo"),
-                std::ffi::OsStr::new("-NoProfile"),
-                std::ffi::OsStr::new("-NonInteractive"),
-                std::ffi::OsStr::new("-ExecutionPolicy"),
-                std::ffi::OsStr::new("Bypass"),
-                std::ffi::OsStr::new("-Command"),
-                std::ffi::OsStr::new(script),
+                std::ffi::OsStr::new("/D"),
+                std::ffi::OsStr::new("/S"),
+                std::ffi::OsStr::new("/C"),
             ]
         );
+        assert_eq!(args[3], std::ffi::OsStr::new(&format!("\"{script}\"")));
     }
 }
