@@ -3250,6 +3250,11 @@ fn render_session(
         && (model.projection.run_errored() || retry_backoff)
         && model.daemon_serves(haider_rpc::FEATURE_RUN_RETRY_V1);
     let mut retry_height = u16::from(retry_row);
+    // CU-2: the sacred screen-control banner. While the model is moving the
+    // real cursor/keyboard, the owner MUST see it — this row is claimed
+    // before every other optional panel (below) and never sheds.
+    let screen_control = model.projection.screen_control_active();
+    let mut screen_control_height = u16::from(screen_control);
     let mut todos_height = model
         .projection
         .todos()
@@ -3277,6 +3282,13 @@ fn render_session(
     };
     let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
     let mut budget = area.height.saturating_sub(fixed + transcript_min);
+    // CU-2: the screen-control banner is claimed before every optional
+    // panel — a session driving the real cursor must always be visible.
+    if screen_control_height > budget {
+        screen_control_height = 0;
+    } else {
+        budget -= screen_control_height;
+    }
     // TUI6.1 fix 2: the closing rule claims FIRST — before EVERY optional
     // panel — per `band_rule_reserve`'s law: reserved whenever chrome +
     // input + the transcript's sacred row leave it a row. It takes a
@@ -3386,6 +3398,7 @@ fn render_session(
         palette_area,
         throughput_area,
         retry_area,
+        screen_control_area,
         rule_area,
         composer_area,
         band_rule_area,
@@ -3406,6 +3419,7 @@ fn render_session(
         Constraint::Length(palette_height),
         Constraint::Length(throughput_height),
         Constraint::Length(retry_height),
+        Constraint::Length(screen_control_height),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
         Constraint::Length(band_rule_h),
@@ -3854,6 +3868,22 @@ fn render_session(
         }
     }
 
+    // CU-2: the sacred screen-control banner — a warm, unmissable strip
+    // while a session is moving the real cursor/keyboard. Esc is the same
+    // interrupt that stops any turn (the daemon's cancel token aborts the
+    // in-flight computer action), so the copy points there.
+    if screen_control && screen_control_area.height > 0 {
+        let warn = theme.warn_style().add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ◉ ", warn),
+                Span::styled("controlling your screen", warn),
+                Span::styled(" — esc to stop", theme.dim_style()),
+            ]))
+            .style(theme.warn_style()),
+            screen_control_area,
+        );
+    }
     if queue_height > 0 {
         // The ⧗ queued panel (sim tui.js:2891-2906): header + numbered
         // rows, text truncated at 72 chars.
@@ -8672,6 +8702,13 @@ fn tool_desc(args: &serde_json::Value) -> String {
     if let Some(desc) = args.get("desc").and_then(|v| v.as_str()) {
         return desc.to_owned();
     }
+    // CU-2 computer tool: the action is a top-level `"action"` tag with
+    // coordinate/text siblings. Render exactly what the model is doing to
+    // the screen — the transcript is the owner's window into a session that
+    // can move their real cursor.
+    if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
+        return computer_action_desc(action, args);
+    }
     if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
         return path.to_owned();
     }
@@ -8682,6 +8719,50 @@ fn tool_desc(args: &serde_json::Value) -> String {
         };
     }
     String::new()
+}
+
+/// Human-readable summary of one CU-2 computer action for the tool row.
+fn computer_action_desc(action: &str, args: &serde_json::Value) -> String {
+    let u = |key| args.get(key).and_then(serde_json::Value::as_u64);
+    let xy = || match (u("x"), u("y")) {
+        (Some(x), Some(y)) => format!(" ({x}, {y})"),
+        _ => String::new(),
+    };
+    let point = |key| {
+        args.get(key).map_or_else(String::new, |p| {
+            match (
+                p.get("x").and_then(serde_json::Value::as_u64),
+                p.get("y").and_then(serde_json::Value::as_u64),
+            ) {
+                (Some(x), Some(y)) => format!("({x}, {y})"),
+                _ => String::new(),
+            }
+        })
+    };
+    match action {
+        "left_click" | "right_click" | "middle_click" | "double_click" | "mouse_move" => {
+            format!("{action}{}", xy())
+        }
+        "left_click_drag" => format!("drag {} → {}", point("from"), point("to")),
+        "type" => match args.get("text").and_then(|v| v.as_str()) {
+            Some(text) => format!("type \"{text}\""),
+            None => "type".to_owned(),
+        },
+        "key" => match args.get("keys").and_then(|v| v.as_str()) {
+            Some(keys) => format!("key {keys}"),
+            None => "key".to_owned(),
+        },
+        "scroll" => {
+            let dir = args.get("direction").and_then(|v| v.as_str()).unwrap_or("");
+            let amount = u("amount").unwrap_or(0);
+            format!("scroll {dir} ×{amount}{}", xy())
+        }
+        "wait" => match u("ms") {
+            Some(ms) => format!("wait {ms}ms"),
+            None => "wait".to_owned(),
+        },
+        other => other.replace('_', " "),
+    }
 }
 
 /// The tool row's meta text (sim `.meta`): `running…` while in progress,

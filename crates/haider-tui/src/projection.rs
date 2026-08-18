@@ -1293,6 +1293,40 @@ impl SessionProjection {
         &self.entries
     }
 
+    /// CU-2 safety signal: is the model mid-flight on a `computer` action
+    /// that MOVES the screen (any click/type/key/move/scroll/drag), as
+    /// opposed to a passive screenshot/cursor read? Drives the sacred
+    /// "controlling your screen" banner so the owner can never miss that a
+    /// session is driving their real machine.
+    #[must_use]
+    pub fn screen_control_active(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            let TranscriptEntry::Item(block) = entry else {
+                return false;
+            };
+            let TurnItem::ToolCall {
+                name, status, args, ..
+            } = &block.item
+            else {
+                return false;
+            };
+            if name != "computer"
+                || !matches!(
+                    status,
+                    haider_protocol::item::ToolStatus::InProgress
+                        | haider_protocol::item::ToolStatus::Pending
+                )
+            {
+                return false;
+            }
+            // Observation (screenshot / cursor_position) is not control.
+            !matches!(
+                args.get("action").and_then(|v| v.as_str()),
+                Some("screenshot") | Some("cursor_position") | None
+            )
+        })
+    }
+
     /// View-cache invalidation token; no semantic state is derived from it.
     #[must_use]
     pub const fn render_revision(&self) -> u64 {
