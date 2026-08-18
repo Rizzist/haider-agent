@@ -8,21 +8,26 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
+use haider_protocol::ids::ArtifactRef;
 use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{Block, PrefixDigests, StreamEvent};
+use haider_protocol::tool::ImageBlockRef;
 use reqwest::header::AUTHORIZATION;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::anthropic::{
-    ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
-    ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicProvider, SseChunkSource,
-    read_error_body_bounded, replay_anthropic_sse, stream_sse_source,
+    ANTHROPIC_COMPUTER_BETA_20250124, ANTHROPIC_COMPUTER_BETA_20251124, ANTHROPIC_FAST_BETA_VALUE,
+    ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE,
+    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicComputerToolVersion, AnthropicProvider,
+    SseChunkSource, anthropic_computer_tool_version, read_error_body_bounded,
+    replay_anthropic_native_computer_sse, replay_anthropic_sse, stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
 use crate::{
     AnthropicCacheTtl, Message, PromptCacheMetadata, Provider as _, ProviderError,
-    ProviderErrorKind, ToolDefinition, TurnRequest, UserCommandRecord, select_anthropic_cache_ttl,
+    ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest, UserCommandRecord,
+    select_anthropic_cache_ttl,
 };
 
 struct HangingFixture {
@@ -223,6 +228,10 @@ async fn anthropic_oauth_subscription_is_bearer_beta_without_api_key_and_fixed_o
 }
 
 fn payload_provider(oauth: bool) -> AnthropicProvider {
+    model_payload_provider(oauth, "claude-audit")
+}
+
+fn model_payload_provider(oauth: bool, model: &str) -> AnthropicProvider {
     let vault = MemoryVault::new();
     let alias = CredentialAlias::new("anthropic-payload-audit");
     vault
@@ -230,10 +239,10 @@ fn payload_provider(oauth: bool) -> AnthropicProvider {
         .expect("store payload audit secret");
     let credential = vault.resolve(&alias).expect("resolve payload audit secret");
     if oauth {
-        AnthropicProvider::new_subscription(credential, "claude-audit", ANTHROPIC_OAUTH_BASE_URL)
+        AnthropicProvider::new_subscription(credential, model, ANTHROPIC_OAUTH_BASE_URL)
             .expect("Anthropic subscription provider")
     } else {
-        AnthropicProvider::new(credential, "claude-audit").expect("Anthropic key provider")
+        AnthropicProvider::new(credential, model).expect("Anthropic key provider")
     }
 }
 
@@ -676,6 +685,441 @@ fn tool_schemas_drop_top_level_combinators_for_both_auth_modes() {
             "unrelated schema keys are untouched (oauth={oauth})"
         );
     }
+}
+
+fn computer_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "computer".into(),
+        description: "Use the desktop".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+        }),
+    }
+}
+
+#[test]
+fn anthropic_native_computer_model_table_is_documented_and_fail_closed() {
+    for model in [
+        "claude-opus-5",
+        "claude-sonnet-5-20260801",
+        "anthropic.claude-opus-4-8",
+        "claude-opus-4-7@20260801",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-opus-4-5",
+    ] {
+        assert_eq!(
+            anthropic_computer_tool_version(model),
+            Some(AnthropicComputerToolVersion::V20251124),
+            "{model} uses the latest native dialect"
+        );
+    }
+    for model in [
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5@20251001",
+        "anthropic.claude-opus-4-1",
+        "claude-sonnet-4",
+        "claude-opus-4-20250514",
+    ] {
+        assert_eq!(
+            anthropic_computer_tool_version(model),
+            Some(AnthropicComputerToolVersion::V20250124),
+            "{model} uses the earlier native dialect"
+        );
+    }
+    for model in [
+        "claude-audit",
+        "claude-fable-5",
+        "claude-haiku-5",
+        "claude-opus-5-1",
+        "claude-sonnet-3-7",
+    ] {
+        assert_eq!(
+            anthropic_computer_tool_version(model),
+            None,
+            "unknown/unsupported `{model}` stays generic"
+        );
+    }
+}
+
+#[test]
+fn native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_actions() {
+    let screenshot = ImageBlockRef {
+        artifact: ArtifactRef::new("blake3:anthropic-native-screen"),
+        media_type: "image/png".into(),
+        width: 1_600,
+        height: 900,
+        byte_len: 12,
+    };
+    let request = TurnRequest {
+        messages: vec![
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "toolu_screen".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            }]),
+            Message::tool_result_with_images(
+                "toolu_screen",
+                "screenshot captured (1600x900)",
+                false,
+                vec![screenshot.clone()],
+            ),
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "toolu_click".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "left_click", "x": 321, "y": 654}),
+            }]),
+        ],
+        model: "claude-opus-5".into(),
+        max_tokens: 128,
+        system_prompt: None,
+        tools: vec![computer_tool()],
+        attachments: vec![ResolvedAttachment {
+            artifact: screenshot.artifact,
+            data_base64: "iVBORw0KGgo=".into(),
+        }],
+        cache_metadata: None,
+    };
+    let payload = model_payload_provider(false, "claude-opus-5")
+        .request_payload(&request)
+        .expect("native computer payload");
+
+    assert_eq!(
+        payload["tools"][0],
+        serde_json::json!({
+            "type": "computer_20251124",
+            "name": "computer",
+            "display_width_px": 1600,
+            "display_height_px": 900,
+            "display_number": 1,
+        })
+    );
+    assert!(payload["tools"][0].get("description").is_none());
+    assert!(payload["tools"][0].get("input_schema").is_none());
+    assert_eq!(
+        payload["messages"][2]["content"][0]["input"],
+        serde_json::json!({"action": "left_click", "coordinate": [321, 654]}),
+        "normalized assistant history replays in Anthropic's coordinate-array shape"
+    );
+    assert_eq!(
+        payload["messages"][1]["content"][0]["content"][1]["type"], "image",
+        "CU-1 screenshots remain native Anthropic tool_result image blocks"
+    );
+}
+
+#[test]
+fn native_computer_initial_size_is_xga_and_generic_fallback_is_unchanged() {
+    let mut native = payload_request(None);
+    native.model = "claude-sonnet-4-5".into();
+    native.tools = vec![computer_tool()];
+    let payload = model_payload_provider(false, "claude-sonnet-4-5")
+        .request_payload(&native)
+        .expect("earlier native payload");
+    assert_eq!(
+        payload["tools"][0],
+        serde_json::json!({
+            "type": "computer_20250124",
+            "name": "computer",
+            "display_width_px": 1024,
+            "display_height_px": 768,
+            "display_number": 1,
+        })
+    );
+
+    let mut generic = payload_request(None);
+    generic.tools = vec![computer_tool()];
+    let payload = payload_provider(false)
+        .request_payload(&generic)
+        .expect("generic computer payload");
+    assert_eq!(
+        payload["tools"][0],
+        serde_json::json!({
+            "name": "computer",
+            "description": "Use the desktop",
+            "input_schema": {
+                "type": "object",
+                "properties": {"action": {"type": "string"}},
+                "required": ["action"],
+            },
+        }),
+        "a non-native model retains the pre-CU-5 custom-function bytes"
+    );
+}
+
+#[test]
+fn native_computer_sse_translates_action_envelope_before_dispatch() {
+    let stream = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_scroll\",\"name\":\"computer\",\"input\":{}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"action\\\":\\\"scroll\\\",\\\"coordinate\\\":[120,240],\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"scroll_direction\\\":\\\"down\\\",\\\"scroll_amount\\\":7}\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+    let items = replay_anthropic_native_computer_sse(stream.as_bytes());
+    assert_eq!(
+        items.first(),
+        Some(&Ok(StreamEvent::ToolCallStart {
+            call_id: "toolu_scroll".into(),
+            name: "computer".into(),
+        }))
+    );
+    let args = items
+        .iter()
+        .find_map(|item| match item {
+            Ok(StreamEvent::ToolCallArgsDelta { args_fragment, .. }) => {
+                Some(serde_json::from_str::<serde_json::Value>(args_fragment).expect("args JSON"))
+            }
+            _ => None,
+        })
+        .expect("translated args delta");
+    assert_eq!(
+        args,
+        serde_json::json!({
+            "action": "scroll",
+            "x": 120,
+            "y": 240,
+            "direction": "down",
+            "amount": 7,
+        })
+    );
+    assert!(items.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "toolu_scroll"
+    )));
+}
+
+#[test]
+fn native_computer_action_translation_covers_supported_anthropic_vocabulary() {
+    let cases = [
+        (
+            serde_json::json!({"action": "screenshot"}),
+            serde_json::json!({"action": "screenshot"}),
+        ),
+        (
+            serde_json::json!({"action": "cursor_position"}),
+            serde_json::json!({"action": "cursor_position"}),
+        ),
+        (
+            serde_json::json!({"action": "left_click", "coordinate": [12, 34]}),
+            serde_json::json!({"action": "left_click", "x": 12, "y": 34}),
+        ),
+        (
+            serde_json::json!({"action": "right_click"}),
+            serde_json::json!({"action": "right_click"}),
+        ),
+        (
+            serde_json::json!({"action": "middle_click"}),
+            serde_json::json!({"action": "middle_click"}),
+        ),
+        (
+            serde_json::json!({"action": "double_click"}),
+            serde_json::json!({"action": "double_click"}),
+        ),
+        (
+            serde_json::json!({"action": "left_mouse_down"}),
+            serde_json::json!({"action": "left_mouse_down"}),
+        ),
+        (
+            serde_json::json!({"action": "left_mouse_up"}),
+            serde_json::json!({"action": "left_mouse_up"}),
+        ),
+        (
+            serde_json::json!({"action": "mouse_move", "coordinate": [55, 89]}),
+            serde_json::json!({"action": "mouse_move", "x": 55, "y": 89}),
+        ),
+        (
+            serde_json::json!({
+                "action": "left_click_drag",
+                "start_coordinate": [1, 2],
+                "coordinate": [300, 400],
+            }),
+            serde_json::json!({
+                "action": "left_click_drag",
+                "from": {"x": 1, "y": 2},
+                "to": {"x": 300, "y": 400},
+            }),
+        ),
+        (
+            serde_json::json!({"action": "type", "text": "hello"}),
+            serde_json::json!({"action": "type", "text": "hello"}),
+        ),
+        (
+            serde_json::json!({"action": "key", "text": "CMD+SHIFT+P"}),
+            serde_json::json!({"action": "key", "keys": "CMD+SHIFT+P"}),
+        ),
+        (
+            serde_json::json!({
+                "action": "scroll",
+                "coordinate": [101, 202],
+                "scroll_direction": "up",
+                "scroll_amount": 3,
+            }),
+            serde_json::json!({
+                "action": "scroll",
+                "x": 101,
+                "y": 202,
+                "direction": "up",
+                "amount": 3,
+            }),
+        ),
+        (
+            serde_json::json!({"action": "wait", "duration": 1.25}),
+            serde_json::json!({"action": "wait", "ms": 1250}),
+        ),
+    ];
+
+    for (native, neutral) in cases {
+        assert_eq!(
+            crate::wire::anthropic_computer_input_to_neutral(&native)
+                .expect("native action translates"),
+            neutral
+        );
+        assert_eq!(
+            crate::wire::anthropic_computer_input_from_neutral(&neutral)
+                .expect("neutral action replays"),
+            native
+        );
+    }
+    for unsupported in [
+        serde_json::json!({"action": "triple_click", "coordinate": [3, 4]}),
+        serde_json::json!({"action": "hold_key", "text": "shift", "duration": 1}),
+        serde_json::json!({"action": "zoom", "region": [0, 0, 10, 10]}),
+        serde_json::json!({"action": "left_click", "coordinate": [3, 4], "key": "shift"}),
+        serde_json::json!({"action": "right_click", "coordinate": [3, 4]}),
+        serde_json::json!({
+            "action": "scroll",
+            "coordinate": [3, 4],
+            "scroll_direction": "down",
+            "scroll_amount": 2,
+            "key": "shift",
+        }),
+        serde_json::json!({"action": "screenshot", "future_field": true}),
+    ] {
+        assert!(
+            crate::wire::anthropic_computer_input_to_neutral(&unsupported).is_err(),
+            "native-only or lossy action input must fail honestly: {unsupported}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_computer_beta_is_sent_on_bedrock_and_vertex_only_when_advertised() {
+    let mut bedrock_turn = payload_request(None);
+    bedrock_turn.model = "anthropic.claude-opus-5".into();
+    bedrock_turn.tools = vec![computer_tool()];
+    let bedrock = AnthropicProvider::new_endpoint(
+        secret_credential("bedrock-native-computer", b"BEDROCK_NATIVE_COMPUTER"),
+        "anthropic.claude-opus-5",
+        "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+    )
+    .expect("bedrock provider");
+    let payload = bedrock
+        .request_payload(&bedrock_turn)
+        .expect("bedrock native payload");
+    let request = bedrock.request(&payload).await.expect("bedrock request");
+    assert_eq!(
+        request
+            .headers()
+            .get(ANTHROPIC_OAUTH_BETA_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(ANTHROPIC_COMPUTER_BETA_20251124)
+    );
+
+    let mut vertex_turn = payload_request(None);
+    vertex_turn.model = "claude-sonnet-4-5@20250929".into();
+    vertex_turn.tools = vec![computer_tool()];
+    let vertex = AnthropicProvider::new_vertex(
+        secret_credential("vertex-native-computer", b"VERTEX_NATIVE_COMPUTER"),
+        "claude-sonnet-4-5@20250929",
+        "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+    )
+    .expect("vertex provider");
+    let payload = vertex
+        .request_payload(&vertex_turn)
+        .expect("vertex native payload");
+    let request = vertex.request(&payload).await.expect("vertex request");
+    assert_eq!(
+        request
+            .headers()
+            .get(ANTHROPIC_OAUTH_BETA_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(ANTHROPIC_COMPUTER_BETA_20250124)
+    );
+
+    let generic_payload = vertex
+        .request_payload(&one_line_turn("claude-sonnet-4-5@20250929"))
+        .expect("vertex generic payload");
+    let generic_request = vertex
+        .request(&generic_payload)
+        .await
+        .expect("vertex generic request");
+    assert!(
+        !generic_request
+            .headers()
+            .contains_key(ANTHROPIC_OAUTH_BETA_HEADER),
+        "generic Vertex request remains byte-identical"
+    );
+}
+
+#[tokio::test]
+async fn native_computer_beta_composes_with_fast_and_oauth_headers() {
+    let mut turn = payload_request(None);
+    turn.model = "claude-opus-5".into();
+    turn.tools = vec![computer_tool()];
+
+    let api_key = model_payload_provider(false, "claude-opus-5").with_fast(true);
+    let payload = api_key.request_payload(&turn).expect("native fast payload");
+    let request = api_key
+        .request(&payload)
+        .await
+        .expect("native fast request");
+    assert_eq!(
+        request
+            .headers()
+            .get(ANTHROPIC_OAUTH_BETA_HEADER)
+            .expect("computer beta header")
+            .to_str()
+            .expect("ASCII beta header"),
+        format!("{ANTHROPIC_FAST_BETA_VALUE},{ANTHROPIC_COMPUTER_BETA_20251124}")
+    );
+
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("anthropic-native-computer-header-audit");
+    vault
+        .put(&alias, b"ANTHROPIC_NATIVE_COMPUTER_SENTINEL")
+        .expect("store OAuth access");
+    let oauth = AnthropicProvider::new_subscription_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve OAuth access"),
+        "claude-opus-5",
+        ANTHROPIC_OAUTH_BASE_URL,
+        Arc::new(StubFixedResolver {
+            address: SocketAddr::from(([93, 184, 216, 34], 443)),
+        }),
+    )
+    .expect("OAuth native provider")
+    .with_fast(true);
+    let payload = oauth.request_payload(&turn).expect("OAuth native payload");
+    let request = oauth.request(&payload).await.expect("OAuth native request");
+    assert_eq!(
+        request
+            .headers()
+            .get(ANTHROPIC_OAUTH_BETA_HEADER)
+            .expect("composed OAuth computer beta header")
+            .to_str()
+            .expect("ASCII beta header"),
+        format!(
+            "{ANTHROPIC_OAUTH_BETA_VALUE},{ANTHROPIC_FAST_BETA_VALUE},{ANTHROPIC_COMPUTER_BETA_20251124}"
+        )
+    );
 }
 
 impl HangingFixture {

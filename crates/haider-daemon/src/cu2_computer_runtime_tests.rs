@@ -29,7 +29,10 @@ use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider, TurnRequest};
 use haider_store::{SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand};
-use haider_tools::{ComputerBackend, ComputerCancelToken, ComputerOutput, ComputerResult};
+use haider_tools::{
+    ComputerBackend, ComputerCancelToken, ComputerInspection, ComputerInspectionBounds,
+    ComputerOutput, ComputerResult,
+};
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +111,18 @@ impl ComputerBackend for FakeComputerBackend {
                 Ok(ComputerOutput::ScreenshotPng(self.screenshot.clone()))
             }
             ComputerAction::CursorPosition => Ok(ComputerOutput::CursorPosition { x: 5, y: 7 }),
+            ComputerAction::Inspect { .. } => Ok(ComputerOutput::Inspection(ComputerInspection {
+                role: Some("button".into()),
+                label: Some("Send message".into()),
+                title: Some("Send".into()),
+                bounds: Some(ComputerInspectionBounds {
+                    x: 980,
+                    y: 320,
+                    width: 88,
+                    height: 42,
+                }),
+                value: None,
+            })),
             ComputerAction::Wait { .. } if self.block_wait => {
                 *self.active_cancel.lock().expect("cancel lock") = Some(cancel.clone());
                 self.entered.notify_one();
@@ -139,6 +154,7 @@ impl ComputerBackend for FakeComputerBackend {
 fn action_name(action: &ComputerAction) -> &'static str {
     match action {
         ComputerAction::LeftClick { .. } => "left_click",
+        ComputerAction::Inspect { .. } => "inspect",
         ComputerAction::Wait { .. } => "wait",
         _ => "computer_action",
     }
@@ -352,6 +368,17 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
                 call_id: "cu2-screenshot".into(),
             },
             FakeStep::EmitToolCall {
+                call_id: "cu2-inspect".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "inspect", "x": 1024, "y": 341}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "cu2-inspect".into(),
+            },
+            FakeStep::EmitToolCall {
                 call_id: "cu2-click".into(),
                 name: "computer".into(),
                 args: serde_json::json!({"action": "left_click", "x": 1024, "y": 341}),
@@ -429,7 +456,7 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
     assert!(!journal_json.contains(&base64::engine::general_purpose::STANDARD.encode(&cas_bytes)));
 
     let requests: Vec<TurnRequest> = provider.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert!(requests[1].messages.iter().any(|message| {
         matches!(message.blocks.as_slice(), [Block::ToolResult { call_id, images, .. }]
             if call_id == "cu2-screenshot" && images == std::slice::from_ref(&image))
@@ -445,10 +472,17 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
     assert_eq!(provider_bytes, cas_bytes);
     assert!(requests[2].messages.iter().any(|message| {
         matches!(message.blocks.as_slice(), [Block::ToolResult { call_id, preview, images, .. }]
+            if call_id == "cu2-inspect"
+                && preview == "{\"role\":\"button\",\"label\":\"Send message\",\"title\":\"Send\",\"bounds\":{\"x\":980,\"y\":320,\"width\":88,\"height\":42},\"value\":null}"
+                && images.is_empty())
+    }));
+    assert!(requests[3].messages.iter().any(|message| {
+        matches!(message.blocks.as_slice(), [Block::ToolResult { call_id, preview, images, .. }]
             if call_id == "cu2-click" && preview == "left_click completed" && images.is_empty())
     }));
 
     let mut control_effect = None;
+    let mut inspect_effect = None;
     let mut phases = Vec::new();
     for event in &events {
         if let Ok(EventPayload::Effect(phase)) =
@@ -460,9 +494,19 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
             {
                 control_effect = Some(intent.effect.clone());
             }
+            if let EffectPhase::Intent(intent) = &phase
+                && intent.class == EffectClass::ScreenObserve
+                && intent.summary == "computer inspect"
+            {
+                inspect_effect = Some(intent.effect.clone());
+            }
             phases.push(phase);
         }
     }
+    let inspect_effect = inspect_effect.expect("inspect ScreenObserve intent");
+    assert!(phases.iter().any(|phase| matches!(phase,
+        EffectPhase::Outcome { effect, outcome: EffectOutcome::Ok, .. }
+            if effect == &inspect_effect)));
     let control_effect = control_effect.expect("click ScreenControl intent");
     assert!(phases.iter().any(|phase| matches!(phase,
         EffectPhase::Authorized { effect, verdict: AuthorizationVerdict::Allow }

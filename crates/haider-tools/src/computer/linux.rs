@@ -835,7 +835,9 @@ impl LinuxComputerBackend {
                 .await?;
             }
             ComputerAction::Wait { .. } => unreachable!("wait is dispatched asynchronously"),
-            ComputerAction::Screenshot | ComputerAction::CursorPosition => {
+            ComputerAction::Screenshot
+            | ComputerAction::CursorPosition
+            | ComputerAction::Inspect { .. } => {
                 unreachable!("observe actions do not enter control")
             }
         }
@@ -853,6 +855,12 @@ impl ComputerBackend for LinuxComputerBackend {
         cancel: &ComputerCancelToken,
     ) -> ComputerResult<ComputerOutput> {
         cancel.check()?;
+        if matches!(action, ComputerAction::Inspect { .. }) {
+            return Err(ComputerError::InspectUnsupported {
+                platform: "linux".into(),
+                message: "accessibility inspection is not supported on Linux yet".into(),
+            });
+        }
         self.ensure_connection(cancel).await?;
         match action {
             ComputerAction::Screenshot => self
@@ -1155,6 +1163,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
     match action {
         ComputerAction::Screenshot => "screenshot",
         ComputerAction::CursorPosition => "cursor_position",
+        ComputerAction::Inspect { .. } => "inspect",
         ComputerAction::LeftClick { .. } => "left_click",
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",

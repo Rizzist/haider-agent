@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{Message, PromptCacheMetadata, ToolDefinition, UserCommandRecord};
 use haider_accounts::{MemoryVault, Vault};
+use haider_protocol::ids::ArtifactRef;
 use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::PrefixDigests;
+use haider_protocol::tool::ImageBlockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -153,7 +155,7 @@ async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
         None,
         sender,
         Duration::from_secs(90),
-        DecoderKind::Responses,
+        DecoderKind::Responses(OpenAiComputerToolKind::Generic),
     ));
 
     assert_eq!(
@@ -188,7 +190,7 @@ async fn dropping_openai_stream_aborts_its_hanging_source() {
         None,
         sender,
         Duration::from_secs(90),
-        DecoderKind::Responses,
+        DecoderKind::Responses(OpenAiComputerToolKind::Generic),
     ));
     let mut stream = ProviderStream::owned(receiver, producer);
     assert!(matches!(
@@ -928,6 +930,484 @@ fn probe_request(model: &str) -> TurnRequest {
         attachments: Vec::new(),
         cache_metadata: None,
     }
+}
+
+fn computer_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "computer".into(),
+        description: "neutral computer tool".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+        }),
+    }
+}
+
+#[test]
+fn native_computer_negotiation_pins_preview_ga_generic_and_lite_shapes() {
+    for model in ["computer-use-preview", "computer-use-preview-2025-03-11"] {
+        let mut preview = probe_request(model);
+        preview.tools = vec![computer_tool_definition()];
+        let preview = responses_request_json(&preview, false, None, false).expect("preview wire");
+        assert_eq!(
+            preview["tools"],
+            serde_json::json!([{
+                "type": "computer_use_preview",
+                "display_width": 2048,
+                "display_height": 1152,
+                "environment": openai_computer_environment(),
+            }])
+        );
+        assert_eq!(preview["truncation"], "auto");
+    }
+
+    for model in ["gpt-5.4", "gpt-5.5-2026-06-01", "gpt-5.6-sol"] {
+        let mut request = probe_request(model);
+        request.tools = vec![computer_tool_definition()];
+        let payload =
+            responses_request_json(&request, false, None, false).expect("GA computer wire");
+        assert_eq!(payload["tools"], serde_json::json!([{"type": "computer"}]));
+    }
+
+    for model in [
+        "gpt-5.3",
+        "gpt-5.7",
+        "gpt-6.0",
+        "future-computer-model",
+        "computer-use-preview-future",
+    ] {
+        let mut generic_request = probe_request(model);
+        generic_request.tools = vec![computer_tool_definition()];
+        let generic = responses_request_json(&generic_request, false, None, false)
+            .expect("generic fallback wire");
+        assert_eq!(generic["tools"][0]["type"], "function");
+        assert_eq!(generic["tools"][0]["name"], "computer");
+        assert_eq!(generic["tools"][0]["strict"], false);
+        assert_eq!(generic["tools"][0]["description"], "neutral computer tool");
+        assert_eq!(
+            generic["tools"][0]["parameters"],
+            computer_tool_definition().input_schema
+        );
+    }
+
+    let mut lite_request = probe_request("gpt-5.6");
+    lite_request.tools = vec![computer_tool_definition()];
+    let lite = responses_request_json(&lite_request, true, None, false).expect("lite generic wire");
+    assert_eq!(lite["tools"][0]["type"], "function");
+    assert_eq!(lite["tools"][0]["name"], "computer");
+}
+
+#[test]
+fn native_computer_call_decodes_preview_and_ga_batches_to_singular_actions() {
+    let preview_item = serde_json::json!({
+        "type": "computer_call",
+        "id": "cu_preview_item",
+        "call_id": "cu_preview",
+        "action": {"type": "click", "button": "left", "x": 420, "y": 240},
+        "pending_safety_checks": [{"id": "safe_1", "code": "policy"}],
+        "status": "completed",
+    });
+    let preview_wire = format!(
+        "event: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": preview_item}),
+        serde_json::json!({"type": "response.completed", "response": {"id": "resp_preview"}}),
+    );
+    let generic_events = replay_openai_responses_sse(preview_wire.as_bytes());
+    assert!(!generic_events.iter().any(|item| matches!(
+        item,
+        Ok(StreamEvent::ProviderOpaque { .. } | StreamEvent::ToolCallStart { .. })
+    )));
+    assert_eq!(
+        generic_events.last(),
+        Some(&Ok(StreamEvent::Finish {
+            reason: FinishReason::EndTurn,
+        }))
+    );
+
+    let preview_events =
+        replay_openai_native_computer_sse(preview_wire.as_bytes(), "computer-use-preview");
+    let preview_args = preview_events
+        .iter()
+        .filter_map(|item| match item {
+            Ok(StreamEvent::ToolCallArgsDelta { args_fragment, .. }) => {
+                Some(serde_json::from_str::<serde_json::Value>(args_fragment).expect("args JSON"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        preview_args,
+        [
+            serde_json::json!({"action": "left_click", "x": 420, "y": 240}),
+            serde_json::json!({"action": "screenshot"}),
+        ]
+    );
+    assert!(preview_events.contains(&Ok(StreamEvent::ProviderOpaque {
+        provider: OPENAI_PROVIDER_NAME.into(),
+        data: preview_item,
+    })));
+    assert_eq!(
+        preview_events.last(),
+        Some(&Ok(StreamEvent::Finish {
+            reason: FinishReason::ToolUse,
+        }))
+    );
+
+    let ga_item = serde_json::json!({
+        "type": "computer_call",
+        "call_id": "cu_ga",
+        "actions": [
+            {"type": "keypress", "keys": ["CTRL", "L"]},
+            {"type": "type", "text": "https://example.com"},
+        ],
+        "status": "completed",
+    });
+    let ga_wire = format!(
+        "event: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": ga_item}),
+        serde_json::json!({"type": "response.completed", "response": {"id": "resp_ga"}}),
+    );
+    let ga_actions = replay_openai_native_computer_sse(ga_wire.as_bytes(), "gpt-5.4")
+        .into_iter()
+        .filter_map(|item| match item {
+            Ok(StreamEvent::ToolCallArgsDelta { args_fragment, .. }) => {
+                Some(serde_json::from_str::<serde_json::Value>(&args_fragment).expect("args JSON"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ga_actions,
+        [
+            serde_json::json!({"action": "key", "keys": "CTRL+L"}),
+            serde_json::json!({"action": "type", "text": "https://example.com"}),
+            serde_json::json!({"action": "screenshot"}),
+        ]
+    );
+}
+
+#[test]
+fn native_computer_action_translation_covers_the_supported_openai_vocabulary() {
+    let translate = |action: serde_json::Value| {
+        openai_computer_actions(&action)
+            .expect("supported native action")
+            .into_iter()
+            .map(|action| serde_json::to_value(action).expect("normalized action JSON"))
+            .collect::<Vec<_>>()
+    };
+
+    for lossy in [
+        serde_json::json!({
+            "type": "click", "button": "left", "x": 1, "y": 2, "keys": ["SHIFT"]
+        }),
+        serde_json::json!({
+            "type": "scroll", "x": 1, "y": 2, "scroll_x": 0, "scroll_y": 100,
+            "keys": ["CTRL"]
+        }),
+        serde_json::json!({
+            "type": "click", "button": "left", "x": 1, "y": 2, "keys": "SHIFT"
+        }),
+    ] {
+        assert!(
+            openai_computer_actions(&lossy).is_err(),
+            "native modifier input must not be silently weakened: {lossy}"
+        );
+    }
+
+    assert_eq!(
+        translate(serde_json::json!({
+            "type": "click", "button": "right", "x": 7, "y": 8
+        })),
+        [
+            serde_json::json!({"action": "mouse_move", "x": 7, "y": 8}),
+            serde_json::json!({"action": "right_click"}),
+        ]
+    );
+    assert_eq!(
+        translate(serde_json::json!({
+            "type": "double_click", "x": 9, "y": 10
+        })),
+        [
+            serde_json::json!({"action": "mouse_move", "x": 9, "y": 10}),
+            serde_json::json!({"action": "double_click"}),
+        ]
+    );
+    assert_eq!(
+        translate(serde_json::json!({
+            "type": "drag",
+            "path": [{"x": 1, "y": 2}, {"x": 4, "y": 5}, {"x": 7, "y": 8}]
+        })),
+        [
+            serde_json::json!({"action": "mouse_move", "x": 1, "y": 2}),
+            serde_json::json!({"action": "left_mouse_down"}),
+            serde_json::json!({"action": "mouse_move", "x": 4, "y": 5}),
+            serde_json::json!({"action": "mouse_move", "x": 7, "y": 8}),
+            serde_json::json!({"action": "left_mouse_up"}),
+        ]
+    );
+    assert_eq!(
+        translate(serde_json::json!({
+            "type": "drag",
+            "path": [[1, 2], [7, 8]]
+        })),
+        [serde_json::json!({
+            "action": "left_click_drag",
+            "from": {"x": 1, "y": 2},
+            "to": {"x": 7, "y": 8}
+        })]
+    );
+    assert_eq!(
+        translate(serde_json::json!({
+            "type": "scroll", "x": 20, "y": 30, "scroll_x": -250, "scroll_y": 151
+        })),
+        [
+            serde_json::json!({
+                "action": "scroll", "x": 20, "y": 30, "direction": "down", "amount": 2
+            }),
+            serde_json::json!({
+                "action": "scroll", "x": 20, "y": 30, "direction": "left", "amount": 3
+            }),
+        ]
+    );
+    assert_eq!(
+        translate(serde_json::json!({"type": "keypress", "keys": ["CTRL", "L"]})),
+        [serde_json::json!({"action": "key", "keys": "CTRL+L"})]
+    );
+    assert_eq!(
+        translate(serde_json::json!({"type": "type", "text": "hello"})),
+        [serde_json::json!({"action": "type", "text": "hello"})]
+    );
+    assert_eq!(
+        translate(serde_json::json!({"type": "move", "x": 11, "y": 12})),
+        [serde_json::json!({"action": "mouse_move", "x": 11, "y": 12})]
+    );
+    assert_eq!(
+        translate(serde_json::json!({"type": "wait"})),
+        [serde_json::json!({"action": "wait", "ms": 2000})]
+    );
+    assert_eq!(
+        translate(serde_json::json!({"type": "screenshot"})),
+        [serde_json::json!({"action": "screenshot"})]
+    );
+
+    for rejected in [
+        serde_json::json!({
+            "type": "click", "button": "left", "x": 1, "y": 2, "keys": ["SHIFT"]
+        }),
+        serde_json::json!({"type": "drag", "path": [{"x": 1, "y": 2}]}),
+        serde_json::json!({
+            "type": "scroll", "x": 1, "y": 2, "scroll_x": 0, "scroll_y": 0
+        }),
+        serde_json::json!({"type": "zoom", "x": 1, "y": 2}),
+    ] {
+        assert!(openai_computer_actions(&rejected).is_err());
+    }
+}
+
+fn native_computer_followup(model: &str, call: serde_json::Value) -> TurnRequest {
+    let provider_call_id = call["call_id"].as_str().expect("native call id").to_owned();
+    let native_actions = if let Some(actions) = call["actions"].as_array() {
+        actions.iter().collect::<Vec<_>>()
+    } else {
+        vec![&call["action"]]
+    };
+    let mut normalized_actions = native_actions
+        .into_iter()
+        .flat_map(|action| openai_computer_actions(action).expect("native action translates"))
+        .collect::<Vec<_>>();
+    if !matches!(normalized_actions.last(), Some(ComputerAction::Screenshot)) {
+        normalized_actions.push(ComputerAction::Screenshot);
+    }
+    let action_count = normalized_actions.len();
+    let artifact = ArtifactRef::new(format!("blake3:{provider_call_id}"));
+    let mut assistant_blocks = vec![Block::ProviderOpaque {
+        provider: OPENAI_PROVIDER_NAME.into(),
+        data: call,
+    }];
+    for index in 0..action_count {
+        assistant_blocks.push(Block::ToolCall {
+            call_id: native_computer_action_call_id(&provider_call_id, index),
+            name: "computer".into(),
+            args: if index + 1 == action_count {
+                serde_json::json!({"action": "screenshot"})
+            } else {
+                serde_json::json!({"action": "wait", "ms": 2000})
+            },
+        });
+    }
+    let mut messages = vec![Message::assistant(assistant_blocks)];
+    for index in 0..action_count {
+        let call_id = native_computer_action_call_id(&provider_call_id, index);
+        if index + 1 == action_count {
+            messages.push(Message::tool_result_with_images(
+                call_id,
+                "captured",
+                false,
+                vec![ImageBlockRef {
+                    artifact: artifact.clone(),
+                    media_type: "image/png".into(),
+                    width: 1_600,
+                    height: 900,
+                    byte_len: 8,
+                }],
+            ));
+        } else {
+            messages.push(Message::tool_result(call_id, "ok", false));
+        }
+    }
+    TurnRequest {
+        messages,
+        model: model.into(),
+        max_tokens: 256,
+        system_prompt: None,
+        tools: vec![computer_tool_definition()],
+        attachments: vec![crate::ResolvedAttachment {
+            artifact,
+            data_base64: "iVBORw0=".into(),
+        }],
+        cache_metadata: None,
+    }
+}
+
+#[test]
+fn native_computer_results_group_under_provider_call_and_preserve_contract() {
+    let preview_call = serde_json::json!({
+        "type": "computer_call",
+        "call_id": "preview_group",
+        "action": {"type": "click", "button": "left", "x": 10, "y": 20},
+        "pending_safety_checks": [{"id": "safe_1", "code": "policy"}],
+        "status": "completed",
+    });
+    let preview = responses_request_json(
+        &native_computer_followup("computer-use-preview", preview_call.clone()),
+        false,
+        None,
+        false,
+    )
+    .expect("preview follow-up");
+    assert_eq!(preview["tools"][0]["display_width"], 1_600);
+    assert_eq!(preview["tools"][0]["display_height"], 900);
+    assert_eq!(preview["input"][0], preview_call);
+    assert_eq!(preview["input"].as_array().expect("input").len(), 2);
+    assert_eq!(preview["input"][1]["type"], "computer_call_output");
+    assert_eq!(preview["input"][1]["call_id"], "preview_group");
+    assert_eq!(
+        preview["input"][1]["acknowledged_safety_checks"],
+        serde_json::json!([{"id": "safe_1", "code": "policy"}])
+    );
+    assert_eq!(
+        preview["input"][1]["output"],
+        serde_json::json!({
+            "type": "computer_screenshot",
+            "image_url": "data:image/png;base64,iVBORw0=",
+        })
+    );
+
+    let ga_call = serde_json::json!({
+        "type": "computer_call",
+        "call_id": "ga_group",
+        "actions": [{"type": "wait"}],
+        "status": "completed",
+    });
+    let ga = responses_request_json(
+        &native_computer_followup("gpt-5.4", ga_call.clone()),
+        false,
+        None,
+        false,
+    )
+    .expect("GA follow-up");
+    assert_eq!(ga["tools"], serde_json::json!([{"type": "computer"}]));
+    assert_eq!(ga["input"][0], ga_call);
+    assert_eq!(ga["input"].as_array().expect("input").len(), 2);
+    assert_eq!(
+        ga["input"][1],
+        serde_json::json!({
+            "type": "computer_call_output",
+            "call_id": "ga_group",
+            "output": {
+                "type": "computer_screenshot",
+                "image_url": "data:image/png;base64,iVBORw0=",
+                "detail": "original",
+            }
+        })
+    );
+
+    let expanded_call = serde_json::json!({
+        "type": "computer_call",
+        "call_id": "expanded_group",
+        "actions": [
+            {"type": "click", "button": "right", "x": 10, "y": 20},
+            {"type": "scroll", "x": 10, "y": 20, "scroll_x": -200, "scroll_y": 200}
+        ],
+        "status": "completed",
+    });
+    let expanded = responses_request_json(
+        &native_computer_followup("gpt-5.6", expanded_call.clone()),
+        false,
+        None,
+        false,
+    )
+    .expect("expanded GA follow-up");
+    assert_eq!(expanded["input"][0], expanded_call);
+    assert_eq!(expanded["input"].as_array().expect("input").len(), 2);
+    assert_eq!(expanded["input"][1]["call_id"], "expanded_group");
+    assert_eq!(
+        expanded["input"][1]["output"]["type"],
+        "computer_screenshot"
+    );
+}
+
+#[test]
+fn native_computer_result_shaping_does_not_hide_denied_or_failed_actions() {
+    for status in ["denied", "rejected", "cancelled", "failed"] {
+        let call = serde_json::json!({
+            "type": "computer_call",
+            "call_id": format!("blocked_{status}"),
+            "actions": [{"type": "click", "button": "left", "x": 10, "y": 20}],
+            "status": "completed",
+        });
+        let mut request = native_computer_followup("gpt-5.4", call);
+        let first_result = request
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.blocks)
+            .find_map(|block| match block {
+                Block::ToolResult { preview, .. } => Some(preview),
+                _ => None,
+            })
+            .expect("synthetic action result");
+        *first_result = serde_json::json!({
+            "status": status,
+            "error": {"kind": "test_failure"},
+        })
+        .to_string();
+
+        let error = responses_request_json(&request, false, None, false)
+            .expect_err("an incomplete native action must not become computer_call_output");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(error.message.contains("did not complete"), "{error:?}");
+        assert!(error.message.contains(status), "{error:?}");
+    }
+
+    let call = serde_json::json!({
+        "type": "computer_call",
+        "call_id": "missing_intermediate",
+        "action": {"type": "click", "button": "left", "x": 10, "y": 20},
+        "pending_safety_checks": [{"id": "must_not_ack"}],
+        "status": "completed",
+    });
+    let mut request = native_computer_followup("computer-use-preview", call);
+    let missing_call_id = native_computer_action_call_id("missing_intermediate", 0);
+    request.messages.retain(|message| {
+        !message.blocks.iter().any(
+            |block| matches!(block, Block::ToolResult { call_id, .. } if call_id == &missing_call_id),
+        )
+    });
+    let error = responses_request_json(&request, false, None, false)
+        .expect_err("the final screenshot cannot cover a missing action result");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("missing result 1 of 2"), "{error:?}");
 }
 
 #[test]

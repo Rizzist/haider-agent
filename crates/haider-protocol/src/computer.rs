@@ -25,16 +25,20 @@ pub enum ScrollDirection {
     Right,
 }
 
-/// Anthropic-compatible action vocabulary exposed by the `computer` tool.
+/// Provider-neutral action vocabulary exposed by Haider's `computer` tool.
 ///
-/// The tagged shape deliberately keeps the action name at the top level so a
-/// later native provider adapter can map it without translating a nested
+/// The tagged shape deliberately keeps the action name at the top level so
+/// native provider adapters can translate it without adding a second nested
 /// command envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ComputerAction {
     Screenshot,
     CursorPosition,
+    Inspect {
+        x: u32,
+        y: u32,
+    },
     LeftClick {
         x: u32,
         y: u32,
@@ -74,7 +78,9 @@ impl ComputerAction {
     #[must_use]
     pub const fn effect_class(&self) -> crate::effect::EffectClass {
         match self {
-            Self::Screenshot | Self::CursorPosition => crate::effect::EffectClass::ScreenObserve,
+            Self::Screenshot | Self::CursorPosition | Self::Inspect { .. } => {
+                crate::effect::EffectClass::ScreenObserve
+            }
             // `wait` is conservatively control-gated: it is part of an
             // interactive computer-action sequence, but grants no observer a
             // new way to keep a control sequence alive.

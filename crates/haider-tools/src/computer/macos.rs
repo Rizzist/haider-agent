@@ -5,11 +5,14 @@
 //! `CGDisplayBounds`, so Retina backing scale and CU-1 downscaling are both
 //! accounted for without a hard-coded scale factor.
 
-use super::{ComputerBackend, ComputerCancelToken, ComputerError, ComputerOutput, ComputerResult};
+use super::{
+    ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
+    ComputerInspectionBounds, ComputerOutput, ComputerResult,
+};
 use async_trait::async_trait;
 use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 use image::{DynamicImage, ImageFormat, RgbaImage};
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 use std::io::Cursor;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,6 +46,11 @@ const CG_FLAG_OPTION: u64 = 0x0008_0000;
 const CG_FLAG_COMMAND: u64 = 0x0010_0000;
 const CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 const CG_BITMAP_BYTE_ORDER_32_BIG: u32 = 4 << 12;
+const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+const AX_ERROR_SUCCESS: i32 = 0;
+const AX_ERROR_ATTRIBUTE_UNSUPPORTED: i32 = -25_205;
+const AX_ERROR_NO_VALUE: i32 = -25_212;
+const AX_VALUE_CGRECT: u32 = 3;
 
 static NEXT_INPUT_OWNER: AtomicU64 = AtomicU64::new(1);
 static INPUT_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -50,6 +58,9 @@ static HELD_LEFT_OWNER: Mutex<Option<u64>> = Mutex::new(None);
 
 type CFTypeRef = *const c_void;
 type CFDictionaryRef = *const c_void;
+type CFStringRef = *const c_void;
+type AXUIElementRef = *const c_void;
+type AXValueRef = *const c_void;
 type CGImageRef = *mut c_void;
 type CGColorSpaceRef = *mut c_void;
 type CGContextRef = *mut c_void;
@@ -134,6 +145,20 @@ unsafe extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    fn AXUIElementCopyElementAtPosition(
+        application: AXUIElementRef,
+        x: f32,
+        y: f32,
+        element: *mut AXUIElementRef,
+    ) -> i32;
+    fn AXUIElementCopyAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: *mut CFTypeRef,
+    ) -> i32;
+    fn AXValueGetTypeID() -> usize;
+    fn AXValueGetValue(value: AXValueRef, value_type: u32, value_ptr: *mut c_void) -> u8;
     static kAXTrustedCheckOptionPrompt: CFTypeRef;
 }
 
@@ -149,6 +174,22 @@ unsafe extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> CFDictionaryRef;
+    fn CFGetTypeID(value: CFTypeRef) -> usize;
+    fn CFCopyDescription(value: CFTypeRef) -> CFStringRef;
+    fn CFStringCreateWithCString(
+        allocator: *const c_void,
+        c_string: *const c_char,
+        encoding: u32,
+    ) -> CFStringRef;
+    fn CFStringGetTypeID() -> usize;
+    fn CFStringGetLength(string: CFStringRef) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+    fn CFStringGetCString(
+        string: CFStringRef,
+        buffer: *mut c_char,
+        buffer_size: isize,
+        encoding: u32,
+    ) -> u8;
     fn CFRelease(value: CFTypeRef);
 }
 
@@ -436,6 +477,75 @@ impl MacOsComputerBackend {
             / bounds.size.height)
             .floor() as u32;
         Ok((x, y))
+    }
+
+    fn inspect(
+        &self,
+        x: u32,
+        y: u32,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<ComputerOutput> {
+        cancel.check()?;
+        self.preflight_accessibility()?;
+        let viewport = self.viewport()?;
+        let point = map_delivered_pixel(viewport, ScreenPoint { x, y })?;
+
+        // SAFETY: create returns a retained process-wide accessibility object.
+        let system_wide = unsafe { AXUIElementCreateSystemWide() };
+        if system_wide.is_null() {
+            return Err(ComputerError::Backend {
+                message: "macOS could not create the system-wide accessibility element".into(),
+            });
+        }
+        let mut element: AXUIElementRef = ptr::null();
+        // SAFETY: `system_wide` is live, the point is finite and mapped from a
+        // validated screenshot pixel, and `element` is a writable out pointer.
+        let ax_error = unsafe {
+            AXUIElementCopyElementAtPosition(
+                system_wide,
+                point.x as f32,
+                point.y as f32,
+                &mut element,
+            )
+        };
+        // SAFETY: balance the create rule for the system-wide object.
+        unsafe { CFRelease(system_wide) };
+        if ax_error != AX_ERROR_SUCCESS {
+            return Err(if ax_error == AX_ERROR_NO_VALUE {
+                ComputerError::InvalidAction {
+                    message: format!(
+                        "no accessibility element exists at screenshot pixel ({x}, {y})"
+                    ),
+                }
+            } else {
+                ComputerError::Backend {
+                    message: format!(
+                        "macOS accessibility hit-test failed at screenshot pixel ({x}, {y}) (AXError {ax_error})"
+                    ),
+                }
+            });
+        }
+        if element.is_null() {
+            return Err(ComputerError::Backend {
+                message: "macOS accessibility hit-test returned no element".into(),
+            });
+        }
+
+        let inspection = (|| {
+            cancel.check()?;
+            Ok(ComputerInspection {
+                role: copy_ax_text_attribute(element, c"AXRole")?,
+                label: copy_ax_text_attribute(element, c"AXDescription")?,
+                title: copy_ax_text_attribute(element, c"AXTitle")?,
+                bounds: copy_ax_bounds(element)?
+                    .and_then(|bounds| map_accessibility_bounds(viewport, bounds)),
+                value: copy_ax_text_attribute(element, c"AXValue")?,
+            })
+        })();
+        // SAFETY: the successful copy-at-position call returned this retained
+        // accessibility element exactly once.
+        unsafe { CFRelease(element) };
+        inspection.map(ComputerOutput::Inspection)
     }
 
     fn post_mouse(
@@ -818,7 +928,9 @@ impl MacOsComputerBackend {
                 cancel,
             )?,
             ComputerAction::Wait { .. } => unreachable!("wait is dispatched asynchronously"),
-            ComputerAction::Screenshot | ComputerAction::CursorPosition => {
+            ComputerAction::Screenshot
+            | ComputerAction::CursorPosition
+            | ComputerAction::Inspect { .. } => {
                 unreachable!("observe actions do not enter control")
             }
         }
@@ -862,6 +974,196 @@ fn map_delivered_pixel(viewport: Viewport, point: ScreenPoint) -> ComputerResult
     })
 }
 
+fn copy_ax_attribute(
+    element: AXUIElementRef,
+    attribute: &CStr,
+) -> ComputerResult<Option<CFTypeRef>> {
+    // SAFETY: the C string is NUL-terminated for the full call and the
+    // returned Core Foundation string is retained and released below.
+    let attribute_name = unsafe {
+        CFStringCreateWithCString(ptr::null(), attribute.as_ptr(), CF_STRING_ENCODING_UTF8)
+    };
+    if attribute_name.is_null() {
+        return Err(ComputerError::Backend {
+            message: "macOS could not construct an accessibility attribute name".into(),
+        });
+    }
+    let mut value: CFTypeRef = ptr::null();
+    // SAFETY: both element and attribute-name objects are live and `value` is
+    // a writable out pointer. A successful Copy transfers one retain to us.
+    let ax_error = unsafe { AXUIElementCopyAttributeValue(element, attribute_name, &mut value) };
+    // SAFETY: balance the Create rule for the attribute-name string.
+    unsafe { CFRelease(attribute_name) };
+    match ax_error {
+        AX_ERROR_SUCCESS if value.is_null() => Err(ComputerError::Backend {
+            message: format!(
+                "macOS accessibility attribute `{}` returned a null value",
+                attribute.to_string_lossy()
+            ),
+        }),
+        AX_ERROR_SUCCESS => Ok(Some(value)),
+        AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NO_VALUE => Ok(None),
+        error => Err(ComputerError::Backend {
+            message: format!(
+                "macOS could not read accessibility attribute `{}` (AXError {error})",
+                attribute.to_string_lossy()
+            ),
+        }),
+    }
+}
+
+fn copy_ax_text_attribute(
+    element: AXUIElementRef,
+    attribute: &CStr,
+) -> ComputerResult<Option<String>> {
+    let Some(value) = copy_ax_attribute(element, attribute)? else {
+        return Ok(None);
+    };
+    let text = (|| {
+        // SAFETY: `value` is a live CF object copied above; type-id APIs do not
+        // alter ownership.
+        let is_string = unsafe { CFGetTypeID(value) == CFStringGetTypeID() };
+        if is_string {
+            cf_string_to_string(value)
+        } else {
+            // Non-string AXValue payloads (for example numeric slider values)
+            // still receive a stable textual representation.
+            // SAFETY: `value` is live; Copy returns a retained CFString.
+            let description = unsafe { CFCopyDescription(value) };
+            if description.is_null() {
+                return Err(ComputerError::Backend {
+                    message: format!(
+                        "macOS could not describe accessibility attribute `{}`",
+                        attribute.to_string_lossy()
+                    ),
+                });
+            }
+            let text = cf_string_to_string(description);
+            // SAFETY: balance the Copy rule for the description string.
+            unsafe { CFRelease(description) };
+            text
+        }
+    })();
+    // SAFETY: balance the successful attribute Copy exactly once.
+    unsafe { CFRelease(value) };
+    text.map(Some)
+}
+
+fn cf_string_to_string(string: CFStringRef) -> ComputerResult<String> {
+    // SAFETY: `string` is a live CFString for these read-only calls.
+    let length = unsafe { CFStringGetLength(string) };
+    let max_bytes = unsafe { CFStringGetMaximumSizeForEncoding(length, CF_STRING_ENCODING_UTF8) };
+    let capacity = max_bytes
+        .checked_add(1)
+        .and_then(|length| usize::try_from(length).ok())
+        .ok_or_else(|| ComputerError::Backend {
+            message: "macOS accessibility string is too large to encode".into(),
+        })?;
+    let mut buffer = vec![0_u8; capacity];
+    let buffer_size = isize::try_from(capacity).map_err(|_| ComputerError::Backend {
+        message: "macOS accessibility string buffer exceeds the CFIndex range".into(),
+    })?;
+    // SAFETY: `buffer` is writable for `buffer_size` bytes and CFString writes
+    // a terminating NUL when conversion succeeds.
+    let converted = unsafe {
+        CFStringGetCString(
+            string,
+            buffer.as_mut_ptr().cast(),
+            buffer_size,
+            CF_STRING_ENCODING_UTF8,
+        ) != 0
+    };
+    if !converted {
+        return Err(ComputerError::Backend {
+            message: "macOS could not encode an accessibility string as UTF-8".into(),
+        });
+    }
+    // SAFETY: successful CFStringGetCString guarantees the terminating NUL.
+    Ok(unsafe { CStr::from_ptr(buffer.as_ptr().cast()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn copy_ax_bounds(element: AXUIElementRef) -> ComputerResult<Option<CGRect>> {
+    let Some(value) = copy_ax_attribute(element, c"AXFrame")? else {
+        return Ok(None);
+    };
+    let bounds = (|| {
+        // SAFETY: `value` is live and these type-id calls do not alter it.
+        if unsafe { CFGetTypeID(value) != AXValueGetTypeID() } {
+            return Err(ComputerError::Backend {
+                message: "macOS AXFrame attribute was not an AXValue".into(),
+            });
+        }
+        let mut bounds = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        // SAFETY: `bounds` has the exact CoreGraphics CGRect ABI requested by
+        // AXValue and remains writable for the synchronous call.
+        if unsafe { AXValueGetValue(value, AX_VALUE_CGRECT, (&mut bounds as *mut CGRect).cast()) }
+            == 0
+        {
+            return Err(ComputerError::Backend {
+                message: "macOS AXFrame attribute did not contain a CGRect".into(),
+            });
+        }
+        Ok(bounds)
+    })();
+    // SAFETY: balance the successful AXFrame attribute Copy exactly once.
+    unsafe { CFRelease(value) };
+    bounds.map(Some)
+}
+
+fn map_accessibility_bounds(
+    viewport: Viewport,
+    bounds: CGRect,
+) -> Option<ComputerInspectionBounds> {
+    let display = viewport.display_bounds;
+    if ![
+        bounds.origin.x,
+        bounds.origin.y,
+        bounds.size.width,
+        bounds.size.height,
+        display.size.width,
+        display.size.height,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+        || bounds.size.width < 0.0
+        || bounds.size.height < 0.0
+        || display.size.width <= 0.0
+        || display.size.height <= 0.0
+    {
+        return None;
+    }
+    let scale_x = f64::from(viewport.image_width) / display.size.width;
+    let scale_y = f64::from(viewport.image_height) / display.size.height;
+    let left = ((bounds.origin.x - display.origin.x) * scale_x)
+        .floor()
+        .clamp(0.0, f64::from(viewport.image_width));
+    let top = ((bounds.origin.y - display.origin.y) * scale_y)
+        .floor()
+        .clamp(0.0, f64::from(viewport.image_height));
+    let right = ((bounds.origin.x + bounds.size.width - display.origin.x) * scale_x)
+        .ceil()
+        .clamp(left, f64::from(viewport.image_width));
+    let bottom = ((bounds.origin.y + bounds.size.height - display.origin.y) * scale_y)
+        .ceil()
+        .clamp(top, f64::from(viewport.image_height));
+    let x = left as u32;
+    let y = top as u32;
+    Some(ComputerInspectionBounds {
+        x,
+        y,
+        width: (right as u32).saturating_sub(x),
+        height: (bottom as u32).saturating_sub(y),
+    })
+}
+
 #[async_trait]
 impl ComputerBackend for MacOsComputerBackend {
     async fn execute(
@@ -879,6 +1181,7 @@ impl ComputerBackend for MacOsComputerBackend {
                 let (x, y) = self.model_cursor_position()?;
                 Ok(ComputerOutput::CursorPosition { x, y })
             }
+            ComputerAction::Inspect { x, y } => self.inspect(*x, *y, cancel),
             ComputerAction::Wait { ms } => {
                 self.preflight_accessibility()?;
                 self.viewport()?;
@@ -935,6 +1238,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
     match action {
         ComputerAction::Screenshot => "screenshot",
         ComputerAction::CursorPosition => "cursor_position",
+        ComputerAction::Inspect { .. } => "inspect",
         ComputerAction::LeftClick { .. } => "left_click",
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",
@@ -1037,6 +1341,62 @@ mod tests {
         assert_eq!(point.x, 820.0);
         assert_eq!(point.y, 500.0);
         assert!(map_delivered_pixel(viewport, ScreenPoint { x: 2_048, y: 0 }).is_err());
+    }
+
+    #[test]
+    fn accessibility_bounds_map_back_to_the_delivered_cu1_viewport() {
+        let viewport = Viewport {
+            display_bounds: CGRect {
+                origin: CGPoint { x: 100.0, y: 50.0 },
+                size: CGSize {
+                    width: 1_440.0,
+                    height: 900.0,
+                },
+            },
+            image_width: 2_048,
+            image_height: 1_280,
+        };
+        assert_eq!(
+            map_accessibility_bounds(
+                viewport,
+                CGRect {
+                    origin: CGPoint { x: 820.0, y: 500.0 },
+                    size: CGSize {
+                        width: 144.0,
+                        height: 90.0,
+                    },
+                },
+            ),
+            Some(ComputerInspectionBounds {
+                x: 1_024,
+                y: 640,
+                width: 205,
+                height: 128,
+            })
+        );
+
+        assert_eq!(
+            map_accessibility_bounds(
+                viewport,
+                CGRect {
+                    origin: CGPoint {
+                        x: 1_480.0,
+                        y: 100.0,
+                    },
+                    size: CGSize {
+                        width: 100.0,
+                        height: 20.0,
+                    },
+                },
+            ),
+            Some(ComputerInspectionBounds {
+                x: 1_962,
+                y: 71,
+                width: 86,
+                height: 29,
+            }),
+            "horizontal AX bounds clamp against admitted width, not height"
+        );
     }
 
     #[test]

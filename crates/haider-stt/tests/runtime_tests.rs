@@ -5,6 +5,8 @@
 mod common;
 
 use std::ffi::OsString;
+// Only the macOS well-known-paths test constructs PathBuf values.
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
 use common::{build_stored_zip, write_stub_script};

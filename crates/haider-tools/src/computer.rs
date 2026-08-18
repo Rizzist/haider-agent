@@ -51,6 +51,10 @@ pub enum ComputerError {
     InvalidAction {
         message: String,
     },
+    InspectUnsupported {
+        platform: String,
+        message: String,
+    },
     Cancelled,
     Backend {
         message: String,
@@ -63,6 +67,7 @@ impl std::fmt::Display for ComputerError {
             Self::Unavailable { message, .. }
             | Self::PermissionRequired { message, .. }
             | Self::InvalidAction { message }
+            | Self::InspectUnsupported { message, .. }
             | Self::Backend { message } => formatter.write_str(message),
             Self::Cancelled => formatter.write_str("computer action was cancelled"),
         }
@@ -103,11 +108,32 @@ impl ComputerCancelToken {
     }
 }
 
-/// Native result before the daemon performs CU-1 image admission.
+/// Accessibility bounds in the model-visible screenshot coordinate space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerInspectionBounds {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Platform-neutral accessibility element returned by `inspect`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerInspection {
+    pub role: Option<String>,
+    pub label: Option<String>,
+    pub title: Option<String>,
+    pub bounds: Option<ComputerInspectionBounds>,
+    pub value: Option<String>,
+}
+
+/// Native result before the daemon performs CU-1 image admission or renders a
+/// structured accessibility inspection as tool-result text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputerOutput {
     ScreenshotPng(Vec<u8>),
     CursorPosition { x: u32, y: u32 },
+    Inspection(ComputerInspection),
     Confirmed { action: String },
 }
 
@@ -232,7 +258,7 @@ fn validate_argument_keys(arguments: &Value) -> ToolResult<()> {
     let allowed: &[&str] = match action {
         "screenshot" | "cursor_position" | "right_click" | "middle_click" | "double_click"
         | "left_mouse_down" | "left_mouse_up" => &["action"],
-        "left_click" | "mouse_move" => &["action", "x", "y"],
+        "inspect" | "left_click" | "mouse_move" => &["action", "x", "y"],
         "left_click_drag" => &["action", "from", "to"],
         "type" => &["action", "text"],
         "key" => &["action", "keys"],
@@ -292,6 +318,9 @@ impl EffectOperation for ComputerOperation {
             ComputerAction::LeftClick { x, y } | ComputerAction::MouseMove { x, y } => {
                 format!("Target screenshot pixel ({x}, {y})")
             }
+            ComputerAction::Inspect { x, y } => {
+                format!("Inspect accessibility element at screenshot pixel ({x}, {y})")
+            }
             ComputerAction::LeftClickDrag { from, to } => format!(
                 "Drag from screenshot pixel ({}, {}) to ({}, {})",
                 from.x, from.y, to.x, to.y
@@ -332,6 +361,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
     match action {
         ComputerAction::Screenshot => "screenshot",
         ComputerAction::CursorPosition => "cursor_position",
+        ComputerAction::Inspect { .. } => "inspect",
         ComputerAction::LeftClick { .. } => "left_click",
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",
@@ -374,7 +404,7 @@ pub fn computer_manifest() -> ToolManifest {
                 "action": {
                     "type": "string",
                     "enum": [
-                        "screenshot", "cursor_position", "left_click", "right_click",
+                        "screenshot", "cursor_position", "inspect", "left_click", "right_click",
                         "middle_click", "double_click", "left_mouse_down",
                         "left_mouse_up", "mouse_move", "left_click_drag", "type",
                         "key", "scroll", "wait"

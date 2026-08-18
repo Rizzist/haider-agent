@@ -1058,6 +1058,7 @@ fn golden_computer_actions() {
         &vec![
             ComputerAction::Screenshot,
             ComputerAction::CursorPosition,
+            ComputerAction::Inspect { x: 400, y: 225 },
             ComputerAction::LeftClick { x: 120, y: 240 },
             ComputerAction::RightClick,
             ComputerAction::MiddleClick,

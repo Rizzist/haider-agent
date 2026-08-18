@@ -6,6 +6,11 @@
     "action": "cursor_position"
   },
   {
+    "action": "inspect",
+    "x": 400,
+    "y": 225
+  },
+  {
     "action": "left_click",
     "x": 120,
     "y": 240

@@ -165,11 +165,9 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
         return Err(error);
     }
 
-    if let Err(error) = resume_suspended_process(pid) {
-        // KILL_ON_JOB_CLOSE makes this a fail-closed spawn: no command byte ran
-        // and closing the only job handle terminates the suspended process.
-        return Err(error);
-    }
+    // KILL_ON_JOB_CLOSE makes this a fail-closed spawn: no command byte ran
+    // and closing the only job handle terminates the suspended process.
+    resume_suspended_process(pid)?;
 
     let token = NEXT_WINDOWS_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let group = ProcessGroup { pid, token };

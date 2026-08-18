@@ -1,6 +1,6 @@
 //! Anthropic Messages wire types and the incremental SSE state machine.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
@@ -50,6 +50,8 @@ pub(crate) fn request_json(
     cache_ttl: Option<crate::AnthropicCacheTtl>,
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
+    let native_computer = crate::anthropic::anthropic_computer_tool_version(&request.model)
+        .filter(|_| request.tools.iter().any(|tool| tool.name == "computer"));
     let mut messages = request
         .messages
         .iter()
@@ -58,7 +60,12 @@ pub(crate) fn request_json(
                 MessageRole::User | MessageRole::Tool => "user",
                 MessageRole::Assistant => "assistant",
             };
-            let content = message_content(message.role, &message.blocks, &attachments)?;
+            let content = message_content(
+                message.role,
+                &message.blocks,
+                &attachments,
+                native_computer.is_some(),
+            )?;
             Ok(serde_json::json!({
                 "role": role,
                 "content": content,
@@ -69,6 +76,18 @@ pub(crate) fn request_json(
         .tools
         .iter()
         .map(|tool| {
+            if tool.name == "computer"
+                && let Some(version) = native_computer
+            {
+                let (width, height) = anthropic_computer_display_size(request);
+                return serde_json::json!({
+                    "type": version.tool_type(),
+                    "name": "computer",
+                    "display_width_px": width,
+                    "display_height_px": height,
+                    "display_number": 1,
+                });
+            }
             serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
@@ -238,6 +257,286 @@ fn anthropic_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
     schema
 }
 
+/// Anthropic requires one display coordinate space in the native tool
+/// declaration. Once CU-1 has admitted a computer screenshot, its exact
+/// post-downscale dimensions are authoritative. Before the first screenshot,
+/// use Anthropic's documented XGA baseline; the first native action is
+/// coordinate-free `screenshot`, and the following request then advertises
+/// the admitted dimensions.
+fn anthropic_computer_display_size(request: &TurnRequest) -> (u32, u32) {
+    const INITIAL_WIDTH: u32 = 1_024;
+    const INITIAL_HEIGHT: u32 = 768;
+
+    let computer_calls = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolCall { call_id, name, .. } if name == "computer" => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    request
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|message| message.blocks.iter().rev())
+        .find_map(|block| match block {
+            Block::ToolResult {
+                call_id, images, ..
+            } if computer_calls.contains(call_id.as_str()) => {
+                images.last().map(|image| (image.width, image.height))
+            }
+            _ => None,
+        })
+        .unwrap_or((INITIAL_WIDTH, INITIAL_HEIGHT))
+}
+
+/// Converts one normalized Haider computer action back to the model-trained
+/// Anthropic input vocabulary for assistant-message replay.
+pub(crate) fn anthropic_computer_input_from_neutral(
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, ProviderError> {
+    translate_computer_input(input, ComputerInputDirection::ToAnthropic).map_err(|message| {
+        invalid_request(format!("invalid normalized computer action: {message}"))
+    })
+}
+
+/// Converts a completed Anthropic native computer `tool_use.input` object to
+/// the exact platform-neutral JSON accepted by `ComputerAction` dispatch.
+pub(crate) fn anthropic_computer_input_to_neutral(
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, ProviderError> {
+    translate_computer_input(input, ComputerInputDirection::ToNeutral)
+        .map_err(|message| malformed(format!("invalid Anthropic computer action: {message}")))
+}
+
+#[derive(Clone, Copy)]
+enum ComputerInputDirection {
+    ToAnthropic,
+    ToNeutral,
+}
+
+fn translate_computer_input(
+    input: &serde_json::Value,
+    direction: ComputerInputDirection,
+) -> Result<serde_json::Value, String> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| "input must be an object".to_owned())?;
+    let action = required_string(object, "action")?;
+    match direction {
+        ComputerInputDirection::ToNeutral => match action {
+            "screenshot" | "cursor_position" | "left_mouse_down" | "left_mouse_up" => {
+                ensure_only_fields(object, &["action"])?;
+                Ok(serde_json::json!({"action": action}))
+            }
+            "right_click" | "middle_click" | "double_click" => {
+                // Anthropic permits both an optional coordinate and a held-key
+                // modifier on these actions. The neutral variants operate at
+                // the current cursor and cannot express either field
+                // atomically, so never pretend that dropping them is safe.
+                ensure_only_fields(object, &["action"])?;
+                Ok(serde_json::json!({"action": action}))
+            }
+            "left_click" => {
+                // The native schema also permits a `key` modifier. A modified
+                // click has no single ComputerAction equivalent.
+                ensure_only_fields(object, &["action", "coordinate"])?;
+                let [x, y] = required_coordinate(object, "coordinate")?;
+                Ok(serde_json::json!({"action": action, "x": x, "y": y}))
+            }
+            "mouse_move" => {
+                ensure_only_fields(object, &["action", "coordinate"])?;
+                let [x, y] = required_coordinate(object, "coordinate")?;
+                Ok(serde_json::json!({"action": action, "x": x, "y": y}))
+            }
+            "left_click_drag" => {
+                ensure_only_fields(object, &["action", "start_coordinate", "coordinate"])?;
+                let [from_x, from_y] = required_coordinate(object, "start_coordinate")?;
+                let [to_x, to_y] = required_coordinate(object, "coordinate")?;
+                Ok(serde_json::json!({
+                    "action": "left_click_drag",
+                    "from": {"x": from_x, "y": from_y},
+                    "to": {"x": to_x, "y": to_y},
+                }))
+            }
+            "type" => {
+                ensure_only_fields(object, &["action", "text"])?;
+                Ok(serde_json::json!({
+                    "action": "type",
+                    "text": required_string(object, "text")?,
+                }))
+            }
+            "key" => {
+                ensure_only_fields(object, &["action", "text"])?;
+                Ok(serde_json::json!({
+                    "action": "key",
+                    "keys": required_string(object, "text")?,
+                }))
+            }
+            "scroll" => {
+                // A native scroll may carry a held-key modifier. There is no
+                // neutral atomic equivalent, so an extra modifier field must
+                // fail instead of being silently discarded.
+                ensure_only_fields(
+                    object,
+                    &["action", "coordinate", "scroll_direction", "scroll_amount"],
+                )?;
+                let [x, y] = required_coordinate(object, "coordinate")?;
+                Ok(serde_json::json!({
+                    "action": "scroll",
+                    "x": x,
+                    "y": y,
+                    "direction": required_string(object, "scroll_direction")?,
+                    "amount": required_u32(object, "scroll_amount")?,
+                }))
+            }
+            "wait" => {
+                ensure_only_fields(object, &["action", "duration"])?;
+                let duration = required_number(object, "duration")?;
+                let milliseconds = duration * 1_000.0;
+                if !milliseconds.is_finite() || milliseconds < 0.0 || milliseconds > u64::MAX as f64
+                {
+                    return Err("`duration` is outside the supported millisecond range".into());
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ms = milliseconds.round() as u64;
+                Ok(serde_json::json!({"action": "wait", "ms": ms}))
+            }
+            unsupported => Err(format!(
+                "action `{unsupported}` has no platform-neutral ComputerAction equivalent"
+            )),
+        },
+        ComputerInputDirection::ToAnthropic => match action {
+            "screenshot" | "cursor_position" | "right_click" | "middle_click" | "double_click"
+            | "left_mouse_down" | "left_mouse_up" => Ok(serde_json::json!({"action": action})),
+            "left_click" | "mouse_move" => Ok(serde_json::json!({
+                "action": action,
+                "coordinate": [required_u32(object, "x")?, required_u32(object, "y")?],
+            })),
+            "left_click_drag" => {
+                let from = required_object(object, "from")?;
+                let to = required_object(object, "to")?;
+                Ok(serde_json::json!({
+                    "action": "left_click_drag",
+                    "start_coordinate": [required_u32(from, "x")?, required_u32(from, "y")?],
+                    "coordinate": [required_u32(to, "x")?, required_u32(to, "y")?],
+                }))
+            }
+            "type" => Ok(serde_json::json!({
+                "action": "type",
+                "text": required_string(object, "text")?,
+            })),
+            "key" => Ok(serde_json::json!({
+                "action": "key",
+                "text": required_string(object, "keys")?,
+            })),
+            "scroll" => Ok(serde_json::json!({
+                "action": "scroll",
+                "coordinate": [required_u32(object, "x")?, required_u32(object, "y")?],
+                "scroll_direction": required_string(object, "direction")?,
+                "scroll_amount": required_u32(object, "amount")?,
+            })),
+            "wait" => {
+                let milliseconds = required_u64(object, "ms")?;
+                Ok(serde_json::json!({
+                    "action": "wait",
+                    "duration": milliseconds as f64 / 1_000.0,
+                }))
+            }
+            unsupported => Err(format!(
+                "action `{unsupported}` has no Anthropic native computer equivalent"
+            )),
+        },
+    }
+}
+
+fn required_object<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("`{field}` must be an object"))
+}
+
+fn ensure_only_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "`{field}` cannot be represented by the platform-neutral ComputerAction"
+        ));
+    }
+    Ok(())
+}
+
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("`{field}` must be a string"))
+}
+
+fn required_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("`{field}` must be a non-negative integer"))
+}
+
+fn required_u32(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u32, String> {
+    let value = required_u64(object, field)?;
+    u32::try_from(value).map_err(|_| format!("`{field}` exceeds the u32 coordinate range"))
+}
+
+fn required_number(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<f64, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("`{field}` must be a number"))
+}
+
+fn required_coordinate(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<[u32; 2], String> {
+    let coordinate = object
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("`{field}` must be a two-integer array"))?;
+    if coordinate.len() != 2 {
+        return Err(format!("`{field}` must contain exactly two integers"));
+    }
+    let x = coordinate[0]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| format!("`{field}[0]` must be a u32 integer"))?;
+    let y = coordinate[1]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| format!("`{field}[1]` must be a u32 integer"))?;
+    Ok([x, y])
+}
+
 fn attachment_index(request: &TurnRequest) -> Result<HashMap<&str, &str>, ProviderError> {
     let mut attachments = HashMap::new();
     for attachment in &request.attachments {
@@ -266,6 +565,7 @@ fn message_content(
     role: MessageRole,
     blocks: &[Block],
     attachments: &HashMap<&str, &str>,
+    native_computer: bool,
 ) -> Result<Vec<serde_json::Value>, ProviderError> {
     let mut content = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -278,7 +578,7 @@ fn message_content(
             content.push(data.clone());
             continue;
         }
-        content.push(content_block(role, block, attachments)?);
+        content.push(content_block(role, block, attachments, native_computer)?);
     }
     Ok(content)
 }
@@ -329,6 +629,7 @@ fn content_block(
     role: MessageRole,
     block: &Block,
     attachments: &HashMap<&str, &str>,
+    native_computer: bool,
 ) -> Result<serde_json::Value, ProviderError> {
     match block {
         Block::Text { text } => Ok(serde_json::json!({"type": "text", "text": text})),
@@ -339,12 +640,19 @@ fn content_block(
             call_id,
             name,
             args,
-        } if role == MessageRole::Assistant => Ok(serde_json::json!({
-            "type": "tool_use",
-            "id": call_id,
-            "name": name,
-            "input": args,
-        })),
+        } if role == MessageRole::Assistant => {
+            let input = if native_computer && name == "computer" {
+                anthropic_computer_input_from_neutral(args)?
+            } else {
+                args.clone()
+            };
+            Ok(serde_json::json!({
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": input,
+            }))
+        }
         Block::ToolCall { .. } => Err(invalid_request(
             "Anthropic tool_use blocks are only valid in assistant messages",
         )),
@@ -476,12 +784,19 @@ pub(crate) struct SseDecoder {
 
 impl SseDecoder {
     pub(crate) fn new(account: Option<CredentialAlias>) -> Self {
+        Self::with_native_computer(account, false)
+    }
+
+    pub(crate) fn with_native_computer(
+        account: Option<CredentialAlias>,
+        native_computer: bool,
+    ) -> Self {
         Self {
             utf8: Utf8Assembler::default(),
             line_buffer: String::new(),
             event_name: None,
             data_lines: Vec::new(),
-            state: StreamState::new(account),
+            state: StreamState::new(account, native_computer),
             terminal: false,
         }
     }
@@ -637,6 +952,7 @@ fn known_event_name(name: &str) -> bool {
 #[derive(Debug)]
 struct StreamState {
     account: Option<CredentialAlias>,
+    native_computer: bool,
     started: bool,
     open_blocks: BTreeMap<usize, OpenBlock>,
     seen_blocks: BTreeSet<usize>,
@@ -646,9 +962,10 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(account: Option<CredentialAlias>) -> Self {
+    fn new(account: Option<CredentialAlias>, native_computer: bool) -> Self {
         Self {
             account,
+            native_computer,
             started: false,
             open_blocks: BTreeMap::new(),
             seen_blocks: BTreeSet::new(),
@@ -705,6 +1022,8 @@ impl StreamState {
                         (
                             OpenBlock::Tool {
                                 call_id: id.clone(),
+                                native_computer: self.native_computer && name == "computer",
+                                input_json: String::new(),
                             },
                             Some(StreamEvent::ToolCallStart { call_id: id, name }),
                         )
@@ -794,12 +1113,28 @@ impl StreamState {
                         citations.push(citation);
                         Ok(Vec::new())
                     }
-                    (OpenBlock::Tool { call_id }, WireDelta::InputJson { partial_json }) => {
-                        Ok(vec![StreamEvent::ToolCallArgsDelta {
-                            call_id: call_id.clone(),
-                            args_fragment: partial_json,
-                        }])
+                    (
+                        OpenBlock::Tool {
+                            input_json,
+                            native_computer: true,
+                            ..
+                        },
+                        WireDelta::InputJson { partial_json },
+                    ) => {
+                        input_json.push_str(&partial_json);
+                        Ok(Vec::new())
                     }
+                    (
+                        OpenBlock::Tool {
+                            call_id,
+                            native_computer: false,
+                            ..
+                        },
+                        WireDelta::InputJson { partial_json },
+                    ) => Ok(vec![StreamEvent::ToolCallArgsDelta {
+                        call_id: call_id.clone(),
+                        args_fragment: partial_json,
+                    }]),
                     // W-B: a server tool call streams its input exactly like
                     // a client tool call, but into the replay accumulator.
                     (
@@ -837,8 +1172,34 @@ impl StreamState {
                 self.require_started("content_block_stop")?;
                 self.require_before_message_delta("content_block_stop")?;
                 match self.open_blocks.remove(&index) {
-                    Some(OpenBlock::Tool { call_id }) => {
-                        Ok(vec![StreamEvent::ToolCallEnd { call_id }])
+                    Some(OpenBlock::Tool {
+                        call_id,
+                        native_computer: false,
+                        ..
+                    }) => Ok(vec![StreamEvent::ToolCallEnd { call_id }]),
+                    Some(OpenBlock::Tool {
+                        call_id,
+                        native_computer: true,
+                        input_json,
+                    }) => {
+                        let input = serde_json::from_str(&input_json).map_err(|error| {
+                            malformed(format!(
+                                "Anthropic computer tool input is not valid JSON: {error}"
+                            ))
+                        })?;
+                        let neutral = anthropic_computer_input_to_neutral(&input)?;
+                        let args_fragment = serde_json::to_string(&neutral).map_err(|error| {
+                            malformed(format!(
+                                "normalized Anthropic computer input could not serialize: {error}"
+                            ))
+                        })?;
+                        Ok(vec![
+                            StreamEvent::ToolCallArgsDelta {
+                                call_id: call_id.clone(),
+                                args_fragment,
+                            },
+                            StreamEvent::ToolCallEnd { call_id },
+                        ])
                     }
                     // W-B (LW2): the finished server tool call is captured
                     // VERBATIM — id, name, streamed input, and every unknown
@@ -1160,6 +1521,8 @@ enum OpenBlock {
     },
     Tool {
         call_id: String,
+        native_computer: bool,
+        input_json: String,
     },
     /// A provider-executed tool call accumulating its streamed input plus
     /// every unknown sibling field for verbatim replay (W-B).

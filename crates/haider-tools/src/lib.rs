@@ -27,8 +27,9 @@ pub use broker::{
     PermissionPolicy, PolicyDecision, SessionGrant, SessionGrantScope,
 };
 pub use computer::{
-    ComputerBackend, ComputerCancelToken, ComputerError, ComputerOperation, ComputerOutput,
-    ComputerResult, UnavailableComputerBackend, computer_manifest, platform_computer_backend,
+    ComputerBackend, ComputerCancelToken, ComputerError, ComputerInspection,
+    ComputerInspectionBounds, ComputerOperation, ComputerOutput, ComputerResult,
+    UnavailableComputerBackend, computer_manifest, platform_computer_backend,
 };
 pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};
 pub use filesystem::{

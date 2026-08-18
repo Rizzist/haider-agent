@@ -7584,6 +7584,27 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 presentation: None,
                             })
                         }
+                        Ok(ComputerOutput::Inspection(inspection)) => {
+                            broker
+                                .journal_computer_outcome(&intent, EffectOutcome::Ok)
+                                .await?;
+                            Ok(BoundedResult {
+                                preview: serde_json::to_string(&inspection).map_err(|error| {
+                                    ToolError::Runtime {
+                                        message: format!(
+                                            "could not encode computer accessibility inspection: {error}"
+                                        ),
+                                    }
+                                })?,
+                                truncated: false,
+                                artifact: None,
+                                images: Vec::new(),
+                                cursor: None,
+                                status: ToolResultStatus::Completed,
+                                reason: None,
+                                presentation: None,
+                            })
+                        }
                         Ok(ComputerOutput::Confirmed { action }) => {
                             broker
                                 .journal_computer_outcome(&intent, EffectOutcome::Ok)
@@ -8006,9 +8027,9 @@ fn computer_failure_result(error: &ComputerError) -> BoundedResult {
             "computer action was cancelled".into(),
             None,
         ),
-        ComputerError::Unavailable { message, .. } | ComputerError::Backend { message } => {
-            (ToolResultStatus::Failed, message.clone(), None)
-        }
+        ComputerError::Unavailable { message, .. }
+        | ComputerError::InspectUnsupported { message, .. }
+        | ComputerError::Backend { message } => (ToolResultStatus::Failed, message.clone(), None),
     };
     let error_json = serde_json::to_value(error).unwrap_or_else(|_| {
         serde_json::json!({

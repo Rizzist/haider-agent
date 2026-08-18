@@ -115,15 +115,17 @@ pub(crate) fn rendered_prefix_digests(
 }
 
 pub use anthropic::{
-    ANTHROPIC_API_URL, ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL,
-    ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME,
-    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, ANTHROPIC_PROVIDER_NAME, AnthropicCacheTtl, AnthropicCapture,
+    ANTHROPIC_API_URL, ANTHROPIC_COMPUTER_BETA_20250124, ANTHROPIC_COMPUTER_BETA_20251124,
+    ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
+    ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_OAUTH_SYSTEM_IDENTITY,
+    ANTHROPIC_PROVIDER_NAME, AnthropicCacheTtl, AnthropicCapture, AnthropicComputerToolVersion,
     AnthropicProvider, AnthropicRetryPolicy, AnthropicTransportConfig,
     BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME, BEDROCK_SEED_MODELS,
     VERTEX_ANTHROPIC_VERSION, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS,
-    anthropic_http_client_build_count, bedrock_mantle_base_url, replay_anthropic_http_error,
-    replay_anthropic_sse, select_anthropic_cache_ttl, validate_bedrock_mantle_base_url,
-    validate_vertex_models_base_url, vertex_models_base_url,
+    anthropic_computer_tool_version, anthropic_http_client_build_count, bedrock_mantle_base_url,
+    replay_anthropic_http_error, replay_anthropic_native_computer_sse, replay_anthropic_sse,
+    select_anthropic_cache_ttl, validate_bedrock_mantle_base_url, validate_vertex_models_base_url,
+    vertex_models_base_url,
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
@@ -152,7 +154,7 @@ pub use openai::{
     codex_alpha_search_response_text, codex_alpha_search_url, openai_http_client_build_count,
     replay_deepseek_chat_sse, replay_deepseek_models_response, replay_kimi_chat_sse,
     replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
-    replay_openai_models_response, replay_openai_responses_sse,
+    replay_openai_models_response, replay_openai_native_computer_sse, replay_openai_responses_sse,
     validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};

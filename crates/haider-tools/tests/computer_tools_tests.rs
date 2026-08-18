@@ -102,12 +102,28 @@ fn computer_manifest_matches_additive_golden_and_parameter_schemas_are_live() {
 
 #[test]
 fn action_parser_is_strict_and_wait_is_control_gated() {
+    let inspect = ComputerOperation::from_tool_args(serde_json::json!({
+        "action": "inspect",
+        "x": 30,
+        "y": 40
+    }))
+    .expect("inspect parses");
+    assert_eq!(inspect.action().effect_class(), EffectClass::ScreenObserve);
     let wait = ComputerOperation::from_tool_args(serde_json::json!({
         "action": "wait",
         "ms": 250
     }))
     .expect("wait parses");
     assert_eq!(wait.action().effect_class(), EffectClass::ScreenControl);
+    assert!(matches!(
+        ComputerOperation::from_tool_args(serde_json::json!({
+            "action": "inspect",
+            "x": 30,
+            "y": 40,
+            "future": true
+        })),
+        Err(ToolError::InvalidArgument { .. })
+    ));
     assert!(matches!(
         ComputerOperation::from_tool_args(serde_json::json!({
             "action": "screenshot",

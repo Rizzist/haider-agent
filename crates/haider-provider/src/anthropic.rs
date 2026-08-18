@@ -71,6 +71,11 @@ pub const ANTHROPIC_OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
 /// whenever the body carries `speed: "fast"` (G3). On OAuth requests it is
 /// comma-joined AFTER the subscription beta.
 pub const ANTHROPIC_FAST_BETA_VALUE: &str = "fast-mode-2026-02-01";
+/// Beta tokens paired with Anthropic's two model-trained computer-use tool
+/// schemas. These are request features, so they compose on the ONE
+/// `anthropic-beta` header with OAuth subscription identity and fast mode.
+pub const ANTHROPIC_COMPUTER_BETA_20251124: &str = "computer-use-2025-11-24";
+pub const ANTHROPIC_COMPUTER_BETA_20250124: &str = "computer-use-2025-01-24";
 const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
@@ -85,6 +90,63 @@ static SHARED_ANTHROPIC_CLIENT: OnceLock<Result<reqwest::Client, String>> = Once
 static SHARED_ANTHROPIC_OAUTH_CLIENT: OnceLock<Result<SharedAnthropicFixedTransport, String>> =
     OnceLock::new();
 static ANTHROPIC_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Anthropic's model-keyed native computer tool dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicComputerToolVersion {
+    V20251124,
+    V20250124,
+}
+
+impl AnthropicComputerToolVersion {
+    #[must_use]
+    pub const fn tool_type(self) -> &'static str {
+        match self {
+            Self::V20251124 => "computer_20251124",
+            Self::V20250124 => "computer_20250124",
+        }
+    }
+
+    #[must_use]
+    pub const fn beta(self) -> &'static str {
+        match self {
+            Self::V20251124 => ANTHROPIC_COMPUTER_BETA_20251124,
+            Self::V20250124 => ANTHROPIC_COMPUTER_BETA_20250124,
+        }
+    }
+}
+
+/// Resolves only Anthropic's documented computer-use-capable model slugs.
+/// Enterprise prefixes and dated release suffixes share the same row; an
+/// unknown or future slug deliberately remains on Haider's generic function
+/// tool until its native contract is documented.
+#[must_use]
+pub fn anthropic_computer_tool_version(model: &str) -> Option<AnthropicComputerToolVersion> {
+    match crate::effort::base_model(model) {
+        "claude-opus-5" | "claude-sonnet-5" | "claude-opus-4-8" | "claude-opus-4-7"
+        | "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-opus-4-5" => {
+            Some(AnthropicComputerToolVersion::V20251124)
+        }
+        "claude-sonnet-4-5" | "claude-haiku-4-5" | "claude-opus-4-1" | "claude-sonnet-4"
+        | "claude-opus-4" => Some(AnthropicComputerToolVersion::V20250124),
+        _ => None,
+    }
+}
+
+fn anthropic_computer_beta_from_payload(payload: &serde_json::Value) -> Option<&'static str> {
+    payload
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(
+            |tool| match tool.get("type").and_then(serde_json::Value::as_str) {
+                Some("computer_20251124") => Some(ANTHROPIC_COMPUTER_BETA_20251124),
+                Some("computer_20250124") => Some(ANTHROPIC_COMPUTER_BETA_20250124),
+                _ => None,
+            },
+        )
+}
 
 #[derive(Clone)]
 struct SharedAnthropicFixedTransport {
@@ -644,32 +706,45 @@ impl AnthropicProvider {
         if self.endpoint_shape == AnthropicEndpointShape::Standard {
             request = request.header("anthropic-version", ANTHROPIC_VERSION);
         }
+        let computer_beta = anthropic_computer_beta_from_payload(payload);
         request = match self.auth_mode {
             AnthropicAuthMode::ApiKey => {
                 let request = request.header("x-api-key", self.api_key_header()?);
+                let mut betas = Vec::new();
                 if self.fast {
-                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_FAST_BETA_VALUE)
-                } else {
+                    betas.push(ANTHROPIC_FAST_BETA_VALUE);
+                }
+                betas.extend(computer_beta);
+                if betas.is_empty() {
                     request
+                } else {
+                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
                 }
             }
             AnthropicAuthMode::OAuthBearer => {
-                // Fast mode APPENDS its beta to the OAuth beta in ONE
-                // comma-joined header value — the server reads the header as
-                // a token list and the subscription beta must survive.
-                let beta = if self.fast {
-                    format!("{ANTHROPIC_OAUTH_BETA_VALUE},{ANTHROPIC_FAST_BETA_VALUE}")
-                } else {
-                    ANTHROPIC_OAUTH_BETA_VALUE.to_owned()
-                };
+                // Optional feature betas APPEND after the OAuth identity in
+                // ONE comma-joined header — the subscription token must
+                // survive every composition.
+                let mut betas = vec![ANTHROPIC_OAUTH_BETA_VALUE];
+                if self.fast {
+                    betas.push(ANTHROPIC_FAST_BETA_VALUE);
+                }
+                betas.extend(computer_beta);
                 request
                     .header(AUTHORIZATION, self.authorization_header()?)
-                    .header(ANTHROPIC_OAUTH_BETA_HEADER, beta)
+                    .header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
             }
-            // G4b Vertex: a bare GCP Bearer token — no beta header ever
-            // (fast is Claude-API-only and the factory never sets it here).
+            // G4b Vertex: a bare GCP Bearer token. Vertex keeps feature beta
+            // headers (the official Anthropic Vertex client does the same),
+            // while only `anthropic-version` moves into the request body.
+            // Fast remains Claude-API-only and the factory never sets it here.
             AnthropicAuthMode::CloudBearer => {
-                request.header(AUTHORIZATION, self.authorization_header()?)
+                let request = request.header(AUTHORIZATION, self.authorization_header()?);
+                if let Some(computer_beta) = computer_beta {
+                    request.header(ANTHROPIC_OAUTH_BETA_HEADER, computer_beta)
+                } else {
+                    request
+                }
             }
         };
         request.json(payload).build().map_err(transport_error)
@@ -752,6 +827,8 @@ impl Provider for AnthropicProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        let native_computer = anthropic_computer_tool_version(&request.model).is_some()
+            && request.tools.iter().any(|tool| tool.name == "computer");
         let response = self.send_request(&request).await?;
 
         if !response.status().is_success() {
@@ -778,7 +855,14 @@ impl Provider for AnthropicProvider {
         let account = self.account.clone();
         let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
         let producer = tokio::spawn(async move {
-            stream_response(response, account, sender, chunk_idle_timeout).await;
+            stream_response(
+                response,
+                account,
+                sender,
+                chunk_idle_timeout,
+                native_computer,
+            )
+            .await;
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
@@ -828,8 +912,13 @@ async fn stream_response(
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
+    native_computer: bool,
 ) {
-    stream_sse_source(response, account, sender, chunk_idle_timeout).await;
+    if native_computer {
+        stream_sse_source_with_native(response, account, sender, chunk_idle_timeout, true).await;
+    } else {
+        stream_sse_source(response, account, sender, chunk_idle_timeout).await;
+    }
 }
 
 pub(crate) trait SseChunkSource {
@@ -847,12 +936,22 @@ impl SseChunkSource for reqwest::Response {
 }
 
 pub(crate) async fn stream_sse_source<S: SseChunkSource>(
-    mut source: S,
+    source: S,
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
 ) {
-    let mut decoder = SseDecoder::new(account);
+    stream_sse_source_with_native(source, account, sender, chunk_idle_timeout, false).await;
+}
+
+async fn stream_sse_source_with_native<S: SseChunkSource>(
+    mut source: S,
+    account: Option<CredentialAlias>,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    chunk_idle_timeout: Duration,
+    native_computer: bool,
+) {
+    let mut decoder = SseDecoder::with_native_computer(account, native_computer);
     loop {
         let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
@@ -1018,6 +1117,23 @@ pub fn vertex_models_base_url(project: &str, location: &str) -> Result<String, P
 #[must_use]
 pub fn replay_anthropic_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
     let mut decoder = SseDecoder::new(None);
+    let mut items = Vec::new();
+    for chunk in bytes.chunks(7) {
+        items.extend(decoder.push(chunk));
+        if decoder.is_terminal() {
+            return items;
+        }
+    }
+    items.extend(decoder.finish());
+    items
+}
+
+/// Replays captured native-computer SSE through the live translation seam.
+/// This is fixture/test support; ordinary replay remains byte-identical and
+/// generic unless the request actually advertised Anthropic's native tool.
+#[must_use]
+pub fn replay_anthropic_native_computer_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    let mut decoder = SseDecoder::with_native_computer(None, true);
     let mut items = Vec::new();
     for chunk in bytes.chunks(7) {
         items.extend(decoder.push(chunk));

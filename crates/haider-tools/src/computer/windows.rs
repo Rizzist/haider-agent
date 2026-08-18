@@ -747,7 +747,9 @@ impl WindowsComputerBackend {
                 cancel,
             )?,
             ComputerAction::Wait { .. } => unreachable!("wait is dispatched asynchronously"),
-            ComputerAction::Screenshot | ComputerAction::CursorPosition => {
+            ComputerAction::Screenshot
+            | ComputerAction::CursorPosition
+            | ComputerAction::Inspect { .. } => {
                 unreachable!("observe actions do not enter control")
             }
         }
@@ -774,6 +776,10 @@ impl ComputerBackend for WindowsComputerBackend {
                 let (x, y) = self.model_cursor_position()?;
                 Ok(ComputerOutput::CursorPosition { x, y })
             }
+            ComputerAction::Inspect { .. } => Err(ComputerError::InspectUnsupported {
+                platform: "windows".into(),
+                message: "accessibility inspection is not supported on Windows yet".into(),
+            }),
             ComputerAction::Wait { ms } => {
                 self.viewport()?;
                 tokio::select! {
@@ -1078,6 +1084,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
     match action {
         ComputerAction::Screenshot => "screenshot",
         ComputerAction::CursorPosition => "cursor_position",
+        ComputerAction::Inspect { .. } => "inspect",
         ComputerAction::LeftClick { .. } => "left_click",
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",

@@ -6,7 +6,7 @@
 //! Chat Completions, the common wire implemented by vLLM, Ollama, LM Studio,
 //! LiteLLM, TGI, Hugging Face endpoints, and generic gateways.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
+use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
@@ -60,6 +61,22 @@ pub const OPENAI_ALPHA_SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex
 const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
 const KIMI_OAUTH_HOST: &str = "api.kimi.com";
 const DEEPSEEK_HOST: &str = "api.deepseek.com";
+
+// The preview tool requires an explicit display coordinate space before the
+// first screenshot exists. Use one bounded 16:9 CU-1 bootstrap viewport, then
+// advertise the exact dimensions of the newest admitted computer screenshot
+// on every follow-up request. GA `computer` deliberately has no display
+// fields: its coordinate space is established by the returned
+// `computer_screenshot` with `detail: original`.
+const OPENAI_COMPUTER_BOOTSTRAP_WIDTH: u32 = haider_protocol::tool::TOOL_RESULT_IMAGE_MAX_DIMENSION;
+const OPENAI_COMPUTER_BOOTSTRAP_HEIGHT: u32 = 1_152;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiComputerToolKind {
+    Generic,
+    Preview,
+    Ga,
+}
 
 const STREAM_CAPACITY: usize = 32;
 const MODELS_BODY_LIMIT: usize = 1024 * 1024;
@@ -676,8 +693,15 @@ impl Provider for OpenAiProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        let computer_kind =
+            openai_computer_tool_kind(&request.model, self.http.codex_responses_lite);
         let response = self.send_request(&request).await?;
-        checked_stream(response, self.http.account.clone(), DecoderKind::Responses).await
+        checked_stream(
+            response,
+            self.http.account.clone(),
+            DecoderKind::Responses(computer_kind),
+        )
+        .await
     }
 }
 
@@ -1314,7 +1338,7 @@ fn body_too_large(context: &str, limit: usize) -> ProviderError {
 
 #[derive(Debug, Clone, Copy)]
 enum DecoderKind {
-    Responses,
+    Responses(OpenAiComputerToolKind),
     Chat(CompatibleDialect),
 }
 
@@ -1350,7 +1374,9 @@ async fn stream_sse_source<S: SseChunkSource>(
     kind: DecoderKind,
 ) {
     let mut decoder = match kind {
-        DecoderKind::Responses => OpenAiDecoder::Responses(ResponsesDecoder::new(account)),
+        DecoderKind::Responses(computer_kind) => {
+            OpenAiDecoder::Responses(ResponsesDecoder::new(account, computer_kind))
+        }
         DecoderKind::Chat(dialect) => OpenAiDecoder::Chat(ChatDecoder::new(account, dialect)),
     };
     loop {
@@ -1507,6 +1533,7 @@ impl SseFramer {
 struct ResponsesDecoder {
     framer: SseFramer,
     account: Option<CredentialAlias>,
+    computer_kind: OpenAiComputerToolKind,
     open_calls: BTreeMap<usize, ResponseFunctionCall>,
     call_items: HashMap<String, usize>,
     pending_tool_events: Vec<StreamEvent>,
@@ -1522,10 +1549,11 @@ struct ResponseFunctionCall {
 }
 
 impl ResponsesDecoder {
-    fn new(account: Option<CredentialAlias>) -> Self {
+    fn new(account: Option<CredentialAlias>, computer_kind: OpenAiComputerToolKind) -> Self {
         Self {
             framer: SseFramer::default(),
             account,
+            computer_kind,
             open_calls: BTreeMap::new(),
             call_items: HashMap::new(),
             pending_tool_events: Vec::new(),
@@ -1752,6 +1780,13 @@ impl ResponsesDecoder {
                 }
                 return Ok(vec![StreamEvent::WebSources { sources }]);
             }
+            Some("computer_call") => {
+                if self.computer_kind == OpenAiComputerToolKind::Generic {
+                    return Ok(Vec::new());
+                }
+                self.saw_tool = true;
+                return native_computer_call_events(item);
+            }
             Some("function_call") => {}
             _ => return Ok(Vec::new()),
         }
@@ -1846,6 +1881,311 @@ impl ResponsesDecoder {
         self.terminal = true;
         vec![Err(error)]
     }
+}
+
+fn native_computer_call_events(
+    item: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<StreamEvent>, ProviderError> {
+    let call_id = object_string(item, "call_id", "OpenAI computer_call item")?;
+    let native_actions = if let Some(actions) = item.get("actions") {
+        actions
+            .as_array()
+            .ok_or_else(|| malformed("OpenAI computer_call actions must be an array"))?
+            .iter()
+            .collect::<Vec<_>>()
+    } else {
+        vec![
+            item.get("action")
+                .ok_or_else(|| malformed("OpenAI computer_call has no action or actions"))?,
+        ]
+    };
+    if native_actions.is_empty() {
+        return Err(malformed("OpenAI computer_call actions must not be empty"));
+    }
+    let mut actions = Vec::new();
+    for action in native_actions {
+        actions.extend(openai_computer_actions(action)?);
+    }
+    // Both native contracts require the updated screen as their one call
+    // output. The neutral runtime executes singular actions, so make that
+    // screenshot an explicit final ScreenObserve operation unless the model
+    // already requested it last.
+    if !matches!(actions.last(), Some(ComputerAction::Screenshot)) {
+        actions.push(ComputerAction::Screenshot);
+    }
+
+    let mut events = vec![StreamEvent::ProviderOpaque {
+        provider: OPENAI_PROVIDER_NAME.into(),
+        data: serde_json::Value::Object(item.clone()),
+    }];
+    for (index, action) in actions.into_iter().enumerate() {
+        let action_call_id = native_computer_action_call_id(&call_id, index);
+        let arguments = serde_json::to_string(&action).map_err(|error| {
+            malformed(format!(
+                "OpenAI computer action could not be normalized: {error}"
+            ))
+        })?;
+        events.push(StreamEvent::ToolCallStart {
+            call_id: action_call_id.clone(),
+            name: "computer".into(),
+        });
+        events.push(StreamEvent::ToolCallArgsDelta {
+            call_id: action_call_id.clone(),
+            args_fragment: arguments,
+        });
+        events.push(StreamEvent::ToolCallEnd {
+            call_id: action_call_id,
+        });
+    }
+    Ok(events)
+}
+
+fn native_computer_action_call_id(call_id: &str, index: usize) -> String {
+    format!("{call_id}::haider-computer::{index}")
+}
+
+fn openai_computer_actions(
+    action: &serde_json::Value,
+) -> Result<Vec<ComputerAction>, ProviderError> {
+    let object = action
+        .as_object()
+        .ok_or_else(|| malformed("OpenAI computer action must be an object"))?;
+    let action_type = object_string(object, "type", "OpenAI computer action")?;
+    let coordinate = || -> Result<(u32, u32), ProviderError> {
+        Ok((
+            openai_action_u32(object, "x", &action_type)?,
+            openai_action_u32(object, "y", &action_type)?,
+        ))
+    };
+    match action_type.as_str() {
+        "screenshot" => Ok(vec![ComputerAction::Screenshot]),
+        "click" => {
+            reject_openai_action_modifiers(object, &action_type)?;
+            let (x, y) = coordinate()?;
+            match object
+                .get("button")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("left")
+            {
+                "left" => Ok(vec![ComputerAction::LeftClick { x, y }]),
+                "right" => Ok(vec![
+                    ComputerAction::MouseMove { x, y },
+                    ComputerAction::RightClick,
+                ]),
+                "wheel" | "middle" => Ok(vec![
+                    ComputerAction::MouseMove { x, y },
+                    ComputerAction::MiddleClick,
+                ]),
+                button => Err(malformed(format!(
+                    "OpenAI computer click uses unsupported button `{button}`"
+                ))),
+            }
+        }
+        "double_click" => {
+            reject_openai_action_modifiers(object, &action_type)?;
+            if object
+                .get("button")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|button| button != "left")
+            {
+                return Err(malformed(
+                    "OpenAI computer double_click supports only the left button in the neutral computer vocabulary",
+                ));
+            }
+            let (x, y) = coordinate()?;
+            Ok(vec![
+                ComputerAction::MouseMove { x, y },
+                ComputerAction::DoubleClick,
+            ])
+        }
+        "move" | "mouse_move" => {
+            let (x, y) = coordinate()?;
+            Ok(vec![ComputerAction::MouseMove { x, y }])
+        }
+        "drag" => {
+            reject_openai_action_modifiers(object, &action_type)?;
+            let path = object
+                .get("path")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| malformed("OpenAI computer drag requires a path array"))?;
+            if path.len() < 2 {
+                return Err(malformed(
+                    "OpenAI computer drag path requires at least two points",
+                ));
+            }
+            let from = openai_action_point(&path[0], "drag path start")?;
+            if path.len() == 2 {
+                let to = openai_action_point(&path[1], "drag path end")?;
+                return Ok(vec![ComputerAction::LeftClickDrag { from, to }]);
+            }
+            let mut actions = Vec::with_capacity(path.len().saturating_add(2));
+            actions.push(ComputerAction::MouseMove {
+                x: from.x,
+                y: from.y,
+            });
+            actions.push(ComputerAction::LeftMouseDown);
+            for (index, point) in path.iter().enumerate().skip(1) {
+                let point = openai_action_point(point, &format!("drag path point {index}"))?;
+                actions.push(ComputerAction::MouseMove {
+                    x: point.x,
+                    y: point.y,
+                });
+            }
+            actions.push(ComputerAction::LeftMouseUp);
+            Ok(actions)
+        }
+        "type" => Ok(vec![ComputerAction::Type {
+            text: object_string(object, "text", "OpenAI computer type action")?,
+        }]),
+        "keypress" | "key" => {
+            let keys = object
+                .get("keys")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| malformed("OpenAI computer keypress requires a keys array"))?;
+            let keys = keys
+                .iter()
+                .map(|key| {
+                    key.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| malformed("OpenAI computer keypress keys must be strings"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if keys.is_empty() {
+                return Err(malformed(
+                    "OpenAI computer keypress requires at least one key",
+                ));
+            }
+            Ok(vec![ComputerAction::Key {
+                keys: keys.join("+"),
+            }])
+        }
+        "scroll" => openai_scroll_actions(object),
+        "wait" => Ok(vec![ComputerAction::Wait { ms: 2_000 }]),
+        other => Err(malformed(format!(
+            "OpenAI computer action `{other}` is unsupported by the neutral computer vocabulary"
+        ))),
+    }
+}
+
+fn openai_scroll_actions(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<ComputerAction>, ProviderError> {
+    reject_openai_action_modifiers(object, "scroll")?;
+    let x = openai_action_u32(object, "x", "scroll")?;
+    let y = openai_action_u32(object, "y", "scroll")?;
+    let scroll_x = openai_action_i64(object, "scroll_x", "scroll")?;
+    let scroll_y = openai_action_i64(object, "scroll_y", "scroll")?;
+    let mut actions = Vec::new();
+    let mut append = |delta: i64, negative, positive| {
+        if delta == 0 {
+            return;
+        }
+        // OpenAI deltas are pixel-like. The native backends consume bounded
+        // line counts; the documented harness uses one wheel step per ~100
+        // delta units, rounded and never collapsed to zero.
+        let magnitude = delta.unsigned_abs().saturating_add(50) / 100;
+        actions.push(ComputerAction::Scroll {
+            x,
+            y,
+            direction: if delta < 0 { negative } else { positive },
+            amount: u32::try_from(magnitude.max(1)).unwrap_or(u32::MAX),
+        });
+    };
+    append(scroll_y, ScrollDirection::Up, ScrollDirection::Down);
+    append(scroll_x, ScrollDirection::Left, ScrollDirection::Right);
+    if actions.is_empty() {
+        return Err(malformed("OpenAI computer scroll has zero delta"));
+    }
+    Ok(actions)
+}
+
+fn reject_openai_action_modifiers(
+    object: &serde_json::Map<String, serde_json::Value>,
+    action_type: &str,
+) -> Result<(), ProviderError> {
+    let Some(keys) = object.get("keys") else {
+        return Ok(());
+    };
+    let keys = keys.as_array().ok_or_else(|| {
+        malformed(format!(
+            "OpenAI computer action `{action_type}` has a non-array `keys` modifier"
+        ))
+    })?;
+    if !keys.is_empty() {
+        return Err(malformed(format!(
+            "OpenAI computer action `{action_type}` uses modifiers that the neutral computer vocabulary cannot represent atomically"
+        )));
+    }
+    Ok(())
+}
+
+fn openai_action_point(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<ScreenPoint, ProviderError> {
+    if let Some(coordinate) = value.as_array() {
+        if coordinate.len() != 2 {
+            return Err(malformed(format!(
+                "OpenAI computer {context} coordinate array must contain exactly two integers"
+            )));
+        }
+        return Ok(ScreenPoint {
+            x: coordinate[0]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "OpenAI computer {context} x coordinate must be a non-negative integer"
+                    ))
+                })?,
+            y: coordinate[1]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "OpenAI computer {context} y coordinate must be a non-negative integer"
+                    ))
+                })?,
+        });
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| malformed(format!("OpenAI computer {context} must be an object")))?;
+    Ok(ScreenPoint {
+        x: openai_action_u32(object, "x", context)?,
+        y: openai_action_u32(object, "y", context)?,
+    })
+}
+
+fn openai_action_u32(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<u32, ProviderError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            malformed(format!(
+                "OpenAI computer {context} requires non-negative integer `{field}`"
+            ))
+        })
+}
+
+fn openai_action_i64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<i64, ProviderError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            malformed(format!(
+                "OpenAI computer {context} requires integer `{field}`"
+            ))
+        })
 }
 
 /// One finished hosted `web_search_call` item (W-B): captured VERBATIM for
@@ -2288,7 +2628,21 @@ impl ChatDecoder {
 /// Replays native Responses SSE bytes through the live incremental decoder.
 #[must_use]
 pub fn replay_openai_responses_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
-    let mut decoder = ResponsesDecoder::new(None);
+    replay_responses_sse(bytes, OpenAiComputerToolKind::Generic)
+}
+
+/// Replays native-computer Responses SSE bytes under the same model
+/// capability negotiation used by live OpenAI requests.
+#[must_use]
+pub fn replay_openai_native_computer_sse(bytes: &[u8], model: &str) -> Vec<ProviderStreamItem> {
+    replay_responses_sse(bytes, openai_computer_tool_kind(model, false))
+}
+
+fn replay_responses_sse(
+    bytes: &[u8],
+    computer_kind: OpenAiComputerToolKind,
+) -> Vec<ProviderStreamItem> {
+    let mut decoder = ResponsesDecoder::new(None, computer_kind);
     let mut items = Vec::new();
     for chunk in bytes.chunks(7) {
         items.extend(decoder.push(chunk));
@@ -2561,7 +2915,22 @@ fn responses_request_json(
     effort: Option<&str>,
     hosted_web_search: bool,
 ) -> Result<serde_json::Value, ProviderError> {
+    let computer_kind = openai_computer_tool_kind(&request.model, codex_responses_lite);
+    let computer_display = latest_computer_display_dimensions(request).unwrap_or((
+        OPENAI_COMPUTER_BOOTSTRAP_WIDTH,
+        OPENAI_COMPUTER_BOOTSTRAP_HEIGHT,
+    ));
     let attachments = attachment_index(request)?;
+    let native_computer_results = native_computer_result_index(request)?;
+    let computer_result_call_ids = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let mut input = Vec::new();
     for (message_index, message) in request.messages.iter().enumerate() {
         let mut content = Vec::new();
@@ -2591,6 +2960,15 @@ fn responses_request_json(
                         "normalized reasoning summaries cannot be replayed as OpenAI reasoning items",
                     ));
                 }
+                Block::ToolCall { call_id, .. }
+                    if message.role == MessageRole::Assistant
+                        && native_computer_results.contains_key(call_id) =>
+                {
+                    // The provider-native `computer_call` immediately before
+                    // this normalized block is the assistant replay item.
+                    // The normalized singular calls exist only for local
+                    // dispatch and must not be echoed as function calls.
+                }
                 Block::ToolCall {
                     call_id,
                     name,
@@ -2613,6 +2991,92 @@ fn responses_request_json(
                     return Err(invalid_request(
                         "OpenAI function_call items are only valid in assistant messages",
                     ));
+                }
+                Block::ToolResult {
+                    call_id,
+                    preview,
+                    images,
+                    ..
+                } if matches!(message.role, MessageRole::User | MessageRole::Tool)
+                    && native_computer_results.contains_key(call_id) =>
+                {
+                    flush_response_message(&mut input, message.role, &mut content);
+                    let target = native_computer_results.get(call_id).ok_or_else(|| {
+                        internal("OpenAI native computer result index changed during shaping")
+                    })?;
+                    if let Some(status) = failed_computer_result_status(preview) {
+                        // A GA computer_call may expand to several normalized
+                        // actions followed by the required screenshot. Never
+                        // hide an earlier denial/failure behind that final
+                        // image or acknowledge preview safety checks for an
+                        // action Haider did not complete.
+                        return Err(invalid_request(format!(
+                            "OpenAI native computer call `{}` did not complete: {status}",
+                            target.provider_call_id
+                        )));
+                    }
+                    if target.final_action {
+                        for index in 0..target.action_count {
+                            let expected =
+                                native_computer_action_call_id(&target.provider_call_id, index);
+                            if !computer_result_call_ids.contains(expected.as_str()) {
+                                return Err(invalid_request(format!(
+                                    "OpenAI native computer call `{}` is missing result {} of {}",
+                                    target.provider_call_id,
+                                    index + 1,
+                                    target.action_count,
+                                )));
+                            }
+                        }
+                        let image = images.last().ok_or_else(|| {
+                            invalid_request(format!(
+                                "OpenAI native computer call `{}` completed without its required updated screenshot",
+                                target.provider_call_id
+                            ))
+                        })?;
+                        if !crate::tool_image_media_type_supported(&image.media_type) {
+                            return Err(invalid_request(format!(
+                                "tool image {} has unsupported media type",
+                                image.artifact
+                            )));
+                        }
+                        let data = resolved_attachment(&attachments, image.artifact.as_str())?;
+                        let screenshot = match target.kind {
+                            OpenAiComputerToolKind::Ga => serde_json::json!({
+                                "type": "computer_screenshot",
+                                "image_url": format!("data:{};base64,{data}", image.media_type),
+                                "detail": "original",
+                            }),
+                            OpenAiComputerToolKind::Preview => serde_json::json!({
+                                "type": "computer_screenshot",
+                                "image_url": format!("data:{};base64,{data}", image.media_type),
+                            }),
+                            OpenAiComputerToolKind::Generic => {
+                                return Err(internal(
+                                    "generic computer result entered the native result shaper",
+                                ));
+                            }
+                        };
+                        let mut output = serde_json::json!({
+                            "type": "computer_call_output",
+                            "call_id": target.provider_call_id,
+                            "output": screenshot,
+                        });
+                        if target.kind == OpenAiComputerToolKind::Preview
+                            && !target.pending_safety_checks.is_empty()
+                        {
+                            output
+                                .as_object_mut()
+                                .ok_or_else(|| {
+                                    internal("OpenAI computer_call_output was not an object")
+                                })?
+                                .insert(
+                                    "acknowledged_safety_checks".into(),
+                                    serde_json::Value::Array(target.pending_safety_checks.clone()),
+                                );
+                        }
+                        input.push(output);
+                    }
                 }
                 Block::ToolResult {
                     call_id,
@@ -2727,6 +3191,22 @@ fn responses_request_json(
         .tools
         .iter()
         .map(|tool| {
+            if tool.name == "computer" {
+                match computer_kind {
+                    OpenAiComputerToolKind::Preview => {
+                        return serde_json::json!({
+                            "type": "computer_use_preview",
+                            "display_width": computer_display.0,
+                            "display_height": computer_display.1,
+                            "environment": openai_computer_environment(),
+                        });
+                    }
+                    OpenAiComputerToolKind::Ga => {
+                        return serde_json::json!({"type": "computer"});
+                    }
+                    OpenAiComputerToolKind::Generic => {}
+                }
+            }
             serde_json::json!({
                 "type": "function",
                 "name": tool.name,
@@ -2769,6 +3249,9 @@ fn responses_request_json(
             "max_output_tokens".into(),
             serde_json::json!(request.max_tokens),
         );
+    }
+    if computer_kind == OpenAiComputerToolKind::Preview {
+        object.insert("truncation".into(), serde_json::json!("auto"));
     }
     if let Some(instructions) = &request.system_prompt {
         object.insert(
@@ -2815,6 +3298,173 @@ fn responses_request_json(
         }
     }
     Ok(payload)
+}
+
+#[derive(Debug, Clone)]
+struct NativeComputerResultTarget {
+    kind: OpenAiComputerToolKind,
+    provider_call_id: String,
+    final_action: bool,
+    action_count: usize,
+    pending_safety_checks: Vec<serde_json::Value>,
+}
+
+fn native_computer_result_index(
+    request: &TurnRequest,
+) -> Result<HashMap<String, NativeComputerResultTarget>, ProviderError> {
+    let mut results = HashMap::new();
+    for item in request.messages.iter().flat_map(|message| &message.blocks) {
+        let Block::ProviderOpaque { provider, data } = item else {
+            continue;
+        };
+        if provider != OPENAI_PROVIDER_NAME
+            || data.get("type").and_then(serde_json::Value::as_str) != Some("computer_call")
+        {
+            continue;
+        }
+        let object = data
+            .as_object()
+            .ok_or_else(|| invalid_request("OpenAI computer_call replay item must be an object"))?;
+        let provider_call_id = object_string(object, "call_id", "OpenAI computer_call replay")?;
+        let (kind, native_actions) = if let Some(actions) = object.get("actions") {
+            (
+                OpenAiComputerToolKind::Ga,
+                actions
+                    .as_array()
+                    .ok_or_else(|| {
+                        invalid_request("OpenAI computer_call replay actions must be an array")
+                    })?
+                    .iter()
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                OpenAiComputerToolKind::Preview,
+                vec![object.get("action").ok_or_else(|| {
+                    invalid_request("OpenAI computer_call replay has no action or actions")
+                })?],
+            )
+        };
+        let mut actions = Vec::new();
+        for action in native_actions {
+            actions.extend(openai_computer_actions(action)?);
+        }
+        if !matches!(actions.last(), Some(ComputerAction::Screenshot)) {
+            actions.push(ComputerAction::Screenshot);
+        }
+        if actions.is_empty() {
+            return Err(invalid_request(
+                "OpenAI computer_call replay actions must not be empty",
+            ));
+        }
+        let pending_safety_checks = object
+            .get("pending_safety_checks")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let last = actions.len().saturating_sub(1);
+        for index in 0..actions.len() {
+            results.insert(
+                native_computer_action_call_id(&provider_call_id, index),
+                NativeComputerResultTarget {
+                    kind,
+                    provider_call_id: provider_call_id.clone(),
+                    final_action: index == last,
+                    action_count: actions.len(),
+                    pending_safety_checks: pending_safety_checks.clone(),
+                },
+            );
+        }
+    }
+    Ok(results)
+}
+
+fn openai_computer_tool_kind(model: &str, codex_responses_lite: bool) -> OpenAiComputerToolKind {
+    // The subscription endpoint's responses-lite contract rejects hosted
+    // tools. Keep its generic function declaration byte-for-byte unchanged
+    // even when the underlying model also exists on the public API.
+    if codex_responses_lite {
+        return OpenAiComputerToolKind::Generic;
+    }
+    if matches!(
+        model,
+        "computer-use-preview" | "computer-use-preview-2025-03-11"
+    ) {
+        return OpenAiComputerToolKind::Preview;
+    }
+    if openai_ga_computer_model(model) {
+        return OpenAiComputerToolKind::Ga;
+    }
+    OpenAiComputerToolKind::Generic
+}
+
+fn openai_computer_environment() -> &'static str {
+    // The preview contract uses this to tune its interaction policy. Haider's
+    // computer backend controls the host desktop, not an isolated browser.
+    #[cfg(target_os = "macos")]
+    {
+        "mac"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "windows"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "browser"
+    }
+}
+
+fn failed_computer_result_status(preview: &str) -> Option<&'static str> {
+    let value = serde_json::from_str::<serde_json::Value>(preview).ok()?;
+    let status = value.get("status")?.as_str()?;
+    match status {
+        "denied" => Some("denied"),
+        "rejected" => Some("rejected"),
+        "cancelled" => Some("cancelled"),
+        "failed" => Some("failed"),
+        _ => None,
+    }
+}
+
+fn openai_ga_computer_model(model: &str) -> bool {
+    // Hosted-tool negotiation must fail closed. A numerically newer or
+    // otherwise unknown model is not evidence that the Responses endpoint
+    // accepts the GA `computer` tool. Add newly documented model families to
+    // this table only after their native-tool contract is verified.
+    ["gpt-5.4", "gpt-5.5", "gpt-5.6"]
+        .iter()
+        .any(|base| model == *base || model.starts_with(&format!("{base}-")))
+}
+
+fn latest_computer_display_dimensions(request: &TurnRequest) -> Option<(u32, u32)> {
+    let computer_calls = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolCall { call_id, name, .. } if name == "computer" => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    request
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|message| message.blocks.iter().rev())
+        .find_map(|block| match block {
+            Block::ToolResult {
+                call_id, images, ..
+            } if computer_calls.contains(call_id.as_str()) => images
+                .last()
+                .map(|image| (image.width, image.height))
+                .filter(|(width, height)| *width > 0 && *height > 0),
+            _ => None,
+        })
 }
 
 fn openai_explicit_cache_enabled(request: &TurnRequest, codex_responses_lite: bool) -> bool {
