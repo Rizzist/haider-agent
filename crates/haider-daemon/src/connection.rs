@@ -32,6 +32,9 @@
 // Crate-internal by necessity: these tests exercise the private fair queue and
 // writer's reserved drain lane directly. The externally visible session laws
 // live in `tests/session_hub_tests.rs` and haider-daemond's UDS tests.
+#[cfg(test)]
+#[path = "connection_duplex_tests.rs"]
+mod connection_duplex_tests;
 #[cfg(all(test, unix))]
 #[path = "connection_tests.rs"]
 mod connection_tests;
@@ -40,7 +43,7 @@ use crate::DaemonError;
 use crate::session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub,
 };
-use haider_platform::{IpcStream, IpcWriteHalf};
+use haider_platform::IpcStream;
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_ACCOUNT_LOGIN_API_V1,
     FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1, FEATURE_BRANCH_CREATE_V1,
@@ -57,7 +60,7 @@ use haider_rpc::{
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
@@ -876,7 +879,7 @@ pub(crate) struct ConnectionContext {
 pub(crate) async fn serve(
     stream: IpcStream,
     context: ConnectionContext,
-    mut drain: watch::Receiver<Option<DrainNotice>>,
+    drain: watch::Receiver<Option<DrainNotice>>,
 ) -> Result<ConnectionExit, DaemonError> {
     let credentials = haider_platform::peer_credentials(&stream).map_err(|error| {
         DaemonError::io("read Unix peer credentials", &context.endpoint_path, error)
@@ -890,7 +893,25 @@ pub(crate) async fn serve(
         });
     }
 
-    let (mut reader, writer) = haider_platform::split(stream);
+    let (reader, writer) = haider_platform::split(stream);
+    serve_io(reader, writer, context, drain).await
+}
+
+/// Runs the framed connection after the transport-specific peer gate.
+///
+/// Production reaches this only through [`serve`]. Keeping the byte-stream
+/// loop generic gives every platform a no-bind `tokio::io::duplex` regression
+/// seam without bypassing the real endpoint's owner check.
+async fn serve_io<R, W>(
+    mut reader: R,
+    writer: W,
+    context: ConnectionContext,
+    mut drain: watch::Receiver<Option<DrainNotice>>,
+) -> Result<ConnectionExit, DaemonError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let lane = OutboundLane::new(
         context.outbound_queue_capacity,
         context.outbound_queued_bytes,
@@ -1075,11 +1096,14 @@ pub(crate) async fn serve(
 /// at its boundary the notice is written, then queued checkpoint traffic may
 /// follow under the same deadline. Returns whether `ServerDraining` reached
 /// the wire.
-async fn run_writer(
-    mut writer: IpcWriteHalf,
+async fn run_writer<W>(
+    mut writer: W,
     queued: OutboundLane,
     mut reserved: mpsc::Receiver<ReservedNotice>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut notice = Option::<ReservedNotice>::None;
     let mut reserve_open = true;
     let mut notice_written = false;
@@ -1178,13 +1202,16 @@ async fn run_writer(
 
 /// Writes one ordinary frame, adopting the drain deadline the moment the
 /// reserved notice appears.
-async fn write_ordinary(
-    writer: &mut IpcWriteHalf,
+async fn write_ordinary<W>(
+    writer: &mut W,
     bytes: &[u8],
     notice: &mut Option<ReservedNotice>,
     reserve_open: &mut bool,
     reserved: &mut mpsc::Receiver<ReservedNotice>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let write = writer.write_all(bytes);
     tokio::pin!(write);
     loop {

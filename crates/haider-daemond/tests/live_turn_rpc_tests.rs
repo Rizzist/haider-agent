@@ -3205,11 +3205,20 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
         other => panic!("expected cancellable shell receipt, got {other:?}"),
     };
     tokio::time::timeout(support::DEADLINE, async {
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(10));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if fs::metadata(&heartbeat).is_ok_and(|metadata| metadata.len() > 1) {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    client
+                        .send(&WireFrame::Ping { nonce: u64::MAX - 1 }, config.frame_limit)
+                        .await;
+                }
+                () = tokio::task::yield_now() => {}
+            }
         }
     })
     .await
@@ -6938,22 +6947,27 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         0,
     )
     .await;
-    loop {
-        if let WireFrame::Event { envelope, .. } = client.next().await
-            && envelope.run_id.as_ref() == Some(&run_id)
-            && let Ok(EventPayload::Item(ItemEvent::Delta {
-                delta: ItemDelta::CommandOutput { chunk_b64, .. },
-                ..
-            })) = serde_json::from_value::<EventPayload>(envelope.payload)
-            && BASE64
-                .decode(chunk_b64)
-                .expect("command output base64")
-                .windows(b"started".len())
-                .any(|window| window == b"started")
-        {
-            break;
+    tokio::time::timeout(support::DEADLINE, async {
+        loop {
+            if let WireFrame::Event { envelope, .. } =
+                client.next_with_keepalive(config.frame_limit).await
+                && envelope.run_id.as_ref() == Some(&run_id)
+                && let Ok(EventPayload::Item(ItemEvent::Delta {
+                    delta: ItemDelta::CommandOutput { chunk_b64, .. },
+                    ..
+                })) = serde_json::from_value::<EventPayload>(envelope.payload)
+                && BASE64
+                    .decode(chunk_b64)
+                    .expect("command output base64")
+                    .windows(b"started".len())
+                    .any(|window| window == b"started")
+            {
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("exec child starts within the deadline");
     assert!(heartbeat.exists(), "real child started");
     drop(answerer);
     send_request(

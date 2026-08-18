@@ -34,6 +34,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
 
+// Turns that execute the production Windows PowerShell pay a cold-start cost
+// that can exceed five seconds under the concurrent crate gate. Keep Unix's
+// existing budget byte-for-byte and widen only the Windows test ceiling.
+#[cfg(windows)]
+const PROCESS_TURN_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(not(windows))]
+const PROCESS_TURN_DEADLINE: Duration = Duration::from_secs(5);
+
 struct FixedProviderFactory {
     provider: Arc<dyn Provider>,
     context_window: Option<u64>,
@@ -134,10 +142,21 @@ impl TestWorker {
     }
 
     async fn submit(&self, suffix: &str) -> RunId {
-        self.submit_on_branch(suffix, None).await
+        self.submit_on_branch_with_deadline(suffix, None, Duration::from_secs(5))
+            .await
     }
 
     async fn submit_on_branch(&self, suffix: &str, branch_id: Option<BranchId>) -> RunId {
+        self.submit_on_branch_with_deadline(suffix, branch_id, Duration::from_secs(5))
+            .await
+    }
+
+    async fn submit_on_branch_with_deadline(
+        &self,
+        suffix: &str,
+        branch_id: Option<BranchId>,
+        deadline: Duration,
+    ) -> RunId {
         let run_id = RunId::new(format!("instructions-run-{suffix}"));
         let accepted = self
             .hub
@@ -161,7 +180,7 @@ impl TestWorker {
             .await
             .expect("accept turn");
         self.handle.submit(accepted).await.expect("submit turn");
-        wait_for_terminal(&self.store, &self.session_id, &run_id).await;
+        wait_for_terminal(&self.store, &self.session_id, &run_id, deadline).await;
         run_id
     }
 
@@ -180,8 +199,13 @@ fn canonical_utf8(path: &Path) -> String {
         .to_owned()
 }
 
-async fn wait_for_terminal(store: &SqliteStoreHandle, session_id: &SessionId, run_id: &RunId) {
-    timeout(Duration::from_secs(5), async {
+async fn wait_for_terminal(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    deadline: Duration,
+) {
+    timeout(deadline, async {
         loop {
             let events = store.read(session_id, 0, 512).await.expect("read events");
             if events.iter().any(|event| {
@@ -509,7 +533,9 @@ async fn one_pinned_logical_turn_sees_one_snapshot_and_edits_apply_next_turn() {
         calls: Arc::new(AtomicUsize::new(0)),
     });
     let worker = TestWorker::start(workspace.path(), provider, "pinning", 4096, Some(64_000)).await;
-    worker.submit("pinning-one").await;
+    worker
+        .submit_on_branch_with_deadline("pinning-one", None, PROCESS_TURN_DEADLINE)
+        .await;
     worker.submit("pinning-two").await;
 
     let requests = inner.requests();
@@ -828,7 +854,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         .recover_queued(accepted)
         .await
         .expect("resume recovery");
-    wait_for_terminal(&recovered, &session_id, &run_id).await;
+    wait_for_terminal(&recovered, &session_id, &run_id, Duration::from_secs(5)).await;
 
     assert!(
         fake.requests()[0]

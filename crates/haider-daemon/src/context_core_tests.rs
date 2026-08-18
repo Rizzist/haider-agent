@@ -80,6 +80,15 @@ const BRANCH_EXEC_COMMAND: &str = "printf branch";
 #[cfg(windows)]
 const BRANCH_EXEC_COMMAND: &str = "[Console]::Out.Write('branch')";
 
+// The production Windows interpreter is inbox PowerShell. Its cold process
+// startup is materially slower under the fully concurrent per-crate gate;
+// this bound covers that platform cost without changing Unix's five-second
+// regression budget or any production deadline.
+#[cfg(windows)]
+const PROCESS_TURN_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(not(windows))]
+const PROCESS_TURN_DEADLINE: Duration = Duration::from_secs(5);
+
 /// MUTATION CHECK: leave the selected branch out of worker startup,
 /// `HarnessConfig`, or terminal sinks. Expected RUNTIME failure: at least one
 /// non-aggregate envelope for `branch-run` below is written on main.
@@ -255,7 +264,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         .expect("accept branch");
     assert_eq!(accepted.branch_id, Some(branch_id.clone()));
     handle.submit(accepted).await.expect("submit branch");
-    timeout(Duration::from_secs(5), async {
+    timeout(PROCESS_TURN_DEADLINE, async {
         loop {
             let events = store.read(&session_id, 0, 512).await.expect("read");
             if events.iter().any(|event| {

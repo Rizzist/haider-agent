@@ -184,6 +184,30 @@ impl UdsClient {
             .expect("frame deadline")
     }
 
+    /// Waits for one frame while preserving the negotiated peer's R9 side of
+    /// the liveness contract. Use this only around deliberately slow setup;
+    /// tests that exercise silent-peer teardown must keep using `receive`.
+    pub async fn next_with_keepalive(&mut self, limit: usize) -> WireFrame {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), self.receive()).await {
+                    Ok(frame) => return frame,
+                    Err(_) => {
+                        self.send(
+                            &WireFrame::Ping {
+                                nonce: u64::MAX - 1,
+                            },
+                            limit,
+                        )
+                        .await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("frame deadline")
+    }
+
     /// Next frame, or `None` when the daemon closed the connection first.
     pub async fn try_receive(&mut self) -> Option<WireFrame> {
         if let Some(frame) = self.pending.pop_front() {
