@@ -6,12 +6,15 @@
 //! real logged-in desktop and interactive ScreenCast/RemoteDesktop consent.
 
 use haider_protocol::computer::ComputerAction;
-use haider_tools::{
-    ComputerBackend, ComputerCancelToken, ComputerOutput, platform_computer_backend,
-};
+// Keep the manual fixture's backend trait contract explicit in this Linux-only test.
+#[allow(unused_imports)]
+use haider_tools::ComputerBackend;
+use haider_tools::{ComputerCancelToken, ComputerOutput, platform_computer_backend};
 
 #[tokio::test]
 #[ignore = "requires HAIDER_CU_WAYLAND_E2E=1, a real Wayland session, portal bridge, and interactive consent"]
+// Manual fixture failures need the exact Wayland assertion context.
+#[allow(clippy::expect_used)]
 async fn real_wayland_portal_capture_and_remote_desktop_pointer_round_trip() {
     assert_eq!(
         std::env::var("HAIDER_CU_WAYLAND_E2E").as_deref(),

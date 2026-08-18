@@ -671,7 +671,7 @@ impl OutboundLane {
         self.inner.ready.notify_waiters();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn attachment_lane_count(&self) -> usize {
         self.inner
             .state

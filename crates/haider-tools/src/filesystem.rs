@@ -76,7 +76,10 @@ use serde_json::{Value, json};
 use std::collections::{BinaryHeap, HashMap};
 #[cfg(unix)]
 use std::ffi::CStr;
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 #[cfg(windows)]
@@ -2044,6 +2047,8 @@ where
 }
 
 #[cfg(windows)]
+// Keep the explicit Windows publication error branch so handle/drop ordering remains auditable.
+#[allow(clippy::question_mark)]
 fn apply_windows_write(
     workspace_root: &OwnedFd,
     relative: &Path,
@@ -2150,6 +2155,8 @@ fn apply_windows_write(
 }
 
 #[cfg(windows)]
+// Keep the explicit Windows publication error branch so handle/drop ordering remains auditable.
+#[allow(clippy::question_mark)]
 fn apply_windows_edit(
     workspace_root: &OwnedFd,
     relative: &Path,
@@ -2790,11 +2797,15 @@ fn open_windows_copy_directory(path: &Path, display_path: &Path) -> ToolResult<W
 }
 
 #[cfg(windows)]
+// Retain the strict Windows path-identity validation seam for dispatch paths that opt into it.
+#[allow(dead_code)]
 fn windows_path_identity(path: &Path, display_path: &Path) -> ToolResult<WindowsPathIdentity> {
     Ok(open_windows_path_entry(path, display_path, false)?.identity)
 }
 
 #[cfg(windows)]
+// Retain the strict Windows path-identity validation seam while current dispatch validates handles directly.
+#[allow(dead_code)]
 fn require_windows_path_identity(
     path: &Path,
     display_path: &Path,
@@ -2828,6 +2839,8 @@ fn require_windows_path_identity(
 }
 
 #[cfg(windows)]
+// Keep the staged-copy error branch explicit so Windows staging ownership remains auditable.
+#[allow(clippy::question_mark)]
 fn apply_windows_path(
     workspace_dir: &OwnedFd,
     source_relative: &Path,
@@ -3187,6 +3200,8 @@ fn copy_windows_entry(
 }
 
 #[cfg(windows)]
+// Keep explicit branch returns to preserve the directory/file fixture's parallel control flow.
+#[allow(clippy::needless_return)]
 fn copy_windows_entry_from_handle(
     source: &Path,
     destination: &Path,
@@ -4307,11 +4322,13 @@ fn create_path_staging_directory(
     })
 }
 
+#[cfg(unix)]
 enum StagedCopyCommitFailure {
     CleanupSafe(ToolError),
     PreserveStaging(ToolError),
 }
 
+#[cfg(unix)]
 impl StagedCopyCommitFailure {
     fn parts(self) -> (ToolError, bool) {
         match self {
@@ -4583,20 +4600,24 @@ fn require_unchanged_content(
 }
 
 const SNAPSHOT_ATTEMPTS: usize = 4;
+#[cfg(unix)]
 const MAX_SINGLE_READ_SNAPSHOT_BYTES: usize = i32::MAX as usize - 1;
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotBasis {
     CowClone,
     MetadataGuardedFallback,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct FileSnapshot {
     bytes: Vec<u8>,
     basis: SnapshotBasis,
 }
 
+#[cfg(unix)]
 impl FileSnapshot {
     fn parts(self) -> (Vec<u8>, SnapshotBasis) {
         (self.bytes, self.basis)
@@ -4742,7 +4763,7 @@ fn try_clone_file_at(parent: &OwnedFd, source: &fs::File) -> Option<fs::File> {
     None
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn try_clone_file_at(_parent: &OwnedFd, _source: &fs::File) -> Option<fs::File> {
     None
 }
@@ -4901,7 +4922,7 @@ fn require_commit_parent_path(parent: &OwnedFd, display_path: &Path) -> ToolResu
     })
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn require_commit_parent_path(_parent: &OwnedFd, _display_path: &Path) -> ToolResult<()> {
     Ok(())
 }
@@ -5104,6 +5125,7 @@ fn open_parent_creating_at(
     Ok((directory, leaf))
 }
 
+#[cfg(unix)]
 fn normal_components(relative: &Path) -> Vec<OsString> {
     relative
         .components()
@@ -5737,6 +5759,8 @@ mod windows_tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
 
     #[test]
+    // Keep the explicit remainder check because this fixture mirrors the Windows ABI alignment rule.
+    #[allow(clippy::manual_is_multiple_of)]
     fn staged_publish_terminates_an_exactly_sized_verbatim_destination() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let parent = fs::canonicalize(directory.path()).expect("canonical temporary directory");

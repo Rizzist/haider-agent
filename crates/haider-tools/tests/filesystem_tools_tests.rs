@@ -4,14 +4,18 @@ use haider_protocol::EventPayload;
 use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase, FileFreshness};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_tools::{
-    CasSink, ChangeLedger, ChangeLedgerSink, EffectBroker, FsEdit, FsRead, FsSearch, FsWrite,
-    FsWriteRecord, JournalSink, PermissionPolicy, ResultBounds, ToolError, ToolResult,
-    TurnAttribution,
+    CasSink, ChangeLedger, EffectBroker, FsEdit, FsRead, FsSearch, FsWrite, JournalSink,
+    PermissionPolicy, ResultBounds, ToolError, ToolResult, TurnAttribution,
 };
+#[cfg(unix)]
+use haider_tools::{ChangeLedgerSink, FsWriteRecord};
 use std::fs;
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
 // Every JournalSink double in this module is constructed as one value and
@@ -138,6 +142,7 @@ impl JournalSink for TerminalGateJournal {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Default)]
 struct FailFirstTerminalJournal {
     storage: Arc<SharedJournalStorage>,
@@ -145,6 +150,7 @@ struct FailFirstTerminalJournal {
     terminal_attempts: Arc<AtomicUsize>,
 }
 
+#[cfg(unix)]
 impl FailFirstTerminalJournal {
     fn observer(&self) -> JournalObserver {
         JournalObserver {
@@ -153,6 +159,7 @@ impl FailFirstTerminalJournal {
     }
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl JournalSink for FailFirstTerminalJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
@@ -174,9 +181,11 @@ impl JournalSink for FailFirstTerminalJournal {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Default)]
 struct RejectOutcomeJournal;
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl JournalSink for RejectOutcomeJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
@@ -187,11 +196,13 @@ impl JournalSink for RejectOutcomeJournal {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct DispatchBarrierJournal {
     barrier: Arc<tokio::sync::Barrier>,
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl JournalSink for DispatchBarrierJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
@@ -206,12 +217,14 @@ impl JournalSink for DispatchBarrierJournal {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct DispatchGateJournal {
     reached: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl JournalSink for DispatchGateJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
@@ -227,6 +240,7 @@ impl JournalSink for DispatchGateJournal {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct GatedLedger {
     inner: ChangeLedger,
@@ -234,6 +248,7 @@ struct GatedLedger {
     release: Arc<Barrier>,
 }
 
+#[cfg(unix)]
 impl ChangeLedgerSink for GatedLedger {
     fn record_fs_write(
         &self,
@@ -247,9 +262,11 @@ impl ChangeLedgerSink for GatedLedger {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 struct RejectLedger;
 
+#[cfg(unix)]
 impl ChangeLedgerSink for RejectLedger {
     fn record_fs_write(
         &self,
@@ -261,12 +278,14 @@ impl ChangeLedgerSink for RejectLedger {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct GatedRejectLedger {
     reached: Arc<Barrier>,
     release: Arc<Barrier>,
 }
 
+#[cfg(unix)]
 impl ChangeLedgerSink for GatedRejectLedger {
     fn record_fs_write(
         &self,

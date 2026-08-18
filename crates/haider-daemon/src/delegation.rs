@@ -105,7 +105,7 @@ impl DelegationHandle {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_stall_deadline(hub: SessionHub, stall_deadline: Duration) -> Self {
         Self {
             hub,

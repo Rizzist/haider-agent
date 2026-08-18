@@ -151,7 +151,8 @@ mod windows_tests {
     /// The daemon-spawn hygiene must clear the exact Win32 flag that would
     /// otherwise let a long-lived daemon retain its launcher's capture pipe.
     #[test]
-    #[allow(unsafe_code)]
+    // Test setup failures should retain their exact Win32 fixture context.
+    #[allow(unsafe_code, clippy::expect_used)]
     fn daemon_spawn_hygiene_clears_an_inheritable_handle() {
         let path = std::env::temp_dir().join(format!(
             "haider-platform-inheritance-{}.tmp",

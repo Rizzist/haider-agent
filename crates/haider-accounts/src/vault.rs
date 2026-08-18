@@ -60,6 +60,7 @@ impl Drop for VaultRefreshLock {
 
 impl SecretHandle {
     /// Crate-private on purpose: only [`Vault`] implementations mint handles.
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(secret: Vec<u8>) -> Self {
         Self {
             secret: Zeroizing::new(secret.into_boxed_slice()),

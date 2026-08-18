@@ -13,7 +13,9 @@ use std::fs;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 type DirectoryHandle = OwnedFd;
@@ -284,6 +286,8 @@ fn read_candidate_platform(
     let cap = remaining.min(MAX_PROJECT_INSTRUCTION_FILE_BYTES);
     let read_limit = u64::try_from(cap.saturating_add(1)).unwrap_or(u64::MAX);
     let mut bytes = Vec::with_capacity(cap.saturating_add(1));
+    // Keep the Windows read binding shape aligned with the platform reader fixture.
+    #[allow(unused_mut)]
     let mut file = match fs::File::open(&path) {
         Ok(file) => file,
         Err(error) => {

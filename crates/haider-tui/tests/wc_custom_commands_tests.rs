@@ -6,9 +6,10 @@
 use haider_protocol::ids::SessionId;
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode, Screen};
 use haider_tui::commands::{DynamicSlots, palette_items};
+#[cfg(unix)]
+use haider_tui::custom_commands::discover_project_commands_dir;
 use haider_tui::custom_commands::{
-    CommandSource, CustomCommand, ParseError, discover_project_commands_dir, load, load_for,
-    parse_command_file, substitute,
+    CommandSource, CustomCommand, ParseError, load, load_for, parse_command_file, substitute,
 };
 use std::fs;
 use std::path::Path;

@@ -11,10 +11,12 @@ use std::path::PathBuf;
 
 use common::{build_stored_zip, write_stub_script};
 use haider_stt::SttError;
+#[cfg(target_os = "macos")]
+use haider_stt::runtime::well_known_runtime_paths;
 use haider_stt::runtime::{
     discover_runtime_with, extract_runtime_zip, find_on_path, find_runtime_in_dir,
     install_runtime_with_homebrew, reject_unsafe_zip_entries, runtime_directory,
-    runtime_executable_names, well_known_runtime_paths,
+    runtime_executable_names,
 };
 
 /// The ADE discovery ladder is pinned: managed `<whisper>/runtime/` beats

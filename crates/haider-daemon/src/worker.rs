@@ -8647,7 +8647,7 @@ fn optional_u64(args: &serde_json::Value, field: &str) -> Result<Option<u64>, Ha
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
     process_result_with_signal(result, None)
 }

@@ -65,7 +65,7 @@ const KIMI_REFRESH_MAX_ATTEMPTS: usize = 3;
 // unparseable import is stamped this far ahead and marked inside its vault
 // bundle for one eager refresh on first resolution.
 const CODEX_IMPORT_FALLBACK_WINDOW: Duration = Duration::from_secs(15 * 60);
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
 pub(crate) const CLAUDE_CODE_CREDENTIAL_SERVICE: &str = "Claude Code-credentials";
 pub(crate) const CLAUDE_DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub(crate) const CLAUDE_NATIVE_IDENTITY_LABEL: &str = "Linked to Claude Code";
@@ -1042,9 +1042,23 @@ pub(crate) struct ClaudeCredentialInput {
 /// a denied or locked Keychain without tests ever touching the real store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeNativeCredentialFailure {
+    // Unsupported production targets can only report `Missing`, but the
+    // injected seam keeps these typed outcomes for supported targets/tests.
+    #[cfg_attr(
+        all(not(test), not(any(target_os = "macos", target_os = "windows"))),
+        allow(dead_code)
+    )]
     Denied,
+    #[cfg_attr(
+        all(not(test), not(any(target_os = "macos", target_os = "windows"))),
+        allow(dead_code)
+    )]
     Locked,
     Missing,
+    #[cfg_attr(
+        all(not(test), not(any(target_os = "macos", target_os = "windows"))),
+        allow(dead_code)
+    )]
     Unavailable,
 }
 
@@ -1070,9 +1084,10 @@ pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
 /// and permits at most one interactive Keychain read for this object (one
 /// object is constructed per daemon boot).
 #[derive(Default)]
-#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct PlatformClaudeNativeCredentialStore {
+    #[cfg(all(target_os = "macos", not(test)))]
     interactive_attempted: AtomicBool,
+    #[cfg(all(target_os = "macos", not(test)))]
     last_failure: Mutex<Option<ClaudeNativeCredentialFailure>>,
 }
 

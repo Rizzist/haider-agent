@@ -250,7 +250,7 @@ impl TaskFacade {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_kill_grace(hub: SessionHub, kill_grace: Duration) -> Self {
         Self { hub, kill_grace }
     }
@@ -974,7 +974,7 @@ impl TaskFacade {
 
 /// Test-only fact builder: the exact production envelope shape without a
 /// spawned child, for staging prior-life journal states.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_task_fact_envelope(
     hub: &SessionHub,
     session_id: &SessionId,
