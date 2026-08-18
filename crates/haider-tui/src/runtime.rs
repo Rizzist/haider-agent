@@ -1438,6 +1438,9 @@ impl DemoDriver {
             | AppRequest::GraphRefresh
             | AppRequest::GraphInspectRefresh
             | AppRequest::RunRetry { .. }
+            // Computer OS-permission actions are daemon/OS truth — the demo
+            // world has no parked TCC grant to open Settings for.
+            | AppRequest::OpenPermissionSettings { .. }
             | AppRequest::FleetMemberGraph { .. }
             | AppRequest::GraphPin
             | AppRequest::GraphAbandon { .. }

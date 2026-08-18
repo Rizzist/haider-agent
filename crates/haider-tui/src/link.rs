@@ -835,6 +835,11 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::GraphStatus { session } => RequestBody::GraphStatus {
             session_id: session,
         },
+        LiveCommand::OpenPermissionSettings {
+            session,
+            request_id,
+            permission,
+        } => haider_client::open_permission_settings_request(session, request_id, permission),
         LiveCommand::GraphInspect { session } => RequestBody::GraphInspect {
             session_id: session,
             cursor: None,

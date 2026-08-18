@@ -729,6 +729,24 @@ pub fn route_task_event(
     true
 }
 
+/// Route an additive computer OS-permission event (outside `EventPayload`) to
+/// the active session projection: a `permission_grant_needed` becomes the live
+/// grant card; a `permission_grant_resolved` clears it. Returns `false` for a
+/// non-permission payload so the caller keeps trying decoders / counts unknown.
+pub fn route_permission_event(projection: &mut SessionProjection, envelope: &RawEnvelope) -> bool {
+    use haider_protocol::permission::PermissionEventPayload;
+    let Ok(payload) = PermissionEventPayload::from_payload_value(envelope.payload.clone()) else {
+        return false;
+    };
+    match payload {
+        PermissionEventPayload::PermissionGrantNeeded(card) => projection.set_permission_card(card),
+        PermissionEventPayload::PermissionGrantResolved(resolved) => {
+            projection.resolve_permission_card(&resolved.request_id);
+        }
+    }
+    true
+}
+
 /// Apply one payload to every chip transcript in the tree — the answer
 /// fallback for menus with no recorded opening (see [`classify`]).
 pub fn broadcast(chips: &mut [ChipModel], payload: &EventPayload) {

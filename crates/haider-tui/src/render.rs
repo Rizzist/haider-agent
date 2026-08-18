@@ -3126,10 +3126,16 @@ fn render_session(
     let menu_wrapped_body_rows = menu.map_or(0, |m| {
         wrapped_menu_body(m, area.width, model.clock_ms).len()
     });
-    let needed_input = menu.map_or_else(
+    // The computer-permission grant card replaces the plain blocking menu and
+    // needs a few extra rows for its labelled prompt + action buttons.
+    let card_rows = model.projection.permission_card().map(permission_card_rows);
+    let mut needed_input = menu.map_or_else(
         || composer_height(model, area.width).saturating_add(ask_rows),
         |m| u16::try_from(1 + menu_wrapped_body_rows + m.options.len() + 1).unwrap_or(u16::MAX),
     );
+    if let Some(rows) = card_rows {
+        needed_input = needed_input.max(rows);
+    }
     // What the input may claim: everything beyond header(2) + header
     // rule(1) + input rule(1) + gap(1) + one sacred transcript row.
     let mut gap: u16 = 1;
@@ -3137,7 +3143,10 @@ fn render_session(
     let mut header_h: u16 = 2;
     let mut header_rule_h: u16 = 1;
     let mut input_rule_h: u16 = 1;
-    let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
+    let mut floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
+    if let Some(rows) = card_rows {
+        floor_input = floor_input.max(rows);
+    }
     let mut input_avail = area
         .height
         .saturating_sub(header_h + header_rule_h + input_rule_h + gap + transcript_min);
@@ -3917,7 +3926,41 @@ fn render_session(
         }
     }
 
-    if let Some(menu) = menu {
+    if model.login.is_none()
+        && let Some(card) = model.projection.permission_card()
+    {
+        // The computer OS-permission grant card takes the blocking-menu slot,
+        // enriching the paired `computer-os-permission` menu with Open Settings
+        // / Retry and the native-prompt explanation. The login card outranks it
+        // for the same reason it outranks a menu (keyboard ownership).
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(rule_area.width as usize),
+                theme.warn_style(),
+            ))
+            .style(theme.text_style()),
+            rule_area,
+        );
+        let (card_lines, button_hits) = permission_card_block(card, theme, composer_area);
+        frame.render_widget(
+            Paragraph::new(Text::from(card_lines)).style(theme.menu_style()),
+            composer_area,
+        );
+        for (row_offset, hit) in button_hits {
+            let y = composer_area.y + row_offset;
+            if y < composer_area.y + composer_area.height {
+                hits.push((
+                    Rect {
+                        x: composer_area.x,
+                        y,
+                        width: composer_area.width,
+                        height: 1,
+                    },
+                    hit,
+                ));
+            }
+        }
+    } else if let Some(menu) = menu {
         // Sim InputMenu (tui.js:4932): warn top border, gold-soft ground.
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -6766,6 +6809,101 @@ impl DiffTone {
 /// TOP (the last ones carry the live context), then the title; options
 /// NEVER. Returns the rendered lines plus each option's (row offset, option
 /// index) for the hit map.
+fn permission_label(permission: haider_protocol::permission::SystemPermission) -> &'static str {
+    use haider_protocol::permission::SystemPermission;
+    match permission {
+        SystemPermission::ScreenRecording => "Screen Recording",
+        SystemPermission::Accessibility => "Accessibility",
+    }
+}
+
+/// Rows the computer-permission grant card claims in the input band: header +
+/// note + Open Settings, plus Retry while the grant is still pending (a
+/// restart-pending card drops Retry — a recheck cannot help until restart).
+fn permission_card_rows(card: &haider_protocol::permission::PermissionGrantNeeded) -> u16 {
+    if card.auto_restart_pending { 3 } else { 4 }
+}
+
+/// One full-width card button: bold label left, dim key hint right.
+fn permission_button_line(label: &str, key_hint: &str, theme: &Theme, width: u16) -> Line<'static> {
+    let left = format!(" ›  {label}");
+    let right = format!("{key_hint} ");
+    let pad = (width as usize)
+        .saturating_sub(left.chars().count() + right.chars().count())
+        .max(1);
+    Line::from(vec![
+        Span::styled(left, theme.text_style().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(right, ratatui::style::Style::default().fg(theme.dim.into())),
+    ])
+}
+
+/// The computer OS-permission grant card: replaces the plain
+/// `computer-os-permission` blocking menu with a labelled prompt plus the
+/// clickable Open Settings / Retry actions (and a granted-restart note). The
+/// returned `(row_offset, Hit)` pairs come from what actually rendered.
+fn permission_card_block(
+    card: &haider_protocol::permission::PermissionGrantNeeded,
+    theme: &Theme,
+    area: Rect,
+) -> (Vec<Line<'static>>, Vec<(u16, Hit)>) {
+    let allocated = area.height as usize;
+    if allocated == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let label = permission_label(card.permission);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<(u16, Hit)> = Vec::new();
+    if card.auto_restart_pending {
+        lines.push(Line::from(vec![
+            Span::styled("  ✓  ", theme.ok_style()),
+            Span::styled(
+                format!("{label} granted"),
+                theme.ok_style().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::styled(
+            "     Restart Haider to use it — quit and reopen; the parked action resumes automatically."
+                .to_string(),
+            theme.text_style(),
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  ⚠  ", theme.warn_style()),
+            Span::styled(
+                format!("macOS needs {label} for computer use"),
+                theme.warn_style().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::styled(
+            "     Haider opened the system prompt — grant it, then Retry (it resumes automatically)."
+                .to_string(),
+            theme.text_style(),
+        ));
+    }
+    let open_offset = u16::try_from(lines.len()).unwrap_or(0);
+    lines.push(permission_button_line(
+        "Open Settings",
+        "o",
+        theme,
+        area.width,
+    ));
+    hits.push((open_offset, Hit::PermissionOpenSettings));
+    if !card.auto_restart_pending {
+        let retry_offset = u16::try_from(lines.len()).unwrap_or(0);
+        lines.push(permission_button_line(
+            "Retry now",
+            "r ⏎",
+            theme,
+            area.width,
+        ));
+        hits.push((retry_offset, Hit::PermissionRetry));
+    }
+    lines.truncate(allocated);
+    hits.retain(|(offset, _)| (*offset as usize) < allocated);
+    (lines, hits)
+}
+
 fn menu_block(
     menu: &haider_protocol::menu::Menu,
     selection: usize,

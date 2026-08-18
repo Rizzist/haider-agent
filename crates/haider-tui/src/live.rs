@@ -57,6 +57,8 @@ fn recognized_payload(payload: &serde_json::Value) -> bool {
         .is_ok()
         || serde_json::from_value::<haider_protocol::hook::HookEventPayload>(payload.clone())
             .is_ok()
+        || haider_protocol::permission::PermissionEventPayload::from_payload_value(payload.clone())
+            .is_ok()
 }
 
 /// The daemon's per-connection attachment ceiling
@@ -243,6 +245,15 @@ pub enum LiveCommand {
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
+    },
+    /// `computer.permission_open_settings` — grant card's Open Settings button.
+    /// The daemon maps the permission enum to a compiled System Settings deep
+    /// link and opens it; the TUI never sends a URL. Non-durable (like a read):
+    /// a lost reply is simply re-clicked, never resent under a durable id.
+    OpenPermissionSettings {
+        session: SessionId,
+        request_id: String,
+        permission: haider_protocol::permission::SystemPermission,
     },
     /// `graph.pin` — receipt-backed pin of the built-in ship-loop template
     /// (CG-M1). DURABLE: a lost response retries under the same command id
@@ -535,6 +546,7 @@ impl LiveCommand {
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
             | Self::GraphStatus { .. }
+            | Self::OpenPermissionSettings { .. }
             | Self::GraphInspect { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. }
@@ -3910,6 +3922,17 @@ impl LiveDriver {
                     command_id,
                     session,
                     worker_generation,
+                })]
+            }
+            AppRequest::OpenPermissionSettings {
+                session,
+                request_id,
+                permission,
+            } => {
+                vec![self.enqueue(LiveCommand::OpenPermissionSettings {
+                    session,
+                    request_id,
+                    permission,
                 })]
             }
             AppRequest::GraphPin => {

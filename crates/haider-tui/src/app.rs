@@ -2192,6 +2192,13 @@ pub enum AppRequest {
     /// Owner 2026-08-16 (manual retry): re-run a terminal-failed session's
     /// last user turn — receipt-backed `run.retry`, no new user message.
     RunRetry { session: SessionId },
+    /// Grant card: open the macOS System Settings pane for a parked computer
+    /// OS-permission (`computer.permission_open_settings`).
+    OpenPermissionSettings {
+        session: SessionId,
+        request_id: String,
+        permission: haider_protocol::permission::SystemPermission,
+    },
     /// Owner 2026-08-16 (fleet member detail): read the DETAIL member's own
     /// child-graph status for its workflow section.
     FleetMemberGraph { session: SessionId },
@@ -2378,6 +2385,12 @@ pub enum Hit {
     /// Owner 2026-08-16: the manual-retry ambient row — click retries the
     /// failed turn.
     RetryRun,
+    /// Computer OS-permission grant card: open the exact System Settings pane
+    /// for the parked permission (routes to `computer.permission_open_settings`).
+    PermissionOpenSettings,
+    /// Computer OS-permission grant card: recheck now — answers the paired
+    /// `computer-os-permission` menu's retry option.
+    PermissionRetry,
     /// Aura / Accounts / Peers launcher rows, by identity not ordinal.
     ExtraRow(LauncherRow),
     /// The palette row's actual content at render time.
@@ -4889,6 +4902,51 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// Grant card: open the exact macOS System Settings pane for the parked
+    /// permission (routes to `computer.permission_open_settings`, which maps the
+    /// enum to a compiled deep link — the TUI never sends a URL). No-op unless a
+    /// card is live and a session is attached.
+    pub fn request_permission_open_settings(&mut self) {
+        let Some(card) = self.projection.permission_card() else {
+            return;
+        };
+        let Some(session) = self.active_session.clone() else {
+            return;
+        };
+        let request_id = card.request_id.clone();
+        let permission = card.permission;
+        self.requests.push(AppRequest::OpenPermissionSettings {
+            session,
+            request_id,
+            permission,
+        });
+        self.dirty = true;
+    }
+
+    /// Grant card: recheck the OS permission now by answering the paired
+    /// `computer-os-permission` menu's `retry` option — the same durable
+    /// menu-answer path the daemon's automatic poll also uses, so there is
+    /// exactly one authorization channel. No-op unless the card's menu is open.
+    pub fn retry_permission(&mut self) {
+        let Some(card) = self.projection.permission_card() else {
+            return;
+        };
+        let menu_id = card.menu_id.clone();
+        let Some(menu) = self.projection.open_menu() else {
+            return;
+        };
+        if menu.id != menu_id {
+            return;
+        }
+        let index = menu
+            .options
+            .iter()
+            .position(|option| option.key == "retry")
+            .unwrap_or(0);
+        self.menu_selection = index;
+        self.submit_menu_answer();
+    }
+
     /// The correlated `run.retry` reply: daemon truth — a fresh run is live
     /// on the SAME user turn.
     pub fn apply_run_retried(&mut self, session: &SessionId) {
@@ -5160,6 +5218,23 @@ impl AppModel {
                 self.dirty = true;
             }
             return;
+        }
+        // The computer-permission grant card replaces the blocking menu and
+        // owns its action keys: `o` opens the exact Settings pane, `r`/⏎
+        // rechecks now. Other keys fall through to the underlying permission
+        // menu's ordinary handling.
+        if self.screen == Screen::Session && self.projection.permission_card().is_some() {
+            match key.code {
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    self.request_permission_open_settings();
+                    return;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+                    self.retry_permission();
+                    return;
+                }
+                _ => {}
+            }
         }
         // A SELECT menu replaces the composer (sim §3 law); a zero-option
         // free-text ask leaves the keys to the composer.
@@ -10034,6 +10109,9 @@ impl AppModel {
                                 &mut self.branch_state,
                                 &mut self.projection,
                                 envelope,
+                            ) && !crate::session::route_permission_event(
+                                &mut self.projection,
+                                envelope,
                             ) {
                                 self.projection.count_unknown_payload();
                             }
@@ -11249,6 +11327,12 @@ impl AppModel {
             // (fetch status + one-shot graph.inspect, then show the view).
             Hit::RetryRun => {
                 self.issue_run_retry();
+            }
+            Hit::PermissionOpenSettings => {
+                self.request_permission_open_settings();
+            }
+            Hit::PermissionRetry => {
+                self.retry_permission();
             }
             Hit::GraphStrip => {
                 self.graph_unsupported = false;

@@ -219,6 +219,11 @@ pub struct SessionProjection {
     /// starts it empty, and a menu with no recorded opening falls back to
     /// the pre-W3c3 broadcast.
     menu_owner: std::collections::HashMap<haider_protocol::ids::MenuId, MenuScopeOwner>,
+    /// The active computer OS-permission grant card (additive
+    /// `permission_grant_needed` event). It enriches the paired blocking
+    /// `computer-os-permission` menu with the Open Settings / Restart actions
+    /// and the native-prompt explanation; cleared by `permission_grant_resolved`.
+    permission_card: Option<haider_protocol::permission::PermissionGrantNeeded>,
     todos: Option<TodoPanel>,
     usage: Option<Usage>,
     /// W-G: assistant OUTPUT text characters streamed this turn — the honest
@@ -1349,6 +1354,34 @@ impl SessionProjection {
     #[must_use]
     pub fn open_menu(&self) -> Option<&Menu> {
         self.menu.as_ref()
+    }
+
+    /// The active computer OS-permission grant card, if any.
+    #[must_use]
+    pub fn permission_card(&self) -> Option<&haider_protocol::permission::PermissionGrantNeeded> {
+        self.permission_card.as_ref()
+    }
+
+    /// Records a `permission_grant_needed` card (additive event, decoded by
+    /// [`crate::session::route_permission_event`]).
+    pub fn set_permission_card(
+        &mut self,
+        card: haider_protocol::permission::PermissionGrantNeeded,
+    ) {
+        self.permission_card = Some(card);
+    }
+
+    /// Clears the card once its matching `permission_grant_resolved` arrives
+    /// (request_id-scoped so a superseding card is never dropped by a stale
+    /// resolution).
+    pub fn resolve_permission_card(&mut self, request_id: &str) {
+        if self
+            .permission_card
+            .as_ref()
+            .is_some_and(|card| card.request_id == request_id)
+        {
+            self.permission_card = None;
+        }
     }
 
     #[must_use]
