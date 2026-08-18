@@ -20,9 +20,11 @@
 //!   span) without disturbing any earlier line.
 //!
 //! Wrapping ([`wrap_spans`]) reproduces the transcript's pre-wrap walker
-//! (render.rs `wrap_pre_line`) over kind-tagged characters, so the styled
-//! path breaks rows exactly where plain wrapping of the RENDERED text
-//! would — styling adds or removes zero rows.
+//! (render.rs `wrap_pre_line`) over kind-tagged GRAPHEME CLUSTERS, so the
+//! styled path breaks rows exactly where plain wrapping of the RENDERED
+//! text would — styling adds or removes zero rows, and an emoji (VS16,
+//! ZWJ family, flag, skin-tone) stays one unbreakable unit whose width
+//! matches ratatui's renderer.
 
 /// The style vocabulary a markdown span can carry. Kinds are semantic —
 /// the renderer maps them onto THEME SLOTS (style.rs), never raw colors.
@@ -575,32 +577,46 @@ fn underscore_close(chars: &[char], from: usize) -> Option<usize> {
 /// break. Every produced row fits the budget; the final row lands even
 /// when empty (blank lines keep their rail row).
 #[must_use]
+/// Display width of ONE grapheme cluster, consistent with ratatui's
+/// renderer (which measures each grapheme with unicode-width). Emoji —
+/// including VS16 (⚠️), ZWJ families (👨‍👩‍👧), regional-indicator flags,
+/// and skin-tone sequences — stay a single unbreakable unit that never
+/// splits mid-cluster, and a cluster with no positive width still claims
+/// one cell so it cannot collapse to nothing. This matches what the
+/// composer already does (`cluster_cells`); the transcript/markdown path
+/// used to measure per CHAR, which split emoji and mis-summed their width.
+fn cluster_cells(cluster: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(cluster).max(1)
+}
+
 pub fn wrap_spans(spans: &[MdSpan], budget: usize) -> Vec<Vec<MdSpan>> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
     let budget = budget.max(1);
-    // Flatten to (char, kind), expanding tabs — kinds ride each cell.
-    let mut cells: Vec<(char, MdKind)> = Vec::new();
+    // Flatten to (grapheme-cluster, kind), expanding tabs — kinds ride each
+    // cell, and each cell is a whole cluster so emoji never split.
+    let mut cells: Vec<(String, MdKind)> = Vec::new();
     for span in spans {
-        for ch in span.text.chars() {
-            if ch == '\t' {
+        for cluster in span.text.graphemes(true) {
+            if cluster == "\t" {
                 for _ in 0..4 {
-                    cells.push((' ', span.kind));
+                    cells.push((" ".to_owned(), span.kind));
                 }
             } else {
-                cells.push((ch, span.kind));
+                cells.push((cluster.to_owned(), span.kind));
             }
         }
     }
-    let mut rows: Vec<Vec<(char, MdKind)>> = Vec::new();
-    let mut row: Vec<(char, MdKind)> = Vec::new();
+    let mut rows: Vec<Vec<(String, MdKind)>> = Vec::new();
+    let mut row: Vec<(String, MdKind)> = Vec::new();
     let mut row_width = 0usize;
     let mut i = 0usize;
     while i < cells.len() {
-        let is_space = cells[i].0 == ' ';
+        let is_space = cells[i].0 == " ";
         let mut end = i;
         let mut run_width = 0usize;
-        while end < cells.len() && (cells[end].0 == ' ') == is_space {
-            run_width += UnicodeWidthChar::width(cells[end].0).unwrap_or(0);
+        while end < cells.len() && (cells[end].0 == " ") == is_space {
+            run_width += cluster_cells(&cells[end].0);
             end += 1;
         }
         if row_width + run_width <= budget {
@@ -614,7 +630,7 @@ pub fn wrap_spans(spans: &[MdSpan], budget: usize) -> Vec<Vec<MdSpan>> {
             let mut j = i;
             loop {
                 while row_width < budget && j < end {
-                    row.push(cells[j]);
+                    row.push(cells[j].clone());
                     row_width += 1;
                     j += 1;
                 }
@@ -638,17 +654,17 @@ pub fn wrap_spans(spans: &[MdSpan], budget: usize) -> Vec<Vec<MdSpan>> {
             rows.push(std::mem::take(&mut row));
             row_width = 0;
         }
-        for &(ch, kind) in &cells[i..end] {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if ch_width > budget {
+        for cell in &cells[i..end] {
+            let cell_width = cluster_cells(&cell.0);
+            if cell_width > budget {
                 continue;
             }
-            if row_width + ch_width > budget {
+            if row_width + cell_width > budget {
                 rows.push(std::mem::take(&mut row));
                 row_width = 0;
             }
-            row.push((ch, kind));
-            row_width += ch_width;
+            row.push(cell.clone());
+            row_width += cell_width;
         }
         i = end;
     }
@@ -656,13 +672,13 @@ pub fn wrap_spans(spans: &[MdSpan], budget: usize) -> Vec<Vec<MdSpan>> {
     rows.into_iter().map(compress).collect()
 }
 
-/// Merge adjacent same-kind cells back into spans.
-fn compress(cells: Vec<(char, MdKind)>) -> Vec<MdSpan> {
+/// Merge adjacent same-kind cells (grapheme clusters) back into spans.
+fn compress(cells: Vec<(String, MdKind)>) -> Vec<MdSpan> {
     let mut out: Vec<MdSpan> = Vec::new();
-    for (ch, kind) in cells {
+    for (cluster, kind) in cells {
         match out.last_mut() {
-            Some(last) if last.kind == kind => last.text.push(ch),
-            _ => out.push(MdSpan::new(String::from(ch), kind)),
+            Some(last) if last.kind == kind => last.text.push_str(&cluster),
+            _ => out.push(MdSpan::new(cluster, kind)),
         }
     }
     out
@@ -744,15 +760,14 @@ fn embolden(cell: &[MdSpan]) -> Vec<MdSpan> {
 /// Display width of a cell's spans — the same cell arithmetic as
 /// [`wrap_spans`]: tabs expand to 4, unrepresentable glyphs count 0.
 fn spans_width(spans: &[MdSpan]) -> usize {
-    use unicode_width::UnicodeWidthChar;
-    spans
-        .iter()
-        .flat_map(|span| span.text.chars())
-        .map(|ch| {
-            if ch == '\t' {
+    use unicode_segmentation::UnicodeSegmentation;
+    let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+    text.graphemes(true)
+        .map(|cluster| {
+            if cluster == "\t" {
                 4
             } else {
-                UnicodeWidthChar::width(ch).unwrap_or(0)
+                cluster_cells(cluster)
             }
         })
         .sum()
@@ -762,15 +777,16 @@ fn spans_width(spans: &[MdSpan]) -> usize {
 /// floor. Tabs break words exactly as [`wrap_spans`] expands them to
 /// spaces.
 fn longest_word(spans: &[MdSpan]) -> usize {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
+    let text: String = spans.iter().map(|span| span.text.as_str()).collect();
     let mut widest = 0usize;
     let mut current = 0usize;
-    for ch in spans.iter().flat_map(|span| span.text.chars()) {
-        if ch == ' ' || ch == '\t' {
+    for cluster in text.graphemes(true) {
+        if cluster == " " || cluster == "\t" {
             widest = widest.max(current);
             current = 0;
         } else {
-            current += UnicodeWidthChar::width(ch).unwrap_or(0);
+            current += cluster_cells(cluster);
         }
     }
     widest.max(current)
@@ -914,4 +930,57 @@ fn stacked(header: &[Vec<MdSpan>], body: &[&MdTableRow], budget: usize) -> Vec<V
         }
     }
     out
+}
+
+#[cfg(test)]
+mod emoji_width_tests {
+    use super::{MdKind, MdSpan, cluster_cells, longest_word, spans_width, wrap_spans};
+
+    fn text(s: &str) -> Vec<MdSpan> {
+        vec![MdSpan::new(s, MdKind::Text)]
+    }
+
+    /// MUTATION CHECK: measure emoji per-char instead of per grapheme
+    /// cluster. Expected failure: a ZWJ family, a VS16 emoji, and a flag
+    /// each stay ONE unbreakable cluster whose width matches ratatui's
+    /// renderer, and none split mid-cluster when wrapped.
+    #[test]
+    fn emoji_clusters_stay_one_unit_across_measure_and_wrap() {
+        // One grapheme cluster each — never a per-scalar sum.
+        for emoji in ["😀", "⚠️", "👨‍👩‍👧", "🇺🇸", "👍🏽"] {
+            let w = spans_width(&text(emoji));
+            assert_eq!(
+                w,
+                cluster_cells(emoji),
+                "`{emoji}` measures as one cluster, not per-char"
+            );
+            // longest_word (the wrap floor) agrees — one unbroken run.
+            assert_eq!(longest_word(&text(emoji)), w, "`{emoji}` is one word");
+        }
+
+        // A cluster is never split across a wrap boundary: wrap a line whose
+        // budget lands mid-emoji and every row's rendered text stays valid
+        // (the emoji appears whole on exactly one row).
+        let line = text("ab 👨‍👩‍👧 cd");
+        let rows = wrap_spans(&line, 4);
+        let joined: String = rows
+            .iter()
+            .map(|row| row.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect();
+        assert!(
+            joined.contains("👨‍👩‍👧"),
+            "the family emoji survives wrapping whole"
+        );
+        assert!(
+            rows.iter().all(|row| {
+                let t: String = row.iter().map(|s| s.text.as_str()).collect();
+                // No row ends or starts with a bare ZWJ/joiner fragment.
+                !t.starts_with('\u{200d}') && !t.ends_with('\u{200d}')
+            }),
+            "no row splits the ZWJ sequence"
+        );
+
+        // Plain ASCII is unchanged — one cell per char.
+        assert_eq!(spans_width(&text("hello")), 5);
+    }
 }

@@ -8580,22 +8580,26 @@ fn wrap_body(text: &str, budget: usize) -> Vec<String> {
 
 /// Wrap one newline-free line, preserving every space (pre-wrap).
 fn wrap_pre_line(line: &str, budget: usize, rows: &mut Vec<String>) {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
+    // Grapheme clusters, not chars: an emoji (VS16/ZWJ/flag/skin-tone) stays
+    // one unbreakable unit whose width matches ratatui's renderer, so it
+    // never splits mid-cluster or mis-sums in the pre/code wrap path.
+    let cluster_w = |c: &str| unicode_width::UnicodeWidthStr::width(c).max(1);
     let mut row = String::new();
     let mut row_width = 0usize;
-    let mut chars = line.chars().peekable();
-    while let Some(&first) = chars.peek() {
-        let is_space = first == ' ';
+    let mut clusters = line.graphemes(true).peekable();
+    while let Some(&first) = clusters.peek() {
+        let is_space = first == " ";
         // Collect one run (all-spaces or no-spaces).
         let mut run = String::new();
         let mut run_width = 0usize;
-        while let Some(&ch) = chars.peek() {
-            if (ch == ' ') != is_space {
+        while let Some(&cluster) = clusters.peek() {
+            if (cluster == " ") != is_space {
                 break;
             }
-            chars.next();
-            run.push(ch);
-            run_width += UnicodeWidthChar::width(ch).unwrap_or(0);
+            clusters.next();
+            run.push_str(cluster);
+            run_width += cluster_w(cluster);
         }
         if row_width + run_width <= budget {
             row.push_str(&run);
@@ -8634,20 +8638,20 @@ fn wrap_pre_line(line: &str, budget: usize, rows: &mut Vec<String>) {
             rows.push(std::mem::take(&mut row));
             row_width = 0;
         }
-        for ch in run.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if ch_width > budget {
+        for cluster in run.graphemes(true) {
+            let cluster_width = cluster_w(cluster);
+            if cluster_width > budget {
                 // Unrepresentable at this width (e.g. CJK beside a rail in
                 // a 3-col frame) — dropping is the only honest option that
                 // keeps the no-implicit-wrap invariant.
                 continue;
             }
-            if row_width + ch_width > budget {
+            if row_width + cluster_width > budget {
                 rows.push(std::mem::take(&mut row));
                 row_width = 0;
             }
-            row.push(ch);
-            row_width += ch_width;
+            row.push_str(cluster);
+            row_width += cluster_width;
         }
     }
     // The final row lands even when empty (blank pre-wrap lines keep their
