@@ -746,7 +746,7 @@ impl ProviderFactory for UnconfiguredProviderFactory {
 pub struct SystemPromptBuilder;
 
 impl SystemPromptBuilder {
-    pub const VERSION: &'static str = "haider-system-v2";
+    pub const VERSION: &'static str = "haider-system-v3";
 
     pub fn build(metadata: &SessionMetadataV1, instructions: &[(&str, &str)]) -> String {
         Self::build_with_handoff(metadata, instructions, None)
@@ -3734,17 +3734,23 @@ async fn perform_manual_compaction(
     let handoff_dir = delegation
         .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
         .await?;
-    let post_compaction_system_prompt = SystemPromptBuilder::build_with_handoff(
-        metadata,
-        &instruction_entries,
-        handoff_dir.as_deref(),
-    );
     let post_compaction_tools = advertised_tool_definitions(
         &dependencies.tool_factory,
         grant,
         &resolved.provider_name,
         web_degrade,
     );
+    let post_compaction_system_prompt = {
+        let mut prompt = SystemPromptBuilder::build_with_handoff(
+            metadata,
+            &instruction_entries,
+            handoff_dir.as_deref(),
+        );
+        // Same instruct-pipe manual as the live turn, so the cached system
+        // prefix is identical across normal and post-compaction requests.
+        prompt.push_str(&tool_manual(&post_compaction_tools));
+        prompt
+    };
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let usage_account = resolved
         .account_alias
@@ -4608,6 +4614,12 @@ async fn start_turn(
         &resolved.provider_name,
         web_degrade,
     );
+    // Instruct pipe: the tools ride the wire as minimal stubs; their signatures
+    // and semantics ride the cached system prompt as one compact manual for the
+    // exact advertised set.
+    if let Some(system_prompt) = config.system_prompt.as_mut() {
+        system_prompt.push_str(&tool_manual(&config.tools));
+    }
     if matches!(
         resolved.provider_name.as_str(),
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
@@ -6481,11 +6493,140 @@ fn bounded_search_preview(text: String) -> (String, bool) {
     (text, true)
 }
 
+/// Instruct-pipe stub of a tool's JSON Schema (LW-IP). Native tool-calling
+/// still needs the STRUCTURE — object-ness, property types, `required`, and
+/// `enum` value sets are what a provider validates a tool call against — so
+/// those are kept; everything a provider merely DISPLAYS to the model
+/// (per-property `description`s) and every bound the daemon re-enforces server
+/// side (`minLength`/`maxLength`/`minimum`/`pattern`/`additionalProperties`/
+/// combinators) is dropped from the wire and moved, in compact prose, into the
+/// system-prompt tool manual. The recursion keeps nested `properties`/`items`
+/// so array-of-object and nested-object shapes still guide the model.
+pub(crate) fn stub_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(map) = schema else {
+        return schema.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for key in ["type", "enum", "required"] {
+        if let Some(value) = map.get(key) {
+            out.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(serde_json::Value::Object(properties)) = map.get("properties") {
+        let stubbed = properties
+            .iter()
+            .map(|(name, value)| (name.clone(), stub_schema(value)))
+            .collect();
+        out.insert("properties".to_owned(), serde_json::Value::Object(stubbed));
+    }
+    if let Some(items) = map.get("items") {
+        out.insert("items".to_owned(), stub_schema(items));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// The one authoritative line for a tool in the system-prompt manual: a typed
+/// signature (`?` = optional, `∈` lists an enum's values) plus only the
+/// semantics a caller cannot infer from the argument name. Deliberately terse
+/// — the point of the instruct pipe is to carry meaning without JSON-Schema
+/// syntax tax. `None` only guards an unknown name — every advertised tool is
+/// described here (including `computer`, whose stub schema the generic/Gemini
+/// path leans on this manual to explain; native providers substitute their own
+/// computer tool and ignore both).
+pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
+    // Enum-valued arguments are NOT enumerated here — the stub schema still
+    // carries their allowed values, so listing them again would be dead weight.
+    // Each line keeps only the signature plus semantics a caller cannot infer
+    // from the argument name.
+    Some(match name {
+        "computer" => {
+            "computer(action, x?, y?, from?, to?, text?, keys?, direction?, amount?, ms?) — control the local desktop. Call screenshot first; x/y and from/to are pixels in the latest screenshot; text=type, keys=shortcut like cmd+shift+4; direction+amount scroll; ms=wait ≤60000"
+        }
+        "fs_read" => {
+            "fs_read(path, offset?, limit?) — read a bounded UTF-8 file slice; a directory path lists it"
+        }
+        "fs_glob" => "fs_glob(pattern, path?) — list workspace files matching a glob",
+        "fs_search" => "fs_search(pattern, path?, glob?, case?, mode?) — search file contents",
+        "fs_write" => {
+            "fs_write(path, content) — create or replace one UTF-8 file, making parent dirs"
+        }
+        "fs_edit" => {
+            "fs_edit(path, edits:[{old, new, replace_all?}]) — atomic anchored replacements on a fresh file; each `old` must be unique unless replace_all"
+        }
+        "fs_path" => {
+            "fs_path(operation, source, destination?, overwrite?) — move/delete/copy; destination is required for move and copy"
+        }
+        "process_exec" => {
+            "process_exec(command, cwd?, background?, name?) — run one shell command in the workspace; background=true returns a task_id, outlives the turn, and its completion posts as a session message (read task_output, stop task_kill)"
+        }
+        "task_output" => {
+            "task_output(task_id, cursor?) — read a background task's output; no cursor = rolling tail, cursor = page from that byte offset"
+        }
+        "task_kill" => "task_kill(task_id) — terminate a background task's whole process group",
+        "web_fetch" => {
+            "web_fetch(url, max_bytes?) — fetch a public https (or loopback http) URL and return its readable text"
+        }
+        "web_search" => "web_search(query) — search the web, returning a bounded text summary",
+        "spawn_subagent" => {
+            "spawn_subagent(task, prompt, model?, provider?, workflow?, workflow_trigger?, parent_slot?, workflow_author?) — delegate one bounded task to a depth-capped child; task = short label, prompt = full brief"
+        }
+        "message_subagent" => {
+            "message_subagent(agent, message) — steer a running direct child or start an idle one (agent = id returned by spawn_subagent)"
+        }
+        "todo_write" => {
+            "todo_write(items:[{id, text, state, dep?}]) — REPLACE the whole todo list with the complete plan; keep exactly one item processing; dep = id this item is blocked on"
+        }
+        "graph_evidence" => {
+            "graph_evidence(graph_id, node, verdict, detail, slot?, subject_digest?, signal?, workspace_mutation?) — attest an open obligation; node must equal an open obligation; signal/workspace_mutation carry daemon provenance for verified slots"
+        }
+        "workflow_author" => {
+            "workflow_author(template) — replace this workflow child's initial graph with one bounded validated DAG (template: name, version, start_node, nodes)"
+        }
+        "request_input" => {
+            "request_input(kind, title, body?, options?) — ask the user one blocking prompt; options=[{key, label, detail?}] for a choice"
+        }
+        _ => return None,
+    })
+}
+
+/// Builds the system-prompt tool manual for exactly the tools advertised this
+/// turn (the grant/provider-filtered set), so a child or a provider that sheds
+/// a tool never sees a signature for one it cannot call. Returns `""` when no
+/// advertised tool is manual-described (e.g. a computer-only child), leaving
+/// the base prompt byte-identical.
+pub(crate) fn tool_manual(tools: &[ToolDefinition]) -> String {
+    let lines: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| tool_manual_line(&tool.name))
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut manual = String::from(
+        "\n\nTool manual — authoritative call signatures (? marks an optional argument). \
+         Each tool's schema lists any enum values and the daemon enforces every argument bound; \
+         call tools through the native tool interface:",
+    );
+    for line in lines {
+        manual.push_str("\n- ");
+        manual.push_str(line);
+    }
+    manual
+}
+
 fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
+    // Instruct pipe: the wire carries only a tool's NAME and a minimal stub
+    // schema (structure + enums). Its human-readable description AND every
+    // per-property description move into the single system-prompt tool manual,
+    // so the model reads one compact manual instead of paying JSON-Schema
+    // syntax tax on every tool, every turn. `computer` is stubbed like the
+    // rest: Anthropic/OpenAI substitute their native computer tool (this schema
+    // is never read there), and the generic/Gemini path is covered by the
+    // manual plus the daemon's own `ComputerOperation::from_tool_args` checks.
     ToolDefinition {
         name: manifest.name,
-        description: manifest.description,
-        input_schema: manifest.input_schema,
+        description: String::new(),
+        input_schema: stub_schema(&manifest.input_schema),
     }
 }
 

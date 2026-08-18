@@ -293,11 +293,12 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
     }
 }
 
-/// MUTATION CHECK: add an empty delimiter or retain the v1 policy identifier.
+/// MUTATION CHECK: add an empty delimiter or retain a stale policy identifier.
 /// Expected RUNTIME failure: the no-files prompt differs anywhere other than
-/// the explicitly pinned v2 version line.
+/// the explicitly pinned v3 version line. (The builder stays pure — the
+/// instruct-pipe tool manual is appended by the worker turn path, not here.)
 #[tokio::test]
-async fn empty_walk_composes_byte_identical_v1_body_with_v2_version() {
+async fn empty_walk_composes_byte_identical_body_with_v3_version() {
     let root = tempfile::tempdir().expect("workspace");
     let cwd = canonical_utf8(root.path());
     let loaded = load(&cwd).await;
@@ -306,7 +307,7 @@ async fn empty_walk_composes_byte_identical_v1_body_with_v2_version() {
     assert_eq!(
         prompt,
         format!(
-            "haider-system-v2\nYou are Haider Code, a coding agent operating inside the canonical workspace below.\n\
+            "haider-system-v3\nYou are Haider Code, a coding agent operating inside the canonical workspace below.\n\
              Workspace: {cwd}\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result."

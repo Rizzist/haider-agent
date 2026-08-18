@@ -557,9 +557,16 @@ fn todo_write_is_registered_advertised_and_routable() {
         .iter()
         .find(|definition| definition.name == "todo_write")
         .expect("todo_write is advertised to providers");
+    // Instruct pipe: the wire definition is description-free; the whole-list-
+    // replace teaching lives in the authored manifest (and, at turn time, the
+    // system-prompt tool manual), not on the advertised ToolDefinition.
+    assert!(definition.description.is_empty());
     assert!(
-        definition.description.contains("REPLACES the whole list"),
-        "the description teaches whole-list-replace usage"
+        entry
+            .manifest
+            .description
+            .contains("REPLACES the whole list"),
+        "the authored manifest teaches whole-list-replace usage"
     );
 }
 

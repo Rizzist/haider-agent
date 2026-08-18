@@ -5,8 +5,8 @@ use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
     WebCapabilityDegrade, advertised_tool_definitions, defer_shell_handoff,
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
-    explicit_computer_use_intent, registered_tool_route, registered_tools, tool_inventory_snapshot,
-    typed_tool_result,
+    explicit_computer_use_intent, registered_tool_route, registered_tools, stub_schema,
+    tool_inventory_snapshot, tool_manual, tool_manual_line, typed_tool_result,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -899,4 +899,142 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
         }));
     }
     recovered.close().await.expect("close store");
+}
+
+/// MUTATION CHECK: keep a description/bound in the stub, forget to recurse into
+/// items/properties, or leave a top-level combinator. Expected RUNTIME failure:
+/// the stub still carries prose/bounds, or drops the nested structure a native
+/// tool call is validated against.
+#[test]
+fn stub_schema_keeps_structure_drops_prose_and_bounds() {
+    let full = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "description": "the file path"},
+            "mode": {"type": "string", "enum": ["a", "b"], "description": "the mode"},
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old": {"type": "string", "minLength": 1, "description": "anchor"},
+                        "new": {"type": "string"}
+                    },
+                    "required": ["old", "new"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false,
+        "anyOf": [{"required": ["path"]}]
+    });
+    let stub = stub_schema(&full);
+    // Structure a provider validates against is kept, recursively.
+    assert_eq!(stub["type"], "object");
+    assert_eq!(stub["required"], serde_json::json!(["path"]));
+    assert_eq!(stub["properties"]["path"]["type"], "string");
+    assert_eq!(
+        stub["properties"]["mode"]["enum"],
+        serde_json::json!(["a", "b"])
+    );
+    assert_eq!(stub["properties"]["edits"]["type"], "array");
+    assert_eq!(
+        stub["properties"]["edits"]["items"]["required"],
+        serde_json::json!(["old", "new"])
+    );
+    assert_eq!(
+        stub["properties"]["edits"]["items"]["properties"]["old"]["type"],
+        "string"
+    );
+    // Prose and every daemon-re-enforced bound/combinator are gone everywhere.
+    let text = serde_json::to_string(&stub).expect("serialize stub");
+    for banned in [
+        "description",
+        "minLength",
+        "minItems",
+        "additionalProperties",
+        "anyOf",
+        "the file path",
+        "anchor",
+    ] {
+        assert!(!text.contains(banned), "stub must drop `{banned}`: {text}");
+    }
+}
+
+/// MUTATION CHECK: add a tool without a manual line, or leave a description on
+/// the wire. Expected RUNTIME failure: an advertised tool has no signature the
+/// model can read, or a wire ToolDefinition still carries a description.
+#[test]
+fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let root = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    assert!(
+        root.iter().any(|tool| tool.name == "computer"),
+        "root pack should include computer"
+    );
+    for tool in &root {
+        assert!(
+            tool_manual_line(&tool.name).is_some(),
+            "advertised tool `{}` has no manual line — instruct-pipe drift",
+            tool.name
+        );
+        assert!(
+            tool.description.is_empty(),
+            "wire tool `{}` still carries a description — semantics belong in the manual",
+            tool.name
+        );
+    }
+    let manual = tool_manual(&root);
+    for signature in ["fs_read(", "process_exec(", "computer(", "todo_write("] {
+        assert!(manual.contains(signature), "manual missing `{signature}`");
+    }
+    // The whole-list-replace teaching that used to live on the todo_write wire
+    // description now lives in the manual.
+    assert!(manual.contains("REPLACE the whole todo list"));
+}
+
+/// MUTATION CHECK: stop stubbing, stop emptying wire descriptions, or move
+/// nothing into the manual. Expected RUNTIME failure: the instruct pipe stops
+/// being a real (>1/3) net reduction of the advertised prefix.
+#[test]
+fn instruct_pipe_shrinks_the_advertised_wire_pack() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let stubbed =
+        advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    let registry = registered_tools();
+    // Original prefix: each tool's name + full description + full schema.
+    let full_prefix: usize = stubbed
+        .iter()
+        .map(|tool| {
+            let manifest = registry
+                .iter()
+                .find(|entry| entry.manifest.name == tool.name)
+                .expect("advertised tool has a registry manifest");
+            tool.name.len()
+                + manifest.manifest.description.len()
+                + serde_json::to_string(&manifest.manifest.input_schema)
+                    .expect("serialize full")
+                    .len()
+        })
+        .sum();
+    // Instruct-pipe prefix: name + (empty) wire description + stub schema, plus
+    // the one shared manual carried once in the system prompt.
+    let stub_wire: usize = stubbed
+        .iter()
+        .map(|tool| {
+            tool.name.len()
+                + tool.description.len()
+                + serde_json::to_string(&tool.input_schema)
+                    .expect("serialize stub")
+                    .len()
+        })
+        .sum();
+    let new_total = stub_wire + tool_manual(&stubbed).len();
+    assert!(full_prefix > 0 && new_total < full_prefix);
+    assert!(
+        full_prefix - new_total > full_prefix / 3,
+        "instruct pipe must cut the advertised prefix by >1/3 (new {new_total} vs full {full_prefix})"
+    );
 }
