@@ -31,18 +31,20 @@ comment    = "#" ...                 ; whole-line, ignored
   authored in the source.
 - A node **without** `@agent-type` is a **control node**: it only gates —
   identity on the artifact.
-- Gate default is `cmd`. Meanings:
-  | gate | resolved | green when |
+- Gate default is `cmd`. Lowering (onto the CG gate vocabulary):
+  | gate | compiles to | green when |
   |---|---|---|
-  | `cmd` | command-green | the node's command/child exits 0 |
-  | `ship` | reviewer-SHIP | a reviewer says SHIP |
-  | `all-of-N` | all-of-N | every one of N fan-out dimensions is green |
-  | `human` | human-confirm | the human approves (the run parks on a menu) |
-- `↺target` (ASCII alias `^target`) declares the red edge: when the gate
-  exhausts its in-node retries, the runtime reopens `target` — which **must
-  be an earlier node** — as a new rev-bound attempt. Forward or unknown
-  targets are parse errors. Green always flows to the next line; the last
-  node's green is `done`.
+  | `cmd` | CommandGreen | the node's command/child exits 0 |
+  | `ship` | CommandGreen | INTERIM: a reviewer child is still a child whose gate exits green; a dedicated reviewer gate can widen this lowering without touching sources |
+  | `all-of-N` | AllOfN{n} · N ≤ 8 | every one of N fan-out dimensions is green (N is bounded by the per-attempt evidence budget — a wider N would be a never-green node) |
+  | `human` | HumanConfirm | the human approves (the run parks on a menu) |
+- `↺target` (ASCII alias `^target`) declares the red edge, which **must
+  target an earlier node** (forward or unknown targets are parse errors).
+  It compiles into `LoomNodeMeta.back`; the intended semantics — exhaustion
+  reopens `target` as a new rev-bound attempt — land when the Loom runtime
+  (phase C) consumes that metadata. Until then the CG law applies unchanged:
+  exhaustion reopens the graph's start node. Green always flows to the next
+  line; the last node's green is `done`.
 
 ## Example (the flagship)
 
@@ -65,8 +67,13 @@ publish              "you approve the cut"               :human
   I/O from the registry, and wires edges (`green: next`, `red: retry ≤cap`,
   `back: target`, `human: hold`).
 - **Type-check** (A4): edge `A → B` is valid iff `A.out` is accepted by
-  `B.in` (subtype/coercion later; exact match first). Checked at
-  registration.
+  `B.in`. Acceptance is exact string match, with ONE widening: an expected
+  composite `X + Y` accepts a carried `X` or `Y` (any single operand) — a
+  deliberate v1 weakening that lets a joiner node consume the latest
+  artifact while its earlier inputs remain reachable upstream. Composites
+  are recognized on the EXPECTED side only; a composite carried type does
+  not decompose in v1. Checked at registration; header types must be
+  identifiers (or `A + B` composites), never empty.
 - **Bounds**: hop cap and per-node attempt caps are runtime constants, not
   source-controlled (a graph author cannot un-bound a run).
 - Versioning: this document is `pipe/v1`. The version rides the registry

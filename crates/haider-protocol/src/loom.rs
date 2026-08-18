@@ -12,8 +12,8 @@
 //! record: the template is a derived artifact.
 
 use crate::graph::{
-    GRAPH_MAX_ATTEMPTS, GraphExecutorShape, GraphGateKind, GraphNodeName, GraphNodeSpec,
-    GraphTemplateSpec, validate_graph_template,
+    GRAPH_MAX_ATTEMPTS, GRAPH_MAX_EVIDENCE_PER_ATTEMPT, GRAPH_TEMPLATE_VERSION, GraphExecutorShape,
+    GraphGateKind, GraphNodeName, GraphNodeSpec, GraphTemplateSpec, validate_graph_template,
 };
 use serde::{Deserialize, Serialize};
 
@@ -205,9 +205,25 @@ pub fn parse_pipe(source: &str) -> LoomAst {
             && let Some((input, output)) = io.split_once("->")
             && is_ident(head.trim())
         {
-            ast.name = Some(head.trim().to_string());
-            ast.in_type = input.trim().to_string();
-            ast.out_type = output.trim().to_string();
+            let head = head.trim();
+            let input = input.trim();
+            let output = output.trim();
+            if head.len() > 64 {
+                ast.errors
+                    .push(format!("workflow name `{head}` exceeds 64 bytes"));
+            }
+            // Empty or malformed types would silently disable the typed-edge
+            // law; a second `->` means the header was mis-split.
+            if output.contains("->") {
+                ast.errors.push("header declares more than one `->`".into());
+            } else if !valid_type_expr(input) || !valid_type_expr(output) {
+                ast.errors.push(format!(
+                    "header types must be identifiers (optionally `A + B`): `{input}` -> `{output}`"
+                ));
+            }
+            ast.name = Some(head.to_string());
+            ast.in_type = input.to_string();
+            ast.out_type = output.to_string();
             continue;
         }
         match parse_node_line(line) {
@@ -248,6 +264,11 @@ fn is_ident(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+/// A type expression is one identifier or a `A + B` composite of identifiers.
+fn valid_type_expr(value: &str) -> bool {
+    !value.is_empty() && value.split('+').all(|operand| is_ident(operand.trim()))
+}
+
 fn parse_node_line(line: &str) -> Result<LoomNodeAst, String> {
     // The quoted task is lifted first so its words never read as tokens.
     let (task, rest) = match line.find('"') {
@@ -283,25 +304,54 @@ fn parse_node_line(line: &str) -> Result<LoomNodeAst, String> {
         gate: LoomGate::Cmd,
         back: None,
     };
+    let mut saw_gate = false;
     for token in tokens {
         if let Some(atype) = token.strip_prefix('@') {
             if !is_ident(atype) {
                 return Err(format!("bad agent type `@{atype}` on {name}"));
             }
+            // Duplicates never last-win: a second token is a contradiction.
+            if node.agent_type.is_some() {
+                return Err(format!("duplicate agent type on {name}"));
+            }
             node.agent_type = Some(atype.to_string());
         } else if let Some(gate) = token.strip_prefix(':') {
+            if saw_gate {
+                return Err(format!("duplicate gate on {name}"));
+            }
+            saw_gate = true;
             node.gate = match gate {
                 "cmd" => LoomGate::Cmd,
                 "ship" => LoomGate::Ship,
                 "human" => LoomGate::Human,
-                other => match other.strip_prefix("all-of-").and_then(|n| n.parse().ok()) {
-                    Some(n) if n > 0 => LoomGate::AllOf(n),
+                other => match other.strip_prefix("all-of-") {
+                    // Digits only (no `+6`), and bounded: the gate's green
+                    // count must be satisfiable within one attempt's evidence
+                    // budget — a wider N is a never-green node by construction.
+                    Some(digits)
+                        if !digits.is_empty()
+                            && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+                    {
+                        match digits.parse::<u32>() {
+                            Ok(n) if n > 0 && n <= GRAPH_MAX_EVIDENCE_PER_ATTEMPT => {
+                                LoomGate::AllOf(n)
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "gate :all-of-{digits} on {name} must be 1..={GRAPH_MAX_EVIDENCE_PER_ATTEMPT}"
+                                ));
+                            }
+                        }
+                    }
                     _ => return Err(format!("unknown gate :{other} on {name}")),
                 },
             };
         } else if let Some(back) = token.strip_prefix('↺').or_else(|| token.strip_prefix('^')) {
             if !is_ident(back) {
                 return Err(format!("bad back-edge target `{back}` on {name}"));
+            }
+            if node.back.is_some() {
+                return Err(format!("duplicate back-edge on {name}"));
             }
             node.back = Some(back.to_string());
         } else {
@@ -390,12 +440,17 @@ pub fn compile_pipe(
                 GRAPH_MAX_ATTEMPTS,
             ),
         };
+        // The store's evidence path REQUIRES a round bound on every
+        // non-human gate ("open graph node has no evidence-round bound" is a
+        // StoreCorrupt); human gates must not carry one.
+        let max_evidence_per_attempt =
+            (gate != GraphGateKind::HumanConfirm).then_some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT);
         specs.push(GraphNodeSpec {
             name: cg_name.clone(),
             gate,
             executor,
             max_attempts,
-            max_evidence_per_attempt: None,
+            max_evidence_per_attempt,
             depends_on: previous.clone().into_iter().collect(),
             verify_slots: Vec::new(),
         });
@@ -419,7 +474,7 @@ pub fn compile_pipe(
     }
     let template = GraphTemplateSpec {
         name: name.clone(),
-        version: 1,
+        version: GRAPH_TEMPLATE_VERSION,
         start_node: specs.first().map(|spec| spec.name.clone()),
         nodes: specs,
     };
@@ -501,6 +556,16 @@ fn workflow_digest(workflow: &LoomWorkflow) -> String {
     hasher.update(workflow.pipe_version.as_bytes());
     hasher.update(b"\x1f");
     hasher.update(workflow.source.as_bytes());
+    // The digest binds the RESOLVED type signatures too: the same source
+    // compiled against a changed registry is a different workflow identity.
+    for meta in &workflow.meta {
+        hasher.update(meta.node.as_str().as_bytes());
+        hasher.update(b"\x1e");
+        hasher.update(meta.in_type.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\x1e");
+        hasher.update(meta.out_type.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\x1f");
+    }
     hasher.update(&workflow.rev.to_le_bytes());
     hasher.finalize().to_hex()[..16].to_string()
 }
@@ -581,6 +646,20 @@ publish              "you approve the cut"               :human
         // The control node carries no type and is identity on the artifact.
         assert!(workflow.meta[5].agent_type.is_none());
         assert!(!workflow.digest.is_empty());
+        // Verify-fix pin: every non-human node carries the evidence-round
+        // bound the store REQUIRES (None → StoreCorrupt at run time); human
+        // gates must not carry one.
+        for spec in &workflow.template.nodes {
+            if spec.gate == GraphGateKind::HumanConfirm {
+                assert!(spec.max_evidence_per_attempt.is_none());
+            } else {
+                assert_eq!(
+                    spec.max_evidence_per_attempt,
+                    Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT)
+                );
+            }
+        }
+        assert_eq!(workflow.template.version, GRAPH_TEMPLATE_VERSION);
         // The compiled template passes the CG validator (redundant with
         // compile, pinned here so a validator change surfaces loudly).
         assert!(validate_graph_template(&workflow.template).is_ok());
@@ -694,5 +773,74 @@ publish              "you approve the cut"               :human
         let mut regranted = base.clone();
         regranted.apis.push("elevenlabs".into());
         assert_ne!(base.digest(), regranted.digest());
+    }
+    /// Verify-fix pins: duplicate tokens are contradictions, not last-wins;
+    /// all-of-N is digits-only and bounded; headers with empty/malformed
+    /// types or a second `->` reject instead of disabling the type law.
+    #[test]
+    fn parse_rejects_duplicates_bounds_and_bad_headers() {
+        let dup = parse_pipe("f: A -> A\nn :human :cmd \"x\"");
+        assert!(dup.errors.iter().any(|e| e.contains("duplicate gate")));
+        let dup_type = parse_pipe("f: A -> A\nn @a @b \"x\"");
+        assert!(
+            dup_type
+                .errors
+                .iter()
+                .any(|e| e.contains("duplicate agent type"))
+        );
+        let dup_back = parse_pipe("f: A -> A\na \"x\"\nb ↺a ^a");
+        assert!(
+            dup_back
+                .errors
+                .iter()
+                .any(|e| e.contains("duplicate back-edge"))
+        );
+
+        let wide = parse_pipe("f: A -> A\nn :all-of-4294967295 \"x\"");
+        assert!(wide.errors.iter().any(|e| e.contains("must be 1..=")));
+        let plus = parse_pipe("f: A -> A\nn :all-of-+6 \"x\"");
+        assert!(plus.errors.iter().any(|e| e.contains("unknown gate")));
+
+        let empty_in = parse_pipe("f:  -> B\nn \"x\"");
+        assert!(empty_in.errors.iter().any(|e| e.contains("header types")));
+        let double_arrow = parse_pipe("f: A -> B -> C\nn \"x\"");
+        assert!(
+            double_arrow
+                .errors
+                .iter()
+                .any(|e| e.contains("more than one"))
+        );
+        let long = parse_pipe(&format!("{}: A -> A\nn \"x\"", "x".repeat(70)));
+        assert!(long.errors.iter().any(|e| e.contains("exceeds 64 bytes")));
+    }
+
+    /// Verify-fix pin: the workflow digest binds the RESOLVED registry
+    /// signatures — same source, changed registry, different identity.
+    #[test]
+    fn digest_binds_resolved_type_signatures() {
+        let src = "f: SourceURL -> Transcript\nn @researcher \"t\"";
+        let a = compile_pipe(&parse_pipe(src), |_| {
+            Some(LoomTypeSig {
+                in_type: "SourceURL".into(),
+                out_type: "Transcript".into(),
+            })
+        })
+        .expect("a");
+        // Same source, but the registry now says the researcher produces a
+        // RicherTranscript — the pipe output check would fail, so compare via
+        // a compatible change: keep out_type but change in_type acceptance.
+        let b = compile_pipe(
+            &parse_pipe("f:  .. -> Transcript\nn @researcher \"t\""),
+            |_| None,
+        );
+        assert!(b.is_err(), "malformed header must reject");
+        let c = compile_pipe(&parse_pipe(src), |_| {
+            Some(LoomTypeSig {
+                in_type: "SourceURL + PlaylistURL".into(),
+                out_type: "Transcript".into(),
+            })
+        })
+        .expect("c");
+        assert_ne!(a.digest, c.digest);
     }
 }
