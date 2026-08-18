@@ -684,34 +684,7 @@ fn exact_once_shell_command() -> String {
 
 #[cfg(windows)]
 fn windows_powershell_command(script: &str) -> String {
-    // The exec interpreter is cmd; when a fixture needs real PowerShell
-    // semantics it invokes PowerShell explicitly, so the command cmd runs is
-    // `powershell.exe -EncodedCommand <utf16le-base64>`. EncodedCommand is
-    // quote-proof — it survives cmd's `/S /C "..."` wrapping intact.
-    let executable = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("WINDIR"))
-        .map(std::path::PathBuf::from)
-        .map(|root| {
-            root.join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe")
-        })
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        });
-    let encoded = BASE64.encode(
-        script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
-    format!(
-        "\"{executable}\" -NoProfile -NonInteractive -EncodedCommand {encoded}",
-        executable = executable.display(),
-        encoded = encoded,
-    )
+    script.into()
 }
 
 #[cfg(unix)]

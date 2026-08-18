@@ -159,10 +159,11 @@ fn terminate_daemon_checked(profile: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 const EXEC_WRITE_COMMAND: &str = "printf ok > exec-created.txt";
 
-// The Windows exec interpreter is cmd (fast per-turn spawn), so fixtures
-// speak cmd, not PowerShell.
+// T4 made absolute System32 PowerShell the Windows interpreter for BOTH
+// user `!` commands and the exec tool (the shell_command pin in
+// haider-tools), so fixtures speak PowerShell, not cmd.
 #[cfg(windows)]
-const EXEC_WRITE_COMMAND: &str = r#">exec-created.txt <nul set /p "=ok" & exit /b 0"#;
+const EXEC_WRITE_COMMAND: &str = "[IO.File]::WriteAllText('exec-created.txt','ok')";
 
 #[test]
 fn version_prints_workspace_version() {
