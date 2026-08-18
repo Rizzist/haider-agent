@@ -6142,6 +6142,7 @@ impl BrokerToolFactory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
+    Plan,
     TodoWrite,
     GraphEvidence,
     FsRead,
@@ -6212,6 +6213,15 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             DispatchMode::Await,
             ToolPermissionDefault::NotApplicable,
             RegisteredToolRoute::RequestInput,
+        ),
+        // D4: actor-owned like request_input — presenting a proposal is not
+        // a side effect; the run parks on the durable plan menu.
+        registered_tool(
+            plan_definition(),
+            vec![],
+            DispatchMode::Await,
+            ToolPermissionDefault::NotApplicable,
+            RegisteredToolRoute::Plan,
         ),
         {
             // G1: actor-owned like request_input — no brokered effect.
@@ -6365,6 +6375,7 @@ pub(crate) fn default_child_grant() -> Grant {
                     RegisteredToolRoute::TodoWrite
                         | RegisteredToolRoute::GraphEvidence
                         | RegisteredToolRoute::WorkflowAuthor
+                        | RegisteredToolRoute::Plan
                         | RegisteredToolRoute::Computer
                 )
             })
@@ -6378,6 +6389,7 @@ pub(crate) fn default_child_grant() -> Grant {
                     RegisteredToolRoute::TodoWrite
                         | RegisteredToolRoute::GraphEvidence
                         | RegisteredToolRoute::WorkflowAuthor
+                        | RegisteredToolRoute::Plan
                         | RegisteredToolRoute::Computer
                 )
             })
@@ -6584,6 +6596,9 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "request_input" => {
             "request_input(kind, title, body?, options?) — ask the user one blocking prompt; options=[{key, label, detail?}] for a choice"
+        }
+        "plan" => {
+            "plan(title, body) — present a full markdown plan/proposal for review before acting; the user answers accept / revise (with a note) / reject and the result is {decision, note}. Use for designs, migrations, architectures — anything that deserves approval first"
         }
         _ => return None,
     })
@@ -8458,6 +8473,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .await
             }
             RegisteredToolRoute::RequestInput
+            | RegisteredToolRoute::Plan
             | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::GraphEvidence
             | RegisteredToolRoute::WorkflowAuthor
@@ -9155,6 +9171,26 @@ fn request_input_definition() -> ToolDefinition {
             },
             "required": ["kind", "title"],
             "additionalProperties": false
+        }),
+    }
+}
+
+/// D4: the generic plan tool. The full markdown proposal parks the run on a
+/// durable menu the client renders full screen; the decision comes back as
+/// the tool result.
+fn plan_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "plan".into(),
+        description: "Present a full plan/proposal (markdown) for human review before acting; \
+                      returns {decision: accept|revise|reject, note}"
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "minLength": 1, "maxLength": haider_tools::PLAN_TITLE_MAX_BYTES},
+                "body": {"type": "string", "minLength": 1, "maxLength": haider_tools::PLAN_BODY_MAX_BYTES}
+            },
+            "required": ["title", "body"]
         }),
     }
 }

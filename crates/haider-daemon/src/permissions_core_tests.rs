@@ -553,6 +553,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             .collect::<Vec<_>>(),
         [
             "request_input",
+            "plan",
             "todo_write",
             "graph_evidence",
             "fs_read",

@@ -3132,6 +3132,11 @@ pub struct AppModel {
     pub demo_requests: Vec<DemoRequest>,
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
+    /// D4: scroll offset into the open `plan` proposal document (the plan
+    /// menu's markdown body renders full-height in the transcript area).
+    pub plan_scroll: u16,
+    /// The plan menu the scroll belongs to — a NEW proposal starts at the top.
+    pub plan_menu_seen: Option<MenuId>,
     /// Selected row in the slash palette (open while composer starts with /).
     /// Ranges over the FULL match list; the render window follows.
     pub palette_selection: usize,
@@ -3387,6 +3392,8 @@ impl Default for AppModel {
             )),
             demo_requests: Vec::new(),
             menu_selection: 0,
+            plan_scroll: 0,
+            plan_menu_seen: None,
             palette_selection: 0,
             palette_scroll: 0,
             palette_dismissed: false,
@@ -5235,6 +5242,50 @@ impl AppModel {
                 }
                 _ => {}
             }
+        }
+        // D4: an open `plan` proposal owns the scroll keys — the document
+        // fills the transcript area, so ↑↓/PgUp/PgDn page it and Tab cycles
+        // the decision; digits/⏎ still answer through the ordinary menu path.
+        if self.screen == Screen::Session
+            && let Some(menu) = self.projection.open_menu()
+            && menu.origin == "plan"
+            && !menu.options.is_empty()
+        {
+            if self.plan_menu_seen.as_ref() != Some(&menu.id) {
+                self.plan_menu_seen = Some(menu.id.clone());
+                self.plan_scroll = 0;
+            }
+            let options = menu.options.len();
+            match key.code {
+                KeyCode::Up => {
+                    self.plan_scroll = self.plan_scroll.saturating_sub(1);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Down => {
+                    self.plan_scroll = self.plan_scroll.saturating_add(1);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.plan_scroll = self.plan_scroll.saturating_sub(10);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.plan_scroll = self.plan_scroll.saturating_add(10);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.menu_selection = (self.menu_selection + 1) % options.max(1);
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
+            }
+            self.handle_menu_key(key.code);
+            return;
         }
         // A SELECT menu replaces the composer (sim §3 law); a zero-option
         // free-text ask leaves the keys to the composer.

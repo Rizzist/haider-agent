@@ -3630,11 +3630,22 @@ fn render_session(
         transcript_area.width,
     );
     debug_assert_eq!(visible_total, total);
-    let paragraph = Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false });
-    frame.render_widget(
-        paragraph.scroll((scroll.saturating_sub(visible_base), 0)),
-        transcript_area,
-    );
+    // D4: an open `plan` proposal owns the transcript area — the full
+    // markdown document renders here (scrolled), while the decision menu
+    // keeps the composer band through the ordinary blocking-menu path.
+    let plan_menu = model
+        .projection
+        .open_menu()
+        .filter(|open| open.origin == "plan" && !open.options.is_empty() && model.login.is_none());
+    if let Some(plan) = plan_menu {
+        render_plan_document(plan, theme, frame, transcript_area, model.plan_scroll);
+    } else {
+        let paragraph = Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false });
+        frame.render_widget(
+            paragraph.scroll((scroll.saturating_sub(visible_base), 0)),
+            transcript_area,
+        );
+    }
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
     // top-visible content. Chrome per the sim's ACTUAL CSS (owner item 11 —
@@ -6691,6 +6702,15 @@ fn wrapped_menu_body(
     width: u16,
     now_ms: u64,
 ) -> Vec<(String, DiffTone)> {
+    // D4: a `plan` proposal's body is the full document — it renders in the
+    // transcript area, never in the composer band; the band keeps a one-line
+    // pointer so the sizing ladder stays sane.
+    if menu.origin == "plan" {
+        return vec![(
+            "proposal above — ↑↓/PgUp/PgDn scroll · Tab cycles the decision".into(),
+            DiffTone::Body,
+        )];
+    }
     let budget = (width as usize).saturating_sub(2).max(1);
     // Both recovery families speak through their typed presentation when
     // they carry one: the provider/account card (E2) and the E6
@@ -6902,6 +6922,86 @@ fn permission_card_block(
     lines.truncate(allocated);
     hits.retain(|(offset, _)| (*offset as usize) < allocated);
     (lines, hits)
+}
+
+/// D4: the full-screen plan proposal — header, markdown document with the
+/// agent-message rail treatment, and a scroll indicator. Scroll is clamped to
+/// the document, so a stale `plan_scroll` can never blank the surface.
+fn render_plan_document(
+    menu: &haider_protocol::menu::Menu,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    scroll: u16,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("◇ PLAN ", theme.gold_style()),
+        Span::styled("· ", theme.dim_style()),
+        Span::styled(menu.title.clone(), theme.bright_style()),
+    ]));
+    lines.push(Line::styled(
+        "─".repeat(area.width as usize),
+        theme.dim_style(),
+    ));
+    let budget = (area.width as usize).saturating_sub(3);
+    if budget > 0 {
+        let document = menu.body.join("\n");
+        let md_lines = crate::md::render_markdown(&document);
+        let mut idx = 0usize;
+        let push_row = |lines: &mut Vec<Line<'static>>, row: Vec<crate::md::MdSpan>| {
+            let mut spans = vec![Span::raw(" "), Span::styled("▏ ", theme.rail_style())];
+            spans.extend(
+                row.into_iter()
+                    .map(|span| Span::styled(span.text, theme.md_style(span.kind))),
+            );
+            lines.push(Line::from(spans));
+        };
+        while idx < md_lines.len() {
+            if md_lines[idx].table.is_some() {
+                let start = idx;
+                while idx < md_lines.len() && md_lines[idx].table.is_some() {
+                    idx += 1;
+                }
+                let rows: Vec<&crate::md::MdTableRow> = md_lines[start..idx]
+                    .iter()
+                    .filter_map(|line| line.table.as_ref())
+                    .collect();
+                for row in crate::md::layout_table(&rows, budget) {
+                    push_row(&mut lines, row);
+                }
+                continue;
+            }
+            for row in crate::md::wrap_spans(&md_lines[idx].spans, budget) {
+                push_row(&mut lines, row);
+            }
+            idx += 1;
+        }
+    }
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(area.height);
+    let clamped = scroll.min(max_scroll);
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph.scroll((clamped, 0)), area);
+    // Scroll indicator in the top-right corner while the document overflows.
+    if max_scroll > 0 && area.width > 12 {
+        let label = format!(" {clamped}/{max_scroll} ▾ ");
+        let width = u16::try_from(label.len()).unwrap_or(0).min(area.width);
+        let corner = Rect {
+            x: area.x + area.width - width,
+            y: area.y,
+            width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(label, theme.dim_style())),
+            corner,
+        );
+    }
 }
 
 fn menu_block(

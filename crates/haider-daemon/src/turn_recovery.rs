@@ -543,9 +543,11 @@ fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint
                 if !reduction.tool_results.contains(call_id)
                     && match &open_menu.menu.kind {
                         haider_protocol::menu::MenuKind::Permission { .. } => {
-                            name != "request_input"
+                            name != "request_input" && name != "plan"
                         }
-                        _ => name == "request_input",
+                        // `plan` parks on the same InputRequired machinery as
+                        // `request_input`; both reconstruct their checkpoint.
+                        _ => name == "request_input" || name == "plan",
                     } =>
             {
                 Some(RequestInputCheckpoint {
@@ -1044,6 +1046,92 @@ mod partial_stream_recovery_tests {
                 source_run: Some(run_id),
                 source_item: Some(item_id),
             }
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod plan_recovery_tests {
+    use super::*;
+    use haider_protocol::item::ToolStatus;
+    use haider_protocol::menu::{MenuOption, MenuScope};
+
+    /// D4 MUTATION CHECK: narrow the pending-checkpoint predicate back to
+    /// `request_input` only. Expected RUNTIME failure: a daemon restart while
+    /// a `plan` proposal is open would drop the parked turn instead of
+    /// reconstructing its checkpoint.
+    #[test]
+    fn restart_reconstructs_a_parked_plan_checkpoint() {
+        let session_id = SessionId::new("plan-restart");
+        let run_id = RunId::new("run-plan-restart");
+        let item_id = ItemId::new("plan-item");
+        let menu_id = MenuId::new("plan-menu");
+        let plan = haider_tools::Plan {
+            title: "Datacenter build-out".into(),
+            body: "# Tiers\n\n- edge".into(),
+        };
+        let menu = {
+            let mut menu = plan.menu(menu_id.clone());
+            menu.id = menu_id.clone();
+            menu
+        };
+        let args = serde_json::json!({
+            "title": "Datacenter build-out",
+            "body": "# Tiers\n\n- edge",
+        });
+        let payloads = vec![
+            EventPayload::UserMessage {
+                text: "propose it".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: TurnItem::ToolCall {
+                    call_id: "plan-call".into(),
+                    name: "plan".into(),
+                    args: args.clone(),
+                    status: ToolStatus::InProgress,
+                },
+            }),
+            EventPayload::MenuOpened(menu),
+            EventPayload::RunState(RunState::InputRequired {
+                menu: menu_id.clone(),
+            }),
+        ];
+        let mut envelopes = recovery_envelopes(
+            7,
+            &DeviceId::new("plan-restart-device"),
+            &session_id,
+            &run_id,
+            None,
+            payloads,
+        )
+        .expect("recovery envelopes");
+        for (index, envelope) in envelopes.iter_mut().enumerate() {
+            envelope.seq = u64::try_from(index + 1).expect("small sequence");
+        }
+        let mut reductions = HashMap::new();
+        for envelope in envelopes {
+            reduce(&mut reductions, envelope);
+        }
+        let reduction = reductions.get(&run_id).expect("reduced run");
+        let checkpoint = pending_checkpoint(reduction).expect("plan checkpoint reconstructs");
+        assert_eq!(checkpoint.tool_name, "plan");
+        assert_eq!(checkpoint.call_id, "plan-call");
+        assert_eq!(checkpoint.menu.id, menu_id);
+        assert_eq!(checkpoint.menu.origin, "plan");
+        // The durable menu still carries the full document for the client.
+        assert_eq!(checkpoint.menu.body[0], "# Tiers");
+        let _ = (
+            MenuOption {
+                key: String::new(),
+                label: String::new(),
+                detail: None,
+                decision: None,
+            },
+            MenuScope::Session,
         );
     }
 }

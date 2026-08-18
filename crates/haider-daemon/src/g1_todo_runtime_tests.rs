@@ -601,7 +601,11 @@ fn child_tool_pack_excludes_root_authority_tools() {
             .any(|definition| definition.name == "graph_evidence")
     );
     assert!(!child.iter().any(|definition| definition.name == "computer"));
-    assert_eq!(root.len(), child.len() + 3, "exactly three tools removed");
+    assert_eq!(
+        root.len(),
+        child.len() + 4,
+        "exactly four tools removed (todo_write, graph_evidence, computer, plan)"
+    );
     for definition in &child {
         assert!(
             root.iter().any(|other| other.name == definition.name),
