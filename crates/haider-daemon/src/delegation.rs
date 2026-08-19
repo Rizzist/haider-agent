@@ -1863,46 +1863,66 @@ impl DelegationHandle {
                     }
                 }
                 if graph_boundary || terminal_boundary {
-                    let reductions = reduce_graphs(&mirror.graph_envelopes);
-                    let Some(status) = rollup_graph_status(&reductions, &payload) else {
-                        continue;
-                    };
-                    let workflow =
-                        self.hub
-                            .loom_workflow(&status.template)
-                            .await?
-                            .filter(|workflow| {
-                                graph_template_digest(&workflow.template) == status.digest
-                            });
-                    let Some(rollup) = graph_rollup(
-                        &record.agent_id,
-                        status,
-                        workflow.as_ref(),
-                        mirror.child_run_terminal,
-                    ) else {
-                        continue;
-                    };
-                    if !rollup_is_material(&payload, mirror.last_rollup.as_ref(), &rollup) {
-                        continue;
+                    'rollup: {
+                        let reductions = reduce_graphs(&mirror.graph_envelopes);
+                        let Some(status) = rollup_graph_status(&reductions, &payload) else {
+                            break 'rollup;
+                        };
+                        let workflow =
+                            self.hub
+                                .loom_workflow(&status.template)
+                                .await?
+                                .filter(|workflow| {
+                                    graph_template_digest(&workflow.template) == status.digest
+                                });
+                        let Some(rollup) = graph_rollup(
+                            &record.agent_id,
+                            status,
+                            workflow.as_ref(),
+                            mirror.child_run_terminal,
+                        ) else {
+                            break 'rollup;
+                        };
+                        if !rollup_is_material(&payload, mirror.last_rollup.as_ref(), &rollup) {
+                            break 'rollup;
+                        }
+                        let event_id = format!(
+                            "delegation-graph-rollup-{}-{}",
+                            record.agent_id.as_str(),
+                            envelope.seq
+                        );
+                        if mirror.projected_events.contains(&event_id) {
+                            mirror.last_rollup = Some(rollup);
+                        } else if !same_rollup_transition(mirror.last_rollup.as_ref(), &rollup) {
+                            projections.push(graph_rollup_projection_envelope(
+                                record,
+                                &event_id,
+                                envelope.event_id,
+                                rollup.clone(),
+                                self.hub.device_id(),
+                                self.hub.worker_generation(),
+                            )?);
+                            mirror.projected_events.insert(event_id);
+                            mirror.last_rollup = Some(rollup);
+                        }
                     }
-                    let event_id = format!(
-                        "delegation-graph-rollup-{}-{}",
-                        record.agent_id.as_str(),
-                        envelope.seq
-                    );
-                    if mirror.projected_events.contains(&event_id) {
-                        mirror.last_rollup = Some(rollup);
-                    } else if !same_rollup_transition(mirror.last_rollup.as_ref(), &rollup) {
-                        projections.push(graph_rollup_projection_envelope(
-                            record,
-                            &event_id,
-                            envelope.event_id,
-                            rollup.clone(),
-                            self.hub.device_id(),
-                            self.hub.worker_generation(),
-                        )?);
-                        mirror.projected_events.insert(event_id);
-                        mirror.last_rollup = Some(rollup);
+                    // rev933c finding 5: the reduction history must not grow
+                    // with the child run. A terminal graph's events can no
+                    // longer change any future reduction — drop them once
+                    // this boundary (which may have published its final
+                    // rollup) has consumed them. The hard cap is a backstop
+                    // against pathological non-graph retention (menu spam);
+                    // dropping the OLDEST envelopes can only misproject
+                    // graphs that are already long dead.
+                    if let Some(dead) = terminal_graph_id(&payload) {
+                        mirror.graph_envelopes.retain(|kept| {
+                            raw_payload_graph_id(&kept.payload) != Some(dead.as_str())
+                        });
+                    }
+                    const GRAPH_ENVELOPE_CAP: usize = 8_192;
+                    if mirror.graph_envelopes.len() > GRAPH_ENVELOPE_CAP {
+                        let excess = mirror.graph_envelopes.len() - GRAPH_ENVELOPE_CAP;
+                        mirror.graph_envelopes.drain(..excess);
                     }
                 }
             }
@@ -2160,6 +2180,25 @@ fn graph_reduction_event(payload: &serde_json::Value) -> bool {
                 || kind == "evidence_recorded"
                 || kind.starts_with("menu_")
         })
+}
+
+/// The graph a TERMINAL payload closes, if any — the prune key for the
+/// mirror's reduction history (rev933c finding 5).
+fn terminal_graph_id(
+    payload: &haider_protocol::EventPayload,
+) -> Option<&haider_protocol::ids::GraphId> {
+    match payload {
+        haider_protocol::EventPayload::GraphCompleted(completed) => Some(&completed.graph_id),
+        haider_protocol::EventPayload::GraphAbandoned(abandoned) => Some(&abandoned.graph_id),
+        haider_protocol::EventPayload::GraphSuperseded(superseded) => Some(&superseded.old),
+        _ => None,
+    }
+}
+
+/// Raw top-level `graph_id` peek — the graph_* family all carry it; events
+/// without one (menus, attaches keyed differently) are conservatively kept.
+fn raw_payload_graph_id(payload: &serde_json::Value) -> Option<&str> {
+    payload.get("graph_id").and_then(serde_json::Value::as_str)
 }
 
 fn graph_rollup_boundary(payload: &haider_protocol::EventPayload) -> bool {

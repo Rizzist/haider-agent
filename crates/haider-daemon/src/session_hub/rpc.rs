@@ -1223,7 +1223,7 @@ impl HubConnection {
                 input,
                 status,
             } => {
-                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_CAPABILITY_DENIED,
@@ -6081,6 +6081,25 @@ impl HubConnection {
         request_id: RequestId,
         session_id: SessionId,
     ) -> Result<(), SessionHubError> {
+        // rev933c finding 8: a legal max-size snapshot (input + status caps
+        // plus envelope overhead) must fit this connection's negotiated
+        // frame limit, or a later publish would kill the watcher's
+        // connection mid-delivery. Refuse the registration upfront instead.
+        let snapshot_ceiling = SURFACE_INPUT_MAX_BYTES + SURFACE_STATUS_MAX_BYTES + 8_192;
+        if let Some(limit) = self.sink.max_frame_bytes()
+            && limit < snapshot_ceiling
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &format!(
+                    "surface watch needs a negotiated frame limit of at least \
+                     {snapshot_ceiling} bytes; this connection negotiated {limit}"
+                ),
+                false,
+                None,
+            );
+        }
         if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
             return self.respond_error(
                 request_id,

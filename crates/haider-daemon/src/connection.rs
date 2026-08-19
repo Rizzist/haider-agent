@@ -800,6 +800,10 @@ struct ConnectionFrameSink {
 }
 
 impl FrameSink for ConnectionFrameSink {
+    fn max_frame_bytes(&self) -> Option<usize> {
+        Some(self.outbound_limit)
+    }
+
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
         let bytes = encode_outbound(&frame, self.outbound_limit, self.encoding)

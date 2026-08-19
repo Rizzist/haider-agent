@@ -74,12 +74,12 @@ pub(crate) fn live_update_bridge(profile_dir: PathBuf, no_update_check: bool) ->
                 let _ = work_tx.send(event);
             });
         if let Err(error) = spawned {
-            send_app(
-                &tx,
-                AppEvent::UpdateFailed {
-                    message: format!("could not start update worker: {error}"),
-                },
-            );
+            // rev933c finding 6: this failure belongs to the INSTALL flow —
+            // an App-classed event would leave update_in_progress latched
+            // forever.
+            let _ = tx.send(LiveUpdateEvent::Install(AppEvent::UpdateFailed {
+                message: format!("could not start update worker: {error}"),
+            }));
         }
     };
 

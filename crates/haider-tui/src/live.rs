@@ -513,6 +513,17 @@ pub enum TranscriptionOp {
     Set,
 }
 
+impl LiveDriver {
+    /// The redial counter — bumps on every fresh socket. The runtime's
+    /// volatile publishers key their caches on it so a reconnect (which
+    /// cleared the daemon's surface state) republishes unchanged content
+    /// (rev933c finding 3).
+    #[must_use]
+    pub fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
+    }
+}
+
 impl LiveCommand {
     /// The durable idempotency key, for the mutations that have one.
     #[must_use]
@@ -3071,11 +3082,16 @@ impl LiveDriver {
                 // live input surface: the session is active and a session
                 // surface is on screen. Anything else ignores the op — the
                 // absence of a republish tells the injector it did not land.
+                // rev933c finding 4: an injected op lands only when the
+                // PLAIN session composer owns Enter — never under a menu
+                // card, the help overlay, or a non-session surface, where a
+                // synthesized Submit would answer/activate something else.
+                // The subagent view is excluded too: its composer messages
+                // the CHILD, which is not the surface the ADE mirrored.
                 if model.active_session.as_ref() == Some(&session)
-                    && matches!(
-                        model.screen,
-                        crate::app::Screen::Session | crate::app::Screen::Subagent
-                    )
+                    && model.screen == crate::app::Screen::Session
+                    && model.projection.open_menu().is_none()
+                    && !model.help_open
                 {
                     match op {
                         haider_rpc::SurfaceInjectOp::Set { text } => {

@@ -817,15 +817,18 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
     // it — 4 KiB keeps these byte-budget laws stable across additions.
     config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
-    config.outbound_queue_capacity = 512;
+    // rev933c finding 7: the connection HALVES this capacity into per-lane
+    // slots, and every pong rides the System lane — the per-lane count
+    // bound must stay strictly above the flood so only the BYTES fire.
+    config.outbound_queue_capacity = 1024;
     // rev933b finding 8: the refusal must not depend on how much of the
     // 4 KiB Welcome headroom the CURRENT feature list happens to eat. 400
     // framed pongs (~14 KiB) exceed the entire possible slack, so a refusal
     // fires under any Welcome size that still fits the frame limit.
     let pings = 400;
     assert!(
-        config.outbound_queue_capacity > pings + 1,
-        "the frame-count bound must not be what fires here — only the bytes"
+        config.outbound_queue_capacity / 2 > pings + 1,
+        "the per-lane frame-count bound must not be what fires here — only the bytes"
     );
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;

@@ -2945,7 +2945,7 @@ pub async fn run_live(
     // W-INP: the composer publishes itself as the session's volatile input
     // surface — one publish per actual change, revisions monotonic for the
     // life of this process.
-    let mut published_input: Option<(haider_protocol::ids::SessionId, String)> = None;
+    let mut published_input: Option<(u64, haider_protocol::ids::SessionId, String)> = None;
     let mut input_revision: u64 = 0;
 
     while !model.should_quit {
@@ -2991,7 +2991,10 @@ pub async fn run_live(
                             if key.code == KeyCode::Char('c')
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                     );
-                    if link_replies_open || quit_key || !matches!(event, Event::Key(_)) {
+                    if link_replies_open
+                        || quit_key
+                        || !matches!(event, Event::Key(_) | Event::Paste(_))
+                    {
                         dispatch_input(&mut model, &hit_map, event);
                     } else {
                         model.flash =
@@ -3168,7 +3171,9 @@ pub async fn run_live(
             && let Some(session) = model.active_session.clone()
         {
             let text = model.composer.text().to_owned();
-            let current = (session.clone(), text.clone());
+            // The epoch keys the cache: a redial cleared the daemon's
+            // surface state, so the same text must publish again.
+            let current = (driver.connection_epoch(), session.clone(), text.clone());
             if published_input.as_ref() != Some(&current) {
                 input_revision = input_revision.saturating_add(1);
                 pending.push_back(crate::live::LiveCommand::SurfacePublish {

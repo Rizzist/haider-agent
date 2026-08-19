@@ -286,6 +286,14 @@ pub trait FrameSink: Send + Sync {
     /// Admits one complete frame without waiting on a socket.
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError>;
 
+    /// The largest encodable outbound frame, when the sink knows one.
+    /// Handlers whose replies have a KNOWN maximum size (surface snapshots)
+    /// refuse registration upfront instead of letting a later oversized
+    /// encode kill the connection (rev933c finding 8). `None` = ungated.
+    fn max_frame_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Admits best-effort traffic without borrowing capacity reserved for
     /// replies or pongs. Sinks without a separate reply floor may use their
     /// normal admission path.
