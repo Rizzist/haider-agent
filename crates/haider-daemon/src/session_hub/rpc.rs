@@ -1217,6 +1217,18 @@ impl HubConnection {
                 }
                 self.session_list_watch(request_id)
             }
+            RequestBody::SessionPipePath { session_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_pipe_path(request_id, session_id).await
+            }
             RequestBody::SessionRead { session_id, range } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -5940,6 +5952,40 @@ impl HubConnection {
             }
         }));
         Ok(())
+    }
+
+    async fn session_pipe_path(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        let path = match self.hub.inner.pipe_native.sidecar_path(&session_id) {
+            Ok(path) => path,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &error.to_string(),
+                    false,
+                    None,
+                );
+            }
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionPipePath {
+                path: path.to_string_lossy().into_owned(),
+            },
+        })
     }
 
     async fn session_read(

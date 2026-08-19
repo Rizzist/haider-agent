@@ -471,6 +471,80 @@ impl FrameSink for CapturingFrameSink {
     }
 }
 
+/// The pipe location is daemon-owned: the view RPC returns the exact absolute
+/// resolver output for a durable session and applies the standard session
+/// not-found response before exposing any synthesized filename.
+#[tokio::test]
+async fn session_pipe_path_resolves_absolute_path_and_rejects_unknown_session() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("pipe-path-rpc-session");
+    hub.create_internal_session(create_command(&session_id, "pipe-path-rpc"))
+        .await
+        .expect("session created");
+
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("view connection");
+    connection
+        .request(
+            haider_rpc::RequestId::new("pipe-path-happy"),
+            haider_rpc::RequestBody::SessionPipePath {
+                session_id: session_id.clone(),
+            },
+        )
+        .await
+        .expect("pipe path response");
+    connection
+        .request(
+            haider_rpc::RequestId::new("pipe-path-missing"),
+            haider_rpc::RequestBody::SessionPipePath {
+                session_id: SessionId::new("missing-pipe-path-session"),
+            },
+        )
+        .await
+        .expect("missing response");
+
+    let expected_path = root
+        .path()
+        .join("pipe/pipe-path-rpc-session.pipe")
+        .to_string_lossy()
+        .into_owned();
+    {
+        let frames = sink.0.lock().expect("frames");
+        assert!(matches!(
+            &frames[0],
+            WireFrame::Response {
+                request_id,
+                body: haider_rpc::ResponseBody::SessionPipePath { path },
+            } if request_id.as_str() == "pipe-path-happy"
+                && path == &expected_path
+                && std::path::Path::new(path).is_absolute()
+        ));
+        assert!(matches!(
+            &frames[1],
+            WireFrame::Response {
+                request_id,
+                body: haider_rpc::ResponseBody::Error { code, message, .. },
+            } if request_id.as_str() == "pipe-path-missing"
+                && code == haider_rpc::ERROR_CODE_NOT_FOUND
+                && message == "session was not found"
+        ));
+    }
+
+    drop(connection);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// The new refresh method requires Control and hands a correlation-owned job
 /// to the bounded account actor mailbox.
 ///

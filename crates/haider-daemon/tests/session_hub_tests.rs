@@ -541,10 +541,25 @@ fn expected_sidecar_body(events: &[RawEnvelope]) -> String {
 }
 
 fn expected_sidecar(session_id: &SessionId, generation: u64, events: &[RawEnvelope]) -> String {
-    format!(
-        "{{\"pipe\":\"haider.session.jsonl\",\"version\":1,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n{}",
-        expected_sidecar_body(events)
-    )
+    expected_sidecar_batches(session_id, generation, &[events])
+}
+
+fn expected_sidecar_batches(
+    session_id: &SessionId,
+    generation: u64,
+    batches: &[&[RawEnvelope]],
+) -> String {
+    let mut expected = format!(
+        "{{\"pipe\":\"haider.session.jsonl\",\"version\":2,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
+    );
+    for batch in batches {
+        expected.push_str(&expected_sidecar_body(batch));
+        let head = batch.iter().map(|event| event.seq).max().unwrap_or(0);
+        expected.push_str(&format!(
+            "{{\"coverage\":{head},\"generation\":{generation}}}\n"
+        ));
+    }
+    expected
 }
 
 async fn stored_sidecar(
@@ -569,6 +584,13 @@ async fn append_delta(
     worker_generation: u64,
     event_id: &str,
 ) -> u64 {
+    let delta = delta_pipe_event(session_id, event_id, worker_generation);
+    let mut events = [delta];
+    hub.append(&mut events).await.expect("delta appends");
+    events[0].seq
+}
+
+fn delta_pipe_event(session_id: &SessionId, event_id: &str, worker_generation: u64) -> RawEnvelope {
     let mut delta = envelope(session_id, event_id, worker_generation);
     delta.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Delta {
         item_id: ItemId::new("sealed-replay-item"),
@@ -577,9 +599,7 @@ async fn append_delta(
         },
     }))
     .expect("delta serializes");
-    let mut events = [delta];
-    hub.append(&mut events).await.expect("delta appends");
-    events[0].seq
+    delta
 }
 
 fn capabilities() -> CapabilitySet {
@@ -5946,6 +5966,9 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
             }),
         ),
     ];
+    // A non-node envelope can carry branch provenance without requiring the
+    // test to seed the store's branch graph first.
+    events[3].branch_id = Some(BranchId::new("branch-sidecar"));
 
     hub.append(&mut events).await.expect("pipe batch commits");
     let bytes = std::fs::read(sidecar_path(&root, &session_id)).expect("sidecar exists");
@@ -5956,6 +5979,75 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     assert_eq!(
         String::from_utf8(bytes).expect("sidecar utf8"),
         stored_sidecar(&store, &session_id, 1).await
+    );
+    let sidecar = std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads");
+    let values: Vec<serde_json::Value> = sidecar
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str(line).expect("sidecar line is JSON"))
+        .collect();
+    assert_eq!(
+        values
+            .iter()
+            .find_map(|value| value.get("branch_id"))
+            .expect("branched row"),
+        "branch-sidecar"
+    );
+    assert!(
+        values
+            .iter()
+            .filter(|value| value.get("role").is_some())
+            .all(|value| value["ordinal"] == 0),
+        "every row kind carries its ordinal identity"
+    );
+    assert_eq!(values.last().expect("coverage")["coverage"], events[4].seq);
+    assert_eq!(values.last().expect("coverage")["generation"], 1);
+    let row_lines: Vec<&str> = sidecar
+        .lines()
+        .skip(1)
+        .filter(|line| line.contains("\"role\""))
+        .collect();
+    let expected_rows: Vec<String> = events
+        .iter()
+        .filter_map(haider_protocol::pipe::sidecar_row_line)
+        .collect();
+    assert_eq!(row_lines, expected_rows);
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: removing the zero-row coalescing threshold either writes a
+/// watermark too early or leaves the sidecar cursor stale at the 256th delta.
+#[tokio::test]
+async fn native_pipe_coalesces_255_non_rows_and_covers_the_256th() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-coverage-coalesce");
+    let generation = store.worker_generation();
+    let mut seed = vec![user_pipe_event(&session_id, "seed", generation, "seed")];
+    hub.append(&mut seed).await.expect("seed commits");
+    let path = sidecar_path(&root, &session_id);
+    let before = std::fs::read_to_string(&path).expect("seed sidecar reads");
+
+    let mut deltas: Vec<RawEnvelope> = (0..255)
+        .map(|index| delta_pipe_event(&session_id, &format!("coalesce-{index}"), generation))
+        .collect();
+    hub.append(&mut deltas).await.expect("255 deltas commit");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("sidecar reads"),
+        before,
+        "255 non-row envelopes must remain coalesced in memory"
+    );
+
+    append_delta(&hub, &session_id, generation, "coalesce-256").await;
+    let after = std::fs::read_to_string(path).expect("covered sidecar reads");
+    let appended: Vec<&str> = after
+        .strip_prefix(&before)
+        .expect("append only")
+        .lines()
+        .collect();
+    assert_eq!(appended.len(), 1, "at most one coverage line per batch");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(appended[0]).expect("coverage JSON"),
+        serde_json::json!({"coverage": seed[0].seq + 256, "generation": 1})
     );
     hub.shutdown().await.expect("hub stops");
 }
@@ -5983,7 +6075,7 @@ async fn native_pipe_truncates_a_torn_tail_before_resume() {
     hub.append(&mut second).await.expect("second commits");
     assert_eq!(
         std::fs::read_to_string(path).expect("sidecar reads"),
-        stored_sidecar(&store, &session_id, 1).await
+        expected_sidecar_batches(&session_id, 1, &[&first, &second])
     );
     hub.shutdown().await.expect("second hub stops");
 }
@@ -6001,8 +6093,43 @@ async fn native_pipe_resume_skips_the_already_reconciled_batch() {
     let mut second = vec![user_pipe_event(&session_id, "second", generation, "two")];
     hub.append(&mut second).await.expect("second commits");
     let body = std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads");
-    assert_eq!(body, stored_sidecar(&store, &session_id, 1).await);
-    assert_eq!(body.lines().count(), 3, "current batch must not duplicate");
+    assert_eq!(
+        body,
+        expected_sidecar_batches(&session_id, 1, &[&first, &second])
+    );
+    assert_eq!(body.lines().count(), 5, "current batch must not duplicate");
+    hub.shutdown().await.expect("second hub stops");
+}
+
+/// MUTATION CHECK: treating only row-shaped tails as resumable rebuilds this
+/// healthy v2 file; using the last row cursor duplicates it during catch-up.
+#[tokio::test]
+async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-coverage-resume");
+    let generation = store.worker_generation();
+    let mut seed = vec![user_pipe_event(&session_id, "seed", generation, "one")];
+    hub.append(&mut seed).await.expect("seed commits");
+    hub.shutdown().await.expect("first hub stops");
+
+    let mut missed = [delta_pipe_event(&session_id, "missed-delta", generation)];
+    store
+        .append(&mut missed)
+        .await
+        .expect("offline delta commits");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    append_delta(&hub, &session_id, generation, "resume-trigger").await;
+
+    let sidecar = std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads");
+    let rows: Vec<&str> = sidecar
+        .lines()
+        .filter(|line| line.contains("\"role\""))
+        .collect();
+    assert_eq!(rows.len(), 1, "the row before coverage must not duplicate");
+    let tail: serde_json::Value =
+        serde_json::from_str(sidecar.lines().last().expect("tail")).expect("tail JSON");
+    assert_eq!(tail["coverage"], missed[0].seq + 1);
+    assert_eq!(tail["generation"], 1);
     hub.shutdown().await.expect("second hub stops");
 }
 
@@ -6033,6 +6160,16 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
         std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads"),
         stored_sidecar(&store, &session_id, 1).await
     );
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads twice");
+    let tail: serde_json::Value =
+        serde_json::from_str(sidecar.lines().last().expect("coverage tail"))
+            .expect("coverage tail JSON");
+    assert_eq!(
+        tail["coverage"],
+        store.latest_seq(&session_id).await.expect("journal head"),
+        "rebuild/reconcile must end with coverage at the journal head"
+    );
     hub.shutdown().await.expect("second hub stops");
 }
 
@@ -6049,7 +6186,7 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     std::fs::write(
         &path,
         format!(
-            "{{\"pipe\":\"haider.session.jsonl\",\"version\":1,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":2,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
         ),
     )
     .expect("corruption writes");
@@ -6091,6 +6228,65 @@ async fn native_pipe_tail_ahead_of_journal_rebuilds_and_increments_generation() 
     hub.shutdown().await.expect("second hub stops");
 }
 
+/// MUTATION CHECK: coverage values participate in the same ahead-of-journal
+/// guard as row seqs.
+#[tokio::test]
+async fn native_pipe_coverage_tail_ahead_rebuilds_and_increments_generation() {
+    use std::io::Write as _;
+
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-ahead-coverage");
+    let generation = store.worker_generation();
+    let mut seed = vec![user_pipe_event(&session_id, "seed", generation, "one")];
+    hub.append(&mut seed).await.expect("seed commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let path = sidecar_path(&root, &session_id);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("sidecar opens")
+        .write_all(b"{\"coverage\":999,\"generation\":1}\n")
+        .expect("ahead coverage writes");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    append_one(&hub, &session_id, generation, "rebuild-trigger").await;
+    assert_eq!(
+        std::fs::read_to_string(path).expect("rebuilt sidecar reads"),
+        stored_sidecar(&store, &session_id, 2).await
+    );
+    hub.shutdown().await.expect("second hub stops");
+}
+
+/// MUTATION CHECK: accepting the old header version would append v2 line
+/// kinds beneath a v1 header instead of performing the generation-bumped
+/// atomic rebuild.
+#[tokio::test]
+async fn native_pipe_v1_header_rebuilds_to_v2_with_generation_bump() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-v1-rebuild");
+    let generation = store.worker_generation();
+    let mut seed = vec![user_pipe_event(&session_id, "seed", generation, "one")];
+    hub.append(&mut seed).await.expect("seed commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let path = sidecar_path(&root, &session_id);
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":1,\"session_id\":\"{session_id}\",\"generation\":4}}\n{}",
+            expected_sidecar_body(&seed)
+        ),
+    )
+    .expect("v1 sidecar writes");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    append_one(&hub, &session_id, generation, "rebuild-trigger").await;
+    assert_eq!(
+        std::fs::read_to_string(path).expect("rebuilt v2 sidecar reads"),
+        stored_sidecar(&store, &session_id, 5).await
+    );
+    hub.shutdown().await.expect("second hub stops");
+}
+
 #[tokio::test]
 async fn native_pipe_io_failure_never_fails_the_journal_append() {
     let (root, store, hub) = open_hub(None, 8).await;
@@ -6113,7 +6309,7 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     std::fs::create_dir(root.path().join("pipe")).expect("sidecar directory creates");
     std::fs::write(
         sidecar_path(&root, &session_id),
-        b"{\"pipe\":\"haider.session.jsonl\",\"version\":1,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
+        b"{\"pipe\":\"haider.session.jsonl\",\"version\":2,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
     )
     .expect("stale sidecar writes");
     append_one(&hub, &session_id, generation, "retry-trigger").await;

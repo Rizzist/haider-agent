@@ -327,12 +327,14 @@ pub const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
 /// ADE capability sniff: `haider export` renders seq-keyed rows (pipe/json
 /// carry per-turn journal seq + a head_seq cursor, `--since` is exact).
 pub const FEATURE_EXPORT_SEQ_V1: &str = "export_seq_v1";
-/// Daemon maintains a crash-resumable JSONL sidecar for every session. Its
-/// body rows are byte-identical to individually serialized turns from an
-/// unmasked `haider export --format json` within that export window. The
-/// sidecar covers the full journal; one-shot exports retain at most their
-/// bounded replay window and use `--since` to reach the remaining suffix.
-pub const FEATURE_PIPE_NATIVE_V1: &str = "pipe_native_v1";
+/// Daemon maintains a rebuildable v2 JSONL sidecar for every session. Rows are
+/// byte-identical to individually serialized unmasked JSON-export turns and
+/// carry `(seq, ordinal)` identity plus an optional branch. Coverage lines
+/// prove which non-projecting journal envelopes were inspected: readers set
+/// `covered_through = max(row seqs, coverage values)` and are at head only
+/// when it equals the roster/status `head_seq`. V2 readers must ignore unknown
+/// row keys and unknown line kinds.
+pub const FEATURE_PIPE_NATIVE_V2: &str = "pipe_native_v2";
 
 /// One todo child returned by `graph.run_set.open`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1220,6 +1222,10 @@ pub enum RequestBody {
     /// Starts a connection-scoped watch of changed/new session summaries.
     #[serde(rename = "session.list_watch")]
     SessionListWatch {},
+    /// Resolves the daemon-owned native JSONL sidecar path for one session.
+    /// Clients must not derive this path from the raw session id.
+    #[serde(rename = "session.pipe_path")]
+    SessionPipePath { session_id: SessionId },
     /// Non-subscribing read of committed envelopes in an inclusive range.
     #[serde(rename = "session.read")]
     SessionRead {
@@ -1741,6 +1747,9 @@ pub enum ResponseBody {
     /// Acknowledges a connection-scoped session roster watch.
     #[serde(rename = "session.list_watch")]
     SessionListWatch { accepted: bool },
+    /// Absolute daemon-resolved native JSONL sidecar path.
+    #[serde(rename = "session.pipe_path")]
+    SessionPipePath { path: String },
     #[serde(rename = "session.read")]
     SessionRead { result: SessionReadResult },
     #[serde(rename = "session.observe")]

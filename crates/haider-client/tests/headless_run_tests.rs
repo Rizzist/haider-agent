@@ -602,7 +602,20 @@ async fn control_attach_precedes_submit_and_pre_response_events_correlate() {
     assert_eq!(result.outcome, HeadlessOutcome::Done);
     assert_eq!(result.response.as_deref(), Some("daemon answer"));
     assert_eq!(result.terminal_seq, Some(3));
-    assert_eq!(events.len(), 3);
+    // Two-phase announcement law: resolution-time first (created_seq from
+    // session.create — the mock's 0), the acceptance-time refinement second.
+    assert!(matches!(
+        events.first(),
+        Some(HeadlessEvent::Accepted {
+            session_id,
+            head_seq: 0,
+        }) if session_id.as_str() == "headless-session"
+    ));
+    assert!(matches!(
+        events.get(1),
+        Some(HeadlessEvent::Accepted { head_seq: 1, .. })
+    ));
+    assert_eq!(events.len(), 5);
 }
 
 /// MUTATION CHECK: omit the `--trust-hooks` feature requirement or require it
@@ -730,7 +743,7 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
     assert_eq!(result.terminal_seq, Some(2));
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 4);
 }
 
 /// MUTATION CHECK: create the session before uploading, omit uploaded refs
@@ -884,7 +897,7 @@ async fn headless_attach_uploads_then_submits_with_durable_identity() {
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
     assert_eq!(result.attachments, vec![expected_ref]);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 4);
 }
 
 /// MUTATION CHECK: begin the wall clock only after submit correlation or wait
@@ -1155,7 +1168,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
         .into_iter()
         .filter_map(|event| match event {
             HeadlessEvent::Envelope(envelope) => Some(envelope.seq),
-            HeadlessEvent::PermissionDenied(_) => None,
+            HeadlessEvent::Accepted { .. } | HeadlessEvent::PermissionDenied(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(seqs, vec![1, 2, 3]);
@@ -1272,7 +1285,7 @@ async fn lagged_pressure_recovers_every_durable_sequence() {
         .into_iter()
         .filter_map(|event| match event {
             HeadlessEvent::Envelope(envelope) => Some(envelope.seq),
-            HeadlessEvent::PermissionDenied(_) => None,
+            HeadlessEvent::Accepted { .. } | HeadlessEvent::PermissionDenied(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(seqs, (1..=TERMINAL_SEQ).collect::<Vec<_>>());
@@ -1962,7 +1975,7 @@ async fn parked_waiting_does_not_end_run_and_natural_cancelled_is_distinct() {
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Cancelled);
     assert_eq!(result.terminal_seq, Some(2));
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 4);
 }
 
 /// MUTATION CHECK: report the cancellation terminal instead of retaining the
@@ -2117,7 +2130,7 @@ async fn blocked_output_does_not_delay_wall_clock_cancellation() {
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Timeout);
     assert_eq!(result.terminal_seq, Some(3));
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 5);
 }
 
 /// MUTATION CHECK: treat disconnect during forced-outcome grace as immediate
@@ -2212,7 +2225,7 @@ async fn confirmed_cancel_disconnect_replays_terminal_within_grace() {
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Timeout);
     assert_eq!(result.terminal_seq, Some(1));
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 3);
 }
 
 /// MUTATION CHECK: freeze the first cancel generation, discard cancellation

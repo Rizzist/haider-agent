@@ -227,23 +227,43 @@ fn unknown_import_source_is_rejected() {
     assert!(error.contains("unknown source `other-cli`"));
 }
 
+/// MUTATION CHECK: move the accepted record after the first envelope, omit
+/// its cursor, or send it to stderr. Expected runtime failure: the first-line
+/// schema/order assertions fail before any model output is inspected.
 #[test]
-fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
+fn run_jsonl_announces_acceptance_before_lf_framed_envelopes() {
     let out = haider()
         .args(["run", "--provider", "fake", "--jsonl", "hello"])
         .output()
         .expect("binary runs");
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "exit {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(out.stderr.is_empty());
     assert!(out.stdout.ends_with(b"\n"));
     assert!(!out.stdout.contains(&b'\r'));
 
     let text = String::from_utf8(out.stdout).expect("utf8");
-    let envelopes: Vec<RawEnvelope> = text
-        .lines()
+    let mut lines = text.lines();
+    let accepted: serde_json::Value =
+        serde_json::from_str(lines.next().expect("accepted line")).expect("accepted JSON");
+    assert_eq!(accepted["event"], "accepted");
+    assert!(
+        accepted["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(accepted["head_seq"].as_u64().is_some_and(|seq| seq > 0));
+    assert_eq!(accepted.as_object().expect("accepted object").len(), 3);
+    let envelopes: Vec<RawEnvelope> = lines
         .map(|line| serde_json::from_str(line).expect("RawEnvelope JSONL line"))
         .collect();
     assert!(!envelopes.is_empty());
+    assert_eq!(accepted["session_id"], envelopes[0].session_id.as_str());
+    assert_eq!(accepted["head_seq"], envelopes[0].seq);
     assert!(
         envelopes
             .windows(2)
@@ -294,7 +314,9 @@ fn run_default_print_is_exact_under_redirected_no_term_io() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"fake response: hello\n");
-    assert!(out.stderr.is_empty());
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert!(stderr.starts_with("session "));
+    assert_eq!(stderr.lines().count(), 1);
 }
 
 #[test]
@@ -551,11 +573,7 @@ fn run_jsonl_exits_65_when_fake_provider_errors() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let text = String::from_utf8(out.stdout).expect("utf8");
-    let envelopes: Vec<RawEnvelope> = text
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("RawEnvelope JSONL line"))
-        .collect();
+    let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
         envelopes.last().map(typed),
         Some(Some(EventPayload::RunState(RunState::Errored)))
@@ -1486,9 +1504,14 @@ fn output_broken_pipe_is_a_typed_io_failure() {
 }
 
 fn parse_jsonl(output: &[u8]) -> Vec<RawEnvelope> {
-    String::from_utf8(output.to_vec())
-        .expect("utf8")
-        .lines()
+    let text = String::from_utf8(output.to_vec()).expect("utf8");
+    let mut lines = text.lines();
+    let accepted: serde_json::Value =
+        serde_json::from_str(lines.next().expect("accepted line")).expect("accepted JSONL line");
+    assert_eq!(accepted["event"], "accepted");
+    assert!(accepted["session_id"].is_string());
+    assert!(accepted["head_seq"].is_u64());
+    lines
         .map(|line| serde_json::from_str(line).expect("RawEnvelope JSONL line"))
         .collect()
 }

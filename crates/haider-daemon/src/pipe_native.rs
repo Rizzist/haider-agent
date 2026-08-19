@@ -3,6 +3,9 @@
 //! The journal remains authoritative. A sidecar failure is reported and the
 //! session is left unreconciled so its next committed append retries from the
 //! last self-describing line (or rebuilds a corrupt file).
+//! Readers compute `covered_through` as the maximum row `seq` or coverage
+//! value encountered while reading forward. EOF proves the reader is at head
+//! only when that value equals the roster/status `head_seq`.
 
 use haider_core::{SqliteStoreHandle, StoreHandle};
 use haider_protocol::envelope::RawEnvelope;
@@ -19,15 +22,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const RECONCILE_PAGE_ENVELOPES: usize = 1_024;
 const RECONCILE_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+const COVERAGE_COALESCE_ENVELOPES: u64 = 256;
 const TAIL_SCAN_BYTES: usize = 8 * 1_024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const SIDECAR_MAGIC: &str = "haider.session.jsonl";
-const SIDECAR_VERSION: u64 = 1;
+// V2 adds coverage line kinds and `(seq, ordinal)` row identity with optional
+// branches. Readers are forward-compatible by ignoring unknown row keys and
+// unknown line kinds.
+const SIDECAR_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarCursor {
+    /// Cursor represented by the last persisted row or coverage line.
     seq: u64,
+    /// Highest envelope processed in this daemon lifetime. This may be ahead
+    /// of `seq` while non-projecting hot batches are being coalesced.
+    pending_seq: u64,
     generation: u64,
 }
 
@@ -36,6 +47,14 @@ struct SidecarHeader {
     pipe: String,
     version: u64,
     session_id: String,
+    generation: u64,
+}
+
+/// A durable proof that all journal envelopes through `coverage` were
+/// inspected, including envelopes which project no transcript row.
+#[derive(Serialize)]
+struct SidecarCoverage {
+    coverage: u64,
     generation: u64,
 }
 
@@ -72,7 +91,9 @@ impl PipeNativeWriter {
         }
     }
 
-    /// Maintains one session after its journal batch has committed. Errors are
+    /// Maintains one session after its journal batch has committed. Ordinary
+    /// appends are intentionally not fsynced: the journal owns durability and
+    /// boot reconciliation heals a lost or torn sidecar tail. Errors are
     /// returned only for observation; callers must never fail the append.
     pub(crate) async fn maintain(
         &self,
@@ -114,9 +135,9 @@ impl PipeNativeWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(session_id);
         let cursor = if let Some(cursor) = known_cursor {
-            let (data, seq) = render_after(committed, cursor.seq);
+            let (data, next_cursor) = render_hot_batch(committed, cursor)?;
             append_once(path, data).await?;
-            SidecarCursor { seq, ..cursor }
+            next_cursor
         } else {
             let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
             if dirty {
@@ -165,7 +186,6 @@ impl PipeNativeWriter {
         cursor: SidecarCursor,
     ) -> Result<SidecarCursor, PipeNativeError> {
         let mut read_cursor = cursor.seq;
-        let mut line_cursor = cursor.seq;
         let mut append_file = None;
         loop {
             let page = store
@@ -183,7 +203,7 @@ impl PipeNativeWriter {
                 break;
             };
             read_cursor = last.seq;
-            let (chunk, next_cursor) = render_after(&page, line_cursor);
+            let chunk = render_rows_after(&page, cursor.seq);
             if !chunk.is_empty() {
                 let file = match append_file.take() {
                     Some(file) => file,
@@ -191,13 +211,17 @@ impl PipeNativeWriter {
                 };
                 append_file = Some(write_open(file, chunk).await?);
             }
-            line_cursor = next_cursor;
         }
-        if let Some(file) = append_file {
-            sync_open(file).await?;
-        }
+        let file = match append_file.take() {
+            Some(file) => file,
+            None => open_append(path).await?,
+        };
+        let file = write_open(file, coverage_line(read_cursor, cursor.generation)?).await?;
+        // Reconciliation is a repair path, so retain an explicit sync here.
+        sync_open(file).await?;
         Ok(SidecarCursor {
-            seq: line_cursor,
+            seq: read_cursor,
+            pending_seq: read_cursor,
             ..cursor
         })
     }
@@ -225,7 +249,6 @@ impl PipeNativeWriter {
         header.push('\n');
         file = write_temp(file, header).await?;
         let mut read_cursor = 0;
-        let mut line_cursor = 0;
         loop {
             let page = store
                 .read_page(
@@ -240,18 +263,19 @@ impl PipeNativeWriter {
                 break;
             };
             read_cursor = last.seq;
-            let (chunk, next_cursor) = render_after(&page, line_cursor);
-            line_cursor = next_cursor;
+            let chunk = render_rows_after(&page, 0);
             file = write_temp(file, chunk).await?;
         }
+        file = write_temp(file, coverage_line(read_cursor, generation)?).await?;
         finish_temp(file, temp_path, path).await?;
         Ok(SidecarCursor {
-            seq: line_cursor,
+            seq: read_cursor,
+            pending_seq: read_cursor,
             generation,
         })
     }
 
-    fn sidecar_path(&self, session_id: &SessionId) -> Result<PathBuf, PipeNativeError> {
+    pub(crate) fn sidecar_path(&self, session_id: &SessionId) -> Result<PathBuf, PipeNativeError> {
         let id = session_id.as_str();
         // Production session ids are generated by `random_id("session")`
         // and use only this filename-safe alphabet. Keep the boundary strict
@@ -267,26 +291,86 @@ impl PipeNativeWriter {
                 "session id is not a safe sidecar filename: {id:?}"
             )));
         }
-        Ok(self.pipe_dir.join(format!("{id}.pipe")))
+        let pipe_dir = if self.pipe_dir.is_absolute() {
+            self.pipe_dir.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    PipeNativeError(format!("cannot resolve absolute sidecar path: {error}"))
+                })?
+                .join(&self.pipe_dir)
+        };
+        Ok(pipe_dir.join(format!("{id}.pipe")))
     }
 }
 
-fn render_after(envelopes: &[RawEnvelope], cursor: u64) -> (String, u64) {
+fn ordered_after(envelopes: &[RawEnvelope], cursor: u64) -> Vec<&RawEnvelope> {
     let mut ordered: Vec<&RawEnvelope> = envelopes
         .iter()
         .filter(|envelope| envelope.seq > cursor)
         .collect();
     ordered.sort_by_key(|envelope| envelope.seq);
+    ordered
+}
+
+fn render_rows_after(envelopes: &[RawEnvelope], cursor: u64) -> String {
     let mut data = String::new();
-    let mut line_cursor = cursor;
+    for envelope in ordered_after(envelopes, cursor) {
+        if let Some(line) = sidecar_row_line(envelope) {
+            data.push_str(&line);
+            data.push('\n');
+        }
+    }
+    data
+}
+
+fn coverage_line(coverage: u64, generation: u64) -> Result<String, PipeNativeError> {
+    let mut line = serde_json::to_string(&SidecarCoverage {
+        coverage,
+        generation,
+    })
+    .map_err(|error| PipeNativeError(format!("sidecar coverage serialization failed: {error}")))?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// Render an ordinary committed batch. A row-producing batch gets exactly
+/// one trailing watermark. Non-projecting batches coalesce until 256 newly
+/// covered envelopes can be represented by one watermark.
+fn render_hot_batch(
+    envelopes: &[RawEnvelope],
+    cursor: SidecarCursor,
+) -> Result<(String, SidecarCursor), PipeNativeError> {
+    let ordered = ordered_after(envelopes, cursor.pending_seq);
+    let Some(last) = ordered.last() else {
+        return Ok((String::new(), cursor));
+    };
+    let pending_seq = last.seq;
+    let mut data = String::new();
+    let mut produced_row = false;
     for envelope in ordered {
         if let Some(line) = sidecar_row_line(envelope) {
             data.push_str(&line);
             data.push('\n');
-            line_cursor = envelope.seq;
+            produced_row = true;
         }
     }
-    (data, line_cursor)
+    let should_cover =
+        produced_row || pending_seq.saturating_sub(cursor.seq) >= COVERAGE_COALESCE_ENVELOPES;
+    let seq = if should_cover {
+        data.push_str(&coverage_line(pending_seq, cursor.generation)?);
+        pending_seq
+    } else {
+        cursor.seq
+    };
+    Ok((
+        data,
+        SidecarCursor {
+            seq,
+            pending_seq,
+            ..cursor
+        },
+    ))
 }
 
 enum SidecarState {
@@ -360,6 +444,7 @@ fn inspect_sidecar_blocking(
     if len == header_len {
         return Ok(SidecarState::Ready(SidecarCursor {
             seq: 0,
+            pending_seq: 0,
             generation: header.generation,
         }));
     }
@@ -380,9 +465,8 @@ fn inspect_sidecar_blocking(
             generation: header.generation,
         });
     };
-    // Ship-gate round 2: the tail must be a REAL row, not any JSON object
-    // that happens to carry an in-range seq — a stray `{"seq":5}` would
-    // otherwise become a trusted cursor and permanently skip rows.
+    // The tail must be either a real row or a coverage watermark, not any JSON
+    // object that happens to carry an in-range cursor.
     let row_shaped = value
         .get("role")
         .and_then(serde_json::Value::as_str)
@@ -391,18 +475,30 @@ fn inspect_sidecar_blocking(
             .get("at_ms")
             .and_then(serde_json::Value::as_u64)
             .is_some();
-    if !row_shaped {
+    let coverage_shaped = value
+        .get("coverage")
+        .and_then(serde_json::Value::as_u64)
+        .is_some()
+        && value
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            .is_some();
+    if !row_shaped && !coverage_shaped {
         return Ok(SidecarState::Corrupt {
             generation: header.generation,
         });
     }
-    let Some(seq) = value.get("seq").and_then(serde_json::Value::as_u64) else {
+    let Some(seq) = value
+        .get(if row_shaped { "seq" } else { "coverage" })
+        .and_then(serde_json::Value::as_u64)
+    else {
         return Ok(SidecarState::Corrupt {
             generation: header.generation,
         });
     };
     Ok(SidecarState::Ready(SidecarCursor {
         seq,
+        pending_seq: seq,
         generation: header.generation,
     }))
 }
@@ -430,7 +526,6 @@ async fn append_once(path: PathBuf, data: String) -> Result<(), PipeNativeError>
     tokio::task::spawn_blocking(move || {
         let mut file = OpenOptions::new().append(true).open(path)?;
         file.write_all(data.as_bytes())?;
-        file.sync_data()?;
         Ok(())
     })
     .await

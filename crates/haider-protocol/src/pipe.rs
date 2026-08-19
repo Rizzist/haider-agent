@@ -12,6 +12,9 @@ struct TextRow {
     text: String,
     at_ms: u64,
     seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    ordinal: u32,
 }
 
 #[derive(Serialize)]
@@ -22,6 +25,9 @@ struct IncompleteRow {
     interruption: crate::error::ErrorPresentation,
     at_ms: u64,
     seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    ordinal: u32,
 }
 
 #[derive(Serialize)]
@@ -30,6 +36,9 @@ struct ErrorRow {
     presentation: crate::error::ErrorPresentation,
     at_ms: u64,
     seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    ordinal: u32,
 }
 
 #[derive(Serialize)]
@@ -39,6 +48,9 @@ struct ToolRow {
     summary: String,
     at_ms: u64,
     seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    ordinal: u32,
 }
 
 /// One structured transcript row shared by the sidecar and JSON export.
@@ -107,6 +119,10 @@ pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
     let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
     let seq = envelope.seq;
     let at_ms = envelope.committed_at_ms;
+    let branch_id = envelope
+        .branch_id
+        .as_ref()
+        .map(|branch_id| branch_id.as_str().to_owned());
     match payload {
         EventPayload::NodeCommitted(node) => match node.kind {
             NodeKind::UserTurn { text, .. } => Some(SidecarRow(SidecarRowKind::Text(TextRow {
@@ -114,6 +130,8 @@ pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
                 text,
                 at_ms,
                 seq,
+                branch_id,
+                ordinal: 0,
             }))),
             NodeKind::AssistantCommit { text, .. } => {
                 Some(SidecarRow(SidecarRowKind::Text(TextRow {
@@ -121,6 +139,8 @@ pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
                     text,
                     at_ms,
                     seq,
+                    branch_id,
+                    ordinal: 0,
                 })))
             }
             NodeKind::ToolExchange { tool, summary, .. } => {
@@ -130,6 +150,8 @@ pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
                     summary,
                     at_ms,
                     seq,
+                    branch_id,
+                    ordinal: 0,
                 })))
             }
             _ => None,
@@ -144,6 +166,8 @@ pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
             interruption,
             at_ms,
             seq,
+            branch_id,
+            ordinal: 0,
         }))),
         EventPayload::RunFailed {
             presentation: Some(presentation),
@@ -153,6 +177,8 @@ pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
             presentation,
             at_ms,
             seq,
+            branch_id,
+            ordinal: 0,
         }))),
         _ => None,
     }
@@ -227,7 +253,7 @@ mod tests {
     use crate::envelope::{EventEnvelope, PromptRender, RenderTargets};
     use crate::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
     use crate::history::TreeNode;
-    use crate::ids::{DeviceId, EventId, ItemId, NodeId, SessionId};
+    use crate::ids::{BranchId, DeviceId, EventId, ItemId, NodeId, SessionId};
     use crate::verify::VerifyVerdict;
 
     fn envelope(seq: u64, payload: EventPayload) -> RawEnvelope {
@@ -334,5 +360,23 @@ mod tests {
         );
         assert!(lines.iter().all(|line| !line.contains(['\n', '\r'])));
         assert_eq!(escape_pipe_field("a\\|\r\nb"), "|a\\\\\\|\\nb|");
+    }
+
+    #[test]
+    fn sidecar_rows_pin_branch_and_ordinal_identity() {
+        let mut event = node(
+            7,
+            NodeKind::UserTurn {
+                text: "branched".into(),
+                attachments: Vec::new(),
+            },
+        );
+        event.branch_id = Some(BranchId::new("branch-seven"));
+        assert_eq!(
+            sidecar_row_line(&event).as_deref(),
+            Some(
+                "{\"role\":\"user\",\"text\":\"branched\",\"at_ms\":1700000000007,\"seq\":7,\"branch_id\":\"branch-seven\",\"ordinal\":0}"
+            )
+        );
     }
 }

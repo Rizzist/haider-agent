@@ -377,6 +377,11 @@ pub struct HeadlessRunRequest {
 /// Incremental facts exposed to output adapters.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeadlessEvent {
+    /// Durable turn acceptance, emitted before any replayed/model envelope.
+    Accepted {
+        session_id: SessionId,
+        head_seq: u64,
+    },
     /// One fully applied durable envelope. Duplicates and gap-crossing frames
     /// are never emitted.
     Envelope(Box<RawEnvelope>),
@@ -1057,15 +1062,15 @@ async fn run_headless_inner(
         cache_policy: None,
     };
 
-    let (session_id, created_generation) =
+    let (session_id, created_generation, created_seq) =
         before_acceptance_deadline(timeout_deadline, "session.create", async {
             loop {
                 match connection.client.request(create_body.clone()).await {
                     Ok(ResponseBody::SessionCreate {
                         session_id,
+                        created_seq,
                         worker_generation,
                         metadata,
-                        ..
                     }) => {
                         let expected = (!request.permission_overrides.is_empty())
                             .then_some(request.permission_overrides);
@@ -1077,7 +1082,7 @@ async fn run_headless_inner(
                                         .into(),
                             });
                         }
-                        break Ok((session_id, worker_generation));
+                        break Ok((session_id, worker_generation, created_seq));
                     }
                     Ok(ResponseBody::Error {
                         code,
@@ -1108,6 +1113,17 @@ async fn run_headless_inner(
         .await?;
 
     let mut reducer = HeadlessReducer::new(session_id.clone(), output);
+    // The announcement fires at session RESOLUTION — before the attach —
+    // because replay envelopes legitimately race (and win against) the
+    // turn.submit response: consumers need the session identity as the
+    // FIRST event, ahead of any envelope. The adapter dedupes the later
+    // acceptance-time emission, whose head_seq refines this baseline.
+    reducer
+        .emit(HeadlessEvent::Accepted {
+            session_id: session_id.clone(),
+            head_seq: created_seq,
+        })
+        .await;
     connection.worker_generation = created_generation;
     before_acceptance_deadline(
         timeout_deadline,
@@ -1187,10 +1203,17 @@ async fn run_headless_inner(
             Ok(ResponseBody::TurnSubmit {
                 session_id: accepted_session,
                 run_id,
+                accepted_seq,
                 worker_generation,
                 ..
             }) if accepted_session == session_id => {
                 connection.worker_generation = worker_generation;
+                reducer
+                    .emit(HeadlessEvent::Accepted {
+                        session_id: accepted_session,
+                        head_seq: accepted_seq,
+                    })
+                    .await;
                 break run_id;
             }
             Ok(ResponseBody::Error {

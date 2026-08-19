@@ -125,6 +125,8 @@ fn json_renders_a_stable_public_schema() {
     let turns = value["turns"].as_array().expect("turns");
     assert_eq!(turns.len(), 3);
     assert_eq!(turns[0]["role"], "user");
+    assert_eq!(turns[0]["ordinal"], 0);
+    assert!(turns[0].get("branch_id").is_none());
     assert_eq!(turns[1]["role"], "assistant");
     assert_eq!(turns[2]["role"], "tool");
 

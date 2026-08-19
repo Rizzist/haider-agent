@@ -13,6 +13,7 @@ use haider_client::{
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::session::SessionPermissionOverridesV1;
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 pub(crate) const EX_USAGE: u8 = 2;
@@ -399,20 +400,82 @@ fn write_error_json(
     output.flush()
 }
 
-fn adapt_events(output: RunOutput, mut events: mpsc::Receiver<HeadlessEvent>) -> io::Result<()> {
+#[derive(Serialize)]
+struct AcceptedAnnouncement<'a> {
+    event: &'static str,
+    session_id: &'a str,
+    head_seq: u64,
+}
+
+fn adapt_events(output: RunOutput, events: mpsc::Receiver<HeadlessEvent>) -> io::Result<()> {
     let stdout = io::stdout();
-    let mut stdout = io::BufWriter::new(stdout.lock());
+    let stderr = io::stderr();
+    adapt_events_to(
+        output,
+        events,
+        io::BufWriter::new(stdout.lock()),
+        stderr.lock(),
+    )
+}
+
+fn adapt_events_to(
+    output: RunOutput,
+    mut events: mpsc::Receiver<HeadlessEvent>,
+    mut stdout: impl Write,
+    mut stderr: impl Write,
+) -> io::Result<()> {
+    let mut announced = false;
     while let Some(event) = events.blocking_recv() {
         match event {
-            HeadlessEvent::Envelope(envelope) if output == RunOutput::Jsonl => {
-                serde_json::to_writer(&mut stdout, envelope.as_ref()).map_err(io::Error::other)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+            HeadlessEvent::Accepted {
+                session_id,
+                head_seq,
+            } if !announced => {
+                let accepted = AcceptedAnnouncement {
+                    event: "accepted",
+                    session_id: session_id.as_str(),
+                    head_seq,
+                };
+                match output {
+                    RunOutput::Jsonl => {
+                        serde_json::to_writer(&mut stdout, &accepted).map_err(io::Error::other)?;
+                        stdout.write_all(b"\n")?;
+                        stdout.flush()?;
+                    }
+                    RunOutput::Json => {
+                        // Single-JSON stdout remains exactly one document; the
+                        // accepted record therefore uses stderr and is flushed
+                        // before any model envelope can be observed.
+                        serde_json::to_writer(&mut stderr, &accepted).map_err(io::Error::other)?;
+                        stderr.write_all(b"\n")?;
+                        stderr.flush()?;
+                    }
+                    RunOutput::Print => {
+                        // Keep stdout as assistant-text-only for shell pipelines.
+                        // The human announcement is still the first output line.
+                        writeln!(stderr, "session {}", session_id.as_str())?;
+                        stderr.flush()?;
+                    }
+                }
+                announced = true;
+            }
+            HeadlessEvent::Accepted { .. } => {}
+            HeadlessEvent::Envelope(envelope) => {
+                if output == RunOutput::Jsonl {
+                    serde_json::to_writer(&mut stdout, envelope.as_ref())
+                        .map_err(io::Error::other)?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
             }
             HeadlessEvent::PermissionDenied(denial) => {
-                eprintln!("haider: denied permission: {}", denial.effect_summary);
+                writeln!(
+                    stderr,
+                    "haider: denied permission: {}",
+                    denial.effect_summary
+                )?;
+                stderr.flush()?;
             }
-            HeadlessEvent::Envelope(_) => {}
         }
     }
     Ok(())
@@ -584,5 +647,62 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
             EX_PROTOCOL
         }
         HeadlessRunError::Rpc { .. } => EX_SOFTWARE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MUTATION CHECK: buffering the accepted event behind an envelope makes
+    /// the first JSONL object a journal row instead of the head proof.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn jsonl_adapter_writes_accepted_before_any_envelope() {
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .try_send(HeadlessEvent::Accepted {
+                session_id: haider_protocol::ids::SessionId::new("session-order"),
+                head_seq: 7,
+            })
+            .expect("accepted event queues");
+        let envelope = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "event_id": "event-order",
+            "seq": 7,
+            "session_id": "session-order",
+            "device_id": "device-order",
+            "authority_epoch": 1,
+            "worker_generation": 1,
+            "committed_at_ms": 1,
+            "render": {"ui": false, "durable": true, "prompt": "omit"},
+            "payload": {"type": "future_event"}
+        }))
+        .expect("raw envelope fixture");
+        sender
+            .try_send(HeadlessEvent::Envelope(Box::new(envelope)))
+            .expect("envelope queues");
+        drop(sender);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr)
+            .expect("adapter succeeds");
+
+        let lines: Vec<serde_json::Value> = String::from_utf8(stdout)
+            .expect("utf8 output")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSONL object"))
+            .collect();
+        assert_eq!(
+            lines[0],
+            serde_json::json!({
+                "event": "accepted",
+                "session_id": "session-order",
+                "head_seq": 7
+            })
+        );
+        assert_eq!(lines[1]["event_id"], "event-order");
+        assert!(stderr.is_empty());
     }
 }

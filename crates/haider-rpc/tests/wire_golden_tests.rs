@@ -134,6 +134,39 @@ fn turn_submit_round_trips_subturn_mode() {
     ));
 }
 
+/// The native sidecar lookup is a typed read RPC; pin both discriminants so a
+/// client never has to infer a filesystem path from the session id.
+#[test]
+fn session_pipe_path_request_and_response_have_stable_wire_shapes() {
+    let session_id = haider_protocol::ids::SessionId::new("pipe-path-wire-session");
+    assert_eq!(
+        serde_json::to_value(RequestBody::SessionPipePath {
+            session_id: session_id.clone(),
+        })
+        .expect("encode pipe path request"),
+        serde_json::json!({
+            "method": "session.pipe_path",
+            "session_id": "pipe-path-wire-session",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ResponseBody::SessionPipePath {
+            path: "/profile/pipe/pipe-path-wire-session.pipe".into(),
+        })
+        .expect("encode pipe path response"),
+        serde_json::json!({
+            "method": "session.pipe_path",
+            "path": "/profile/pipe/pipe-path-wire-session.pipe",
+        })
+    );
+    let decoded: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "session.pipe_path",
+        "session_id": session_id,
+    }))
+    .expect("decode pipe path request");
+    assert!(matches!(decoded, RequestBody::SessionPipePath { .. }));
+}
+
 /// MUTATION CHECK: charge a 5 MiB image as if the default frame carried raw
 /// bytes, or shrink the documented bound below the padded base64 envelope.
 /// Expected RUNTIME failure: encoding returns `FrameTooLarge` instead of a
