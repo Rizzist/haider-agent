@@ -586,7 +586,7 @@ fn help_carries_the_sim_menus_and_keys_explainers() {
     let (rows, _, _) = draw(&model, 140, 40);
     assert!(
         rows.iter()
-            .any(|row| row.contains("menus — every card (permission · hook trust · update"))
+            .any(|row| row.contains("menus — every card (permission · hook trust · recovery"))
     );
     assert!(
         rows.iter()
