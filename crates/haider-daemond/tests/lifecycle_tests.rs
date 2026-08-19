@@ -812,7 +812,10 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
     // coherent setting), and the pongs that follow have nowhere left to go.
     let profile = format!("byte-budget-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
-    config.frame_limit = config.profile_id.len() + 1_024;
+    // Headroom for the Welcome frame beyond the giant profile id. The
+    // features list lives inside Welcome, so every new feature bit grows
+    // it — 4 KiB keeps these byte-budget laws stable across additions.
+    config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
     config.outbound_queue_capacity = 64;
     let pings = 40;
@@ -882,7 +885,10 @@ async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
     // one large daemon-authored frame a W3b1 test can size.
     let profile = format!("drain-reserve-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
-    config.frame_limit = config.profile_id.len() + 1_024;
+    // Headroom for the Welcome frame beyond the giant profile id. The
+    // features list lives inside Welcome, so every new feature bit grows
+    // it — 4 KiB keeps these byte-budget laws stable across additions.
+    config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
     let reason = format!("maintenance-{}", "r".repeat(4 * 1024));
     let task = spawn(config.clone());
@@ -956,7 +962,10 @@ async fn never_reading_client_is_cut_at_the_drain_deadline_and_releases_everythi
     let root = test_root("w3b1-");
     let profile = format!("never-reads-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
-    config.frame_limit = config.profile_id.len() + 1_024;
+    // Headroom for the Welcome frame beyond the giant profile id. The
+    // features list lives inside Welcome, so every new feature bit grows
+    // it — 4 KiB keeps these byte-budget laws stable across additions.
+    config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
     config.drain_timeout = Duration::from_millis(250);
     let task = spawn(config.clone());
@@ -1008,7 +1017,10 @@ async fn client_that_never_reads_a_byte_cannot_hold_the_barrier_open() {
     let root = test_root("w3b1-");
     let profile = format!("never-reads-strict-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
-    config.frame_limit = config.profile_id.len() + 1_024;
+    // Headroom for the Welcome frame beyond the giant profile id. The
+    // features list lives inside Welcome, so every new feature bit grows
+    // it — 4 KiB keeps these byte-budget laws stable across additions.
+    config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
     config.drain_timeout = Duration::from_millis(250);
     let task = spawn(config.clone());
@@ -1062,7 +1074,10 @@ async fn one_byte_reader_cannot_hold_the_barrier_open() {
     let root = test_root("w3b1-");
     let profile = format!("one-byte-reader-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
-    config.frame_limit = config.profile_id.len() + 1_024;
+    // Headroom for the Welcome frame beyond the giant profile id. The
+    // features list lives inside Welcome, so every new feature bit grows
+    // it — 4 KiB keeps these byte-budget laws stable across additions.
+    config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
     config.drain_timeout = Duration::from_millis(250);
     let task = spawn(config.clone());
@@ -1171,7 +1186,10 @@ async fn forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it() {
     let root = test_root("w3b1-");
     let profile = format!("forced-writer-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
-    config.frame_limit = config.profile_id.len() + 1_024;
+    // Headroom for the Welcome frame beyond the giant profile id. The
+    // features list lives inside Welcome, so every new feature bit grows
+    // it — 4 KiB keeps these byte-budget laws stable across additions.
+    config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
