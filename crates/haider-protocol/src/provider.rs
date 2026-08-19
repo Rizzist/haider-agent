@@ -242,7 +242,9 @@ pub struct NormalizedUsage {
 }
 
 /// Request lane for cache/cost aggregation. Variants are append-only.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageRequestKind {
     #[default]

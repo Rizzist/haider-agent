@@ -6679,12 +6679,16 @@ async fn session_summaries(
 ) -> Result<Vec<SessionSummary>, SessionHubError> {
     let mut sessions = Vec::with_capacity(session_ids.len());
     for session_id in session_ids {
-        // Read the fold seed before sealing the head. Model selection updates
-        // metadata and appends its fact atomically: a selection between these
-        // reads is included by the later head, while one after the head cannot
-        // leak a post-head seed into the summary.
-        let metadata = hub.inner.store.session_metadata(session_id).await?;
+        // Ship-gate round: the HEAD seals FIRST. The two reads are not a
+        // snapshot — a rename/model commit between them updates metadata and
+        // appends its fact atomically, so metadata-then-head could pair OLD
+        // metadata with the NEW head, and a head-gated watcher recording
+        // that head would suppress the refold forever. Head-first inverts
+        // the race into a self-healing one: a commit after this head read
+        // moves the TRUE head past the recorded value, so the next tick
+        // refolds and converges. Staleness is transient, never sticky.
         let head_seq = hub.inner.store.latest_seq(session_id).await?;
+        let metadata = hub.inner.store.session_metadata(session_id).await?;
         // Roster truth for unattached sessions replays the same sealed journal
         // as observation, so watches and explicit lists cannot disagree.
         let (turns, footprint) =

@@ -523,6 +523,15 @@ fn is_item_delta(envelope: &RawEnvelope) -> bool {
     let payload = &envelope.payload;
     payload.get("type").and_then(serde_json::Value::as_str) == Some("item")
         && payload.get("event").and_then(serde_json::Value::as_str) == Some("delta")
+        // Ship-gate round: a skippable delta must also be ADDRESSABLE — a
+        // shape carrying the delta discriminant but no item_id is a corrupt
+        // envelope the client should SEE, never silently lose. Subtype
+        // fields stay unchecked on purpose: future delta kinds this daemon
+        // cannot parse must still seal.
+        && payload
+            .get("item_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
         // ItemDelta is an internally tagged union. Requiring its string
         // discriminant matches the frozen wire shape without decoding or
         // cloning payloads, while still sealing future delta subtypes that

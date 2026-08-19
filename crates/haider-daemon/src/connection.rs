@@ -598,8 +598,14 @@ impl OutboundLane {
                     Err(_) => return None,
                 };
                 // Floor first: reply turnover must not wait behind camped
-                // event traffic.
-                if let Some(frame) = state.floor.pop_front() {
+                // event traffic — EXCEPT while the Welcome is still queued
+                // (ship-gate round): a floor-admitted fatal could otherwise
+                // be written msgpack-encoded before the JSON handshake
+                // frame. The welcome pops within one or two round-robin
+                // turns, so the deferral is momentary.
+                if !state.welcome_queued
+                    && let Some(frame) = state.floor.pop_front()
+                {
                     finish_pop(&mut state, &frame);
                     return Some(frame);
                 }
@@ -733,6 +739,12 @@ impl OutboundLane {
 fn finish_pop(state: &mut OutboundState, frame: &QueuedFrame) {
     if let Some((attachment_id, _)) = &frame.response_for {
         state.pending_responses.remove(attachment_id);
+    }
+    // Ship-gate round: the queued-welcome flag tracks PRESENCE in the queue
+    // — the floor deferral and the writer's fire-time barrier both key off
+    // it, and both must release the moment the frame moves to the writer.
+    if frame.welcome {
+        state.welcome_queued = false;
     }
     state.fire_one_ticket();
 }
@@ -1241,7 +1253,17 @@ where
         } else if notice.is_none() {
             break;
         }
-        if !notice_written && let Some(reserved_notice) = notice.take() {
+        // Ship-gate round: the barrier re-checks at FIRE time — the writer
+        // may have parked BEFORE the Welcome was queued, so the pre-select
+        // snapshot alone could let a msgpack notice outrun the JSON
+        // handshake frame. While the barrier holds, the notice stays parked
+        // and the loop keeps serving lanes until the Welcome write flips
+        // `welcome_written`.
+        let welcome_barrier_now = !welcome_written && queued.welcome_queued();
+        if !notice_written
+            && !welcome_barrier_now
+            && let Some(reserved_notice) = notice.take()
+        {
             drain_deadline = Some(reserved_notice.deadline);
             match tokio::time::timeout_at(
                 reserved_notice.deadline,

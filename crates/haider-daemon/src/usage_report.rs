@@ -23,7 +23,7 @@
 //! the duration of one request; reasons, reports, and cache entries carry
 //! no token or response bytes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -759,7 +759,7 @@ fn fs_receipt_lines(name: &str, args: &serde_json::Value) -> (u64, u64) {
 ///   snapshot wins (summing them would double-count);
 /// - unattributed usage (no account, no subtotals) is skipped, never
 ///   invented onto an account.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct UsageChunkKey {
     run: String,
     agent: String,
@@ -940,7 +940,11 @@ fn usd_to_microusd(value: f64) -> u64 {
 pub(crate) struct SessionFolder {
     stats: SessionLocalStats,
     current_model: String,
-    chunks: HashMap<UsageChunkKey, (UsagePayload, String)>,
+    /// BTreeMap (ship-gate round): the folds below accumulate FLOAT costs,
+    /// and float addition is non-associative — a HashMap's randomized
+    /// iteration order could shift the final microusd rounding run-to-run.
+    /// Ordered iteration makes every fold deterministic.
+    chunks: BTreeMap<UsageChunkKey, (UsagePayload, String)>,
     tool_attempts: HashMap<String, HashSet<String>>,
     timings: HashMap<String, AgentTiming>,
     run_agents: HashMap<String, Option<String>>,
@@ -953,7 +957,7 @@ impl SessionFolder {
         Self {
             stats: SessionLocalStats::default(),
             current_model: initial_model.to_owned(),
-            chunks: HashMap::new(),
+            chunks: BTreeMap::new(),
             tool_attempts: HashMap::new(),
             timings: HashMap::new(),
             run_agents: HashMap::new(),

@@ -1439,6 +1439,11 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
     // writers (codex/claude-code/opencode) build complete files; a partial
     // one would corrupt a foreign app's history, so the cursor refuses there.
     if let Some(since) = options.since {
+        // Ship-gate round: an at-head cursor yields an EMPTY window, and a
+        // head_seq derived from nothing would read 0 — feeding that back
+        // would replay the whole journal. The advertised cursor is never
+        // allowed to move backwards past what the caller already holds.
+        export.head_seq = export.head_seq.max(since);
         if matches!(
             options.format,
             Format::Codex | Format::ClaudeCode | Format::OpenCode
