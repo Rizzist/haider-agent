@@ -1520,6 +1520,7 @@ impl Store {
         &self,
         record: &LoomAgentType,
     ) -> StoreResult<LoomRegistration> {
+        let record = &normalize_agent_type(record);
         validate_agent_type(record)?;
         let mut connection = self.connection()?;
         let transaction = connection
@@ -1660,13 +1661,32 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let now = now_ms()?;
         let outcome = match existing {
-            Some((rev, ref current)) if *current == workflow.digest => LoomRegistration {
-                id: workflow.id.clone(),
-                rev: u32::try_from(rev)
-                    .map_err(|_| corrupt("loom workflow rev is out of range"))?,
-                digest: workflow.digest.clone(),
-                updated: false,
-            },
+            Some((rev, ref current)) if *current == workflow.digest => {
+                let rev =
+                    u32::try_from(rev).map_err(|_| corrupt("loom workflow rev is out of range"))?;
+                // Round 3: a pre-stamp record (template.version != rev) is
+                // healed HERE — the no-op path is the only chance a legacy
+                // row gets, and an unstamped row breaks the tail/TUI join.
+                workflow.rev = rev;
+                if workflow.template.version != rev {
+                    workflow.template.version = rev;
+                    let json = serde_json::to_string(&workflow)
+                        .map_err(|_| corrupt("loom workflow record is not encodable"))?;
+                    transaction
+                        .execute(
+                            "UPDATE loom_workflows SET record_json = ?2, updated_at_ms = ?3
+                             WHERE id = ?1",
+                            params![workflow.id.as_str(), json.as_str(), to_sqlite_integer(now)?],
+                        )
+                        .map_err(map_sqlite_error)?;
+                }
+                LoomRegistration {
+                    id: workflow.id.clone(),
+                    rev,
+                    digest: workflow.digest.clone(),
+                    updated: false,
+                }
+            }
             Some((rev, _)) => {
                 let next = u32::try_from(rev)
                     .ok()
@@ -12914,6 +12934,22 @@ fn resolve_graph_template_tx(
         .transpose()
 }
 
+/// Round 3 — canonical form BEFORE validation and digesting: typed I/O is
+/// trimmed, API hosts are lowercased. Comparisons downstream (grant hosts,
+/// tail joins) then never fight case or stray whitespace.
+fn normalize_agent_type(record: &LoomAgentType) -> LoomAgentType {
+    let mut record = record.clone();
+    record.in_type = record.in_type.trim().to_owned();
+    record.out_type = record.out_type.trim().to_owned();
+    for api in &mut record.apis {
+        *api = api.trim().to_ascii_lowercase();
+    }
+    for cli in &mut record.clis {
+        *cli = cli.trim().to_owned();
+    }
+    record
+}
+
 /// B1 registration bounds: identifiers, non-empty semantics, bounded lists.
 fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
     let ident = |value: &str| {
@@ -12958,8 +12994,22 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
     if !color_ok {
         return reject("agent type color must be empty or `#rrggbb`");
     }
-    if record.glyph.len() > 16 || record.glyph.chars().any(char::is_control) {
-        return reject("agent type glyph must be ≤16 bytes with no control characters");
+    let invisible = |character: char| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+    };
+    if record.glyph.len() > 16 || record.glyph.chars().any(invisible) {
+        return reject(
+            "agent type glyph must be ≤16 bytes with no control/invisible/reordering characters",
+        );
     }
     for list in [&record.clis, &record.apis, &record.skills, &record.scripts] {
         if list.len() > 32 {
@@ -12968,6 +13018,27 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
         if list.iter().any(|item| item.is_empty() || item.len() > 128) {
             return reject("agent type capability entries must be 1..=128 bytes");
         }
+        if list
+            .iter()
+            .any(|item| item.chars().any(|character| character.is_control()))
+        {
+            return reject("agent type capability entries must not carry control characters");
+        }
+    }
+    // Round 3 — a CLI grant is a PROGRAM NAME the exec fence compares by
+    // exact first token: an `=` would read as an env assignment and
+    // whitespace would split into two tokens, both fence bypass shapes.
+    if record.clis.iter().any(|cli| cli.contains(['=', ' ', '\t'])) {
+        return reject("agent type CLI entries must be bare program names (no `=`, no spaces)");
+    }
+    // An API grant is a HOST the network fence compares literally — never a
+    // URL, port, or credential-bearing form.
+    if record
+        .apis
+        .iter()
+        .any(|api| api.contains(['/', ':', '@', ' ', '\t']))
+    {
+        return reject("agent type API entries must be bare hosts (no scheme/port/path)");
     }
     Ok(())
 }

@@ -88,6 +88,7 @@ fn delegation(parent: &SessionId, child: &SessionId, agent: AgentId) -> Delegati
             attempt: 0,
             parent: None,
             coordinates: None,
+            cli_scope: None,
         },
         state: DelegationState::Spawned,
         report: None,

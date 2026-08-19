@@ -37,6 +37,12 @@ pub struct AgentManifest {
     /// Reserved: workflow/run coordinates (ADW lands post-0.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinates: Option<serde_json::Value>,
+    /// B3 (Loom) — the typed child's declared-CLI exec scope, FROZEN at
+    /// spawn (durable manifest truth): later registry edits never widen a
+    /// running child's executable set. `None` = untyped/unfenced;
+    /// `Some(vec![])` = typed deny-all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_scope: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -490,6 +490,7 @@ fn live_subagent_steer_and_close_refuse_instead_of_destroying_the_text() {
         attempt: 0,
         parent: None,
         coordinates: None,
+        cli_scope: None,
     };
     pass(
         &mut driver,

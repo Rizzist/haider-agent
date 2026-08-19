@@ -3082,6 +3082,12 @@ pub struct AppModel {
     /// workflows, and whether the detail pane is open.
     pub loom_selection: usize,
     pub loom_detail: bool,
+    /// Round 3: scroll offset inside an open /loom detail pane, clamped
+    /// against the render-published ceiling (the plan-surface pattern).
+    pub loom_scroll: u16,
+    pub loom_scroll_max: std::cell::Cell<u16>,
+    /// Round 3: where /loom returns on esc — the screen it was opened from.
+    pub loom_return: Option<Screen>,
     /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
@@ -3176,8 +3182,10 @@ pub struct AppModel {
     /// The render-computed scroll ceiling for the CURRENT document/viewport;
     /// the key handler clamps against it so overscroll never accumulates.
     pub plan_scroll_max: std::cell::Cell<u16>,
-    /// The plan menu the scroll belongs to — a NEW proposal starts at the top.
-    pub plan_menu_seen: std::cell::RefCell<Option<MenuId>>,
+    /// The plan the scroll belongs to — a NEW proposal starts at the top.
+    /// Keyed by (menu id, body byte length) so a re-issued id with different
+    /// content still reads as a new proposal (round 3).
+    pub plan_menu_seen: std::cell::RefCell<Option<(MenuId, usize)>>,
     /// Selected row in the slash palette (open while composer starts with /).
     /// Ranges over the FULL match list; the render window follows.
     pub palette_selection: usize,
@@ -3407,6 +3415,9 @@ impl Default for AppModel {
             loom_loaded: false,
             loom_selection: 0,
             loom_detail: false,
+            loom_scroll: 0,
+            loom_scroll_max: std::cell::Cell::new(0),
+            loom_return: None,
             graph_inspect: None,
             retry_inflight: false,
             graph_unsupported: false,
@@ -5280,7 +5291,19 @@ impl AppModel {
         // detail pane, esc backs out (detail → list → where you came from).
         if self.screen == Screen::Loom {
             let total = self.loom_types.len() + self.loom_workflows.len();
+            // Round 3: a registry that emptied under an open detail pane
+            // leaves no subject — fold the pane so esc means one press.
+            if total == 0 {
+                self.loom_detail = false;
+            }
+            let ceiling = self.loom_scroll_max.get();
             match key.code {
+                KeyCode::Up if self.loom_detail => {
+                    self.loom_scroll = self.loom_scroll.min(ceiling).saturating_sub(1);
+                }
+                KeyCode::Down if self.loom_detail => {
+                    self.loom_scroll = self.loom_scroll.saturating_add(1).min(ceiling);
+                }
                 KeyCode::Up => {
                     self.loom_selection = self.loom_selection.saturating_sub(1);
                 }
@@ -5289,14 +5312,24 @@ impl AppModel {
                 }
                 KeyCode::Enter if total > 0 => {
                     self.loom_detail = !self.loom_detail;
+                    self.loom_scroll = 0;
+                    // Unknown ceiling until the pane paints once.
+                    self.loom_scroll_max.set(u16::MAX);
                 }
                 KeyCode::Esc => {
                     if self.loom_detail {
                         self.loom_detail = false;
-                    } else if self.active_session.is_some() {
-                        self.screen = Screen::Session;
+                        self.loom_scroll = 0;
                     } else {
-                        self.screen = Screen::Launcher;
+                        // Round 3: esc returns to the screen /loom was
+                        // OPENED from, not blindly to the session.
+                        self.screen = self.loom_return.take().unwrap_or({
+                            if self.active_session.is_some() {
+                                Screen::Session
+                            } else {
+                                Screen::Launcher
+                            }
+                        });
                     }
                 }
                 _ => {}
@@ -5329,9 +5362,14 @@ impl AppModel {
             && menu.origin == "plan"
             && !menu.options.is_empty()
         {
-            if self.plan_menu_seen.borrow().as_ref() != Some(&menu.id) {
-                *self.plan_menu_seen.borrow_mut() = Some(menu.id.clone());
+            let plan_key = (menu.id.clone(), menu.body.iter().map(String::len).sum());
+            if self.plan_menu_seen.borrow().as_ref() != Some(&plan_key) {
+                *self.plan_menu_seen.borrow_mut() = Some(plan_key);
                 self.plan_scroll.set(0);
+                // Round 3: the ceiling for an UNPAINTED document is unknown —
+                // never discard a keypress against a stale (or zero) max; the
+                // next render publishes the real one and clamps.
+                self.plan_scroll_max.set(u16::MAX);
             }
             let options = menu.options.len();
             // Review round 2: the STATE clamps too — the render clamp alone
@@ -8951,6 +8989,8 @@ impl AppModel {
         }
         self.loom_selection = 0;
         self.loom_detail = false;
+        self.loom_scroll = 0;
+        self.loom_return = Some(self.screen);
         self.screen = Screen::Loom;
     }
 

@@ -73,6 +73,7 @@ fn record(parent: &SessionId, child: &SessionId) -> DelegationRecord {
             attempt: 0,
             parent: None,
             coordinates: None,
+            cli_scope: None,
         },
         state: DelegationState::Spawned,
         report: None,

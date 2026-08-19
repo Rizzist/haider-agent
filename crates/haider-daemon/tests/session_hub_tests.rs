@@ -806,6 +806,7 @@ fn fleet_delegation(
             attempt: 0,
             parent: parent_agent_id,
             coordinates: None,
+            cli_scope: None,
         },
         state: DelegationState::Spawned,
         report: None,

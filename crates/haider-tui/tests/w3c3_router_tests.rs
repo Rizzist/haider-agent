@@ -108,6 +108,7 @@ fn manifest(agent: &str, parent: Option<&str>) -> AgentManifest {
         attempt: 0,
         parent: parent.map(AgentId::new),
         coordinates: None,
+        cli_scope: None,
     }
 }
 

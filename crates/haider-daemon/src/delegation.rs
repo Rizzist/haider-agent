@@ -315,6 +315,13 @@ impl DelegationHandle {
             attempt: 0,
             parent: coordinates.parent_agent_id.clone(),
             coordinates: Some(manifest_coordinates),
+            // Round 3: the exec scope FREEZES at spawn — durable manifest
+            // truth, immune to later registry edits widening a running
+            // child's executable set.
+            cli_scope: coordinates
+                .agent_type
+                .as_ref()
+                .map(|record| record.clis.clone()),
         };
         manifest.placement.ensure_local()?;
         // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — a child must

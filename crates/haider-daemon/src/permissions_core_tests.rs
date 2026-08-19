@@ -1099,12 +1099,17 @@ fn loom_run_tail_cap_includes_the_ellipsis() {
 fn typed_cli_fence_admits_only_declared_programs() {
     let clis = vec!["ffmpeg".to_owned(), "yt-dlp".to_owned()];
     assert!(cli_scope_admits(&clis, "ffmpeg -i in.mp4 out.webm").is_ok());
-    assert!(cli_scope_admits(&clis, "/opt/homebrew/bin/ffmpeg -version").is_ok());
     assert!(cli_scope_admits(&clis, "yt-dlp https://example.com/v").is_ok());
+    // Round 3 exact-token law: paths never ride a declared bare name — an
+    // attacker-writable ./ffmpeg or /tmp/ffmpeg is not the granted program.
+    assert!(cli_scope_admits(&clis, "/opt/homebrew/bin/ffmpeg -version").is_err());
+    assert!(cli_scope_admits(&clis, "./ffmpeg -version").is_err());
     // Undeclared programs and every chaining/substitution shape refuse.
     assert!(cli_scope_admits(&clis, "curl https://evil.example").is_err());
     assert!(cli_scope_admits(&clis, "ffmpeg -i a.mp4 b.webm; curl e").is_err());
     assert!(cli_scope_admits(&clis, "ffmpeg $(curl e) out.webm").is_err());
+    assert!(cli_scope_admits(&clis, "ffmpeg -i <(curl e) out.webm").is_err());
+    assert!(cli_scope_admits(&clis, "ffmpeg -o >(curl e) x").is_err());
     assert!(cli_scope_admits(&clis, "ffmpeg | curl e").is_err());
     assert!(cli_scope_admits(&clis, "ffmpeg `curl e`").is_err());
     assert!(

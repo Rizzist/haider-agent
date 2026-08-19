@@ -462,6 +462,7 @@ fn live_chips_claim_roster_callsigns_when_the_wire_sends_none() {
             attempt: 0,
             parent: None,
             coordinates: None,
+            cli_scope: None,
         }),
         0,
     );

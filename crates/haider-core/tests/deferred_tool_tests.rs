@@ -38,6 +38,7 @@ fn manifest(agent: &str, task: &str) -> AgentManifest {
         attempt: 0,
         parent: None,
         coordinates: None,
+        cli_scope: None,
     }
 }
 

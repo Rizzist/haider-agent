@@ -64,8 +64,15 @@ impl LoomAgentType {
     /// real revision the registry must persist, never a silent no-op.
     #[must_use]
     pub fn digest(&self) -> String {
+        // Length-prefixed framing (review round 3): delimiter bytes inside a
+        // field can never collide with field boundaries, so `["a","b"]` and
+        // `["a\u{1e}b"]` hash differently and a revocation never no-ops.
         let mut hasher = blake3::Hasher::new();
-        for part in [
+        let mut part = |bytes: &[u8]| {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        for field in [
             self.id.as_str(),
             self.name.as_str(),
             self.job.as_str(),
@@ -74,15 +81,13 @@ impl LoomAgentType {
             self.color.as_str(),
             self.glyph.as_str(),
         ] {
-            hasher.update(part.as_bytes());
-            hasher.update(b"\x1f");
+            part(field.as_bytes());
         }
         for list in [&self.clis, &self.apis, &self.skills, &self.scripts] {
+            part(&(list.len() as u64).to_le_bytes());
             for item in list {
-                hasher.update(item.as_bytes());
-                hasher.update(b"\x1e");
+                part(item.as_bytes());
             }
-            hasher.update(b"\x1f");
         }
         hasher.finalize().to_hex()[..16].to_string()
     }
@@ -286,7 +291,10 @@ fn is_ident(value: &str) -> bool {
 /// identifier or an `A + B + ...` composite of bounded (≤64B) identifiers.
 #[must_use]
 pub fn valid_type_expr(value: &str) -> bool {
-    !value.is_empty() && value.split('+').all(|operand| is_ident(operand.trim()))
+    !value.is_empty()
+        && value.len() <= 256
+        && value.split('+').count() <= 8
+        && value.split('+').all(|operand| is_ident(operand.trim()))
 }
 
 fn parse_node_line(line: &str) -> Result<LoomNodeAst, String> {
@@ -573,18 +581,18 @@ fn rebuild_source(ast: &LoomAst) -> String {
 
 fn workflow_digest(workflow: &LoomWorkflow) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(workflow.pipe_version.as_bytes());
-    hasher.update(b"\x1f");
-    hasher.update(workflow.source.as_bytes());
+    let mut part = |bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    part(workflow.pipe_version.as_bytes());
+    part(workflow.source.as_bytes());
     // The digest binds the RESOLVED type signatures too: the same source
     // compiled against a changed registry is a different workflow identity.
     for meta in &workflow.meta {
-        hasher.update(meta.node.as_str().as_bytes());
-        hasher.update(b"\x1e");
-        hasher.update(meta.in_type.as_deref().unwrap_or("").as_bytes());
-        hasher.update(b"\x1e");
-        hasher.update(meta.out_type.as_deref().unwrap_or("").as_bytes());
-        hasher.update(b"\x1f");
+        part(meta.node.as_str().as_bytes());
+        part(meta.in_type.as_deref().unwrap_or("").as_bytes());
+        part(meta.out_type.as_deref().unwrap_or("").as_bytes());
     }
     hasher.finalize().to_hex()[..16].to_string()
 }

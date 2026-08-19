@@ -3642,8 +3642,11 @@ fn render_session(
     if let Some(plan) = plan_menu {
         // Review round 2: RENDER owns the new-proposal reset — plan B paints
         // from the top even before any keypress reaches the key handler.
-        if model.plan_menu_seen.borrow().as_ref() != Some(&plan.id) {
-            *model.plan_menu_seen.borrow_mut() = Some(plan.id.clone());
+        // Round 3: keyed by (id, body length) so a re-issued id with new
+        // content still resets.
+        let plan_key = (plan.id.clone(), plan.body.iter().map(String::len).sum());
+        if model.plan_menu_seen.borrow().as_ref() != Some(&plan_key) {
+            *model.plan_menu_seen.borrow_mut() = Some(plan_key);
             model.plan_scroll.set(0);
         }
         let max_scroll =
@@ -5198,6 +5201,19 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         ),
     ]));
     lines.push(Line::raw(""));
+    // Round 3: an unhydrated live connection is LOADING, not empty — the
+    // once-per-connection loom.list may still be in flight (or the socket
+    // just died and the next connection re-hydrates).
+    if !model.loom_loaded && !model.mode.fabricates_locally() {
+        lines.push(Line::styled(
+            "loading registry from the daemon…",
+            theme.dim_style(),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("esc back", theme.dim_style()));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
     if model.loom_types.is_empty() && model.loom_workflows.is_empty() {
         lines.push(Line::styled(
             "registry empty — register agent types and pipe workflows over loom.*",
@@ -5212,6 +5228,7 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     let selection = model
         .loom_selection
         .min((type_count + model.loom_workflows.len()).saturating_sub(1));
+    let mut selected_line: usize = 0;
 
     if model.loom_detail {
         if selection < type_count {
@@ -5330,6 +5347,9 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             let accent = crate::style::loom_accent_style(&record.color)
                 .unwrap_or_else(|| theme.gold_style());
             let cursor = if index == selection { "❯ " } else { "  " };
+            if index == selection {
+                selected_line = lines.len();
+            }
             lines.push(Line::from(vec![
                 Span::styled(cursor.to_owned(), theme.gold_style()),
                 Span::styled(format!("{} ", record.glyph), accent),
@@ -5370,6 +5390,9 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             theme.gold_style(),
         ));
         for (index, workflow) in model.loom_workflows.iter().enumerate() {
+            if type_count + index == selection {
+                selected_line = lines.len();
+            }
             let cursor = if type_count + index == selection {
                 "❯ "
             } else {
@@ -5417,10 +5440,21 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             theme.dim_style(),
         ));
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-        area,
-    );
+    // Round 3: both views SCROLL — a large registry or a long detail pane
+    // must stay reachable. Detail rides loom_scroll against a published
+    // ceiling (the plan-surface pattern); the list follows its selection.
+    let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total_lines.saturating_sub(area.height);
+    let scroll = if model.loom_detail {
+        model.loom_scroll_max.set(max_scroll);
+        model.loom_scroll.min(max_scroll)
+    } else {
+        let selected = u16::try_from(selected_line).unwrap_or(u16::MAX);
+        selected
+            .saturating_sub(area.height.saturating_sub(3))
+            .min(max_scroll)
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), area);
 }
 
 fn render_graph(

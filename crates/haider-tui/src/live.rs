@@ -964,6 +964,13 @@ pub enum LiveReply {
     Disconnected {
         reason: String,
     },
+    /// Round 3: the fresh socket's welcome facts — features and version —
+    /// re-ground the model BEFORE Reconnected resumes work, so capability
+    /// gates (Loom accents, /loom entry) never trust a dead handshake.
+    Handshake {
+        features: std::collections::BTreeSet<String>,
+        version: String,
+    },
     /// A fresh connection is negotiated. Every attachment is gone with the
     /// old socket, so the working set is rebuilt from the reducer's cursors
     /// and the outbox is resent under its durable ids.
@@ -1549,9 +1556,23 @@ impl LiveDriver {
                 agent_types,
                 workflows,
             } => {
-                model.loom_types = agent_types;
-                model.loom_workflows = workflows;
-                model.loom_loaded = true;
+                // Round 3: a reply that outlived its socket is stale — the
+                // disconnect cleared the snapshot, and reinstalling it here
+                // would latch loom_loaded against the NEXT connection's
+                // hydration. Drop it.
+                if self.connected {
+                    model.loom_types = agent_types;
+                    model.loom_workflows = workflows;
+                    model.loom_loaded = true;
+                    // The registry moved under the browser: keep the stored
+                    // selection inside the new list and close a detail pane
+                    // whose subject may be gone.
+                    let total = model.loom_types.len() + model.loom_workflows.len();
+                    if model.loom_selection >= total {
+                        model.loom_selection = total.saturating_sub(1);
+                        model.loom_detail = false;
+                    }
+                }
                 model.dirty = true;
                 Vec::new()
             }
@@ -2899,6 +2920,9 @@ impl LiveDriver {
                 model.loom_loaded = false;
                 model.loom_types.clear();
                 model.loom_workflows.clear();
+                // Round 3: capability facts die with the socket as well; the
+                // reconnect handshake re-grounds them before work resumes.
+                model.daemon_features.clear();
                 // The run survives the socket; the ATTACHMENT does not.
                 // `active_run` is stream-derived and the reattach replays
                 // whatever moved while we were away.
@@ -2942,6 +2966,12 @@ impl LiveDriver {
                 } else {
                     format!("· reconnecting — {reason}")
                 });
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::Handshake { features, version } => {
+                model.daemon_features = features;
+                model.daemon_version = Some(version);
                 model.dirty = true;
                 Vec::new()
             }

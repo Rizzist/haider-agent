@@ -1486,6 +1486,7 @@ fn golden_agent_family() {
             attempt: 1,
             parent: Some(AgentId::new("a-head")),
             coordinates: None,
+            cli_scope: None,
         },
     );
     golden(
@@ -1530,6 +1531,7 @@ fn golden_agent_spawned_handoff_coordinate_is_additive() {
             "child_session_id": "session-child-handoff",
             "handoff_dir": "/work/project/.haider/handoff/0123456789abcdef",
         })),
+        cli_scope: None,
     });
     additive_golden("agent_spawned_handoff", &fact);
 

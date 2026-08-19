@@ -261,6 +261,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
         attempt: 0,
         parent: None,
         coordinates: None,
+        cli_scope: None,
     };
     store
         .create_delegation(DelegationRecord {

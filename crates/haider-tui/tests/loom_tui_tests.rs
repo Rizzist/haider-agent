@@ -84,6 +84,7 @@ fn typed_chip_paints_its_loom_accent() {
         attempt: 0,
         parent: None,
         coordinates: None,
+        cli_scope: None,
     };
     model
         .chips
@@ -310,6 +311,7 @@ fn typed_chip_accent_requires_a_loom_aware_daemon() {
         attempt: 0,
         parent: None,
         coordinates: None,
+        cli_scope: None,
     };
     model
         .chips
@@ -361,4 +363,38 @@ fn disconnect_clears_the_loom_snapshot() {
     );
     assert!(model.loom_types.is_empty(), "stale types must not survive");
     assert!(model.loom_workflows.is_empty());
+}
+
+/// Round 3 MUTATION CHECK: render "registry empty" for an unhydrated live
+/// connection, or forget the origin screen / detail fold on esc. Expected
+/// RUNTIME failures below.
+#[test]
+fn loom_screen_loading_state_and_esc_origin() {
+    let mut model = launcher_model();
+    model.mode = haider_tui::app::RuntimeMode::Live;
+    model.loom_loaded = false;
+    model.screen = Screen::Loom;
+    let (rows, _) = draw(&model);
+    let all = rows.join("\n");
+    assert!(
+        all.contains("loading registry"),
+        "unhydrated live /loom must say LOADING, never empty:\n{all}"
+    );
+    assert!(
+        !all.contains("registry empty"),
+        "loading must not read as empty:\n{all}"
+    );
+
+    // Esc returns to the screen /loom was opened FROM — and an emptied
+    // registry folds an open detail pane so one press suffices.
+    model.loom_loaded = true;
+    model.loom_detail = true;
+    model.loom_return = Some(Screen::Graph);
+    model.handle(haider_tui::app::AppEvent::Key(
+        ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Esc,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ),
+    ));
+    assert_eq!(model.screen, Screen::Graph, "esc honors the origin screen");
 }

@@ -342,6 +342,15 @@ async fn run_link(
                     events = fresh_events;
                     // A fresh client owns a fresh loss counter.
                     lost_baseline = client.lost_events();
+                    // Round 3: the fresh welcome's capability facts land
+                    // BEFORE Reconnected resumes any feature-gated work.
+                    let handshake = LiveReply::Handshake {
+                        features: client.welcome().features.iter().cloned().collect(),
+                        version: client.welcome().daemon_version.clone(),
+                    };
+                    if replies.send(handshake).await.is_err() {
+                        return;
+                    }
                     if replies.send(LiveReply::Reconnected).await.is_err() {
                         return;
                     }

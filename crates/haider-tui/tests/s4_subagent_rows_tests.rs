@@ -73,6 +73,7 @@ fn manifest(agent: &str, task: &str, child_session: Option<&str>) -> AgentManife
                 "child_session_id": child,
             })
         }),
+        cli_scope: None,
     }
 }
 

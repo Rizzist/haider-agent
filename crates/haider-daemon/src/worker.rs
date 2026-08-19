@@ -4449,22 +4449,23 @@ async fn start_turn(
             web_degrade.anthropic_web_tools = true;
         }
     }
-    // B3 (review round 2) — a typed child's exec fence: the type id is the
-    // daemon-stamped `@type · ` task prefix (C3), and the registry is the
-    // living authority for WHICH binaries that type may run. A typed child
-    // whose record vanished gets deny-all, never unfenced.
-    let cli_scope = match delegation_record
-        .as_ref()
-        .and_then(|record| loom_task_type_id(&record.task))
-    {
-        Some(type_id) => Some(
-            lease
-                .hub()
-                .loom_agent_type(&type_id)
-                .await?
-                .map(|record| record.clis)
-                .unwrap_or_default(),
-        ),
+    // B3 (round 3) — the typed child's exec scope is MANIFEST truth, frozen
+    // at spawn: registry edits never widen a running child's executable
+    // set. Older typed manifests (pre-freeze) fall back to the daemon-truth
+    // task prefix under deny-all-when-unresolvable.
+    let cli_scope = match delegation_record.as_ref() {
+        Some(record) if record.manifest.cli_scope.is_some() => record.manifest.cli_scope.clone(),
+        Some(record) => match loom_task_type_id(&record.task) {
+            Some(type_id) => Some(
+                lease
+                    .hub()
+                    .loom_agent_type(&type_id)
+                    .await?
+                    .map(|typed| typed.clis)
+                    .unwrap_or_default(),
+            ),
+            None => None,
+        },
         None => None,
     };
     let resolved = dependencies
@@ -6528,7 +6529,12 @@ pub(crate) fn effect_within_grant(grant: &Grant, requested: &EffectClass) -> boo
                 EffectClass::Network {
                     host: requested_host,
                 },
-            ) => ceiling_host.is_empty() || ceiling_host == requested_host,
+            ) => {
+                // Round 3: hosts compare case-insensitively — registration
+                // lowercases declared APIs, and URL parsing lowercases the
+                // request host, but the fence never depends on either.
+                ceiling_host.is_empty() || ceiling_host.eq_ignore_ascii_case(requested_host)
+            }
             _ => ceiling == requested,
         })
 }
@@ -6573,20 +6579,27 @@ pub(crate) fn typed_child_grant(record: &haider_protocol::loom::LoomAgentType) -
 /// metacharacters would smuggle a second program (`curl`!) past both this
 /// check and the declared-API host ceiling.
 pub(crate) fn cli_scope_admits(clis: &[String], command: &str) -> Result<(), String> {
-    let chained = command.contains([';', '|', '&', '`', '\n']) || command.contains("$(");
+    // Round 3: process substitution `<(..)`/`>(..)` executes a second
+    // program just like `$(..)` — all are chaining shapes.
+    let chained = command.contains([';', '|', '&', '`', '\n'])
+        || command.contains("$(")
+        || command.contains("<(")
+        || command.contains(">(");
     if chained {
         return Err(
             "typed grant: command chaining/substitution is outside this agent's CLI scope"
                 .to_owned(),
         );
     }
+    // Round 3: EXACT first-token match — no basename resolution, so an
+    // attacker-writable `./ffmpeg` or `/tmp/ffmpeg` never rides a declared
+    // bare name. A declared CLI is the literal token the child may run.
     let first = command.split_whitespace().next().unwrap_or("");
-    let base = first.rsplit('/').next().unwrap_or(first);
-    if clis.iter().any(|cli| cli == base || cli == first) {
+    if clis.iter().any(|cli| cli == first) {
         Ok(())
     } else {
         Err(format!(
-            "typed grant: `{base}` is not among this agent's declared CLIs"
+            "typed grant: `{first}` is not this agent's declared CLI (declare the exact token)"
         ))
     }
 }
