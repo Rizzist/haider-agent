@@ -6085,7 +6085,12 @@ impl HubConnection {
         // plus envelope overhead) must fit this connection's negotiated
         // frame limit, or a later publish would kill the watcher's
         // connection mid-delivery. Refuse the registration upfront instead.
-        let snapshot_ceiling = SURFACE_INPUT_MAX_BYTES + SURFACE_STATUS_MAX_BYTES + 8_192;
+        // rev933d finding 8: a legal snapshot's JSON encoding can be ~2×
+        // its raw bytes (a string of all `\"`/`\\`), plus keys, the echoed
+        // request id, and framing. Size the gate for that worst case, not
+        // the raw caps, so a later publish can never overflow the watcher's
+        // negotiated frame and kill its connection mid-delivery.
+        let snapshot_ceiling = 2 * (SURFACE_INPUT_MAX_BYTES + SURFACE_STATUS_MAX_BYTES) + 16_384;
         if let Some(limit) = self.sink.max_frame_bytes()
             && limit < snapshot_ceiling
         {

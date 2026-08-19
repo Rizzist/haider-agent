@@ -172,3 +172,36 @@ fn dedup_and_materiality_bound_publishes_to_transitions() {
     completed.state = "complete".into();
     assert!(rollup_is_material(&tick, Some(&base), &completed));
 }
+
+/// rev933d finding 5 MUTATION CHECK: re-add `menu_*` to the retention
+/// filter (the unbounded-growth vector), or drop a graph-family kind.
+/// Expected RUNTIME failure: menu events are retained though reduce_graphs
+/// never reads them, or a real graph event stops being retained.
+#[test]
+fn only_graph_family_events_are_retained_for_reduction() {
+    use crate::delegation::graph_reduction_event;
+    let event = |kind: &str| serde_json::json!({ "type": kind });
+    assert!(graph_reduction_event(&event("graph_pinned")));
+    assert!(graph_reduction_event(&event("graph_advanced")));
+    assert!(graph_reduction_event(&event("evidence_recorded")));
+    assert!(graph_reduction_event(&event("todo_graph_attached")));
+    assert!(
+        !graph_reduction_event(&event("menu_opened")),
+        "menus are never consumed by reduce_graphs — retaining them was the leak"
+    );
+    assert!(!graph_reduction_event(&event("item")));
+}
+
+/// rev933d finding 5 MUTATION CHECK: misclassify a live phase as terminal
+/// (or a terminal one as live). Expected RUNTIME failure: the prune would
+/// drop a live graph's events, or never reclaim a dead graph's.
+#[test]
+fn graph_phase_terminality_table_is_exact() {
+    use crate::delegation::graph_phase_is_terminal;
+    use haider_protocol::graph::GraphPhase;
+    assert!(!graph_phase_is_terminal(GraphPhase::Active));
+    assert!(graph_phase_is_terminal(GraphPhase::Completed));
+    assert!(graph_phase_is_terminal(GraphPhase::Blocked));
+    assert!(graph_phase_is_terminal(GraphPhase::Abandoned));
+    assert!(graph_phase_is_terminal(GraphPhase::Superseded));
+}

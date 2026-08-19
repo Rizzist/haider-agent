@@ -3082,16 +3082,13 @@ impl LiveDriver {
                 // live input surface: the session is active and a session
                 // surface is on screen. Anything else ignores the op — the
                 // absence of a republish tells the injector it did not land.
-                // rev933c finding 4: an injected op lands only when the
-                // PLAIN session composer owns Enter — never under a menu
-                // card, the help overlay, or a non-session surface, where a
-                // synthesized Submit would answer/activate something else.
-                // The subagent view is excluded too: its composer messages
-                // the CHILD, which is not the surface the ADE mirrored.
-                if model.active_session.as_ref() == Some(&session)
-                    && model.screen == crate::app::Screen::Session
-                    && model.projection.open_menu().is_none()
-                    && !model.help_open
+                // rev933c/d finding 4: an injected op lands only when the
+                // PLAIN session composer is the live Enter target — the
+                // single predicate that mirrors key-dispatch precedence
+                // (no login/talk-setup/engaged-talk card, no menu, no help,
+                // not the child-messaging subagent view). A synthesized
+                // Submit can therefore never activate a card row.
+                if model.active_session.as_ref() == Some(&session) && model.accepts_injected_input()
                 {
                     match op {
                         haider_rpc::SurfaceInjectOp::Set { text } => {

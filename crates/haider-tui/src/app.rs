@@ -5847,6 +5847,20 @@ impl AppModel {
     /// viewed chip's question). Gates the TUI5 editing keys so ⌃K on a
     /// menu can never eat a hidden draft.
     #[must_use]
+    /// rev933d finding 4: injection from an embedding client applies only
+    /// when the PLAIN session composer is the live Enter target — no card
+    /// (login, `/talk` setup, an engaged talk session), no menu, no help,
+    /// and never the subagent view (whose composer messages the child).
+    /// This mirrors the key-dispatch precedence exactly, so a synthesized
+    /// Submit can never activate a card row or answer a question.
+    pub fn accepts_injected_input(&self) -> bool {
+        self.screen == Screen::Session
+            && self.login.is_none()
+            && self.talk_setup.is_none()
+            && !self.talk.engaged()
+            && self.composer_owns_input()
+    }
+
     fn composer_owns_input(&self) -> bool {
         if self.screen == Screen::Boot || self.help_open {
             return false;

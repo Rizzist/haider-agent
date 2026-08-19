@@ -1798,6 +1798,7 @@ impl DelegationHandle {
                 mirror.metrics_folder.push(&envelope);
                 if graph_reduction_event(&envelope.payload) {
                     mirror.graph_envelopes.push(envelope.clone());
+                    prune_graph_envelopes(&mut mirror.graph_envelopes);
                 }
                 let Ok(payload) = serde_json::from_value::<haider_protocol::EventPayload>(
                     envelope.payload.clone(),
@@ -1905,24 +1906,6 @@ impl DelegationHandle {
                             mirror.projected_events.insert(event_id);
                             mirror.last_rollup = Some(rollup);
                         }
-                    }
-                    // rev933c finding 5: the reduction history must not grow
-                    // with the child run. A terminal graph's events can no
-                    // longer change any future reduction — drop them once
-                    // this boundary (which may have published its final
-                    // rollup) has consumed them. The hard cap is a backstop
-                    // against pathological non-graph retention (menu spam);
-                    // dropping the OLDEST envelopes can only misproject
-                    // graphs that are already long dead.
-                    if let Some(dead) = terminal_graph_id(&payload) {
-                        mirror.graph_envelopes.retain(|kept| {
-                            raw_payload_graph_id(&kept.payload) != Some(dead.as_str())
-                        });
-                    }
-                    const GRAPH_ENVELOPE_CAP: usize = 8_192;
-                    if mirror.graph_envelopes.len() > GRAPH_ENVELOPE_CAP {
-                        let excess = mirror.graph_envelopes.len() - GRAPH_ENVELOPE_CAP;
-                        mirror.graph_envelopes.drain(..excess);
                     }
                 }
             }
@@ -2170,7 +2153,10 @@ fn deadline_elapsed(committed_at_ms: u64, deadline: Duration) -> bool {
     now_ms.saturating_sub(committed_at_ms) >= deadline.as_millis()
 }
 
-fn graph_reduction_event(payload: &serde_json::Value) -> bool {
+pub(crate) fn graph_reduction_event(payload: &serde_json::Value) -> bool {
+    // rev933d finding 5: reduce_graphs consumes ONLY the graph family
+    // (graph_*, todo_graph_attached, evidence_recorded). Menu events were
+    // retained but never read — pure unbounded growth under menu traffic.
     payload
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -2178,21 +2164,43 @@ fn graph_reduction_event(payload: &serde_json::Value) -> bool {
             kind.starts_with("graph_")
                 || kind == "todo_graph_attached"
                 || kind == "evidence_recorded"
-                || kind.starts_with("menu_")
         })
 }
 
-/// The graph a TERMINAL payload closes, if any — the prune key for the
-/// mirror's reduction history (rev933c finding 5).
-fn terminal_graph_id(
-    payload: &haider_protocol::EventPayload,
-) -> Option<&haider_protocol::ids::GraphId> {
-    match payload {
-        haider_protocol::EventPayload::GraphCompleted(completed) => Some(&completed.graph_id),
-        haider_protocol::EventPayload::GraphAbandoned(abandoned) => Some(&abandoned.graph_id),
-        haider_protocol::EventPayload::GraphSuperseded(superseded) => Some(&superseded.old),
-        _ => None,
+/// Bounds the mirror's reduction history WITHOUT ever dropping a live
+/// graph's events (rev933d finding 5). Runs on every push once a soft cap
+/// is crossed: reduce once, keep only events of graphs still non-terminal.
+/// A terminal graph can never change a future reduction, so its events are
+/// safe to drop; a live graph's are not. A pathological single live graph
+/// past the HARD cap drops its own oldest events only.
+fn prune_graph_envelopes(envelopes: &mut Vec<RawEnvelope>) {
+    const SOFT_CAP: usize = 8_192;
+    const HARD_CAP: usize = 16_384;
+    if envelopes.len() <= SOFT_CAP {
+        return;
     }
+    let reductions = reduce_graphs(envelopes);
+    envelopes.retain(|envelope| match raw_payload_graph_id(&envelope.payload) {
+        Some(graph_id) => reductions
+            .graph(&haider_protocol::ids::GraphId::new(graph_id))
+            .and_then(|reduction| reduction.status.as_ref())
+            .is_none_or(|status| !graph_phase_is_terminal(status.phase)),
+        None => true,
+    });
+    if envelopes.len() > HARD_CAP {
+        let excess = envelopes.len() - HARD_CAP;
+        envelopes.drain(..excess);
+    }
+}
+
+pub(crate) fn graph_phase_is_terminal(phase: GraphPhase) -> bool {
+    matches!(
+        phase,
+        GraphPhase::Completed
+            | GraphPhase::Blocked
+            | GraphPhase::Abandoned
+            | GraphPhase::Superseded
+    )
 }
 
 /// Raw top-level `graph_id` peek — the graph_* family all carry it; events
