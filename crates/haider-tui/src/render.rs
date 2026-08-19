@@ -4,7 +4,7 @@
 //! Visual authority: the `/tui` sim — typography, chips, and row shapes are
 //! copied from it deliberately.
 
-use crate::app::{AppModel, Hit, LauncherRow, Screen, update_version_label};
+use crate::app::{AppModel, Hit, LauncherRow, LoomPane, Screen, update_version_label};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_TEXT, PALETTE_MAX_ROWS};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
@@ -1185,6 +1185,19 @@ fn render_launcher(
             "⇄",
             "Peers",
             "remote placement — not supported · Haider runs local-only".to_owned(),
+        ),
+        // Sim rows 4+5 (tui.js:6302-6315): the Loom split surfaces.
+        (
+            LauncherRow::Workflows,
+            "⌘",
+            "Workflows",
+            "typed pipe DAGs — nodes, gates, conditional edges · /workflows".to_owned(),
+        ),
+        (
+            LauncherRow::Loom,
+            "✦",
+            "Loom",
+            "Agent Types — capability-scoped specialists · @type to use".to_owned(),
         ),
     ] {
         // Sim `.aurarow` (tui.js:4403-4413): gold glyph, gold name, dim
@@ -4862,6 +4875,20 @@ fn metrics_chip_row_meta(
 /// The SubTree panel (§2.9): header toggle + depth-first rows with
 /// connectors; every row opens its chip's view. Shared by the session and
 /// subagent screens (the map is one surface).
+/// The act-slot sentence for a chip running a pinned workflow — the DAG
+/// position instead of tool chatter (sim tui.js:5410-5428, Image #26 law).
+fn workflow_chip_activity(roll: &haider_protocol::agent::AgentGraphRollupV1) -> String {
+    match roll.state.as_str() {
+        "complete" => format!("✓ {}/{} nodes green", roll.nodes_green, roll.nodes_total),
+        "failed" => format!("✗ {}/{} nodes green", roll.nodes_green, roll.nodes_total),
+        "gate" => match roll.gate.as_deref() {
+            Some("human") | None => "⛩ gate — needs your confirm".to_owned(),
+            Some(kind) => format!("⛩ {kind} gate — waiting"),
+        },
+        _ => format!("node {}/{}", roll.node_index.max(1), roll.nodes_total),
+    }
+}
+
 fn render_subtree(
     model: &AppModel,
     theme: &Theme,
@@ -4967,6 +4994,10 @@ fn render_subtree(
             let viewing = on_subagent && model.view_path.last() == Some(&chip.agent);
             let activity = if viewing {
                 "viewing ←".to_owned()
+            } else if let Some(roll) = &chip.graph {
+                // Sim workflow chips (tui.js:5410-5428): the act slot
+                // speaks the DAG — nodes green, gate wait, or position.
+                workflow_chip_activity(roll)
             } else {
                 chip.activity()
             };
@@ -5050,6 +5081,20 @@ fn render_subtree(
                         format!(" · {} · {}", chip.name, chip.model),
                         ink,
                     ));
+                }
+            }
+            if let Some(roll) = chip.graph.as_ref().filter(|_| !chip.closed) {
+                // Sim: the NAME stays put while the workflow identity and
+                // its current position rotate beside it.
+                let workflow = roll.workflow_id.as_deref().unwrap_or("workflow");
+                spans.push(Span::styled(" · ".to_owned(), ink));
+                spans.push(Span::styled(format!("⛩ {workflow}"), theme.gold_style()));
+                if roll.state == "running" {
+                    if let Some(label) = roll.node_label.as_deref() {
+                        spans.push(Span::styled(format!(" · {label}"), ink));
+                    }
+                } else {
+                    spans.push(Span::styled(format!(" · {}", roll.state), ink));
                 }
             }
             if *depth == 0 {
@@ -5257,19 +5302,18 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
 /// node chain + pipe source).
 fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let on_types = model.loom_pane == LoomPane::Types;
+    let (title, own, own_noun, sibling) = if on_types {
+        ("loom", model.loom_types.len(), "agent type", "workflows")
+    } else {
+        ("workflows", model.loom_workflows.len(), "workflow", "loom")
+    };
     lines.push(Line::from(vec![
-        Span::styled("loom", theme.bright_style().add_modifier(Modifier::BOLD)),
+        Span::styled(title, theme.bright_style().add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(
-                " — {} agent type{} · {} workflow{}",
-                model.loom_types.len(),
-                if model.loom_types.len() == 1 { "" } else { "s" },
-                model.loom_workflows.len(),
-                if model.loom_workflows.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
+                " — {own} {own_noun}{} registered · tab ⇄ {sibling}",
+                if own == 1 { "" } else { "s" },
             ),
             theme.dim_style(),
         ),
@@ -5288,24 +5332,28 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     }
-    if model.loom_types.is_empty() && model.loom_workflows.is_empty() {
+    if own == 0 {
         lines.push(Line::styled(
-            "registry empty — register agent types and pipe workflows over loom.*",
+            if on_types {
+                "no agent types registered — the model proposes them; a plan you accept registers"
+            } else {
+                "no workflows registered — the model proposes pipe DAGs; a plan you accept registers"
+            },
             theme.dim_style(),
         ));
         lines.push(Line::raw(""));
-        lines.push(Line::styled("esc back", theme.dim_style()));
+        lines.push(Line::styled(
+            format!("tab ⇄ {sibling} · esc back"),
+            theme.dim_style(),
+        ));
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     }
-    let type_count = model.loom_types.len();
-    let selection = model
-        .loom_selection
-        .min((type_count + model.loom_workflows.len()).saturating_sub(1));
+    let selection = model.loom_selection.min(own.saturating_sub(1));
     let mut selected_line: usize = 0;
 
     if model.loom_detail {
-        if selection < type_count {
+        if on_types {
             let record = &model.loom_types[selection];
             let accent = crate::style::loom_accent_style(&record.color)
                 .unwrap_or_else(|| theme.gold_style());
@@ -5364,7 +5412,7 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             if record.skills.is_empty() && record.scripts.is_empty() {
                 lines.push(Line::styled("  none yet", theme.faint_style()));
             }
-        } else if let Some(workflow) = model.loom_workflows.get(selection - type_count) {
+        } else if let Some(workflow) = model.loom_workflows.get(selection) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("@{}", workflow.id),
@@ -5421,7 +5469,7 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled("esc back to the list", theme.dim_style()));
-    } else {
+    } else if on_types {
         lines.push(Line::styled("AGENT TYPES", theme.gold_style()));
         for (index, record) in model.loom_types.iter().enumerate() {
             let accent = crate::style::loom_accent_style(&record.color)
@@ -5461,23 +5509,21 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
                 ),
             ]));
         }
-        if model.loom_types.is_empty() {
-            lines.push(Line::styled("  none registered", theme.faint_style()));
-        }
         lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "↑↓ select · ⏎ detail · tab ⇄ workflows · esc back",
+            theme.dim_style(),
+        ));
+    } else {
         lines.push(Line::styled(
             "WORKFLOWS — run with @name <brief>",
             theme.gold_style(),
         ));
         for (index, workflow) in model.loom_workflows.iter().enumerate() {
-            if type_count + index == selection {
+            if index == selection {
                 selected_line = lines.len();
             }
-            let cursor = if type_count + index == selection {
-                "❯ "
-            } else {
-                "  "
-            };
+            let cursor = if index == selection { "❯ " } else { "  " };
             let mut spans = vec![
                 Span::styled(cursor.to_owned(), theme.gold_style()),
                 Span::styled(
@@ -5511,12 +5557,9 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             ));
             lines.push(Line::from(spans));
         }
-        if model.loom_workflows.is_empty() {
-            lines.push(Line::styled("  none registered", theme.faint_style()));
-        }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "↑↓ select · ⏎ detail · esc back",
+            "↑↓ select · ⏎ detail · tab ⇄ loom · esc back",
             theme.dim_style(),
         ));
     }
