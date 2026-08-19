@@ -23,7 +23,8 @@ use std::time::Duration;
 use haider_platform::{IpcReadHalf, IpcStream, IpcWriteHalf};
 use haider_rpc::{
     Capability, CapabilitySet, ClientKind, CodecError, DEFAULT_FRAME_LIMIT, Hello, ProtocolError,
-    RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
+    RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireEncoding, WireFrame,
+    uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -40,6 +41,12 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const OUTBOUND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy)]
+struct NegotiatedCodec {
+    frame_limit: usize,
+    encoding: WireEncoding,
+}
 
 /// Connection parameters for [`connect`].
 #[derive(Debug, Clone)]
@@ -236,6 +243,10 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
         client_kind: config.client_kind,
         capabilities_requested: config.capabilities.clone(),
         max_receive_frame: u32::try_from(config.frame_limit).unwrap_or(u32::MAX),
+        encodings: (std::env::var("HAIDER_WIRE_MSGPACK").as_deref() == Ok("1"))
+            .then(|| "msgpack".to_owned())
+            .into_iter()
+            .collect(),
     });
     let bytes = uds_codec::encode(&hello, config.frame_limit).map_err(ConnectError::Frame)?;
     let handshake = async {
@@ -271,12 +282,17 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
             }
         }
     };
-    let (welcome, decoder, leftovers) =
+    let (welcome, mut decoder, leftovers) =
         match tokio::time::timeout(config.handshake_timeout, handshake).await {
             Ok(result) => result?,
             Err(_) => return Err(ConnectError::HandshakeTimeout),
         };
-    let client = RpcClient::start(stream, decoder, leftovers, &config, &welcome);
+    let encoding = match welcome.encoding.as_deref() {
+        Some("msgpack") => WireEncoding::MessagePack,
+        _ => WireEncoding::Json,
+    };
+    decoder.set_encoding(encoding);
+    let client = RpcClient::start(stream, decoder, leftovers, &config, &welcome, encoding);
     Ok(Connected {
         client,
         welcome,
@@ -358,6 +374,7 @@ pub struct RpcClient {
     outbound: mpsc::Sender<Zeroizing<Vec<u8>>>,
     events: StdMutex<Option<mpsc::Receiver<WireFrame>>>,
     outbound_limit: usize,
+    encoding: WireEncoding,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// The handshake the connection negotiated on. Retained so a client that
     /// only receives the `RpcClient` (the TUI's `run_live`) can still gate
@@ -373,6 +390,7 @@ impl RpcClient {
         leftovers: VecDeque<WireFrame>,
         config: &ClientConfig,
         welcome: &Welcome,
+        encoding: WireEncoding,
     ) -> Self {
         let (state, _) = watch::channel(ConnectionState::Connected);
         let shared = Arc::new(Shared {
@@ -398,13 +416,17 @@ impl RpcClient {
                 Arc::clone(&shared),
                 events_tx,
                 outbound.clone(),
-                outbound_limit,
+                NegotiatedCodec {
+                    frame_limit: outbound_limit,
+                    encoding,
+                },
             )),
             tokio::spawn(run_writer(writer_half, outbound_rx, Arc::clone(&shared))),
             tokio::spawn(run_heartbeat(
                 Arc::clone(&shared),
                 outbound.clone(),
                 outbound_limit,
+                encoding,
                 config.ping_interval,
                 config.pong_deadline,
             )),
@@ -414,6 +436,7 @@ impl RpcClient {
             outbound,
             events: StdMutex::new(Some(events_rx)),
             outbound_limit,
+            encoding,
             tasks,
             welcome: welcome.clone(),
         }
@@ -500,7 +523,7 @@ impl RpcClient {
         // bodies carry raw secrets, and uniform hygiene is cheaper than a
         // per-method split — the intermediate JSON body is scrubbed inside
         // the codec and the framed buffer zeroizes when the writer drops it.
-        let bytes = uds_codec::encode_zeroizing(&frame, self.outbound_limit)
+        let bytes = uds_codec::encode_zeroizing_with(&frame, self.outbound_limit, self.encoding)
             .map_err(ClientError::Encode)?;
         let (sender, receiver) = oneshot::channel();
         {
@@ -534,7 +557,7 @@ impl RpcClient {
 
     /// Sends one uncorrelated frame (`MenuAnswer` is the intended user).
     pub async fn send_frame(&self, frame: WireFrame) -> Result<(), ClientError> {
-        let bytes = uds_codec::encode_zeroizing(&frame, self.outbound_limit)
+        let bytes = uds_codec::encode_zeroizing_with(&frame, self.outbound_limit, self.encoding)
             .map_err(ClientError::Encode)?;
         self.outbound
             .send(bytes)
@@ -596,11 +619,19 @@ async fn run_reader(
     shared: Arc<Shared>,
     events: mpsc::Sender<WireFrame>,
     outbound: mpsc::Sender<Zeroizing<Vec<u8>>>,
-    outbound_limit: usize,
+    codec: NegotiatedCodec,
 ) {
     let mut state = shared.state.subscribe();
     for frame in leftovers {
-        route_frame(frame, &shared, &events, &outbound, outbound_limit).await;
+        route_frame(
+            frame,
+            &shared,
+            &events,
+            &outbound,
+            codec.frame_limit,
+            codec.encoding,
+        )
+        .await;
     }
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -626,7 +657,15 @@ async fn run_reader(
                 };
                 let batch = decoder.push(&buffer[..read]);
                 for frame in batch.frames {
-                    route_frame(frame, &shared, &events, &outbound, outbound_limit).await;
+                    route_frame(
+                        frame,
+                        &shared,
+                        &events,
+                        &outbound,
+                        codec.frame_limit,
+                        codec.encoding,
+                    )
+                    .await;
                 }
                 if let Some(error) = batch.error {
                     shared.fail(DisconnectReason::Protocol(error.to_string()));
@@ -643,6 +682,7 @@ async fn route_frame(
     events: &mpsc::Sender<WireFrame>,
     outbound: &mpsc::Sender<Zeroizing<Vec<u8>>>,
     outbound_limit: usize,
+    encoding: WireEncoding,
 ) {
     match frame {
         WireFrame::Response { request_id, body } => {
@@ -660,9 +700,11 @@ async fn route_frame(
         }
         WireFrame::Ping { nonce } => {
             // The daemon does not ping today; answer anyway (tolerance).
-            if let Ok(bytes) =
-                uds_codec::encode_zeroizing(&WireFrame::Pong { nonce }, outbound_limit)
-            {
+            if let Ok(bytes) = uds_codec::encode_zeroizing_with(
+                &WireFrame::Pong { nonce },
+                outbound_limit,
+                encoding,
+            ) {
                 let _ = outbound.try_send(bytes);
             }
         }
@@ -731,6 +773,7 @@ async fn run_heartbeat(
     shared: Arc<Shared>,
     outbound: mpsc::Sender<Zeroizing<Vec<u8>>>,
     outbound_limit: usize,
+    encoding: WireEncoding,
     ping_interval: Duration,
     pong_deadline: Duration,
 ) {
@@ -762,7 +805,11 @@ async fn run_heartbeat(
                 }
                 let nonce = next_nonce;
                 next_nonce = next_nonce.saturating_add(1);
-                if let Ok(bytes) = uds_codec::encode_zeroizing(&WireFrame::Ping { nonce }, outbound_limit)
+                if let Ok(bytes) = uds_codec::encode_zeroizing_with(
+                    &WireFrame::Ping { nonce },
+                    outbound_limit,
+                    encoding,
+                )
                 {
                     // A full outbound queue is itself no-progress evidence;
                     // the unanswered ping deadline will catch it.

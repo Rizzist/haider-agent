@@ -1261,6 +1261,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
             session_id: session_id.clone(),
             after_seq: 0,
             mode: AttachMode::Control,
+            sealed_replay: false,
         },
     )
     .await;
@@ -1416,6 +1417,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
             session_id: successor_session.clone(),
             after_seq: 0,
             mode: AttachMode::Control,
+            sealed_replay: false,
         },
     )
     .await;

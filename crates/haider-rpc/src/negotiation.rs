@@ -13,6 +13,8 @@ pub struct ServerRange {
     pub protocol_min: u32,
     pub protocol_max: u32,
     pub capabilities: CapabilitySet,
+    /// Whether the server advertises and serves `wire_msgpack_v1`.
+    pub supports_msgpack: bool,
 }
 
 /// Successful handshake selection returned by [`negotiate`].
@@ -23,6 +25,8 @@ pub struct ServerRange {
 pub struct Negotiated {
     pub protocol: u32,
     pub capabilities_granted: CapabilitySet,
+    /// Selected post-handshake encoding. `None` means JSON.
+    pub encoding: Option<String>,
 }
 
 /// Selects the highest mutually supported protocol implemented by this wire
@@ -89,6 +93,11 @@ pub fn negotiate(client: &Hello, server_range: &ServerRange) -> Result<Negotiate
     Ok(Negotiated {
         protocol: overlap_max,
         capabilities_granted,
+        encoding: client
+            .encodings
+            .iter()
+            .any(|encoding| server_range.supports_msgpack && encoding == "msgpack")
+            .then(|| "msgpack".to_owned()),
     })
 }
 

@@ -30,7 +30,7 @@ use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, ItemId, LeaseId, MenuId,
     NodeId, RunId, SessionId,
 };
-use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{FinishReason, Usage, UsageRequestKind, UsageScope, UsageSource};
 use haider_protocol::session::ModelSelected;
@@ -494,6 +494,25 @@ async fn append_one(
     event[0].seq
 }
 
+async fn append_delta(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    worker_generation: u64,
+    event_id: &str,
+) -> u64 {
+    let mut delta = envelope(session_id, event_id, worker_generation);
+    delta.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Delta {
+        item_id: ItemId::new("sealed-replay-item"),
+        delta: ItemDelta::Text {
+            text: event_id.to_owned(),
+        },
+    }))
+    .expect("delta serializes");
+    let mut events = [delta];
+    hub.append(&mut events).await.expect("delta appends");
+    events[0].seq
+}
+
 fn capabilities() -> CapabilitySet {
     CapabilitySet::from([Capability::View, Capability::Control])
 }
@@ -540,6 +559,7 @@ async fn attach_control_session(
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -576,6 +596,7 @@ async fn create_and_attach_typed_session(
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -1512,6 +1533,107 @@ fn attachment_from(frame: WireFrame) -> (AttachmentId, u64) {
     (attachment_id, attach_state.replay_through_seq)
 }
 
+async fn attach_and_collect_replay(
+    connection: &HubConnection,
+    sink: &Arc<CollectSink>,
+    session_id: &SessionId,
+    request_id: &str,
+    sealed_replay: bool,
+) -> (AttachmentId, Vec<u64>, u64) {
+    connection
+        .request(
+            RequestId::new(request_id),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+                sealed_replay,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let (attachment_id, response_high_water) = attachment_from(sink.next().await);
+    let mut replayed = Vec::new();
+    let caught_up_high_water = loop {
+        match sink.next().await {
+            WireFrame::Event {
+                attachment_id: found,
+                envelope,
+                ..
+            } => {
+                assert_eq!(found, attachment_id);
+                replayed.push(envelope.seq);
+            }
+            WireFrame::AttachCaughtUp {
+                attachment_id: found,
+                high_water_seq,
+            } => {
+                assert_eq!(found, attachment_id);
+                break high_water_seq;
+            }
+            frame => panic!("unexpected replay frame: {frame:?}"),
+        }
+    };
+    assert_eq!(caught_up_high_water, response_high_water);
+    (attachment_id, replayed, caught_up_high_water)
+}
+
+#[tokio::test]
+async fn sealed_replay_skips_only_durable_item_deltas_and_preserves_high_water() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("sealed-replay");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "before-delta").await;
+    append_delta(&hub, &session_id, generation, "durable-delta").await;
+    append_one(&hub, &session_id, generation, "after-delta").await;
+
+    let unsealed_sink = Arc::new(CollectSink::default());
+    let unsealed = hub
+        .open_connection(
+            capabilities(),
+            unsealed_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("unsealed connection");
+    let (_, unsealed_seqs, unsealed_high_water) = attach_and_collect_replay(
+        &unsealed,
+        &unsealed_sink,
+        &session_id,
+        "unsealed-attach",
+        false,
+    )
+    .await;
+
+    let sealed_sink = Arc::new(CollectSink::default());
+    let sealed = hub
+        .open_connection(
+            capabilities(),
+            sealed_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("sealed connection");
+    let (_, sealed_seqs, sealed_high_water) =
+        attach_and_collect_replay(&sealed, &sealed_sink, &session_id, "sealed-attach", true).await;
+
+    assert_eq!(unsealed_seqs, [1, 2, 3]);
+    assert_eq!(sealed_seqs, [1, 3]);
+    assert_eq!(sealed_high_water, unsealed_high_water);
+    assert_eq!(sealed_high_water, 3);
+
+    let live_seq = append_delta(&hub, &session_id, generation, "live-delta").await;
+    for sink in [&unsealed_sink, &sealed_sink] {
+        assert!(matches!(
+            sink.next().await,
+            WireFrame::Event { envelope, .. } if envelope.seq == live_seq
+        ));
+    }
+
+    unsealed.close().await.expect("unsealed connection closes");
+    sealed.close().await.expect("sealed connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// Forces an append at every §5.5 boundary: before registration, in the
 /// impossible registration→H gap, during replay, at H, immediately after H,
 /// before caught-up, and during buffered drain.
@@ -1557,6 +1679,7 @@ async fn replay_live_barrier_is_contiguous_at_every_forced_boundary() {
                         session_id,
                         after_seq: 0,
                         mode: AttachMode::View,
+                        sealed_replay: false,
                     },
                 )
                 .await
@@ -1674,6 +1797,7 @@ async fn full_internal_catch_up_receiver_reregisters_and_resumes_from_store() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -1732,6 +1856,7 @@ async fn cursor_ahead_is_correlated_and_carries_recovery_coordinates() {
                 session_id,
                 after_seq: 9,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -1781,6 +1906,7 @@ async fn detach_mid_replay_purges_and_leaks_no_later_event() {
                 session_id,
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -2072,6 +2198,72 @@ async fn session_summary_carries_its_committed_workspace_cwd() {
         .expect("created session summary");
     assert_eq!(summary.workspace_cwd.as_deref(), Some("/tmp"));
 
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// The first watch tick is a full baseline; subsequent ticks carry only
+/// changed/new summaries, and a stable roster is silent. v1 intentionally
+/// has no removal tombstone.
+#[tokio::test]
+async fn session_list_watch_pushes_baseline_then_changes_and_skips_quiet_ticks() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-watch");
+    create_typed_session(&store, &session_id, "fake").await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+
+    connection
+        .request(
+            RequestId::new("roster-watch-start"),
+            RequestBody::SessionListWatch {},
+        )
+        .await
+        .expect("session.list_watch routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionListWatch { accepted: true },
+        } if request_id.as_str() == "roster-watch-start"
+    ));
+
+    let WireFrame::SessionRosterDelta { summaries } = sink.next().await else {
+        panic!("expected roster baseline");
+    };
+    let baseline = summaries
+        .iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("baseline contains watched session");
+
+    append_one(
+        &hub,
+        &session_id,
+        store.worker_generation(),
+        "roster-watch-change",
+    )
+    .await;
+    let WireFrame::SessionRosterDelta { summaries } = sink.next().await else {
+        panic!("expected changed roster delta");
+    };
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].session_id, session_id);
+    assert!(summaries[0].head_seq > baseline.head_seq);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_200), sink.next())
+            .await
+            .is_err(),
+        "a quiet tick must not enqueue an empty roster delta"
+    );
+
+    connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
@@ -2982,6 +3174,7 @@ async fn slow_client_is_lagged_and_store_resume_is_contiguous() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -3015,6 +3208,7 @@ async fn slow_client_is_lagged_and_store_resume_is_contiguous() {
                 session_id,
                 after_seq: first,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -3074,6 +3268,7 @@ async fn many_concurrent_cursors_each_receive_their_exact_suffix() {
                             session_id,
                             after_seq,
                             mode: AttachMode::View,
+                            sealed_replay: false,
                         },
                     )
                     .await
@@ -3223,6 +3418,7 @@ async fn n_way_menu_answer_race_has_one_streamed_winner_and_correlated_losers() 
                     session_id: session_id.clone(),
                     after_seq: 0,
                     mode: AttachMode::Control,
+                    sealed_replay: false,
                 },
             )
             .await
@@ -3490,6 +3686,7 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
                 session_id: session_id.clone(),
                 after_seq: head,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -3596,6 +3793,7 @@ async fn lost_menu_success_response_is_recovered_from_stream_and_idempotent_retr
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -3640,6 +3838,7 @@ async fn lost_menu_success_response_is_recovered_from_stream_and_idempotent_retr
                 session_id: session_id.clone(),
                 after_seq: 2,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -3711,6 +3910,7 @@ async fn cancelled_shutdown_future_still_aborts_every_owned_hub_task() {
                 session_id: session_id.clone(),
                 after_seq: 1,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -3799,6 +3999,7 @@ async fn drain_during_replay_owns_replay_completion_before_store_close() {
                         session_id,
                         after_seq: 0,
                         mode: AttachMode::View,
+                        sealed_replay: false,
                     },
                 )
                 .await
@@ -3872,6 +4073,7 @@ async fn attachment_after_menu_opened_learns_pending_menu_from_replay() {
                 session_id,
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -3924,6 +4126,7 @@ async fn stale_worker_generation_menu_answer_is_rejected_and_fenced() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -4012,6 +4215,7 @@ async fn recovered_menu_coordinate_authorizes_losers_after_the_winner_commits() 
                 session_id: session_id.clone(),
                 after_seq: opening[0].seq,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await
@@ -4103,6 +4307,7 @@ async fn attach_caught_up(
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4153,6 +4358,7 @@ async fn per_connection_attachment_cap_rejects_overloaded_and_readmits_after_det
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4231,6 +4437,7 @@ async fn global_attachment_cap_binds_independently_of_per_connection_headroom() 
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4304,6 +4511,7 @@ async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4417,6 +4625,7 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4509,6 +4718,7 @@ async fn graceful_drain_broadcasts_an_in_flight_commit_before_teardown() {
                 session_id: session_id.clone(),
                 after_seq: 1,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4598,6 +4808,7 @@ async fn cancelled_registration_refunds_its_admission_slot() {
                         session_id,
                         after_seq: 0,
                         mode: AttachMode::View,
+                        sealed_replay: false,
                     },
                 )
                 .await
@@ -4742,6 +4953,7 @@ async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lag
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4819,6 +5031,7 @@ async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -4919,6 +5132,7 @@ async fn final_suffix_store_read_failure_forces_the_shutdown_outcome() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -5013,6 +5227,7 @@ async fn oversized_envelope_takes_the_store_resume_path_exactly_once() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await
@@ -5375,6 +5590,7 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
                     session_id: session_id.clone(),
                     after_seq: 0,
                     mode: AttachMode::View,
+                    sealed_replay: false,
                 },
             )
             .await
@@ -5410,6 +5626,7 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
                 session_id: cold_session.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         )
         .await

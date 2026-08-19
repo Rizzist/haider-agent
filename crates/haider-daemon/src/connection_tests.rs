@@ -102,6 +102,9 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
+            haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
@@ -143,6 +146,7 @@ fn tight_welcome_omits_only_the_additive_user_command_feature() {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: welcome_features(),
+        encoding: None,
     };
     let full = uds_codec::encode(&WireFrame::Welcome(welcome.clone()), usize::MAX)
         .expect("full Welcome encodes");
@@ -584,6 +588,7 @@ fn queued_byte_budget_covers_the_four_byte_prefix_at_the_exact_boundary() {
     let sink = ConnectionFrameSink {
         lane: OutboundLane::new(1, config.outbound_queued_bytes, frame_limit + 4),
         outbound_limit: frame_limit,
+        encoding: haider_rpc::WireEncoding::Json,
     };
     assert!(
         matches!(sink.offer(&attachment_id, &event), SendAdmission::Sent),
@@ -682,6 +687,7 @@ async fn handshake_over(client: &mut UnixStream) {
         client_kind: haider_rpc::ClientKind::Cli,
         capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
         max_receive_frame: 1024 * 1024,
+        encodings: Vec::new(),
     });
     let bytes = uds_codec::encode(&hello, 1024 * 1024).expect("hello encodes");
     client.write_all(&bytes).await.expect("hello writes");
@@ -723,6 +729,7 @@ struct PairedClient {
     stream: UnixStream,
     decoder: uds_codec::Decoder,
     pending: VecDeque<WireFrame>,
+    encoding: haider_rpc::WireEncoding,
 }
 
 impl PairedClient {
@@ -731,11 +738,13 @@ impl PairedClient {
             stream,
             decoder: uds_codec::Decoder::new(1024 * 1024),
             pending: VecDeque::new(),
+            encoding: haider_rpc::WireEncoding::Json,
         }
     }
 
     async fn send(&mut self, frame: &WireFrame) {
-        let bytes = uds_codec::encode(frame, 1024 * 1024).expect("paired frame encodes");
+        let bytes = uds_codec::encode_with(frame, 1024 * 1024, self.encoding)
+            .expect("paired frame encodes");
         self.stream
             .write_all(&bytes)
             .await
@@ -771,9 +780,34 @@ impl PairedClient {
             client_kind: haider_rpc::ClientKind::Headless,
             capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
             max_receive_frame: 1024 * 1024,
+            encodings: Vec::new(),
         }))
         .await;
         assert!(matches!(self.next().await, Some(WireFrame::Welcome(_))));
+    }
+
+    async fn handshake_msgpack(&mut self) {
+        self.send(&WireFrame::Hello(haider_rpc::Hello {
+            protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
+            protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
+            client_name: "paired-msgpack-test".into(),
+            client_version: "test".into(),
+            client_instance_id: "paired-msgpack-client".into(),
+            client_kind: haider_rpc::ClientKind::Headless,
+            capabilities_requested: CapabilitySet::from([Capability::View]),
+            max_receive_frame: 1024 * 1024,
+            encodings: vec!["msgpack".into()],
+        }))
+        .await;
+        assert!(matches!(
+            self.next().await,
+            Some(WireFrame::Welcome(Welcome {
+                encoding: Some(ref encoding),
+                ..
+            })) if encoding == "msgpack"
+        ));
+        self.encoding = haider_rpc::WireEncoding::MessagePack;
+        self.decoder.set_encoding(self.encoding);
     }
 
     async fn request(&mut self, request: &str, body: haider_rpc::RequestBody) {
@@ -783,6 +817,47 @@ impl PairedClient {
         })
         .await;
     }
+}
+
+#[tokio::test]
+async fn msgpack_switches_after_json_welcome_on_paired_uds() {
+    let (_dir, hub) = liveness_hub().await;
+    let (server, client) = UnixStream::pair().expect("socket pair");
+    let (_drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+    let serve_task = tokio::spawn(serve(server, liveness_context(hub.clone()), drain_rx));
+    let mut client = PairedClient::new(client);
+
+    client.handshake_msgpack().await;
+    client
+        .request(
+            "msgpack-list",
+            haider_rpc::RequestBody::SessionList {
+                cursor: None,
+                limit: 10,
+            },
+        )
+        .await;
+    assert!(matches!(
+        client.next().await,
+        Some(WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::SessionList { .. },
+        }) if request_id.as_str() == "msgpack-list"
+    ));
+
+    client
+        .stream
+        .shutdown()
+        .await
+        .expect("client write half shuts down");
+    assert_eq!(
+        serve_task
+            .await
+            .expect("serve joins")
+            .expect("serve result"),
+        ConnectionExit::ClosedBeforeDrain
+    );
+    hub.shutdown().await.expect("hub shutdown");
 }
 
 struct PairedFakeFactory {
@@ -888,6 +963,7 @@ impl PairedTurnFixture {
                     session_id: session_id.clone(),
                     after_seq: 0,
                     mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
                 },
             )
             .await;

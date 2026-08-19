@@ -130,6 +130,7 @@ fn welcome(profile: &ResolvedProfile) -> Welcome {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: haider_client::required_live_features(),
+        encoding: None,
     }
 }
 
@@ -210,6 +211,7 @@ async fn respond_create_and_attach(
         session_id: attached,
         after_seq,
         mode,
+        ..
     } = attach
     else {
         panic!("submit overtook Control attach");
@@ -651,6 +653,7 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
             RequestBody::SessionAttach {
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -792,6 +795,7 @@ async fn headless_attach_uploads_then_submits_with_durable_identity() {
             RequestBody::SessionAttach {
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -950,6 +954,7 @@ async fn withheld_submit_response_is_recovered_and_durably_cancelled() {
             RequestBody::SessionAttach {
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -1088,6 +1093,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
             RequestBody::SessionAttach {
                 after_seq: 1,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -1217,6 +1223,7 @@ async fn lagged_pressure_recovers_every_durable_sequence() {
         let RequestBody::SessionAttach {
             after_seq,
             mode: AttachMode::Control,
+            sealed_replay: false,
             ..
         } = attach
         else {
@@ -1316,6 +1323,7 @@ async fn withheld_recovery_barrier_cannot_defeat_run_and_grace_deadlines() {
             RequestBody::SessionAttach {
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -1573,6 +1581,7 @@ async fn permission_answer_response_loss_replays_then_retries_current_generation
             RequestBody::SessionAttach {
                 after_seq: 2,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -1744,6 +1753,7 @@ async fn competing_permission_resolution_is_fail_closed_and_cancelled() {
             RequestBody::SessionAttach {
                 after_seq: 2,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -2157,6 +2167,7 @@ async fn confirmed_cancel_disconnect_replays_terminal_within_grace() {
             RequestBody::SessionAttach {
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));
@@ -2246,6 +2257,7 @@ async fn cancel_response_loss_replays_then_retries_same_command_at_current_gener
             RequestBody::SessionAttach {
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
                 ..
             }
         ));

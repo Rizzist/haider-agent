@@ -27,6 +27,7 @@ use haider_protocol::state::RunState;
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{MissedTickBehavior, interval_at};
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
@@ -1204,6 +1205,18 @@ impl HubConnection {
                 }
                 self.session_list(request_id, cursor, limit).await
             }
+            RequestBody::SessionListWatch {} => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_list_watch(request_id)
+            }
             RequestBody::SessionRead { session_id, range } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -1380,6 +1393,7 @@ impl HubConnection {
                 session_id,
                 after_seq,
                 mode,
+                sealed_replay,
             } => {
                 let operation = match mode {
                     AttachMode::View => Operation::View,
@@ -1405,7 +1419,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_attach(request_id, session_id, after_seq, mode)
+                self.session_attach(request_id, session_id, after_seq, mode, sealed_replay)
                     .await
             }
             RequestBody::SessionDetach { attachment_id } => {
@@ -5857,52 +5871,7 @@ impl HubConnection {
         if has_more {
             selected.truncate(limit);
         }
-        let mut sessions = Vec::with_capacity(selected.len());
-        for session_id in &selected {
-            // Read the fold seed before sealing the head. Model selection
-            // updates metadata and appends its fact atomically: a selection
-            // between these reads is therefore included by the later head,
-            // while one after the head cannot leak a post-head seed into the
-            // summary.
-            let metadata = self.hub.inner.store.session_metadata(session_id).await?;
-            let head_seq = self.hub.inner.store.latest_seq(session_id).await?;
-            // Roster truth for unattached sessions: replay the same sealed
-            // journal the observe surface reads. The launcher must never
-            // show "0 turns · 0 tok" for a session that merely lacks an
-            // attachment.
-            let (turns, footprint) =
-                session_summary_truth(&self.hub.inner.store, session_id, head_seq).await?;
-            let (footprint_tokens, footprint_truth) =
-                summary_footprint_fields(turns, footprint.as_ref());
-            let initial_model = metadata
-                .as_ref()
-                .map_or("", |metadata| metadata.model.as_str());
-            let (agent_metrics, last_model) = session_agent_metrics_truth(
-                &self.hub.inner.store,
-                session_id,
-                head_seq,
-                initial_model,
-            )
-            .await?;
-            // G2: the committed title rides the summary top-level so
-            // rosters name rows without decoding metadata.
-            let title = metadata
-                .as_ref()
-                .and_then(|metadata| metadata.title.clone());
-            sessions.push(SessionSummary {
-                session_id: session_id.clone(),
-                head_seq,
-                worker_generation: self.hub.inner.store.worker_generation(),
-                workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
-                metadata,
-                last_model,
-                turn_count: Some(turns),
-                footprint_tokens,
-                footprint_truth,
-                title,
-                agent_metrics,
-            });
-        }
+        let sessions = session_summaries(&self.hub, &selected).await?;
         let next_cursor = has_more
             .then(|| selected.last().map(encode_cursor))
             .flatten();
@@ -5913,6 +5882,59 @@ impl HubConnection {
                 next_cursor,
             },
         })
+    }
+
+    fn session_list_watch(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let mut watch = lock(&self.roster_watch)?;
+        let accepted = watch.as_ref().is_none_or(JoinHandle::is_finished);
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionListWatch { accepted },
+        })?;
+        if !accepted {
+            return Ok(());
+        }
+
+        let hub = self.hub.clone();
+        let sink = Arc::clone(&self.sink);
+        *watch = Some(tokio::spawn(async move {
+            let period = std::time::Duration::from_millis(1_000);
+            let mut ticker = interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut digests = BTreeMap::new();
+            loop {
+                ticker.tick().await;
+                let Ok(ids) = hub.inner.store.session_ids().await else {
+                    continue;
+                };
+                let Ok(summaries) = session_summaries(&hub, &ids).await else {
+                    continue;
+                };
+                let Ok((changed, next_digests)) = roster_delta(&digests, summaries) else {
+                    continue;
+                };
+                if changed.is_empty() {
+                    // Removed sessions are deliberately silent in v1, but
+                    // forgetting their digest lets a later recreation be
+                    // observed as new.
+                    digests = next_digests;
+                    continue;
+                }
+                if sink
+                    .try_send(WireFrame::SessionRosterDelta { summaries: changed })
+                    .is_ok()
+                {
+                    digests = next_digests;
+                } else {
+                    // Retry changed/current rows next tick, but still forget
+                    // removals so a later recreation is observed as new.
+                    digests.retain(|session_id, _| next_digests.contains_key(session_id));
+                }
+                // A full/lagged outbox drops this tick. Since its digest map
+                // remains unchanged, the next tick re-diffs and retries.
+            }
+        }));
+        Ok(())
     }
 
     async fn session_read(
@@ -6214,6 +6236,7 @@ impl HubConnection {
         session_id: SessionId,
         after_seq: u64,
         mode: AttachMode,
+        sealed_replay: bool,
     ) -> Result<(), SessionHubError> {
         if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
             return self.respond_error(
@@ -6278,8 +6301,12 @@ impl HubConnection {
             let _ = self.hub.detach(&attachment_id).await;
             return Err(SessionHubError::Delivery);
         }
-        self.hub
-            .spawn_replay(registration, after_seq, Arc::clone(&self.sink))
+        self.hub.spawn_replay(
+            registration,
+            after_seq,
+            sealed_replay,
+            Arc::clone(&self.sink),
+        )
     }
 
     async fn hooks_list(&self, request_id: RequestId, cwd: String) -> Result<(), SessionHubError> {
@@ -6627,6 +6654,11 @@ impl HubConnection {
         if let Ok(mut stages) = self.stages.lock() {
             *stages = crate::accounts::StagedSecrets::default();
         }
+        if let Ok(mut watch) = self.roster_watch.lock()
+            && let Some(task) = watch.take()
+        {
+            task.abort();
+        }
         if let Ok(Some(facade)) = self.hub.accounts()
             && let Some(oauth) = facade.oauth
         {
@@ -6634,6 +6666,69 @@ impl HubConnection {
         }
         self.hub.detach_connection(&self.connection_id).await
     }
+}
+
+async fn session_summaries(
+    hub: &SessionHub,
+    session_ids: &[SessionId],
+) -> Result<Vec<SessionSummary>, SessionHubError> {
+    let mut sessions = Vec::with_capacity(session_ids.len());
+    for session_id in session_ids {
+        // Read the fold seed before sealing the head. Model selection updates
+        // metadata and appends its fact atomically: a selection between these
+        // reads is included by the later head, while one after the head cannot
+        // leak a post-head seed into the summary.
+        let metadata = hub.inner.store.session_metadata(session_id).await?;
+        let head_seq = hub.inner.store.latest_seq(session_id).await?;
+        // Roster truth for unattached sessions replays the same sealed journal
+        // as observation, so watches and explicit lists cannot disagree.
+        let (turns, footprint) =
+            session_summary_truth(&hub.inner.store, session_id, head_seq).await?;
+        let (footprint_tokens, footprint_truth) =
+            summary_footprint_fields(turns, footprint.as_ref());
+        let initial_model = metadata
+            .as_ref()
+            .map_or("", |metadata| metadata.model.as_str());
+        let (agent_metrics, last_model) =
+            session_agent_metrics_truth(&hub.inner.store, session_id, head_seq, initial_model)
+                .await?;
+        let title = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.title.clone());
+        sessions.push(SessionSummary {
+            session_id: session_id.clone(),
+            head_seq,
+            worker_generation: hub.inner.store.worker_generation(),
+            workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
+            metadata,
+            last_model,
+            turn_count: Some(turns),
+            footprint_tokens,
+            footprint_truth,
+            title,
+            agent_metrics,
+        });
+    }
+    Ok(sessions)
+}
+
+type RosterDigestMap = BTreeMap<String, blake3::Hash>;
+
+fn roster_delta(
+    previous: &RosterDigestMap,
+    summaries: Vec<SessionSummary>,
+) -> Result<(Vec<SessionSummary>, RosterDigestMap), serde_json::Error> {
+    let mut changed = Vec::new();
+    let mut next = BTreeMap::new();
+    for summary in summaries {
+        let session_id = summary.session_id.as_str().to_owned();
+        let digest = blake3::hash(&serde_json::to_vec(&summary)?);
+        if previous.get(&session_id) != Some(&digest) {
+            changed.push(summary);
+        }
+        next.insert(session_id, digest);
+    }
+    Ok((changed, next))
 }
 
 fn standard_base64_decoded_len(encoded: &str) -> Result<usize, &'static str> {

@@ -3,10 +3,11 @@
 
 mod common;
 
-use common::{TEST_FRAME_LIMIT, golden_descriptor, transcript};
+use common::{TEST_FRAME_LIMIT, golden_descriptor, raw_envelope, transcript};
 use haider_rpc::{
-    CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, RequestBody, RequestId, ResponseBody,
-    WireFrame, uds_codec, ws_codec,
+    AttachmentId, CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, RequestBody, RequestId,
+    ResponseBody, WireEncoding, WireFrame, decode_msgpack, encode_msgpack,
+    haider_protocol::ids::SessionId, uds_codec, ws_codec,
 };
 
 struct CodecCase {
@@ -332,5 +333,79 @@ fn ws_limit_is_checked_before_json_decode() {
             frame_limit: 3,
             announced_len: Some(8)
         }
+    ));
+}
+
+#[test]
+fn msgpack_round_trips_nested_json_value_on_both_transports() {
+    let mut envelope = raw_envelope(42);
+    envelope.payload = serde_json::json!({
+        "nested": {
+            "array": [null, true, -7, 3.5, {"deep": "value"}],
+            "unicode": "سلام"
+        }
+    });
+    let frame = WireFrame::Event {
+        attachment_id: AttachmentId::new("attachment-msgpack"),
+        session_id: SessionId::new("session-1"),
+        envelope,
+    };
+
+    let binary = ws_codec::encode_binary(&frame, TEST_FRAME_LIMIT).expect("MessagePack encode");
+    assert_eq!(
+        ws_codec::decode_binary(&binary, TEST_FRAME_LIMIT).expect("MessagePack decode"),
+        frame
+    );
+
+    let uds = uds_codec::encode_with(&frame, TEST_FRAME_LIMIT, WireEncoding::MessagePack)
+        .expect("MessagePack UDS encode");
+    let mut decoder =
+        uds_codec::Decoder::new_with_encoding(TEST_FRAME_LIMIT, WireEncoding::MessagePack);
+    let batch = decoder.push(&uds);
+    assert!(batch.error.is_none(), "UDS MessagePack: {:?}", batch.error);
+    assert_eq!(batch.frames, vec![frame]);
+}
+
+#[test]
+fn msgpack_empty_and_oversize_decode_refusals_match_json_shapes() {
+    assert!(matches!(
+        decode_msgpack(&[], TEST_FRAME_LIMIT),
+        Err(CodecError::EmptyFrame)
+    ));
+
+    let bytes = [0xc0, 0xc0, 0xc0];
+    assert!(matches!(
+        decode_msgpack(&bytes, 2),
+        Err(CodecError::FrameLimitExceeded {
+            frame_limit: 2,
+            announced_len: Some(3)
+        })
+    ));
+}
+
+#[test]
+fn msgpack_encoder_enforces_the_same_bounded_writer_limit_as_json() {
+    let frame = transcript()[0].clone();
+    let encoded = encode_msgpack(&frame, TEST_FRAME_LIMIT).expect("measure MessagePack frame");
+    let exact_limit = encoded.len();
+
+    assert_eq!(
+        encode_msgpack(&frame, exact_limit).expect("exact limit"),
+        encoded
+    );
+    assert!(matches!(
+        encode_msgpack(&frame, exact_limit - 1),
+        Err(CodecError::FrameLimitExceeded {
+            frame_limit,
+            announced_len: None
+        }) if frame_limit == exact_limit - 1
+    ));
+}
+
+#[test]
+fn msgpack_malformed_body_has_a_typed_refusal() {
+    assert!(matches!(
+        decode_msgpack(&[0xc1], TEST_FRAME_LIMIT),
+        Err(CodecError::MessagePackDecode(_))
     ));
 }

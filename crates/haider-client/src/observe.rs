@@ -438,6 +438,7 @@ async fn stream_shard(
                     session_id: session_id.clone(),
                     after_seq,
                     mode: AttachMode::View,
+                    sealed_replay: false,
                 })
                 .await?;
             match response {

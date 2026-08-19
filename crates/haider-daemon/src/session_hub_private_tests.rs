@@ -386,6 +386,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
                     session_id: session_id.clone(),
                     after_seq: 0,
                     mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
                 },
             )
             .await

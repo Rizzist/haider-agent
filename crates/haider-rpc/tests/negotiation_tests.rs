@@ -19,6 +19,7 @@ fn hello(protocol_min: u32, protocol_max: u32) -> Hello {
             Capability::Unknown,
         ]),
         max_receive_frame: 1024 * 1024,
+        encodings: Vec::new(),
     }
 }
 
@@ -30,6 +31,7 @@ fn negotiation_selects_implemented_overlap_and_capability_intersection() {
             protocol_min: 1,
             protocol_max: 3,
             capabilities: capabilities([Capability::View]),
+            supports_msgpack: false,
         },
     )
     .expect("negotiate");
@@ -49,6 +51,7 @@ fn negotiation_rejects_ranges_that_only_overlap_at_unimplemented_versions() {
             protocol_min: 2,
             protocol_max: 3,
             capabilities: capabilities([Capability::View]),
+            supports_msgpack: false,
         },
     )
     .expect_err("wire v1 is not in the overlap");
@@ -66,6 +69,7 @@ fn negotiation_never_grants_unrequested_capabilities() {
             protocol_min: 1,
             protocol_max: 1,
             capabilities: capabilities([Capability::View, Capability::Control]),
+            supports_msgpack: false,
         },
     )
     .expect("negotiate");
@@ -84,6 +88,7 @@ fn negotiation_rejects_disjoint_protocol_ranges() {
             protocol_min: 3,
             protocol_max: 4,
             capabilities: capabilities([]),
+            supports_msgpack: false,
         },
     )
     .expect_err("disjoint ranges must fail");
@@ -102,6 +107,7 @@ fn negotiation_never_grants_the_unknown_capability_even_when_both_sides_list_it(
             protocol_min: 1,
             protocol_max: 1,
             capabilities: capabilities([Capability::View, Capability::Unknown]),
+            supports_msgpack: false,
         },
     )
     .expect("negotiate");
@@ -120,6 +126,7 @@ fn negotiation_rejects_invalid_client_range() {
             protocol_min: 1,
             protocol_max: 1,
             capabilities: capabilities([]),
+            supports_msgpack: false,
         },
     )
     .expect_err("client range invalid");
@@ -135,9 +142,62 @@ fn negotiation_rejects_invalid_server_range() {
             protocol_min: 2,
             protocol_max: 1,
             capabilities: capabilities([]),
+            supports_msgpack: false,
         },
     )
     .expect_err("server range invalid");
 
     assert_eq!(error.code, "invalid_server_protocol_range");
+}
+
+#[test]
+fn negotiation_selects_msgpack_only_when_offered_and_served() {
+    let mut client = hello(1, 1);
+    client.encodings = vec!["msgpack".into()];
+    let negotiated = negotiate(
+        &client,
+        &ServerRange {
+            protocol_min: 1,
+            protocol_max: 1,
+            capabilities: capabilities([]),
+            supports_msgpack: true,
+        },
+    )
+    .expect("negotiate");
+
+    assert_eq!(negotiated.encoding.as_deref(), Some("msgpack"));
+}
+
+#[test]
+fn negotiation_keeps_json_when_msgpack_is_offered_but_not_served() {
+    let mut client = hello(1, 1);
+    client.encodings = vec!["msgpack".into()];
+    let negotiated = negotiate(
+        &client,
+        &ServerRange {
+            protocol_min: 1,
+            protocol_max: 1,
+            capabilities: capabilities([]),
+            supports_msgpack: false,
+        },
+    )
+    .expect("negotiate");
+
+    assert_eq!(negotiated.encoding, None);
+}
+
+#[test]
+fn negotiation_keeps_json_when_msgpack_is_served_but_not_offered() {
+    let negotiated = negotiate(
+        &hello(1, 1),
+        &ServerRange {
+            protocol_min: 1,
+            protocol_max: 1,
+            capabilities: capabilities([]),
+            supports_msgpack: true,
+        },
+    )
+    .expect("negotiate");
+
+    assert_eq!(negotiated.encoding, None);
 }

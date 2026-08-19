@@ -152,6 +152,7 @@ impl UdsClient {
                     client_kind,
                     capabilities_requested,
                     max_receive_frame: u32::try_from(frame_limit).expect("frame limit"),
+                    encodings: Vec::new(),
                 }),
                 frame_limit,
             )

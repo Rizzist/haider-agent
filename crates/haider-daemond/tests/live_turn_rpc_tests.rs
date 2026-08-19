@@ -322,6 +322,7 @@ async fn create_and_attach_for_provider(
             session_id: session_id.clone(),
             after_seq: 0,
             mode: AttachMode::Control,
+            sealed_replay: false,
         },
     )
     .await;
@@ -515,6 +516,7 @@ async fn attach_existing(
             session_id: session_id.clone(),
             after_seq,
             mode: AttachMode::Control,
+            sealed_replay: false,
         },
     )
     .await;
@@ -4735,6 +4737,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             session_id: session_id.clone(),
             after_seq: 0,
             mode: AttachMode::Control,
+            sealed_replay: false,
         },
     )
     .await;
@@ -5181,6 +5184,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
             client_kind: ClientKind::Headless,
             capabilities_requested: CapabilitySet::from([Capability::View]),
             max_receive_frame: u32::try_from(config.frame_limit).expect("frame limit"),
+            encodings: Vec::new(),
         }),
         config.frame_limit,
     )

@@ -1046,6 +1046,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
                     session_id: session_id.clone(),
                     after_seq: 0,
                     mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
                 },
             },
             LIMIT,

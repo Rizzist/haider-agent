@@ -1,23 +1,33 @@
-//! UDS framing: four-byte big-endian length plus shared UTF-8 JSON bytes.
+//! UDS framing: four-byte big-endian length plus JSON or MessagePack bytes.
 //!
 //! The decoder is a streaming state machine and never collects an unbounded
 //! staging buffer. It validates the announced length before reserving any body
-//! storage. An oversized, empty, invalid-UTF-8, or invalid-JSON frame poisons
-//! the decoder; callers must discard it with the connection.
+//! storage. An oversized, empty, or invalid body poisons the decoder; callers
+//! must discard it with the connection.
 
-use crate::codec::{decode_json, encode_json};
-use crate::{CodecError, WireFrame};
+use crate::codec::{decode_json, decode_msgpack, encode_json, encode_msgpack};
+use crate::{CodecError, WireEncoding, WireFrame};
 use zeroize::{Zeroize, Zeroizing};
 
 const PREFIX_LEN: usize = 4;
 
 /// Serializes one UDS frame: a four-byte big-endian prefix holding the exact
-/// JSON body length, followed by the body bytes.
+/// JSON body length, followed by the body bytes. This legacy entry point is
+/// also used for the always-JSON handshake.
 ///
 /// The frame limit is enforced while serializing, so an oversized frame is
 /// rejected before a full-frame buffer ever exists.
 pub fn encode(frame: &WireFrame, frame_limit: usize) -> Result<Vec<u8>, CodecError> {
-    let body = encode_json(frame, frame_limit)?;
+    encode_with(frame, frame_limit, WireEncoding::Json)
+}
+
+/// Serializes one UDS frame with the selected post-handshake encoding.
+pub fn encode_with(
+    frame: &WireFrame,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<Vec<u8>, CodecError> {
+    let body = encode_body(frame, frame_limit, encoding)?;
     let body_len = u32::try_from(body.len()).map_err(|_| CodecError::LengthPrefixOverflow {
         body_len: body.len(),
     })?;
@@ -38,7 +48,7 @@ pub fn encode(frame: &WireFrame, frame_limit: usize) -> Result<Vec<u8>, CodecErr
 }
 
 /// Sensitive encode path (R7): identical bytes to [`encode`], but the
-/// intermediate JSON body buffer is zeroized here and the returned framed
+/// intermediate body buffer is zeroized here and the returned framed
 /// buffer zeroizes itself on drop — a writer that drops it after the socket
 /// write leaves no plaintext copy of a staged secret in freed memory.
 ///
@@ -49,7 +59,16 @@ pub fn encode_zeroizing(
     frame: &WireFrame,
     frame_limit: usize,
 ) -> Result<Zeroizing<Vec<u8>>, CodecError> {
-    let mut body = encode_json(frame, frame_limit)?;
+    encode_zeroizing_with(frame, frame_limit, WireEncoding::Json)
+}
+
+/// Sensitive encode path using the selected post-handshake encoding.
+pub fn encode_zeroizing_with(
+    frame: &WireFrame,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<Zeroizing<Vec<u8>>, CodecError> {
+    let mut body = encode_body(frame, frame_limit, encoding)?;
     let result = (|| {
         let body_len = u32::try_from(body.len()).map_err(|_| CodecError::LengthPrefixOverflow {
             body_len: body.len(),
@@ -71,6 +90,17 @@ pub fn encode_zeroizing(
     })();
     body.zeroize();
     result
+}
+
+fn encode_body(
+    frame: &WireFrame,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<Vec<u8>, CodecError> {
+    match encoding {
+        WireEncoding::Json => encode_json(frame, frame_limit),
+        WireEncoding::MessagePack => encode_msgpack(frame, frame_limit),
+    }
 }
 
 #[derive(Debug)]
@@ -126,6 +156,7 @@ pub struct Decoder {
     /// after deserialize, and any partial body on drop, so a staged secret's
     /// wire bytes do not linger in freed decoder memory.
     zeroize_bodies: bool,
+    encoding: WireEncoding,
 }
 
 impl Decoder {
@@ -138,6 +169,7 @@ impl Decoder {
                 filled: 0,
             },
             zeroize_bodies: false,
+            encoding: WireEncoding::Json,
         }
     }
 
@@ -147,6 +179,29 @@ impl Decoder {
         let mut decoder = Self::new(frame_limit);
         decoder.zeroize_bodies = true;
         decoder
+    }
+
+    /// Creates a decoder for the selected post-handshake encoding.
+    pub fn new_with_encoding(frame_limit: usize, encoding: WireEncoding) -> Self {
+        let mut decoder = Self::new(frame_limit);
+        decoder.encoding = encoding;
+        decoder
+    }
+
+    /// Creates a zeroizing decoder for the selected post-handshake encoding.
+    pub fn new_zeroizing_with_encoding(frame_limit: usize, encoding: WireEncoding) -> Self {
+        let mut decoder = Self::new_zeroizing(frame_limit);
+        decoder.encoding = encoding;
+        decoder
+    }
+
+    /// Switches the post-handshake decoder encoding.
+    ///
+    /// Callers must switch only at a frame boundary, immediately after the
+    /// JSON Hello has been fully decoded.
+    pub fn set_encoding(&mut self, encoding: WireEncoding) {
+        debug_assert!(matches!(&self.state, DecodeState::Prefix { filled: 0, .. }));
+        self.encoding = encoding;
     }
 
     /// Returns whether a prior protocol violation permanently poisoned this
@@ -207,9 +262,12 @@ impl Decoder {
                                 return DecodeBatch::failed(frames, CodecError::DecoderPoisoned);
                             }
                         };
-                        let decoded = match std::str::from_utf8(&body) {
-                            Ok(_) => decode_json(&body, self.frame_limit),
-                            Err(error) => Err(CodecError::InvalidUtf8(error)),
+                        let decoded = match self.encoding {
+                            WireEncoding::Json => match std::str::from_utf8(&body) {
+                                Ok(_) => decode_json(&body, self.frame_limit),
+                                Err(error) => Err(CodecError::InvalidUtf8(error)),
+                            },
+                            WireEncoding::MessagePack => decode_msgpack(&body, self.frame_limit),
                         };
                         if self.zeroize_bodies {
                             body.zeroize();

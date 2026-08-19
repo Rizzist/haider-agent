@@ -590,6 +590,7 @@ async fn fake_non_draining_incumbent(
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: haider_client::required_live_features(),
+        encoding: None,
     };
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept fake incumbent");

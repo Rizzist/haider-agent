@@ -178,6 +178,7 @@ async fn control_attachment(
             session_id,
             after_seq: 0,
             mode: AttachMode::Control,
+            sealed_replay: false,
         })
         .await
         .map_err(|error| error.to_string())?

@@ -55,7 +55,7 @@ use haider_rpc::{
     FEATURE_SESSION_OBSERVE_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SHELL_EXEC_V1,
     FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_USER_COMMAND_V1,
     FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome,
-    WireFrame, negotiate, uds_codec,
+    WireEncoding, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -742,12 +742,14 @@ fn splice_staged_response(state: &mut OutboundState, attachment_id: &AttachmentI
 struct ConnectionFrameSink {
     lane: OutboundLane,
     outbound_limit: usize,
+    encoding: WireEncoding,
 }
 
 impl FrameSink for ConnectionFrameSink {
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
-        let bytes = encode_outbound(&frame, self.outbound_limit).map_err(|_| FrameSendError)?;
+        let bytes = encode_outbound(&frame, self.outbound_limit, self.encoding)
+            .map_err(|_| FrameSendError)?;
         self.lane
             .try_push(key, QueuedFrame::ordinary(bytes))
             .map_err(|_| FrameSendError)
@@ -765,7 +767,8 @@ impl FrameSink for ConnectionFrameSink {
             return self.try_send(frame);
         };
         let marker = Some((attachment_id.clone(), request_id.clone()));
-        let bytes = encode_outbound(&frame, self.outbound_limit).map_err(|_| FrameSendError)?;
+        let bytes = encode_outbound(&frame, self.outbound_limit, self.encoding)
+            .map_err(|_| FrameSendError)?;
         self.lane
             .try_push(
                 LaneKey::System,
@@ -783,7 +786,7 @@ impl FrameSink for ConnectionFrameSink {
     }
 
     fn offer(&self, attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
-        let Ok(bytes) = encode_outbound(frame, self.outbound_limit) else {
+        let Ok(bytes) = encode_outbound(frame, self.outbound_limit, self.encoding) else {
             // Exceeds the negotiated frame limit: no amount of draining can
             // ever admit it.
             return SendAdmission::Refused;
@@ -798,7 +801,7 @@ impl FrameSink for ConnectionFrameSink {
         frame: &WireFrame,
         ticket: &AdmissionTicket,
     ) -> SendAdmission {
-        let Ok(bytes) = encode_outbound(frame, self.outbound_limit) else {
+        let Ok(bytes) = encode_outbound(frame, self.outbound_limit, self.encoding) else {
             return SendAdmission::Refused;
         };
         self.lane.offer(
@@ -957,6 +960,7 @@ where
     let mut grant = Option::<ConnectionGrant>::None;
     let mut hub_connection = Option::<HubConnection>::None;
     let mut outbound_limit = context.frame_limit;
+    let mut encoding = WireEncoding::Json;
     let mut close = false;
     let mut notice_reserved = false;
     let mut notice_refused = false;
@@ -977,7 +981,7 @@ where
                 changed = drain.changed() => {
                     let notice = changed.is_ok().then(|| drain.borrow().clone()).flatten();
                     if let Some(notice) = notice {
-                        match encode_drain_notice(&notice, outbound_limit) {
+                        match encode_drain_notice(&notice, outbound_limit, encoding) {
                             Ok(bytes) => {
                                 // Never blocks and never charged: the reserve exists
                                 // precisely so queue pressure cannot lose this frame.
@@ -999,6 +1003,7 @@ where
                         "handshake_timeout",
                         "Hello did not arrive before the handshake deadline",
                         outbound_limit,
+                        encoding,
                     );
                     close = true;
                 }
@@ -1019,6 +1024,7 @@ where
                             code,
                             "connection made no ping/read or write progress within the deadline",
                             outbound_limit,
+                            encoding,
                         );
                         close = true;
                     }
@@ -1041,7 +1047,9 @@ where
                             &mut grant,
                             &mut hub_connection,
                             &mut outbound_limit,
+                            &mut encoding,
                         ).await?;
+                        decoder.set_encoding(encoding);
                         if close {
                             break;
                         }
@@ -1060,6 +1068,7 @@ where
                             &lane,
                             &WireFrame::ProtocolError(protocol_error),
                             outbound_limit,
+                            encoding,
                         );
                         close = true;
                     }
@@ -1246,6 +1255,7 @@ where
 
 /// Dispatches one decoded frame. Returns `Ok(true)` when the connection must
 /// close (fatal protocol error or rejected handshake).
+#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     frame: WireFrame,
     context: &ConnectionContext,
@@ -1254,6 +1264,7 @@ async fn handle_frame(
     grant: &mut Option<ConnectionGrant>,
     hub_connection: &mut Option<HubConnection>,
     outbound_limit: &mut usize,
+    encoding: &mut WireEncoding,
 ) -> Result<bool, DaemonError> {
     let Some(_) = grant.as_ref() else {
         let WireFrame::Hello(hello) = frame else {
@@ -1262,17 +1273,24 @@ async fn handle_frame(
                 "handshake_required",
                 "Hello must be the first frame",
                 *outbound_limit,
+                WireEncoding::Json,
             )?;
             return Ok(true);
         };
         // From here on the client's max_receive_frame caps everything we
         // send, including the Welcome itself and any rejection.
         *outbound_limit = context.frame_limit.min(hello.max_receive_frame as usize);
-        let close = negotiate_hello(hello, context, drain, lane, grant, *outbound_limit)?;
+        let negotiated_encoding =
+            negotiate_hello(hello, context, drain, lane, grant, *outbound_limit)?;
+        let close = negotiated_encoding.is_none();
+        if let Some(selected) = negotiated_encoding {
+            *encoding = selected;
+        }
         if !close && let Some(granted) = grant.as_ref() {
             let sink: Arc<dyn FrameSink> = Arc::new(ConnectionFrameSink {
                 lane: lane.clone(),
                 outbound_limit: *outbound_limit,
+                encoding: *encoding,
             });
             *hub_connection = Some(
                 context
@@ -1292,7 +1310,7 @@ async fn handle_frame(
 
     match frame {
         WireFrame::Ping { nonce } => {
-            enqueue(lane, &WireFrame::Pong { nonce }, *outbound_limit)?;
+            enqueue(lane, &WireFrame::Pong { nonce }, *outbound_limit, *encoding)?;
             Ok(false)
         }
         WireFrame::Request { request_id, body } => {
@@ -1346,6 +1364,7 @@ async fn handle_frame(
                     failed_write_ids: Vec::new(),
                 }),
                 *outbound_limit,
+                *encoding,
             )?;
             Ok(false)
         }
@@ -1355,6 +1374,7 @@ async fn handle_frame(
                 "unexpected_frame",
                 "frame is not valid from a connected client",
                 *outbound_limit,
+                *encoding,
             )?;
             Ok(true)
         }
@@ -1372,17 +1392,23 @@ fn negotiate_hello(
     lane: &OutboundLane,
     grant: &mut Option<ConnectionGrant>,
     outbound_limit: usize,
-) -> Result<bool, DaemonError> {
+) -> Result<Option<WireEncoding>, DaemonError> {
     let server_range = ServerRange {
         protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
         protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
         capabilities: CapabilitySet::from([Capability::View, Capability::Control]),
+        supports_msgpack: true,
     };
     let negotiated = match negotiate(&hello, &server_range) {
         Ok(negotiated) => negotiated,
         Err(error) => {
-            enqueue(lane, &WireFrame::ProtocolError(error), outbound_limit)?;
-            return Ok(true);
+            enqueue(
+                lane,
+                &WireFrame::ProtocolError(error),
+                outbound_limit,
+                WireEncoding::Json,
+            )?;
+            return Ok(None);
         }
     };
     let frame_limit =
@@ -1404,6 +1430,7 @@ fn negotiate_hello(
         lifecycle_phase,
         capabilities_granted: negotiated.capabilities_granted.clone(),
         features: welcome_features(),
+        encoding: negotiated.encoding.clone(),
     };
     let bytes = encode_welcome_for_peer(welcome, outbound_limit)?;
     lane.try_push(LaneKey::System, QueuedFrame::ordinary(bytes))?;
@@ -1412,7 +1439,10 @@ fn negotiate_hello(
     *grant = Some(ConnectionGrant {
         capabilities: negotiated.capabilities_granted,
     });
-    Ok(false)
+    Ok(Some(match negotiated.encoding.as_deref() {
+        Some("msgpack") => WireEncoding::MessagePack,
+        _ => WireEncoding::Json,
+    }))
 }
 
 fn welcome_features() -> BTreeSet<String> {
@@ -1433,6 +1463,9 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_CONVERGENCE_GRAPH_V3.to_owned(),
         FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
         FEATURE_LOOM_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
+        haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
         FEATURE_EXPORT_SEQ_V1.to_owned(),
         FEATURE_HOOKS_V1.to_owned(),
         FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
@@ -1477,7 +1510,11 @@ fn encode_welcome_for_peer(
         Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
             if welcome.features.remove(FEATURE_USER_COMMAND_V1) =>
         {
-            encode_outbound(&WireFrame::Welcome(welcome), outbound_limit)
+            encode_outbound(
+                &WireFrame::Welcome(welcome),
+                outbound_limit,
+                WireEncoding::Json,
+            )
         }
         Err(error) => Err(DaemonError::Protocol {
             message: format!("outbound frame rejected by peer limit: {error}"),
@@ -1490,6 +1527,7 @@ fn enqueue_fatal(
     code: &str,
     message: &str,
     outbound_limit: usize,
+    encoding: WireEncoding,
 ) -> Result<(), DaemonError> {
     enqueue(
         lane,
@@ -1501,6 +1539,7 @@ fn enqueue_fatal(
             failed_write_ids: Vec::new(),
         }),
         outbound_limit,
+        encoding,
     )
 }
 
@@ -1511,17 +1550,21 @@ fn enqueue(
     lane: &OutboundLane,
     frame: &WireFrame,
     outbound_limit: usize,
+    encoding: WireEncoding,
 ) -> Result<(), DaemonError> {
-    let bytes = encode_outbound(frame, outbound_limit)?;
+    let bytes = encode_outbound(frame, outbound_limit, encoding)?;
     lane.try_push(LaneKey::System, QueuedFrame::ordinary(bytes))
 }
 
 fn encode_outbound(
     frame: &WireFrame,
     outbound_limit: usize,
+    encoding: WireEncoding,
 ) -> Result<Zeroizing<Vec<u8>>, DaemonError> {
-    uds_codec::encode_zeroizing(frame, outbound_limit).map_err(|error| DaemonError::Protocol {
-        message: format!("outbound frame rejected by peer limit: {error}"),
+    uds_codec::encode_zeroizing_with(frame, outbound_limit, encoding).map_err(|error| {
+        DaemonError::Protocol {
+            message: format!("outbound frame rejected by peer limit: {error}"),
+        }
     })
 }
 
@@ -1535,6 +1578,7 @@ fn encode_outbound(
 fn encode_drain_notice(
     notice: &DrainNotice,
     outbound_limit: usize,
+    encoding: WireEncoding,
 ) -> Result<Vec<u8>, DaemonError> {
     let mut reason = notice.reason.clone();
     loop {
@@ -1544,7 +1588,7 @@ fn encode_drain_notice(
             daemon_generation: notice.daemon_generation,
             deadline_unix_ms: notice.deadline_unix_ms,
         };
-        match uds_codec::encode(&frame, outbound_limit) {
+        match uds_codec::encode_with(&frame, outbound_limit, encoding) {
             Ok(bytes) => return Ok(bytes),
             Err(error) if reason.is_empty() => {
                 return Err(DaemonError::Protocol {
@@ -1584,7 +1628,7 @@ pub(crate) fn reject_over_limit(stream: &IpcStream, context: &ConnectionContext)
         presentation: None,
         failed_write_ids: Vec::new(),
     });
-    let Ok(bytes) = encode_outbound(&frame, context.frame_limit) else {
+    let Ok(bytes) = encode_outbound(&frame, context.frame_limit, WireEncoding::Json) else {
         return;
     };
     haider_platform::write_immediate(stream, &bytes);

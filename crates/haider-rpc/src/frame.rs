@@ -316,6 +316,14 @@ pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 /// Daemon implements the Loom registry: agent types + pipe-source workflows
 /// (`loom.list`, `loom.register_agent_type`, `loom.register_workflow`).
 pub const FEATURE_LOOM_V1: &str = "loom_v1";
+/// Daemon can push changed/new session summaries after a read-only roster
+/// watch is accepted.
+pub const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
+/// Daemon supports opt-in MessagePack encoding after the JSON handshake.
+pub const FEATURE_WIRE_MSGPACK_V1: &str = "wire_msgpack_v1";
+/// Daemon can omit superseded item deltas from the durable store phase of a
+/// session attachment replay while preserving the replay cursor and live tail.
+pub const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
 /// ADE capability sniff: `haider export` renders seq-keyed rows (pipe/json
 /// carry per-turn journal seq + a head_seq cursor, `--since` is exact).
 pub const FEATURE_EXPORT_SEQ_V1: &str = "export_seq_v1";
@@ -388,13 +396,16 @@ pub struct Hello {
     /// never invents a capability the client did not ask for.
     #[serde(default)]
     pub capabilities_requested: CapabilitySet,
-    /// Largest JSON body this client can receive.
+    /// Largest encoded body this client can receive.
     ///
     /// The daemon must not send a frame larger than the smaller of this value
     /// and its own configured limit. The default preserves decode tolerance
     /// for pre-release peers that omitted the additive field.
     #[serde(default = "default_frame_limit_u32")]
     pub max_receive_frame: u32,
+    /// Preferred post-handshake wire encodings. Empty means JSON only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encodings: Vec<String>,
 }
 
 /// Daemon lifecycle state advertised in [`Welcome`].
@@ -444,6 +455,9 @@ pub struct Welcome {
     /// features answer whether the negotiated v1 peer implements a method.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub features: BTreeSet<String>,
+    /// Selected post-handshake encoding. Absent means JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 /// A raw secret in transit on the sensitive same-UID UDS staging path (R7).
@@ -1197,6 +1211,9 @@ pub enum RequestBody {
         /// Maximum number of summaries to return.
         limit: u32,
     },
+    /// Starts a connection-scoped watch of changed/new session summaries.
+    #[serde(rename = "session.list_watch")]
+    SessionListWatch {},
     /// Non-subscribing read of committed envelopes in an inclusive range.
     #[serde(rename = "session.read")]
     SessionRead {
@@ -1299,6 +1316,10 @@ pub enum RequestBody {
         session_id: SessionId,
         after_seq: u64,
         mode: AttachMode,
+        /// Omits item deltas from the initial durable replay only. Buffered
+        /// and live delivery after `AttachCaughtUp` remain unfiltered.
+        #[serde(default, skip_serializing_if = "is_false")]
+        sealed_replay: bool,
     },
     /// Ends event delivery for one attachment; never affects session
     /// authority or worker ownership.
@@ -1711,6 +1732,9 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
     },
+    /// Acknowledges a connection-scoped session roster watch.
+    #[serde(rename = "session.list_watch")]
+    SessionListWatch { accepted: bool },
     #[serde(rename = "session.read")]
     SessionRead { result: SessionReadResult },
     #[serde(rename = "session.observe")]
@@ -2389,6 +2413,11 @@ pub enum WireFrame {
         attachment_id: AttachmentId,
         high_water_seq: u64,
     },
+    /// Changed or newly discovered session summaries for a roster watcher.
+    ///
+    /// v1 deliberately does not report removed sessions. Clients that need
+    /// deletion reconciliation must occasionally issue `session.list`.
+    SessionRosterDelta { summaries: Vec<SessionSummary> },
     /// Wire shape of the durable compare-and-set menu command: first
     /// committed answer wins, and `request_seq` plus `worker_generation`
     /// fence stale answers. Only the shape lives here — validation,
@@ -2477,6 +2506,9 @@ enum WireFrameRef<'a> {
         attachment_id: &'a AttachmentId,
         high_water_seq: u64,
     },
+    SessionRosterDelta {
+        summaries: &'a [SessionSummary],
+    },
     MenuAnswer {
         #[serde(skip_serializing_if = "Option::is_none")]
         request_id: &'a Option<RequestId>,
@@ -2531,6 +2563,10 @@ enum WireFrameOwned {
     AttachCaughtUp {
         attachment_id: AttachmentId,
         high_water_seq: u64,
+    },
+    SessionRosterDelta {
+        #[serde(default)]
+        summaries: Vec<SessionSummary>,
     },
     MenuAnswer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2608,6 +2644,9 @@ impl Serialize for WireFrame {
                 attachment_id,
                 high_water_seq: *high_water_seq,
             },
+            Self::SessionRosterDelta { summaries } => {
+                WireFrameRef::SessionRosterDelta { summaries }
+            }
             Self::MenuAnswer {
                 request_id,
                 command_id,
@@ -2693,6 +2732,9 @@ impl<'de> Deserialize<'de> for WireFrame {
                 attachment_id,
                 high_water_seq,
             },
+            WireFrameOwned::SessionRosterDelta { summaries } => {
+                Self::SessionRosterDelta { summaries }
+            }
             WireFrameOwned::MenuAnswer {
                 request_id,
                 command_id,

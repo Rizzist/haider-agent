@@ -1,8 +1,9 @@
 //! Transport-independent wire contracts for the Haider daemon.
 //!
 //! [`WireFrame`] is an explicit, versioned protocol union. It is not JSON-RPC:
-//! WebSockets carry one JSON object per text message, while Unix-domain sockets
-//! carry the same JSON bytes after a four-byte big-endian length prefix.
+//! the Hello/Welcome handshake uses JSON, after which peers may continue with
+//! JSON or negotiate MessagePack. Unix-domain sockets add a four-byte
+//! big-endian length prefix around either body encoding.
 //!
 //! # The sequence-cursor law
 //!
@@ -30,7 +31,7 @@ pub mod ws_codec;
 /// direct workspace dependency.
 pub use haider_protocol;
 
-pub use codec::CodecError;
+pub use codec::{CodecError, WireEncoding, decode_msgpack, encode_msgpack};
 pub use frame::{
     ARTIFACT_PUT_MAX_BYTES, AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus,
     Capability, CapabilitySet, ClientKind, CommandId, DEFAULT_FRAME_LIMIT,
@@ -56,13 +57,14 @@ pub use frame::{
     FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2, FEATURE_CONVERGENCE_GRAPH_V3,
     FEATURE_CONVERGENCE_GRAPH_V4, FEATURE_EXPORT_SEQ_V1, FEATURE_HOOKS_V1, FEATURE_LOOM_V1,
     FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
-    FEATURE_PROVIDER_REMOVE_V1, FEATURE_RUN_RETRY_V1, FEATURE_SESSION_EFFORT_SELECT_V1,
-    FEATURE_SESSION_FAST_SELECT_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_MODEL_SELECT_V1,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_V1,
-    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RENAME_V1, FEATURE_SHELL_EXEC_V1,
-    FEATURE_TOOL_INVENTORY_V1, FEATURE_TRANSCRIPTION_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_USAGE_REPORT_V1, FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, FLEET_MAX_DEPTH,
-    FLEET_MAX_NODES, FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
+    FEATURE_PROVIDER_REMOVE_V1, FEATURE_RUN_RETRY_V1, FEATURE_SESSION_ATTACH_SEALED_V1,
+    FEATURE_SESSION_EFFORT_SELECT_V1, FEATURE_SESSION_FAST_SELECT_V1, FEATURE_SESSION_FLEET_V1,
+    FEATURE_SESSION_LIST_WATCH_V1, FEATURE_SESSION_MODEL_SELECT_V1, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_SESSION_OBSERVE_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RENAME_V1,
+    FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1, FEATURE_TRANSCRIPTION_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_USER_COMMAND_V1,
+    FEATURE_VAULT_STAGE_V1, FEATURE_WIRE_MSGPACK_V1, FLEET_MAX_DEPTH, FLEET_MAX_NODES,
+    FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
     FleetStateCountsWire, Hello, HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput,
     ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
     OAuthFlowStatusWire, OAuthReadyRefWire, ObserveMenuWire, ObserveRunStateWire,

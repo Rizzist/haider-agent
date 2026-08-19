@@ -63,6 +63,7 @@ fn welcome() -> Welcome {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: BTreeSet::new(),
+        encoding: None,
     }
 }
 
@@ -636,6 +637,7 @@ fn request_body_round_trips_the_attachment_commands() {
             session_id: session(4),
             after_seq: 12,
             mode: AttachMode::Control,
+            sealed_replay: false,
         }
     );
     assert_eq!(

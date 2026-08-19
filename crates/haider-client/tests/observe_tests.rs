@@ -105,6 +105,7 @@ fn welcome(profile: &ResolvedProfile, instance: &str) -> Welcome {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View]),
         features: BTreeSet::new(),
+        encoding: None,
     }
 }
 
@@ -170,6 +171,7 @@ async fn accept_attach(
         session_id: attached,
         after_seq,
         mode,
+        ..
     } = body
     else {
         panic!("expected session.attach");
@@ -418,6 +420,7 @@ async fn replay_overflow_during_attach_is_detected_and_resumed() {
             session_id: attached,
             after_seq,
             mode,
+            ..
         } = body
         else {
             panic!("expected first overflow attach");
@@ -471,6 +474,7 @@ async fn replay_overflow_during_attach_is_detected_and_resumed() {
             session_id: attached,
             after_seq,
             mode,
+            ..
         } = body
         else {
             panic!("expected resumed overflow attach");

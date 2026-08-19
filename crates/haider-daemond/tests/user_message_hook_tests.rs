@@ -187,6 +187,7 @@ async fn direct_rpc_submit(
             session_id: session_id.clone(),
             after_seq: 0,
             mode: AttachMode::Control,
+            sealed_replay: false,
         },
     )
     .await;

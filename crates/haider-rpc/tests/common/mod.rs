@@ -93,6 +93,7 @@ pub fn transcript() -> Vec<WireFrame> {
             client_kind: ClientKind::Gui,
             capabilities_requested: capabilities([Capability::View, Capability::Control]),
             max_receive_frame: TEST_FRAME_LIMIT as u32,
+            encodings: Vec::new(),
         }),
         WireFrame::Welcome(Welcome {
             protocol: 1,
@@ -104,6 +105,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View]),
             features: BTreeSet::new(),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-list"),
@@ -125,6 +127,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 session_id: session_id.clone(),
                 after_seq: 4,
                 mode: AttachMode::View,
+                sealed_replay: false,
             },
         },
         WireFrame::Request {
@@ -380,6 +383,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 "session_mutation_v1".to_owned(),
                 "turn_control_v1".to_owned(),
             ]),
+            encoding: None,
         }),
         WireFrame::ProtocolError(ProtocolError {
             code: "invalid_frame".into(),
@@ -455,6 +459,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_TURN_CONTROL_V1.to_owned(),
                 FEATURE_VAULT_STAGE_V1.to_owned(),
             ]),
+            encoding: None,
         }),
         // ── W5b append-only OAuth PKCE/account.add surface ───────────────
         WireFrame::Request {
@@ -548,6 +553,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_TURN_CONTROL_V1.to_owned(),
                 FEATURE_VAULT_STAGE_V1.to_owned(),
             ]),
+            encoding: None,
         }),
         // ── W5c.2a append-only management reads + revision spine ────────
         WireFrame::Response {
@@ -817,6 +823,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_TURN_CONTROL_V1.to_owned(),
                 FEATURE_VAULT_STAGE_V1.to_owned(),
             ]),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-shell-exec"),
@@ -895,6 +902,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View, Capability::Control]),
             features: BTreeSet::from([FEATURE_BRANCH_CREATE_V1.to_owned()]),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-branch-create"),
@@ -975,6 +983,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View, Capability::Control]),
             features: BTreeSet::from([FEATURE_ARTIFACT_PUT_V1.to_owned()]),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-artifact-put"),
@@ -1015,6 +1024,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View, Capability::Control]),
             features: BTreeSet::from([FEATURE_ACCOUNT_OAUTH_DEVICE_V1.to_owned()]),
+            encoding: None,
         }),
         WireFrame::Response {
             request_id: RequestId::new("request-kimi-oauth-start"),
@@ -1136,6 +1146,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View, Capability::Control]),
             features: BTreeSet::from([FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned()]),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-device-candidates"),
@@ -1252,6 +1263,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View]),
             features: BTreeSet::from([FEATURE_USAGE_REPORT_V1.to_owned()]),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-usage-report"),
@@ -1348,6 +1360,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View, Capability::Control]),
             features: BTreeSet::from([FEATURE_SESSION_RENAME_V1.to_owned()]),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-session-rename"),
@@ -1419,6 +1432,7 @@ pub fn transcript() -> Vec<WireFrame> {
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View]),
             features: BTreeSet::from([FEATURE_SESSION_FLEET_V1.to_owned()]),
+            encoding: None,
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-session-fleet"),

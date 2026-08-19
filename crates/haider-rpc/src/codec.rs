@@ -1,8 +1,24 @@
-//! Shared JSON codec support.
+//! Shared JSON and MessagePack codec support.
 
 use std::io::Write;
 
+use serde::Serialize;
+
 use crate::WireFrame;
+
+/// Encoding used for post-handshake wire frames.
+///
+/// Hello and Welcome are always exchanged with the legacy JSON codec. A
+/// connection may switch to [`Self::MessagePack`] only after Welcome confirms
+/// the negotiation outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WireEncoding {
+    /// UTF-8 JSON, the backwards-compatible default.
+    #[default]
+    Json,
+    /// MessagePack binary encoding.
+    MessagePack,
+}
 
 /// A typed wire-codec failure.
 #[derive(Debug)]
@@ -18,13 +34,16 @@ pub enum CodecError {
         frame_limit: usize,
         announced_len: Option<usize>,
     },
-    /// A zero-length JSON body is invalid on both transports: an empty WS
-    /// text message, or a UDS length prefix announcing zero bytes.
+    /// A zero-length body is invalid for either encoding on both transports.
     EmptyFrame,
     /// A complete UDS body was not UTF-8.
     InvalidUtf8(std::str::Utf8Error),
     /// JSON serialization or decoding failed.
     Json(serde_json::Error),
+    /// MessagePack serialization failed.
+    MessagePackEncode(rmp_serde::encode::Error),
+    /// MessagePack decoding failed.
+    MessagePackDecode(rmp_serde::decode::Error),
     /// A body or frame buffer could not be reserved.
     AllocationFailed { requested: usize },
     /// The UDS decoder is permanently poisoned after a framing/body violation.
@@ -50,6 +69,12 @@ impl std::fmt::Display for CodecError {
             Self::EmptyFrame => formatter.write_str("empty UDS frame is invalid"),
             Self::InvalidUtf8(error) => write!(formatter, "frame is not UTF-8: {error}"),
             Self::Json(error) => write!(formatter, "invalid wire JSON: {error}"),
+            Self::MessagePackEncode(error) => {
+                write!(formatter, "invalid wire MessagePack encode: {error}")
+            }
+            Self::MessagePackDecode(error) => {
+                write!(formatter, "invalid wire MessagePack: {error}")
+            }
             Self::AllocationFailed { requested } => {
                 write!(formatter, "could not allocate {requested} bytes for frame")
             }
@@ -69,6 +94,8 @@ impl std::error::Error for CodecError {
         match self {
             Self::InvalidUtf8(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::MessagePackEncode(error) => Some(error),
+            Self::MessagePackDecode(error) => Some(error),
             _ => None,
         }
     }
@@ -163,4 +190,39 @@ pub(crate) fn decode_json(bytes: &[u8], frame_limit: usize) -> Result<WireFrame,
         return Err(CodecError::EmptyFrame);
     }
     Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Encodes one post-handshake frame as MessagePack through the same bounded
+/// writer used by JSON, so the full oversized body is never accumulated.
+pub fn encode_msgpack(frame: &WireFrame, frame_limit: usize) -> Result<Vec<u8>, CodecError> {
+    let mut writer = LimitedWriter::new(frame_limit);
+    let mut serializer = rmp_serde::Serializer::new(&mut writer).with_struct_map();
+    if let Err(error) = frame.serialize(&mut serializer) {
+        if writer.exceeded {
+            return Err(CodecError::FrameLimitExceeded {
+                frame_limit,
+                announced_len: None,
+            });
+        }
+        if let Some(requested) = writer.allocation_failed {
+            return Err(CodecError::AllocationFailed { requested });
+        }
+        return Err(CodecError::MessagePackEncode(error));
+    }
+    Ok(writer.bytes)
+}
+
+/// Decodes one complete post-handshake MessagePack frame after checking its
+/// byte length and rejecting zero-length frames identically to JSON.
+pub fn decode_msgpack(bytes: &[u8], frame_limit: usize) -> Result<WireFrame, CodecError> {
+    if bytes.len() > frame_limit {
+        return Err(CodecError::FrameLimitExceeded {
+            frame_limit,
+            announced_len: Some(bytes.len()),
+        });
+    }
+    if bytes.is_empty() {
+        return Err(CodecError::EmptyFrame);
+    }
+    rmp_serde::from_slice(bytes).map_err(CodecError::MessagePackDecode)
 }

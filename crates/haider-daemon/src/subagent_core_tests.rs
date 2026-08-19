@@ -1753,6 +1753,7 @@ impl UdsControlClient {
                 ]),
                 max_receive_frame: u32::try_from(haider_rpc::DEFAULT_FRAME_LIMIT)
                     .expect("test frame limit fits u32"),
+                encodings: Vec::new(),
             }))
             .await;
         loop {
@@ -1805,6 +1806,7 @@ impl UdsControlClient {
                 session_id,
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         })
         .await;

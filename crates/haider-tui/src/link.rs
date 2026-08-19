@@ -675,6 +675,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             session_id: session,
             after_seq,
             mode: AttachMode::Control,
+            sealed_replay: false,
         },
         LiveCommand::Detach { attachment } => RequestBody::SessionDetach {
             attachment_id: attachment,

@@ -108,6 +108,7 @@ impl DuplexClient {
             client_kind: ClientKind::Headless,
             capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
             max_receive_frame: u32::try_from(FRAME_LIMIT).expect("frame limit fits"),
+            encodings: Vec::new(),
         }))
         .await;
         assert!(matches!(self.next().await, Some(WireFrame::Welcome(_))));
@@ -209,6 +210,7 @@ async fn shell_cancel_settles_and_keeps_the_duplex_connection_open() {
                 session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::Control,
+                sealed_replay: false,
             },
         )
         .await;

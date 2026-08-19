@@ -932,7 +932,21 @@ pub struct HubConnection {
     transport: crate::accounts::ConnectionTransport,
     /// Connection-scoped staged secrets (R7): wiped on close/disconnect.
     stages: Mutex<crate::accounts::StagedSecrets>,
+    /// At most one connection-scoped roster ticker. The task owns no
+    /// connection clone, so aborting this handle tears the watch down
+    /// immediately on close or drop.
+    roster_watch: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
+}
+
+impl Drop for HubConnection {
+    fn drop(&mut self) {
+        if let Ok(watch) = self.roster_watch.get_mut()
+            && let Some(task) = watch.take()
+        {
+            task.abort();
+        }
+    }
 }
 
 /// Infrastructure failure while routing a frame.
@@ -1564,6 +1578,7 @@ impl SessionHub {
             sink,
             transport,
             stages: Mutex::new(crate::accounts::StagedSecrets::default()),
+            roster_watch: Mutex::new(None),
             closed: AtomicBool::new(false),
         })
     }
@@ -2713,6 +2728,7 @@ impl SessionHub {
         &self,
         registration: Registration,
         after_seq: u64,
+        sealed_replay: bool,
         sink: Arc<dyn FrameSink>,
     ) -> Result<(), SessionHubError> {
         if self.inner.draining.load(Ordering::Acquire) {
@@ -2730,7 +2746,14 @@ impl SessionHub {
         // admission so repeated attach/detach cannot grow this registry.
         replay_tasks.retain(|handle| !handle.is_finished());
         let hub = self.clone();
-        let task = tokio::spawn(run_replay(hub, registration, after_seq, sink, cancel));
+        let task = tokio::spawn(run_replay(
+            hub,
+            registration,
+            after_seq,
+            sealed_replay,
+            sink,
+            cancel,
+        ));
         // The lock stays held from the drain recheck through spawn+push, so
         // shutdown's registry take either owns this task or rejects it before
         // it exists. No aborted-but-unjoined admission gap is possible.

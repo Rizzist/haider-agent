@@ -1863,6 +1863,7 @@ async fn attach_buffered_once(
             session_id: reducer.session_id.clone(),
             after_seq: reducer.last_applied,
             mode: AttachMode::Control,
+            sealed_replay: false,
         })
         .await
         .map_err(|error| client_error_as_headless("session.attach before submit retry", error))?;
@@ -1962,6 +1963,7 @@ async fn attach_once(
             session_id: reducer.session_id.clone(),
             after_seq: reducer.last_applied,
             mode: AttachMode::Control,
+            sealed_replay: false,
         })
         .await
         .map_err(|error| client_error_as_headless("session.attach", error))?;

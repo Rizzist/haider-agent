@@ -240,6 +240,7 @@ impl RetryWorld {
                     session_id: self.session_id.clone(),
                     after_seq: 0,
                     mode: AttachMode::Control,
+                    sealed_replay: false,
                 },
             )
             .await

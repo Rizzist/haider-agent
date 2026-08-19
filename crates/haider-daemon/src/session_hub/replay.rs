@@ -12,6 +12,7 @@
 //! (rpc.rs). A replay task never writes the store and never answers requests.
 
 use super::*;
+use haider_protocol::item::ItemEvent;
 
 // ──────── replay pipeline: replay → caught-up → buffered drain → live ───────
 
@@ -41,12 +42,17 @@ pub(super) async fn run_replay(
     hub: SessionHub,
     mut registration: Registration,
     mut last_sent_seq: u64,
+    sealed_replay: bool,
     sink: Arc<dyn FrameSink>,
     mut cancel: watch::Receiver<bool>,
 ) -> ReplayCompletion {
     let attachment_id = registration.attachment_id.clone();
     let session_id = registration.attach_state.session_id.clone();
     let mut high_water = registration.attach_state.replay_through_seq;
+    // Sealing applies only until this attachment announces its initial
+    // durable high-water mark. Any buffered/live tail (including a later
+    // store resume after receiver lag) must remain a faithful event stream.
+    let mut seal_store_replay = sealed_replay;
     loop {
         // Phase: store replay of (last_sent_seq, high_water].
         let replayed = replay_range(
@@ -56,6 +62,7 @@ pub(super) async fn run_replay(
             &session_id,
             &mut last_sent_seq,
             high_water,
+            seal_store_replay,
             &mut registration.lagged,
             &mut cancel,
         )
@@ -79,6 +86,7 @@ pub(super) async fn run_replay(
                             &attachment_id,
                             &session_id,
                             &mut last_sent_seq,
+                            seal_store_replay,
                             &mut registration.lagged,
                             &mut cancel,
                         )
@@ -127,6 +135,7 @@ pub(super) async fn run_replay(
             attachment_id: attachment_id.clone(),
             through_seq: high_water,
         });
+        seal_store_replay = false;
 
         // Phase: buffered drain — deliver `seq > H` already committed during
         // replay, dropping duplicates by seq (at-least-once, R11).
@@ -179,6 +188,7 @@ pub(super) async fn run_replay(
                                     &attachment_id,
                                     &session_id,
                                     &mut last_sent_seq,
+                                    seal_store_replay,
                                     &mut registration.lagged,
                                     &mut cancel,
                                 )
@@ -228,6 +238,7 @@ pub(super) async fn run_replay(
                                 &attachment_id,
                                 &session_id,
                                 &mut last_sent_seq,
+                                seal_store_replay,
                                 &mut registration.lagged,
                                 &mut cancel,
                             )
@@ -277,6 +288,7 @@ pub(super) async fn run_replay(
                                     &attachment_id,
                                     &session_id,
                                     &mut last_sent_seq,
+                                    seal_store_replay,
                                     &mut registration.lagged,
                                     &mut cancel,
                                 )
@@ -418,6 +430,7 @@ async fn replay_range(
     session_id: &SessionId,
     last_sent_seq: &mut u64,
     high_water: u64,
+    sealed_replay: bool,
     lagged: &mut watch::Receiver<Option<u64>>,
     cancel: &mut watch::Receiver<bool>,
 ) -> ReplayStep {
@@ -478,6 +491,13 @@ async fn replay_range(
             if envelope.seq <= *last_sent_seq {
                 continue;
             }
+            if sealed_replay && is_item_delta(&envelope) {
+                // A skipped durable envelope still advances the replay
+                // cursor. CaughtUp therefore reports exactly the same high
+                // water as an unsealed replay.
+                *last_sent_seq = envelope.seq;
+                continue;
+            }
             match deliver_event(
                 hub,
                 sink,
@@ -498,6 +518,11 @@ async fn replay_range(
         }
     }
     ReplayStep::Continue
+}
+
+fn is_item_delta(envelope: &RawEnvelope) -> bool {
+    serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        .is_ok_and(|payload| matches!(payload, EventPayload::Item(ItemEvent::Delta { .. })))
 }
 
 /// Delivers one envelope through [`deliver_frame`]'s pacing law, advancing
@@ -596,12 +621,14 @@ async fn reregister(
 /// head. Runs inside the shutdown grace: the barrier deadline bounds it, and
 /// a deadline overrun forces the outcome — a committed envelope is delivered
 /// here or the drain reports `Forced`, never silently lost.
+#[allow(clippy::too_many_arguments)]
 async fn final_suffix_resume(
     hub: &SessionHub,
     sink: &Arc<dyn FrameSink>,
     attachment_id: &AttachmentId,
     session_id: &SessionId,
     last_sent_seq: &mut u64,
+    sealed_replay: bool,
     lagged: &mut watch::Receiver<Option<u64>>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<(), FinalSuffixFailure> {
@@ -630,6 +657,7 @@ async fn final_suffix_resume(
         session_id,
         last_sent_seq,
         head,
+        sealed_replay,
         lagged,
         cancel,
     )
