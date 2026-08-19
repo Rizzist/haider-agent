@@ -5,8 +5,10 @@
 //! here: provider or tool work (never awaited in an arm — that is R1's
 //! hub-actor purity rule; provider latency must never hold attach, menu, or
 //! cancel liveness hostage), socket writes, RPC/transport concerns (rpc.rs),
-//! and paced delivery (replay.rs). Every await inside a command arm is a
-//! store call (the loop's own `recv` is the one other await in the file).
+//! and paced delivery (replay.rs). Awaits inside command arms are durable
+//! store calls or the post-commit native pipe projection; the latter is
+//! best-effort, never changes the journal result, and finishes before the
+//! committed batch is published. The loop's own `recv` is the other await.
 //!
 //! Law owned here — **same-generation worker-lease fencing (R1/R5)**: the
 //! actor holds at most one [`RegisteredWorker`]; `AcquireWorkerLease`
@@ -19,6 +21,21 @@
 //! generation-only check cannot distinguish.
 
 use super::*;
+
+async fn maintain_pipe_sidecar(
+    writer: &crate::pipe_native::PipeNativeWriter,
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    envelopes: &[RawEnvelope],
+) {
+    if let Err(error) = writer.maintain(store, session_id, envelopes).await {
+        tracing::warn!(
+            session_id = %session_id,
+            %error,
+            "native pipe sidecar maintenance failed; journal append remains committed"
+        );
+    }
+}
 
 pub(super) fn selected_effect_recovery_action(
     menu: &Menu,
@@ -166,8 +183,9 @@ fn effect_recovery_payloads(
 /// One session's entire command order, in one loop, in one task.
 ///
 /// Both §5.5 invariants (module doc) hold by code shape here: the only awaits
-/// inside any arm are the store calls (`append`, `create_session`,
-/// `accept_turn`, `cancel_turn`, `settle_session_idle`, `resolve_menu`),
+/// inside any arm are durable store calls (`append`, `create_session`,
+/// `accept_turn`, `cancel_turn`, `settle_session_idle`, `resolve_menu`) and
+/// best-effort post-commit native pipe maintenance,
 /// publication is a synchronous call after they return in the same arm, and
 /// the `Register` arm contains no await at all. Adding an await between a
 /// store return and its `publish`, or anywhere in `Register`, breaks a law —
@@ -180,6 +198,7 @@ pub(super) async fn run_session_actor(
     worker_generation: u64,
     catch_up_byte_budget: usize,
     store: SqliteStoreHandle,
+    pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
@@ -220,6 +239,7 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        maintain_pipe_sidecar(&pipe_native, &store, &session_id, &envelopes).await;
                         publish(
                             &mut attachments,
                             &envelopes,
@@ -630,6 +650,7 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
+                    maintain_pipe_sidecar(&pipe_native, &store, &session_id, envelopes).await;
                     publish(
                         &mut attachments,
                         envelopes,
@@ -796,6 +817,7 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        maintain_pipe_sidecar(&pipe_native, &store, &session_id, &envelopes).await;
                         publish(
                             &mut attachments,
                             &envelopes,
@@ -998,6 +1020,8 @@ pub(super) async fn run_session_actor(
                                 head = last.seq;
                                 authority_epoch = last.authority_epoch;
                             }
+                            maintain_pipe_sidecar(&pipe_native, &store, &session_id, &envelopes)
+                                .await;
                             publish(
                                 &mut attachments,
                                 &envelopes,

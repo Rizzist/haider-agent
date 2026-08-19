@@ -28,6 +28,7 @@ pub mod item;
 pub mod loom;
 pub mod menu;
 pub mod permission;
+pub mod pipe;
 pub mod project_instructions;
 pub mod provider;
 pub mod retry;

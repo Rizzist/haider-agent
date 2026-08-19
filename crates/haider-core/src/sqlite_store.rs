@@ -29,7 +29,7 @@ use haider_store::{
     TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -45,6 +45,7 @@ pub struct SqliteStoreHandle {
 }
 
 struct StoreOwner {
+    root: PathBuf,
     worker_generation: u64,
     store: Mutex<Option<Store>>,
     fault: tokio::sync::watch::Sender<Option<ProfileStoreFault>>,
@@ -93,10 +94,12 @@ impl SqliteStoreHandle {
     }
 
     fn from_store(store: Store) -> Self {
+        let root = store.root().to_path_buf();
         let worker_generation = store.worker_generation();
         let (fault, _) = tokio::sync::watch::channel(None);
         Self {
             owner: Arc::new(StoreOwner {
+                root,
                 worker_generation,
                 store: Mutex::new(Some(store)),
                 fault,
@@ -140,6 +143,13 @@ impl SqliteStoreHandle {
     /// Profile-owned fencing generation allocated by this store open.
     pub fn worker_generation(&self) -> u64 {
         self.owner.worker_generation
+    }
+
+    /// Profile root containing the journal and daemon-maintained native
+    /// artifacts.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.owner.root
     }
 
     /// Advances and returns the daemon-process generation.

@@ -541,6 +541,7 @@ pub struct SessionHub {
 
 struct HubInner {
     store: SqliteStoreHandle,
+    pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
     config: SessionHubConfig,
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
@@ -1025,8 +1026,10 @@ impl SessionHub {
     ) -> Result<Self, SessionHubError> {
         config.validate().map_err(SessionHubError::InvalidConfig)?;
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
+        let pipe_native = Arc::new(crate::pipe_native::PipeNativeWriter::new(store.root()));
         let inner = Arc::new(HubInner {
             store,
+            pipe_native,
             config,
             observer,
             metrics: Arc::new(HubMetrics::default()),
@@ -2574,6 +2577,7 @@ impl SessionHub {
             self.inner.store.worker_generation(),
             self.inner.config.catch_up_byte_budget,
             self.inner.store.clone(),
+            Arc::clone(&self.inner.pipe_native),
             Arc::clone(&self.inner.observer),
             Arc::clone(&self.inner.metrics),
             Arc::clone(&self.inner.hooks),

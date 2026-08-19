@@ -327,6 +327,9 @@ pub const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
 /// ADE capability sniff: `haider export` renders seq-keyed rows (pipe/json
 /// carry per-turn journal seq + a head_seq cursor, `--since` is exact).
 pub const FEATURE_EXPORT_SEQ_V1: &str = "export_seq_v1";
+/// Daemon maintains a crash-resumable native instruct-pipe sidecar for every
+/// session, byte-identical to the unmasked `haider export --format pipe` body.
+pub const FEATURE_PIPE_NATIVE_V1: &str = "pipe_native_v1";
 
 /// One todo child returned by `graph.run_set.open`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

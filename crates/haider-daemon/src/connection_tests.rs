@@ -145,6 +145,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
+            haider_rpc::FEATURE_PIPE_NATIVE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
             haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),

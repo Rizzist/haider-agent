@@ -25,6 +25,7 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorPresentation;
 use haider_protocol::history::NodeKind;
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::pipe::{escape_pipe_field, pipe_body_line};
 use haider_tui::notify::mask_text;
 use serde_json::{Value, json};
 
@@ -105,6 +106,9 @@ impl Turn {
 pub struct SessionExport {
     pub meta: ExportMeta,
     pub turns: Vec<Turn>,
+    /// Source facts retained for byte-identical native pipe rendering. Other
+    /// formats continue to consume the transcript projection above.
+    envelopes: Vec<RawEnvelope>,
     /// The highest journal seq SEEN in the replay (not just of rendered
     /// turns) — the exact catch-up cursor: subscribe `after_seq=head_seq`
     /// or re-export `--since head_seq` and nothing is missed or repeated.
@@ -195,6 +199,7 @@ impl SessionExport {
         let mut ordered: Vec<&RawEnvelope> = events.iter().collect();
         ordered.sort_by_key(|envelope| envelope.seq);
         let head_seq = ordered.last().map_or(0, |envelope| envelope.seq);
+        let envelopes = ordered.iter().map(|envelope| (*envelope).clone()).collect();
         let mut turns = Vec::new();
         for envelope in ordered {
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
@@ -244,8 +249,16 @@ impl SessionExport {
         Self {
             meta,
             turns,
+            envelopes,
             head_seq,
         }
+    }
+
+    /// Retain only facts after an incremental export cursor in both the raw
+    /// native-pipe source and the turn projection used by other formats.
+    pub(crate) fn retain_after(&mut self, since: u64) {
+        self.envelopes.retain(|envelope| envelope.seq > since);
+        self.turns.retain(|turn| turn.seq() > since);
     }
 
     fn title(&self, masked: bool) -> Option<String> {
@@ -295,11 +308,11 @@ impl SessionExport {
     ///
     /// ```text
     /// pipe-export/v1 session=<id> provider=<p> model=<m> created_ms=<n> cwd=|…| title=|…|
-    /// U  <at_ms> |user text|
-    /// A  <at_ms> |assistant text|
-    /// A! <at_ms> |partial text| interrupted=|title: detail|
-    /// E  <at_ms> |title: detail|
-    /// T  <at_ms> <tool-name> |summary|
+    /// U  <seq> <at_ms> |user text|
+    /// A  <seq> <at_ms> |assistant text|
+    /// A! <seq> <at_ms> |partial text| interrupted=|title: detail|
+    /// E  <seq> <at_ms> |title: detail|
+    /// T  <seq> <at_ms> <tool-name> |summary|
     /// ```
     ///
     /// Text rides between pipes with `\` `|` and newline backslash-escaped,
@@ -310,21 +323,6 @@ impl SessionExport {
     /// export appends after that cursor.
     #[must_use]
     pub fn to_pipe(&self, masked: bool) -> String {
-        fn field(text: &str) -> String {
-            let mut out = String::with_capacity(text.len() + 2);
-            out.push('|');
-            for character in text.chars() {
-                match character {
-                    '\\' => out.push_str("\\\\"),
-                    '|' => out.push_str("\\|"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => {}
-                    other => out.push(other),
-                }
-            }
-            out.push('|');
-            out
-        }
         let mut lines = Vec::with_capacity(self.turns.len() + 1);
         lines.push(format!(
             "pipe-export/v1 session={} provider={} model={} created_ms={} head_seq={} cwd={} title={}",
@@ -333,16 +331,28 @@ impl SessionExport {
             self.meta.model,
             self.meta.created_at_ms,
             self.head_seq,
-            field(&self.meta.cwd),
-            field(&self.title(masked).unwrap_or_default()),
+            escape_pipe_field(&self.meta.cwd),
+            escape_pipe_field(&self.title(masked).unwrap_or_default()),
         ));
+        if !masked {
+            lines.extend(self.envelopes.iter().filter_map(pipe_body_line));
+            let mut body = lines.join("\n");
+            body.push('\n');
+            return body;
+        }
         for turn in &self.turns {
             lines.push(match turn {
                 Turn::User { text, at_ms, seq } => {
-                    format!("U  {seq} {at_ms} {}", field(&self.text(text, masked)))
+                    format!(
+                        "U  {seq} {at_ms} {}",
+                        escape_pipe_field(&self.text(text, masked))
+                    )
                 }
                 Turn::Assistant { text, at_ms, seq } => {
-                    format!("A  {seq} {at_ms} {}", field(&self.text(text, masked)))
+                    format!(
+                        "A  {seq} {at_ms} {}",
+                        escape_pipe_field(&self.text(text, masked))
+                    )
                 }
                 Turn::AssistantIncomplete {
                     text,
@@ -351,8 +361,8 @@ impl SessionExport {
                     seq,
                 } => format!(
                     "A! {seq} {at_ms} {} interrupted={}",
-                    field(&self.text(text, masked)),
-                    field(&self.text(
+                    escape_pipe_field(&self.text(text, masked)),
+                    escape_pipe_field(&self.text(
                         &format!("{}: {}", interruption.title, interruption.detail),
                         masked
                     )),
@@ -363,7 +373,7 @@ impl SessionExport {
                     seq,
                 } => format!(
                     "E  {seq} {at_ms} {}",
-                    field(&self.text(
+                    escape_pipe_field(&self.text(
                         &format!("{}: {}", presentation.title, presentation.detail),
                         masked
                     )),
@@ -375,7 +385,7 @@ impl SessionExport {
                     seq,
                 } => format!(
                     "T  {seq} {at_ms} {name} {}",
-                    field(&self.text(summary, masked))
+                    escape_pipe_field(&self.text(summary, masked))
                 ),
             });
         }
@@ -1454,7 +1464,7 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
             );
             return ExitCode::from(EX_USAGE);
         }
-        export.turns.retain(|turn| turn.seq() > since);
+        export.retain_after(since);
     }
     match write_export(&export, &options) {
         Ok(summary) => {

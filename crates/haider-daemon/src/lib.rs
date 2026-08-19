@@ -70,6 +70,7 @@ mod model_select;
 mod oauth;
 #[cfg(test)]
 mod permissions_core_tests;
+mod pipe_native;
 mod profile_vault;
 mod project_instructions;
 mod provider_registry;

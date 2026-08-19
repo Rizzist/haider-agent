@@ -561,14 +561,29 @@ fn pipe_export_holds_the_line_law_and_is_append_only() {
     assert_eq!(Format::parse("pipe"), Ok(Format::Pipe));
     assert_eq!(Format::parse("instructpipe"), Ok(Format::Pipe));
 
+    let shared_body: String = fixture_events()
+        .iter()
+        .filter_map(haider_protocol::pipe::pipe_body_line)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(
+        pipe.split_once('\n').map_or("", |(_, body)| body),
+        shared_body,
+        "the CLI's unmasked body must be exactly the shared native projection"
+    );
+
     // The line law survives hostile text: newlines and pipes escape instead
     // of splitting or breaking a field.
-    let mut hostile = export.clone();
-    hostile.turns.push(export::Turn::User {
-        text: "line one\nline two |with pipes| and \\backslash".into(),
-        at_ms: 99,
-        seq: 999,
-    });
+    let mut hostile_events = fixture_events();
+    hostile_events.push(node_env(
+        999,
+        99,
+        NodeKind::UserTurn {
+            text: "line one\nline two |with pipes| and \\backslash".into(),
+            attachments: Vec::new(),
+        },
+    ));
+    let hostile = SessionExport::project(fixture_meta(), &hostile_events);
     let rendered = hostile.to_pipe(false);
     assert_eq!(
         rendered.lines().count(),
@@ -625,7 +640,7 @@ fn since_cursor_yields_the_exact_suffix() {
     let cursor = export.turns[0].seq();
     let full = export.to_pipe(false);
     let mut incremental = export.clone();
-    incremental.turns.retain(|turn| turn.seq() > cursor);
+    incremental.retain_after(cursor);
     let suffix = incremental.to_pipe(false);
     let body = |rendered: &str| {
         rendered
