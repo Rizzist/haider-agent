@@ -110,6 +110,7 @@ impl ProviderFactory for FixedProviderFactory {
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: self.fallback_resolver.clone(),
+            compaction_promotion: None,
         })
     }
 }

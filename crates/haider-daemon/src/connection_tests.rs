@@ -138,12 +138,14 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
+            haider_rpc::FEATURE_COMPACTION_GUARD_V1.to_owned(),
             FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V2.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V3.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
+            haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
             haider_rpc::FEATURE_PIPE_NATIVE_V2.to_owned(),
             haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
@@ -1035,6 +1037,7 @@ impl crate::worker::ProviderFactory for PairedFakeFactory {
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: None,
+            compaction_promotion: None,
         })
     }
 }

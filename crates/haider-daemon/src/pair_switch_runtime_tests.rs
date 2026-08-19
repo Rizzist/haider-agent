@@ -10,21 +10,24 @@ use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
 use haider_core::{
-    SessionCreateCommand, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
-    TurnAdmissionDisposition,
+    ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitchCause,
+    ProviderPairSwitchTarget, SessionCreateCommand, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle,
+    TurnAcceptCommand, TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+use haider_protocol::ids::{CredentialAlias, DeviceId, EventId, RunId, SessionId};
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
 };
 use haider_protocol::state::RunState;
-use haider_provider::{FakeProvider, FakeStep};
+use haider_provider::{FakeProvider, FakeStep, ProviderError};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
@@ -35,6 +38,43 @@ use tokio::time::{Duration, timeout};
 struct RoutingProviderFactory {
     providers: HashMap<String, Arc<FakeProvider>>,
     cache_reconciliations: Arc<Mutex<Vec<(SessionId, String)>>>,
+    fallback_enabled: bool,
+}
+
+#[derive(Debug)]
+struct RuntimeFallbackResolver {
+    target: Arc<FakeProvider>,
+}
+
+#[async_trait::async_trait]
+impl ProviderAttemptResolver for RuntimeFallbackResolver {
+    async fn resolve(
+        &self,
+        _current_account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        // Pins the rotation-exhausted entry point: current-provider account
+        // resolution has no alternate and core must consult fallback next.
+        Ok(ProviderAttemptDecision::Stop)
+    }
+
+    async fn resolve_fallback(
+        &self,
+        _current_account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        Ok(ProviderAttemptDecision::Switch(ProviderPairSwitchTarget {
+            provider: Arc::clone(&self.target) as Arc<dyn haider_provider::Provider>,
+            account: CredentialAlias::new("fake-b-account"),
+            provider_name: "fake-b".into(),
+            model: "model-b".into(),
+            context_window: None,
+            cached_input_is_subset: true,
+            auth_scope: "api_key".into(),
+            attempt_resolver: None,
+            cause: ProviderPairSwitchCause::FallbackChain,
+        }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -50,15 +90,28 @@ impl ProviderFactory for RoutingProviderFactory {
                 false,
             )
         })?;
+        let attempt_resolver =
+            (self.fallback_enabled && metadata.provider == "fake-a").then(|| {
+                Arc::new(RuntimeFallbackResolver {
+                    target: Arc::clone(
+                        self.providers
+                            .get("fake-b")
+                            .expect("fallback target is registered"),
+                    ),
+                }) as Arc<dyn ProviderAttemptResolver>
+            });
         Ok(ResolvedTurnProvider {
             provider: Arc::clone(provider) as Arc<dyn haider_provider::Provider>,
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
             context_window: None,
-            account_alias: None,
+            account_alias: attempt_resolver
+                .as_ref()
+                .map(|_| "fake-a-account".to_owned()),
             initial_rotation: None,
             rotation_budget_consumed: false,
-            attempt_resolver: None,
+            attempt_resolver,
+            compaction_promotion: None,
         })
     }
 
@@ -83,6 +136,15 @@ impl PairSwitchWorld {
     /// Store + hub + manager with fakes `fake-a`/`fake-b` creatable, and one
     /// session created on the (`fake-a`, `model-a`) pair.
     async fn boot(prefix: &str, fake_a: Arc<FakeProvider>, fake_b: Arc<FakeProvider>) -> Self {
+        Self::boot_with_fallback(prefix, fake_a, fake_b, false).await
+    }
+
+    async fn boot_with_fallback(
+        prefix: &str,
+        fake_a: Arc<FakeProvider>,
+        fake_b: Arc<FakeProvider>,
+        fallback_enabled: bool,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp profile");
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
         // Leak the tempdir handle so the profile outlives this constructor;
@@ -101,6 +163,7 @@ impl PairSwitchWorld {
                         ("fake-b".to_owned(), fake_b),
                     ]),
                     cache_reconciliations: Arc::clone(&cache_reconciliations),
+                    fallback_enabled,
                 }),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,
@@ -284,6 +347,24 @@ impl PairSwitchWorld {
         .expect("run reaches Done");
     }
 
+    async fn await_run_state(&self, run_id: &RunId, expected: RunState) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if self
+                    .latest_run_states()
+                    .await
+                    .iter()
+                    .any(|(candidate, state)| candidate == run_id && state == &expected)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run reaches expected state");
+    }
+
     /// The RESOLVED (`fake-b`, `model-b`) selection command with a stable
     /// receipt identity.
     fn select_command(&self, command_id: &str) -> SessionSelectModelCommand {
@@ -377,6 +458,168 @@ fn text_turn(text: &str) -> Vec<FakeStep> {
             reason: FinishReason::EndTurn,
         },
     ]
+}
+
+/// LAW: an authentication wall with no within-provider alternate commits the
+/// exact receipted pair-selection transaction, surfaces both the cold epoch
+/// and human-readable hop reason, and finishes the SAME run on provider B.
+///
+/// MUTATION CHECK: return the original Stop, store-direct the metadata edit,
+/// omit either extension, or defer provider B until the next turn. Expected
+/// failure: the run/receipt/fact/request assertions below fail independently.
+#[tokio::test]
+async fn fallback_chain_switch_is_durable_visible_and_finishes_the_same_turn() {
+    let fake_a = Arc::new(FakeProvider::new(vec![FakeStep::Error {
+        kind: haider_provider::ProviderErrorKind::Authentication,
+        message: "provider A auth wall".into(),
+        retry_after_ms: None,
+    }]));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("same turn answer from b")));
+    let world = PairSwitchWorld::boot_with_fallback(
+        "fallback-runtime",
+        fake_a.clone(),
+        fake_b.clone(),
+        true,
+    )
+    .await;
+
+    let run_id = world
+        .run_turn("fallback-runtime-turn", "survive provider A")
+        .await;
+    assert_eq!(fake_a.requests().len(), 1);
+    assert_eq!(fake_b.requests().len(), 1, "same run continues on B");
+    assert_eq!(fake_b.requests()[0].model, "model-b");
+
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata read")
+        .expect("typed metadata");
+    assert_eq!(
+        (metadata.provider.as_str(), metadata.model.as_str()),
+        ("fake-b", "model-b")
+    );
+
+    let request_json = serde_json::json!({
+        "automatic": true,
+        "session_id": world.session_id,
+        "run_id": run_id,
+        "worker_generation": world.store.worker_generation(),
+        "from_provider": "fake-a",
+        "from_model": "model-a",
+        "provider": "fake-b",
+        "model": "model-b",
+        "cause": "fallback_chain",
+    })
+    .to_string();
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    let command_id = format!(
+        "automatic-pair-switch-{}",
+        request_digest.get(..24).expect("digest prefix")
+    );
+    let receipt = world
+        .store
+        .session_select_model_receipt(command_id, request_digest, request_json)
+        .await
+        .expect("receipt lookup")
+        .expect("automatic selection receipt");
+    assert_eq!(
+        (receipt.provider.as_str(), receipt.model.as_str()),
+        ("fake-b", "model-b")
+    );
+
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal");
+    assert!(events.iter().any(|event| {
+        ModelSelected::from_payload_value(&event.payload)
+            .is_some_and(|fact| fact.provider == "fake-b" && fact.model == "model-b")
+    }));
+    let completed_extensions = events.iter().filter_map(|event| {
+        let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+            serde_json::from_value::<EventPayload>(event.payload.clone())
+        else {
+            return None;
+        };
+        Some(item)
+    });
+    let extensions = completed_extensions.collect::<Vec<_>>();
+    assert!(extensions.iter().any(|item| {
+        CacheEpochTransitionV1::from_extension_item(item).is_some_and(|transition| {
+            transition.reason == CacheEpochTransitionReason::ConfigurationChanged
+                && !transition.planned
+                && transition.changed_fields.contains(&"provider".to_owned())
+                && transition.changed_fields.contains(&"model".to_owned())
+        })
+    }));
+    assert!(extensions.iter().any(|item| {
+        matches!(
+            item,
+            TurnItem::Extension { kind, data }
+                if kind == "provider_pair_switch_v1"
+                    && data.get("from_provider").and_then(serde_json::Value::as_str)
+                        == Some("fake-a")
+                    && data.get("to_provider").and_then(serde_json::Value::as_str)
+                        == Some("fake-b")
+                    && data.get("why").and_then(serde_json::Value::as_str)
+                        == Some("fallback_chain")
+        )
+    }));
+
+    world.shutdown().await;
+}
+
+/// Core's trigger fence is authoritative: even a resolver willing to switch
+/// is never consulted for a request-shape failure.
+#[tokio::test]
+async fn invalid_request_never_engages_the_fallback_chain() {
+    let fake_a = Arc::new(FakeProvider::new(vec![FakeStep::Error {
+        kind: haider_provider::ProviderErrorKind::InvalidRequest,
+        message: "bad request belongs to this pair".into(),
+        retry_after_ms: None,
+    }]));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("must stay unused")));
+    let world = PairSwitchWorld::boot_with_fallback(
+        "fallback-invalid",
+        fake_a.clone(),
+        fake_b.clone(),
+        true,
+    )
+    .await;
+    let (run_id, disposition) = world
+        .submit_turn(
+            "fallback-invalid-turn",
+            "do not switch",
+            DeliveryMode::Steer,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    world.await_run_state(&run_id, RunState::Errored).await;
+    assert_eq!(fake_a.requests().len(), 1);
+    assert!(fake_b.requests().is_empty());
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata")
+        .expect("typed metadata");
+    assert_eq!(
+        (metadata.provider.as_str(), metadata.model.as_str()),
+        ("fake-a", "model-a")
+    );
+    let model_facts = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("journal")
+        .into_iter()
+        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
+        .count();
+    assert_eq!(model_facts, 0);
+    world.shutdown().await;
 }
 
 /// LAW (pair_switch_is_receipted_and_next_turn_resolves_the_new_provider):

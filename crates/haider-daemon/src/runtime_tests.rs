@@ -640,6 +640,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
                 initial_rotation: None,
                 rotation_budget_consumed: false,
                 attempt_resolver: None,
+                compaction_promotion: None,
             })
         }
     }

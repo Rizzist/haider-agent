@@ -341,6 +341,7 @@ async fn run_inner(
     // snapshot + vault, so a committed login is picked up by the NEXT
     // logical turn; `"fake"` is creatable only under an injected test
     // configuration, never on the production wire path.
+    let account_resilience = accounts_runtime.resilience.clone();
     let provider_factory: std::sync::Arc<dyn crate::worker::ProviderFactory> = match &dependencies
         .provider_factory
     {
@@ -352,7 +353,8 @@ async fn run_inner(
                     accounts_runtime.vault.clone(),
                     std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
                     broker,
-                ),
+                )
+                .with_resilience(account_resilience.clone()),
             ),
             None => std::sync::Arc::new(
                 crate::accounts::AccountsProviderFactory::new_with_management(
@@ -360,24 +362,29 @@ async fn run_inner(
                     accounts_runtime.facade.management.clone(),
                     accounts_runtime.vault.clone(),
                     std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
-                ),
+                )
+                .with_resilience(account_resilience.clone()),
             ),
         },
         crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {
             match accounts_runtime.broker.clone() {
-                Some(broker) => {
-                    std::sync::Arc::new(crate::accounts::AccountsProviderFactory::with_broker(
+                Some(broker) => std::sync::Arc::new(
+                    crate::accounts::AccountsProviderFactory::with_broker(
                         std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
                         accounts_runtime.vault.clone(),
                         std::sync::Arc::clone(builder),
                         broker,
-                    ))
-                }
-                None => std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
-                    std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
-                    accounts_runtime.vault.clone(),
-                    std::sync::Arc::clone(builder),
-                )),
+                    )
+                    .with_resilience(account_resilience.clone()),
+                ),
+                None => std::sync::Arc::new(
+                    crate::accounts::AccountsProviderFactory::new(
+                        std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                        accounts_runtime.vault.clone(),
+                        std::sync::Arc::clone(builder),
+                    )
+                    .with_resilience(account_resilience.clone()),
+                ),
             }
         }
         crate::worker::ProviderFactoryConfig::Injected { factory, .. } => {
@@ -432,6 +439,7 @@ async fn run_inner(
         actor: mut account_actor,
         vault: _,
         broker: credential_broker,
+        resilience: _,
     } = accounts_runtime;
     let oauth_coordinator = accounts_facade.oauth.clone();
     hub.install_accounts(accounts_facade)

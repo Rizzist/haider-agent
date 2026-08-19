@@ -55,9 +55,10 @@ use haider_core::{
     DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
     GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
-    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, RequestInputCheckpoint,
-    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, ProviderPairSwitch,
+    ProviderPairSwitchCommitter, RequestInputCheckpoint, SessionSelectModelCommand,
+    SessionSelectModelOutcome, StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn,
+    SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
     context_soft_threshold_tokens, estimate_provider_request_input_tokens,
     presentation_for_haider_error, sanitized_failure_message,
 };
@@ -149,6 +150,9 @@ pub struct ResolvedTurnProvider {
     pub rotation_budget_consumed: bool,
     /// Daemon-owned live credential resolver for this logical turn.
     pub attempt_resolver: Option<Arc<dyn haider_core::ProviderAttemptResolver>>,
+    /// Optional pre-resolved, strictly larger same-provider lane for the
+    /// compaction runaway guard.
+    pub compaction_promotion: Option<haider_core::ProviderPairSwitchTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +233,64 @@ pub(crate) trait WebSearchExecutor: Send + Sync {
 pub(crate) struct WebSearchFailure {
     pub(crate) message: String,
     pub(crate) degraded: bool,
+}
+
+/// Bridges core's automatic mid-turn lane switch to the exact actor-owned,
+/// receipted transaction used by the public `session.select_model` RPC.
+struct DaemonProviderPairSwitchCommitter {
+    store: HubStoreHandle,
+    device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+}
+
+impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonProviderPairSwitchCommitter")
+            .field("session_id", self.store.session_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+        let request_json = serde_json::json!({
+            "automatic": true,
+            "session_id": self.store.session_id(),
+            "run_id": switch.run_id,
+            "worker_generation": self.store.worker_generation(),
+            "from_provider": switch.from_provider,
+            "from_model": switch.from_model,
+            "provider": switch.to_provider,
+            "model": switch.to_model,
+            "cause": switch.cause.as_str(),
+        })
+        .to_string();
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let command_id = format!(
+            "automatic-pair-switch-{}",
+            request_digest.get(..24).unwrap_or(&request_digest)
+        );
+        let command = SessionSelectModelCommand {
+            command_id,
+            request_digest,
+            request_json,
+            session_id: self.store.session_id().clone(),
+            worker_generation: self.store.worker_generation(),
+            provider: switch.to_provider.clone(),
+            model: switch.to_model.clone(),
+            event_id: self.event_ids.next(),
+            device_id: self.device_id.clone(),
+        };
+        match self.store.hub().select_session_model(command).await {
+            Ok(
+                SessionSelectModelOutcome::Committed { .. }
+                | SessionSelectModelOutcome::IdempotentReplay { .. },
+            ) => Ok(()),
+            Err(error) => Err(hub_error(error)),
+        }
+    }
 }
 
 struct DaemonContextCompactor {
@@ -4793,6 +4855,7 @@ async fn start_turn(
         provider_capabilities.vision != FeatureResolve::Unsupported;
     config.cached_input_is_subset = cached_input_is_subset_for_provider(&resolved.provider_name);
     config.context_compaction_v1 = true;
+    config.compaction_guard_v1 = true;
     config.model = resolved.model;
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
@@ -4939,6 +5002,12 @@ async fn start_turn(
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;
     config.provider_attempt_resolver = resolved.attempt_resolver;
+    config.compaction_promotion = resolved.compaction_promotion;
+    config.provider_pair_switch_committer = Some(Arc::new(DaemonProviderPairSwitchCommitter {
+        store: lease.clone(),
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+    }));
     config.supervisor_commits_cancelled = true;
     // Last uncancellable startup boundary: provider/tool resolution is done,
     // but the harness actor has not been spawned or submitted. A cancellation

@@ -58,6 +58,214 @@ fn model_source(
     source
 }
 
+fn resilience_profiles() -> Vec<ProviderProfileV1> {
+    initial_provider_profiles(
+        &std::collections::BTreeSet::from([
+            OPENAI_PROVIDER_NAME.to_owned(),
+            ANTHROPIC_PROVIDER_NAME.to_owned(),
+        ]),
+        "unused",
+    )
+}
+
+/// MUTATION CHECK: stop splitting the environment form on commas, stop
+/// preferring it to the persisted chain, or accept unknown providers/empty
+/// models. Expected runtime failure: the exact typed coordinates differ or a
+/// malformed entry succeeds.
+#[test]
+fn fallback_chain_registry_and_environment_forms_are_validated() {
+    let profiles = resilience_profiles();
+    let persisted = vec!["anthropic/claude-opus-test".to_owned(), "openai".to_owned()];
+    assert_eq!(
+        resolve_fallback_chain(&persisted, None, &profiles).expect("registry chain"),
+        vec![
+            ProviderTargetV1 {
+                provider: "anthropic".to_owned(),
+                model: Some("claude-opus-test".to_owned()),
+            },
+            ProviderTargetV1 {
+                provider: "openai".to_owned(),
+                model: None,
+            },
+        ]
+    );
+    assert_eq!(
+        resolve_fallback_chain(&persisted, Some(" openai/gpt-test , anthropic "), &profiles,)
+            .expect("environment override"),
+        vec![
+            ProviderTargetV1 {
+                provider: "openai".to_owned(),
+                model: Some("gpt-test".to_owned()),
+            },
+            ProviderTargetV1 {
+                provider: "anthropic".to_owned(),
+                model: None,
+            },
+        ],
+        "the environment replaces rather than appends to the durable chain"
+    );
+    assert!(
+        resolve_fallback_chain(&persisted, Some("unknown/model"), &profiles)
+            .expect_err("unknown provider must be refused")
+            .message
+            .contains("not registered")
+    );
+    assert!(
+        resolve_fallback_chain(&persisted, Some("openai/"), &profiles)
+            .expect_err("empty model must be refused")
+            .message
+            .contains("empty model")
+    );
+    assert!(
+        resolve_fallback_chain(&persisted, Some("openai,,anthropic"), &profiles)
+            .expect_err("empty entry must be refused")
+            .message
+            .contains("must not be empty")
+    );
+    assert!(
+        resolve_fallback_chain(&persisted, Some(""), &profiles)
+            .expect("an explicitly empty override disables fallback")
+            .is_empty()
+    );
+}
+
+/// The new object document is backward-compatible with legacy profile arrays,
+/// and every ordinary profile save preserves its top-level fallback chain.
+#[test]
+fn json_registry_loads_and_preserves_top_level_fallback_chain() {
+    let dir = tempfile::tempdir().expect("temporary provider registry");
+    let path = dir.path().join(PROVIDERS_FILE_NAME);
+    let profiles = resilience_profiles();
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "providers": profiles,
+            "fallback_chain": ["openai/gpt-test", "anthropic"]
+        }))
+        .expect("registry JSON"),
+    )
+    .expect("write registry");
+    let registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        Vec::new(),
+        model_source([]),
+    )
+    .expect("object registry");
+    assert_eq!(
+        registry.fallback_chain(),
+        [
+            ProviderTargetV1 {
+                provider: "openai".to_owned(),
+                model: Some("gpt-test".to_owned()),
+            },
+            ProviderTargetV1 {
+                provider: "anthropic".to_owned(),
+                model: None,
+            },
+        ]
+    );
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read rewritten registry"))
+            .expect("rewritten JSON");
+    assert_eq!(
+        rewritten["fallback_chain"],
+        serde_json::json!(["openai/gpt-test", "anthropic"])
+    );
+
+    let legacy_dir = tempfile::tempdir().expect("legacy registry");
+    std::fs::write(
+        legacy_dir.path().join(PROVIDERS_FILE_NAME),
+        serde_json::to_vec(&resilience_profiles()).expect("legacy JSON"),
+    )
+    .expect("write legacy registry");
+    let legacy = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(legacy_dir.path()),
+        Vec::new(),
+        model_source([]),
+    )
+    .expect("legacy array remains readable");
+    assert!(legacy.fallback_chain().is_empty());
+}
+
+/// MUTATION CHECK: allow an explicit promotion provider to apply to another
+/// current lane, or ignore the per-provider durable model. Expected runtime
+/// failure: the cross-provider lookup succeeds or the local lookup is empty.
+#[test]
+fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
+    let mut profiles = resilience_profiles();
+    profiles
+        .iter_mut()
+        .find(|profile| profile.provider_id == "openai")
+        .expect("openai profile")
+        .promotion_model = Some("gpt-large".to_owned());
+    let registry = ProviderRegistry {
+        store: MemoryProviderStore::default(),
+        profiles: profiles.clone(),
+        model_source: model_source([]),
+        resilience: ProviderResilienceConfigV1 {
+            fallback_chain: Vec::new(),
+            promotion_models: std::collections::HashMap::from([(
+                "openai".to_owned(),
+                "gpt-large".to_owned(),
+            )]),
+            compaction_promotion_override: None,
+        },
+    };
+    assert_eq!(
+        registry.compaction_promotion("openai"),
+        Some(ProviderTargetV1 {
+            provider: "openai".to_owned(),
+            model: Some("gpt-large".to_owned()),
+        })
+    );
+    assert_eq!(registry.compaction_promotion("anthropic"), None);
+
+    let explicit = ProviderRegistry {
+        store: MemoryProviderStore::default(),
+        profiles: profiles.clone(),
+        model_source: model_source([]),
+        resilience: ProviderResilienceConfigV1 {
+            fallback_chain: Vec::new(),
+            promotion_models: std::collections::HashMap::new(),
+            compaction_promotion_override: Some(
+                parse_promotion_override("openai/gpt-env-large", &profiles)
+                    .expect("explicit override"),
+            ),
+        },
+    };
+    assert_eq!(explicit.compaction_promotion("anthropic"), None);
+    assert_eq!(
+        explicit.compaction_promotion("openai"),
+        Some(ProviderTargetV1 {
+            provider: "openai".to_owned(),
+            model: Some("gpt-env-large".to_owned()),
+        })
+    );
+
+    let relative = ProviderRegistry {
+        store: MemoryProviderStore::default(),
+        profiles: profiles.clone(),
+        model_source: model_source([]),
+        resilience: ProviderResilienceConfigV1 {
+            fallback_chain: Vec::new(),
+            promotion_models: std::collections::HashMap::new(),
+            compaction_promotion_override: Some(
+                parse_promotion_override("larger-current-model", &profiles)
+                    .expect("relative override"),
+            ),
+        },
+    };
+    assert_eq!(
+        relative.compaction_promotion("anthropic"),
+        Some(ProviderTargetV1 {
+            provider: "anthropic".to_owned(),
+            model: Some("larger-current-model".to_owned()),
+        })
+    );
+    assert!(parse_promotion_override("unknown/model", &profiles).is_err());
+    assert!(parse_promotion_override("openai/", &profiles).is_err());
+}
+
 /// MUTATION CHECK (review of record, W5c.2b): weaken the availability
 /// derivation to `profile.enabled` alone (drop the
 /// `api_family != Unknown` conjunct). Expected runtime failure: the enabled
@@ -81,6 +289,7 @@ fn enabled_profile_with_unknown_api_family_is_never_available() {
             auth_requirement: ProviderAuthRequirementWire::Unknown,
             configured_models: vec!["future-model".to_owned()],
             default_model: Some("future-model".to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::Custom,
         }])
         .expect("seed store");
@@ -256,6 +465,7 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: vec!["literal-guess".to_owned()],
             default_model: Some("frontier-a".to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::Custom,
         }])
         .expect("seed store");
@@ -296,6 +506,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: Vec::new(),
             default_model: Some("frontier-a".to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::Custom,
         }])
         .expect("seed store");
@@ -830,6 +1041,7 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
         auth_requirement: ProviderAuthRequirementWire::ApiKey,
         configured_models: vec!["my-gpt-deployment".to_owned()],
         default_model: Some("my-gpt-deployment".to_owned()),
+        promotion_model: None,
         provenance: ProviderProvenance::Custom,
     };
     let store = MemoryProviderStore::default();

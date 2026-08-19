@@ -84,6 +84,7 @@ impl ProviderFactory for FakeFactory {
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: None,
+            compaction_promotion: None,
         })
     }
 }
@@ -133,6 +134,7 @@ impl ProviderFactory for DurableEntryFactory {
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: None,
+            compaction_promotion: None,
         })
     }
 }
@@ -2223,6 +2225,7 @@ impl ProviderFactory for BlockingProviderFactory {
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: None,
+            compaction_promotion: None,
         })
     }
 }
@@ -3814,6 +3817,7 @@ impl ProviderFactory for PanicOnceFactory {
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: None,
+            compaction_promotion: None,
         })
     }
 }

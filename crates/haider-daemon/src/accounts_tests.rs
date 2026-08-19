@@ -491,6 +491,131 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     );
 }
 
+/// MUTATION CHECK: skip the active-credential proof, accept an equal/smaller
+/// target window, or forget to build the promotion lane. Expected runtime
+/// failure: an unusable target resolves or the valid larger target disappears.
+#[tokio::test]
+async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_provider_lane() {
+    let provider = "promotion-fixture";
+    let alias = CredentialAlias::new("promotion-fixture-key");
+    let summary = ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
+        models: vec!["model-small".to_owned(), "model-large".to_owned()],
+        model_details: vec![
+            ModelDetailWire {
+                name: "model-small".to_owned(),
+                context_window: Some(32_000),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
+            },
+            ModelDetailWire {
+                name: "model-large".to_owned(),
+                context_window: Some(128_000),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
+            },
+        ],
+        auth_methods: vec![AuthMethod::ApiKey],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("model-small".to_owned()),
+        enabled: true,
+    };
+    let metadata = haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/compaction-promotion".to_owned(),
+        provider: provider.to_owned(),
+        model: "model-small".to_owned(),
+        max_tokens: 64,
+        permission_overrides: None,
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        created_at_ms: 1,
+    };
+    let resilience = |model: &str| AccountsResilienceConfig {
+        fallback_chain: Vec::new(),
+        promotion_targets: HashMap::from([(
+            provider.to_owned(),
+            ProviderTargetV1 {
+                provider: provider.to_owned(),
+                model: Some(model.to_owned()),
+            },
+        )]),
+    };
+
+    let unsigned = AccountsProviderFactory::new_with_management(
+        Arc::new(StdMutex::new(Vec::new())),
+        ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]),
+        VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    )
+    .with_resilience(resilience("model-large"));
+    assert!(
+        unsigned
+            .resolve_compaction_promotion(&metadata)
+            .await
+            .is_none()
+    );
+
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: provider.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "promotion fixture".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let vault = Arc::new(MemoryVault::default());
+    vault.put(&alias, b"promotion-secret").expect("seed key");
+    let signed = AccountsProviderFactory::new_with_management(
+        Arc::new(StdMutex::new(vec![descriptor.clone()])),
+        ManagementSnapshot::new(0, vec![descriptor], vec![summary]),
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    );
+    let promoted = signed
+        .clone()
+        .with_resilience(resilience("model-large"))
+        .resolve_compaction_promotion(&metadata)
+        .await
+        .expect("signed larger promotion");
+    assert_eq!(promoted.provider_name, provider);
+    assert_eq!(promoted.model, "model-large");
+    assert_eq!(promoted.context_window, Some(128_000));
+    assert_eq!(promoted.account, alias);
+    assert_eq!(
+        promoted.cause,
+        haider_core::ProviderPairSwitchCause::CompactionGuard
+    );
+
+    assert!(
+        signed
+            .clone()
+            .with_resilience(resilience("model-small"))
+            .resolve_compaction_promotion(&metadata)
+            .await
+            .is_none(),
+        "the current/equal-window model is not a promotion"
+    );
+    assert!(
+        signed
+            .with_resilience(resilience("model-with-unknown-window"))
+            .resolve_compaction_promotion(&metadata)
+            .await
+            .is_none(),
+        "unknown catalog windows cannot prove a larger promotion"
+    );
+}
+
 fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
     ProviderSummaryWire {
         provider: provider.to_owned(),
@@ -1129,6 +1254,139 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     assert!(broker.shutdown().await);
     actor.shutdown().await;
     store.close().await.expect("close");
+}
+
+fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlias) {
+    let current = CredentialAlias::new("fallback-anthropic");
+    let target = CredentialAlias::new("fallback-openai");
+    let descriptors = vec![
+        CredentialDescriptor {
+            alias: current.clone(),
+            provider: ANTHROPIC_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "fallback current".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+        CredentialDescriptor {
+            alias: target.clone(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "fallback target".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+    ];
+    let snapshot = Arc::new(StdMutex::new(descriptors));
+    let vault = Arc::new(MemoryVault::default());
+    vault
+        .put(&current, b"fallback-anthropic-secret")
+        .expect("current secret");
+    vault
+        .put(&target, b"fallback-openai-secret")
+        .expect("target secret");
+    let factory = AccountsProviderFactory::new(
+        snapshot,
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    )
+    .with_resilience(AccountsResilienceConfig {
+        fallback_chain: vec![
+            ProviderTargetV1 {
+                provider: ANTHROPIC_PROVIDER_NAME.into(),
+                model: Some("claude-test".into()),
+            },
+            // No signed-in credential: traversal must skip this entry.
+            ProviderTargetV1 {
+                provider: GEMINI_PROVIDER_NAME.into(),
+                model: Some("gemini-test".into()),
+            },
+            ProviderTargetV1 {
+                provider: OPENAI_PROVIDER_NAME.into(),
+                model: Some("gpt-test".into()),
+            },
+        ],
+        promotion_targets: HashMap::new(),
+    });
+    let metadata = haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/fallback-chain".into(),
+        provider: ANTHROPIC_PROVIDER_NAME.into(),
+        // The current provider, not an exact optional model entry, anchors
+        // traversal. Manual model selection must not disable the chain.
+        model: "claude-manual-selection".into(),
+        max_tokens: 64,
+        permission_overrides: None,
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        created_at_ms: 1,
+    };
+    (
+        AccountsAttemptResolver::new(factory, metadata, ProviderTuning::default(), None),
+        current,
+    )
+}
+
+/// MUTATION CHECK: include entries before the current provider, wrap at the
+/// end, or stop at the first credentialless entry. Expected failure: the
+/// selected pair/cursor assertions change.
+#[tokio::test]
+async fn fallback_chain_is_one_pass_no_wrap_and_skips_missing_credentials() {
+    let (resolver, current) = fallback_chain_resolver_fixture();
+    let quota = haider_provider::ProviderError::new(
+        ProviderErrorKind::QuotaExhausted,
+        "current provider quota wall",
+    );
+    let decision = resolver
+        .resolve_fallback(&current, &quota)
+        .await
+        .expect("fallback resolution");
+    let haider_core::ProviderAttemptDecision::Switch(target) = decision else {
+        panic!("quota wall must select the next credentialed provider")
+    };
+    assert_eq!(target.provider_name, OPENAI_PROVIDER_NAME);
+    assert_eq!(target.model, "gpt-test");
+    assert_eq!(target.account.as_str(), "fallback-openai");
+    assert_eq!(
+        target.provider.capabilities().await.provider,
+        OPENAI_PROVIDER_NAME
+    );
+
+    let next = target
+        .attempt_resolver
+        .expect("switched lane carries its forward-only cursor")
+        .resolve_fallback(&target.account, &quota)
+        .await
+        .expect("terminal traversal");
+    assert!(matches!(next, haider_core::ProviderAttemptDecision::Stop));
+}
+
+/// MUTATION CHECK: broaden cross-provider fallback to request/context or
+/// permission failures. Expected failure: one of these returns `Switch`.
+#[tokio::test]
+async fn fallback_chain_refuses_non_health_provider_failures() {
+    let (resolver, current) = fallback_chain_resolver_fixture();
+    for kind in [
+        ProviderErrorKind::InvalidRequest,
+        ProviderErrorKind::ContextExceeded,
+        ProviderErrorKind::PermissionDenied,
+    ] {
+        let decision = resolver
+            .resolve_fallback(
+                &current,
+                &haider_provider::ProviderError::new(kind, "not a provider-health wall"),
+            )
+            .await
+            .expect("non-health resolution");
+        assert!(matches!(
+            decision,
+            haider_core::ProviderAttemptDecision::Stop
+        ));
+    }
 }
 
 /// MUTATION CHECK (W5c.1 resolver-backed factory): bypass
@@ -4251,6 +4509,7 @@ fn endpoint_edit_profile(provider: &str, origin: &str) -> ProviderProfileV1 {
         auth_requirement: ProviderAuthRequirementWire::ApiKey,
         configured_models: vec!["model-a".to_owned()],
         default_model: Some("model-a".to_owned()),
+        promotion_model: None,
         provenance: ProviderProvenance::Custom,
     }
 }
@@ -4897,6 +5156,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
                 "frontier-legacy-b".to_owned(),
             ],
             default_model: Some("frontier-legacy-a".to_owned()),
+            promotion_model: None,
             provenance: crate::provider_registry::ProviderProvenance::Custom,
         },
         ProviderProfileV1 {
@@ -4908,6 +5168,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: vec!["frontier-legacy-old".to_owned()],
             default_model: Some("frontier-legacy-old".to_owned()),
+            promotion_model: None,
             provenance: crate::provider_registry::ProviderProvenance::Custom,
         },
     ];
@@ -5217,6 +5478,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: vec!["seed-key".to_owned()],
             default_model: Some("seed-key".to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::Custom,
         },
         ProviderProfileV1 {
@@ -5228,6 +5490,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             auth_requirement: ProviderAuthRequirementWire::None,
             configured_models: vec!["seed-none".to_owned()],
             default_model: Some("seed-none".to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::Custom,
         },
         ProviderProfileV1 {
@@ -5239,6 +5502,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: Vec::new(),
             default_model: None,
+            promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
         },
     ];
@@ -7745,6 +8009,7 @@ fn removable_provider_profile(provider: &str) -> ProviderProfileV1 {
         auth_requirement: ProviderAuthRequirementWire::ApiKey,
         configured_models: vec!["custom-model".to_owned()],
         default_model: Some("custom-model".to_owned()),
+        promotion_model: None,
         provenance: ProviderProvenance::Custom,
     }
 }

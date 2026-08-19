@@ -226,6 +226,12 @@ pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
 pub const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 /// Daemon implements durable idle-only context compaction.
 pub const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
+/// Daemon can durably continue a failing turn on the next configured
+/// provider/model lane after the current provider exhausts its accounts.
+pub const FEATURE_FALLBACK_CHAIN_V1: &str = "fallback_chain_v1";
+/// Daemon guards against ineffective repeated compaction and can durably
+/// promote the session to a configured larger-context model.
+pub const FEATURE_COMPACTION_GUARD_V1: &str = "compaction_guard_v1";
 /// Daemon implements the durable `account.login_api` command (R7/R10).
 pub const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 /// Daemon implements connection-scoped `vault.stage` secret staging (R7).

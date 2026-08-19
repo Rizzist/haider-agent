@@ -26,6 +26,8 @@ use haider_rpc::{
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PROVIDERS_FILE_NAME: &str = "providers.json";
+pub(crate) const FALLBACK_CHAIN_ENV: &str = "HAIDER_FALLBACK_CHAIN";
+pub(crate) const COMPACTION_PROMOTION_ENV: &str = "HAIDER_COMPACTION_PROMOTION";
 
 #[async_trait::async_trait]
 pub trait ProviderEndpointValidator: Send + Sync {
@@ -73,11 +75,101 @@ pub(crate) struct ProviderProfileV1 {
     #[serde(default)]
     pub configured_models: Vec<String>,
     pub default_model: Option<String>,
+    /// Optional larger-context model on this provider. Runtime promotion
+    /// still verifies the discovered context window before selecting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_model: Option<String>,
     pub provenance: ProviderProvenance,
+}
+
+/// One validated provider/model coordinate from the profile's resilience
+/// configuration. A fallback entry may omit `model`; promotion targets never
+/// do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderTargetV1 {
+    pub provider: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromotionOverrideV1 {
+    provider: Option<String>,
+    model: String,
+}
+
+/// Immutable, startup-resolved resilience settings. This is deliberately
+/// cloneable so the provider factory can retain the same parsed snapshot after
+/// the mutable registry moves into the account actor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProviderResilienceConfigV1 {
+    fallback_chain: Vec<ProviderTargetV1>,
+    promotion_models: HashMap<String, String>,
+    compaction_promotion_override: Option<PromotionOverrideV1>,
+}
+
+impl ProviderResilienceConfigV1 {
+    pub(crate) fn fallback_chain(&self) -> &[ProviderTargetV1] {
+        &self.fallback_chain
+    }
+
+    pub(crate) fn compaction_promotion(&self, current_provider: &str) -> Option<ProviderTargetV1> {
+        if let Some(target) = &self.compaction_promotion_override {
+            if target
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider != current_provider)
+            {
+                return None;
+            }
+            return Some(ProviderTargetV1 {
+                provider: current_provider.to_owned(),
+                model: Some(target.model.clone()),
+            });
+        }
+        self.promotion_models
+            .get(current_provider)
+            .map(|model| ProviderTargetV1 {
+                provider: current_provider.to_owned(),
+                model: Some(model.clone()),
+            })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProviderRegistryDocumentV1 {
+    #[serde(default, alias = "profiles")]
+    providers: Vec<ProviderProfileV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fallback_chain: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum ProviderRegistryFileV1 {
+    Legacy(Vec<ProviderProfileV1>),
+    Document(ProviderRegistryDocumentV1),
+}
+
+impl ProviderRegistryFileV1 {
+    fn into_document(self) -> ProviderRegistryDocumentV1 {
+        match self {
+            Self::Legacy(providers) => ProviderRegistryDocumentV1 {
+                providers,
+                fallback_chain: Vec::new(),
+            },
+            Self::Document(document) => document,
+        }
+    }
 }
 
 pub(crate) trait ProviderRegistryStoreLike: Send + Sync {
     fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError>;
+    fn load_document(&self) -> Result<ProviderRegistryDocumentV1, HaiderError> {
+        self.load().map(|providers| ProviderRegistryDocumentV1 {
+            providers,
+            fallback_chain: Vec::new(),
+        })
+    }
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError>;
 }
 
@@ -92,25 +184,37 @@ impl JsonProviderRegistryStore {
             path: profile_dir.as_ref().join(PROVIDERS_FILE_NAME),
         }
     }
+
+    fn read_document(&self) -> Result<ProviderRegistryDocumentV1, HaiderError> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ProviderRegistryDocumentV1::default());
+            }
+            Err(error) => return Err(file_error("read", &self.path, error)),
+        };
+        serde_json::from_slice::<ProviderRegistryFileV1>(&bytes)
+            .map(ProviderRegistryFileV1::into_document)
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "provider registry `{}` is not valid JSON: {error}",
+                        self.path.display()
+                    ),
+                    false,
+                )
+            })
+    }
 }
 
 impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
     fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(file_error("read", &self.path, error)),
-        };
-        serde_json::from_slice(&bytes).map_err(|error| {
-            HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                format!(
-                    "provider registry `{}` is not valid JSON: {error}",
-                    self.path.display()
-                ),
-                false,
-            )
-        })
+        self.read_document().map(|document| document.providers)
+    }
+
+    fn load_document(&self) -> Result<ProviderRegistryDocumentV1, HaiderError> {
+        self.read_document()
     }
 
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
@@ -123,7 +227,14 @@ impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
         })?;
         fs::create_dir_all(parent)
             .map_err(|error| file_error("create parent directory for", &self.path, error))?;
-        let bytes = serde_json::to_vec_pretty(profiles).map_err(|error| {
+        // Provider management mutates only the provider rows. Preserve the
+        // profile-level resilience configuration across every such write.
+        let fallback_chain = self.read_document()?.fallback_chain;
+        let document = ProviderRegistryDocumentV1 {
+            providers: profiles.to_vec(),
+            fallback_chain,
+        };
+        let bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
             HaiderError::new(
                 ErrorCode::Internal,
                 format!("could not serialize provider registry: {error}"),
@@ -154,6 +265,10 @@ impl ProviderRegistryStoreLike for Arc<dyn ProviderRegistryStoreLike> {
         self.as_ref().load()
     }
 
+    fn load_document(&self) -> Result<ProviderRegistryDocumentV1, HaiderError> {
+        self.as_ref().load_document()
+    }
+
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
         self.as_ref().save(profiles)
     }
@@ -162,6 +277,10 @@ impl ProviderRegistryStoreLike for Arc<dyn ProviderRegistryStoreLike> {
 impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
     fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
         self.as_ref().load()
+    }
+
+    fn load_document(&self) -> Result<ProviderRegistryDocumentV1, HaiderError> {
+        self.as_ref().load_document()
     }
 
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
@@ -209,10 +328,12 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct ProviderRegistry<S> {
     store: S,
     profiles: Vec<ProviderProfileV1>,
     model_source: Arc<dyn ProviderModelSourceLike>,
+    resilience: ProviderResilienceConfigV1,
 }
 
 impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
@@ -221,11 +342,15 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         initial: Vec<ProviderProfileV1>,
         model_source: Arc<dyn ProviderModelSourceLike>,
     ) -> Result<Self, HaiderError> {
-        let mut profiles = store.load()?;
+        // Environment overrides are captured exactly once for this registry
+        // instance. Long-running turns never reread mutable process state.
+        let fallback_chain_override = read_env_override(FALLBACK_CHAIN_ENV)?;
+        let compaction_promotion_override = read_env_override(COMPACTION_PROMOTION_ENV)?;
+        let document = store.load_document()?;
+        let mut profiles = document.providers;
         if profiles.is_empty() {
             profiles = initial;
             validate_profiles(&profiles)?;
-            store.save(&profiles)?;
         } else {
             validate_profiles(&profiles)?;
             for profile in initial {
@@ -237,12 +362,38 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 }
             }
             validate_profiles(&profiles)?;
-            store.save(&profiles)?;
         }
+        let fallback_chain = resolve_fallback_chain(
+            &document.fallback_chain,
+            fallback_chain_override.as_deref(),
+            &profiles,
+        )?;
+        let compaction_promotion_override = compaction_promotion_override
+            .as_deref()
+            .map(|value| parse_promotion_override(value, &profiles))
+            .transpose()?;
+        let promotion_models = profiles
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .promotion_model
+                    .as_ref()
+                    .map(|model| (profile.provider_id.clone(), model.clone()))
+            })
+            .collect();
+        let resilience = ProviderResilienceConfigV1 {
+            fallback_chain,
+            promotion_models,
+            compaction_promotion_override,
+        };
+        // Refuse invalid resilience configuration before rewriting the
+        // registry projection during bootstrap/profile reconciliation.
+        store.save(&profiles)?;
         Ok(Self {
             store,
             profiles,
             model_source,
+            resilience,
         })
     }
 
@@ -250,6 +401,22 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         self.profiles
             .iter()
             .find(|profile| profile.provider_id == provider)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn fallback_chain(&self) -> &[ProviderTargetV1] {
+        self.resilience.fallback_chain()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn compaction_promotion(&self, current_provider: &str) -> Option<ProviderTargetV1> {
+        self.resilience.compaction_promotion(current_provider)
+    }
+
+    /// A frozen startup snapshot suitable for provider-factory construction.
+    #[allow(dead_code)]
+    pub(crate) fn resilience_config(&self) -> ProviderResilienceConfigV1 {
+        self.resilience.clone()
     }
 
     /// Projects every profile into its wire summary. `has_credential`
@@ -432,6 +599,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 auth_requirement,
                 configured_models,
                 default_model,
+                promotion_model: None,
                 provenance: ProviderProvenance::Custom,
             };
             next.push(profile.clone());
@@ -821,6 +989,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
                 .map(|slug| (*slug).to_owned())
                 .collect(),
             default_model: Some(BEDROCK_SEED_MODELS[0].to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
         };
     }
@@ -837,6 +1006,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
                 .map(|slug| (*slug).to_owned())
                 .collect(),
             default_model: Some(VERTEX_SEED_MODELS[0].to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
         };
     }
@@ -853,6 +1023,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
                 .map(|slug| (*slug).to_owned())
                 .collect(),
             default_model: Some(DEEPSEEK_SEED_MODELS[0].to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
         };
     }
@@ -869,6 +1040,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
                 .map(|slug| (*slug).to_owned())
                 .collect(),
             default_model: Some(XAI_SEED_MODELS[0].to_owned()),
+            promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
         };
     }
@@ -952,6 +1124,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
         auth_requirement,
         configured_models: Vec::new(),
         default_model: None,
+        promotion_model: None,
         provenance,
     }
 }
@@ -1047,6 +1220,122 @@ fn validated_default(
     Ok(default_model)
 }
 
+fn read_env_override(name: &str) -> Result<Option<String>, HaiderError> {
+    std::env::var_os(name)
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                invalid(format!(
+                    "environment override `{name}` must contain valid UTF-8"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn parse_fallback_chain(
+    raw_entries: &[String],
+    comma_separated: bool,
+    profiles: &[ProviderProfileV1],
+) -> Result<Vec<ProviderTargetV1>, HaiderError> {
+    let entries = if comma_separated {
+        let raw = raw_entries.first().map_or("", String::as_str);
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        raw.split(',').collect::<Vec<_>>()
+    } else {
+        raw_entries.iter().map(String::as_str).collect::<Vec<_>>()
+    };
+    entries
+        .into_iter()
+        .map(|entry| parse_fallback_target(entry, profiles))
+        .collect()
+}
+
+fn resolve_fallback_chain(
+    persisted: &[String],
+    environment: Option<&str>,
+    profiles: &[ProviderProfileV1],
+) -> Result<Vec<ProviderTargetV1>, HaiderError> {
+    match environment {
+        Some(value) => parse_fallback_chain(&[value.to_owned()], true, profiles),
+        None => parse_fallback_chain(persisted, false, profiles),
+    }
+}
+
+fn parse_fallback_target(
+    entry: &str,
+    profiles: &[ProviderProfileV1],
+) -> Result<ProviderTargetV1, HaiderError> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err(invalid("fallback chain entries must not be empty"));
+    }
+    let (provider, model) = match entry.split_once('/') {
+        Some((provider, model)) => {
+            let model = model.trim();
+            if model.is_empty() {
+                return Err(invalid(format!(
+                    "fallback chain entry `{entry}` has an empty model"
+                )));
+            }
+            (provider.trim(), Some(model.to_owned()))
+        }
+        None => (entry, None),
+    };
+    require_known_provider(provider, profiles, "fallback chain")?;
+    Ok(ProviderTargetV1 {
+        provider: provider.to_owned(),
+        model,
+    })
+}
+
+fn parse_promotion_override(
+    value: &str,
+    profiles: &[ProviderProfileV1],
+) -> Result<PromotionOverrideV1, HaiderError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(invalid(format!(
+            "environment override `{COMPACTION_PROMOTION_ENV}` must name a model"
+        )));
+    }
+    let (provider, model) = match value.split_once('/') {
+        Some((provider, model)) => {
+            let provider = provider.trim();
+            require_known_provider(provider, profiles, "compaction promotion")?;
+            (Some(provider.to_owned()), model.trim())
+        }
+        None => (None, value),
+    };
+    if model.is_empty() {
+        return Err(invalid(format!(
+            "environment override `{COMPACTION_PROMOTION_ENV}` has an empty model"
+        )));
+    }
+    Ok(PromotionOverrideV1 {
+        provider,
+        model: model.to_owned(),
+    })
+}
+
+fn require_known_provider(
+    provider: &str,
+    profiles: &[ProviderProfileV1],
+    setting: &str,
+) -> Result<(), HaiderError> {
+    if profiles
+        .iter()
+        .any(|profile| profile.provider_id == provider)
+    {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "{setting} provider `{provider}` is not registered"
+        )))
+    }
+}
+
 fn validate_profiles(profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
     let mut ids = std::collections::HashSet::new();
     for profile in profiles {
@@ -1060,6 +1349,16 @@ fn validate_profiles(profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> 
                 ),
                 false,
             ));
+        }
+        if profile
+            .promotion_model
+            .as_deref()
+            .is_some_and(|model| model.is_empty() || model.trim() != model)
+        {
+            return Err(invalid(format!(
+                "provider `{}` promotion model must be non-empty and trimmed",
+                profile.provider_id
+            )));
         }
     }
     Ok(())

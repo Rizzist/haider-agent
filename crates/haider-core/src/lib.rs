@@ -24,13 +24,15 @@ mod recovery;
 mod sqlite_store;
 
 pub use actor::{
-    CancelToken, ChildWaitCheckpoint, ContextCompactor, DeferredTicket, DeferredToolCheckpoint,
-    DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
-    HarnessActor, HarnessConfig, HarnessHandle, PartialStreamCheckpoint, ProviderAttemptDecision,
-    ProviderAttemptResolver, RealRetrySleeper, RequestInputCheckpoint, ResolvedProviderAttempt,
-    RetrySleeper, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    SubmitPartialStreamTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    TurnOutcome, VISION_IMAGE_ESTIMATE_TOKENS, context_soft_threshold_tokens,
+    COMPACTION_MIN_FREED_PERCENT, CancelToken, ChildWaitCheckpoint, ContextCompactor,
+    DeferredTicket, DeferredToolCheckpoint, DeferredToolResult, EventIdGenerator,
+    FinalizationGuard, FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle,
+    PartialStreamCheckpoint, ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch,
+    ProviderPairSwitchCause, ProviderPairSwitchCommitter, ProviderPairSwitchTarget,
+    RealRetrySleeper, RequestInputCheckpoint, ResolvedProviderAttempt, RetrySleeper,
+    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
+    SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome,
+    VISION_IMAGE_ESTIMATE_TOKENS, compaction_guard_tripped, context_soft_threshold_tokens,
     estimate_provider_request_input_tokens, presentation_for_haider_error, retry_backoff_ms,
     retry_jittered_backoff_ms, sanitized_failure_message,
 };

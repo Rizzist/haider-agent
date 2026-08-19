@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use haider_core::{
     ArtifactReader, CommittedRange, ContextCompactor, FinalizationGuard, FinalizationGuardDecision,
     HarnessActor, HarnessConfig, HarnessHandle, MemoryStore, ProviderAttemptDecision,
-    ProviderAttemptResolver, ResolvedProviderAttempt, StoreHandle, SubmitCommittedTurn, SubmitTurn,
-    ToolDispatchResult, ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS,
-    estimate_provider_request_input_tokens,
+    ProviderAttemptResolver, ProviderPairSwitch, ProviderPairSwitchCause,
+    ProviderPairSwitchCommitter, ProviderPairSwitchTarget, ResolvedProviderAttempt, StoreHandle,
+    SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
+    VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -605,6 +606,56 @@ impl ContextCompactor for ShrinkingContextCompactor {
     }
 }
 
+#[derive(Debug, Default)]
+struct IneffectiveContextCompactor {
+    calls: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct RecordingPairSwitchCommitter {
+    switches: Mutex<Vec<ProviderPairSwitch>>,
+}
+
+#[async_trait]
+impl ProviderPairSwitchCommitter for RecordingPairSwitchCommitter {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+        self.switches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(switch.clone());
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ContextCompactor for IneffectiveContextCompactor {
+    async fn plan(
+        &self,
+        _run_id: &RunId,
+        resume_cause: CompactionResume,
+    ) -> Result<CompactionIntent, HaiderError> {
+        Ok(CompactionIntent {
+            operation_id: "ineffective-test-compaction".into(),
+            covers_from: NodeId::new("old-root"),
+            covers_to: NodeId::new("old-head"),
+            resume_cause,
+        })
+    }
+
+    async fn compact(
+        &self,
+        _run_id: &RunId,
+        _intent: &CompactionIntent,
+        covered_messages: Vec<Message>,
+        _attachments: Vec<haider_provider::ResolvedAttachment>,
+        _latest_compaction_summary_end: Option<usize>,
+    ) -> Result<Message, HaiderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(covered_messages.len(), 1);
+        Ok(covered_messages.into_iter().next().expect("covered prefix"))
+    }
+}
+
 fn estimated_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
     estimate_provider_request_input_tokens(
         messages,
@@ -700,6 +751,260 @@ fn soft_threshold_honors_eighty_five_percent_and_output_reserve() {
     assert_eq!(
         haider_core::context_soft_threshold_tokens(200_000, 200_000),
         Some(0)
+    );
+}
+
+/// MUTATION CHECK: change `<` to `<=`, round the percentage before comparing,
+/// or drop the independent hard-fit arm. Expected runtime failure: one of the
+/// exact-boundary or over-budget cases changes its decision.
+#[test]
+fn compaction_guard_uses_exact_fifteen_percent_and_hard_fit_laws() {
+    assert_eq!(haider_core::COMPACTION_MIN_FREED_PERCENT, 15);
+    assert!(haider_core::compaction_guard_tripped(100, 86, 1_000));
+    assert!(!haider_core::compaction_guard_tripped(100, 85, 1_000));
+    assert!(!haider_core::compaction_guard_tripped(101, 85, 1_000));
+    assert!(haider_core::compaction_guard_tripped(101, 86, 1_000));
+    assert!(haider_core::compaction_guard_tripped(100, 50, 49));
+}
+
+/// Regression law: rolling out `compaction_guard_v1` must not weaken the v0
+/// hard-fit check. With the feature off, an oversized post-compaction request
+/// still fails before provider work.
+#[tokio::test]
+async fn feature_off_retains_post_compaction_hard_fit_error() {
+    let messages = vec![
+        Message::user_text("oversized history ".repeat(500)),
+        Message::user_text("current"),
+    ];
+    let mut bounded = config();
+    bounded.reserved_output_tokens = 1;
+    let used = estimated_input_tokens(&bounded, &messages);
+    bounded.context_window = Some(used / 2);
+    assert!(!bounded.compaction_guard_v1);
+    let compactor = Arc::new(IneffectiveContextCompactor::default());
+    bounded.context_compactor = Some(compactor.clone());
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let handle = HarnessActor::spawn(bounded, provider.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("feature-off-hard-fit"),
+            messages,
+        })
+        .await
+        .expect("hard-fit turn accepted")
+        .wait()
+        .await
+        .expect("hard-fit turn outcome");
+
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert!(provider.requests().is_empty());
+    assert!(
+        outcome
+            .error
+            .expect("hard-fit error")
+            .message
+            .contains("compacted provider input estimate")
+    );
+}
+
+/// MUTATION CHECK: omit the effectiveness arm or fall through to another
+/// request/compaction. Expected runtime failure: the provider receives a
+/// request, the turn succeeds, or the compactor is called more than once.
+#[tokio::test]
+async fn ineffective_compaction_without_promotion_errors_without_a_second_compaction() {
+    let history = Message::user_text("ineffective history ".repeat(500));
+    let messages = vec![history, Message::user_text("current")];
+    let mut bounded = config();
+    bounded.reserved_output_tokens = 1;
+    let used = estimated_input_tokens(&bounded, &messages);
+    let window = used.saturating_mul(100).saturating_add(84) / 85;
+    bounded.context_window = Some(window);
+    bounded.context_compaction_v1 = true;
+    bounded.compaction_guard_v1 = true;
+    assert!(used >= haider_core::context_soft_threshold_tokens(window, 1).expect("soft threshold"));
+    assert!(used <= window.saturating_sub(1));
+
+    let compactor = Arc::new(IneffectiveContextCompactor::default());
+    bounded.context_compactor = Some(compactor.clone());
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let handle = HarnessActor::spawn(bounded, provider.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("ineffective-compaction-guard"),
+            messages,
+        })
+        .await
+        .expect("guarded turn accepted")
+        .wait()
+        .await
+        .expect("guarded turn outcome");
+
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("honest context error");
+    assert_eq!(error.code, ErrorCode::ProviderError);
+    assert!(error.message.contains("ContextExceeded"));
+    assert!(error.message.contains("context compaction guard"));
+    assert!(error.message.contains("minimum reduction is 15%"));
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert!(provider.requests().is_empty());
+}
+
+/// MUTATION CHECK: skip the durable switch, accept a non-larger window, or
+/// keep sending on the original provider. Expected runtime failure: the
+/// receipt coordinates disappear or the request lands on the wrong lane.
+#[tokio::test]
+async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
+    let partial = "p".repeat(5_000);
+    let messages = vec![
+        Message::user_text("promotion history ".repeat(500)),
+        Message::user_text("current"),
+    ];
+    let mut bounded = config();
+    bounded.model = "model-small".into();
+    bounded.usage_scope.provider = "fake-a".into();
+    bounded.usage_scope.model = bounded.model.clone();
+    bounded.usage_scope.cache_epoch = "epoch-small".into();
+    bounded.usage_account = Some(CredentialAlias::new("fake-a-primary"));
+    bounded.reserved_output_tokens = 1;
+    let used = estimated_input_tokens(&bounded, &messages);
+    let window = used.saturating_mul(100).saturating_add(84) / 85;
+    let mut continued_messages = messages.clone();
+    continued_messages.push(Message::assistant(vec![Block::Text {
+        text: partial.clone(),
+    }]));
+    continued_messages.push(Message::user_text(
+        "Continue exactly where you stopped. Do not repeat completed content.",
+    ));
+    let promoted_window = estimated_input_tokens(&bounded, &continued_messages).saturating_add(1);
+    assert!(promoted_window > window);
+    bounded.context_window = Some(window);
+    bounded.context_compaction_v1 = true;
+    bounded.compaction_guard_v1 = true;
+    let compactor = Arc::new(IneffectiveContextCompactor::default());
+    bounded.context_compactor = Some(compactor.clone());
+
+    let original = Arc::new(FakeProvider::new(Vec::new()));
+    let promoted = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText { text: partial },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    bounded.compaction_promotion = Some(ProviderPairSwitchTarget {
+        provider: promoted.clone(),
+        account: CredentialAlias::new("fake-a-primary"),
+        provider_name: "fake-a".into(),
+        model: "model-large".into(),
+        context_window: Some(promoted_window),
+        cached_input_is_subset: true,
+        auth_scope: "api_key".into(),
+        attempt_resolver: None,
+        cause: ProviderPairSwitchCause::CompactionGuard,
+    });
+    let committer = Arc::new(RecordingPairSwitchCommitter::default());
+    bounded.provider_pair_switch_committer = Some(committer.clone());
+
+    let handle = HarnessActor::spawn(bounded, original.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("ineffective-compaction-promotes"),
+            messages,
+        })
+        .await
+        .expect("promotion turn accepted")
+        .wait()
+        .await
+        .expect("promotion turn outcome");
+
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert!(original.requests().is_empty());
+    let requests = promoted.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].model, "model-large");
+    assert_eq!(requests[1].model, "model-large");
+    let switches = committer
+        .switches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(switches.len(), 1);
+    assert_eq!(switches[0].from_provider, "fake-a");
+    assert_eq!(switches[0].from_model, "model-small");
+    assert_eq!(switches[0].to_provider, "fake-a");
+    assert_eq!(switches[0].to_model, "model-large");
+    assert_eq!(switches[0].cause, ProviderPairSwitchCause::CompactionGuard);
+}
+
+/// MUTATION CHECK: change the strict window ordering to `>=` or trust only
+/// the model name. Expected runtime failure: the equal-window target commits
+/// and receives provider work instead of ending with ContextExceeded.
+#[tokio::test]
+async fn compaction_promotion_refuses_a_model_without_a_larger_known_window() {
+    let messages = vec![
+        Message::user_text("non-larger history ".repeat(500)),
+        Message::user_text("current"),
+    ];
+    let mut bounded = config();
+    bounded.model = "model-small".into();
+    bounded.usage_scope.provider = "fake-a".into();
+    bounded.usage_scope.model = bounded.model.clone();
+    bounded.reserved_output_tokens = 1;
+    let used = estimated_input_tokens(&bounded, &messages);
+    let window = used.saturating_mul(100).saturating_add(84) / 85;
+    bounded.context_window = Some(window);
+    bounded.context_compaction_v1 = true;
+    bounded.compaction_guard_v1 = true;
+    let compactor = Arc::new(IneffectiveContextCompactor::default());
+    bounded.context_compactor = Some(compactor.clone());
+
+    let promoted = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    bounded.compaction_promotion = Some(ProviderPairSwitchTarget {
+        provider: promoted.clone(),
+        account: CredentialAlias::new("fake-a-primary"),
+        provider_name: "fake-a".into(),
+        model: "model-not-larger".into(),
+        context_window: Some(window),
+        cached_input_is_subset: true,
+        auth_scope: "api_key".into(),
+        attempt_resolver: None,
+        cause: ProviderPairSwitchCause::CompactionGuard,
+    });
+    let committer = Arc::new(RecordingPairSwitchCommitter::default());
+    bounded.provider_pair_switch_committer = Some(committer.clone());
+
+    let original = Arc::new(FakeProvider::new(Vec::new()));
+    let handle = HarnessActor::spawn(bounded, original.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("non-larger-promotion-refused"),
+            messages,
+        })
+        .await
+        .expect("refusal turn accepted")
+        .wait()
+        .await
+        .expect("refusal turn outcome");
+
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert!(original.requests().is_empty());
+    assert!(promoted.requests().is_empty());
+    assert!(
+        committer
+            .switches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     );
 }
 

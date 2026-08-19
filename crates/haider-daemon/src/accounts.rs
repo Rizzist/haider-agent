@@ -79,7 +79,7 @@ use crate::oauth::{
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
     ProviderConfigureInput, ProviderEndpointValidator, ProviderModelSourceLike, ProviderProvenance,
-    ProviderRegistry, ProviderRegistryStoreLike, initial_provider_profiles,
+    ProviderRegistry, ProviderRegistryStoreLike, ProviderTargetV1, initial_provider_profiles,
 };
 use crate::session_hub::FrameSink;
 
@@ -6498,6 +6498,13 @@ pub(crate) struct AccountsProviderFactory {
     builder: Arc<dyn AccountProviderBuilder>,
     broker: Option<CredentialBroker>,
     gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
+    resilience: AccountsResilienceConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AccountsResilienceConfig {
+    pub fallback_chain: Vec<ProviderTargetV1>,
+    pub promotion_targets: HashMap<String, ProviderTargetV1>,
 }
 
 struct ReadOnlySnapshotStore(Vec<CredentialDescriptor>);
@@ -6529,6 +6536,7 @@ impl AccountsProviderFactory {
             builder,
             broker: None,
             gemini_cache_registry: Arc::default(),
+            resilience: AccountsResilienceConfig::default(),
         }
     }
 
@@ -6545,6 +6553,7 @@ impl AccountsProviderFactory {
             builder,
             broker: Some(broker),
             gemini_cache_registry: Arc::default(),
+            resilience: AccountsResilienceConfig::default(),
         }
     }
 
@@ -6561,6 +6570,7 @@ impl AccountsProviderFactory {
             builder,
             broker: None,
             gemini_cache_registry: Arc::default(),
+            resilience: AccountsResilienceConfig::default(),
         }
     }
 
@@ -6578,7 +6588,13 @@ impl AccountsProviderFactory {
             builder,
             broker: Some(broker),
             gemini_cache_registry: Arc::default(),
+            resilience: AccountsResilienceConfig::default(),
         }
+    }
+
+    pub(crate) fn with_resilience(mut self, resilience: AccountsResilienceConfig) -> Self {
+        self.resilience = resilience;
+        self
     }
 
     fn provider_profile(&self, provider: &str) -> Option<ProviderSummaryWire> {
@@ -6596,6 +6612,74 @@ impl AccountsProviderFactory {
             .into_iter()
             .find(|detail| detail.name == model)
             .and_then(|detail| detail.context_window)
+    }
+
+    async fn resolve_compaction_promotion(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> Option<haider_core::ProviderPairSwitchTarget> {
+        let target = self.resilience.promotion_targets.get(&metadata.provider)?;
+        if target.provider != metadata.provider {
+            return None;
+        }
+        let model = target.model.as_ref()?.clone();
+        if model == metadata.model {
+            return None;
+        }
+        let current_window = self.model_context_window(&metadata.provider, &metadata.model)?;
+        let target_window = self.model_context_window(&target.provider, &model)?;
+        if target_window <= current_window {
+            return None;
+        }
+        let has_signed_in_credential = self.snapshot.lock().ok().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.provider == target.provider && row.active)
+        });
+        if !has_signed_in_credential {
+            return None;
+        }
+        let resolved = self.resolve_account(&target.provider, None).await.ok()?;
+        let credential = self.resolve_secret(&resolved.descriptor).await.ok()?;
+        let oauth_access_fingerprint = (matches!(
+            resolved.descriptor.provider.as_str(),
+            KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME | GROK_OAUTH_PROVIDER_NAME
+        ) && resolved.descriptor.auth_method == AuthMethod::OAuth)
+            .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
+        let mut target_metadata = metadata.clone();
+        target_metadata.model = model.clone();
+        let tuning = ProviderTuning::from_metadata(&target_metadata);
+        let provider = self
+            .build_provider(&resolved.descriptor, credential, &target_metadata, &tuning)
+            .ok()?;
+        let auth_scope = match provider.credential_surface() {
+            haider_provider::ProviderCredentialSurface::Opaque => "opaque",
+            haider_provider::ProviderCredentialSurface::ApiKey => "api_key",
+            haider_provider::ProviderCredentialSurface::OAuthSubscriptionBearer => {
+                "oauth_subscription"
+            }
+            haider_provider::ProviderCredentialSurface::CloudBearer => "cloud_bearer",
+        }
+        .to_owned();
+        let next_resolver = AccountsAttemptResolver::new(
+            self.clone(),
+            target_metadata,
+            tuning,
+            oauth_access_fingerprint,
+        );
+        Some(haider_core::ProviderPairSwitchTarget {
+            provider,
+            account: resolved.descriptor.alias,
+            provider_name: target.provider.clone(),
+            model,
+            context_window: Some(target_window),
+            cached_input_is_subset: !matches!(
+                target.provider.as_str(),
+                ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME | DEEPSEEK_PROVIDER_NAME
+            ),
+            auth_scope,
+            attempt_resolver: Some(Arc::new(next_resolver)),
+            cause: haider_core::ProviderPairSwitchCause::CompactionGuard,
+        })
     }
 
     /// Builds the adapter under an EXPLICIT tuning. W-B threads the tuning
@@ -6814,6 +6898,11 @@ struct AccountsAttemptResolver {
     auth_refresh_attempted: AtomicBool,
     web_fallback_attempted: AtomicBool,
     oauth_access_fingerprint: Option<[u8; 32]>,
+    /// Index of the chain entry that produced this lane. `None` means the
+    /// turn started from session metadata and must locate that pair once.
+    /// Carrying the cursor across hops makes traversal strictly no-wrap even
+    /// when a provider occurs more than once with different models.
+    fallback_cursor: Option<usize>,
 }
 
 impl AccountsAttemptResolver {
@@ -6830,7 +6919,13 @@ impl AccountsAttemptResolver {
             auth_refresh_attempted: AtomicBool::new(false),
             web_fallback_attempted: AtomicBool::new(false),
             oauth_access_fingerprint,
+            fallback_cursor: None,
         }
+    }
+
+    fn at_fallback_cursor(mut self, cursor: usize) -> Self {
+        self.fallback_cursor = Some(cursor);
+        self
     }
 
     fn current_descriptor(&self, alias: &CredentialAlias) -> Option<CredentialDescriptor> {
@@ -6995,6 +7090,118 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             },
         ))
     }
+
+    async fn resolve_fallback(
+        &self,
+        _current_account: &CredentialAlias,
+        error: &haider_provider::ProviderError,
+    ) -> Result<haider_core::ProviderAttemptDecision, HaiderError> {
+        if !matches!(
+            error.kind,
+            ProviderErrorKind::Authentication
+                | ProviderErrorKind::RateLimited
+                | ProviderErrorKind::Overloaded
+                | ProviderErrorKind::QuotaExhausted
+        ) {
+            return Ok(haider_core::ProviderAttemptDecision::Stop);
+        }
+        let chain = &self.factory.resilience.fallback_chain;
+        let start = self.fallback_cursor.map_or_else(
+            || {
+                chain
+                    .iter()
+                    .position(|entry| entry.provider == self.metadata.provider)
+            },
+            Some,
+        );
+        let Some(start) = start else {
+            return Ok(haider_core::ProviderAttemptDecision::Stop);
+        };
+
+        for (index, entry) in chain.iter().enumerate().skip(start.saturating_add(1)) {
+            if entry.provider == self.metadata.provider {
+                continue;
+            }
+            let has_signed_in_credential = self.factory.snapshot.lock().ok().is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.provider == entry.provider && row.active)
+            });
+            if !has_signed_in_credential {
+                continue;
+            }
+            let model = match entry.model.clone().or_else(|| {
+                self.factory
+                    .provider_profile(&entry.provider)
+                    .and_then(|profile| profile.default_model)
+            }) {
+                Some(model) if !model.trim().is_empty() => model,
+                _ => continue,
+            };
+            let resolved = match self.factory.resolve_account(&entry.provider, None).await {
+                Ok(resolved) => resolved,
+                Err(_) => continue,
+            };
+            let credential = match self.factory.resolve_secret(&resolved.descriptor).await {
+                Ok(credential) => credential,
+                Err(_) => continue,
+            };
+            let oauth_access_fingerprint = (matches!(
+                resolved.descriptor.provider.as_str(),
+                KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME | GROK_OAUTH_PROVIDER_NAME
+            ) && resolved.descriptor.auth_method
+                == AuthMethod::OAuth)
+                .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
+            let mut metadata = self.metadata.clone();
+            metadata.provider = entry.provider.clone();
+            metadata.model = model.clone();
+            let tuning = ProviderTuning::from_metadata(&metadata);
+            let provider = match self.factory.build_provider(
+                &resolved.descriptor,
+                credential,
+                &metadata,
+                &tuning,
+            ) {
+                Ok(provider) => provider,
+                Err(_) => continue,
+            };
+            let auth_scope = match provider.credential_surface() {
+                haider_provider::ProviderCredentialSurface::Opaque => "opaque",
+                haider_provider::ProviderCredentialSurface::ApiKey => "api_key",
+                haider_provider::ProviderCredentialSurface::OAuthSubscriptionBearer => {
+                    "oauth_subscription"
+                }
+                haider_provider::ProviderCredentialSurface::CloudBearer => "cloud_bearer",
+            }
+            .to_owned();
+            let context_window = self.factory.model_context_window(&entry.provider, &model);
+            let next_resolver = AccountsAttemptResolver::new(
+                self.factory.clone(),
+                metadata,
+                tuning,
+                oauth_access_fingerprint,
+            )
+            .at_fallback_cursor(index);
+            return Ok(haider_core::ProviderAttemptDecision::Switch(
+                haider_core::ProviderPairSwitchTarget {
+                    provider,
+                    account: resolved.descriptor.alias,
+                    provider_name: entry.provider.clone(),
+                    model,
+                    context_window,
+                    cached_input_is_subset: !matches!(
+                        entry.provider.as_str(),
+                        ANTHROPIC_PROVIDER_NAME
+                            | ANTHROPIC_OAUTH_PROVIDER_NAME
+                            | DEEPSEEK_PROVIDER_NAME
+                    ),
+                    auth_scope,
+                    attempt_resolver: Some(Arc::new(next_resolver)),
+                    cause: haider_core::ProviderPairSwitchCause::FallbackChain,
+                },
+            ));
+        }
+        Ok(haider_core::ProviderAttemptDecision::Stop)
+    }
 }
 
 impl AccountsProviderFactory {
@@ -7011,6 +7218,7 @@ impl AccountsProviderFactory {
             self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
         let context_window = self.model_context_window(&metadata.provider, &metadata.model);
+        let compaction_promotion = self.resolve_compaction_promotion(metadata).await;
         Ok(crate::worker::ResolvedTurnProvider {
             provider,
             provider_name: metadata.provider.clone(),
@@ -7027,6 +7235,7 @@ impl AccountsProviderFactory {
                     oauth_access_fingerprint,
                 )) as Arc<dyn haider_core::ProviderAttemptResolver>
             }),
+            compaction_promotion,
         })
     }
 }
@@ -7641,6 +7850,9 @@ pub(crate) struct AccountsRuntime {
     /// The vault provision the production provider factory shares.
     pub vault: VaultProvision,
     pub broker: Option<CredentialBroker>,
+    /// Immutable, startup-validated resilience selection captured from the
+    /// registry plus one-shot environment overrides.
+    pub resilience: AccountsResilienceConfig,
 }
 
 /// The environment variable AWS documents for Bedrock bearer keys; the
@@ -7782,6 +7994,24 @@ impl AccountsRuntime {
             accounts.list().to_vec(),
             providers.summaries(&provider_has_credential(&accounts)),
         );
+        let promotion_targets = management
+            .read()
+            .map(|view| {
+                view.providers
+                    .into_iter()
+                    .filter_map(|summary| {
+                        providers
+                            .compaction_promotion(&summary.provider)
+                            .filter(|target| target.provider == summary.provider)
+                            .map(|target| (summary.provider, target))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let resilience = AccountsResilienceConfig {
+            fallback_chain: providers.fallback_chain().to_vec(),
+            promotion_targets,
+        };
         let actor_vault: Arc<dyn Vault> = match &vault {
             VaultProvision::Available(vault) => Arc::clone(vault),
             VaultProvision::Unsupported => Arc::new(MemoryVault::default()),
@@ -7845,6 +8075,7 @@ impl AccountsRuntime {
                     actor: Some(actor),
                     vault,
                     broker: Some(broker),
+                    resilience,
                 })
             }
             VaultProvision::PlatformDefault => {
@@ -7866,6 +8097,7 @@ impl AccountsRuntime {
                     actor: Some(actor),
                     vault: VaultProvision::Unsupported,
                     broker: None,
+                    resilience,
                 })
             }
         }

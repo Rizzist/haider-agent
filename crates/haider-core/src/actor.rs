@@ -40,6 +40,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerification};
+use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
@@ -99,6 +100,10 @@ const RETRY_CEILING_MS: u64 = 30_000;
 /// but a daemon must not park one request indefinitely on an untrusted value.
 /// Values above one minute terminalize as retryable exhaustion.
 const MAX_PROVIDER_RETRY_AFTER_MS: u64 = 60_000;
+/// Minimum percentage of the pre-compaction provider input footprint that a
+/// compaction must free. Below this bound, another compaction in the same turn
+/// is more likely to thrash than recover useful context capacity.
+pub const COMPACTION_MIN_FREED_PERCENT: u64 = 15;
 
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
@@ -125,6 +130,9 @@ pub struct HarnessConfig {
     /// Daemons set this when serving `context_compaction_v1`; standalone
     /// embeddings retain W7a hard-fit behavior unless they opt in.
     pub context_compaction_v1: bool,
+    /// Enables the post-compaction runaway guard and promotion path. This is
+    /// independent from proactive compaction for additive feature rollout.
+    pub compaction_guard_v1: bool,
     /// Deterministic daemon-owned policy bound to every request in this actor.
     pub system_prompt: Option<String>,
     /// Ephemeral daemon-authored user-role context appended after compiler
@@ -167,6 +175,12 @@ pub struct HarnessConfig {
     pub rotation_budget_consumed: bool,
     /// Daemon-owned resolver consulted only at a pre-first-event boundary.
     pub provider_attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    /// Daemon-owned durable pair-selection seam. Automatic fallback and
+    /// promotion refuse to switch unless this is installed.
+    pub provider_pair_switch_committer: Option<Arc<dyn ProviderPairSwitchCommitter>>,
+    /// Optional already-resolved larger-context lane used by the compaction
+    /// runaway guard. Daemons prove its credential and window ordering.
+    pub compaction_promotion: Option<ProviderPairSwitchTarget>,
     /// Injected backoff wait for the M4 provider-retry seam. Defaults to a
     /// real `tokio` timer; laws swap in an instant recording sleeper.
     pub retry_sleeper: Arc<dyn RetrySleeper>,
@@ -214,6 +228,7 @@ impl HarnessConfig {
             reserved_output_tokens: 4096,
             cached_input_is_subset: true,
             context_compaction_v1: false,
+            compaction_guard_v1: false,
             system_prompt: None,
             volatile_user_tail: None,
             tools: Vec::new(),
@@ -231,6 +246,8 @@ impl HarnessConfig {
             initial_rotation: None,
             rotation_budget_consumed: false,
             provider_attempt_resolver: None,
+            provider_pair_switch_committer: None,
+            compaction_promotion: None,
             retry_sleeper: Arc::new(RealRetrySleeper),
             context_compactor: None,
             finalization_guard: None,
@@ -463,6 +480,73 @@ pub struct ResolvedProviderAttempt {
     pub rotation: RotationEvent,
 }
 
+/// Why an automatic provider/model switch was required in the middle of a
+/// logical turn. The reason is carried into both the durable selection
+/// receipt and the UI-visible switch marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPairSwitchCause {
+    FallbackChain,
+    CompactionGuard,
+}
+
+impl ProviderPairSwitchCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FallbackChain => "fallback_chain",
+            Self::CompactionGuard => "compaction_guard",
+        }
+    }
+}
+
+/// A fully resolved replacement lane. Daemon resolution proves the
+/// credential and constructs the provider before core crosses the durable
+/// switch boundary; core then installs every live request coordinate only
+/// after [`ProviderPairSwitchCommitter`] confirms the metadata mutation.
+#[derive(Clone)]
+pub struct ProviderPairSwitchTarget {
+    pub provider: Arc<dyn Provider>,
+    pub account: CredentialAlias,
+    pub provider_name: String,
+    pub model: String,
+    pub context_window: Option<u64>,
+    pub cached_input_is_subset: bool,
+    pub auth_scope: String,
+    pub attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    pub cause: ProviderPairSwitchCause,
+}
+
+impl std::fmt::Debug for ProviderPairSwitchTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderPairSwitchTarget")
+            .field("account", &self.account)
+            .field("provider_name", &self.provider_name)
+            .field("model", &self.model)
+            .field("context_window", &self.context_window)
+            .field("cached_input_is_subset", &self.cached_input_is_subset)
+            .field("auth_scope", &self.auth_scope)
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Secret-free coordinates committed through the daemon's existing
+/// receipted `session.select_model` actor path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPairSwitch {
+    pub run_id: RunId,
+    pub from_provider: String,
+    pub from_model: String,
+    pub to_provider: String,
+    pub to_model: String,
+    pub cause: ProviderPairSwitchCause,
+}
+
+#[async_trait]
+pub trait ProviderPairSwitchCommitter: Send + Sync + std::fmt::Debug {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError>;
+}
+
 /// Result of consulting the daemon at an eligible pre-first-event failure.
 pub enum ProviderAttemptDecision {
     /// Retry with refreshed credentials for the same account. This does not
@@ -479,6 +563,9 @@ pub enum ProviderAttemptDecision {
     },
     /// Commit the supplied durable event, then retry with the alternate.
     Rotate(ResolvedProviderAttempt),
+    /// Commit a durable provider/model pair selection, then continue this
+    /// same logical turn on the fully resolved replacement lane.
+    Switch(ProviderPairSwitchTarget),
     /// Keep the existing provider and apply ordinary retry/backoff policy.
     Wait,
     /// Surface the original provider failure.
@@ -494,6 +581,18 @@ pub trait ProviderAttemptResolver: Send + Sync + std::fmt::Debug {
         current_account: &CredentialAlias,
         error: &ProviderError,
     ) -> Result<ProviderAttemptDecision, HaiderError>;
+
+    /// Resolves a cross-provider fallback only after the current provider is
+    /// out of healthy local options. Implementations must return `Stop` for
+    /// non-provider-health failures; core fences the call to the allowed
+    /// health taxonomy as a second line of defense.
+    async fn resolve_fallback(
+        &self,
+        _current_account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        Ok(ProviderAttemptDecision::Stop)
+    }
 }
 
 /// Injectable backoff wait for the provider-retry seam (W-C M4). Production
@@ -1701,6 +1800,9 @@ impl HarnessActor {
         let mut provider_request_count = 0usize;
         let mut continuation_count = 0usize;
         let mut forced_compaction_used = false;
+        // Once an ineffective compaction promotes this turn, later request
+        // rounds may use the larger hard budget but must never compact again.
+        let mut compaction_guard_consumed = false;
         let mut provider_attempt = 0usize;
         let mut completed_usage: Option<Usage> = None;
         // W-B: provider-executed tool rows and cited web sources are
@@ -1741,9 +1843,13 @@ impl HarnessActor {
                 .enforce_context_policy(
                     &run_id,
                     &mut messages,
-                    current_turn_start,
-                    latest_compaction_summary_end,
+                    &mut current_turn_start,
+                    &mut latest_compaction_summary_end,
                     volatile_user_tail.as_deref(),
+                    &mut provider,
+                    &mut usage_account,
+                    &mut stable_history_end,
+                    &mut compaction_guard_consumed,
                 )
                 .await
             {
@@ -1902,7 +2008,8 @@ impl HarnessActor {
                 match opened {
                     Ok(stream) => break stream,
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
-                        let compacted = if request_projection_compacted {
+                        let compacted = if request_projection_compacted || compaction_guard_consumed
+                        {
                             Err(repeated_context_overflow_after_compaction())
                         } else {
                             self.force_context_compaction(
@@ -1935,9 +2042,13 @@ impl HarnessActor {
                                     run_id: &run_id,
                                     cancel: &cancel,
                                 },
-                                provider_attempt,
+                                &mut provider_attempt,
                                 &mut provider,
                                 &mut usage_account,
+                                &mut messages,
+                                &mut stable_history_end,
+                                &mut current_turn_start,
+                                &mut latest_compaction_summary_end,
                                 &mut rotation_budget_consumed,
                                 &mut capability_fallback_consumed,
                                 error,
@@ -2054,7 +2165,8 @@ impl HarnessActor {
                         if error.kind == ProviderErrorKind::ContextExceeded
                             && !provider_content_seen =>
                     {
-                        let compacted = if request_projection_compacted {
+                        let compacted = if request_projection_compacted || compaction_guard_consumed
+                        {
                             Err(repeated_context_overflow_after_compaction())
                         } else {
                             self.force_context_compaction(
@@ -2087,9 +2199,13 @@ impl HarnessActor {
                                     run_id: &run_id,
                                     cancel: &cancel,
                                 },
-                                provider_attempt,
+                                &mut provider_attempt,
                                 &mut provider,
                                 &mut usage_account,
+                                &mut messages,
+                                &mut stable_history_end,
+                                &mut current_turn_start,
+                                &mut latest_compaction_summary_end,
                                 &mut rotation_budget_consumed,
                                 &mut capability_fallback_consumed,
                                 error,
@@ -3131,9 +3247,13 @@ impl HarnessActor {
     async fn prepare_pre_first_event_retry(
         &mut self,
         context: ProviderRetryContext<'_>,
-        provider_attempt: usize,
+        provider_attempt: &mut usize,
         provider: &mut Arc<dyn Provider>,
         account: &mut Option<CredentialAlias>,
+        messages: &mut Vec<Message>,
+        stable_history_end: &mut usize,
+        current_turn_start: &mut usize,
+        latest_compaction_summary_end: &mut Option<usize>,
         rotation_budget_consumed: &mut bool,
         capability_fallback_consumed: &mut bool,
         error: ProviderError,
@@ -3202,7 +3322,7 @@ impl HarnessActor {
                     // to the capped-retry / Errored path so a non-recovering
                     // 401 terminates. The legitimate refresh-then-succeed path
                     // (a refresh at a low attempt count) is unaffected.
-                    if provider_attempt < MAX_API_RETRIES {
+                    if *provider_attempt < MAX_API_RETRIES {
                         *provider = refreshed;
                         *account = Some(refreshed_account);
                         return Ok(());
@@ -3228,26 +3348,233 @@ impl HarnessActor {
                     *rotation_budget_consumed = true;
                     return Ok(());
                 }
+                ProviderAttemptDecision::Switch(target) => {
+                    self.commit_provider_pair_switch(
+                        context.run_id,
+                        target,
+                        provider,
+                        account,
+                        messages,
+                        stable_history_end,
+                        current_turn_start,
+                        latest_compaction_summary_end,
+                    )
+                    .await?;
+                    *provider_attempt = 0;
+                    *rotation_budget_consumed = true;
+                    return Ok(());
+                }
                 ProviderAttemptDecision::Wait => {
                     *rotation_budget_consumed = true;
                 }
                 ProviderAttemptDecision::Stop => {
                     *rotation_budget_consumed = true;
+                    if provider_error_allows_pair_fallback(&error) {
+                        let fallback = tokio::select! {
+                            biased;
+                            () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                            resolution = resolver.resolve_fallback(&current_account, &error) => resolution,
+                        }
+                        .map_err(DriveError::Account)?;
+                        if let ProviderAttemptDecision::Switch(target) = fallback {
+                            return self
+                                .commit_provider_pair_switch(
+                                    context.run_id,
+                                    target,
+                                    provider,
+                                    account,
+                                    messages,
+                                    stable_history_end,
+                                    current_turn_start,
+                                    latest_compaction_summary_end,
+                                )
+                                .await
+                                .inspect(|()| *provider_attempt = 0);
+                        }
+                    }
                     return Err(DriveError::Provider(error));
                 }
             }
         }
-        if provider_error_allows_retry(&error) && provider_attempt < MAX_API_RETRIES {
+        if provider_error_allows_retry(&error) && *provider_attempt < MAX_API_RETRIES {
             self.wait_before_provider_retry(
                 context.run_id,
                 context.cancel,
-                provider_attempt,
+                *provider_attempt,
                 &error,
             )
             .await
+        } else if provider_error_allows_pair_fallback(&error)
+            && let (Some(resolver), Some(current_account)) = (
+                self.config.provider_attempt_resolver.clone(),
+                account.clone(),
+            )
+        {
+            let fallback = tokio::select! {
+                biased;
+                () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                resolution = resolver.resolve_fallback(&current_account, &error) => resolution,
+            }
+            .map_err(DriveError::Account)?;
+            match fallback {
+                ProviderAttemptDecision::Switch(target) => self
+                    .commit_provider_pair_switch(
+                        context.run_id,
+                        target,
+                        provider,
+                        account,
+                        messages,
+                        stable_history_end,
+                        current_turn_start,
+                        latest_compaction_summary_end,
+                    )
+                    .await
+                    .inspect(|()| *provider_attempt = 0),
+                ProviderAttemptDecision::Retry { .. }
+                | ProviderAttemptDecision::Fallback { .. }
+                | ProviderAttemptDecision::Rotate(_)
+                | ProviderAttemptDecision::Wait
+                | ProviderAttemptDecision::Stop => Err(DriveError::Provider(error)),
+            }
         } else {
             Err(DriveError::Provider(error))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_provider_pair_switch(
+        &mut self,
+        run_id: &RunId,
+        target: ProviderPairSwitchTarget,
+        provider: &mut Arc<dyn Provider>,
+        account: &mut Option<CredentialAlias>,
+        messages: &mut Vec<Message>,
+        stable_history_end: &mut usize,
+        current_turn_start: &mut usize,
+        latest_compaction_summary_end: &mut Option<usize>,
+    ) -> Result<(), DriveError> {
+        let Some(committer) = self.config.provider_pair_switch_committer.clone() else {
+            return Err(DriveError::Provider(provider_protocol_error(
+                "automatic provider/model switch has no durable committer",
+            )));
+        };
+        let switch = ProviderPairSwitch {
+            run_id: run_id.clone(),
+            from_provider: self.config.usage_scope.provider.clone(),
+            from_model: self.config.model.clone(),
+            to_provider: target.provider_name.clone(),
+            to_model: target.model.clone(),
+            cause: target.cause,
+        };
+        if switch.from_provider == switch.to_provider && switch.from_model == switch.to_model {
+            return Err(DriveError::Provider(provider_protocol_error(
+                "automatic provider/model switch did not change the active pair",
+            )));
+        }
+        committer.commit(&switch).await.map_err(DriveError::Store)?;
+
+        remap_after_provider_opaque_strip(
+            messages,
+            &target.provider_name,
+            stable_history_end,
+            current_turn_start,
+            latest_compaction_summary_end,
+        );
+
+        let previous_scope = self.config.usage_scope.clone();
+        // A pre-first-event provider failure may not have emitted usage for
+        // this turn, so the scope's carried stable count can still be zero.
+        // Measure the actor's live immutable boundary before changing the
+        // pair; this is the cache prefix the automatic switch actually
+        // invalidates.
+        let invalidated_stable_tokens = estimated_request_input_tokens(
+            &self.config,
+            &messages[..(*stable_history_end).min(messages.len())],
+        );
+        self.config.model = target.model.clone();
+        self.config.context_window = target.context_window;
+        self.config.cached_input_is_subset = target.cached_input_is_subset;
+        self.config.usage_account = Some(target.account.clone());
+        self.config.usage_scope.provider = target.provider_name.clone();
+        self.config.usage_scope.model = target.model.clone();
+        self.config.usage_scope.account_scope = Some(target.account.clone());
+        self.config.usage_scope.auth_scope = target.auth_scope.clone();
+        self.config.usage_scope.cache_epoch = digest_json(&serde_json::json!({
+            "provider": target.provider_name,
+            "model": target.model,
+            "account": target.account,
+            "auth": target.auth_scope,
+            "reasoning": self.config.reasoning_settings,
+            "system": digest_json(&self.config.system_prompt),
+            "tools": canonical_tool_definitions_digest(&self.config.tools),
+        }));
+        self.config.cache_reuse_gap_ms = None;
+        self.config.provider_tool_fallback_tools.clear();
+        // A compactor is bound to the provider/model used to construct it.
+        // Continuing with that stale lane would be a silent reverse switch.
+        self.config.context_compactor = None;
+        self.config.provider_attempt_resolver = target.attempt_resolver;
+        *provider = target.provider;
+        *account = Some(target.account.clone());
+
+        let changed_fields = [
+            (switch.from_provider != switch.to_provider).then_some("provider"),
+            (switch.from_model != switch.to_model).then_some("model"),
+            (previous_scope.auth_scope != self.config.usage_scope.auth_scope).then_some("auth"),
+            (previous_scope.account_scope != self.config.usage_scope.account_scope)
+                .then_some("account"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let transition = CacheEpochTransitionV1 {
+            reason: CacheEpochTransitionReason::ConfigurationChanged,
+            planned: false,
+            changed_fields,
+            invalidated_stable_tokens,
+            rewarm_cost_usd: None,
+            rewarm_base_input_equivalent_tokens: None,
+            transition_id: digest_json(&serde_json::json!({
+                "cause": switch.cause.as_str(),
+                "from_provider": switch.from_provider,
+                "from_model": switch.from_model,
+                "to_provider": switch.to_provider,
+                "to_model": switch.to_model,
+            })),
+            // The exact request epoch includes provider-rendered digests and
+            // the live compaction boundary, which do not exist until the next
+            // request is assembled. Omitting the endpoints is honest; the
+            // named transition itself still records the cold boundary.
+            from_cache_epoch: None,
+            to_cache_epoch: None,
+        };
+        let transition_item = transition.extension_item().map_err(|error| {
+            DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot serialize automatic cache epoch transition: {error}"),
+                false,
+            ))
+        })?;
+        let TurnItem::Extension { kind, data } = transition_item else {
+            unreachable!("cache transition always uses the extension carrier")
+        };
+        self.commit_ui_extension_marker(run_id, &kind, data)
+            .await
+            .map_err(DriveError::Store)?;
+        self.commit_ui_extension_marker(
+            run_id,
+            "provider_pair_switch_v1",
+            serde_json::json!({
+                "from_provider": switch.from_provider,
+                "from_model": switch.from_model,
+                "to_provider": switch.to_provider,
+                "to_model": switch.to_model,
+                "why": switch.cause.as_str(),
+            }),
+        )
+        .await
+        .map_err(DriveError::Store)
     }
 
     async fn force_context_compaction(
@@ -3348,13 +3675,18 @@ impl HarnessActor {
     /// context policy immediately before every provider request. Unknown
     /// catalog windows publish honest estimates but disable proactive
     /// compaction; provider-reported overflow can still force recovery.
+    #[allow(clippy::too_many_arguments)]
     async fn enforce_context_policy(
         &mut self,
         run_id: &RunId,
         messages: &mut Vec<Message>,
-        current_turn_start: usize,
-        latest_compaction_summary_end: Option<usize>,
+        current_turn_start: &mut usize,
+        latest_compaction_summary_end: &mut Option<usize>,
         volatile_user_tail: Option<&str>,
+        provider: &mut Arc<dyn Provider>,
+        account: &mut Option<CredentialAlias>,
+        stable_history_end: &mut usize,
+        compaction_guard_consumed: &mut bool,
     ) -> Result<bool, DriveError> {
         // Volatile context is excluded from durable cache boundaries, but it
         // still consumes real provider input capacity. Measure a request-only
@@ -3383,6 +3715,18 @@ impl HarnessActor {
                     "reserved output budget leaves no provider input capacity",
                 ))
             })?;
+        if self.config.compaction_guard_v1 && *compaction_guard_consumed {
+            return if before.used_tokens > input_budget {
+                Err(compaction_guard_repeat_error(
+                    before.used_tokens,
+                    input_budget,
+                ))
+            } else {
+                // The promoted hard budget absorbs this request. Crossing its
+                // soft line cannot trigger a second compaction in this turn.
+                Ok(false)
+            };
+        }
         let should_compact = if self.config.context_compaction_v1 {
             let soft_threshold =
                 context_soft_threshold_tokens(window, self.config.reserved_output_tokens)
@@ -3402,8 +3746,8 @@ impl HarnessActor {
         self.perform_context_compaction(
             run_id,
             messages,
-            current_turn_start,
-            latest_compaction_summary_end,
+            *current_turn_start,
+            *latest_compaction_summary_end,
         )
         .await?;
         let after = estimated_context_footprint(&self.config, messages);
@@ -3411,6 +3755,56 @@ impl HarnessActor {
             self.commit_context_footprint(run_id, &after)
                 .await
                 .map_err(DriveError::Store)?;
+        }
+        if self.config.compaction_guard_v1
+            && compaction_guard_tripped(before.used_tokens, after.used_tokens, input_budget)
+        {
+            *compaction_guard_consumed = true;
+            let promotion = self.config.compaction_promotion.take().filter(|target| {
+                target.cause == ProviderPairSwitchCause::CompactionGuard
+                    && target.provider_name == self.config.usage_scope.provider
+                    && target
+                        .context_window
+                        .is_some_and(|target_window| target_window > window)
+            });
+            let Some(promotion) = promotion else {
+                return Err(compaction_runaway_guard_error(
+                    before.used_tokens,
+                    after.used_tokens,
+                    input_budget,
+                ));
+            };
+            self.commit_provider_pair_switch(
+                run_id,
+                promotion,
+                provider,
+                account,
+                messages,
+                stable_history_end,
+                current_turn_start,
+                latest_compaction_summary_end,
+            )
+            .await?;
+            let promoted = estimated_context_footprint(&self.config, messages);
+            if self.config.context_compaction_v1 {
+                self.commit_context_footprint(run_id, &promoted)
+                    .await
+                    .map_err(DriveError::Store)?;
+            }
+            let promoted_budget = self
+                .config
+                .context_window
+                .and_then(|promoted_window| {
+                    promoted_window.checked_sub(self.config.reserved_output_tokens)
+                })
+                .ok_or_else(|| compaction_guard_repeat_error(promoted.used_tokens, input_budget))?;
+            if promoted.used_tokens > promoted_budget {
+                return Err(compaction_guard_repeat_error(
+                    promoted.used_tokens,
+                    promoted_budget,
+                ));
+            }
+            return Ok(true);
         }
         if after.used_tokens > input_budget {
             return Err(DriveError::Provider(ProviderError::new(
@@ -5946,6 +6340,28 @@ fn repeated_context_overflow_after_compaction() -> DriveError {
     ))
 }
 
+fn compaction_runaway_guard_error(before: u64, after: u64, input_budget: u64) -> DriveError {
+    let freed = before.saturating_sub(after);
+    DriveError::Provider(ProviderError::new(
+        ProviderErrorKind::ContextExceeded,
+        format!(
+            "context compaction guard stopped an ineffective retry: used {before} -> {after} \
+             tokens (freed {freed}); input budget is {input_budget} and the minimum reduction is \
+             {COMPACTION_MIN_FREED_PERCENT}%"
+        ),
+    ))
+}
+
+fn compaction_guard_repeat_error(used: u64, input_budget: u64) -> DriveError {
+    DriveError::Provider(ProviderError::new(
+        ProviderErrorKind::ContextExceeded,
+        format!(
+            "context compaction guard refused a second compaction in this turn: provider input \
+             estimate {used} exceeds the promoted budget {input_budget}"
+        ),
+    ))
+}
+
 fn loop_limit_error(count: usize, limit: usize) -> HaiderError {
     let mut error = HaiderError::new(
         ErrorCode::LoopLimit,
@@ -6276,6 +6692,68 @@ fn provider_error_allows_rotation(error: &ProviderError) -> bool {
     }
 }
 
+/// Cross-provider fallback is a provider-health recovery only. Request,
+/// context, and permission failures belong to the selected pair and must
+/// never be laundered into a silent provider change.
+fn provider_error_allows_pair_fallback(error: &ProviderError) -> bool {
+    matches!(
+        error.kind,
+        ProviderErrorKind::Authentication
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Overloaded
+            | ProviderErrorKind::QuotaExhausted
+    )
+}
+
+fn accepted_opaque_provider(provider_name: &str) -> &'static str {
+    match provider_name {
+        haider_provider::ANTHROPIC_PROVIDER_NAME
+        | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME => {
+            haider_provider::ANTHROPIC_PROVIDER_NAME
+        }
+        haider_provider::OPENAI_PROVIDER_NAME | haider_provider::OPENAI_OAUTH_PROVIDER_NAME => {
+            haider_provider::OPENAI_PROVIDER_NAME
+        }
+        haider_provider::GEMINI_PROVIDER_NAME => haider_provider::GEMINI_PROVIDER_NAME,
+        _ => haider_provider::OPENAI_COMPATIBLE_PROVIDER_NAME,
+    }
+}
+
+/// Drops opaque continuation blocks minted by a different wire family and
+/// remaps every live compiler boundary across messages that become empty.
+fn remap_after_provider_opaque_strip(
+    messages: &mut Vec<Message>,
+    provider_name: &str,
+    stable_history_end: &mut usize,
+    current_turn_start: &mut usize,
+    latest_compaction_summary_end: &mut Option<usize>,
+) {
+    let accepted = accepted_opaque_provider(provider_name);
+    let mut boundary_map = Vec::with_capacity(messages.len().saturating_add(1));
+    boundary_map.push(0usize);
+    let mut retained = 0usize;
+    for message in messages.iter_mut() {
+        message.blocks.retain(|block| {
+            !matches!(
+                block,
+                Block::ProviderOpaque { provider, .. } if provider != accepted
+            )
+        });
+        retained = retained.saturating_add(usize::from(!message.blocks.is_empty()));
+        boundary_map.push(retained);
+    }
+    messages.retain(|message| !message.blocks.is_empty());
+    let remap = |boundary: usize| {
+        boundary_map
+            .get(boundary.min(boundary_map.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(messages.len())
+    };
+    *stable_history_end = remap(*stable_history_end);
+    *current_turn_start = remap(*current_turn_start);
+    *latest_compaction_summary_end = latest_compaction_summary_end.map(remap);
+}
+
 fn digest_json(value: &impl serde::Serialize) -> String {
     serde_json::to_vec(value).map_or_else(
         |_| blake3::hash(b"serialization-error").to_hex().to_string(),
@@ -6513,6 +6991,19 @@ pub fn context_soft_threshold_tokens(window: u64, reserved_output_tokens: u64) -
     let eighty_five_percent =
         u64::try_from(u128::from(window).saturating_mul(85) / 100).unwrap_or(u64::MAX);
     Some(eighty_five_percent.min(hard_fit))
+}
+
+/// Returns whether one compaction failed the hard-fit or minimum-effectiveness
+/// laws. Integer cross-multiplication keeps the exact 15% boundary stable for
+/// small footprints and avoids floating-point rounding.
+#[must_use]
+pub fn compaction_guard_tripped(before: u64, after: u64, input_budget: u64) -> bool {
+    if after > input_budget {
+        return true;
+    }
+    let freed = before.saturating_sub(after);
+    u128::from(freed).saturating_mul(100)
+        < u128::from(before).saturating_mul(u128::from(COMPACTION_MIN_FREED_PERCENT))
 }
 
 fn estimated_context_footprint(config: &HarnessConfig, messages: &[Message]) -> ContextFootprint {
