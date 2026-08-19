@@ -825,6 +825,10 @@ pub struct ChipModel {
     /// child-session head. `None` preserves the legacy elapsed/token row.
     pub metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
     pub question: Option<ChipQuestion>,
+    /// Latest workflow-run rollup published by the delegation mirror
+    /// (`agent_graph_rollup_v1`). `None` = the child runs no pinned
+    /// workflow (or an older daemon) — the row keeps plain activity.
+    pub graph: Option<haider_protocol::agent::AgentGraphRollupV1>,
     pub closed: bool,
     pub removing: bool,
     pub children: Vec<ChipModel>,
@@ -891,6 +895,7 @@ impl ChipModel {
             last_event_at_ms: None,
             metrics: None,
             question: None,
+            graph: None,
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -952,6 +957,7 @@ impl ChipModel {
             last_event_at_ms: None,
             metrics: None,
             question: None,
+            graph: None,
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -2634,12 +2640,26 @@ impl std::ops::Deref for OutboundAnswer {
     }
 }
 
+/// Which half of the Loom registry the browser shows. The sim splits the
+/// two surfaces (`/loom` = Agent Types, `/workflows` = pipe DAG templates);
+/// one Screen::Loom carries both as panes so every `match Screen` stays put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoomPane {
+    #[default]
+    Types,
+    Workflows,
+}
+
 /// The launcher's non-session rows (value-carrying hit payload, P2-9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LauncherRow {
     Aura,
     Accounts,
     Peers,
+    /// The Workflows registry browser (`/workflows`) — typed pipe DAGs.
+    Workflows,
+    /// The Loom agent-type browser (`/loom`) — capability-scoped specialists.
+    Loom,
 }
 
 /// A composer surface's identity (TUI5 item 9): the launcher, one session
@@ -3156,6 +3176,8 @@ pub struct AppModel {
     pub loom_scroll_max: std::cell::Cell<u16>,
     /// Round 3: where /loom returns on esc — the screen it was opened from.
     pub loom_return: Option<Screen>,
+    /// Which registry pane `Screen::Loom` shows (`/loom` vs `/workflows`).
+    pub loom_pane: LoomPane,
     /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
@@ -3493,6 +3515,7 @@ impl Default for AppModel {
             loom_scroll: 0,
             loom_scroll_max: std::cell::Cell::new(0),
             loom_return: None,
+            loom_pane: LoomPane::default(),
             graph_inspect: None,
             retry_inflight: false,
             graph_unsupported: false,
@@ -5381,7 +5404,10 @@ impl AppModel {
         // D3 — /loom browser: ↑↓ move over types+workflows, ⏎ opens the
         // detail pane, esc backs out (detail → list → where you came from).
         if self.screen == Screen::Loom {
-            let total = self.loom_types.len() + self.loom_workflows.len();
+            let total = match self.loom_pane {
+                LoomPane::Types => self.loom_types.len(),
+                LoomPane::Workflows => self.loom_workflows.len(),
+            };
             // Round 3: a registry that emptied under an open detail pane
             // leaves no subject — fold the pane so esc means one press.
             if total == 0 {
@@ -5406,6 +5432,17 @@ impl AppModel {
                     self.loom_scroll = 0;
                     // Unknown ceiling until the pane paints once.
                     self.loom_scroll_max.set(u16::MAX);
+                }
+                KeyCode::Tab => {
+                    // ⇄ the sibling registry pane, selection reset — the
+                    // sim's two surfaces, one keystroke apart.
+                    self.loom_pane = match self.loom_pane {
+                        LoomPane::Types => LoomPane::Workflows,
+                        LoomPane::Workflows => LoomPane::Types,
+                    };
+                    self.loom_selection = 0;
+                    self.loom_detail = false;
+                    self.loom_scroll = 0;
                 }
                 KeyCode::Esc => {
                     if self.loom_detail {
@@ -9073,19 +9110,34 @@ impl AppModel {
     /// D3 — open the Loom registry browser. Registry truth is daemon-owned:
     /// live-only, feature-gated; the browse list reads the D1 snapshot.
     fn enter_loom(&mut self) {
+        self.enter_loom_pane(LoomPane::Types, "loom");
+    }
+
+    fn enter_workflows(&mut self) {
+        self.enter_loom_pane(LoomPane::Workflows, "workflows");
+    }
+
+    fn enter_loom_pane(&mut self, pane: LoomPane, surface: &str) {
         self.dirty = true;
         if self.mode.fabricates_locally() {
-            self.flash = Some("· /loom — live only; the registry is daemon truth".to_owned());
+            self.flash = Some(format!(
+                "· /{surface} — live only; the registry is daemon truth"
+            ));
             return;
         }
         if !self.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
-            self.flash = Some(self.stale_daemon_note("loom"));
+            self.flash = Some(self.stale_daemon_note(surface));
             return;
         }
+        self.loom_pane = pane;
         self.loom_selection = 0;
         self.loom_detail = false;
         self.loom_scroll = 0;
-        self.loom_return = Some(self.screen);
+        // Re-entering from the browser itself (pane hop) must keep the
+        // ORIGINAL return screen, not overwrite it with Screen::Loom.
+        if self.screen != Screen::Loom {
+            self.loom_return = Some(self.screen);
+        }
         self.screen = Screen::Loom;
     }
 
@@ -9845,6 +9897,7 @@ impl AppModel {
             // CG-M1: `/graph [pin|abandon|status]`.
             "graph" => self.enter_graph(arg.as_deref()),
             "loom" => self.enter_loom(),
+            "workflows" => self.enter_workflows(),
             // Owner 2026-08-16: manual retry of the failed turn — the
             // keyboard path to the ambient retry row's click.
             "retry" => self.issue_run_retry(),
@@ -10792,6 +10845,32 @@ impl AppModel {
     }
 
     fn handle_envelope(&mut self, payload: &EventPayload) {
+        // W-UI: a child's workflow rollup rides the parent stream as a
+        // typed extension item (`agent_graph_rollup_v1`). It is CHIP state,
+        // not transcript prose — route it to the chip and swallow both
+        // marker halves so the transcript never shows the raw fact.
+        if let EventPayload::Item(event) = payload {
+            let item = match event {
+                haider_protocol::item::ItemEvent::Started { item, .. }
+                | haider_protocol::item::ItemEvent::Completed { item, .. } => Some(item),
+                haider_protocol::item::ItemEvent::Delta { .. } => None,
+            };
+            if let Some(haider_protocol::item::TurnItem::Extension { kind, data }) = item
+                && kind == haider_protocol::agent::AGENT_GRAPH_ROLLUP_EXTENSION_KIND
+            {
+                if matches!(event, haider_protocol::item::ItemEvent::Completed { .. })
+                    && let Ok(roll) = serde_json::from_value::<
+                        haider_protocol::agent::AgentGraphRollupV1,
+                    >(data.clone())
+                    && let Some(chip) = find_chip_mut(&mut self.chips, roll.agent.as_str())
+                {
+                    chip.note_event_at(self.clock_ms);
+                    chip.graph = Some(roll);
+                    self.dirty = true;
+                }
+                return;
+            }
+        }
         // Recovery consequences are derived from the still-open typed card,
         // but dispatched only after this committed MenuAnswered fact applies.
         // A stale/rejected local click therefore cannot start an account op.
@@ -11664,6 +11743,8 @@ impl AppModel {
                 LauncherRow::Aura => self.enter_aura(),
                 LauncherRow::Accounts => self.enter_accounts(),
                 LauncherRow::Peers => self.reject_remote_placement(),
+                LauncherRow::Workflows => self.enter_workflows(),
+                LauncherRow::Loom => self.enter_loom(),
             },
             // `/accounts` rows: click = make active for its provider (sim
             // tui.js:3604 onClick useAccount). Value-carrying alias, and

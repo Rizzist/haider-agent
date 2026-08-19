@@ -218,3 +218,18 @@ fn tui_restart_plans_preserve_original_argv_for_both_process_strategies() {
     assert_eq!(windows.args, expected_args);
     assert_eq!(windows.mode, RestartMode::DetachedSpawn);
 }
+
+/// MUTATION CHECK: let a following flag be swallowed as the `--session`
+/// value (rev933 finding 6). Expected RUNTIME failure: the parse accepts
+/// `--no-update-check` as a session id instead of refusing.
+#[test]
+fn bare_session_flag_refuses_a_flag_shaped_value() {
+    let args: Vec<String> = ["--session", "--no-update-check"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        parse_bare_tui_options(&args),
+        Err("--session requires a session id".to_owned())
+    );
+}

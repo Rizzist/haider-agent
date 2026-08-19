@@ -57,6 +57,28 @@ pub const fn osc_reset_title() -> &'static str {
     "\u{1b}[23;2t"
 }
 
+/// ADE correlation seam (W-OSC): a namespaced OSC naming the session this
+/// PTY's TUI is attached to. Real terminals discard unknown OSC numbers;
+/// an embedding ADE parses it to re-home this terminal into the right
+/// session surface. An empty payload announces "back at the launcher".
+/// The id is control-stripped so a hostile name can never smuggle a second
+/// escape sequence into the stream.
+#[must_use]
+pub fn osc_session_announce(session_id: Option<&str>) -> String {
+    let clean: String = session_id
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control() && *c != ';')
+        .collect();
+    format!("\u{1b}]7791;haider;attached={clean}\u{1b}\\")
+}
+
+fn sync_session_announce(session_id: Option<&str>) {
+    let mut out = stdout();
+    let _ = out.write_all(osc_session_announce(session_id).as_bytes());
+    let _ = out.flush();
+}
+
 static TITLE_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn sync_window_title(title: &str) {
@@ -2902,6 +2924,17 @@ pub async fn run_live(
     let mut pointer: Option<(u16, u16)> = None;
     let mut update_events_open = true;
     let mut update_in_progress = false;
+    // Finding 5 (rev933): the update transaction RESTARTS the daemon, and
+    // the link's bounded recovery (~3s) can lose the race against the
+    // updater's 30s health window. A link death while a transaction is in
+    // flight is therefore expected — the transaction owns the outcome. The
+    // grace deadline bounds the wait so a dead updater can never wedge the
+    // terminal.
+    let mut link_replies_open = true;
+    let mut update_grace: Option<tokio::time::Instant> = None;
+    // W-OSC: outer None = nothing announced yet, so the first tail pass
+    // always announces (launcher or the --session target alike).
+    let mut announced_session: Option<Option<String>> = None;
 
     while !model.should_quit {
         // Issue whatever the driver asked for. `try_send` keeps the UI loop
@@ -2939,12 +2972,31 @@ pub async fn run_live(
                 }
                 None => break,
             },
-            reply = link.replies.recv() => match reply {
+            reply = link.replies.recv(), if link_replies_open => match reply {
                 Some(reply) => inbound = Some(reply),
+                None if update_in_progress => {
+                    link_replies_open = false;
+                    update_grace = Some(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(90),
+                    );
+                    model.flash =
+                        Some("· updating — daemon restarting, holding on…".to_owned());
+                    model.dirty = true;
+                }
                 None => return Err(std::io::Error::other(
                     "link supervisor stopped unexpectedly after bounded recovery",
                 )),
             },
+            () = async {
+                match update_grace {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if update_grace.is_some() => {
+                return Err(std::io::Error::other(
+                    "daemon connection lost during an update and no outcome arrived in time",
+                ));
+            }
             // T2: talk-runtime outcomes (envelopes mark dirty and ride the
             // guarded 30 fps frame tick below — the wave adds NO timer).
             // The supervisor outlives this loop (its handle is owned
@@ -2965,10 +3017,26 @@ pub async fn run_live(
                             AppEvent::UpdateCurrent { .. } | AppEvent::UpdateFailed { .. }
                         ) {
                             update_in_progress = false;
+                            if !link_replies_open {
+                                // The daemon link is already gone; a failed
+                                // transaction leaves nothing to render from.
+                                let detail = match &event {
+                                    AppEvent::UpdateFailed { message } => message.clone(),
+                                    _ => "update did not install".to_owned(),
+                                };
+                                return Err(std::io::Error::other(format!(
+                                    "daemon connection lost during a failed update: {detail}"
+                                )));
+                            }
                         }
                         model.handle(event);
                     }
                     Some(LiveUpdateEvent::Installed) => return Ok(LiveExit::UpdateInstalled),
+                    None if !link_replies_open => {
+                        return Err(std::io::Error::other(
+                            "update worker stopped while the daemon link was down",
+                        ));
+                    }
                     None => update_events_open = false,
                 }
             }
@@ -3046,6 +3114,19 @@ pub async fn run_live(
         if title != active_title {
             active_title = title;
             sync_window_title(&active_title);
+        }
+        // W-OSC: announce the attached session to the embedding terminal
+        // whenever the binding changes (attach, hop, back-to-launcher).
+        let attached = match model.screen {
+            crate::app::Screen::Boot | crate::app::Screen::Launcher => None,
+            _ => model
+                .active_session
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+        };
+        if announced_session.as_ref() != Some(&attached) {
+            sync_session_announce(attached.as_deref());
+            announced_session = Some(attached);
         }
     }
     Ok(LiveExit::Quit)

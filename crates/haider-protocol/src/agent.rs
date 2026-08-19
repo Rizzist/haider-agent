@@ -270,3 +270,40 @@ impl AgentMetricsSnapshot {
         }
     }
 }
+
+/// Stable turn-item extension kind for a child workflow-run rollup. The
+/// delegation mirror publishes one into the PARENT session whenever a
+/// child session's pinned Loom workflow makes a material transition
+/// (node advance, gate wait, terminal). Clients that know the kind route
+/// it to the child's chip; older clients keep the generic quiet row.
+pub const AGENT_GRAPH_ROLLUP_EXTENSION_KIND: &str = "agent_graph_rollup_v1";
+
+/// Compact, render-ready state of one child's pinned workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGraphRollupV1 {
+    /// The child agent this rollup describes (the chip identity).
+    pub agent: AgentId,
+    /// Registry workflow id when the pinned template digest joins a
+    /// registered Loom workflow; `None` for ad-hoc templates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// The pinned instance's template digest (the drift-proof join key).
+    pub template_digest: String,
+    /// "running" | "gate" | "complete" | "failed" — additive vocabulary;
+    /// clients render unknown states as running.
+    pub state: String,
+    /// 1-based ordinal of the current node while running.
+    pub node_index: u64,
+    pub nodes_total: u64,
+    /// Nodes whose gates are fully satisfied.
+    pub nodes_green: u64,
+    /// The current node's source name, when one is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_label: Option<String>,
+    /// The current node's typed specialist (Loom agent-type id), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Pending gate vocabulary when `state == "gate"` (cmd/ship/human/…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+}

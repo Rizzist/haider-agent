@@ -163,7 +163,7 @@ pub(crate) fn parse_bare_tui_options(args: &[String]) -> Result<Option<BareTuiOp
             "--session" if options.session.is_none() => {
                 let id = iter
                     .next()
-                    .filter(|id| !id.is_empty())
+                    .filter(|id| !id.is_empty() && !id.starts_with('-'))
                     .ok_or_else(|| "--session requires a session id".to_owned())?;
                 options.session = Some(id.clone());
             }
@@ -449,7 +449,10 @@ async fn tui_command(rest: &[String]) -> ExitCode {
                 eprintln!("haider tui: --no-update-check was supplied twice");
                 return ExitCode::from(2);
             }
-            "--session" => match iter.next().filter(|id| !id.is_empty()) {
+            "--session" => match iter
+                .next()
+                .filter(|id| !id.is_empty() && !id.starts_with('-'))
+            {
                 Some(id) => session = Some(id.clone()),
                 None => {
                     eprintln!("haider tui: --session requires a session id");

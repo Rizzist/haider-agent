@@ -136,6 +136,24 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Mid-turn input mode — steer, subturn (next tool), or queue (turn end)",
         "<steer|subturn|turn>",
     ),
+    // D3+/W-UI: the Loom split surfaces (sim parity — launcher rows and
+    // palette both). `/graph` is the running pinned DAG; `/workflows` the
+    // registered pipe templates; `/loom` the capability-scoped agent types.
+    session_cmd(
+        "graph",
+        "Convergence Graph — the pinned run: nodes, gates, evidence",
+        "[pin]",
+    ),
+    cmd(
+        "workflows",
+        "Workflows — typed pipe DAGs: signatures, node chains, source",
+        "",
+    ),
+    cmd(
+        "loom",
+        "Loom — Agent Types: capability-scoped specialists · @type spawns one",
+        "",
+    ),
     session_cmd("update", "Check for and install a production update", ""),
     session_cmd("rename", "Rename this session", "<name>"),
     cmd("reset", "Reset the demo — restore the seed sessions", ""),
@@ -458,6 +476,9 @@ pub const HELP_TEXT: &[&str] = &[
     "  /talk [setup·wave] dictate into the composer (live) — ◉ chip or /talk toggles; ⏎ sends · esc cancels · typing keeps the words",
     "  /tools             core + custom tools · register with a dispatch mode (menu card) — demo only",
     "  /queue <steer|subturn|turn> mid-turn input — safe boundary, next tool call, or turn end",
+    "  /graph [pin]       Convergence Graph — where the pinned run stands (nodes · gates · evidence)",
+    "  /workflows         Workflows — registered typed pipe DAGs (tab ⇄ loom) — live only",
+    "  /loom              Loom — agent types: job, typed I/O, capability grants (tab ⇄ workflows) — live only",
     "  /update            check for and install production updates",
     "  /rename <name>     rename this session",
     "  /reset             reset the demo to the seed sessions",

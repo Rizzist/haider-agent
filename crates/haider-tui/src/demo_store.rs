@@ -856,6 +856,7 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         spawned_at_ms: dto.spawned_at_ms,
         last_event_at_ms: dto.last_event_at_ms,
         metrics: None,
+        graph: None,
         question: dto.question.map(|q| ChipQuestion {
             recovery: q.recovery,
             text: q.text,
