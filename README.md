@@ -1,5 +1,9 @@
 <div align="center">
 
+<img src="assets/haider-agent-logo.png" alt="Haider Agent logo" width="320" />
+
+<br/>
+
 # بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ
 
 *In the Name of God, the Most Beneficent, the Most Merciful*
