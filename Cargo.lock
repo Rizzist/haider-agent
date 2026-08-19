@@ -1225,6 +1225,7 @@ dependencies = [
  "haider-tui",
  "haider-verify",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

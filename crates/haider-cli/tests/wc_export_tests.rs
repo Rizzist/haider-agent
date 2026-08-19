@@ -117,7 +117,8 @@ fn markdown_renders_from_a_fixture_journal() {
 
 #[test]
 fn json_renders_a_stable_public_schema() {
-    let value: Value = serde_json::from_str(&fixture_export().to_json(false)).expect("json");
+    let rendered = fixture_export().to_json(false);
+    let value: Value = serde_json::from_str(&rendered).expect("json");
     assert_eq!(value["schema"], "haider.export.v1");
     assert_eq!(value["session_id"], "sess-abc");
     assert_eq!(value["cwd"], "/Users/dev/proj.rs");
@@ -126,6 +127,43 @@ fn json_renders_a_stable_public_schema() {
     assert_eq!(turns[0]["role"], "user");
     assert_eq!(turns[1]["role"], "assistant");
     assert_eq!(turns[2]["role"], "tool");
+
+    // EQUALITY LAW applies to this bounded export window. The native sidecar
+    // covers the full journal; successive `--since` windows cover any suffix
+    // beyond the CLI's one-shot replay cap.
+    let shared_rows: Vec<String> = fixture_events()
+        .iter()
+        .filter_map(haider_protocol::pipe::sidecar_row_line)
+        .collect();
+    let compact = compact_json_whitespace(&rendered);
+    assert!(
+        compact.contains(&format!("\"turns\":[{}]", shared_rows.join(","))),
+        "each unmasked JSON turn must preserve the shared sidecar row bytes: {rendered}"
+    );
+}
+
+fn compact_json_whitespace(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in input.chars() {
+        if in_string {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else if character == '"' {
+            in_string = true;
+            output.push(character);
+        } else if !character.is_whitespace() {
+            output.push(character);
+        }
+    }
+    output
 }
 
 #[test]
@@ -572,8 +610,8 @@ fn pipe_export_holds_the_line_law_and_is_append_only() {
         "the CLI's unmasked body must be exactly the shared native projection"
     );
 
-    // The line law survives hostile text: newlines and pipes escape instead
-    // of splitting or breaking a field.
+    // The line law survives hostile text and tool names: newlines and pipes
+    // escape instead of splitting or breaking a field.
     let mut hostile_events = fixture_events();
     hostile_events.push(node_env(
         999,
@@ -581,6 +619,15 @@ fn pipe_export_holds_the_line_law_and_is_append_only() {
         NodeKind::UserTurn {
             text: "line one\nline two |with pipes| and \\backslash".into(),
             attachments: Vec::new(),
+        },
+    ));
+    hostile_events.push(node_env(
+        1_000,
+        100,
+        NodeKind::ToolExchange {
+            tool: "bad tool|\n\\name".into(),
+            summary: "hostile tool name".into(),
+            artifact: None,
         },
     ));
     let hostile = SessionExport::project(fixture_meta(), &hostile_events);
@@ -593,6 +640,10 @@ fn pipe_export_holds_the_line_law_and_is_append_only() {
     assert!(
         rendered.contains("line one\\nline two \\|with pipes\\|"),
         "escapes must be visible:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("T  1000 100 |bad tool\\|\\n\\\\name| |hostile tool name|"),
+        "tool-name field must use the same one-line escaping:\n{rendered}"
     );
 
     // APPEND-ONLY LAW: exporting a session that only GREW yields the

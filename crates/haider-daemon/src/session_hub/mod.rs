@@ -1018,6 +1018,27 @@ impl SessionHub {
         Self::with_observer(store, config, Arc::new(NoopObserver))
     }
 
+    /// Reconciles journals committed by startup recovery before this hub
+    /// existed. Sidecar projection is best-effort, just like post-commit actor
+    /// maintenance: journal recovery remains authoritative if filesystem I/O
+    /// fails.
+    pub(crate) async fn reconcile_pipe_sidecars(&self, session_ids: &[SessionId]) {
+        for session_id in session_ids {
+            if let Err(error) = self
+                .inner
+                .pipe_native
+                .maintain(&self.inner.store, session_id, &[])
+                .await
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    %error,
+                    "startup-recovered native pipe sidecar reconciliation failed; journal remains authoritative"
+                );
+            }
+        }
+    }
+
     /// Creates a hub with a semantic-boundary observer.
     pub fn with_observer(
         store: SqliteStoreHandle,

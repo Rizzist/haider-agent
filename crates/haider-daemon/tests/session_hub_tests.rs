@@ -530,22 +530,33 @@ fn user_pipe_event(
     )
 }
 
-fn expected_pipe_body(events: &[RawEnvelope]) -> String {
+fn expected_sidecar_body(events: &[RawEnvelope]) -> String {
     let mut ordered: Vec<&RawEnvelope> = events.iter().collect();
     ordered.sort_by_key(|event| event.seq);
     ordered
         .into_iter()
-        .filter_map(haider_protocol::pipe::pipe_body_line)
+        .filter_map(haider_protocol::pipe::sidecar_row_line)
         .map(|line| format!("{line}\n"))
         .collect()
 }
 
-async fn stored_pipe_body(store: &SqliteStoreHandle, session_id: &SessionId) -> String {
+fn expected_sidecar(session_id: &SessionId, generation: u64, events: &[RawEnvelope]) -> String {
+    format!(
+        "{{\"pipe\":\"haider.session.jsonl\",\"version\":1,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n{}",
+        expected_sidecar_body(events)
+    )
+}
+
+async fn stored_sidecar(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    generation: u64,
+) -> String {
     let events = store
         .read(session_id, 0, usize::MAX)
         .await
         .expect("journal reads");
-    expected_pipe_body(&events)
+    expected_sidecar(session_id, generation, &events)
 }
 
 fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::PathBuf {
@@ -5938,10 +5949,13 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
 
     hub.append(&mut events).await.expect("pipe batch commits");
     let bytes = std::fs::read(sidecar_path(&root, &session_id)).expect("sidecar exists");
-    assert_eq!(bytes, expected_pipe_body(&events).into_bytes());
+    assert_eq!(
+        bytes,
+        expected_sidecar(&session_id, 1, &events).into_bytes()
+    );
     assert_eq!(
         String::from_utf8(bytes).expect("sidecar utf8"),
-        stored_pipe_body(&store, &session_id).await
+        stored_sidecar(&store, &session_id, 1).await
     );
     hub.shutdown().await.expect("hub stops");
 }
@@ -5961,7 +5975,7 @@ async fn native_pipe_truncates_a_torn_tail_before_resume() {
         .append(true)
         .open(&path)
         .expect("sidecar opens")
-        .write_all(b"U  999 999 |torn")
+        .write_all(b"{\"role\":\"user\",\"text\":\"torn\",\"at_ms\":999,\"seq\":999}")
         .expect("torn tail written");
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
@@ -5969,7 +5983,7 @@ async fn native_pipe_truncates_a_torn_tail_before_resume() {
     hub.append(&mut second).await.expect("second commits");
     assert_eq!(
         std::fs::read_to_string(path).expect("sidecar reads"),
-        stored_pipe_body(&store, &session_id).await
+        stored_sidecar(&store, &session_id, 1).await
     );
     hub.shutdown().await.expect("second hub stops");
 }
@@ -5987,8 +6001,8 @@ async fn native_pipe_resume_skips_the_already_reconciled_batch() {
     let mut second = vec![user_pipe_event(&session_id, "second", generation, "two")];
     hub.append(&mut second).await.expect("second commits");
     let body = std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads");
-    assert_eq!(body, stored_pipe_body(&store, &session_id).await);
-    assert_eq!(body.lines().count(), 2, "current batch must not duplicate");
+    assert_eq!(body, stored_sidecar(&store, &session_id, 1).await);
+    assert_eq!(body.lines().count(), 3, "current batch must not duplicate");
     hub.shutdown().await.expect("second hub stops");
 }
 
@@ -6017,7 +6031,7 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
     assert_eq!(
         std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads"),
-        stored_pipe_body(&store, &session_id).await
+        stored_sidecar(&store, &session_id, 1).await
     );
     hub.shutdown().await.expect("second hub stops");
 }
@@ -6032,12 +6046,47 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     hub.shutdown().await.expect("hub stops");
 
     let path = sidecar_path(&root, &session_id);
-    std::fs::write(&path, b"garbage without numeric sequence\n").expect("corruption writes");
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":1,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
+        ),
+    )
+    .expect("corruption writes");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
     assert_eq!(
         std::fs::read_to_string(path).expect("sidecar reads"),
-        stored_pipe_body(&store, &session_id).await
+        stored_sidecar(&store, &session_id, 2).await
+    );
+    hub.shutdown().await.expect("second hub stops");
+}
+
+#[tokio::test]
+async fn native_pipe_tail_ahead_of_journal_rebuilds_and_increments_generation() {
+    use std::io::Write as _;
+
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-ahead-tail");
+    let generation = store.worker_generation();
+    let mut first = vec![user_pipe_event(&session_id, "first", generation, "one")];
+    hub.append(&mut first).await.expect("first commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let path = sidecar_path(&root, &session_id);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("sidecar opens")
+        .write_all(b"{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n")
+        .expect("ahead row writes");
+
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
+    assert_eq!(
+        std::fs::read_to_string(path).expect("rebuilt sidecar reads"),
+        stored_sidecar(&store, &session_id, 2).await,
+        "a syntactically valid cursor ahead of the journal must not be trusted"
     );
     hub.shutdown().await.expect("second hub stops");
 }
@@ -6064,13 +6113,13 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     std::fs::create_dir(root.path().join("pipe")).expect("sidecar directory creates");
     std::fs::write(
         sidecar_path(&root, &session_id),
-        b"U  999 999 |plausible but untrusted after failure|\n",
+        b"{\"pipe\":\"haider.session.jsonl\",\"version\":1,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
     )
     .expect("stale sidecar writes");
     append_one(&hub, &session_id, generation, "retry-trigger").await;
     assert_eq!(
         std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("rebuilt sidecar reads"),
-        stored_pipe_body(&store, &session_id).await,
+        stored_sidecar(&store, &session_id, 10).await,
         "a dirty session must rebuild instead of trusting the old numeric tail"
     );
     hub.shutdown().await.expect("hub stops");

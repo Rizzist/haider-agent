@@ -119,12 +119,19 @@ struct OpenMenu {
     opening_generation: u64,
 }
 
-pub(crate) async fn recover_interrupted_turns(
+pub(crate) struct StartupTurnRecovery {
+    pub(crate) work: Vec<RecoveredWork>,
+    pub(crate) touched_sessions: Vec<SessionId>,
+}
+
+pub(crate) async fn recover_interrupted_turns_report(
     store: &SqliteStoreHandle,
     device_id: &DeviceId,
-) -> Result<Vec<RecoveredWork>, HaiderError> {
+) -> Result<StartupTurnRecovery, HaiderError> {
     let mut recovered = Vec::new();
+    let mut touched_sessions = Vec::new();
     for session_id in store.session_ids().await? {
+        let mut touched = false;
         let runnable_metadata = store.session_metadata(&session_id).await?.is_some();
         let mut cursor = 0;
         let mut reductions = HashMap::<RunId, RunReduction>::new();
@@ -174,12 +181,14 @@ pub(crate) async fn recover_interrupted_turns(
                     matches!(state, RunState::Cancelling),
                 )
                 .await?;
+                touched = true;
                 continue;
             }
             if state == RunState::Queued {
                 if let Some(accepted_seq) = reduction.user_seq {
                     if !activated_recovered_queue {
                         append_recovered_active(store, device_id, &session_id, &run_id).await?;
+                        touched = true;
                         activated_recovered_queue = true;
                     }
                     recovered.push(RecoveredWork::Queued(recovered_acceptance(
@@ -194,6 +203,7 @@ pub(crate) async fn recover_interrupted_turns(
                 {
                     if !activated_recovered_queue {
                         append_recovered_active(store, device_id, &session_id, &run_id).await?;
+                        touched = true;
                         activated_recovered_queue = true;
                     }
                     recovered.push(RecoveredWork::Retry(AcceptedRunRetry {
@@ -329,9 +339,26 @@ pub(crate) async fn recover_interrupted_turns(
                 matches!(state, RunState::Cancelling),
             )
             .await?;
+            touched = true;
+        }
+        if touched {
+            touched_sessions.push(session_id);
         }
     }
-    Ok(recovered)
+    Ok(StartupTurnRecovery {
+        work: recovered,
+        touched_sessions,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn recover_interrupted_turns(
+    store: &SqliteStoreHandle,
+    device_id: &DeviceId,
+) -> Result<Vec<RecoveredWork>, HaiderError> {
+    Ok(recover_interrupted_turns_report(store, device_id)
+        .await?
+        .work)
 }
 
 fn checkpoint_state_matches(state: &RunState, checkpoint: &RequestInputCheckpoint) -> bool {

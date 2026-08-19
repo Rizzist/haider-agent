@@ -25,7 +25,7 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorPresentation;
 use haider_protocol::history::NodeKind;
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::pipe::{escape_pipe_field, pipe_body_line};
+use haider_protocol::pipe::{escape_pipe_field, pipe_body_line, sidecar_row};
 use haider_tui::notify::mask_text;
 use serde_json::{Value, json};
 
@@ -106,8 +106,8 @@ impl Turn {
 pub struct SessionExport {
     pub meta: ExportMeta,
     pub turns: Vec<Turn>,
-    /// Source facts retained for byte-identical native pipe rendering. Other
-    /// formats continue to consume the transcript projection above.
+    /// Source facts retained for shared unmasked pipe/JSON row rendering.
+    /// Other formats continue to consume the transcript projection above.
     envelopes: Vec<RawEnvelope>,
     /// The highest journal seq SEEN in the replay (not just of rendered
     /// turns) — the exact catch-up cursor: subscribe `after_seq=head_seq`
@@ -312,10 +312,11 @@ impl SessionExport {
     /// A  <seq> <at_ms> |assistant text|
     /// A! <seq> <at_ms> |partial text| interrupted=|title: detail|
     /// E  <seq> <at_ms> |title: detail|
-    /// T  <seq> <at_ms> <tool-name> |summary|
+    /// T  <seq> <at_ms> |tool-name| |summary|
     /// ```
     ///
-    /// Text rides between pipes with `\` `|` and newline backslash-escaped,
+    /// Text and tool names ride between pipes with `\` `|` and newline
+    /// backslash-escaped,
     /// so ONE LINE PER EVENT holds for stream/grep consumers. The rendering
     /// is a pure function of the projection in `seq` order: re-exporting a
     /// session that only grew yields the previous bytes plus new lines, and
@@ -384,7 +385,8 @@ impl SessionExport {
                     at_ms,
                     seq,
                 } => format!(
-                    "T  {seq} {at_ms} {name} {}",
+                    "T  {seq} {at_ms} {} {}",
+                    escape_pipe_field(name),
                     escape_pipe_field(&self.text(summary, masked))
                 ),
             });
@@ -462,8 +464,47 @@ impl SessionExport {
 
     /// The structured export schema — a documented, stable public shape (NOT
     /// the raw envelope).
+    ///
+    /// Within an export window, unmasked `turns` rows are constructed from the
+    /// same serialized rows as the full-journal JSONL sidecar. A one-shot
+    /// export is bounded by [`MAX_REPLAY_EVENTS`]; use `--since` to reach the
+    /// remainder of journals larger than that window.
     #[must_use]
     pub fn to_json(&self, masked: bool) -> String {
+        if !masked {
+            #[derive(serde::Serialize)]
+            struct JsonDocument<'a, T> {
+                schema: &'static str,
+                session_id: &'a str,
+                title: Option<String>,
+                cwd: &'a str,
+                provider: &'a str,
+                model: &'a str,
+                created_at_ms: u64,
+                head_seq: u64,
+                masked: bool,
+                turns: T,
+            }
+
+            let document = JsonDocument {
+                schema: "haider.export.v1",
+                session_id: &self.meta.session_id,
+                title: self.title(false),
+                cwd: &self.meta.cwd,
+                provider: &self.meta.provider,
+                model: &self.meta.model,
+                created_at_ms: self.meta.created_at_ms,
+                head_seq: self.head_seq,
+                masked: false,
+                turns: self
+                    .envelopes
+                    .iter()
+                    .filter_map(sidecar_row)
+                    .collect::<Vec<_>>(),
+            };
+            return serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_owned());
+        }
+
         let turns: Vec<Value> = self
             .turns
             .iter()
@@ -1234,9 +1275,11 @@ const EX_UNAVAILABLE: u8 = 69;
 const EX_IOERR: u8 = 74;
 const EX_BLOCKED: u8 = 77;
 
-/// A hard cap on the envelopes retained for one export replay (M4). Export is
-/// a full, bounded, follow-off replay; a hostile or enormous session must not
-/// be able to OOM the exporter by streaming an unbounded number of facts.
+/// A hard cap on the envelopes retained for one export replay (M4). Each
+/// one-shot export is a bounded window; a hostile or enormous session must
+/// not be able to OOM the exporter by streaming an unbounded number of facts.
+/// `--since` advances the window to the remaining journal suffix. Unlike this
+/// windowed view, the daemon-maintained JSONL sidecar covers the full journal.
 const MAX_REPLAY_EVENTS: usize = 500_000;
 
 /// Drain `receiver` into a BOUNDED buffer of at most `max_events` items,

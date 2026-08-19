@@ -50,7 +50,7 @@ mod runtime_tests;
 use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_over_limit, serve};
 use crate::endpoint;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
-use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
+use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns_report};
 use crate::worker::WorkerManager;
 use crate::{
     DaemonConfig, DaemonDependencies, DaemonError, DaemonState, IncumbentDiagnostics, Readiness,
@@ -272,8 +272,8 @@ async fn run_inner(
         return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
     }
     let turn_recovery_started = Instant::now();
-    let recovered_work = match recover_interrupted_turns(&store, &device_id).await {
-        Ok(work) => work,
+    let turn_recovery = match recover_interrupted_turns_report(&store, &device_id).await {
+        Ok(recovery) => recovery,
         Err(error) => {
             let _ = store.close().await;
             return Err(error.into());
@@ -282,7 +282,7 @@ async fn run_inner(
     tracing::trace!(
         target: "haider.recovery",
         phase = "turns",
-        recovered_work = recovered_work.len(),
+        recovered_work = turn_recovery.work.len(),
         operation_micros = turn_recovery_started.elapsed().as_micros(),
         "pre-ready recovery phase completed"
     );
@@ -319,6 +319,12 @@ async fn run_inner(
     );
 
     let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
+    // Startup turn recovery commits directly through the store before a hub
+    // exists. Reconcile every journal it changed now: otherwise a terminal E
+    // row can remain absent forever when no later append touches the session.
+    hub.reconcile_pipe_sidecars(&turn_recovery.touched_sessions)
+        .await;
+    let recovered_work = turn_recovery.work;
     let (hook_service, hook_engine) =
         crate::hooks::HookEngine::start(config.store_dir.clone(), store.clone(), hub.clone())
             .await

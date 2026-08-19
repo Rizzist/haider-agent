@@ -22,6 +22,89 @@ fn shutdown_channel() -> (
     })
 }
 
+/// A startup terminalizer writes through the store before the session hub
+/// exists. The new hub must explicitly reconcile that session; no later
+/// append is allowed to hide the recovery-ordering hole this test pins.
+#[tokio::test]
+async fn startup_recovery_run_failed_reaches_sidecar_without_later_append() {
+    use crate::SessionHubConfig;
+    use crate::turn_recovery::recover_interrupted_turns_report;
+    use haider_core::{SqliteStoreHandle, StoreHandle};
+    use haider_protocol::EventPayload;
+    use haider_protocol::envelope::{
+        EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+    };
+    use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+    use haider_protocol::pipe::sidecar_row_line;
+    use haider_protocol::state::RunState;
+
+    let root = tempfile::tempdir().expect("profile");
+    let first = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open first generation");
+    let session_id = SessionId::new("startup-recovery-sidecar");
+    let run_id = RunId::new("interrupted-run");
+    let device_id = DeviceId::new("old-daemon");
+    let mut interrupted = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("interrupted-running"),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id),
+        agent_id: None,
+        device_id: device_id.clone(),
+        authority_epoch: 0,
+        worker_generation: first.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Thinking))
+            .expect("running payload"),
+    }];
+    StoreHandle::append(&first, &mut interrupted)
+        .await
+        .expect("seed interrupted run");
+    first.close().await.expect("close first generation");
+
+    let recovered = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open recovery generation");
+    let recovery = recover_interrupted_turns_report(&recovered, &DeviceId::new("new-daemon"))
+        .await
+        .expect("terminalize interrupted run");
+    assert_eq!(recovery.touched_sessions, vec![session_id.clone()]);
+    let events = StoreHandle::read(&recovered, &session_id, 0, 64)
+        .await
+        .expect("read recovered journal");
+    let failed: &RawEnvelope = events
+        .iter()
+        .find(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::RunFailed { .. })
+            )
+        })
+        .expect("recovery committed RunFailed");
+    let expected_error_row = sidecar_row_line(failed).expect("RunFailed projects to sidecar");
+
+    let hub = SessionHub::new(recovered.clone(), SessionHubConfig::default()).expect("hub");
+    hub.reconcile_pipe_sidecars(&recovery.touched_sessions)
+        .await;
+    let sidecar =
+        std::fs::read_to_string(root.path().join("pipe").join(format!("{session_id}.pipe")))
+            .expect("startup reconcile creates sidecar");
+    assert!(
+        sidecar.lines().any(|line| line == expected_error_row),
+        "recovery error row must be present without a subsequent append"
+    );
+}
+
 #[tokio::test]
 async fn a_step_that_completes_is_not_evidence_that_the_barrier_held() {
     let (_sender, shutdown) = shutdown_channel();

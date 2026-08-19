@@ -327,8 +327,11 @@ pub const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
 /// ADE capability sniff: `haider export` renders seq-keyed rows (pipe/json
 /// carry per-turn journal seq + a head_seq cursor, `--since` is exact).
 pub const FEATURE_EXPORT_SEQ_V1: &str = "export_seq_v1";
-/// Daemon maintains a crash-resumable native instruct-pipe sidecar for every
-/// session, byte-identical to the unmasked `haider export --format pipe` body.
+/// Daemon maintains a crash-resumable JSONL sidecar for every session. Its
+/// body rows are byte-identical to individually serialized turns from an
+/// unmasked `haider export --format json` within that export window. The
+/// sidecar covers the full journal; one-shot exports retain at most their
+/// bounded replay window and use `--since` to reach the remaining suffix.
 pub const FEATURE_PIPE_NATIVE_V1: &str = "pipe_native_v1";
 
 /// One todo child returned by `graph.run_set.open`.
