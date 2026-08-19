@@ -207,14 +207,23 @@ fn loom_screen_lists_registry() {
         Some(ratatui::style::Color::Rgb(0xc2, 0x70, 0x1c)),
         "type row must paint the registry accent"
     );
+    // W-UI pane split: workflows live on their own pane now — the Types
+    // pane never lists them.
+    assert!(
+        !rows.iter().any(|row| row.contains("@clip")),
+        "types pane must not list workflows:\n{}",
+        rows.join("\n")
+    );
+    model.loom_pane = haider_tui::app::LoomPane::Workflows;
+    let (rows, _) = draw(&model);
     assert!(
         rows.iter().any(|row| row.contains("@clip")),
-        "workflow row missing:\n{}",
+        "workflow row missing on the workflows pane:\n{}",
         rows.join("\n")
     );
 
     // ⏎ detail: the workflow pane shows the typed signature + pipe source.
-    model.loom_selection = 1;
+    model.loom_selection = 0;
     model.loom_detail = true;
     let (rows, _) = draw(&model);
     let all = rows.join("\n");

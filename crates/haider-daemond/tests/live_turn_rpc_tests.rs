@@ -3411,8 +3411,12 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
         names,
         [
             "request_input",
-            // G1: the actor-owned plan surface sits with request_input —
+            // D4/E2 (v0.0.925): the actor-owned plan surface and the
+            // plan-gated loom_register sit with request_input —
             // NotApplicable policy, no brokered effect.
+            "plan",
+            "loom_register",
+            // G1: the actor-owned todo surface.
             "todo_write",
             "graph_evidence",
             "fs_read",
