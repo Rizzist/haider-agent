@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 14;
 
 struct Migration {
     version: u32,
@@ -293,6 +293,12 @@ const MIGRATIONS: &[Migration] = &[
                 created_at_ms  INTEGER NOT NULL,
                 updated_at_ms  INTEGER NOT NULL
             );
+        ",
+    },
+    Migration {
+        version: 14,
+        sql: "
+            ALTER TABLE events ADD COLUMN payload_kind TEXT;
         ",
     },
 ];

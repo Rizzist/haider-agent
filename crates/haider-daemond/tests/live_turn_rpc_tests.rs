@@ -159,14 +159,20 @@ impl Provider for DurableEntryProvider {
             let mut statement = connection
                 .prepare("SELECT envelope_json FROM events ORDER BY seq ASC")
                 .expect("provider-entry query");
-            let envelopes = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .expect("provider-entry rows")
-                .map(|row| {
-                    serde_json::from_str::<RawEnvelope>(&row.expect("stored envelope"))
-                        .expect("typed stored envelope")
-                })
-                .collect::<Vec<_>>();
+            let mut rows = statement.query([]).expect("provider-entry rows");
+            let mut envelopes = Vec::<RawEnvelope>::new();
+            while let Some(row) = rows.next().expect("provider-entry row") {
+                let envelope = match row.get_ref(0).expect("stored envelope") {
+                    rusqlite::types::ValueRef::Text(bytes) => {
+                        serde_json::from_slice(bytes).expect("typed legacy JSON envelope")
+                    }
+                    rusqlite::types::ValueRef::Blob(bytes) => {
+                        rmp_serde::from_slice(bytes).expect("typed MessagePack envelope")
+                    }
+                    value => panic!("unexpected envelope storage class: {value:?}"),
+                };
+                envelopes.push(envelope);
+            }
             let run = envelopes.iter().find_map(|envelope| {
                 let payload =
                     serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;

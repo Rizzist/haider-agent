@@ -5,9 +5,11 @@
 //!   sequences are monotonic and gap-free even across processes.
 //! - An envelope is TRUE only once [`EventStore::append`] returns. Publishing
 //!   committed envelopes to live subscribers is the caller's duty.
-//! - The `envelope_json` column is the authoritative byte-for-byte record;
+//! - The `envelope_json` column stores the authoritative encoded record: JSON
+//!   text for legacy rows and MessagePack for current rows. Each row's bytes
+//!   remain authoritative and immutable;
 //!   the `seq` / `event_id` / `committed_at_ms` columns are denormalized
-//!   copies for indexing, cross-checked against the JSON on every read.
+//!   copies for indexing, cross-checked against the record on every read.
 //! - `worker_generation` is profile-owned and advances once per successful
 //!   open while the exclusive profile lock is held, fencing actor identities
 //!   across process restarts even when the wall clock repeats.
@@ -70,7 +72,7 @@ use haider_protocol::tool::{AttachmentBlock, ImageBlockRef};
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
-    TransactionBehavior, params,
+    TransactionBehavior, params, types::ValueRef,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -4683,7 +4685,7 @@ impl Store {
             },
             payload,
         };
-        let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
+        let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
                 format!("cannot serialize session-created envelope: {error}"),
@@ -4693,13 +4695,14 @@ impl Store {
         transaction
             .execute(
                 "INSERT INTO events(
-                    session_id, seq, envelope_json, event_id, committed_at_ms
-                 ) VALUES (?1, 1, ?2, ?3, ?4)",
+                    session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+                 ) VALUES (?1, 1, ?2, ?3, ?4, ?5)",
                 params![
                     command.session_id.as_str(),
-                    envelope_json,
+                    envelope_bytes,
                     command.event_id.as_str(),
                     created_at_sql,
+                    payload_kind(&envelope),
                 ],
             )
             .map_err(map_sqlite_error)?;
@@ -6929,10 +6932,9 @@ impl Store {
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let session_id: String = row.get(0).map_err(map_sqlite_error)?;
             let seq: i64 = row.get(1).map_err(map_sqlite_error)?;
-            let envelope_json: String = row.get(2).map_err(map_sqlite_error)?;
-            let envelope: RawEnvelope = serde_json::from_str(&envelope_json).map_err(|error| {
+            let envelope = decode_envelope_column(row, 2).map_err(|error| {
                 corrupt(format!(
-                    "invalid hook-outbox envelope JSON for session {session_id}, seq {seq}: {error}"
+                    "invalid hook-outbox envelope for session {session_id}, seq {seq}: {error}"
                 ))
             })?;
             let stored_seq = u64::try_from(seq)
@@ -7560,12 +7562,11 @@ impl Store {
         let mut spent = 0_usize;
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
-            let envelope_json: String = row.get(1).map_err(map_sqlite_error)?;
             let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
             let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-            let envelope: RawEnvelope = serde_json::from_str(&envelope_json).map_err(|error| {
+            let envelope = decode_envelope_column(row, 1).map_err(|error| {
                 corrupt(format!(
-                    "invalid envelope JSON for session {session}, seq {stored_seq}: {error}"
+                    "invalid envelope for session {session}, seq {stored_seq}: {error}"
                 ))
             })?;
             validate_stored_envelope(
@@ -8095,35 +8096,37 @@ fn graph_evidence_provenance(
     through_seq: u64,
     limit: usize,
 ) -> StoreResult<Vec<GraphEvidenceProvenanceRow>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut statement = connection
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
                AND seq > ?2
                AND seq <= ?3
-               AND instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
-               AND json_extract(envelope_json, '$.payload.graph_id') = ?4
-             ORDER BY seq ASC
-             LIMIT ?5",
+               AND (
+                   payload_kind = 'evidence_recorded'
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
+                       AND json_extract(envelope_json, '$.payload.graph_id') = ?4
+                   )
+               )
+             ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    let encoded = statement
-        .query_map(
-            params![
-                session_id.as_str(),
-                to_sqlite_integer(after_seq)?,
-                to_sqlite_integer(through_seq)?,
-                graph_id.as_str(),
-                i64::try_from(limit).unwrap_or(i64::MAX),
-            ],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(map_sqlite_error)?
-        .collect::<Result<Vec<_>, _>>()
+    let mut rows = statement
+        .query(params![
+            session_id.as_str(),
+            to_sqlite_integer(after_seq)?,
+            to_sqlite_integer(through_seq)?,
+            graph_id.as_str(),
+        ])
         .map_err(map_sqlite_error)?;
     let mut recorded = Vec::<(RawEnvelope, EvidenceRecorded)>::new();
-    for json in encoded {
-        let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid graph provenance envelope in session {session_id}: {error}"
             ))
@@ -8131,6 +8134,9 @@ fn graph_evidence_provenance(
         match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
             Ok(EventPayload::EvidenceRecorded(evidence)) if evidence.graph_id == *graph_id => {
                 recorded.push((envelope, evidence));
+                if recorded.len() == limit {
+                    break;
+                }
             }
             _ => {}
         }
@@ -8156,19 +8162,24 @@ fn graph_evidence_provenance(
                 "SELECT envelope_json FROM events
                  WHERE session_id = ?1
                    AND seq <= ?2
-                   AND instr(envelope_json, '\"type\":\"process_signal_recorded\"') > 0
+                   AND (
+                       payload_kind = 'process_signal_recorded'
+                       OR (
+                           payload_kind IS NULL
+                           AND instr(envelope_json, '\"type\":\"process_signal_recorded\"') > 0
+                       )
+                   )
                  ORDER BY seq ASC",
             )
             .map_err(map_sqlite_error)?;
-        let rows = signal_statement
-            .query_map(
-                params![session_id.as_str(), to_sqlite_integer(through_seq)?],
-                |row| row.get::<_, String>(0),
-            )
+        let mut rows = signal_statement
+            .query(params![
+                session_id.as_str(),
+                to_sqlite_integer(through_seq)?
+            ])
             .map_err(map_sqlite_error)?;
-        for json in rows {
-            let json = json.map_err(map_sqlite_error)?;
-            let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let envelope = decode_envelope_column(row, 0).map_err(|error| {
                 corrupt(format!(
                     "invalid graph signal provenance envelope in session {session_id}: {error}"
                 ))
@@ -8206,19 +8217,24 @@ fn graph_evidence_provenance(
                 "SELECT envelope_json FROM events
                  WHERE session_id = ?1
                    AND seq <= ?2
-                   AND instr(envelope_json, '\"workspace_mutation\"') > 0
+                   AND (
+                       payload_kind IN ('effect', 'task_completed')
+                       OR (
+                           payload_kind IS NULL
+                           AND instr(envelope_json, '\"workspace_mutation\"') > 0
+                       )
+                   )
                  ORDER BY seq ASC",
             )
             .map_err(map_sqlite_error)?;
-        let rows = mutation_statement
-            .query_map(
-                params![session_id.as_str(), to_sqlite_integer(through_seq)?],
-                |row| row.get::<_, String>(0),
-            )
+        let mut rows = mutation_statement
+            .query(params![
+                session_id.as_str(),
+                to_sqlite_integer(through_seq)?
+            ])
             .map_err(map_sqlite_error)?;
-        for json in rows {
-            let json = json.map_err(map_sqlite_error)?;
-            let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let envelope = decode_envelope_column(row, 0).map_err(|error| {
                 corrupt(format!(
                     "invalid graph mutation provenance envelope in session {session_id}: {error}"
                 ))
@@ -8349,8 +8365,7 @@ fn load_graph_reduction_envelopes(
     connection: &Connection,
     session_id: &SessionId,
 ) -> StoreResult<Vec<RawEnvelope>> {
-    // Event rows are always persisted through serde_json::to_string, so the
-    // compact outer payload tag is a stable marker. Prefix matching may
+    // The indexed outer payload kind is a stable marker. Prefix matching may
     // over-select a future graph/menu variant, which the tolerant reducer
     // ignores, but it cannot omit a current graph-reduction input.
     let mut statement = connection
@@ -8358,26 +8373,34 @@ fn load_graph_reduction_envelopes(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
                AND (
-                   instr(envelope_json, '\"type\":\"graph_') > 0
-                   OR instr(envelope_json, '\"type\":\"todo_graph_attached\"') > 0
-                   OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
-                   OR instr(envelope_json, '\"type\":\"menu_') > 0
+                   payload_kind LIKE 'graph\\_%' ESCAPE '\\'
+                   OR payload_kind = 'todo_graph_attached'
+                   OR payload_kind = 'evidence_recorded'
+                   OR payload_kind LIKE 'menu\\_%' ESCAPE '\\'
+                   OR (
+                       payload_kind IS NULL
+                       AND (
+                           instr(envelope_json, '\"type\":\"graph_') > 0
+                           OR instr(envelope_json, '\"type\":\"todo_graph_attached\"') > 0
+                           OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
+                           OR instr(envelope_json, '\"type\":\"menu_') > 0
+                       )
+                   )
                )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    let envelopes = statement
-        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
-        .map_err(map_sqlite_error)?
-        .map(|json| {
-            let json = json.map_err(map_sqlite_error)?;
-            serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
-                corrupt(format!(
-                    "invalid graph-reduction envelope in session {session_id}: {error}"
-                ))
-            })
-        })
-        .collect::<StoreResult<Vec<_>>>()?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        envelopes.push(decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!(
+                "invalid graph-reduction envelope in session {session_id}: {error}"
+            ))
+        })?);
+    }
     Ok(envelopes)
 }
 
@@ -8385,22 +8408,30 @@ fn rebuild_graph_telemetry_cache(connection: &Connection) -> StoreResult<GraphTe
     let mut statement = connection
         .prepare(
             "SELECT envelope_json FROM events
-             WHERE instr(envelope_json, '\"type\":\"graph_') > 0
-                OR instr(envelope_json, '\"type\":\"todo_graph_attached\"') > 0
-                OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
-                OR instr(envelope_json, '\"type\":\"menu_') > 0
-                OR instr(envelope_json, '\"item\":\"tool_call\"') > 0
-                OR instr(envelope_json, '\"type\":\"tool_result\"') > 0
+             WHERE payload_kind LIKE 'graph\\_%' ESCAPE '\\'
+                OR payload_kind = 'todo_graph_attached'
+                OR payload_kind = 'evidence_recorded'
+                OR payload_kind LIKE 'menu\\_%' ESCAPE '\\'
+                OR payload_kind = 'item'
+                OR payload_kind = 'tool_result'
+                OR (
+                    payload_kind IS NULL
+                    AND (
+                        instr(envelope_json, '\"type\":\"graph_') > 0
+                        OR instr(envelope_json, '\"type\":\"todo_graph_attached\"') > 0
+                        OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
+                        OR instr(envelope_json, '\"type\":\"menu_') > 0
+                        OR instr(envelope_json, '\"item\":\"tool_call\"') > 0
+                        OR instr(envelope_json, '\"type\":\"tool_result\"') > 0
+                    )
+                )
              ORDER BY session_id ASC, seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(map_sqlite_error)?;
+    let mut rows = statement.query([]).map_err(map_sqlite_error)?;
     let mut grouped = HashMap::<SessionId, Vec<RawEnvelope>>::new();
-    for json in rows {
-        let json = json.map_err(map_sqlite_error)?;
-        let envelope = serde_json::from_str::<RawEnvelope>(&json).map_err(|error| {
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid graph telemetry envelope during store open: {error}"
             ))
@@ -9063,12 +9094,18 @@ fn validate_computer_observation_effect(
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
-               AND instr(envelope_json, '\"type\":\"effect\"') > 0
+               AND (
+                   payload_kind = 'effect'
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"type\":\"effect\"') > 0
+                   )
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    let rows = statement
-        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+    let mut rows = statement
+        .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
     let mut intent_seq = None;
     let mut authorized_seq = None;
@@ -9079,9 +9116,8 @@ fn validate_computer_observation_effect(
         ComputerObservationKind::Inspect => "computer inspect",
     };
 
-    for json in rows {
-        let json = json.map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid effect envelope in session {session_id}: {error}"
             ))
@@ -9281,16 +9317,21 @@ fn load_workspace_mutation(
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
-               AND instr(envelope_json, '\"workspace_mutation\"') > 0
+               AND (
+                   payload_kind IN ('effect', 'task_completed')
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"workspace_mutation\"') > 0
+                   )
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    let rows = statement
-        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+    let mut rows = statement
+        .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
-    for json in rows {
-        let json = json.map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid workspace-mutation envelope in session {session_id}: {error}"
             ))
@@ -9332,22 +9373,26 @@ fn load_workspace_mutation(
             .prepare_cached(
                 "SELECT envelope_json FROM events
                  WHERE session_id = ?1
-                   AND instr(envelope_json, '\"type\":\"effect\"') > 0
+                   AND (
+                       payload_kind = 'effect'
+                       OR (
+                           payload_kind IS NULL
+                           AND instr(envelope_json, '\"type\":\"effect\"') > 0
+                       )
+                   )
                  ORDER BY seq ASC",
             )
             .map_err(map_sqlite_error)?;
-        let intent_rows = intent_statement
-            .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+        let mut intent_rows = intent_statement
+            .query([session_id.as_str()])
             .map_err(map_sqlite_error)?;
         let mut matched_intent = false;
-        for intent_json in intent_rows {
-            let intent_json = intent_json.map_err(map_sqlite_error)?;
-            let intent_envelope: RawEnvelope =
-                serde_json::from_str(&intent_json).map_err(|error| {
-                    corrupt(format!(
-                        "invalid effect envelope in session {session_id}: {error}"
-                    ))
-                })?;
+        while let Some(row) = intent_rows.next().map_err(map_sqlite_error)? {
+            let intent_envelope = decode_envelope_column(row, 0).map_err(|error| {
+                corrupt(format!(
+                    "invalid effect envelope in session {session_id}: {error}"
+                ))
+            })?;
             let Ok(EventPayload::Effect(EffectPhase::Intent(intent))) =
                 serde_json::from_value::<EventPayload>(intent_envelope.payload)
             else {
@@ -9569,26 +9614,33 @@ fn load_child_graph_attachments(
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
-               AND instr(envelope_json, '\"type\":\"child_graph_attached\"') > 0
+               AND (
+                   payload_kind = 'child_graph_attached'
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"type\":\"child_graph_attached\"') > 0
+                   )
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    statement
-        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
-        .map_err(map_sqlite_error)?
-        .filter_map(|json| match json {
-            Err(error) => Some(Err(map_sqlite_error(error))),
-            Ok(json) => match serde_json::from_str::<RawEnvelope>(&json) {
-                Err(error) => Some(Err(corrupt(format!(
-                    "invalid child attachment envelope in session {session_id}: {error}"
-                )))),
-                Ok(envelope) => match serde_json::from_value::<EventPayload>(envelope.payload) {
-                    Ok(EventPayload::ChildGraphAttached(attached)) => Some(Ok(attached)),
-                    _ => None,
-                },
-            },
-        })
-        .collect()
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut attached = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!(
+                "invalid child attachment envelope in session {session_id}: {error}"
+            ))
+        })?;
+        if let Ok(EventPayload::ChildGraphAttached(item)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            attached.push(item);
+        }
+    }
+    Ok(attached)
 }
 
 #[allow(clippy::result_large_err)]
@@ -9646,28 +9698,27 @@ fn load_child_template_observations(
     let mut statement = connection
         .prepare_cached(
             "SELECT envelope_json FROM events
-             WHERE instr(envelope_json, '\"type\":\"child_template_observed\"') > 0
+             WHERE payload_kind = 'child_template_observed'
+                OR (
+                    payload_kind IS NULL
+                    AND instr(envelope_json, '\"type\":\"child_template_observed\"') > 0
+                )
              ORDER BY session_id ASC, seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(map_sqlite_error)?
-        .filter_map(|json| match json {
-            Err(error) => Some(Err(map_sqlite_error(error))),
-            Ok(json) => match serde_json::from_str::<RawEnvelope>(&json) {
-                Err(error) => Some(Err(corrupt(format!(
-                    "invalid child cache observation envelope: {error}"
-                )))),
-                Ok(envelope) => match serde_json::from_value::<EventPayload>(envelope.payload) {
-                    Ok(EventPayload::ChildTemplateObserved(observed)) => {
-                        Some(Ok((envelope.session_id, observed)))
-                    }
-                    _ => None,
-                },
-            },
-        })
-        .collect()
+    let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+    let mut observed = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!("invalid child cache observation envelope: {error}"))
+        })?;
+        if let Ok(EventPayload::ChildTemplateObserved(item)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            observed.push((envelope.session_id, item));
+        }
+    }
+    Ok(observed)
 }
 
 #[allow(clippy::result_large_err)]
@@ -10023,20 +10074,23 @@ fn process_signals_since(
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1 AND seq >= ?2
-               AND instr(envelope_json, '\"type\":\"process_signal_recorded\"') > 0
+               AND (
+                   payload_kind = 'process_signal_recorded'
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"type\":\"process_signal_recorded\"') > 0
+                   )
+               )
              ORDER BY seq DESC",
         )
         .map_err(map_sqlite_error)?;
     let first_seq = to_sqlite_integer(first_seq)?;
-    let rows = statement
-        .query_map(params![session_id.as_str(), first_seq], |row| {
-            row.get::<_, String>(0)
-        })
+    let mut rows = statement
+        .query(params![session_id.as_str(), first_seq])
         .map_err(map_sqlite_error)?;
     let mut signals = Vec::new();
-    for json in rows {
-        let json = json.map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid process-signal envelope in session {session_id}: {error}"
             ))
@@ -10089,7 +10143,13 @@ fn workspace_revision_at_or_before(
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1 AND seq <= ?2
-               AND instr(envelope_json, '\"workspace_mutation\"') > 0
+               AND (
+                   payload_kind IN ('effect', 'task_completed')
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"workspace_mutation\"') > 0
+                   )
+               )
              ORDER BY seq DESC",
         )
         .map_err(map_sqlite_error)?;
@@ -10100,8 +10160,7 @@ fn workspace_revision_at_or_before(
         ])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let json: String = row.get(0).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid workspace-mutation envelope in session {session_id}: {error}"
             ))
@@ -10143,7 +10202,13 @@ fn process_effect_outcome_seq(
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
-               AND instr(envelope_json, '\"type\":\"effect\"') > 0
+               AND (
+                   payload_kind = 'effect'
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"type\":\"effect\"') > 0
+                   )
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
@@ -10151,8 +10216,7 @@ fn process_effect_outcome_seq(
         .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let json: String = row.get(0).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid process-effect envelope in session {session_id}: {error}"
             ))
@@ -10212,7 +10276,14 @@ fn validate_process_signal_provenance(
     let mut statement = transaction
         .prepare_cached(
             "SELECT envelope_json FROM events
-             WHERE session_id = ?1 AND instr(envelope_json, '\"type\":\"effect\"') > 0
+             WHERE session_id = ?1
+               AND (
+                   payload_kind = 'effect'
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"type\":\"effect\"') > 0
+                   )
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
@@ -10222,8 +10293,7 @@ fn validate_process_signal_provenance(
     let mut matched_intent = false;
     let mut matched_terminal = false;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let json: String = row.get(0).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid effect envelope in session {session_id}: {error}"
             ))
@@ -10452,8 +10522,7 @@ fn latest_run_states(
     let mut states = HashMap::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let json: String = row.get(1).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -10495,16 +10564,13 @@ fn main_timeline_retrying_event_id(
         .map_err(map_sqlite_error)?;
     let stored_seq = i64::try_from(state_seq)
         .map_err(|_| corrupt("event sequence exceeds SQLite INTEGER range"))?;
-    let Some(json) = statement
-        .query_row(rusqlite::params![session_id.as_str(), stored_seq], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()
-        .map_err(map_sqlite_error)?
-    else {
+    let mut rows = statement
+        .query(rusqlite::params![session_id.as_str(), stored_seq])
+        .map_err(map_sqlite_error)?;
+    let Some(row) = rows.next().map_err(map_sqlite_error)? else {
         return Ok(None);
     };
-    let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+    let envelope = decode_envelope_column(row, 0).map_err(|error| {
         corrupt(format!(
             "invalid envelope JSON for session {session_id}, seq {state_seq}: {error}"
         ))
@@ -10536,8 +10602,7 @@ fn main_timeline_run_prompt_source(
     let mut source = None;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let json: String = row.get(1).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -10588,8 +10653,7 @@ fn latest_main_timeline_failed_turn(
     let mut failed = HashSet::<RunId>::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let json: String = row.get(1).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -10652,8 +10716,7 @@ fn latest_tree_head(
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq: i64 = row.get(0).map_err(map_sqlite_error)?;
-        let json: String = row.get(1).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -10754,8 +10817,8 @@ fn append_transaction_envelopes(
     let mut insert = transaction
         .prepare_cached(
             "INSERT INTO events(
-                session_id, seq, envelope_json, event_id, committed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(map_sqlite_error)?;
     for (offset, envelope) in envelopes.iter_mut().enumerate() {
@@ -10765,7 +10828,7 @@ fn append_transaction_envelopes(
             .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
         envelope.committed_at_ms = committed_at_ms;
         stamp_workspace_mutation(transaction, envelope)?;
-        let json = serde_json::to_string(envelope).map_err(|error| {
+        let bytes = encode_envelope(envelope).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
                 format!("cannot serialize command envelope: {error}"),
@@ -10776,9 +10839,10 @@ fn append_transaction_envelopes(
             .execute(params![
                 session_id.as_str(),
                 to_sqlite_integer(envelope.seq)?,
-                json,
+                bytes,
                 envelope.event_id.as_str(),
                 to_sqlite_integer(committed_at_ms)?,
+                payload_kind(envelope),
             ])
             .map_err(map_sqlite_error)?;
         enqueue_hook_dispatch(transaction, envelope)?;
@@ -11473,19 +11537,18 @@ fn load_envelope(
     session_id: &SessionId,
     seq: u64,
 ) -> StoreResult<Option<RawEnvelope>> {
-    let envelope_json = connection
-        .query_row(
-            "SELECT envelope_json FROM events WHERE session_id = ?1 AND seq = ?2",
-            params![session_id.as_str(), to_sqlite_integer(seq)?],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
+    let mut statement = connection
+        .prepare_cached("SELECT envelope_json FROM events WHERE session_id = ?1 AND seq = ?2")
         .map_err(map_sqlite_error)?;
-    envelope_json
-        .map(|json| {
-            serde_json::from_str(&json).map_err(|error| {
+    let mut rows = statement
+        .query(params![session_id.as_str(), to_sqlite_integer(seq)?])
+        .map_err(map_sqlite_error)?;
+    rows.next()
+        .map_err(map_sqlite_error)?
+        .map(|row| {
+            decode_envelope_column(row, 0).map_err(|error| {
                 corrupt(format!(
-                    "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+                    "invalid envelope for session {session_id}, seq {seq}: {error}"
                 ))
             })
         })
@@ -11496,21 +11559,17 @@ fn load_envelope_by_event_id(
     transaction: &Transaction<'_>,
     event_id: &EventId,
 ) -> StoreResult<Option<RawEnvelope>> {
-    let envelope_json = transaction
-        .query_row(
-            "SELECT envelope_json FROM events WHERE event_id = ?1",
-            [event_id.as_str()],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
+    let mut statement = transaction
+        .prepare_cached("SELECT envelope_json FROM events WHERE event_id = ?1")
         .map_err(map_sqlite_error)?;
-    envelope_json
-        .map(|json| {
-            serde_json::from_str(&json).map_err(|error| {
-                corrupt(format!(
-                    "invalid envelope JSON for event {event_id}: {error}"
-                ))
-            })
+    let mut rows = statement
+        .query([event_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    rows.next()
+        .map_err(map_sqlite_error)?
+        .map(|row| {
+            decode_envelope_column(row, 0)
+                .map_err(|error| corrupt(format!("invalid envelope for event {event_id}: {error}")))
         })
         .transpose()
 }
@@ -11614,8 +11673,7 @@ fn historical_resolution(
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let json: String = row.get(1).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {}, seq {seq}: {error}",
                 command.session_id
@@ -11746,12 +11804,11 @@ impl EventStore for Store {
         let mut envelopes = Vec::new();
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
-            let envelope_json: String = row.get(1).map_err(map_sqlite_error)?;
             let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
             let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-            let envelope: RawEnvelope = serde_json::from_str(&envelope_json).map_err(|error| {
+            let envelope = decode_envelope_column(row, 1).map_err(|error| {
                 corrupt(format!(
-                    "invalid envelope JSON for session {session}, seq {stored_seq}: {error}"
+                    "invalid envelope for session {session}, seq {stored_seq}: {error}"
                 ))
             })?;
             validate_stored_envelope(
@@ -11823,8 +11880,8 @@ fn append_envelopes(
         let mut insert = transaction
             .prepare_cached(
                 "INSERT INTO events(
-                    session_id, seq, envelope_json, event_id, committed_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .map_err(map_sqlite_error)?;
         for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter()) {
@@ -11832,7 +11889,7 @@ fn append_envelopes(
             envelope.seq = seq;
             envelope.committed_at_ms = committed_at_ms;
             stamp_workspace_mutation(&transaction, &mut envelope)?;
-            let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
+            let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
                     format!("cannot serialize event envelope: {error}"),
@@ -11843,9 +11900,10 @@ fn append_envelopes(
                 .execute(params![
                     session.as_str(),
                     to_sqlite_integer(seq)?,
-                    envelope_json,
+                    envelope_bytes,
                     envelope.event_id.as_str(),
                     committed_at_sql,
+                    payload_kind(&envelope),
                 ])
                 .map_err(map_sqlite_error)?;
             enqueue_hook_dispatch(&transaction, &envelope)?;
@@ -11950,18 +12008,21 @@ fn validate_workspace_mutation_intent(
         .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
-               AND instr(envelope_json, '\"type\":\"effect\"') > 0
+               AND (
+                   payload_kind = 'effect'
+                   OR (
+                       payload_kind IS NULL
+                       AND instr(envelope_json, '\"type\":\"effect\"') > 0
+                   )
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
-    let rows = statement
-        .query_map([envelope.session_id.as_str()], |row| {
-            row.get::<_, String>(0)
-        })
+    let mut rows = statement
+        .query([envelope.session_id.as_str()])
         .map_err(map_sqlite_error)?;
-    for json in rows {
-        let json = json.map_err(map_sqlite_error)?;
-        let candidate: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let candidate = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid effect envelope in session {}: {error}",
                 envelope.session_id
@@ -12312,8 +12373,7 @@ fn validate_branch_fork(
     let mut candidate = None;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let json: String = row.get(1).map_err(map_sqlite_error)?;
-        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -12816,8 +12876,38 @@ fn open_connection(path: &Path) -> StoreResult<Connection> {
     Ok(connection)
 }
 
+fn encode_envelope(envelope: &RawEnvelope) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    rmp_serde::to_vec_named(envelope)
+}
+
+fn payload_kind(envelope: &RawEnvelope) -> &str {
+    envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// Decodes the authoritative event record according to its SQLite storage
+/// class. Version-13-and-earlier rows are JSON `TEXT`; current rows are
+/// MessagePack `BLOB`s.
+fn decode_envelope_column(row: &rusqlite::Row<'_>, index: usize) -> Result<RawEnvelope, String> {
+    let value = row
+        .get_ref(index)
+        .map_err(|error| format!("cannot read encoded envelope column: {error}"))?;
+    match value {
+        ValueRef::Text(bytes) => serde_json::from_slice(bytes)
+            .map_err(|error| format!("legacy JSON decode failed: {error}")),
+        ValueRef::Blob(bytes) => rmp_serde::from_slice(bytes)
+            .map_err(|error| format!("MessagePack decode failed: {error}")),
+        ValueRef::Null => Err("encoded envelope has SQLite NULL storage class".to_owned()),
+        ValueRef::Integer(_) => Err("encoded envelope has SQLite INTEGER storage class".to_owned()),
+        ValueRef::Real(_) => Err("encoded envelope has SQLite REAL storage class".to_owned()),
+    }
+}
+
 /// Cross-checks the denormalized row columns against the fields embedded in
-/// the envelope JSON. Any disagreement means the journal was tampered with or
+/// the encoded envelope. Any disagreement means the journal was tampered with or
 /// corrupted, never a validation bug in the caller.
 fn validate_stored_envelope(
     requested_session: &SessionId,

@@ -13,6 +13,7 @@ haider-platform = { path = "../haider-platform" }
 haider-protocol = { path = "../haider-protocol" }
 image.workspace = true
 rusqlite.workspace = true
+rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

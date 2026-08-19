@@ -43,6 +43,50 @@ use haider_store::{
     GraphSwitchOutcome, MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand,
     ProcessSignalOutcome, SessionCreateCommand, Store,
 };
+use rusqlite::params;
+
+fn rewrite_first_blob_kind_as_legacy(store: &Store, kind: &str) {
+    let connection = rusqlite::Connection::open(store.database_path()).expect("open raw journal");
+    let (rowid, bytes): (i64, Vec<u8>) = connection
+        .query_row(
+            "SELECT rowid, envelope_json FROM events
+             WHERE payload_kind = ?1 AND typeof(envelope_json) = 'blob'
+             ORDER BY session_id, seq LIMIT 1",
+            [kind],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("matching blob row");
+    let envelope: haider_protocol::envelope::RawEnvelope =
+        rmp_serde::from_slice(&bytes).expect("decode MessagePack test row");
+    let json = serde_json::to_string(&envelope).expect("encode legacy JSON test row");
+    connection
+        .execute(
+            "UPDATE events SET envelope_json = ?1, payload_kind = NULL WHERE rowid = ?2",
+            params![json, rowid],
+        )
+        .expect("rewrite row as legacy JSON text");
+}
+
+fn rewrite_blob_event_as_legacy(store: &Store, event_id: &EventId) {
+    let connection = rusqlite::Connection::open(store.database_path()).expect("open raw journal");
+    let bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT envelope_json FROM events
+             WHERE event_id = ?1 AND typeof(envelope_json) = 'blob'",
+            [event_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("matching blob event");
+    let envelope: haider_protocol::envelope::RawEnvelope =
+        rmp_serde::from_slice(&bytes).expect("decode MessagePack test event");
+    let json = serde_json::to_string(&envelope).expect("encode legacy JSON test event");
+    connection
+        .execute(
+            "UPDATE events SET envelope_json = ?1, payload_kind = NULL WHERE event_id = ?2",
+            params![json, event_id.as_str()],
+        )
+        .expect("rewrite event as legacy JSON text");
+}
 
 fn create_session(store: &Store, name: &str) -> SessionId {
     let session_id = SessionId::new(name);
@@ -1489,6 +1533,71 @@ fn filesystem_mutation_subject_is_daemon_verified_and_stale_checkable() {
             .as_ref()
             .and_then(|details| details["kind"].as_str()),
         Some("stale_evidence_subject")
+    );
+}
+
+/// MUTATION CHECK: drop either the payload-kind branch or the legacy
+/// substring fallback from evidence/workspace provenance pushdowns. Expected
+/// failure: graph inspection loses one format's evidence or enrichment.
+#[test]
+fn graph_inspect_preserves_legacy_and_blob_workspace_provenance() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "mixed-workspace-provenance");
+    pin(&store, &session_id, "mixed-workspace-provenance");
+    advance_to_verify(&store, &session_id, 53_000);
+
+    let mut first_evidence_event = None;
+    for (offset, slot) in [(1_usize, "tests"), (2, "lint")] {
+        let serial = 53_000 + offset;
+        let run_id = RunId::new(format!("mixed-mutation-run-{serial}"));
+        let (mutation, _) =
+            append_workspace_mutation(&store, &session_id, &run_id, serial, EffectClass::FsWrite);
+        let mut command = evidence_command(
+            &store,
+            &session_id,
+            serial + 10,
+            haider_protocol::graph::verify_node(),
+            EvidenceVerdict::Green,
+            "mixed-format workspace evidence",
+        );
+        command.run_id = run_id.clone();
+        command.slot = Some(slot.into());
+        command.subject_digest = mutation.subject_digest.clone();
+        command.workspace_mutation = Some(WorkspaceMutationRef {
+            run_id,
+            effect_id: mutation.effect_id,
+        });
+        let GraphEvidenceOutcome::Committed { envelopes, .. } = store
+            .record_graph_evidence(&command)
+            .expect("record workspace evidence")
+        else {
+            panic!("fresh workspace evidence commits");
+        };
+        if first_evidence_event.is_none() {
+            first_evidence_event = envelopes
+                .iter()
+                .find(|envelope| envelope.payload["type"] == "evidence_recorded")
+                .map(|envelope| envelope.event_id.clone());
+        }
+    }
+
+    rewrite_blob_event_as_legacy(&store, &EventId::new("mutation-outcome-53001"));
+    rewrite_blob_event_as_legacy(&store, &first_evidence_event.expect("first evidence event"));
+    let inspected = store
+        .graph_inspect(&session_id, None, u32::MAX)
+        .expect("inspect mixed provenance");
+    let workspace_rows = inspected
+        .snapshot
+        .evidence
+        .iter()
+        .filter(|row| matches!(row.source, GraphEvidenceSource::WorkspaceMutation { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(workspace_rows.len(), 2);
+    assert!(
+        workspace_rows
+            .iter()
+            .all(|row| row.workspace_mutation.is_some())
     );
 }
 
@@ -3446,6 +3555,8 @@ fn m2c_metrics_rebuild_byte_for_byte_after_reopen() {
                 "abandon-and-finish",
             ))
             .expect("explicit override");
+        rewrite_first_blob_kind_as_legacy(&store, "graph_pinned");
+        rewrite_first_blob_kind_as_legacy(&store, "evidence_recorded");
         serde_json::to_vec(&(
             store.graph_runs(&session_id).expect("runs"),
             store.graph_node_attempts(&session_id).expect("attempts"),
@@ -4382,6 +4493,16 @@ fn m2c_graph_inspect_is_bounded_paged_and_never_exposes_evidence_detail() {
         EvidenceVerdict::Green,
         "SECRET RAW TEST OUTPUT",
     );
+    record_verify_slot(
+        &store,
+        &session_id,
+        41_002,
+        "lint",
+        EvidenceVerdict::Green,
+        "SECRET RAW LINT OUTPUT",
+    );
+    rewrite_first_blob_kind_as_legacy(&store, "evidence_recorded");
+    rewrite_first_blob_kind_as_legacy(&store, "process_signal_recorded");
     let first = store
         .graph_inspect(&session_id, None, 1)
         .expect("first inspect page");

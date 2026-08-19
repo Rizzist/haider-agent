@@ -86,6 +86,107 @@ fn append_read_and_reopen_replay_are_byte_identical() {
     assert_eq!(must(serde_json::to_vec(&replayed)), committed_json);
 }
 
+/// MUTATION CHECK: make the reader accept only one SQLite storage class.
+/// Expected failure: either the hand-inserted legacy row or the API-appended
+/// MessagePack row cannot be replayed across the format boundary.
+#[test]
+fn mixed_legacy_json_and_msgpack_rows_obey_journal_laws() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("session-mixed-encoding");
+    let mut legacy = envelope(&session, "legacy-json", json!({"type": "legacy_fact"}));
+    legacy.seq = 1;
+    legacy.committed_at_ms = 101;
+
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute(
+        "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
+        params![session.as_str(), 101_i64, "{}"],
+    ));
+    must(connection.execute(
+        "INSERT INTO events(
+            session_id, seq, envelope_json, event_id, committed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            session.as_str(),
+            1_i64,
+            must(serde_json::to_string(&legacy)),
+            legacy.event_id.as_str(),
+            101_i64,
+        ],
+    ));
+    drop(connection);
+
+    let mut current = vec![envelope(
+        &session,
+        "current-msgpack",
+        json!({"type": "current_fact"}),
+    )];
+    let range = must(store.append(&mut current));
+    assert_eq!((range.first_seq, range.last_seq), (2, 2));
+    assert_eq!(must(store.latest_seq(&session)), 2);
+    assert_eq!(
+        must(store.read(&session, 0, 10)),
+        [legacy.clone(), current[0].clone()]
+    );
+    assert_eq!(must(store.read(&session, 1, 10)), current);
+    assert_eq!(
+        must(store.journal_replay(&session)),
+        [legacy, current[0].clone()]
+    );
+}
+
+/// MUTATION CHECK: bind encoded bytes as text or omit the payload-kind index.
+/// Expected failure: SQLite reports the wrong storage class or kind.
+#[test]
+fn append_stores_msgpack_blob_and_payload_kind() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("session-blob-storage-pin");
+    let mut batch = vec![envelope(
+        &session,
+        "blob-storage-pin",
+        json!({"type": "storage_pin", "value": 42}),
+    )];
+    must(store.append(&mut batch));
+
+    let connection = must(Connection::open(store.database_path()));
+    let (storage_class, kind): (String, String) = must(connection.query_row(
+        "SELECT typeof(envelope_json), payload_kind FROM events WHERE event_id = ?1",
+        [batch[0].event_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ));
+    assert_eq!(storage_class, "blob");
+    assert_eq!(kind, "storage_pin");
+}
+
+/// MUTATION CHECK: remove the global UNIQUE law on `events.event_id`.
+/// Expected failure: the duplicate blob commits and advances the journal head.
+#[test]
+fn duplicate_event_id_is_rejected_after_blob_commit() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("session-blob-duplicate");
+    let mut original = vec![envelope(
+        &session,
+        "blob-duplicate-id",
+        json!({"type": "original"}),
+    )];
+    must(store.append(&mut original));
+
+    let mut duplicate = vec![envelope(
+        &session,
+        "blob-duplicate-id",
+        json!({"type": "duplicate"}),
+    )];
+    let Err(error) = store.append(&mut duplicate) else {
+        panic!("duplicate event ID unexpectedly committed");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(must(store.latest_seq(&session)), 1);
+    assert_eq!(must(store.read(&session, 0, 10)), original);
+}
+
 #[test]
 fn sequences_are_monotonic_gap_free_and_per_session() {
     let root = test_root();
@@ -364,19 +465,19 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 13);
+        assert_eq!(must(store.schema_version()), 14);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 13);
+    assert_eq!(must(reopened.schema_version()), 14);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 12",
+        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
         [],
         |row| row.get(0),
     ));
-    assert_eq!(registered, 12);
+    assert_eq!(registered, 14);
     for table in [
         "sessions",
         "events",
