@@ -30,6 +30,10 @@ pub(crate) struct ConfigOptions {
     pub(crate) effort: Option<String>,
     pub(crate) fast: Option<bool>,
     pub(crate) account: Option<String>,
+    /// rev933b finding 5: a warmed session's effort/speed change invalidates
+    /// the provider cache prefix, and the daemon refuses it without explicit
+    /// consent. This flag IS that consent for headless callers.
+    pub(crate) confirm_epoch: bool,
 }
 
 impl ConfigOptions {
@@ -105,6 +109,13 @@ pub(crate) enum ConfigError {
     Protocol(&'static str),
     MissingMetadata,
     InvalidSelector(String),
+    /// rev933b finding 6: setters apply sequentially and are individually
+    /// durable — a mid-sequence failure must DISCLOSE what already
+    /// committed instead of reporting a clean failure.
+    Partial {
+        applied: Vec<&'static str>,
+        error: Box<ConfigError>,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -131,6 +142,11 @@ impl std::fmt::Display for ConfigError {
                 "session has no typed configuration metadata; it may have been created by an older daemon"
             ),
             Self::InvalidSelector(message) => write!(formatter, "invalid_argument: {message}"),
+            Self::Partial { applied, error } => write!(
+                formatter,
+                "PARTIALLY applied — committed: {}; then failed: {error}                  (run `config --json` to read the durable state)",
+                applied.join(", ")
+            ),
         }
     }
 }
@@ -140,7 +156,7 @@ pub(crate) async fn session_config_command(session_id: &str, rest: &[String]) ->
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>]"
+                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] [--confirm-epoch]"
             );
             return ExitCode::SUCCESS;
         }
@@ -231,6 +247,8 @@ pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ConfigOptions>, St
                 options.account = Some(required_value(rest, index, "--account", "an alias")?);
             }
             "--account" => return Err("duplicate --account flag".into()),
+            "--confirm-epoch" if !options.confirm_epoch => options.confirm_epoch = true,
+            "--confirm-epoch" => return Err("duplicate --confirm-epoch flag".into()),
             other => return Err(format!("unknown flag `{other}`")),
         }
         index += 1;
@@ -261,16 +279,27 @@ async fn execute(
     if options.mutates() {
         let (attachment_id, mut worker_generation) =
             control_attachment(client, session_id.clone(), summary.head_seq).await?;
+        let mut applied = Vec::new();
         let mutation = apply_mutations(
             client,
             &session_id,
             &providers,
             &options,
             &mut worker_generation,
+            &mut applied,
         )
         .await;
         detach(client, attachment_id).await;
-        mutation?;
+        mutation.map_err(|error| {
+            if applied.is_empty() {
+                error
+            } else {
+                ConfigError::Partial {
+                    applied,
+                    error: Box::new(error),
+                }
+            }
+        })?;
         summary = session_summary(client, &session_id).await?;
     }
     let digest = session_digest(client, session_id).await?;
@@ -283,6 +312,7 @@ async fn apply_mutations(
     providers: &[ProviderSummaryWire],
     options: &ConfigOptions,
     worker_generation: &mut u64,
+    applied: &mut Vec<&'static str>,
 ) -> Result<(), ConfigError> {
     if options.account.is_some() {
         return Err(ConfigError::MissingFeatures(BTreeSet::from([
@@ -298,7 +328,7 @@ async fn apply_mutations(
                 worker_generation: *worker_generation,
                 model,
                 provider,
-                confirm_new_epoch: false,
+                confirm_new_epoch: options.confirm_epoch,
             })
             .await
             .map_err(ConfigError::Client)?;
@@ -308,6 +338,7 @@ async fn apply_mutations(
             SelectionKind::Model,
             "session.select_model response method mismatch",
         )?;
+        applied.push("model");
     }
     if let Some(effort) = options.effort.as_ref() {
         let response = client
@@ -316,7 +347,7 @@ async fn apply_mutations(
                 session_id: session_id.clone(),
                 worker_generation: *worker_generation,
                 effort: Some(effort.clone()),
-                confirm_new_epoch: false,
+                confirm_new_epoch: options.confirm_epoch,
             })
             .await
             .map_err(ConfigError::Client)?;
@@ -326,6 +357,7 @@ async fn apply_mutations(
             SelectionKind::Effort,
             "session.select_effort response method mismatch",
         )?;
+        applied.push("effort");
     }
     if let Some(enabled) = options.fast {
         let response = client
@@ -334,7 +366,7 @@ async fn apply_mutations(
                 session_id: session_id.clone(),
                 worker_generation: *worker_generation,
                 enabled,
-                confirm_new_epoch: false,
+                confirm_new_epoch: options.confirm_epoch,
             })
             .await
             .map_err(ConfigError::Client)?;
@@ -344,6 +376,7 @@ async fn apply_mutations(
             SelectionKind::Fast,
             "session.select_fast response method mismatch",
         )?;
+        applied.push("speed");
     }
     Ok(())
 }
@@ -687,6 +720,10 @@ fn write_human(document: &SessionConfigDocument) -> ExitCode {
 
 fn failure(error: &ConfigError) -> ExitCode {
     eprintln!("haider session config: {error}");
+    failure_code(error)
+}
+
+fn failure_code(error: &ConfigError) -> ExitCode {
     let code = match error {
         ConfigError::Ensure(
             EnsureError::ProtocolMismatch(_)
@@ -725,6 +762,7 @@ fn failure(error: &ConfigError) -> ExitCode {
             EX_PROTOCOL
         }
         ConfigError::Rpc { .. } => EX_SOFTWARE,
+        ConfigError::Partial { error, .. } => return failure_code(error),
     };
     ExitCode::from(code)
 }

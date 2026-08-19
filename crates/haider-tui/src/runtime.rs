@@ -19,7 +19,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEventKind,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -2683,7 +2684,13 @@ pub enum ShellRequest {
 /// is acted on only by the runtime after the transaction has fully finished.
 #[derive(Debug)]
 pub enum LiveUpdateEvent {
+    /// A CHECK outcome (startup or /update check). Never touches the
+    /// install latch — an unrelated check must not cancel an installer
+    /// (rev933b finding 4).
     App(AppEvent),
+    /// An INSTALL transaction outcome other than success. Clears the
+    /// latch and owns the dead-link exit semantics.
+    Install(AppEvent),
     Installed,
 }
 
@@ -2968,7 +2975,24 @@ pub async fn run_live(
                         Event::Mouse(mouse) => pointer = Some((mouse.column, mouse.row)),
                         _ => {}
                     }
-                    dispatch_input(&mut model, &hit_map, event);
+                    // rev933b finding 3: while the update transaction holds
+                    // a dead link, a keystroke would type into a void and a
+                    // submit would be silently lost across the restart.
+                    // Hold key input honestly; ⌃C still reaches dispatch so
+                    // the user can always leave.
+                    let quit_key = matches!(
+                        &event,
+                        Event::Key(key)
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                    );
+                    if link_replies_open || quit_key || !matches!(event, Event::Key(_)) {
+                        dispatch_input(&mut model, &hit_map, event);
+                    } else {
+                        model.flash =
+                            Some("· updating — input held until the restart".to_owned());
+                        model.dirty = true;
+                    }
                 }
                 None => break,
             },
@@ -3011,23 +3035,22 @@ pub async fn run_live(
             }
             update_event = updates.events.recv(), if update_events_open => {
                 match update_event {
-                    Some(LiveUpdateEvent::App(event)) => {
-                        if matches!(
-                            &event,
-                            AppEvent::UpdateCurrent { .. } | AppEvent::UpdateFailed { .. }
-                        ) {
-                            update_in_progress = false;
-                            if !link_replies_open {
-                                // The daemon link is already gone; a failed
-                                // transaction leaves nothing to render from.
-                                let detail = match &event {
-                                    AppEvent::UpdateFailed { message } => message.clone(),
-                                    _ => "update did not install".to_owned(),
-                                };
-                                return Err(std::io::Error::other(format!(
-                                    "daemon connection lost during a failed update: {detail}"
-                                )));
-                            }
+                    // Check outcomes are plain data — they never clear the
+                    // install latch and never own the dead-link exit
+                    // (rev933b finding 4).
+                    Some(LiveUpdateEvent::App(event)) => model.handle(event),
+                    Some(LiveUpdateEvent::Install(event)) => {
+                        update_in_progress = false;
+                        if !link_replies_open {
+                            // The daemon link is already gone; a failed
+                            // transaction leaves nothing to render from.
+                            let detail = match &event {
+                                AppEvent::UpdateFailed { message } => message.clone(),
+                                _ => "update did not install".to_owned(),
+                            };
+                            return Err(std::io::Error::other(format!(
+                                "daemon connection lost during a failed update: {detail}"
+                            )));
                         }
                         model.handle(event);
                     }

@@ -282,6 +282,9 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             worker_generation: self.store.worker_generation(),
             provider: switch.to_provider.clone(),
             model: switch.to_model.clone(),
+            // rev933b finding 7: the automatic switch observed this exact
+            // pair; a concurrent explicit selection moves it and must win.
+            expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };

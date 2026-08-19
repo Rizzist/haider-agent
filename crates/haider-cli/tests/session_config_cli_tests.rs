@@ -157,3 +157,43 @@ fn models_json_vocabulary_is_stable() {
     provider.auth_methods = vec![];
     assert_eq!(auth_state(&provider, &[]), "not_required");
 }
+
+/// rev933b finding 5 MUTATION CHECK: drop the --confirm-epoch flag or stop
+/// threading it into the selects. Expected RUNTIME failure: the parse row
+/// flips (the threading half is pinned by the daemon's confirm law).
+#[test]
+fn confirm_epoch_flag_parses_once_and_defaults_off() {
+    let options = parse_options(&args(&["--effort", "high", "--confirm-epoch"]))
+        .expect("parses")
+        .expect("not help");
+    assert!(options.confirm_epoch);
+    assert!(
+        !parse_options(&args(&["--json"]))
+            .expect("parses")
+            .expect("not help")
+            .confirm_epoch,
+        "consent is never implied"
+    );
+    assert_eq!(
+        parse_options(&args(&["--confirm-epoch", "--confirm-epoch"])),
+        Err("duplicate --confirm-epoch flag".to_owned())
+    );
+}
+
+/// rev933b finding 6 MUTATION CHECK: stop disclosing committed setters on a
+/// mid-sequence failure. Expected RUNTIME failure: the rendered sentence
+/// loses the committed list or the remedy.
+#[test]
+fn partial_failure_discloses_what_committed() {
+    let error = cli_main::session_config::ConfigError::Partial {
+        applied: vec!["model"],
+        error: Box::new(cli_main::session_config::ConfigError::Protocol(
+            "session.select_effort response method mismatch",
+        )),
+    };
+    let rendered = error.to_string();
+    assert!(rendered.contains("PARTIALLY applied"));
+    assert!(rendered.contains("committed: model"));
+    assert!(rendered.contains("session.select_effort"));
+    assert!(rendered.contains("config --json"));
+}

@@ -396,6 +396,7 @@ impl PairSwitchWorld {
             worker_generation,
             provider: "fake-b".into(),
             model: "model-b".into(),
+            expected_pair: None,
             event_id: EventId::new(format!("{command_id}-event")),
             device_id: self.device_id.clone(),
         }
@@ -1803,4 +1804,62 @@ fn cache_boundaries_remap_across_foreign_opaque_removal() {
 fn wh4_deepseek_cache_usage_is_disjoint_at_the_worker_boundary() {
     assert!(!super::cached_input_is_subset_for_provider("deepseek"));
     assert!(super::cached_input_is_subset_for_provider("openai"));
+}
+
+/// rev933b finding 7 MUTATION CHECK: drop the `expected_pair` comparison in
+/// `select_session_model` (apply unconditionally). Expected RUNTIME failure:
+/// the stale automatic switch overwrites the user's explicit selection
+/// instead of refusing with RevisionConflict.
+#[tokio::test]
+async fn automatic_switch_cas_refuses_when_the_pair_moved_underneath_it() {
+    let fake_a = Arc::new(FakeProvider::new(text_turn("answer from a")));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("answer from b")));
+    let world = PairSwitchWorld::boot("f7-cas", fake_a.clone(), fake_b.clone()).await;
+
+    // The user's explicit selection moves the durable pair to (fake-b,
+    // model-b); explicit commands are unconditional (expected_pair: None).
+    let explicit = world.select_command("f7-cas-explicit");
+    assert!(matches!(
+        world
+            .store
+            .select_session_model(explicit)
+            .await
+            .expect("explicit selection"),
+        SessionSelectModelOutcome::Committed { .. }
+    ));
+
+    // An automatic switch that still believes the session runs (fake-a,
+    // model-a) must refuse rather than overwrite the newer explicit word.
+    let mut stale = world
+        .select_command_at_generation("f7-cas-automatic-stale", world.store.worker_generation());
+    stale.expected_pair = Some(("fake-a".to_owned(), "model-a".to_owned()));
+    let refusal = world
+        .store
+        .select_session_model(stale)
+        .await
+        .expect_err("stale CAS must refuse");
+    assert_eq!(refusal.code, ErrorCode::RevisionConflict);
+
+    // The pair the CLI committed survives untouched.
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata read")
+        .expect("session metadata");
+    assert_eq!(metadata.provider, "fake-b");
+    assert_eq!(metadata.model, "model-b");
+
+    // A CAS that observed the CURRENT pair applies normally.
+    let mut fresh = world
+        .select_command_at_generation("f7-cas-automatic-fresh", world.store.worker_generation());
+    fresh.expected_pair = Some(("fake-b".to_owned(), "model-b".to_owned()));
+    assert!(matches!(
+        world
+            .store
+            .select_session_model(fresh)
+            .await
+            .expect("fresh CAS applies"),
+        SessionSelectModelOutcome::Committed { .. }
+    ));
 }

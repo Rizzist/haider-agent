@@ -690,6 +690,12 @@ pub struct SessionSelectModelCommand {
     pub worker_generation: u64,
     pub provider: String,
     pub model: String,
+    /// rev933b finding 7: an AUTOMATIC mid-turn switch is only valid
+    /// against the pair it observed (compare-and-swap). `Some` refuses the
+    /// commit with RevisionConflict when the durable pair moved underneath
+    /// it (a concurrent explicit selection wins). Explicit selections pass
+    /// `None` — the user's latest word is unconditional.
+    pub expected_pair: Option<(String, String)>,
     pub event_id: EventId,
     pub device_id: DeviceId,
 }
@@ -5022,6 +5028,18 @@ impl Store {
                 false,
             ));
         };
+        if let Some((expected_provider, expected_model)) = &command.expected_pair
+            && (&metadata.provider != expected_provider || &metadata.model != expected_model)
+        {
+            return Err(store_error(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "automatic selection expected pair {expected_provider}/{expected_model} but                      the session moved to {}/{} — refusing to overwrite a newer explicit                      selection",
+                    metadata.provider, metadata.model
+                ),
+                false,
+            ));
+        }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {

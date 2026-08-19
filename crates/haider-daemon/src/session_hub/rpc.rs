@@ -3833,6 +3833,7 @@ impl HubConnection {
             worker_generation,
             provider: resolved_provider,
             model: resolved_model,
+            expected_pair: None,
             event_id: EventId::new(random_id("model-selected")?),
             device_id: self.hub.inner.device_id.clone(),
         };

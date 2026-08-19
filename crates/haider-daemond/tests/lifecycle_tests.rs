@@ -817,8 +817,12 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
     // it — 4 KiB keeps these byte-budget laws stable across additions.
     config.frame_limit = config.profile_id.len() + 4_096;
     config.outbound_queued_bytes = config.frame_limit + 4;
-    config.outbound_queue_capacity = 64;
-    let pings = 40;
+    config.outbound_queue_capacity = 512;
+    // rev933b finding 8: the refusal must not depend on how much of the
+    // 4 KiB Welcome headroom the CURRENT feature list happens to eat. 400
+    // framed pongs (~14 KiB) exceed the entire possible slack, so a refusal
+    // fires under any Welcome size that still fits the frame limit.
+    let pings = 400;
     assert!(
         config.outbound_queue_capacity > pings + 1,
         "the frame-count bound must not be what fires here — only the bytes"
@@ -840,14 +844,20 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
         )
         .await;
     for nonce in 0..pings {
-        client
-            .send(
+        // The refused charge may close the connection while the flood is
+        // still in flight — a mid-flood write failure IS the law firing,
+        // never a test defect.
+        if !client
+            .try_send(
                 &WireFrame::Ping {
                     nonce: nonce as u64,
                 },
                 config.frame_limit,
             )
-            .await;
+            .await
+        {
+            break;
+        }
     }
     // The client never reads, so the only way this returns is the connection
     // being closed by the refused charge.

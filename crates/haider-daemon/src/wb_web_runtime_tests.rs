@@ -275,6 +275,7 @@ impl WebWorld {
                 worker_generation,
                 provider: provider.to_owned(),
                 model: model.to_owned(),
+                expected_pair: None,
                 event_id: EventId::new(format!("{command_id}-event")),
                 device_id: self.device_id.clone(),
             })

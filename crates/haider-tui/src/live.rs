@@ -1585,7 +1585,13 @@ impl LiveDriver {
                     model.loom_types = agent_types;
                     model.loom_workflows = workflows;
                     model.loom_loaded = true;
-                    let total = model.loom_types.len() + model.loom_workflows.len();
+                    // rev933b finding 9: the clamp is PANE-LOCAL — the
+                    // browser shows one list at a time, so a stale index
+                    // must fold against the ACTIVE pane, not both combined.
+                    let total = match model.loom_pane {
+                        crate::app::LoomPane::Types => model.loom_types.len(),
+                        crate::app::LoomPane::Workflows => model.loom_workflows.len(),
+                    };
                     if model.loom_selection >= total {
                         model.loom_selection = total.saturating_sub(1);
                     }

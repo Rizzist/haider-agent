@@ -56,15 +56,18 @@ pub(crate) fn live_update_bridge(profile_dir: PathBuf, no_update_check: bool) ->
         let spawned = std::thread::Builder::new()
             .name("haider-tui-update".into())
             .spawn(move || {
+                // rev933b finding 4: install outcomes carry their own
+                // event class so an unrelated CHECK can never clear the
+                // install latch or trip the dead-link exit.
                 let event = match runtime.block_on(run_update(UpdateOptions { check: false })) {
                     Ok(UpdateRunOutcome::Updated { .. }) => LiveUpdateEvent::Installed,
                     Ok(UpdateRunOutcome::Current { version }) => {
-                        LiveUpdateEvent::App(AppEvent::UpdateCurrent { version })
+                        LiveUpdateEvent::Install(AppEvent::UpdateCurrent { version })
                     }
                     Ok(UpdateRunOutcome::Available { latest, .. }) => {
-                        LiveUpdateEvent::App(AppEvent::UpdateAvailable { version: latest })
+                        LiveUpdateEvent::Install(AppEvent::UpdateAvailable { version: latest })
                     }
-                    Err(error) => LiveUpdateEvent::App(AppEvent::UpdateFailed {
+                    Err(error) => LiveUpdateEvent::Install(AppEvent::UpdateFailed {
                         message: error.to_string(),
                     }),
                 };
