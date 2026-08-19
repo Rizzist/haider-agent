@@ -322,8 +322,12 @@ async fn run_inner(
     // Startup turn recovery commits directly through the store before a hub
     // exists. Reconcile every journal it changed now: otherwise a terminal E
     // row can remain absent forever when no later append touches the session.
-    hub.reconcile_pipe_sidecars(&turn_recovery.touched_sessions)
-        .await;
+    // Ship-gate round 2: the FULL sweep, not just recovery-touched sessions
+    // — a prior life's failed reconcile left no durable retry state, so
+    // every boot re-establishes the sidecar law for every session before
+    // the endpoint binds.
+    let _ = &turn_recovery.touched_sessions;
+    hub.reconcile_all_pipe_sidecars().await;
     let recovered_work = turn_recovery.work;
     let (hook_service, hook_engine) =
         crate::hooks::HookEngine::start(config.store_dir.clone(), store.clone(), hub.clone())

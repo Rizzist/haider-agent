@@ -1018,6 +1018,24 @@ impl SessionHub {
         Self::with_observer(store, config, Arc::new(NoopObserver))
     }
 
+    /// Ship-gate round 2: reconcile EVERY session's sidecar at boot — not
+    /// just the ones startup recovery touched. The dirty state is
+    /// memory-only, so a reconcile that failed in a PRIOR life left no
+    /// durable retry obligation; the full sweep is the obligation. Cost is
+    /// one tail read per current session (catch-up work only where a file
+    /// is actually behind), before the endpoint binds.
+    pub(crate) async fn reconcile_all_pipe_sidecars(&self) {
+        match self.inner.store.session_ids().await {
+            Ok(session_ids) => self.reconcile_pipe_sidecars(&session_ids).await,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.message,
+                    "boot sidecar sweep could not list sessions; journal remains authoritative"
+                );
+            }
+        }
+    }
+
     /// Reconciles journals committed by startup recovery before this hub
     /// existed. Sidecar projection is best-effort, just like post-commit actor
     /// maintenance: journal recovery remains authoritative if filesystem I/O

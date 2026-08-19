@@ -70,13 +70,38 @@ pub fn sidecar_row_line(envelope: &RawEnvelope) -> Option<String> {
 /// Build the structured form serialized by [`sidecar_row_line`].
 #[must_use]
 pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
-    match envelope
-        .payload
+    // Ship-gate round 2: the peek goes DEEP enough that the common case —
+    // item Started/Delta/ordinary-Completed, non-projecting node kinds —
+    // never pays the full payload clone+decode. Only the exact five
+    // qualifying shapes proceed.
+    let payload_value = &envelope.payload;
+    let type_tag = payload_value
         .get("type")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("node_committed" | "item" | "run_failed") => {}
-        _ => return None,
+        .and_then(serde_json::Value::as_str);
+    let qualifies = match type_tag {
+        Some("node_committed") => payload_value
+            .get("kind")
+            .and_then(|kind| kind.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "user_turn" | "assistant_commit" | "tool_exchange")),
+        Some("item") => {
+            payload_value
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                == Some("completed")
+                && payload_value
+                    .get("item")
+                    .and_then(|item| item.get("item"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("incomplete_agent_message")
+        }
+        Some("run_failed") => payload_value
+            .get("presentation")
+            .is_some_and(|presentation| presentation.is_object()),
+        _ => false,
+    };
+    if !qualifies {
+        return None;
     }
 
     let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;

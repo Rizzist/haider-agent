@@ -380,6 +380,22 @@ fn inspect_sidecar_blocking(
             generation: header.generation,
         });
     };
+    // Ship-gate round 2: the tail must be a REAL row, not any JSON object
+    // that happens to carry an in-range seq — a stray `{"seq":5}` would
+    // otherwise become a trusted cursor and permanently skip rows.
+    let row_shaped = value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|role| matches!(role, "user" | "assistant" | "error" | "tool"))
+        && value
+            .get("at_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_some();
+    if !row_shaped {
+        return Ok(SidecarState::Corrupt {
+            generation: header.generation,
+        });
+    }
     let Some(seq) = value.get("seq").and_then(serde_json::Value::as_u64) else {
         return Ok(SidecarState::Corrupt {
             generation: header.generation,
