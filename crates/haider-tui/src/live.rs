@@ -112,6 +112,14 @@ pub enum LiveCommand {
         /// create WITHOUT the model having fabricated anything.
         first_text: String,
     },
+    /// W-INP: publish this client's composer text (and later its status
+    /// strip) as the session's volatile input surface. Fire-and-forget —
+    /// the ack carries no client-visible state.
+    SurfacePublish {
+        session: SessionId,
+        input: Option<(String, u64)>,
+        status: Option<(String, u64)>,
+    },
     Submit {
         command_id: CommandId,
         session: SessionId,
@@ -526,6 +534,7 @@ impl LiveCommand {
             Self::GraphPin { command_id, .. } | Self::GraphAbandon { command_id, .. } => {
                 Some(command_id)
             }
+            Self::SurfacePublish { .. } => None,
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::DeviceImport { command_id, .. } => Some(command_id),
@@ -573,6 +582,13 @@ impl LiveCommand {
 /// One inbound fact the driver reduces.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveReply {
+    /// W-INP: an embedding client injected into this session's live input
+    /// surface. The TUI is the owning composer — it applies the op and its
+    /// next publish is the acknowledgement.
+    InputInjected {
+        session: SessionId,
+        op: haider_rpc::SurfaceInjectOp,
+    },
     /// A `session.list` page.
     /// The Loom registry (agent types + workflows), installed on the model.
     LoomRegistry {
@@ -3049,6 +3065,44 @@ impl LiveDriver {
                     commands.extend(self.graph_refresh(model));
                 }
                 commands
+            }
+            LiveReply::InputInjected { session, op } => {
+                // Apply only when this composer is genuinely the session's
+                // live input surface: the session is active and a session
+                // surface is on screen. Anything else ignores the op — the
+                // absence of a republish tells the injector it did not land.
+                if model.active_session.as_ref() == Some(&session)
+                    && matches!(
+                        model.screen,
+                        crate::app::Screen::Session | crate::app::Screen::Subagent
+                    )
+                {
+                    match op {
+                        haider_rpc::SurfaceInjectOp::Set { text } => {
+                            model.composer.set_text(text);
+                        }
+                        haider_rpc::SurfaceInjectOp::Insert { text } => {
+                            model.composer.insert_str(&text);
+                        }
+                        haider_rpc::SurfaceInjectOp::Clear => model.composer.clear(),
+                        haider_rpc::SurfaceInjectOp::Submit => {
+                            // Exactly the Enter path — mid-turn queue modes,
+                            // command dispatch, and drafts all keep their
+                            // ordinary meaning.
+                            model.handle(crate::app::AppEvent::Key(
+                                ratatui::crossterm::event::KeyEvent::new(
+                                    ratatui::crossterm::event::KeyCode::Enter,
+                                    ratatui::crossterm::event::KeyModifiers::NONE,
+                                ),
+                            ));
+                        }
+                        // Unknown = a newer daemon's vocabulary — ignored,
+                        // never fatal (forward-compat law).
+                        _ => {}
+                    }
+                    model.dirty = true;
+                }
+                Vec::new()
             }
             LiveReply::Draining { reason } => {
                 model.flash = Some(format!("· daemon draining — {reason}"));

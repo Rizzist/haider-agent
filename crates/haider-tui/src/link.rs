@@ -726,6 +726,17 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         // captured attachment blocks ride BOTH forms — the branch capture
         // law and the attachment capture law never trade against each
         // other.
+        LiveCommand::SurfacePublish {
+            session,
+            input,
+            status,
+        } => RequestBody::SessionSurfacePublish {
+            session_id: session,
+            input: input
+                .map(|(text, revision)| haider_rpc::SurfaceInputPublishWire { text, revision }),
+            status: status
+                .map(|(line, revision)| haider_rpc::SurfaceStatusPublishWire { line, revision }),
+        },
         LiveCommand::Submit {
             command_id,
             session,
@@ -1155,6 +1166,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionDetach { attachment_id } => vec![LiveReply::Detached {
             attachment: attachment_id,
         }],
+        // W-INP: the publish ack carries nothing the composer needs — the
+        // composer is the authority the daemon just mirrored.
+        ResponseBody::SessionSurfacePublished { .. } => Vec::new(),
         ResponseBody::SessionDiagnostic { .. } => context
             .command_id
             .clone()
@@ -1695,6 +1709,11 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             high_water_seq,
         }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
+        // W-INP: an embedding client steering this composer.
+        WireFrame::SessionInputInjected { session_id, op } => vec![LiveReply::InputInjected {
+            session: session_id,
+            op,
+        }],
         WireFrame::ProtocolError(error)
             if matches!(
                 error.code.as_str(),

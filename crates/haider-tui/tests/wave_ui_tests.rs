@@ -312,3 +312,78 @@ fn osc_session_announce_bytes_are_exact_and_sanitized() {
         "control characters and separators never smuggle a second escape"
     );
 }
+
+/// W-INP MUTATION CHECK: drop the session/screen guard on injection, or
+/// stop applying an op to the composer. Expected RUNTIME failure: a foreign
+/// session steers this composer, or a Set/Insert/Clear stops landing.
+#[test]
+fn input_injection_applies_only_to_the_active_session_surface() {
+    use haider_rpc::SurfaceInjectOp;
+    use haider_tui::live::{LiveDriver, LiveReply};
+    use haider_tui::runtime::live_pass;
+
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(haider_protocol::ids::SessionId::new("inp-1"));
+    model.screen = Screen::Session;
+    let mut driver = LiveDriver::new("inp-test");
+
+    let inject = |op: SurfaceInjectOp, session: &str| LiveReply::InputInjected {
+        session: haider_protocol::ids::SessionId::new(session),
+        op,
+    };
+
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(inject(
+            SurfaceInjectOp::Set {
+                text: "from the ADE".into(),
+            },
+            "inp-1",
+        )),
+        std::time::Instant::now(),
+    );
+    assert_eq!(model.composer.text(), "from the ADE");
+
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(inject(
+            SurfaceInjectOp::Insert {
+                text: " +more".into(),
+            },
+            "inp-1",
+        )),
+        std::time::Instant::now(),
+    );
+    assert_eq!(model.composer.text(), "from the ADE +more");
+
+    // A FOREIGN session's inject never lands.
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(inject(SurfaceInjectOp::Clear, "other-session")),
+        std::time::Instant::now(),
+    );
+    assert_eq!(model.composer.text(), "from the ADE +more");
+
+    // Nor does one while the launcher owns the screen.
+    model.screen = Screen::Launcher;
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(inject(SurfaceInjectOp::Clear, "inp-1")),
+        std::time::Instant::now(),
+    );
+    assert_eq!(model.composer.text(), "from the ADE +more");
+
+    model.screen = Screen::Session;
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(inject(SurfaceInjectOp::Clear, "inp-1")),
+        std::time::Instant::now(),
+    );
+    assert_eq!(model.composer.text(), "");
+}
