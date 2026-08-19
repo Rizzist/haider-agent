@@ -835,6 +835,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::GraphStatus { session } => RequestBody::GraphStatus {
             session_id: session,
         },
+        LiveCommand::LoomList => RequestBody::LoomList {},
         LiveCommand::OpenPermissionSettings {
             session,
             request_id,
@@ -1252,6 +1253,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         // The reduction carries no session id — tag it from the request
         // context so a stale reply for a since-switched session installs
         // nothing. A read with no context session cannot be routed; drop it.
+        ResponseBody::LoomList {
+            agent_types,
+            workflows,
+        } => vec![LiveReply::LoomRegistry {
+            agent_types,
+            workflows,
+        }],
         ResponseBody::GraphStatus { status } => match context.graph.clone() {
             Some(session) => vec![LiveReply::Graph {
                 session,

@@ -380,3 +380,21 @@ pub fn shimmer_level(phase: u8, index: usize, len: usize) -> u8 {
         None => 0,
     }
 }
+
+/// D1 — a Loom registry accent (`#rrggbb`) as a terminal style; None on bad
+/// input so an unvalidated registry color can never poison a render. Lives in
+/// the style seam: raw `Color::` construction is permitted here only.
+pub(crate) fn loom_accent_style(hex: &str) -> Option<ratatui::style::Style> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |range: std::ops::Range<usize>| u8::from_str_radix(&hex[range], 16).ok();
+    Some(
+        ratatui::style::Style::default().fg(ratatui::style::Color::Rgb(
+            channel(0..2)?,
+            channel(2..4)?,
+            channel(4..6)?,
+        )),
+    )
+}

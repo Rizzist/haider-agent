@@ -231,6 +231,10 @@ pub enum LiveCommand {
     GraphStatus {
         session: SessionId,
     },
+    /// `loom.list` — a receipt-free READ of the Loom registry (agent types +
+    /// compiled workflows). Fetched once per connection; colors the typed
+    /// chips and annotates the graph screen.
+    LoomList,
     /// `graph.inspect` (M2c) — a ONE-SHOT paged read of graph telemetry
     /// (template rollups, tool-selection stats, evidence provenance with real
     /// workspace-revision provenance). Issued when the `/graph` screen opens;
@@ -546,6 +550,7 @@ impl LiveCommand {
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
             | Self::GraphStatus { .. }
+            | Self::LoomList
             | Self::OpenPermissionSettings { .. }
             | Self::GraphInspect { .. }
             // A stage carries no durable identity BY DESIGN (see above).
@@ -565,6 +570,11 @@ impl LiveCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveReply {
     /// A `session.list` page.
+    /// The Loom registry (agent types + workflows), installed on the model.
+    LoomRegistry {
+        agent_types: Vec<haider_protocol::loom::LoomAgentType>,
+        workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+    },
     Listed {
         sessions: Vec<SessionSummary>,
         next_cursor: Option<String>,
@@ -1535,6 +1545,16 @@ impl LiveDriver {
     #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         match reply {
+            LiveReply::LoomRegistry {
+                agent_types,
+                workflows,
+            } => {
+                model.loom_types = agent_types;
+                model.loom_workflows = workflows;
+                model.loom_loaded = true;
+                model.dirty = true;
+                Vec::new()
+            }
             LiveReply::Listed {
                 sessions,
                 next_cursor,
@@ -1557,11 +1577,18 @@ impl LiveDriver {
                     }
                 }
                 model.dirty = true;
-                next_cursor.map_or_else(Vec::new, |cursor| {
+                let mut follow = next_cursor.map_or_else(Vec::new, |cursor| {
                     vec![LiveCommand::List {
                         cursor: Some(cursor),
                     }]
-                })
+                });
+                // D1: hydrate the Loom registry once per connection — the
+                // typed-chip colors and graph annotations read from it.
+                if !model.loom_loaded && model.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
+                    model.loom_loaded = true;
+                    follow.push(LiveCommand::LoomList);
+                }
+                follow
             }
             LiveReply::Attached {
                 session,

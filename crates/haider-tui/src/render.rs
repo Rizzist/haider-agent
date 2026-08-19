@@ -4939,8 +4939,47 @@ fn render_subtree(
                         theme.bright_style()
                     },
                 ),
-                Span::styled(format!(" · {} · {}", chip.name, chip.model), ink),
             ];
+            // D1: a typed child's task label leads with `@type ·` (the C2
+            // spawn convention) — paint the type segment in its Loom accent
+            // and glyph so specialization reads at a glance.
+            let typed = chip
+                .name
+                .strip_prefix('@')
+                .and_then(|rest| rest.split_once(" · "))
+                .and_then(|(type_id, remainder)| {
+                    model.loom_type(type_id).map(|record| {
+                        (
+                            record.glyph.clone(),
+                            crate::style::loom_accent_style(&record.color),
+                            type_id.to_owned(),
+                            remainder.to_owned(),
+                        )
+                    })
+                });
+            match typed {
+                Some((glyph_text, accent, type_id, remainder)) if !chip.closed => {
+                    let accent_style = accent.unwrap_or_else(|| theme.gold_style());
+                    spans.push(Span::styled(" · ".to_owned(), ink));
+                    if !glyph_text.is_empty() {
+                        spans.push(Span::styled(format!("{glyph_text} "), accent_style));
+                    }
+                    spans.push(Span::styled(
+                        format!("@{type_id}"),
+                        accent_style.add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" · {remainder} · {}", chip.model),
+                        ink,
+                    ));
+                }
+                _ => {
+                    spans.push(Span::styled(
+                        format!(" · {} · {}", chip.name, chip.model),
+                        ink,
+                    ));
+                }
+            }
             if *depth == 0 {
                 spans.push(Span::styled(format!(" · {}", chip.device), ink));
             }
@@ -5151,15 +5190,26 @@ fn render_graph(
         return;
     };
 
-    // Header: template · digest · epoch.
-    lines.push(Line::from(vec![
+    // Header: template · digest · epoch (+ the Loom typed signature).
+    let loom = model.loom_workflow_meta(&status.template);
+    let mut header = vec![
         Span::styled(status.template.clone(), theme.bright_style()),
         Span::styled(
             format!(" · {}", crate::graph::digest_short(&status.digest)),
             theme.faint_style(),
         ),
         Span::styled(format!(" · epoch {}", status.attempt), theme.dim_style()),
-    ]));
+    ];
+    if let Some(workflow) = loom {
+        header.push(Span::styled(
+            format!(
+                " · {} -> {} · {}",
+                workflow.in_type, workflow.out_type, workflow.pipe_version
+            ),
+            theme.gold_style(),
+        ));
+    }
+    lines.push(Line::from(header));
     lines.push(Line::raw(""));
 
     // One row per node: glyph · gate · attempt · evidence tally.
@@ -5174,6 +5224,33 @@ fn render_graph(
             format!(" · attempt {}/8", node.current_attempt.unwrap_or(0)),
             theme.dim_style(),
         ));
+        // D2: a Loom node names its specialist and task, in the type accent.
+        if let Some(meta) =
+            loom.and_then(|workflow| workflow.meta.iter().find(|meta| meta.node == node.node))
+        {
+            if let Some(type_id) = &meta.agent_type {
+                let accent = model
+                    .loom_type(type_id)
+                    .and_then(|record| crate::style::loom_accent_style(&record.color))
+                    .unwrap_or_else(|| theme.gold_style());
+                let glyph_text = model
+                    .loom_type(type_id)
+                    .map(|record| record.glyph.clone())
+                    .filter(|glyph| !glyph.is_empty())
+                    .map(|glyph| format!("{glyph} "))
+                    .unwrap_or_default();
+                spans.push(Span::styled(
+                    format!(" · {glyph_text}@{type_id}"),
+                    accent.add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !meta.task.is_empty() {
+                spans.push(Span::styled(
+                    format!(" \"{}\"", meta.task),
+                    theme.dim_style(),
+                ));
+            }
+        }
         if crate::graph::is_human_gate(node) {
             // Human gate — no evidence tally.
         } else if node.evidence_slots.is_empty() {

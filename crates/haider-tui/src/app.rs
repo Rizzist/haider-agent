@@ -330,6 +330,23 @@ pub struct AccountsState {
 }
 
 impl AppModel {
+    /// D1 — resolve a Loom agent type by id (chip coloring, graph rows).
+    #[must_use]
+    pub fn loom_type(&self, id: &str) -> Option<&haider_protocol::loom::LoomAgentType> {
+        self.loom_types.iter().find(|record| record.id == id)
+    }
+
+    /// D2 — the Loom workflow behind a pinned template name, if registered.
+    #[must_use]
+    pub fn loom_workflow_meta(
+        &self,
+        template: &str,
+    ) -> Option<&haider_protocol::loom::LoomWorkflow> {
+        self.loom_workflows
+            .iter()
+            .find(|record| record.id == template)
+    }
+
     /// Whether the connected daemon serves a method family. Demo mode
     /// answers everything locally, so it is always capable there.
     #[must_use]
@@ -3046,6 +3063,11 @@ pub struct AppModel {
     /// always-visible strip above the composer and the `/graph` status view;
     /// never fabricated — it is a read of durable daemon truth.
     pub graph: Option<haider_protocol::graph::GraphStatus>,
+    /// D1 — the Loom registry snapshot (types color the `@type ·` chips; the
+    /// workflows annotate the graph screen with tasks + typed I/O).
+    pub loom_types: Vec<haider_protocol::loom::LoomAgentType>,
+    pub loom_workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+    pub loom_loaded: bool,
     /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
@@ -3361,6 +3383,9 @@ impl Default for AppModel {
             subtree_collapsed: false,
             fleet: crate::fleet::FleetView::default(),
             graph: None,
+            loom_types: Vec::new(),
+            loom_workflows: Vec::new(),
+            loom_loaded: false,
             graph_inspect: None,
             retry_inflight: false,
             graph_unsupported: false,
