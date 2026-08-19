@@ -122,6 +122,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 ///
 /// MUTATION CHECK: remove `FEATURE_RUN_RETRY_V1`. Expected RUNTIME failure:
 /// clients cannot discover the served receipt-backed `run.retry` command.
+///
+/// MUTATION CHECK: remove `FEATURE_SESSION_CONFIG_V1` or
+/// `FEATURE_MODELS_LIST_V1`. Expected RUNTIME failure: the ADE cannot sniff
+/// the headless session-config door / model-library enumeration (W-CFG).
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -147,8 +151,10 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
+            haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),
             haider_rpc::FEATURE_PIPE_NATIVE_V2.to_owned(),
             haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned(),
             haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),

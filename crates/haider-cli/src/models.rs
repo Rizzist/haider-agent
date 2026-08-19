@@ -18,8 +18,8 @@ const MODELS_SCHEMA: &str = "haider.models.v1";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ModelsOptions {
-    json: bool,
+pub(crate) struct ModelsOptions {
+    pub(crate) json: bool,
 }
 
 #[derive(Serialize)]
@@ -133,7 +133,7 @@ pub(crate) async fn models_command(rest: &[String]) -> ExitCode {
     }
 }
 
-fn parse_options(rest: &[String]) -> Result<Option<ModelsOptions>, String> {
+pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ModelsOptions>, String> {
     if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
         return Ok(None);
     }
@@ -269,7 +269,7 @@ fn provider_view(
     }
 }
 
-fn auth_state(
+pub(crate) fn auth_state(
     provider: &ProviderSummaryWire,
     descriptors: &[CredentialDescriptor],
 ) -> &'static str {
@@ -316,7 +316,7 @@ fn model_detail_view(detail: ModelDetailWire) -> ModelView {
     }
 }
 
-fn availability_name(availability: ProviderAvailabilityWire) -> &'static str {
+pub(crate) fn availability_name(availability: ProviderAvailabilityWire) -> &'static str {
     match availability {
         ProviderAvailabilityWire::Available => "available",
         ProviderAvailabilityWire::Unavailable => "unavailable",

@@ -24,23 +24,23 @@ const SESSION_ACCOUNT_SELECT_FEATURE: &str = "session_account_select_v1";
 const LIST_PAGE: u32 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ConfigOptions {
-    json: bool,
-    model: Option<String>,
-    effort: Option<String>,
-    fast: Option<bool>,
-    account: Option<String>,
+pub(crate) struct ConfigOptions {
+    pub(crate) json: bool,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) fast: Option<bool>,
+    pub(crate) account: Option<String>,
 }
 
 impl ConfigOptions {
-    fn mutates(&self) -> bool {
+    pub(crate) fn mutates(&self) -> bool {
         self.model.is_some()
             || self.effort.is_some()
             || self.fast.is_some()
             || self.account.is_some()
     }
 
-    fn required_features(&self) -> BTreeSet<String> {
+    pub(crate) fn required_features(&self) -> BTreeSet<String> {
         let mut features = BTreeSet::from([
             haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
@@ -93,7 +93,7 @@ struct FootprintView {
 }
 
 #[derive(Debug)]
-enum ConfigError {
+pub(crate) enum ConfigError {
     Ensure(EnsureError),
     MissingFeatures(BTreeSet<String>),
     Client(ClientError),
@@ -196,7 +196,7 @@ pub(crate) async fn session_config_command(session_id: &str, rest: &[String]) ->
     }
 }
 
-fn parse_options(rest: &[String]) -> Result<Option<ConfigOptions>, String> {
+pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ConfigOptions>, String> {
     if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
         return Ok(None);
     }
@@ -403,7 +403,7 @@ fn selected_generation(
     }
 }
 
-fn resolve_model_selector(
+pub(crate) fn resolve_model_selector(
     selector: &str,
     providers: &[ProviderSummaryWire],
 ) -> Result<(Option<String>, String), ConfigError> {
