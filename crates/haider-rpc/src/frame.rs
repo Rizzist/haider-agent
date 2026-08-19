@@ -2415,6 +2415,9 @@ pub enum WireFrame {
     },
     /// Changed or newly discovered session summaries for a roster watcher.
     ///
+    /// Each frame carries at most 64 summaries. Larger baselines and change
+    /// sets are split into independently droppable chunks.
+    ///
     /// v1 deliberately does not report removed sessions. Clients that need
     /// deletion reconciliation must occasionally issue `session.list`.
     SessionRosterDelta { summaries: Vec<SessionSummary> },

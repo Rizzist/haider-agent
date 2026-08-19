@@ -26,7 +26,7 @@ use haider_rpc::{
     RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireEncoding, WireFrame,
     uds_codec,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
@@ -251,38 +251,9 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
     let bytes = uds_codec::encode(&hello, config.frame_limit).map_err(ConnectError::Frame)?;
     let handshake = async {
         stream.write_all(&bytes).await.map_err(ConnectError::Io)?;
-        let mut decoder = uds_codec::Decoder::new_zeroizing(config.frame_limit);
-        let mut buffer = [0_u8; 16 * 1024];
-        let mut leftovers = VecDeque::new();
-        loop {
-            let read = stream.read(&mut buffer).await.map_err(ConnectError::Io)?;
-            if read == 0 {
-                return Err(ConnectError::ClosedDuringHandshake);
-            }
-            let batch = decoder.push(&buffer[..read]);
-            let mut frames = batch.frames.into_iter();
-            let first = frames.next();
-            match first {
-                Some(WireFrame::Welcome(welcome)) => {
-                    leftovers.extend(frames);
-                    if let Some(error) = batch.error {
-                        return Err(ConnectError::Frame(error));
-                    }
-                    return Ok((welcome, decoder, leftovers));
-                }
-                Some(WireFrame::ProtocolError(error)) => {
-                    return Err(ConnectError::Rejected(error));
-                }
-                Some(_) => return Err(ConnectError::UnexpectedFrame),
-                None => {
-                    if let Some(error) = batch.error {
-                        return Err(ConnectError::Frame(error));
-                    }
-                }
-            }
-        }
+        read_handshake(&mut stream, config.frame_limit).await
     };
-    let (welcome, mut decoder, leftovers) =
+    let (welcome, decoder, leftovers) =
         match tokio::time::timeout(config.handshake_timeout, handshake).await {
             Ok(result) => result?,
             Err(_) => return Err(ConnectError::HandshakeTimeout),
@@ -291,13 +262,96 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
         Some("msgpack") => WireEncoding::MessagePack,
         _ => WireEncoding::Json,
     };
-    decoder.set_encoding(encoding);
     let client = RpcClient::start(stream, decoder, leftovers, &config, &welcome, encoding);
     Ok(Connected {
         client,
         welcome,
         peer_credentials,
     })
+}
+
+/// Reads exactly the always-JSON handshake frame, preserving any bytes from
+/// the same read for a fresh decoder using the Welcome's negotiated encoding.
+/// The byte boundary is structural: post-handshake bytes are never offered to
+/// the JSON decoder, sniffed, or decoded with a fallback codec.
+async fn read_handshake<R>(
+    reader: &mut R,
+    frame_limit: usize,
+) -> Result<(Welcome, uds_codec::Decoder, VecDeque<WireFrame>), ConnectError>
+where
+    R: AsyncRead + Unpin,
+{
+    const PREFIX_LEN: usize = 4;
+
+    let mut json_decoder = uds_codec::Decoder::new_zeroizing(frame_limit);
+    let mut prefix = [0_u8; PREFIX_LEN];
+    let mut prefix_filled = 0_usize;
+    let mut body_remaining = None;
+    let mut buffer = [0_u8; 16 * 1024];
+
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(ConnectError::Io)?;
+        if read == 0 {
+            return Err(ConnectError::ClosedDuringHandshake);
+        }
+
+        let mut cursor = 0_usize;
+        while cursor < read {
+            if prefix_filled < PREFIX_LEN {
+                let take = (PREFIX_LEN - prefix_filled).min(read - cursor);
+                prefix[prefix_filled..prefix_filled + take]
+                    .copy_from_slice(&buffer[cursor..cursor + take]);
+                prefix_filled += take;
+
+                let batch = json_decoder.push(&buffer[cursor..cursor + take]);
+                cursor += take;
+                debug_assert!(batch.frames.is_empty());
+                if let Some(error) = batch.error {
+                    return Err(ConnectError::Frame(error));
+                }
+                if prefix_filled == PREFIX_LEN {
+                    body_remaining = Some(u32::from_be_bytes(prefix) as usize);
+                }
+                continue;
+            }
+
+            let Some(remaining) = body_remaining else {
+                return Err(ConnectError::UnexpectedFrame);
+            };
+            let take = remaining.min(read - cursor);
+            let batch = json_decoder.push(&buffer[cursor..cursor + take]);
+            cursor += take;
+            body_remaining = Some(remaining - take);
+
+            if let Some(error) = batch.error {
+                return Err(ConnectError::Frame(error));
+            }
+            if body_remaining != Some(0) {
+                debug_assert!(batch.frames.is_empty());
+                continue;
+            }
+
+            let mut frames = batch.frames.into_iter();
+            let first = frames.next().ok_or(ConnectError::UnexpectedFrame)?;
+            debug_assert!(frames.next().is_none());
+            let welcome = match first {
+                WireFrame::Welcome(welcome) => welcome,
+                WireFrame::ProtocolError(error) => return Err(ConnectError::Rejected(error)),
+                _ => return Err(ConnectError::UnexpectedFrame),
+            };
+            let encoding = match welcome.encoding.as_deref() {
+                Some("msgpack") => WireEncoding::MessagePack,
+                _ => WireEncoding::Json,
+            };
+            let mut decoder =
+                uds_codec::Decoder::new_zeroizing_with_encoding(frame_limit, encoding);
+            let remainder = decoder.push(&buffer[cursor..read]);
+            if let Some(error) = remainder.error {
+                return Err(ConnectError::Frame(error));
+            }
+            return Ok((welcome, decoder, remainder.frames.into()));
+        }
+    }
 }
 
 fn classify_connect_error(error: std::io::Error) -> ConnectError {
@@ -818,5 +872,55 @@ async fn run_heartbeat(
                 unacked.push_back((nonce, Instant::now()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn coalesced_json_welcome_and_msgpack_frame_switches_at_frame_boundary() {
+        let welcome = Welcome {
+            protocol: WIRE_PROTOCOL_VERSION,
+            instance_id: "coalesced-instance".into(),
+            daemon_generation: 7,
+            frame_limit: DEFAULT_FRAME_LIMIT as u32,
+            profile_id: "coalesced-profile".into(),
+            daemon_version: "test".into(),
+            lifecycle_phase: haider_rpc::LifecyclePhase::Ready,
+            capabilities_granted: CapabilitySet::from([Capability::View]),
+            features: Default::default(),
+            encoding: Some("msgpack".into()),
+        };
+        let draining = WireFrame::ServerDraining {
+            reason: "test drain".into(),
+            instance_id: welcome.instance_id.clone(),
+            daemon_generation: welcome.daemon_generation,
+            deadline_unix_ms: 1234,
+        };
+        let mut bytes =
+            uds_codec::encode(&WireFrame::Welcome(welcome.clone()), DEFAULT_FRAME_LIMIT)
+                .expect("encode JSON Welcome");
+        bytes.extend(
+            uds_codec::encode_with(&draining, DEFAULT_FRAME_LIMIT, WireEncoding::MessagePack)
+                .expect("encode MessagePack notice"),
+        );
+
+        // One peer write deliberately makes the JSON handshake and first
+        // MessagePack frame available to the reader as a single byte stream.
+        let (mut peer, mut reader) = tokio::io::duplex(bytes.len());
+        peer.write_all(&bytes)
+            .await
+            .expect("write coalesced stream");
+
+        let (decoded_welcome, _decoder, leftovers) =
+            read_handshake(&mut reader, DEFAULT_FRAME_LIMIT)
+                .await
+                .expect("coalesced handshake succeeds");
+        assert_eq!(decoded_welcome, welcome);
+        assert_eq!(leftovers, VecDeque::from([draining]));
     }
 }

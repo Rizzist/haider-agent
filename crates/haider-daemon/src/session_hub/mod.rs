@@ -284,6 +284,13 @@ pub trait FrameSink: Send + Sync {
     /// Admits one complete frame without waiting on a socket.
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError>;
 
+    /// Admits best-effort traffic without borrowing capacity reserved for
+    /// replies or pongs. Sinks without a separate reply floor may use their
+    /// normal admission path.
+    fn try_send_droppable(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.try_send(frame)
+    }
+
     /// Stages a `SessionAttach` RESPONSE with response-before-event
     /// ordering: a sink with keyed event lanes must not admit this
     /// attachment's event offers until the response has left the queue, and

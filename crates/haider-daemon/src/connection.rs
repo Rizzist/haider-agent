@@ -186,6 +186,9 @@ enum LaneKey {
 #[derive(Debug)]
 struct QueuedFrame {
     bytes: OutboundBytes,
+    /// The JSON Welcome is the encoding barrier: no negotiated MessagePack
+    /// frame may pass it on the reserved writer lane.
+    welcome: bool,
     /// Set for a staged attach response: popping it clears this attachment's
     /// pending-response marker (response-before-event ordering), and a purge
     /// that still finds it uses the request id to answer the request.
@@ -199,6 +202,16 @@ impl QueuedFrame {
     fn ordinary(bytes: impl Into<OutboundBytes>) -> Self {
         Self {
             bytes: bytes.into(),
+            welcome: false,
+            response_for: None,
+            floor: false,
+        }
+    }
+
+    fn welcome(bytes: impl Into<OutboundBytes>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            welcome: true,
             response_for: None,
             floor: false,
         }
@@ -259,6 +272,9 @@ struct OutboundState {
     /// Frames currently admitted through the reply floor (queued or in
     /// flight): at most one.
     floor_in_use: usize,
+    /// Sticky once the Welcome encoding barrier has been admitted. The
+    /// writer combines this with its local `welcome_written` state.
+    welcome_queued: bool,
     /// Attachments whose staged attach response has not yet been popped:
     /// their event offers answer `Busy` until it pops, and a purge that
     /// still finds the marker removes the staged response and reports its
@@ -374,6 +390,7 @@ impl OutboundLane {
                     queued_frames: 0,
                     queued_bytes: 0,
                     floor_in_use: 0,
+                    welcome_queued: false,
                     pending_responses: HashMap::new(),
                     tickets: VecDeque::new(),
                     closed: false,
@@ -500,6 +517,20 @@ impl OutboundLane {
     /// ordinary capacity camped. Refusal — ordinary full AND floor occupied
     /// — is terminal for the caller.
     fn try_push(&self, key: LaneKey, frame: QueuedFrame) -> Result<(), DaemonError> {
+        self.try_push_with_floor(key, frame, true)
+    }
+
+    /// Admits ordinary droppable traffic without consuming the reply floor.
+    fn try_push_droppable(&self, key: LaneKey, frame: QueuedFrame) -> Result<(), DaemonError> {
+        self.try_push_with_floor(key, frame, false)
+    }
+
+    fn try_push_with_floor(
+        &self,
+        key: LaneKey,
+        frame: QueuedFrame,
+        allow_floor: bool,
+    ) -> Result<(), DaemonError> {
         let charged = frame.bytes.len();
         let mut state = self.inner.state.lock().map_err(|_| DaemonError::Task {
             message: "connection outbox mutex is poisoned".into(),
@@ -515,6 +546,7 @@ impl OutboundLane {
             && lane_len < self.inner.per_lane_capacity
             && next_bytes.is_some_and(|total| total <= self.inner.byte_budget);
         if ordinary_admits {
+            state.welcome_queued |= frame.welcome;
             if let Some((attachment_id, request_id)) = frame.response_for.clone() {
                 state.pending_responses.insert(attachment_id, request_id);
             }
@@ -529,8 +561,9 @@ impl OutboundLane {
             self.inner.ready.notify_one();
             return Ok(());
         }
-        if state.floor_in_use == 0 && charged <= self.inner.floor_byte_allowance {
+        if allow_floor && state.floor_in_use == 0 && charged <= self.inner.floor_byte_allowance {
             let mut frame = frame;
+            state.welcome_queued |= frame.welcome;
             frame.floor = true;
             if let Some((attachment_id, request_id)) = frame.response_for.clone() {
                 state.pending_responses.insert(attachment_id, request_id);
@@ -547,6 +580,13 @@ impl OutboundLane {
                 state.queued_frames, state.queued_bytes
             ),
         })
+    }
+
+    fn welcome_queued(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .is_ok_and(|state| state.welcome_queued)
     }
 
     async fn recv(&self) -> Option<QueuedFrame> {
@@ -755,6 +795,15 @@ impl FrameSink for ConnectionFrameSink {
             .map_err(|_| FrameSendError)
     }
 
+    fn try_send_droppable(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        let key = attachment_lane(&frame);
+        let bytes = encode_outbound(&frame, self.outbound_limit, self.encoding)
+            .map_err(|_| FrameSendError)?;
+        self.lane
+            .try_push_droppable(key, QueuedFrame::ordinary(bytes))
+            .map_err(|_| FrameSendError)
+    }
+
     fn try_send_for(
         &self,
         attachment_id: &AttachmentId,
@@ -774,6 +823,7 @@ impl FrameSink for ConnectionFrameSink {
                 LaneKey::System,
                 QueuedFrame {
                     bytes: bytes.into(),
+                    welcome: false,
                     response_for: marker,
                     floor: false,
                 },
@@ -1121,9 +1171,18 @@ where
     let mut notice = Option::<ReservedNotice>::None;
     let mut reserve_open = true;
     let mut notice_written = false;
+    let mut welcome_written = false;
     let mut drain_deadline = Option::<Instant>::None;
     loop {
-        let next = if reserve_open && !notice_written {
+        // A MessagePack drain notice can only be created after negotiation,
+        // and negotiation admits its marked JSON Welcome before publishing
+        // that encoding to the connection loop. Therefore the sticky queue
+        // marker closes the only race: while that barrier is pending, serve
+        // the ordinary lanes; after its write, restore the exact reserved
+        // bias. Pre-negotiation JSON drains never set the marker and retain
+        // their byte-for-byte ordering.
+        let welcome_barrier = !welcome_written && queued.welcome_queued();
+        let next = if reserve_open && !notice_written && !welcome_barrier {
             tokio::select! {
                 biased;
                 received = reserved.recv() => {
@@ -1171,7 +1230,9 @@ where
             // memory bounds.
             queued.credit(&frame);
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    welcome_written |= frame.welcome;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                     return Ok(notice_written);
                 }
@@ -1433,7 +1494,7 @@ fn negotiate_hello(
         encoding: negotiated.encoding.clone(),
     };
     let bytes = encode_welcome_for_peer(welcome, outbound_limit)?;
-    lane.try_push(LaneKey::System, QueuedFrame::ordinary(bytes))?;
+    lane.try_push(LaneKey::System, QueuedFrame::welcome(bytes))?;
     // Retained, not discarded: the grant is what later frames are authorized
     // against (W3b2 reads it through `ConnectionGrant`).
     *grant = Some(ConnectionGrant {

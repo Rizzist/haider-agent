@@ -6,8 +6,50 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{UnixStream, unix::OwnedWriteHalf};
+
+struct FirstWriteGate {
+    writer: OwnedWriteHalf,
+    gate: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    started: Option<oneshot::Sender<()>>,
+}
+
+impl AsyncWrite for FirstWriteGate {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Some(started) = self.started.take() {
+            let _ = started.send(());
+        }
+        if let Some(gate) = self.gate.as_mut() {
+            if gate.as_mut().poll(context).is_pending() {
+                return Poll::Pending;
+            }
+            self.gate = None;
+        }
+        Pin::new(&mut self.writer).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_shutdown(context)
+    }
+}
 
 fn ordinary(bytes: &[u8]) -> QueuedFrame {
     QueuedFrame::ordinary(bytes.to_vec())
@@ -16,6 +58,7 @@ fn ordinary(bytes: &[u8]) -> QueuedFrame {
 fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> QueuedFrame {
     QueuedFrame {
         bytes: bytes.to_vec().into(),
+        welcome: false,
         response_for: Some((attachment.clone(), RequestId::new(request))),
         floor: false,
     }
@@ -352,6 +395,29 @@ async fn reply_floor_admits_and_pops_ahead_of_camped_event_traffic() {
     // A second floor push while the floor is in use is refused terminally.
     lane.try_push(LaneKey::System, ordinary(b"reply-3"))
         .expect_err("floor in use and ordinary camped");
+}
+
+/// Roster deltas are best-effort observations, never replies. When ordinary
+/// capacity is camped they must leave the sole reply floor untouched.
+#[tokio::test]
+async fn droppable_roster_refusal_preserves_the_reply_floor() {
+    let lane = OutboundLane::new(1, 1_024, 64);
+    assert!(matches!(
+        lane.offer(
+            LaneKey::Attachment(AttachmentId::new("camped")),
+            b"event".to_vec(),
+            None
+        ),
+        SendAdmission::Sent
+    ));
+
+    lane.try_push_droppable(LaneKey::System, ordinary(b"roster"))
+        .expect_err("roster cannot borrow the reply floor");
+    assert_eq!(lane.inner.state.lock().expect("state lock").floor_in_use, 0);
+
+    lane.try_push(LaneKey::System, ordinary(b"reply"))
+        .expect("reply still enters its reserved floor");
+    assert_eq!(lane.recv().await.expect("floor reply").bytes, b"reply");
 }
 
 /// MUTATION CHECK: stop firing admission tickets in arrival order (fire the
@@ -856,6 +922,95 @@ async fn msgpack_switches_after_json_welcome_on_paired_uds() {
             .expect("serve joins")
             .expect("serve result"),
         ConnectionExit::ClosedBeforeDrain
+    );
+    hub.shutdown().await.expect("hub shutdown");
+}
+
+#[tokio::test]
+async fn msgpack_drain_waits_for_json_welcome_on_paired_uds() {
+    let (_dir, hub) = liveness_hub().await;
+    let (server, mut client) = UnixStream::pair().expect("socket pair");
+    let (reader, writer) = server.into_split();
+    let (write_started, started) = oneshot::channel();
+    let release = Arc::new(Notify::new());
+    let gated_writer = FirstWriteGate {
+        writer,
+        gate: Some(Box::pin(Arc::clone(&release).notified_owned())),
+        started: Some(write_started),
+    };
+    let (drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+    let serve_task = tokio::spawn(serve_io(
+        reader,
+        gated_writer,
+        liveness_context(hub.clone()),
+        drain_rx,
+    ));
+
+    let hello = WireFrame::Hello(haider_rpc::Hello {
+        protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
+        protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
+        client_name: "paired-drain-order-test".into(),
+        client_version: "test".into(),
+        client_instance_id: "paired-drain-order-client".into(),
+        client_kind: haider_rpc::ClientKind::Headless,
+        capabilities_requested: CapabilitySet::from([Capability::View]),
+        max_receive_frame: 1024 * 1024,
+        encodings: vec!["msgpack".into()],
+    });
+    client
+        .write_all(&uds_codec::encode(&hello, 1024 * 1024).expect("Hello encodes"))
+        .await
+        .expect("Hello writes");
+    started.await.expect("writer reached the queued Welcome");
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    drain_tx.send_replace(Some(DrainNotice {
+        reason: "test drain".into(),
+        instance_id: "instance-liveness".into(),
+        daemon_generation: 1,
+        deadline_unix_ms: 1,
+        deadline,
+    }));
+    tokio::task::yield_now().await;
+    release.notify_one();
+
+    async fn read_one(stream: &mut UnixStream, encoding: haider_rpc::WireEncoding) -> WireFrame {
+        let mut prefix = [0_u8; 4];
+        stream
+            .read_exact(&mut prefix)
+            .await
+            .expect("frame prefix reads");
+        let body_len = usize::try_from(u32::from_be_bytes(prefix)).expect("length fits");
+        let mut bytes = prefix.to_vec();
+        bytes.resize(4 + body_len, 0);
+        stream
+            .read_exact(&mut bytes[4..])
+            .await
+            .expect("frame body reads");
+        let mut decoder = uds_codec::Decoder::new(1024 * 1024);
+        decoder.set_encoding(encoding);
+        let batch = decoder.push(&bytes);
+        assert!(batch.error.is_none(), "frame decodes in expected encoding");
+        batch.frames.into_iter().next().expect("one frame")
+    }
+
+    assert!(matches!(
+        read_one(&mut client, haider_rpc::WireEncoding::Json).await,
+        WireFrame::Welcome(Welcome {
+            encoding: Some(ref encoding),
+            ..
+        }) if encoding == "msgpack"
+    ));
+    assert!(matches!(
+        read_one(&mut client, haider_rpc::WireEncoding::MessagePack).await,
+        WireFrame::ServerDraining { .. }
+    ));
+    assert_eq!(
+        serve_task
+            .await
+            .expect("serve joins")
+            .expect("serve result"),
+        ConnectionExit::NoticeDelivered
     );
     hub.shutdown().await.expect("hub shutdown");
 }

@@ -12,7 +12,6 @@
 //! (rpc.rs). A replay task never writes the store and never answers requests.
 
 use super::*;
-use haider_protocol::item::ItemEvent;
 
 // ──────── replay pipeline: replay → caught-up → buffered drain → live ───────
 
@@ -521,8 +520,99 @@ async fn replay_range(
 }
 
 fn is_item_delta(envelope: &RawEnvelope) -> bool {
-    serde_json::from_value::<EventPayload>(envelope.payload.clone())
-        .is_ok_and(|payload| matches!(payload, EventPayload::Item(ItemEvent::Delta { .. })))
+    let payload = &envelope.payload;
+    payload.get("type").and_then(serde_json::Value::as_str) == Some("item")
+        && payload.get("event").and_then(serde_json::Value::as_str) == Some("delta")
+        // ItemDelta is an internally tagged union. Requiring its string
+        // discriminant matches the frozen wire shape without decoding or
+        // cloning payloads, while still sealing future delta subtypes that
+        // this daemon does not know how to deserialize.
+        && payload
+            .get("delta")
+            .and_then(|delta| delta.get("delta"))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn envelope_with_payload(payload: serde_json::Value) -> RawEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "event_id": "ev-structural-delta-test",
+            "seq": 1,
+            "session_id": "s-structural-delta-test",
+            "device_id": "d-structural-delta-test",
+            "authority_epoch": 0,
+            "worker_generation": 0,
+            "committed_at_ms": 0,
+            "render": {
+                "ui": true,
+                "durable": true,
+                "prompt": "verbatim"
+            },
+            "payload": payload
+        }))
+        .expect("raw envelope")
+    }
+
+    #[test]
+    fn sealed_replay_structurally_skips_known_item_delta() {
+        let envelope = envelope_with_payload(serde_json::json!({
+            "type": "item",
+            "event": "delta",
+            "item_id": "it-known",
+            "delta": {
+                "delta": "command_output",
+                "stream": "stdout",
+                "chunk_b64": "aGk="
+            }
+        }));
+
+        assert!(is_item_delta(&envelope));
+    }
+
+    #[test]
+    fn sealed_replay_structurally_skips_unknown_item_delta_subtype() {
+        let envelope = envelope_with_payload(serde_json::json!({
+            "type": "item",
+            "event": "delta",
+            "item_id": "it-future",
+            "delta": {
+                "delta": "future_stream_kind",
+                "future_field": { "opaque": true }
+            }
+        }));
+
+        assert!(is_item_delta(&envelope));
+    }
+
+    #[test]
+    fn sealed_replay_delivers_non_item_payload() {
+        let envelope = envelope_with_payload(serde_json::json!({
+            "type": "run_state",
+            "state": "thinking"
+        }));
+
+        assert!(!is_item_delta(&envelope));
+    }
+
+    #[test]
+    fn sealed_replay_delivers_malformed_item_delta_payload() {
+        let missing_delta_shape = envelope_with_payload(serde_json::json!({
+            "type": "item",
+            "event": "delta",
+            "item_id": "it-malformed",
+            "delta": "not-an-item-delta-object"
+        }));
+        let malformed_payload = envelope_with_payload(serde_json::json!("not-an-object"));
+
+        assert!(!is_item_delta(&missing_delta_shape));
+        assert!(!is_item_delta(&malformed_payload));
+    }
 }
 
 /// Delivers one envelope through [`deliver_frame`]'s pacing law, advancing

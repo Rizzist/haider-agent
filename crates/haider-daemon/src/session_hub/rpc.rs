@@ -25,7 +25,7 @@ use haider_protocol::menu::MenuKind;
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
 use haider_tools::MessageSubagent;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval_at};
 
@@ -5901,37 +5901,42 @@ impl HubConnection {
             let period = std::time::Duration::from_millis(1_000);
             let mut ticker = interval_at(tokio::time::Instant::now() + period, period);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut digests = BTreeMap::new();
+            let mut pushed_heads = BTreeMap::<String, u64>::new();
             loop {
                 ticker.tick().await;
                 let Ok(ids) = hub.inner.store.session_ids().await else {
                     continue;
                 };
-                let Ok(summaries) = session_summaries(&hub, &ids).await else {
-                    continue;
-                };
-                let Ok((changed, next_digests)) = roster_delta(&digests, summaries) else {
-                    continue;
-                };
-                if changed.is_empty() {
-                    // Removed sessions are deliberately silent in v1, but
-                    // forgetting their digest lets a later recreation be
-                    // observed as new.
-                    digests = next_digests;
+                let mut current_heads = Vec::with_capacity(ids.len());
+                let mut head_read_failed = false;
+                for session_id in &ids {
+                    match hub.inner.store.latest_seq(session_id).await {
+                        Ok(head_seq) => current_heads.push((session_id.clone(), head_seq)),
+                        Err(_) => {
+                            head_read_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if head_read_failed {
                     continue;
                 }
-                if sink
-                    .try_send(WireFrame::SessionRosterDelta { summaries: changed })
-                    .is_ok()
-                {
-                    digests = next_digests;
-                } else {
-                    // Retry changed/current rows next tick, but still forget
-                    // removals so a later recreation is observed as new.
-                    digests.retain(|session_id, _| next_digests.contains_key(session_id));
+
+                // Removed sessions are deliberately silent in v1. Forgetting
+                // their head makes a later recreation appear new.
+                let current_ids = current_heads
+                    .iter()
+                    .map(|(session_id, _)| session_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                pushed_heads.retain(|session_id, _| current_ids.contains(session_id.as_str()));
+                let changed_ids = roster_fold_candidates(&pushed_heads, &current_heads);
+                if changed_ids.is_empty() {
+                    continue;
                 }
-                // A full/lagged outbox drops this tick. Since its digest map
-                // remains unchanged, the next tick re-diffs and retries.
+                let Ok(changed) = session_summaries(&hub, &changed_ids).await else {
+                    continue;
+                };
+                push_roster_chunks(sink.as_ref(), changed, &mut pushed_heads);
             }
         }));
         Ok(())
@@ -6712,23 +6717,47 @@ async fn session_summaries(
     Ok(sessions)
 }
 
-type RosterDigestMap = BTreeMap<String, blake3::Hash>;
+const ROSTER_DELTA_CHUNK_SIZE: usize = 64;
 
-fn roster_delta(
-    previous: &RosterDigestMap,
+fn roster_fold_candidates(
+    pushed_heads: &BTreeMap<String, u64>,
+    current_heads: &[(SessionId, u64)],
+) -> Vec<SessionId> {
+    current_heads
+        .iter()
+        .filter(|(session_id, head_seq)| pushed_heads.get(session_id.as_str()) != Some(head_seq))
+        .map(|(session_id, _)| session_id.clone())
+        .collect()
+}
+
+fn push_roster_chunks(
+    sink: &dyn FrameSink,
     summaries: Vec<SessionSummary>,
-) -> Result<(Vec<SessionSummary>, RosterDigestMap), serde_json::Error> {
-    let mut changed = Vec::new();
-    let mut next = BTreeMap::new();
-    for summary in summaries {
-        let session_id = summary.session_id.as_str().to_owned();
-        let digest = blake3::hash(&serde_json::to_vec(&summary)?);
-        if previous.get(&session_id) != Some(&digest) {
-            changed.push(summary);
+    pushed_heads: &mut BTreeMap<String, u64>,
+) {
+    let mut summaries = summaries.into_iter();
+    loop {
+        let chunk = summaries
+            .by_ref()
+            .take(ROSTER_DELTA_CHUNK_SIZE)
+            .collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
         }
-        next.insert(session_id, digest);
+        let sent_heads = chunk
+            .iter()
+            .map(|summary| (summary.session_id.as_str().to_owned(), summary.head_seq))
+            .collect::<Vec<_>>();
+        if sink
+            .try_send_droppable(WireFrame::SessionRosterDelta { summaries: chunk })
+            .is_ok()
+        {
+            pushed_heads.extend(sent_heads);
+        }
+        // A refused chunk leaves its heads unchanged, so every member is
+        // selected and folded again on the next tick. Later independent
+        // chunks may still make progress.
     }
-    Ok((changed, next))
 }
 
 fn standard_base64_decoded_len(encoded: &str) -> Result<usize, &'static str> {
@@ -6759,6 +6788,84 @@ fn normalize_session_title(title: Option<String>) -> Option<String> {
         None
     } else {
         Some(capped.to_owned())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod roster_wave_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct ChunkSink {
+        calls: Mutex<Vec<usize>>,
+        fail_call: usize,
+    }
+
+    impl FrameSink for ChunkSink {
+        fn try_send(&self, _frame: WireFrame) -> Result<(), FrameSendError> {
+            Err(FrameSendError)
+        }
+
+        fn try_send_droppable(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+            let WireFrame::SessionRosterDelta { summaries } = frame else {
+                return Err(FrameSendError);
+            };
+            let mut calls = self.calls.lock().map_err(|_| FrameSendError)?;
+            calls.push(summaries.len());
+            if calls.len() == self.fail_call {
+                Err(FrameSendError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn summary(index: usize) -> SessionSummary {
+        SessionSummary {
+            session_id: SessionId::new(format!("session-{index:03}")),
+            head_seq: u64::try_from(index).expect("test index fits") + 1,
+            worker_generation: 1,
+            metadata: None,
+            last_model: None,
+            workspace_cwd: None,
+            turn_count: None,
+            footprint_tokens: None,
+            footprint_truth: None,
+            title: None,
+            agent_metrics: None,
+        }
+    }
+
+    #[test]
+    fn unchanged_roster_heads_select_no_summary_folds() {
+        let pushed_heads = BTreeMap::from([("session-000".to_owned(), 7)]);
+        let current_heads = vec![(SessionId::new("session-000"), 7)];
+
+        assert!(roster_fold_candidates(&pushed_heads, &current_heads).is_empty());
+    }
+
+    #[test]
+    fn sixty_five_roster_rows_chunk_and_only_successful_chunks_advance_heads() {
+        let summaries = (0..65).map(summary).collect::<Vec<_>>();
+        let current_heads = summaries
+            .iter()
+            .map(|summary| (summary.session_id.clone(), summary.head_seq))
+            .collect::<Vec<_>>();
+        let sink = ChunkSink {
+            calls: Mutex::new(Vec::new()),
+            fail_call: 2,
+        };
+        let mut pushed_heads = BTreeMap::new();
+
+        push_roster_chunks(&sink, summaries, &mut pushed_heads);
+
+        assert_eq!(*sink.calls.lock().expect("calls lock"), vec![64, 1]);
+        assert_eq!(pushed_heads.len(), 64);
+        assert_eq!(
+            roster_fold_candidates(&pushed_heads, &current_heads),
+            vec![SessionId::new("session-064")]
+        );
     }
 }
 
