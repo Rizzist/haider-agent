@@ -48,28 +48,47 @@ pub enum Turn {
     User {
         text: String,
         at_ms: u64,
+        /// The journal seq of the producing envelope — the row identity a
+        /// live subscriber keys by, so cold-rebuilt rows match live rows.
+        seq: u64,
     },
     Assistant {
         text: String,
         at_ms: u64,
+        seq: u64,
     },
     AssistantIncomplete {
         text: String,
         interruption: ErrorPresentation,
         at_ms: u64,
+        seq: u64,
     },
     Error {
         presentation: ErrorPresentation,
         at_ms: u64,
+        seq: u64,
     },
     Tool {
         name: String,
         summary: String,
         at_ms: u64,
+        seq: u64,
     },
 }
 
 impl Turn {
+    /// The journal seq of the producing envelope.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::User { seq, .. }
+            | Self::Assistant { seq, .. }
+            | Self::AssistantIncomplete { seq, .. }
+            | Self::Error { seq, .. }
+            | Self::Tool { seq, .. } => *seq,
+        }
+    }
+
     fn at_ms(&self) -> u64 {
         match self {
             Self::User { at_ms, .. }
@@ -86,6 +105,10 @@ impl Turn {
 pub struct SessionExport {
     pub meta: ExportMeta,
     pub turns: Vec<Turn>,
+    /// The highest journal seq SEEN in the replay (not just of rendered
+    /// turns) — the exact catch-up cursor: subscribe `after_seq=head_seq`
+    /// or re-export `--since head_seq` and nothing is missed or repeated.
+    pub head_seq: u64,
 }
 
 /// The export formats. `markdown` is the default.
@@ -171,6 +194,7 @@ impl SessionExport {
     pub fn project(meta: ExportMeta, events: &[RawEnvelope]) -> Self {
         let mut ordered: Vec<&RawEnvelope> = events.iter().collect();
         ordered.sort_by_key(|envelope| envelope.seq);
+        let head_seq = ordered.last().map_or(0, |envelope| envelope.seq);
         let mut turns = Vec::new();
         for envelope in ordered {
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
@@ -178,17 +202,21 @@ impl SessionExport {
                 continue;
             };
             let at_ms = envelope.committed_at_ms;
+            let seq = envelope.seq;
             match payload {
                 EventPayload::NodeCommitted(node) => match node.kind {
-                    NodeKind::UserTurn { text, .. } => turns.push(Turn::User { text, at_ms }),
+                    NodeKind::UserTurn { text, .. } => {
+                        turns.push(Turn::User { text, at_ms, seq });
+                    }
                     NodeKind::AssistantCommit { text, .. } => {
-                        turns.push(Turn::Assistant { text, at_ms });
+                        turns.push(Turn::Assistant { text, at_ms, seq });
                     }
                     NodeKind::ToolExchange { tool, summary, .. } => {
                         turns.push(Turn::Tool {
                             name: tool,
                             summary,
                             at_ms,
+                            seq,
                         });
                     }
                     _ => {}
@@ -200,6 +228,7 @@ impl SessionExport {
                     text,
                     interruption,
                     at_ms,
+                    seq,
                 }),
                 EventPayload::RunFailed {
                     presentation: Some(presentation),
@@ -207,11 +236,16 @@ impl SessionExport {
                 } => turns.push(Turn::Error {
                     presentation,
                     at_ms,
+                    seq,
                 }),
                 _ => {}
             }
         }
-        Self { meta, turns }
+        Self {
+            meta,
+            turns,
+            head_seq,
+        }
     }
 
     fn title(&self, masked: bool) -> Option<String> {
@@ -271,7 +305,9 @@ impl SessionExport {
     /// Text rides between pipes with `\` `|` and newline backslash-escaped,
     /// so ONE LINE PER EVENT holds for stream/grep consumers. The rendering
     /// is a pure function of the projection in `seq` order: re-exporting a
-    /// session that only grew yields the previous bytes plus new lines.
+    /// session that only grew yields the previous bytes plus new lines, and
+    /// a `--since` export's BODY lines are exactly the suffix the full
+    /// export appends after that cursor.
     #[must_use]
     pub fn to_pipe(&self, masked: bool) -> String {
         fn field(text: &str) -> String {
@@ -291,28 +327,30 @@ impl SessionExport {
         }
         let mut lines = Vec::with_capacity(self.turns.len() + 1);
         lines.push(format!(
-            "pipe-export/v1 session={} provider={} model={} created_ms={} cwd={} title={}",
+            "pipe-export/v1 session={} provider={} model={} created_ms={} head_seq={} cwd={} title={}",
             self.meta.session_id,
             self.meta.provider,
             self.meta.model,
             self.meta.created_at_ms,
+            self.head_seq,
             field(&self.meta.cwd),
             field(&self.title(masked).unwrap_or_default()),
         ));
         for turn in &self.turns {
             lines.push(match turn {
-                Turn::User { text, at_ms } => {
-                    format!("U  {at_ms} {}", field(&self.text(text, masked)))
+                Turn::User { text, at_ms, seq } => {
+                    format!("U  {seq} {at_ms} {}", field(&self.text(text, masked)))
                 }
-                Turn::Assistant { text, at_ms } => {
-                    format!("A  {at_ms} {}", field(&self.text(text, masked)))
+                Turn::Assistant { text, at_ms, seq } => {
+                    format!("A  {seq} {at_ms} {}", field(&self.text(text, masked)))
                 }
                 Turn::AssistantIncomplete {
                     text,
                     interruption,
                     at_ms,
+                    seq,
                 } => format!(
-                    "A! {at_ms} {} interrupted={}",
+                    "A! {seq} {at_ms} {} interrupted={}",
                     field(&self.text(text, masked)),
                     field(&self.text(
                         &format!("{}: {}", interruption.title, interruption.detail),
@@ -322,8 +360,9 @@ impl SessionExport {
                 Turn::Error {
                     presentation,
                     at_ms,
+                    seq,
                 } => format!(
-                    "E  {at_ms} {}",
+                    "E  {seq} {at_ms} {}",
                     field(&self.text(
                         &format!("{}: {}", presentation.title, presentation.detail),
                         masked
@@ -333,7 +372,11 @@ impl SessionExport {
                     name,
                     summary,
                     at_ms,
-                } => format!("T  {at_ms} {name} {}", field(&self.text(summary, masked))),
+                    seq,
+                } => format!(
+                    "T  {seq} {at_ms} {name} {}",
+                    field(&self.text(summary, masked))
+                ),
             });
         }
         let mut body = lines.join("\n");
@@ -359,12 +402,12 @@ impl SessionExport {
         out.push_str("---\n\n");
         for turn in &self.turns {
             match turn {
-                Turn::User { text, at_ms } => {
+                Turn::User { text, at_ms, .. } => {
                     out.push_str(&format!("## User · {}\n\n", iso8601_ms(*at_ms)));
                     out.push_str(&self.text(text, masked));
                     out.push_str("\n\n");
                 }
-                Turn::Assistant { text, at_ms } => {
+                Turn::Assistant { text, at_ms, .. } => {
                     out.push_str(&format!("## Assistant · {}\n\n", iso8601_ms(*at_ms)));
                     out.push_str(&self.text(text, masked));
                     out.push_str("\n\n");
@@ -373,6 +416,7 @@ impl SessionExport {
                     text,
                     interruption,
                     at_ms,
+                    ..
                 } => {
                     out.push_str(&format!("## Assistant · {}\n\n", iso8601_ms(*at_ms)));
                     out.push_str(&self.text(text, masked));
@@ -384,6 +428,7 @@ impl SessionExport {
                 Turn::Error {
                     presentation,
                     at_ms,
+                    ..
                 } => out.push_str(&format!(
                     "## Error · {}\n\n**{}** — {} (`{}`)\n\nActions: {}\n\n",
                     iso8601_ms(*at_ms),
@@ -413,44 +458,52 @@ impl SessionExport {
             .turns
             .iter()
             .map(|turn| match turn {
-                Turn::User { text, at_ms } => json!({
+                Turn::User { text, at_ms, seq } => json!({
                     "role": "user",
                     "text": self.text(text, masked),
                     "at_ms": at_ms,
+                    "seq": seq,
                 }),
-                Turn::Assistant { text, at_ms } => json!({
+                Turn::Assistant { text, at_ms, seq } => json!({
                     "role": "assistant",
                     "text": self.text(text, masked),
                     "at_ms": at_ms,
+                    "seq": seq,
                 }),
                 Turn::AssistantIncomplete {
                     text,
                     interruption,
                     at_ms,
+                    seq,
                 } => json!({
                     "role": "assistant",
                     "text": self.text(text, masked),
                     "incomplete": true,
                     "interruption": interruption,
                     "at_ms": at_ms,
+                    "seq": seq,
                 }),
                 Turn::Error {
                     presentation,
                     at_ms,
+                    seq,
                 } => json!({
                     "role": "error",
                     "presentation": presentation,
                     "at_ms": at_ms,
+                    "seq": seq,
                 }),
                 Turn::Tool {
                     name,
                     summary,
                     at_ms,
+                    seq,
                 } => json!({
                     "role": "tool",
                     "name": name,
                     "summary": self.text(summary, masked),
                     "at_ms": at_ms,
+                    "seq": seq,
                 }),
             })
             .collect();
@@ -462,6 +515,7 @@ impl SessionExport {
             "provider": self.meta.provider,
             "model": self.meta.model,
             "created_at_ms": self.meta.created_at_ms,
+            "head_seq": self.head_seq,
             "masked": masked,
             "turns": turns,
         });
@@ -1206,6 +1260,10 @@ pub struct ExportOptions {
     pub masked: bool,
     pub confirm: bool,
     pub no_spawn: bool,
+    /// Incremental cursor (pipe/json only): render only turns with
+    /// `seq > since`. The header still carries the CURRENT head_seq, so
+    /// each catch-up call yields the next cursor.
+    pub since: Option<u64>,
 }
 
 /// Parse `<session-id> [--format FMT] [--out PATH] [--masked] [--confirm]
@@ -1217,6 +1275,7 @@ pub fn parse_export_options(rest: &[String]) -> Result<ExportOptions, String> {
     let mut masked = false;
     let mut confirm = false;
     let mut no_spawn = false;
+    let mut since: Option<u64> = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -1236,6 +1295,16 @@ pub fn parse_export_options(rest: &[String]) -> Result<ExportOptions, String> {
                     return Err("--out requires a non-empty path".into());
                 }
                 out = Some(PathBuf::from(value));
+            }
+            "--since" => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--since requires a journal seq".to_owned())?;
+                let cursor: u64 = value
+                    .parse()
+                    .map_err(|_| format!("--since takes a journal seq, got `{value}`"))?;
+                since = Some(cursor);
             }
             "--masked" if !masked => masked = true,
             "--confirm" if !confirm => confirm = true,
@@ -1258,7 +1327,7 @@ pub fn parse_export_options(rest: &[String]) -> Result<ExportOptions, String> {
     }
     Ok(ExportOptions {
         session_id: session_id.ok_or_else(|| {
-            "usage: haider export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm]"
+            "usage: haider export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--since SEQ] [--out PATH] [--masked] [--confirm]"
                 .to_owned()
         })?,
         format,
@@ -1266,6 +1335,7 @@ pub fn parse_export_options(rest: &[String]) -> Result<ExportOptions, String> {
         masked,
         confirm,
         no_spawn,
+        since,
     })
 }
 
@@ -1354,7 +1424,25 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
     }
 
     // 3) Project + render + write.
-    let export = SessionExport::project(meta, &events);
+    let mut export = SessionExport::project(meta, &events);
+    // `--since <seq>`: the incremental cursor. Filtering the projection (not
+    // the render) keeps every format's body exactly the suffix of the full
+    // export's body — the append-only law does the rest. Foreign-store
+    // writers (codex/claude-code/opencode) build complete files; a partial
+    // one would corrupt a foreign app's history, so the cursor refuses there.
+    if let Some(since) = options.since {
+        if matches!(
+            options.format,
+            Format::Codex | Format::ClaudeCode | Format::OpenCode
+        ) {
+            eprintln!(
+                "haider export: --since is a pipe/json/markdown cursor; foreign-store formats \
+                 write complete files"
+            );
+            return ExitCode::from(EX_USAGE);
+        }
+        export.turns.retain(|turn| turn.seq() > since);
+    }
     match write_export(&export, &options) {
         Ok(summary) => {
             if !summary.is_empty() {

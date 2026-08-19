@@ -316,6 +316,9 @@ pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 /// Daemon implements the Loom registry: agent types + pipe-source workflows
 /// (`loom.list`, `loom.register_agent_type`, `loom.register_workflow`).
 pub const FEATURE_LOOM_V1: &str = "loom_v1";
+/// ADE capability sniff: `haider export` renders seq-keyed rows (pipe/json
+/// carry per-turn journal seq + a head_seq cursor, `--since` is exact).
+pub const FEATURE_EXPORT_SEQ_V1: &str = "export_seq_v1";
 
 /// One todo child returned by `graph.run_set.open`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

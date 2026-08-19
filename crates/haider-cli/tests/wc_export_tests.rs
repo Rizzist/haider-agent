@@ -428,6 +428,7 @@ fn opencode_requires_confirmation() {
         masked: false,
         confirm: false,
         no_spawn: true,
+        since: None,
     };
     // The write pathway refuses without --confirm BEFORE touching the db.
     let err = export::write_export(&fixture_export(), &options).expect_err("unconfirmed");
@@ -566,6 +567,7 @@ fn pipe_export_holds_the_line_law_and_is_append_only() {
     hostile.turns.push(export::Turn::User {
         text: "line one\nline two |with pipes| and \\backslash".into(),
         at_ms: 99,
+        seq: 999,
     });
     let rendered = hostile.to_pipe(false);
     assert_eq!(
@@ -583,8 +585,74 @@ fn pipe_export_holds_the_line_law_and_is_append_only() {
     // journal has, so periodic exports diff and cache cleanly.
     let shorter = export.to_pipe(false);
     let longer = hostile.to_pipe(false);
+    // Header carries the catch-up cursor; the grown export's BODY extends
+    // the earlier BODY byte-for-byte (headers differ by head_seq — split
+    // them off before comparing).
+    let body = |rendered: &str| {
+        rendered
+            .split_once('\n')
+            .map(|(_, body)| body.to_owned())
+            .unwrap_or_default()
+    };
     assert!(
-        longer.starts_with(&shorter),
-        "a grown session's export must extend the earlier export byte-for-byte"
+        longer.contains("head_seq="),
+        "header must carry the cursor:\n{longer}"
+    );
+    assert!(
+        body(&longer).starts_with(&body(&shorter)),
+        "a grown session's export body must extend the earlier body byte-for-byte"
+    );
+
+    // Every body line leads with `<kind> <seq> <at_ms>` — the row identity a
+    // live subscriber keys by, so cold-rebuilt rows match live rows.
+    for line in body(&longer).lines() {
+        let mut parts = line.split_whitespace();
+        let _kind = parts.next().expect("kind");
+        let seq: u64 = parts.next().expect("seq").parse().expect("numeric seq");
+        let _at: u64 = parts.next().expect("at_ms").parse().expect("numeric at");
+        assert!(seq > 0 || line.starts_with("U  0"), "seq column: {line}");
+    }
+}
+
+/// MUTATION CHECK (`--since <seq>`): stop filtering the projection, or
+/// filter by anything but strict `seq > since`. Expected RUNTIME failure:
+/// the incremental body is not exactly the suffix the full body appends
+/// after the cursor.
+#[test]
+fn since_cursor_yields_the_exact_suffix() {
+    let export = fixture_export();
+    assert!(export.turns.len() >= 2, "fixture needs at least two turns");
+    let cursor = export.turns[0].seq();
+    let full = export.to_pipe(false);
+    let mut incremental = export.clone();
+    incremental.turns.retain(|turn| turn.seq() > cursor);
+    let suffix = incremental.to_pipe(false);
+    let body = |rendered: &str| {
+        rendered
+            .split_once('\n')
+            .map(|(_, body)| body.to_owned())
+            .unwrap_or_default()
+    };
+    let full_body = body(&full);
+    let suffix_body = body(&suffix);
+    assert!(
+        full_body.ends_with(&suffix_body),
+        "since-body must be the exact tail:\nfull:\n{full_body}\nsuffix:\n{suffix_body}"
+    );
+    assert!(
+        !suffix_body.contains(&full_body.lines().next().unwrap_or_default().to_owned()),
+        "the cursor'd row must not repeat"
+    );
+    // head_seq stays the TRUE head in both — the next cursor is always
+    // current regardless of how much body was skipped.
+    assert_eq!(
+        full.lines().next().and_then(|line| line
+            .split_whitespace()
+            .find(|part| part.starts_with("head_seq="))
+            .map(str::to_owned)),
+        suffix.lines().next().and_then(|line| line
+            .split_whitespace()
+            .find(|part| part.starts_with("head_seq="))
+            .map(str::to_owned)),
     );
 }

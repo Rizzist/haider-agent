@@ -93,6 +93,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
             FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
+            haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
             FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1.to_owned(),
