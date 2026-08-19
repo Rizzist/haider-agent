@@ -10323,7 +10323,13 @@ impl HubCommandOutputContext {
 
     async fn append_image_created(&self, run_id: &RunId, image: ImageCreatedV1) -> ToolResult<()> {
         let mut identity = blake3::Hasher::new();
+        // Round 3: the SESSION joins the identity — event ids are globally
+        // unique across sessions, and the same (call_id, path) can
+        // legitimately recur in another session.
+        identity.update(self.store.session_id().as_str().as_bytes());
+        identity.update(b"\x1f");
         identity.update(image.call_id.as_bytes());
+        identity.update(b"\x1f");
         identity.update(image.path.as_bytes());
         let identity = identity.finalize().to_hex();
         let item_id = ItemId::new(format!("image-created-{identity}"));
@@ -10363,12 +10369,18 @@ impl HubCommandOutputContext {
                 message: format!("cannot serialize image-created envelope: {error}"),
             })?,
         }];
-        StoreHandle::append(&self.store, &mut envelopes)
-            .await
-            .map_err(|error| ToolError::Runtime {
+        match StoreHandle::append(&self.store, &mut envelopes).await {
+            Ok(_) => Ok(()),
+            // Round 3: this envelope's event id is DERIVED (session, call,
+            // path), so the only InvalidArgument this self-built append can
+            // produce is the store's unique-event-id refusal — which means
+            // the fact is ALREADY durable. A replayed emission is a no-op,
+            // never a tool failure.
+            Err(error) if error.code == ErrorCode::InvalidArgument => Ok(()),
+            Err(error) => Err(ToolError::Runtime {
                 message: error.message,
-            })?;
-        Ok(())
+            }),
+        }
     }
 
     async fn append_permission_payload(

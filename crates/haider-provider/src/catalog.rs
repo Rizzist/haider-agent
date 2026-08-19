@@ -387,6 +387,16 @@ pub async fn discover_models_with_resolver(
     }
     if !response.status().is_success() {
         let status = response.status().as_u16();
+        // Grok round 2: the proxy's 402/426 are its client-version gate —
+        // an ACTIONABLE misconfiguration, never generic unavailability.
+        if matches!(status, 402 | 426) {
+            return Err(CatalogError::Unavailable {
+                reason: format!(
+                    "the Grok subscription proxy rejected this client ({status}): the pinned \
+                     x-grok-client-version is no longer admitted — update the harness"
+                ),
+            });
+        }
         // 401/403/404 under a subscription token is the "not served to this
         // credential" case the brief anticipated: honest unavailability, and
         // the caller keeps its last-known list.

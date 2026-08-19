@@ -161,3 +161,27 @@ fn reveal_refuses_untrusted_shapes() {
     std::fs::write(&good, [0x89, b'P', b'N', b'G']).expect("write");
     assert!(reveal_path_command(&good).is_ok());
 }
+
+/// Round 3 MUTATION CHECK: check the extension only BEFORE canonicalization.
+/// Expected RUNTIME failure: a symlink named cover.png targeting a non-image
+/// reaches the OS opener.
+#[cfg(unix)]
+#[test]
+fn reveal_refuses_image_named_symlinks_to_non_images() {
+    use haider_tui::browser::reveal_path_command;
+    let dir = tempfile::tempdir().expect("dir");
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, b"not an image").expect("write");
+    let cover = dir.path().join("cover.png");
+    std::os::unix::fs::symlink(&secret, &cover).expect("symlink");
+    assert!(
+        reveal_path_command(&cover).is_err(),
+        "an image-named symlink to a non-image must refuse"
+    );
+    // A symlink to a REAL image stays revealable (canonical target passes).
+    let real = dir.path().join("real.jpg");
+    std::fs::write(&real, [0xFF, 0xD8, 0xFF]).expect("write");
+    let alias = dir.path().join("alias.jpeg");
+    std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+    assert!(reveal_path_command(&alias).is_ok());
+}

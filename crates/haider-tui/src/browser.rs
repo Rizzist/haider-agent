@@ -88,16 +88,24 @@ fn validated_reveal_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
         return Err(refused("reveal refuses UNC/device paths"));
     }
     const IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
-    let extension_ok = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
-        });
-    if !extension_ok {
+    let image_extension = |candidate: &Path| {
+        candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+            })
+    };
+    if !image_extension(path) {
         return Err(refused("reveal is scoped to image files"));
     }
     let canonical = path.canonicalize()?;
+    // Round 3: the law binds the CANONICAL target too — a symlink named
+    // cover.png pointing at a non-image must refuse, or the extension check
+    // is decoration.
+    if !image_extension(&canonical) {
+        return Err(refused("reveal is scoped to image files"));
+    }
     if !std::fs::metadata(&canonical)?.is_file() {
         return Err(refused("reveal target is not a regular file"));
     }
