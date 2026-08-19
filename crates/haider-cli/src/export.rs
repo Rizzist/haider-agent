@@ -96,6 +96,11 @@ pub enum Format {
     Codex,
     ClaudeCode,
     OpenCode,
+    /// The instruct-pipe line format: one typed line per event, escaped so
+    /// the line law holds. Deterministic and append-only — exporting a
+    /// longer session yields the earlier export plus suffix lines, the same
+    /// prefix-stability the journal itself has.
+    Pipe,
 }
 
 impl Format {
@@ -107,8 +112,9 @@ impl Format {
             "codex" => Ok(Self::Codex),
             "claude-code" | "claude" => Ok(Self::ClaudeCode),
             "opencode" => Ok(Self::OpenCode),
+            "pipe" | "instructpipe" => Ok(Self::Pipe),
             other => Err(format!(
-                "unknown format `{other}` (markdown|json|codex|claude-code|opencode)"
+                "unknown format `{other}` (markdown|json|codex|claude-code|opencode|pipe)"
             )),
         }
     }
@@ -250,6 +256,90 @@ impl SessionExport {
     // -----------------------------------------------------------------------
     // Native renderers
     // -----------------------------------------------------------------------
+
+    /// The instruct-pipe rendering. Line vocabulary:
+    ///
+    /// ```text
+    /// pipe-export/v1 session=<id> provider=<p> model=<m> created_ms=<n> cwd=|…| title=|…|
+    /// U  <at_ms> |user text|
+    /// A  <at_ms> |assistant text|
+    /// A! <at_ms> |partial text| interrupted=|title: detail|
+    /// E  <at_ms> |title: detail|
+    /// T  <at_ms> <tool-name> |summary|
+    /// ```
+    ///
+    /// Text rides between pipes with `\` `|` and newline backslash-escaped,
+    /// so ONE LINE PER EVENT holds for stream/grep consumers. The rendering
+    /// is a pure function of the projection in `seq` order: re-exporting a
+    /// session that only grew yields the previous bytes plus new lines.
+    #[must_use]
+    pub fn to_pipe(&self, masked: bool) -> String {
+        fn field(text: &str) -> String {
+            let mut out = String::with_capacity(text.len() + 2);
+            out.push('|');
+            for character in text.chars() {
+                match character {
+                    '\\' => out.push_str("\\\\"),
+                    '|' => out.push_str("\\|"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => {}
+                    other => out.push(other),
+                }
+            }
+            out.push('|');
+            out
+        }
+        let mut lines = Vec::with_capacity(self.turns.len() + 1);
+        lines.push(format!(
+            "pipe-export/v1 session={} provider={} model={} created_ms={} cwd={} title={}",
+            self.meta.session_id,
+            self.meta.provider,
+            self.meta.model,
+            self.meta.created_at_ms,
+            field(&self.meta.cwd),
+            field(&self.title(masked).unwrap_or_default()),
+        ));
+        for turn in &self.turns {
+            lines.push(match turn {
+                Turn::User { text, at_ms } => {
+                    format!("U  {at_ms} {}", field(&self.text(text, masked)))
+                }
+                Turn::Assistant { text, at_ms } => {
+                    format!("A  {at_ms} {}", field(&self.text(text, masked)))
+                }
+                Turn::AssistantIncomplete {
+                    text,
+                    interruption,
+                    at_ms,
+                } => format!(
+                    "A! {at_ms} {} interrupted={}",
+                    field(&self.text(text, masked)),
+                    field(&self.text(
+                        &format!("{}: {}", interruption.title, interruption.detail),
+                        masked
+                    )),
+                ),
+                Turn::Error {
+                    presentation,
+                    at_ms,
+                } => format!(
+                    "E  {at_ms} {}",
+                    field(&self.text(
+                        &format!("{}: {}", presentation.title, presentation.detail),
+                        masked
+                    )),
+                ),
+                Turn::Tool {
+                    name,
+                    summary,
+                    at_ms,
+                } => format!("T  {at_ms} {name} {}", field(&self.text(summary, masked))),
+            });
+        }
+        let mut body = lines.join("\n");
+        body.push('\n');
+        body
+    }
 
     /// A readable markdown transcript — the shareable artifact.
     #[must_use]
@@ -1168,7 +1258,7 @@ pub fn parse_export_options(rest: &[String]) -> Result<ExportOptions, String> {
     }
     Ok(ExportOptions {
         session_id: session_id.ok_or_else(|| {
-            "usage: haider export <session-id> [--format markdown|json|codex|claude-code|opencode] [--out PATH] [--masked] [--confirm]"
+            "usage: haider export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm]"
                 .to_owned()
         })?,
         format,
@@ -1294,11 +1384,11 @@ pub fn write_export(
 ) -> Result<String, ExportError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match options.format {
-        Format::Markdown | Format::Json => {
-            let body = if options.format == Format::Markdown {
-                export.to_markdown(options.masked)
-            } else {
-                export.to_json(options.masked)
+        Format::Markdown | Format::Json | Format::Pipe => {
+            let body = match options.format {
+                Format::Markdown => export.to_markdown(options.masked),
+                Format::Json => export.to_json(options.masked),
+                _ => export.to_pipe(options.masked),
             };
             match &options.out {
                 Some(path) => {

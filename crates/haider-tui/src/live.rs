@@ -1628,6 +1628,20 @@ impl LiveDriver {
                     }
                 }
                 model.dirty = true;
+                // ADE seam (`haider --session <id>`): the LIST is the proof
+                // of existence — open the target the moment it appears; once
+                // the list is COMPLETE (no next page) an unknown id flashes
+                // honestly instead of waiting forever.
+                if let Some(target) = model.initial_session.clone() {
+                    if model.sessions.iter().any(|entry| entry.id == target) {
+                        model.initial_session = None;
+                        model.open_session(&target);
+                    } else if next_cursor.is_none() {
+                        model.initial_session = None;
+                        model.flash =
+                            Some(format!("· --session: {} is not a known session", target));
+                    }
+                }
                 let mut follow = next_cursor.map_or_else(Vec::new, |cursor| {
                     vec![LiveCommand::List {
                         cursor: Some(cursor),

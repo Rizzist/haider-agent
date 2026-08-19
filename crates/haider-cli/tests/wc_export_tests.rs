@@ -536,3 +536,55 @@ fn parse_defaults_to_markdown_and_reads_flags() {
     assert_eq!(codex.format, Format::Codex);
     assert!(export::parse_export_options(&["--format".to_owned(), "bogus".to_owned()]).is_err());
 }
+
+/// MUTATION CHECK (pipe/instructpipe export): break the one-line-per-event
+/// law (stop escaping newlines/pipes), drop a turn variant from the
+/// renderer, or make the rendering depend on anything but the projection.
+/// Expected RUNTIME failures below.
+#[test]
+fn pipe_export_holds_the_line_law_and_is_append_only() {
+    let export = fixture_export();
+    let pipe = export.to_pipe(false);
+    // Header names the session facts.
+    let mut lines = pipe.lines();
+    let header = lines.next().expect("header line");
+    assert!(header.starts_with("pipe-export/v1 session="), "{header}");
+    assert!(header.contains("provider="), "{header}");
+    // One line per turn, exactly.
+    assert_eq!(
+        pipe.lines().count(),
+        1 + export.turns.len(),
+        "one line per event:\n{pipe}"
+    );
+    // The format keyword parses.
+    assert_eq!(Format::parse("pipe"), Ok(Format::Pipe));
+    assert_eq!(Format::parse("instructpipe"), Ok(Format::Pipe));
+
+    // The line law survives hostile text: newlines and pipes escape instead
+    // of splitting or breaking a field.
+    let mut hostile = export.clone();
+    hostile.turns.push(export::Turn::User {
+        text: "line one\nline two |with pipes| and \\backslash".into(),
+        at_ms: 99,
+    });
+    let rendered = hostile.to_pipe(false);
+    assert_eq!(
+        rendered.lines().count(),
+        1 + hostile.turns.len(),
+        "hostile text must not add lines:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("line one\\nline two \\|with pipes\\|"),
+        "escapes must be visible:\n{rendered}"
+    );
+
+    // APPEND-ONLY LAW: exporting a session that only GREW yields the
+    // previous bytes plus suffix lines — the same prefix stability the
+    // journal has, so periodic exports diff and cache cleanly.
+    let shorter = export.to_pipe(false);
+    let longer = hostile.to_pipe(false);
+    assert!(
+        longer.starts_with(&shorter),
+        "a grown session's export must extend the earlier export byte-for-byte"
+    );
+}

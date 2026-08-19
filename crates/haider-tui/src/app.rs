@@ -3099,6 +3099,10 @@ pub struct AppModel {
     /// workflows annotate the graph screen with tasks + typed I/O).
     pub loom_types: Vec<haider_protocol::loom::LoomAgentType>,
     pub loom_workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+    /// ADE seam: a session id handed to the CLI (`haider --session <id>`)
+    /// that the TUI opens as soon as the live list proves it exists. Cleared
+    /// after one attempt — found or honestly flashed as unknown.
+    pub initial_session: Option<SessionId>,
     pub loom_loaded: bool,
     /// Round 4: the per-connection loom.list dedup latch — separate from
     /// `loom_loaded` (truth) so an in-flight read renders as LOADING.
@@ -3437,6 +3441,7 @@ impl Default for AppModel {
             graph: None,
             loom_types: Vec::new(),
             loom_workflows: Vec::new(),
+            initial_session: None,
             loom_loaded: false,
             loom_requested: false,
             loom_selection: 0,

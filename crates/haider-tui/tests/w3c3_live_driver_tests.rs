@@ -1186,3 +1186,75 @@ fn card(id: &str, scope: MenuScope) -> Menu {
 
 #[allow(dead_code)]
 fn unused(_: AgentId) {}
+
+/// ADE seam MUTATION CHECK (`haider --session <id>`): drop the Listed-arm
+/// open, or stop clearing the target after the COMPLETE list proves the id
+/// unknown. Expected RUNTIME failures: the requested session never opens,
+/// or an unknown id waits forever instead of flashing honestly.
+#[test]
+fn initial_session_opens_from_the_list_or_flashes_unknown() {
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    let mut driver = LiveDriver::new("test");
+    model.initial_session = Some(sid(1));
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(0, 3), summary(1, 5)],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(
+        model.active_session.as_ref(),
+        Some(&sid(1)),
+        "the listed target must open"
+    );
+    assert!(model.initial_session.is_none(), "one attempt, then cleared");
+
+    // An id the COMPLETE list does not contain flashes honestly.
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    let mut driver = LiveDriver::new("test");
+    model.initial_session = Some(sid(9));
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(0, 3)],
+            next_cursor: None,
+        },
+    );
+    assert!(model.initial_session.is_none());
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("not a known session")),
+        "unknown id must flash: {:?}",
+        model.flash
+    );
+
+    // A PAGED list keeps waiting for the rest before giving up.
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    let mut driver = LiveDriver::new("test");
+    model.initial_session = Some(sid(2));
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(0, 3)],
+            next_cursor: Some("page-2".into()),
+        },
+    );
+    assert!(
+        model.initial_session.is_some(),
+        "an incomplete list must not give up"
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(2, 4)],
+            next_cursor: None,
+        },
+    );
+    assert_eq!(model.active_session.as_ref(), Some(&sid(2)));
+}

@@ -93,6 +93,14 @@ async fn dispatch() -> ExitCode {
         // leaving the daemon running. The scriptable half of the front
         // door (bare `haider` on a TTY enters the live TUI instead).
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
+        // ADE seam: open the live TUI attached to one session.
+        [flag, session] if flag == "--session" && !session.is_empty() => {
+            front_door_with_session(FrontDoor::Tui, Some(session.clone())).await
+        }
+        [flag] if flag == "--session" => {
+            eprintln!("haider: --session requires a session id");
+            ExitCode::from(2)
+        }
         [command, rest @ ..] if command == "run" => run::run_command(rest).await,
         [command, rest @ ..] if command == "status" => observe::status_command(rest).await,
         [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
@@ -117,11 +125,11 @@ async fn dispatch() -> ExitCode {
                  events [--follow] [--no-spawn], \
                  graph status <session-id> [--json], graph pin <session-id>, \
                  graph abandon <session-id> [why], \
-                 export <session-id> [--format markdown|json|codex|claude-code|opencode] [--out PATH] [--masked] [--confirm], \
+                 export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \
-                 tui [--theme system|light|dark|desert|oasis], tui --demo [--plain], \
-                 import [codex|claude-code], --ready)"
+                 tui [--theme system|light|dark|desert|oasis] [--session <id>], tui --demo [--plain], \
+                 import [codex|claude-code], --session <id>, --ready)"
             );
             ExitCode::from(2)
         }
@@ -279,6 +287,13 @@ enum FrontDoor {
 /// verify features, and enter the live TUI. The daemon outlives us either
 /// way — closing this connection never implies daemon shutdown (R8).
 async fn front_door(mode: FrontDoor) -> ExitCode {
+    front_door_with_session(mode, None).await
+}
+
+/// ADE seam: `haider --session <id>` (and `haider tui --session <id>`) —
+/// the live TUI opens attached to the given session once the daemon's list
+/// proves it exists.
+async fn front_door_with_session(mode: FrontDoor, initial_session: Option<String>) -> ExitCode {
     let env = haider_client::ProfileEnv::capture();
     let profile = match haider_client::resolve_profile(&env) {
         Ok(profile) => profile,
@@ -314,7 +329,8 @@ async fn front_door(mode: FrontDoor) -> ExitCode {
                 ensured.client.close();
                 return ExitCode::SUCCESS;
             }
-            let model = live_model(&profile);
+            let mut model = live_model(&profile);
+            model.initial_session = initial_session.map(haider_protocol::ids::SessionId::new);
             match run_live(model, ensured.client, profile, live_client_config()).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -356,11 +372,19 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     let mut demo = false;
     let mut plain = false;
     let mut theme: Option<ThemeChoice> = None;
+    let mut session: Option<String> = None;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--demo" => demo = true,
             "--plain" => plain = true,
+            "--session" => match iter.next().filter(|id| !id.is_empty()) {
+                Some(id) => session = Some(id.clone()),
+                None => {
+                    eprintln!("haider tui: --session requires a session id");
+                    return ExitCode::from(2);
+                }
+            },
             "--theme" => match iter.next().and_then(|name| ThemeChoice::parse(name)) {
                 Some(key) => theme = Some(key),
                 None => {
@@ -383,7 +407,13 @@ async fn tui_command(rest: &[String]) -> ExitCode {
             eprintln!("haider tui: --plain is a demo-only oracle; use `--demo --plain`");
             return ExitCode::from(2);
         }
-        return front_door(FrontDoor::Tui).await;
+        return front_door_with_session(FrontDoor::Tui, session).await;
+    }
+    if session.is_some() {
+        // Demo sessions are fabricated locally — a daemon session id has
+        // no meaning there; reject rather than silently ignore.
+        eprintln!("haider tui: --session is live-only; drop --demo");
+        return ExitCode::from(2);
     }
     let interactive = !plain && io::stdout().is_terminal();
     let mut model = AppModel::new();
