@@ -5,8 +5,9 @@ use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
     WebCapabilityDegrade, advertised_tool_definitions, defer_shell_handoff,
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
-    explicit_computer_use_intent, loom_run_tail, registered_tool_route, registered_tools,
-    stub_schema, tool_inventory_snapshot, tool_manual, tool_manual_line, typed_tool_result,
+    explicit_computer_use_intent, grant_admits_manifest_effect, loom_run_tail,
+    registered_tool_route, registered_tools, stub_schema, tool_inventory_snapshot, tool_manual,
+    tool_manual_line, typed_child_grant, typed_tool_result, web_fetch_host_allowed,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -1063,4 +1064,73 @@ fn loom_run_tail_teaches_typed_nodes() {
     );
     assert!(tail.contains("→ publish \"approve\""), "{tail}");
     assert!(tail.contains("spawn_subagent(agent_type"), "{tail}");
+}
+
+/// B2/B3 MUTATION CHECK: widen the typed grant (spawn tools, family network,
+/// exec without CLIs), or let a scoped grant admit foreign hosts. Expected
+/// RUNTIME failure below.
+#[test]
+fn typed_child_grants_are_least_privilege_and_host_scoped() {
+    use haider_protocol::loom::LoomAgentType;
+    let record = |clis: &[&str], apis: &[&str]| LoomAgentType {
+        id: "spec".into(),
+        name: "Spec".into(),
+        job: "do one thing".into(),
+        in_type: "A".into(),
+        out_type: "B".into(),
+        clis: clis.iter().map(|s| s.to_string()).collect(),
+        apis: apis.iter().map(|s| s.to_string()).collect(),
+        skills: Vec::new(),
+        scripts: Vec::new(),
+        color: String::new(),
+        glyph: String::new(),
+        rev: 1,
+    };
+
+    // A CLI specialist: exec yes, network no, spawning never.
+    let cli_grant = typed_child_grant(&record(&["ffmpeg"], &[]));
+    assert!(cli_grant.tools.iter().any(|t| t == "process_exec"));
+    assert!(!cli_grant.tools.iter().any(|t| t == "web_fetch"));
+    assert!(!cli_grant.tools.iter().any(|t| t == "spawn_subagent"));
+    assert!(!cli_grant.tools.iter().any(|t| t == "message_subagent"));
+    assert!(cli_grant.effect_ceiling.contains(&EffectClass::ProcessExec));
+    assert!(
+        !cli_grant
+            .effect_ceiling
+            .iter()
+            .any(|e| matches!(e, EffectClass::Network { .. }))
+    );
+
+    // An API specialist: web_fetch admitted, network HOST-SCOPED, no exec.
+    let api_grant = typed_child_grant(&record(&[], &["fal.ai"]));
+    assert!(api_grant.tools.iter().any(|t| t == "web_fetch"));
+    assert!(!api_grant.tools.iter().any(|t| t == "process_exec"));
+    assert!(api_grant.effect_ceiling.iter().any(|e| matches!(
+        e,
+        EffectClass::Network { host } if host == "fal.ai"
+    )));
+
+    // Admission: web_fetch's FAMILY manifest effect is admitted by the scoped
+    // ceiling (the tool is available)…
+    assert!(grant_admits_manifest_effect(
+        &api_grant,
+        &EffectClass::Network {
+            host: String::new()
+        }
+    ));
+    // …but the USE site is bounded to the declared host.
+    assert!(web_fetch_host_allowed(&api_grant, "fal.ai"));
+    assert!(!web_fetch_host_allowed(&api_grant, "evil.example"));
+    // A family (untyped) grant keeps today's allow-any behavior.
+    assert!(web_fetch_host_allowed(
+        &crate::worker::default_child_grant(),
+        "anything.example"
+    ));
+    // And a grant with NO network at all admits neither family nor host.
+    assert!(!grant_admits_manifest_effect(
+        &cli_grant,
+        &EffectClass::Network {
+            host: String::new()
+        }
+    ));
 }

@@ -4559,11 +4559,16 @@ async fn start_turn(
     // C1: when the pinned template is a REGISTERED LOOM WORKFLOW, ride its
     // typed-node manual beside the graph brief so the model runs each node
     // through the node's agent type (C2's typed spawn).
-    let loom_tail = match graph_status.as_ref().map(|status| status.template.as_str()) {
-        Some(name) => lease
+    let loom_tail = match graph_status.as_ref() {
+        Some(status) => lease
             .hub()
-            .loom_workflow(name)
+            .loom_workflow(&status.template)
             .await?
+            // Verify-fix C1: the PINNED instance is immutable; the registry is
+            // not. The tail only speaks when the registry record still IS the
+            // pinned workflow (digest match) — a re-registered rev must never
+            // teach nodes the pinned graph does not enforce.
+            .filter(|workflow| workflow.digest == status.digest)
             .map(|workflow| loom_run_tail(&workflow)),
         None => None,
     };
@@ -6437,6 +6442,69 @@ pub(crate) fn effect_within_grant(grant: &Grant, requested: &EffectClass) -> boo
         })
 }
 
+/// B3 — the least-privilege grant for a TYPED child. A specialist is a LEAF:
+/// filesystem work is always granted (artifact output is the point), exec
+/// rides only with declared CLIs, the network only with declared APIs — and
+/// then HOST-SCOPED per API rather than the family — and child-spawning is
+/// never granted.
+pub(crate) fn typed_child_grant(record: &haider_protocol::loom::LoomAgentType) -> Grant {
+    let mut tools: Vec<String> = [
+        "request_input",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "fs_path",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let mut effects = vec![EffectClass::FsRead, EffectClass::FsWrite];
+    if !record.clis.is_empty() {
+        tools.extend(["process_exec", "task_output", "task_kill"].map(str::to_owned));
+        effects.push(EffectClass::ProcessExec);
+    }
+    if !record.apis.is_empty() {
+        tools.push("web_fetch".to_owned());
+        for api in &record.apis {
+            effects.push(EffectClass::Network { host: api.clone() });
+        }
+    }
+    Grant {
+        tools,
+        effect_ceiling: effects,
+    }
+}
+
+/// B2/B3 — ADMISSION of a tool by its MANIFEST effect. A manifest names the
+/// family (`Network{host:""}`); a typed grant may hold host-SCOPED members.
+/// The tool is admitted (validated/advertised/dispatched) when the grant
+/// holds ANY member of the family — the per-call host is then bounded at the
+/// use site ([`web_fetch_host_allowed`]).
+pub(crate) fn grant_admits_manifest_effect(grant: &Grant, effect: &EffectClass) -> bool {
+    if effect_within_grant(grant, effect) {
+        return true;
+    }
+    matches!(effect, EffectClass::Network { host } if host.is_empty())
+        && grant
+            .effect_ceiling
+            .iter()
+            .any(|ceiling| matches!(ceiling, EffectClass::Network { .. }))
+}
+
+/// B2 — the use-site fence: under a grant whose network ceilings are ALL
+/// host-scoped, a fetch may touch only a declared host. A family ceiling
+/// (empty host) keeps today's behavior.
+pub(crate) fn web_fetch_host_allowed(grant: &Grant, host: &str) -> bool {
+    effect_within_grant(
+        grant,
+        &EffectClass::Network {
+            host: host.to_owned(),
+        },
+    )
+}
+
 pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
     let registry = registered_tools();
     Grant {
@@ -6453,7 +6521,7 @@ pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
                             .manifest
                             .effects
                             .iter()
-                            .all(|effect| effect_within_grant(ceiling, effect))
+                            .all(|effect| grant_admits_manifest_effect(ceiling, effect))
                     })
             })
             .collect(),
@@ -6477,7 +6545,7 @@ pub(crate) fn validate_grant(grant: &Grant) -> Result<(), HaiderError> {
             .manifest
             .effects
             .iter()
-            .all(|effect| effect_within_grant(grant, effect))
+            .all(|effect| grant_admits_manifest_effect(grant, effect))
         {
             return Err(grant_corrupt(format!(
                 "delegated manifest grants tool `{name}` above its effect ceiling"
@@ -6654,6 +6722,17 @@ pub(crate) fn loom_run_tail(workflow: &haider_protocol::loom::LoomWorkflow) -> S
             tail.push('"');
         }
     }
+    // Verify-fix C4: aggregate cap — the tail rides EVERY turn's volatile
+    // context; per-node bounds do not bound the whole.
+    const LOOM_TAIL_MAX_BYTES: usize = 1_200;
+    if tail.len() > LOOM_TAIL_MAX_BYTES {
+        let mut end = LOOM_TAIL_MAX_BYTES;
+        while !tail.is_char_boundary(end) {
+            end -= 1;
+        }
+        tail.truncate(end);
+        tail.push('…');
+    }
     tail
 }
 
@@ -6721,7 +6800,7 @@ pub(crate) fn advertised_tool_definitions(
                             .manifest
                             .effects
                             .iter()
-                            .all(|effect| effect_within_grant(grant, effect))
+                            .all(|effect| grant_admits_manifest_effect(grant, effect))
                     })
         });
     } else {
@@ -7457,7 +7536,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             .manifest
                             .effects
                             .iter()
-                            .all(|effect| effect_within_grant(grant, effect))
+                            .all(|effect| grant_admits_manifest_effect(grant, effect))
                     });
             if !allowed {
                 return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
@@ -7712,6 +7791,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             // child's role framing and the display label carries `@type ·` so
             // surfaces can color the chip. Unknown types are a completed
             // rejection the model can correct — never a turn failure.
+            let mut typed_record: Option<haider_protocol::loom::LoomAgentType> = None;
             if let Some(type_id) = request.agent_type.clone() {
                 let record = self.output.store.hub().loom_agent_type(&type_id).await?;
                 let Some(record) = record else {
@@ -7732,18 +7812,27 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         presentation: None,
                     }));
                 };
+                typed_record = Some(record.clone());
+                // Verify-fix C5: registry strings frame a SINGLE-LINE role
+                // header — newlines must not fake a second header.
+                let line = |value: &str| value.replace(['\n', '\r'], " ");
                 request.prompt = format!(
                     "[agent type @{} — {} · {} -> {}]\n{}\n\n{}",
                     record.id,
-                    record.name,
-                    record.in_type,
-                    record.out_type,
+                    line(&record.name),
+                    line(&record.in_type),
+                    line(&record.out_type),
                     record.job,
                     request.prompt
                 );
-                if !request.task.starts_with('@') {
-                    request.task = format!("@{} · {}", record.id, request.task);
-                }
+                // Verify-fix C3: the `@type ·` chip convention is DAEMON
+                // truth, never model input — a task that already leads with
+                // `@` is stripped before the honest prefix goes on.
+                let clean = request.task.trim_start_matches('@').trim_start().to_owned();
+                request.task = format!("@{} · {}", record.id, clean);
+            } else if request.task.starts_with('@') {
+                // An UNTYPED spawn must not cosplay as a specialist.
+                request.task = request.task.trim_start_matches('@').trim_start().to_owned();
             }
             // F1: resolve the child's pair BEFORE any durable spawn work. A
             // typed selection refusal is a completed tool result — the model
@@ -7784,6 +7873,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         tool_item_id: item_id.clone(),
                         call_id: call_id.to_owned(),
                         metadata: child_metadata,
+                        agent_type: typed_record,
                     },
                     request,
                 )
@@ -8075,6 +8165,30 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // typed tool RESULT the model can react to, never a turn
                 // failure; only journal-append failures abort.
                 let operation = WebFetch::from_tool_args(&args).map_err(tool_error)?;
+                // B2 — the use-site host fence: a typed child's grant scopes
+                // the network to its DECLARED APIs; a fetch outside them is a
+                // completed refusal the model can react to.
+                if let Some(grant) = &self.grant
+                    && !web_fetch_host_allowed(grant, operation.host())
+                {
+                    return Ok(ToolDispatchResult::Completed(BoundedResult {
+                        preview: serde_json::json!({
+                            "ok": false,
+                            "error": format!(
+                                "host `{}` is outside this agent's granted APIs",
+                                operation.host()
+                            ),
+                        })
+                        .to_string(),
+                        truncated: false,
+                        artifact: None,
+                        images: Vec::new(),
+                        cursor: None,
+                        status: ToolResultStatus::Completed,
+                        reason: None,
+                        presentation: None,
+                    }));
+                }
                 match broker.begin_web_fetch(&operation, &policy).await {
                     Ok(intent) => {
                         let execution = tokio::select! {

@@ -1630,6 +1630,18 @@ impl Store {
             }
         }
         let ast = parse_pipe(source);
+        // Verify-fix C2: template resolution consults the built-in catalog
+        // FIRST, so a workflow named after a catalog (or child) template would
+        // register as a zombie — listable, never resolvable. Reject up front.
+        if let Some(name) = ast.name.as_deref()
+            && graph_template(name).is_some()
+        {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("workflow name `{name}` collides with a built-in template"),
+                false,
+            ));
+        }
         let mut workflow =
             compile_pipe(&ast, |id| signatures.get(id).cloned()).map_err(|errors| {
                 HaiderError::new(

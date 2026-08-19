@@ -83,6 +83,9 @@ pub(crate) struct SpawnCoordinates {
     /// here already resolved ([`DelegationHandle::resolve_child_metadata`]);
     /// `establish` never re-resolves.
     pub(crate) metadata: SessionMetadataV1,
+    /// B3 — the resolved Loom agent type of a TYPED spawn: the child's grant
+    /// narrows to the type's capabilities (least privilege).
+    pub(crate) agent_type: Option<haider_protocol::loom::LoomAgentType>,
 }
 
 pub(crate) struct MessageCoordinates {
@@ -195,6 +198,14 @@ impl DelegationHandle {
             request.workflow_author,
         );
         let mut requested_grant = crate::worker::default_child_grant();
+        // B3 — a typed child starts from its TYPE's grant, intersected with
+        // the ordinary child ceiling (never wider than an untyped child).
+        if let Some(record) = coordinates.agent_type.as_ref() {
+            requested_grant = crate::worker::intersect_grant(
+                crate::worker::typed_child_grant(record),
+                &requested_grant,
+            );
+        }
         let mut workflow = self
             .prepare_child_workflow(
                 &coordinates,

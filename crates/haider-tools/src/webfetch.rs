@@ -92,7 +92,12 @@ impl WebFetch {
         Self::new(url, max_bytes)
     }
 
+    /// The permission-relevant host, exactly as brokered.
     #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }

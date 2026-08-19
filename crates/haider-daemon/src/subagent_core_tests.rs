@@ -306,6 +306,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         tool_item_id: ItemId::new("branch-spawn-item"),
         call_id: "branch-spawn-call".into(),
         metadata: metadata.clone(),
+        agent_type: None,
     };
     let request = SpawnSubagent {
         task: "test branch pin".into(),
@@ -573,6 +574,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 parent_agent_id: None,
                 tool_item_id: ItemId::new("message-running-spawn-item"),
                 call_id: "message-running-spawn-call".into(),
+                agent_type: None,
                 metadata: SessionMetadataV1 {
                     cwd: workspace_text.clone(),
                     provider: "fake".into(),
@@ -806,6 +808,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 parent_agent_id: None,
                 tool_item_id: ItemId::new("message-idle-spawn-item"),
                 call_id: "message-idle-spawn-call".into(),
+                agent_type: None,
                 metadata: SessionMetadataV1 {
                     cwd: workspace.clone(),
                     provider: "fake".into(),
@@ -998,6 +1001,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 parent_agent_id: None,
                 tool_item_id: ItemId::new("message-owner-item"),
                 call_id: "message-owner-call".into(),
+                agent_type: None,
                 metadata: SessionMetadataV1 {
                     cwd: workspace,
                     provider: "fake".into(),
