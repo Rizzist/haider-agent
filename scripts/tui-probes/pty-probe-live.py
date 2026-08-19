@@ -253,13 +253,31 @@ try:
             "file:" + os.path.join(store, "store.sqlite") + "?mode=ro", uri=True
         )
         try:
+            blob_rows = 0
             for (envelope,) in connection.execute("select envelope_json from events"):
-                payload = json.loads(envelope)["payload"]
+                # v0.0.931+: new rows are msgpack BLOBs (bytes); legacy rows
+                # stay JSON text. Decode both; without the msgpack module,
+                # count blob rows honestly instead of crashing or lying.
+                if isinstance(envelope, (bytes, bytearray)):
+                    try:
+                        import msgpack  # type: ignore
+
+                        payload = msgpack.unpackb(envelope, raw=False)["payload"]
+                    except ImportError:
+                        blob_rows += 1
+                        continue
+                else:
+                    payload = json.loads(envelope)["payload"]
                 kind = payload.get("type")
                 if kind == "tool_result" and payload.get("call_id") != CALL:
                     continue
                 if kind in counts:
                     counts[kind] += 1
+            if blob_rows:
+                print(
+                    f"[probe] {blob_rows} msgpack envelope rows skipped — "
+                    "`pip install msgpack` for full coverage"
+                )
             counts["resolutions"] = connection.execute(
                 "select count(*) from menu_resolutions"
             ).fetchone()[0]

@@ -560,12 +560,17 @@ pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
     /// `attachments` (round 5): the replay's resolved attachments — the
     /// SAME resolution the live lane applied, so an image-bearing history
     /// replays byte-identically instead of always falling back uncached.
+    /// `latest_compaction_summary_end` (hygiene round): the actor's LIVE
+    /// prior-summary boundary at compact time — a second in-turn compaction
+    /// must mark the FIRST compaction's summary as its replay breakpoint,
+    /// not a value frozen at construction.
     async fn compact(
         &self,
         run_id: &RunId,
         intent: &CompactionIntent,
         covered_messages: Vec<Message>,
         attachments: Vec<haider_provider::ResolvedAttachment>,
+        latest_compaction_summary_end: Option<usize>,
     ) -> Result<Message, HaiderError>;
 }
 
@@ -1737,6 +1742,7 @@ impl HarnessActor {
                     &run_id,
                     &mut messages,
                     current_turn_start,
+                    latest_compaction_summary_end,
                     volatile_user_tail.as_deref(),
                 )
                 .await
@@ -1903,6 +1909,7 @@ impl HarnessActor {
                                 &run_id,
                                 &mut messages,
                                 current_turn_start,
+                                latest_compaction_summary_end,
                                 &mut forced_compaction_used,
                             )
                             .await
@@ -2054,6 +2061,7 @@ impl HarnessActor {
                                 &run_id,
                                 &mut messages,
                                 current_turn_start,
+                                latest_compaction_summary_end,
                                 &mut forced_compaction_used,
                             )
                             .await
@@ -3247,13 +3255,19 @@ impl HarnessActor {
         run_id: &RunId,
         messages: &mut Vec<Message>,
         current_turn_start: usize,
+        latest_compaction_summary_end: Option<usize>,
         forced_compaction_used: &mut bool,
     ) -> Result<(), DriveError> {
         if *forced_compaction_used {
             return Err(repeated_context_overflow_after_compaction());
         }
-        self.perform_context_compaction(run_id, messages, current_turn_start)
-            .await?;
+        self.perform_context_compaction(
+            run_id,
+            messages,
+            current_turn_start,
+            latest_compaction_summary_end,
+        )
+        .await?;
         *forced_compaction_used = true;
         Ok(())
     }
@@ -3263,6 +3277,7 @@ impl HarnessActor {
         run_id: &RunId,
         messages: &mut Vec<Message>,
         current_turn_start: usize,
+        latest_compaction_summary_end: Option<usize>,
     ) -> Result<(), DriveError> {
         if current_turn_start == 0 || current_turn_start > messages.len() {
             return Err(DriveError::Provider(ProviderError::new(
@@ -3307,7 +3322,13 @@ impl HarnessActor {
             .await
             .map_err(DriveError::Store)?;
         let summary = compactor
-            .compact(run_id, &intent, covered, attachments)
+            .compact(
+                run_id,
+                &intent,
+                covered,
+                attachments,
+                latest_compaction_summary_end,
+            )
             .await
             .map_err(DriveError::Store)?;
         messages.push(summary);
@@ -3332,6 +3353,7 @@ impl HarnessActor {
         run_id: &RunId,
         messages: &mut Vec<Message>,
         current_turn_start: usize,
+        latest_compaction_summary_end: Option<usize>,
         volatile_user_tail: Option<&str>,
     ) -> Result<bool, DriveError> {
         // Volatile context is excluded from durable cache boundaries, but it
@@ -3377,8 +3399,13 @@ impl HarnessActor {
         if !should_compact {
             return Ok(false);
         }
-        self.perform_context_compaction(run_id, messages, current_turn_start)
-            .await?;
+        self.perform_context_compaction(
+            run_id,
+            messages,
+            current_turn_start,
+            latest_compaction_summary_end,
+        )
+        .await?;
         let after = estimated_context_footprint(&self.config, messages);
         if self.config.context_compaction_v1 {
             self.commit_context_footprint(run_id, &after)

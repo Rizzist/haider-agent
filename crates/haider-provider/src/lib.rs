@@ -154,12 +154,12 @@ pub use openai::{
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
     OpenAiTransportConfig, XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS,
     XAI_SEED_MODELS, azure_openai_origin, codex_alpha_search_request_body,
-    codex_alpha_search_response_text, codex_alpha_search_url, openai_http_client_build_count,
-    replay_deepseek_chat_sse, replay_deepseek_models_response, replay_grok_chat_sse,
-    replay_grok_models_response, replay_kimi_chat_sse, replay_kimi_models_response,
-    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
-    replay_openai_native_computer_sse, replay_openai_responses_sse, replay_xai_chat_sse,
-    replay_xai_models_response, validate_openai_compatible_endpoint,
+    codex_alpha_search_response_text, codex_alpha_search_url, grok_client_version,
+    openai_http_client_build_count, replay_deepseek_chat_sse, replay_deepseek_models_response,
+    replay_grok_chat_sse, replay_grok_models_response, replay_kimi_chat_sse,
+    replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
+    replay_openai_models_response, replay_openai_native_computer_sse, replay_openai_responses_sse,
+    replay_xai_chat_sse, replay_xai_models_response, validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{

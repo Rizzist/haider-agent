@@ -98,14 +98,6 @@ pub const KIMI_OAUTH_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 /// weekly-credits shape; the parser also accepts the legacy monthly fields
 /// the same struct carries on non-unified accounts.
 pub const GROK_OAUTH_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/// The grok-shell User-Agent the proxy expects (platform is compile-time).
-pub const GROK_OAUTH_USAGE_USER_AGENT: &str = if cfg!(target_os = "macos") {
-    "grok-shell/0.2.101 (macos)"
-} else if cfg!(target_os = "windows") {
-    "grok-shell/0.2.101 (windows)"
-} else {
-    "grok-shell/0.2.101 (linux)"
-};
 
 impl UsageMeterEndpoint {
     pub fn url(self) -> &'static str {
@@ -122,17 +114,36 @@ impl UsageMeterEndpoint {
         match self {
             Self::OpenAiOauth | Self::KimiOauth => &[],
             // The Grok proxy version-gates its clients; the meter sends the
-            // same identity set as the inference lane.
-            Self::GrokOauth => &[
-                ("user-agent", GROK_OAUTH_USAGE_USER_AGENT),
-                (
-                    "x-grok-client-identifier",
-                    crate::GROK_SHELL_CLIENT_IDENTIFIER,
-                ),
-                ("x-grok-client-version", crate::GROK_SHELL_CLIENT_VERSION),
-                ("x-grok-client-mode", crate::GROK_SHELL_CLIENT_MODE),
-                ("X-XAI-Token-Auth", crate::GROK_XAI_TOKEN_AUTH),
-            ],
+            // same identity set as the inference lane, and the version
+            // resolves through the SAME env-overridable seam
+            // (HAIDER_GROK_CLIENT_VERSION) — leaked once so the static
+            // header contract stays borrow-free.
+            Self::GrokOauth => {
+                static GROK_HEADERS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
+                    std::sync::OnceLock::new();
+                GROK_HEADERS.get_or_init(|| {
+                    let version = crate::grok_client_version();
+                    let platform = if cfg!(target_os = "macos") {
+                        "macos"
+                    } else if cfg!(target_os = "windows") {
+                        "windows"
+                    } else {
+                        "linux"
+                    };
+                    let user_agent: &'static str =
+                        Box::leak(format!("grok-shell/{version} ({platform})").into_boxed_str());
+                    vec![
+                        ("user-agent", user_agent),
+                        (
+                            "x-grok-client-identifier",
+                            crate::GROK_SHELL_CLIENT_IDENTIFIER,
+                        ),
+                        ("x-grok-client-version", version),
+                        ("x-grok-client-mode", crate::GROK_SHELL_CLIENT_MODE),
+                        ("X-XAI-Token-Auth", crate::GROK_XAI_TOKEN_AUTH),
+                    ]
+                })
+            }
             Self::AnthropicOauth => &[
                 (
                     crate::ANTHROPIC_OAUTH_BETA_HEADER,

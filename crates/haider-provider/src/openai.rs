@@ -61,6 +61,29 @@ pub const GROK_OAUTH_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Version admitted by the Grok subscription proxy. The proxy hard-gates
 /// this value, so it may need bumping when xAI advances the grok-shell client.
 pub const GROK_SHELL_CLIENT_VERSION: &str = "0.2.101";
+
+/// The version actually sent — `HAIDER_GROK_CLIENT_VERSION` overrides the
+/// pinned const, so a proxy-side rotation is a config change for the user
+/// ('grok just works'), never a wait for the next harness release. Resolved
+/// once per process.
+pub fn grok_client_version() -> &'static str {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            std::env::var("HAIDER_GROK_CLIENT_VERSION")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 32
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+                })
+                .unwrap_or_else(|| GROK_SHELL_CLIENT_VERSION.to_owned())
+        })
+        .as_str()
+}
 pub const GROK_SHELL_CLIENT_IDENTIFIER: &str = "grok-shell";
 pub const GROK_SHELL_CLIENT_MODE: &str = "interactive";
 pub const GROK_XAI_TOKEN_AUTH: &str = "xai-grok-cli";
@@ -563,10 +586,10 @@ pub(crate) fn apply_grok_subscription_headers(
     let request = request
         .header(
             reqwest::header::USER_AGENT,
-            format!("grok-shell/{GROK_SHELL_CLIENT_VERSION} ({platform})"),
+            format!("grok-shell/{} ({platform})", grok_client_version()),
         )
         .header("x-grok-client-identifier", GROK_SHELL_CLIENT_IDENTIFIER)
-        .header("x-grok-client-version", GROK_SHELL_CLIENT_VERSION)
+        .header("x-grok-client-version", grok_client_version())
         .header("x-grok-client-mode", GROK_SHELL_CLIENT_MODE)
         .header("X-XAI-Token-Auth", GROK_XAI_TOKEN_AUTH);
     match model {

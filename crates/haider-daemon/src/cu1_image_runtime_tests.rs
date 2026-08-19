@@ -450,7 +450,6 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
         post_compaction_system_prompt: lane_system_prompt.clone(),
         post_compaction_tools: lane_tools.clone(),
         reasoning_settings: "lane-reasoning".into(),
-        latest_compaction_summary_end: None,
         cache_expected_later_reads: 2,
         cache_reuse_gap_ms: Some(17),
         device_id,
@@ -477,6 +476,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
             &intent,
             covered_messages.clone(),
             Vec::new(),
+            None,
         )
         .await;
 
@@ -572,7 +572,6 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
         post_compaction_system_prompt: lane_system_prompt.clone(),
         post_compaction_tools: lane_tools.clone(),
         reasoning_settings: "lane-reasoning".into(),
-        latest_compaction_summary_end: None,
         cache_expected_later_reads: 2,
         cache_reuse_gap_ms: None,
         device_id,
@@ -599,6 +598,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
             &intent,
             covered_messages.clone(),
             Vec::new(),
+            None,
         )
         .await
         .expect_err("fixture has no durable accepted run for the final commit");

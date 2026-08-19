@@ -241,7 +241,6 @@ struct DaemonContextCompactor {
     post_compaction_system_prompt: Option<String>,
     post_compaction_tools: Vec<ToolDefinition>,
     reasoning_settings: String,
-    latest_compaction_summary_end: Option<usize>,
     cache_expected_later_reads: u32,
     cache_reuse_gap_ms: Option<u64>,
     device_id: DeviceId,
@@ -270,9 +269,12 @@ impl DaemonContextCompactor {
         messages: &[Message],
         stable_history_end: usize,
         prefix_digests: PrefixDigests,
+        latest_compaction_summary_end: Option<usize>,
     ) -> PromptCacheMetadata {
-        let latest_compaction_summary_end = self
-            .latest_compaction_summary_end
+        // Hygiene round: the LIVE boundary from the caller — a second
+        // in-turn compaction marks the FIRST one's summary, which a value
+        // frozen at compactor construction could never know about.
+        let latest_compaction_summary_end = latest_compaction_summary_end
             .filter(|boundary| *boundary > 0 && *boundary <= stable_history_end);
         let compaction_epoch = latest_compaction_summary_end.map_or_else(
             || digest_json(&"root-compaction-epoch"),
@@ -389,6 +391,7 @@ impl ContextCompactor for DaemonContextCompactor {
         intent: &CompactionIntent,
         covered_messages: Vec<Message>,
         attachments: Vec<haider_provider::ResolvedAttachment>,
+        latest_compaction_summary_end: Option<usize>,
     ) -> Result<Message, HaiderError> {
         let immutable_history_digest = digest_json(&covered_messages);
         let covered_history_end = covered_messages.len();
@@ -406,6 +409,7 @@ impl ContextCompactor for DaemonContextCompactor {
             &replay_messages,
             covered_history_end,
             prefix_digests.clone(),
+            latest_compaction_summary_end,
         );
         let mut request = TurnRequest {
             messages: replay_messages,
@@ -427,6 +431,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 &request.messages,
                 covered_history_end,
                 prefix_digests.clone(),
+                latest_compaction_summary_end,
             );
             request.cache_metadata = Some(cache_metadata);
         }
@@ -3988,9 +3993,6 @@ async fn perform_manual_compaction(
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
         post_compaction_tools,
         reasoning_settings,
-        // Round 5: a manual compaction after an earlier one marks the SAME
-        // prior-summary breakpoint the live lane would.
-        latest_compaction_summary_end,
         cache_expected_later_reads,
         cache_reuse_gap_ms: None,
         device_id: device_id.clone(),
@@ -4001,7 +4003,13 @@ async fn perform_manual_compaction(
         usage_account,
     };
     if let Err(error) = compactor
-        .compact(&run_id, &intent, messages, Vec::new())
+        .compact(
+            &run_id,
+            &intent,
+            messages,
+            Vec::new(),
+            latest_compaction_summary_end,
+        )
         .await
     {
         append_failure(
@@ -4914,7 +4922,6 @@ async fn start_turn(
         post_compaction_system_prompt: config.system_prompt.clone(),
         post_compaction_tools: config.tools.clone(),
         reasoning_settings: config.reasoning_settings.clone(),
-        latest_compaction_summary_end: config.cache_compaction_summary_end,
         cache_expected_later_reads: config.cache_expected_later_reads,
         cache_reuse_gap_ms: config.cache_reuse_gap_ms,
         device_id: device_id.clone(),
