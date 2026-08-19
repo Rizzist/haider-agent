@@ -13069,14 +13069,21 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
              (alphanumeric plus . _ - + / only)",
         );
     }
-    // Round 5 — the charset admits shell BUILTINS and DISPATCHERS that
-    // execute a program named by their arguments (`.`, `eval`, `xargs`,
-    // shells themselves): declaring one grants everything. Deny the known
-    // dispatcher set and require at least one alphanumeric byte.
-    const CLI_DISPATCHERS: [&str; 24] = [
+    // Rounds 5-6 — the AUTHORITY MODEL, stated once: the CLI fence is a
+    // tool-discipline guard, not a jail. Registration is HUMAN-GATED (the
+    // plan gate / a Control-plane RPC), so the human who accepts a grant is
+    // the security boundary; the fence's job is to make that review
+    // MEANINGFUL — what was declared is what runs, and the obvious
+    // network-scope bypass (curl et al. via chaining) is closed. Shell
+    // BUILTINS and pure DISPATCHERS are denied because they make the
+    // review meaningless (declaring `eval` or `busybox` reads as one tool
+    // but grants everything). General interpreters (python, node, find)
+    // remain declarable: they are legitimate leaf-specialist tools, their
+    // names honestly convey their power, and the human approves them.
+    const CLI_DISPATCHERS: [&str; 26] = [
         ".", "source", "eval", "exec", "command", "builtin", "env", "xargs", "sh", "bash", "zsh",
         "dash", "ksh", "csh", "tcsh", "fish", "nohup", "time", "nice", "sudo", "doas", "su",
-        "setsid", "stdbuf",
+        "setsid", "stdbuf", "busybox", "toybox",
     ];
     if record.clis.iter().any(|cli| {
         let base = cli.rsplit('/').next().unwrap_or(cli);

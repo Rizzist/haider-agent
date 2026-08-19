@@ -288,7 +288,9 @@ fn registration_bounds_types_color_and_glyph() {
     }
     // Round 5: shell builtins/dispatchers grant everything — rejected even
     // though they fit the charset. Same for a path form of one.
-    for dispatcher in [".", "eval", "xargs", "zsh", "/bin/sh", "env"] {
+    for dispatcher in [
+        ".", "eval", "xargs", "zsh", "/bin/sh", "env", "busybox", "toybox",
+    ] {
         let mut record = agent_type("dispatchy", "A", "B");
         record.clis = vec![(*dispatcher).to_owned()];
         assert!(

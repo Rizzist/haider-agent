@@ -241,12 +241,14 @@ const ANTHROPIC_LOOKBACK_BLOCKS: usize = 20;
 /// the message list. `None` when the tail already fits the window. Pure and
 /// deterministic — a function of the request alone.
 ///
-/// Known limitation (round 5, accepted): the marker is recomputed per
-/// request, so when MORE than a full lookback window of blocks lands
-/// between two provider calls, consecutive markers can sit further apart
-/// than the window and the older entry goes unfound. Bridging that needs a
-/// persisted marker ladder; per-drive-round growth is far below the window
-/// in practice, so the recomputed marker bounds the common case.
+/// Known limitation (rounds 5-6, accepted as FORCED): when more than a
+/// full lookback window of blocks lands between two provider calls (a
+/// round with 11+ parallel tool calls), consecutive markers sit further
+/// apart than the window and the gap region re-reads ONCE at full price —
+/// bounded by that single round's output. Bridging would need a marker
+/// LADDER, and Anthropic's four-breakpoint budget (tools, system, stable,
+/// and this slot) leaves exactly one message-history slot: no ladder can
+/// exist. The one-off re-read is the floor the provider's own limits set.
 fn anthropic_intermediate_boundary(
     messages: &[crate::Message],
     stable_history_end: usize,
@@ -271,13 +273,15 @@ fn anthropic_intermediate_boundary(
     for (offset, count) in counts.iter().enumerate().rev() {
         suffix += count;
         if suffix > ANTHROPIC_LOOKBACK_BLOCKS {
-            // Round 5: the LAST message is a legal boundary (the annotator
-            // accepts boundary == len), and a ProviderOpaque-terminated
-            // candidate walks back to the nearest annotatable message so
-            // the slot is never silently wasted.
+            // Round 5/6: the LAST message is a legal boundary (the
+            // annotator accepts boundary == len), and a ProviderOpaque-
+            // terminated candidate walks FORWARD to the nearest annotatable
+            // message — forward SHRINKS the tail, so the ≤window law holds
+            // by construction (walking back could stretch it past the
+            // window, silently re-opening the miss this marker closes).
             let mut boundary = stable_history_end + offset + 1;
-            while boundary > stable_history_end + 1 && !annotatable(boundary) {
-                boundary -= 1;
+            while boundary <= messages.len() && !annotatable(boundary) {
+                boundary += 1;
             }
             return (boundary > stable_history_end
                 && boundary <= messages.len()
@@ -1947,6 +1951,27 @@ mod lookback_tests {
         assert!(
             tail_blocks <= ANTHROPIC_LOOKBACK_BLOCKS,
             "tail after the boundary must fit the window: {tail_blocks}"
+        );
+        // Round 6: a ProviderOpaque-terminated candidate walks FORWARD —
+        // the tail SHRINKS, so the window law still holds.
+        let mut opaque_tailed = messages.clone();
+        let candidate = anthropic_intermediate_boundary(&opaque_tailed, 3).expect("candidate");
+        opaque_tailed[candidate - 1]
+            .blocks
+            .push(Block::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: serde_json::json!({"sealed": true}),
+            });
+        let walked = anthropic_intermediate_boundary(&opaque_tailed, 3)
+            .expect("opaque candidate must not waste the slot");
+        assert!(walked > candidate, "forward walk: {walked} vs {candidate}");
+        let tail_blocks: usize = opaque_tailed[walked..]
+            .iter()
+            .map(|message| message.blocks.len().max(1))
+            .sum();
+        assert!(
+            tail_blocks <= ANTHROPIC_LOOKBACK_BLOCKS,
+            "the window law survives the walk: {tail_blocks}"
         );
         // A short tail needs no extra marker (the slot stays free).
         assert_eq!(anthropic_intermediate_boundary(&messages, 12), None);

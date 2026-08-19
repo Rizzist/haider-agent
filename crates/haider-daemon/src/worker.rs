@@ -467,7 +467,9 @@ impl ContextCompactor for DaemonContextCompactor {
                 let fallback = TurnRequest {
                     messages: degraded_messages,
                     model: self.model.clone(),
-                    max_tokens: self.max_tokens.min(4096),
+                    // Round 6: the degraded path needs the SAME output room
+                    // as the replay — truncation is truncation either way.
+                    max_tokens: self.max_tokens.min(8_192),
                     system_prompt: None,
                     tools: Vec::new(),
                     attachments: Vec::new(),
