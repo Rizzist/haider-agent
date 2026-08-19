@@ -172,8 +172,8 @@ pub use usage::{
 };
 pub use webfetch::{
     WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchExecution, WebFetchOutcome,
-    fetch_public_url, fetch_public_url_with_deadline, fetch_public_url_with_one_retry,
-    fetch_public_url_with_resolver, reduce_html_to_text,
+    fetch_public_url, fetch_public_url_scoped_with_one_retry, fetch_public_url_with_deadline,
+    fetch_public_url_with_one_retry, fetch_public_url_with_resolver, reduce_html_to_text,
 };
 
 /// Provider classes backed by production account credentials in this release.

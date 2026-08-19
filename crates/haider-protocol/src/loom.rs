@@ -60,6 +60,8 @@ pub struct LoomAgentType {
 impl LoomAgentType {
     /// Stable CONTENT digest — the registry's rev counter is deliberately
     /// excluded, so re-registering identical content is detectable as a no-op.
+    /// Display fields (color, glyph) participate: an accent-only edit is a
+    /// real revision the registry must persist, never a silent no-op.
     #[must_use]
     pub fn digest(&self) -> String {
         let mut hasher = blake3::Hasher::new();
@@ -69,6 +71,8 @@ impl LoomAgentType {
             self.job.as_str(),
             self.in_type.as_str(),
             self.out_type.as_str(),
+            self.color.as_str(),
+            self.glyph.as_str(),
         ] {
             hasher.update(part.as_bytes());
             hasher.update(b"\x1f");
@@ -213,7 +217,7 @@ pub fn parse_pipe(source: &str) -> LoomAst {
             && ast.nodes.is_empty()
             && let Some((head, io)) = line.split_once(':')
             && let Some((input, output)) = io.split_once("->")
-            && is_ident(head.trim())
+            && is_ident_chars(head.trim())
         {
             let head = head.trim();
             let input = input.trim();
@@ -267,15 +271,21 @@ pub fn parse_pipe(source: &str) -> LoomAst {
     ast
 }
 
-fn is_ident(value: &str) -> bool {
+fn is_ident_chars(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// A type expression is one identifier or a `A + B` composite of identifiers.
-fn valid_type_expr(value: &str) -> bool {
+fn is_ident(value: &str) -> bool {
+    is_ident_chars(value) && value.len() <= 64
+}
+
+/// The pipe/v1 type-expression law, shared with agent-type registration: one
+/// identifier or an `A + B + ...` composite of bounded (≤64B) identifiers.
+#[must_use]
+pub fn valid_type_expr(value: &str) -> bool {
     !value.is_empty() && value.split('+').all(|operand| is_ident(operand.trim()))
 }
 

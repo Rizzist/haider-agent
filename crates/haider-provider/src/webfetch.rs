@@ -73,6 +73,7 @@ pub async fn fetch_public_url(
         max_bytes,
         Arc::new(SystemFixedDnsResolver),
         WEB_FETCH_TOTAL_DEADLINE,
+        None,
     )
     .await
 }
@@ -84,6 +85,26 @@ pub async fn fetch_public_url_with_one_retry(
     max_bytes: Option<u64>,
 ) -> WebFetchExecution {
     bounded_get_retry(|| fetch_public_url(url, max_bytes)).await
+}
+
+/// Host-scoped variant (Loom B2): EVERY hop of the redirect chain must stay
+/// on one of the granted hosts — a redirect that leaves the scope is a
+/// refusal, never a silent escape past a use-site check on hop 0 alone.
+pub async fn fetch_public_url_scoped_with_one_retry(
+    url: &str,
+    max_bytes: Option<u64>,
+    allowed_hosts: &[String],
+) -> WebFetchExecution {
+    bounded_get_retry(|| {
+        fetch_public_url_inner(
+            url,
+            max_bytes,
+            Arc::new(SystemFixedDnsResolver),
+            WEB_FETCH_TOTAL_DEADLINE,
+            Some(allowed_hosts),
+        )
+    })
+    .await
 }
 
 async fn bounded_get_retry<F, Fut>(mut fetch: F) -> WebFetchExecution
@@ -119,7 +140,7 @@ pub async fn fetch_public_url_with_resolver(
     max_bytes: Option<u64>,
     resolver: Arc<dyn FixedDnsResolver>,
 ) -> Result<WebFetchOutcome, ProviderError> {
-    fetch_public_url_inner(url, max_bytes, resolver, WEB_FETCH_TOTAL_DEADLINE).await
+    fetch_public_url_inner(url, max_bytes, resolver, WEB_FETCH_TOTAL_DEADLINE, None).await
 }
 
 /// Deadline-injectable variant (M6): laws drive a slow-drip loopback server
@@ -135,6 +156,7 @@ pub async fn fetch_public_url_with_deadline(
         max_bytes,
         Arc::new(SystemFixedDnsResolver),
         total_deadline,
+        None,
     )
     .await
 }
@@ -144,6 +166,7 @@ async fn fetch_public_url_inner(
     max_bytes: Option<u64>,
     resolver: Arc<dyn FixedDnsResolver>,
     total_deadline: Duration,
+    allowed_hosts: Option<&[String]>,
 ) -> Result<WebFetchOutcome, ProviderError> {
     // M6: one ABSOLUTE deadline anchors every hop and chunk read below.
     let deadline = tokio::time::Instant::now() + total_deadline;
@@ -160,6 +183,19 @@ async fn fetch_public_url_inner(
     // until the origin is classified on hop 0.
     let mut chain_started_public: Option<bool> = None;
     for _hop in 0..=WEB_FETCH_MAX_REDIRECTS {
+        // Loom B2: the granted-host scope holds on EVERY hop — the target of
+        // each redirect re-enters this check before any connection opens.
+        if let Some(hosts) = allowed_hosts {
+            let host = current.host_str().unwrap_or_default();
+            if !hosts
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(host))
+            {
+                return Err(refused(format!(
+                    "web_fetch host `{host}` is outside this agent's granted APIs"
+                )));
+            }
+        }
         let forbid_downgrade = chain_started_public == Some(true);
         let target = validate_fetch_target(&current, resolver.as_ref(), forbid_downgrade).await?;
         chain_started_public.get_or_insert(target.is_public);
@@ -784,9 +820,41 @@ fn refused(message: impl Into<String>) -> ProviderError {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod retry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Loom B2 MUTATION CHECK: move the host-scope check out of the hop loop
+    /// (back to hop 0 only) or drop it. Expected RUNTIME failure: a scoped
+    /// fetch to a foreign host proceeds past the fence. The refusal fires
+    /// BEFORE any resolution or connection — no network in this test.
+    #[tokio::test]
+    async fn scoped_fetch_refuses_hosts_outside_the_grant() {
+        let hosts = vec!["api.example".to_owned()];
+        let execution =
+            fetch_public_url_scoped_with_one_retry("https://other.example/v1/thing", None, &hosts)
+                .await;
+        let error = execution.outcome.expect_err("foreign host must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("outside this agent's granted APIs"),
+            "{error}"
+        );
+        assert!(!error.retryable, "a scope refusal is never retried");
+        // Host comparison is case-insensitive; the scheme/port are not the
+        // scope, the HOST is.
+        let execution =
+            fetch_public_url_scoped_with_one_retry("https://API.example:443/x", None, &hosts).await;
+        assert!(
+            !matches!(
+                &execution.outcome,
+                Err(error) if error.to_string().contains("granted APIs")
+            ),
+            "case-variant granted host must pass the fence"
+        );
+    }
 
     fn success() -> WebFetchOutcome {
         WebFetchOutcome {

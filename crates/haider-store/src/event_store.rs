@@ -1673,6 +1673,13 @@ impl Store {
                     .and_then(|rev| rev.checked_add(1))
                     .ok_or_else(|| corrupt("loom workflow rev is out of range"))?;
                 workflow.rev = next;
+                // Review round 2: the pinned-instance digest is
+                // `graph_template_digest(template)`, which binds `version` but
+                // never LoomNodeMeta. Stamping `version = rev` makes the
+                // template digest a faithful proxy for the WHOLE workflow
+                // identity — any content change bumps rev, so tasks/types can
+                // never drift behind an unchanged template digest.
+                workflow.template.version = next;
                 let json = serde_json::to_string(&workflow)
                     .map_err(|_| corrupt("loom workflow record is not encodable"))?;
                 transaction
@@ -1698,6 +1705,7 @@ impl Store {
             }
             None => {
                 workflow.rev = 1;
+                workflow.template.version = 1;
                 let json = serde_json::to_string(&workflow)
                     .map_err(|_| corrupt("loom workflow record is not encodable"))?;
                 transaction
@@ -12931,8 +12939,27 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
     if record.job.trim().is_empty() || record.job.len() > 4096 {
         return reject("agent type job must be 1..=4096 bytes");
     }
-    if record.in_type.trim().is_empty() || record.out_type.trim().is_empty() {
-        return reject("agent type must declare its typed I/O");
+    if !haider_protocol::loom::valid_type_expr(record.in_type.trim())
+        || !haider_protocol::loom::valid_type_expr(record.out_type.trim())
+    {
+        return reject("agent type I/O must be bounded type expressions (`A` or `A + B`)");
+    }
+    // Display fields reach terminal cells verbatim — bound them here, never
+    // in the renderer. Color is empty or exactly `#rrggbb`; the glyph is a
+    // short printable cluster.
+    let color_ok = record.color.is_empty()
+        || (record.color.len() == 7
+            && record.color.starts_with('#')
+            && record
+                .color
+                .bytes()
+                .skip(1)
+                .all(|byte| byte.is_ascii_hexdigit()));
+    if !color_ok {
+        return reject("agent type color must be empty or `#rrggbb`");
+    }
+    if record.glyph.len() > 16 || record.glyph.chars().any(char::is_control) {
+        return reject("agent type glyph must be ≤16 bytes with no control characters");
     }
     for list in [&record.clis, &record.apis, &record.skills, &record.scripts] {
         if list.len() > 32 {

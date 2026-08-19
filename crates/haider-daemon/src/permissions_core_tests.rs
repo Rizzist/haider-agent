@@ -3,11 +3,12 @@
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
-    WebCapabilityDegrade, advertised_tool_definitions, defer_shell_handoff,
+    WebCapabilityDegrade, advertised_tool_definitions, cli_scope_admits, defer_shell_handoff,
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
-    explicit_computer_use_intent, grant_admits_manifest_effect, loom_run_tail,
-    registered_tool_route, registered_tools, stub_schema, tool_inventory_snapshot, tool_manual,
-    tool_manual_line, typed_child_grant, typed_tool_result, web_fetch_host_allowed,
+    explicit_computer_use_intent, grant_admits_manifest_effect, loom_run_tail, loom_task_type_id,
+    registered_tool_route, registered_tools, scoped_network_hosts, stub_schema,
+    tool_inventory_snapshot, tool_manual, tool_manual_line, typed_child_grant, typed_tool_result,
+    web_fetch_host_allowed,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -1064,6 +1065,88 @@ fn loom_run_tail_teaches_typed_nodes() {
     );
     assert!(tail.contains("→ publish \"approve\""), "{tail}");
     assert!(tail.contains("spawn_subagent(agent_type"), "{tail}");
+}
+
+/// Review round 2 MUTATION CHECK: put the ellipsis OUTSIDE the cap again.
+/// Expected RUNTIME failure: a long workflow's tail exceeds 1200 bytes.
+#[test]
+fn loom_run_tail_cap_includes_the_ellipsis() {
+    use haider_protocol::loom::{compile_pipe, parse_pipe};
+    let mut source = String::from("cappy: A -> A\n");
+    for index in 0..40 {
+        source.push_str(&format!(
+            "node{index} \"{}\" :cmd\n",
+            "task words repeated over and over ".repeat(4).trim()
+        ));
+    }
+    let workflow = compile_pipe(&parse_pipe(&source), |_| None).expect("compiles");
+    let tail = loom_run_tail(&workflow);
+    assert!(
+        tail.len() <= 1_200,
+        "cap must be honest: {} bytes",
+        tail.len()
+    );
+    assert!(tail.ends_with('…'), "long tail must mark truncation");
+}
+
+/// Review round 2 MUTATION CHECK: drop the chaining check or the first-token
+/// membership from [`cli_scope_admits`], or the `@type · ` parse from
+/// [`loom_task_type_id`]. Expected RUNTIME failure below — the fence is what
+/// keeps a declared-CLI grant from being generic shell (and `curl` from
+/// bypassing the API host ceiling).
+#[test]
+fn typed_cli_fence_admits_only_declared_programs() {
+    let clis = vec!["ffmpeg".to_owned(), "yt-dlp".to_owned()];
+    assert!(cli_scope_admits(&clis, "ffmpeg -i in.mp4 out.webm").is_ok());
+    assert!(cli_scope_admits(&clis, "/opt/homebrew/bin/ffmpeg -version").is_ok());
+    assert!(cli_scope_admits(&clis, "yt-dlp https://example.com/v").is_ok());
+    // Undeclared programs and every chaining/substitution shape refuse.
+    assert!(cli_scope_admits(&clis, "curl https://evil.example").is_err());
+    assert!(cli_scope_admits(&clis, "ffmpeg -i a.mp4 b.webm; curl e").is_err());
+    assert!(cli_scope_admits(&clis, "ffmpeg $(curl e) out.webm").is_err());
+    assert!(cli_scope_admits(&clis, "ffmpeg | curl e").is_err());
+    assert!(cli_scope_admits(&clis, "ffmpeg `curl e`").is_err());
+    assert!(
+        cli_scope_admits(&[], "ffmpeg -version").is_err(),
+        "deny-all"
+    );
+    // The daemon-stamped task prefix is the type-id source of truth.
+    assert_eq!(
+        loom_task_type_id("@researcher · pull the transcript").as_deref(),
+        Some("researcher")
+    );
+    assert_eq!(loom_task_type_id("plain untyped task"), None);
+    assert_eq!(loom_task_type_id("@not a prefix"), None);
+    // The redirect fence's host scope: Some only for host-scoped grants —
+    // a family wildcard or an empty ceiling stays unscoped.
+    use haider_protocol::agent::Grant;
+    let scoped = Grant {
+        tools: Vec::new(),
+        effect_ceiling: vec![EffectClass::Network {
+            host: "api.fal.ai".into(),
+        }],
+    };
+    assert_eq!(
+        scoped_network_hosts(&scoped),
+        Some(vec!["api.fal.ai".to_owned()])
+    );
+    let wildcard = Grant {
+        tools: Vec::new(),
+        effect_ceiling: vec![
+            EffectClass::Network {
+                host: String::new(),
+            },
+            EffectClass::Network {
+                host: "api.fal.ai".into(),
+            },
+        ],
+    };
+    assert_eq!(scoped_network_hosts(&wildcard), None, "wildcard = unscoped");
+    let no_network = Grant {
+        tools: Vec::new(),
+        effect_ceiling: vec![EffectClass::FsRead],
+    };
+    assert_eq!(scoped_network_hosts(&no_network), None);
 }
 
 /// B2/B3 MUTATION CHECK: widen the typed grant (spawn tools, family network,

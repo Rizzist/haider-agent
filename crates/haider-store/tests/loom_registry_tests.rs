@@ -196,3 +196,84 @@ fn registered_workflow_is_pinnable_by_name() {
     };
     assert_eq!(pinned.template, "clip-flow");
 }
+
+/// Review round 2 MUTATION CHECK: stop stamping `template.version = rev`, or
+/// drop color/glyph from the agent digest. Expected RUNTIME failures: a
+/// content revision keeps the same template digest (the tail/TUI join key),
+/// or an accent-only edit silently no-ops.
+#[test]
+fn revisions_move_the_template_digest_and_display_edits_are_real() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("open");
+    let registration = store
+        .loom_register_workflow("wf: A -> A\nstep \"one\" :cmd")
+        .expect("registers");
+    assert_eq!(registration.rev, 1);
+    let first = store
+        .loom_workflow("wf")
+        .expect("reads")
+        .expect("workflow present");
+    assert_eq!(first.template.version, 1, "rev 1 stamps version 1");
+    let first_key = haider_protocol::graph::graph_template_digest(&first.template);
+
+    // A task-only change: the template SHAPE is identical, but the rev bump
+    // stamps a new version, so the join key must move.
+    let second = store
+        .loom_register_workflow("wf: A -> A\nstep \"two\" :cmd")
+        .expect("re-registers");
+    assert_eq!(second.rev, 2);
+    let second_record = store
+        .loom_workflow("wf")
+        .expect("reads")
+        .expect("workflow present");
+    assert_eq!(second_record.template.version, 2);
+    assert_ne!(
+        haider_protocol::graph::graph_template_digest(&second_record.template),
+        first_key,
+        "a content revision must move the pinned-instance join key"
+    );
+
+    // Display-only agent edit = real revision.
+    let mut record = agent_type("painter", "A", "A");
+    assert!(
+        store
+            .loom_register_agent_type(&record)
+            .expect("registers")
+            .updated
+    );
+    record.color = "#00ff00".into();
+    let repaint = store
+        .loom_register_agent_type(&record)
+        .expect("re-registers");
+    assert!(repaint.updated, "a color edit must persist");
+    assert_eq!(repaint.rev, 2);
+}
+
+/// Review round 2 MUTATION CHECK: drop any C5 bound (type-expr law, color
+/// shape, glyph control chars). Expected RUNTIME failure: the bad record
+/// registers.
+#[test]
+fn registration_bounds_types_color_and_glyph() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("open");
+    let mut record = agent_type("bounded", "A", "B");
+    record.in_type = "x".repeat(65);
+    assert!(store.loom_register_agent_type(&record).is_err(), "65B type");
+    let mut record = agent_type("bounded", "A + B", "C");
+    record.color = "red".into();
+    assert!(
+        store.loom_register_agent_type(&record).is_err(),
+        "bad color"
+    );
+    record.color = "#12ab34".into();
+    record.glyph = "\n".into();
+    assert!(
+        store.loom_register_agent_type(&record).is_err(),
+        "ctrl glyph"
+    );
+    record.glyph = "▲".into();
+    assert!(
+        store.loom_register_agent_type(&record).is_ok(),
+        "composite in-type with sane display fields registers"
+    );
+}

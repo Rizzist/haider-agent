@@ -183,6 +183,7 @@ async fn task_dispatcher_with_grant(
             tasks: TaskFacade::with_kill_grace(hub.clone(), Duration::from_millis(300)),
             agent_id: None,
             grant,
+            cli_scope: None,
             web_search: None,
         },
     )

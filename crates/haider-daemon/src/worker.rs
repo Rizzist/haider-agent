@@ -599,6 +599,9 @@ pub struct WorkerToolContext {
     pub agent_id: Option<AgentId>,
     /// Durable child capability ceiling; root sessions have no ceiling here.
     pub grant: Option<Grant>,
+    /// B3 — the typed child's declared-CLI exec scope. `None` = unfenced
+    /// (untyped); `Some(vec![])` = deny-all (typed record unresolvable).
+    pub cli_scope: Option<Vec<String>>,
     /// W-B: the client web_search executor for this turn (None = typed
     /// unavailable result).
     pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
@@ -4446,6 +4449,24 @@ async fn start_turn(
             web_degrade.anthropic_web_tools = true;
         }
     }
+    // B3 (review round 2) — a typed child's exec fence: the type id is the
+    // daemon-stamped `@type · ` task prefix (C3), and the registry is the
+    // living authority for WHICH binaries that type may run. A typed child
+    // whose record vanished gets deny-all, never unfenced.
+    let cli_scope = match delegation_record
+        .as_ref()
+        .and_then(|record| loom_task_type_id(&record.task))
+    {
+        Some(type_id) => Some(
+            lease
+                .hub()
+                .loom_agent_type(&type_id)
+                .await?
+                .map(|record| record.clis)
+                .unwrap_or_default(),
+        ),
+        None => None,
+    };
     let resolved = dependencies
         .provider_factory
         .resolve_for_turn_with_web(metadata, web_degrade)
@@ -4564,11 +4585,16 @@ async fn start_turn(
             .hub()
             .loom_workflow(&status.template)
             .await?
-            // Verify-fix C1: the PINNED instance is immutable; the registry is
-            // not. The tail only speaks when the registry record still IS the
-            // pinned workflow (digest match) — a re-registered rev must never
-            // teach nodes the pinned graph does not enforce.
-            .filter(|workflow| workflow.digest == status.digest)
+            // Verify-fix C1 / review round 2: the PINNED instance is
+            // immutable; the registry is not. The pin persisted
+            // `graph_template_digest(template)`, so the tail joins on that
+            // SAME key — the registry stamps `template.version = rev`, which
+            // makes the template digest a faithful proxy for the whole
+            // workflow identity. A re-registered rev mismatches and the tail
+            // stays silent rather than teach nodes the pin does not enforce.
+            .filter(|workflow| {
+                haider_protocol::graph::graph_template_digest(&workflow.template) == status.digest
+            })
             .map(|workflow| loom_run_tail(&workflow)),
         None => None,
     };
@@ -4591,6 +4617,7 @@ async fn start_turn(
             tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
             agent_id: agent_id.clone(),
             grant: grant.clone(),
+            cli_scope,
             web_search: dependencies.web_search.clone(),
         })
         .await?;
@@ -6477,6 +6504,54 @@ pub(crate) fn typed_child_grant(record: &haider_protocol::loom::LoomAgentType) -
     }
 }
 
+/// B3 (review round 2) — a typed child's exec authority is its DECLARED
+/// CLIs, not "any shell". One declared program per call: chaining
+/// metacharacters would smuggle a second program (`curl`!) past both this
+/// check and the declared-API host ceiling.
+pub(crate) fn cli_scope_admits(clis: &[String], command: &str) -> Result<(), String> {
+    let chained = command.contains([';', '|', '&', '`', '\n']) || command.contains("$(");
+    if chained {
+        return Err(
+            "typed grant: command chaining/substitution is outside this agent's CLI scope"
+                .to_owned(),
+        );
+    }
+    let first = command.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if clis.iter().any(|cli| cli == base || cli == first) {
+        Ok(())
+    } else {
+        Err(format!(
+            "typed grant: `{base}` is not among this agent's declared CLIs"
+        ))
+    }
+}
+
+/// Parses the daemon-stamped `@type · ` task prefix back to its type id.
+/// C3 guarantees the prefix is daemon truth: typed spawns get it stamped,
+/// untyped @-cosplay gets stripped — so a match here IS a typed child.
+pub(crate) fn loom_task_type_id(task: &str) -> Option<String> {
+    let rest = task.strip_prefix('@')?;
+    let (id, _) = rest.split_once(" · ")?;
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then(|| id.to_owned())
+}
+
+/// B2 (review round 2) — the EXPLICIT host scope of a typed grant: `Some`
+/// only when the ceiling holds host-scoped Network members and no family
+/// wildcard. `None` = unscoped (root sessions, untyped children).
+pub(crate) fn scoped_network_hosts(grant: &Grant) -> Option<Vec<String>> {
+    let mut hosts = Vec::new();
+    for effect in &grant.effect_ceiling {
+        if let EffectClass::Network { host } = effect {
+            if host.is_empty() {
+                return None;
+            }
+            hosts.push(host.clone());
+        }
+    }
+    (!hosts.is_empty()).then_some(hosts)
+}
+
 /// B2/B3 — ADMISSION of a tool by its MANIFEST effect. A manifest names the
 /// family (`Network{host:""}`); a typed grant may hold host-SCOPED members.
 /// The tool is admitted (validated/advertised/dispatched) when the grant
@@ -6726,7 +6801,8 @@ pub(crate) fn loom_run_tail(workflow: &haider_protocol::loom::LoomWorkflow) -> S
     // context; per-node bounds do not bound the whole.
     const LOOM_TAIL_MAX_BYTES: usize = 1_200;
     if tail.len() > LOOM_TAIL_MAX_BYTES {
-        let mut end = LOOM_TAIL_MAX_BYTES;
+        // The ellipsis lives INSIDE the cap — 1200 means 1200.
+        let mut end = LOOM_TAIL_MAX_BYTES - '…'.len_utf8();
         while !tail.is_char_boundary(end) {
             end -= 1;
         }
@@ -6933,6 +7009,7 @@ async fn create_broker_tool_dispatcher(
         delegation: context.delegation,
         tasks: context.tasks,
         grant: context.grant,
+        cli_scope: context.cli_scope,
         deferred: Mutex::new(HashMap::new()),
     })))
 }
@@ -7003,6 +7080,7 @@ struct BrokerToolDispatcher {
     delegation: DelegationHandle,
     tasks: crate::tasks::TaskFacade,
     grant: Option<Grant>,
+    cli_scope: Option<Vec<String>>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
 }
 
@@ -8090,6 +8168,24 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::ProcessExec => {
                 let command = required_string(&args, "command")?;
+                // B3 (review round 2) — the typed CLI fence: a leaf
+                // specialist runs its DECLARED CLIs, one program per call
+                // (foreground AND background). A refusal is a completed
+                // typed result the model can react to.
+                if let Some(scope) = &self.cli_scope
+                    && let Err(reason) = cli_scope_admits(scope, &command)
+                {
+                    return Ok(ToolDispatchResult::Completed(BoundedResult {
+                        preview: serde_json::json!({ "ok": false, "error": reason }).to_string(),
+                        truncated: false,
+                        artifact: None,
+                        images: Vec::new(),
+                        cursor: None,
+                        status: ToolResultStatus::Completed,
+                        reason: None,
+                        presentation: None,
+                    }));
+                }
                 let cwd = optional_string(&args, "cwd")?;
                 let background = optional_bool(&args, "background")?.unwrap_or(false);
                 if background {
@@ -8203,10 +8299,27 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     false,
                                 ));
                             }
-                            fetched = haider_provider::fetch_public_url_with_one_retry(
-                                operation.url(),
-                                operation.max_bytes(),
-                            ) => fetched,
+                            fetched = async {
+                                // B2 (review round 2) — the host fence above
+                                // checked hop 0; a typed grant's scope must
+                                // also hold across every REDIRECT hop, so the
+                                // scoped engine re-checks per hop.
+                                match self.grant.as_ref().and_then(scoped_network_hosts) {
+                                    Some(hosts) => {
+                                        haider_provider::fetch_public_url_scoped_with_one_retry(
+                                            operation.url(),
+                                            operation.max_bytes(),
+                                            &hosts,
+                                        )
+                                        .await
+                                    }
+                                    None => haider_provider::fetch_public_url_with_one_retry(
+                                        operation.url(),
+                                        operation.max_bytes(),
+                                    )
+                                    .await,
+                                }
+                            } => fetched,
                         };
                         let retried = execution.attempts == 2;
                         let fetched = execution.outcome;
