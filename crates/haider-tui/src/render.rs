@@ -3640,7 +3640,15 @@ fn render_session(
         .open_menu()
         .filter(|open| open.origin == "plan" && !open.options.is_empty() && model.login.is_none());
     if let Some(plan) = plan_menu {
-        render_plan_document(plan, theme, frame, transcript_area, model.plan_scroll);
+        // Review round 2: RENDER owns the new-proposal reset — plan B paints
+        // from the top even before any keypress reaches the key handler.
+        if model.plan_menu_seen.borrow().as_ref() != Some(&plan.id) {
+            *model.plan_menu_seen.borrow_mut() = Some(plan.id.clone());
+            model.plan_scroll.set(0);
+        }
+        let max_scroll =
+            render_plan_document(plan, theme, frame, transcript_area, model.plan_scroll.get());
+        model.plan_scroll_max.set(max_scroll);
     } else {
         let paragraph = Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false });
         frame.render_widget(
@@ -3660,7 +3668,13 @@ fn render_session(
     // carries the scroll-back that puts the prompt's first row at the
     // viewport top; after a jump the sticky is SUPPRESSED until the next
     // real wheel so it never covers the row it just revealed.
-    if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 && !model.sticky_suppressed.get()
+    // Review round 2: while a plan owns the transcript, the sticky prompt
+    // band must neither paint over the document nor keep a clickable hit.
+    if plan_menu.is_none()
+        && scroll_back > 0
+        && scroll > 0
+        && transcript_area.height > 0
+        && !model.sticky_suppressed.get()
     {
         let sticky = transcript_cache
             .user_rows
@@ -4945,9 +4959,14 @@ fn render_subtree(
             // D1: a typed child's task label leads with `@type ·` (the C2
             // spawn convention) — paint the type segment in its Loom accent
             // and glyph so specialization reads at a glance.
-            let typed = chip
-                .name
-                .strip_prefix('@')
+            // Review round 2: the `@type · ` prefix is DAEMON truth only on
+            // a Loom-aware daemon (C3 strips cosplay there). An old daemon
+            // passes task text through verbatim, so nothing it sends earns
+            // the trusted specialist paint.
+            let typed = model
+                .daemon_serves(haider_rpc::FEATURE_LOOM_V1)
+                .then_some(chip.name.as_str())
+                .and_then(|name| name.strip_prefix('@'))
                 .and_then(|rest| rest.split_once(" · "))
                 .and_then(|(type_id, remainder)| {
                     model.loom_type(type_id).map(|record| {
@@ -5442,7 +5461,7 @@ fn render_graph(
     };
 
     // Header: template · digest · epoch (+ the Loom typed signature).
-    let loom = model.loom_workflow_meta(&status.template);
+    let loom = model.loom_workflow_meta(&status.template, &status.digest);
     let mut header = vec![
         Span::styled(status.template.clone(), theme.bright_style()),
         Span::styled(
@@ -7261,9 +7280,9 @@ fn render_plan_document(
     frame: &mut Frame<'_>,
     area: Rect,
     scroll: u16,
-) {
+) -> u16 {
     if area.height == 0 || area.width == 0 {
-        return;
+        return 0;
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
@@ -7330,6 +7349,7 @@ fn render_plan_document(
             corner,
         );
     }
+    max_scroll
 }
 
 fn menu_block(

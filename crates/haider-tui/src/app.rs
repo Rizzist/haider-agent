@@ -340,15 +340,21 @@ impl AppModel {
         self.loom_types.iter().find(|record| record.id == id)
     }
 
-    /// D2 — the Loom workflow behind a pinned template name, if registered.
+    /// D2 — the Loom workflow behind a pinned template, if the registry
+    /// still holds the PINNED revision. Review round 2: the join requires
+    /// the instance digest — annotating graph A with re-registered B's
+    /// tasks/specialists would be UI fiction, so drifted registries render
+    /// no Loom annotations at all.
     #[must_use]
     pub fn loom_workflow_meta(
         &self,
         template: &str,
+        digest: &str,
     ) -> Option<&haider_protocol::loom::LoomWorkflow> {
-        self.loom_workflows
-            .iter()
-            .find(|record| record.id == template)
+        self.loom_workflows.iter().find(|record| {
+            record.id == template
+                && haider_protocol::graph::graph_template_digest(&record.template) == digest
+        })
     }
 
     /// Whether the connected daemon serves a method family. Demo mode
@@ -3164,9 +3170,14 @@ pub struct AppModel {
     pub menu_selection: usize,
     /// D4: scroll offset into the open `plan` proposal document (the plan
     /// menu's markdown body renders full-height in the transcript area).
-    pub plan_scroll: u16,
+    /// A Cell because RENDER owns the new-proposal reset (review round 2:
+    /// plan B must open at the top BEFORE any keypress).
+    pub plan_scroll: std::cell::Cell<u16>,
+    /// The render-computed scroll ceiling for the CURRENT document/viewport;
+    /// the key handler clamps against it so overscroll never accumulates.
+    pub plan_scroll_max: std::cell::Cell<u16>,
     /// The plan menu the scroll belongs to — a NEW proposal starts at the top.
-    pub plan_menu_seen: Option<MenuId>,
+    pub plan_menu_seen: std::cell::RefCell<Option<MenuId>>,
     /// Selected row in the slash palette (open while composer starts with /).
     /// Ranges over the FULL match list; the render window follows.
     pub palette_selection: usize,
@@ -3427,8 +3438,9 @@ impl Default for AppModel {
             )),
             demo_requests: Vec::new(),
             menu_selection: 0,
-            plan_scroll: 0,
-            plan_menu_seen: None,
+            plan_scroll: std::cell::Cell::new(0),
+            plan_scroll_max: std::cell::Cell::new(0),
+            plan_menu_seen: std::cell::RefCell::new(None),
             palette_selection: 0,
             palette_scroll: 0,
             palette_dismissed: false,
@@ -5317,29 +5329,37 @@ impl AppModel {
             && menu.origin == "plan"
             && !menu.options.is_empty()
         {
-            if self.plan_menu_seen.as_ref() != Some(&menu.id) {
-                self.plan_menu_seen = Some(menu.id.clone());
-                self.plan_scroll = 0;
+            if self.plan_menu_seen.borrow().as_ref() != Some(&menu.id) {
+                *self.plan_menu_seen.borrow_mut() = Some(menu.id.clone());
+                self.plan_scroll.set(0);
             }
             let options = menu.options.len();
+            // Review round 2: the STATE clamps too — the render clamp alone
+            // let overscroll accumulate invisibly, so ↑ took many presses to
+            // bite after paging past the end.
+            let ceiling = self.plan_scroll_max.get();
             match key.code {
                 KeyCode::Up => {
-                    self.plan_scroll = self.plan_scroll.saturating_sub(1);
+                    self.plan_scroll
+                        .set(self.plan_scroll.get().min(ceiling).saturating_sub(1));
                     self.dirty = true;
                     return;
                 }
                 KeyCode::Down => {
-                    self.plan_scroll = self.plan_scroll.saturating_add(1);
+                    self.plan_scroll
+                        .set(self.plan_scroll.get().saturating_add(1).min(ceiling));
                     self.dirty = true;
                     return;
                 }
                 KeyCode::PageUp => {
-                    self.plan_scroll = self.plan_scroll.saturating_sub(10);
+                    self.plan_scroll
+                        .set(self.plan_scroll.get().min(ceiling).saturating_sub(10));
                     self.dirty = true;
                     return;
                 }
                 KeyCode::PageDown => {
-                    self.plan_scroll = self.plan_scroll.saturating_add(10);
+                    self.plan_scroll
+                        .set(self.plan_scroll.get().saturating_add(10).min(ceiling));
                     self.dirty = true;
                     return;
                 }

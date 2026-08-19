@@ -145,3 +145,73 @@ fn plan_document_scrolls_and_clamps() {
         "scrolling back must restore the top:\n{back}"
     );
 }
+
+/// Review round 2 MUTATION CHECK: drop the state-side clamp, the render-time
+/// new-proposal reset, or the reconnect-independent scroll ceiling. Expected
+/// RUNTIME failures: one ↑ after heavy overscroll does not move the view, or
+/// plan B opens at plan A's offset before any keypress.
+#[test]
+fn overscroll_clamps_in_state_and_new_plans_open_at_the_top() {
+    let mut model = launcher_model();
+    submit(&mut model, "propose it");
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        plan_menu(80),
+    ))));
+    // First paint installs the scroll ceiling for the key handler.
+    drop(draw(&model));
+
+    for _ in 0..200 {
+        model.handle(key(KeyCode::PageDown));
+    }
+    let bottom = draw(&model).join("\n");
+    assert!(bottom.contains("filler line 79"), "at the tail:\n{bottom}");
+    // ONE ↑ must move the view — overscroll never accumulates in state.
+    model.handle(key(KeyCode::Up));
+    let up_one = draw(&model).join("\n");
+    assert_ne!(bottom, up_one, "a single ↑ after overscroll must scroll");
+
+    // A NEW proposal opens at the top at first PAINT — no keypress needed.
+    let mut second = plan_menu(80);
+    second.id = MenuId::new("plan-menu-2");
+    second.title = "Second proposal".to_owned();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        second,
+    ))));
+    let fresh = draw(&model).join("\n");
+    assert!(
+        fresh.contains("edge pops"),
+        "plan B must open at its top:\n{fresh}"
+    );
+    assert!(
+        !fresh.contains("filler line 79"),
+        "plan B must not inherit plan A's scroll:\n{fresh}"
+    );
+}
+
+/// Review round 2 MUTATION CHECK: let the sticky prompt band render while a
+/// plan owns the transcript. Expected RUNTIME failure: the pinned history
+/// prompt paints over the document's first row.
+#[test]
+fn an_open_plan_suppresses_the_sticky_prompt_band() {
+    let mut model = launcher_model();
+    for index in 0..40 {
+        submit(&mut model, &format!("history prompt number {index}"));
+    }
+    // Scrolled into history: the sticky band pins the producing prompt.
+    model.scroll_back.set(8);
+    let without_plan = draw(&model).join("\n");
+    assert!(
+        without_plan.contains("history prompt"),
+        "harness: history prompts must be on screen:\n{without_plan}"
+    );
+
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        plan_menu(0),
+    ))));
+    let with_plan = draw(&model).join("\n");
+    assert!(with_plan.contains("◇ PLAN"), "plan owns the transcript");
+    assert!(
+        !with_plan.contains("history prompt"),
+        "the sticky band must not overlay an open plan:\n{with_plan}"
+    );
+}

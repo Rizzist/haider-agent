@@ -2893,6 +2893,12 @@ impl LiveDriver {
             LiveReply::Disconnected { reason } => {
                 self.connected = false;
                 self.attaching.clear();
+                // Review round 2: the Loom registry snapshot is CONNECTION
+                // truth — the next daemon may hold a different registry (or
+                // none), so stale types/colors must not survive the socket.
+                model.loom_loaded = false;
+                model.loom_types.clear();
+                model.loom_workflows.clear();
                 // The run survives the socket; the ATTACHMENT does not.
                 // `active_run` is stream-derived and the reattach replays
                 // whatever moved while we were away.
