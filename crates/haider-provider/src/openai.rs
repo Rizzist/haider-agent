@@ -58,9 +58,6 @@ pub const XAI_SEED_MODEL_CONTEXT_WINDOWS: [(&str, u64); 4] = [
 ];
 pub const GROK_OAUTH_PROVIDER_NAME: &str = "grok-oauth";
 pub const GROK_OAUTH_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
-pub const GROK_OAUTH_SEED_MODELS: [&str; 2] = ["grok-4.6", "grok-4.5"];
-pub const GROK_OAUTH_SEED_MODEL_CONTEXT_WINDOWS: [(&str, u64); 2] =
-    [("grok-4.6", 500_000), ("grok-4.5", 500_000)];
 /// Version admitted by the Grok subscription proxy. The proxy hard-gates
 /// this value, so it may need bumping when xAI advances the grok-shell client.
 pub const GROK_SHELL_CLIENT_VERSION: &str = "0.2.101";

@@ -531,15 +531,23 @@ fn xai_and_grok_oauth_registry_profiles_pin_lane_boundaries() {
     );
     assert_eq!(grok.endpoint.as_deref(), Some(GROK_OAUTH_BASE_URL));
     assert_eq!(grok.auth_methods, vec![AuthMethod::OAuth]);
-    assert_eq!(grok.models, GROK_OAUTH_SEED_MODELS);
-    assert_eq!(
-        grok.model_details
-            .iter()
-            .map(|detail| (detail.name.as_str(), detail.context_window))
-            .collect::<Vec<_>>(),
-        vec![("grok-4.6", Some(500_000)), ("grok-4.5", Some(500_000))]
+    // MUTATION CHECK (kimi law): seed an inventory here again. Expected
+    // RUNTIME failure — a seeded summary suppresses the W5f-2d
+    // auto-discovery trigger, so the CLI lane's live proxy catalog would
+    // never be fetched. The Grok library comes from the Grok CLI's own
+    // catalog endpoint, never from release-pinned constants.
+    assert!(
+        grok.models.is_empty(),
+        "grok-oauth boots inventory-empty; discovery is the only truth"
     );
-    assert_eq!(grok.availability, ProviderAvailabilityWire::Available);
+    assert!(grok.model_details.is_empty());
+    // Kimi parity: a discovery-only lane is honestly UNAVAILABLE until its
+    // authenticated catalog speaks — never a fake seeded Available.
+    assert_eq!(grok.availability, ProviderAvailabilityWire::Unavailable);
+    assert_eq!(
+        grok.availability_reason.as_deref(),
+        Some("provider model inventory is unavailable")
+    );
 }
 
 /// MUTATION CHECK (W5g-5 live fix): revert `configured_profiles` to
