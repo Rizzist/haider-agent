@@ -1091,9 +1091,11 @@ fn meter_routing_is_flavor_and_provider_strict() {
         ("openai-oauth", Some(UsageMeterEndpoint::OpenAiOauth)),
         ("anthropic-oauth", Some(UsageMeterEndpoint::AnthropicOauth)),
         ("kimi-oauth", Some(UsageMeterEndpoint::KimiOauth)),
-        // Grok's proxy exposes quota rather than a stable metering endpoint;
-        // local usage remains zero-cost under the subscription pricing lane.
-        ("grok-oauth", None),
+        // Owner ask (plan-usage UI): the Grok proxy's billing surface IS the
+        // subscription meter — weekly credit percent, on-demand pool, plan
+        // tier — so grok-oauth routes to the fourth meter like the other
+        // CLI lanes. Local usage stays zero-cost under subscription pricing.
+        ("grok-oauth", Some(UsageMeterEndpoint::GrokOauth)),
         ("openai", None),
         ("anthropic", None),
         ("gemini", None),

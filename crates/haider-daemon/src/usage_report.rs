@@ -158,6 +158,7 @@ pub(crate) fn meter_for(descriptor: &CredentialDescriptor) -> Option<UsageMeterE
         haider_provider::OPENAI_OAUTH_PROVIDER_NAME => Some(UsageMeterEndpoint::OpenAiOauth),
         haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME => Some(UsageMeterEndpoint::AnthropicOauth),
         haider_provider::KIMI_OAUTH_PROVIDER_NAME => Some(UsageMeterEndpoint::KimiOauth),
+        haider_provider::GROK_OAUTH_PROVIDER_NAME => Some(UsageMeterEndpoint::GrokOauth),
         _ => None,
     }
 }

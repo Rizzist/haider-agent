@@ -171,8 +171,8 @@ pub use pricing::{
 pub use usage::{
     ANTHROPIC_OAUTH_USAGE_URL, ANTHROPIC_OAUTH_USAGE_USER_AGENT, KIMI_OAUTH_USAGE_URL,
     MeterReading, MeterUnavailable, OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint,
-    normalize_utilization, parse_anthropic_oauth_usage, parse_kimi_usages, parse_openai_wham_usage,
-    parse_rfc3339_to_unix_ms,
+    normalize_utilization, parse_anthropic_oauth_usage, parse_grok_billing, parse_kimi_usages,
+    parse_openai_wham_usage, parse_rfc3339_to_unix_ms,
 };
 pub use webfetch::{
     WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchExecution, WebFetchOutcome,

@@ -80,6 +80,9 @@ pub enum UsageMeterEndpoint {
     AnthropicOauth,
     /// Kimi coding-plan meter.
     KimiOauth,
+    /// SuperGrok/X-Premium subscription meter (the Grok CLI proxy's
+    /// billing surface).
+    GrokOauth,
 }
 
 /// `User-Agent` REQUIRED by the anthropic-oauth usage endpoint; requests
@@ -91,6 +94,18 @@ pub const OPENAI_OAUTH_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/u
 pub const ANTHROPIC_OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// kimi-oauth usage meter URL.
 pub const KIMI_OAUTH_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
+/// grok-oauth usage meter URL — `?format=credits` selects the unified
+/// weekly-credits shape; the parser also accepts the legacy monthly fields
+/// the same struct carries on non-unified accounts.
+pub const GROK_OAUTH_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+/// The grok-shell User-Agent the proxy expects (platform is compile-time).
+pub const GROK_OAUTH_USAGE_USER_AGENT: &str = if cfg!(target_os = "macos") {
+    "grok-shell/0.2.101 (macos)"
+} else if cfg!(target_os = "windows") {
+    "grok-shell/0.2.101 (windows)"
+} else {
+    "grok-shell/0.2.101 (linux)"
+};
 
 impl UsageMeterEndpoint {
     pub fn url(self) -> &'static str {
@@ -98,6 +113,7 @@ impl UsageMeterEndpoint {
             Self::OpenAiOauth => OPENAI_OAUTH_USAGE_URL,
             Self::AnthropicOauth => ANTHROPIC_OAUTH_USAGE_URL,
             Self::KimiOauth => KIMI_OAUTH_USAGE_URL,
+            Self::GrokOauth => GROK_OAUTH_USAGE_URL,
         }
     }
 
@@ -105,6 +121,18 @@ impl UsageMeterEndpoint {
     pub fn extra_headers(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::OpenAiOauth | Self::KimiOauth => &[],
+            // The Grok proxy version-gates its clients; the meter sends the
+            // same identity set as the inference lane.
+            Self::GrokOauth => &[
+                ("user-agent", GROK_OAUTH_USAGE_USER_AGENT),
+                (
+                    "x-grok-client-identifier",
+                    crate::GROK_SHELL_CLIENT_IDENTIFIER,
+                ),
+                ("x-grok-client-version", crate::GROK_SHELL_CLIENT_VERSION),
+                ("x-grok-client-mode", crate::GROK_SHELL_CLIENT_MODE),
+                ("X-XAI-Token-Auth", crate::GROK_XAI_TOKEN_AUTH),
+            ],
             Self::AnthropicOauth => &[
                 (
                     crate::ANTHROPIC_OAUTH_BETA_HEADER,
@@ -126,6 +154,10 @@ impl UsageMeterEndpoint {
             Self::AnthropicOauth => 180_000,
             // Kimi documents no poll bound; stay comfortably conservative.
             Self::KimiOauth => 300_000,
+            // The community floor for the Grok billing surface is 5 minutes
+            // (oh-my-pi TTL, OpenUsage refresh); only the official CLI polls
+            // tighter, and only above 99% usage.
+            Self::GrokOauth => 300_000,
         }
     }
 
@@ -138,6 +170,7 @@ impl UsageMeterEndpoint {
             Self::OpenAiOauth => parse_openai_wham_usage(body),
             Self::AnthropicOauth => parse_anthropic_oauth_usage(body),
             Self::KimiOauth => parse_kimi_usages(body),
+            Self::GrokOauth => parse_grok_billing(body),
         }
     }
 }
@@ -448,6 +481,112 @@ pub fn parse_kimi_usages(body: &[u8]) -> Result<MeterReading, MeterUnavailable> 
     })
 }
 
+// --- grok-oauth ------------------------------------------------------------
+
+/// The proxy's billing payload is proto3-JSON: zero/false/empty fields are
+/// OMITTED, and money rides a `{"val": cents}` wrapper where `{}` (or full
+/// absence) means 0. Every field below therefore defaults — absence is a
+/// VALUE here, never a schema change.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrokBilling {
+    #[serde(default)]
+    subscription_tier: Option<String>,
+    #[serde(default)]
+    config: GrokBillingConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrokBillingConfig {
+    /// Headline: percent of the included plan credits used this period.
+    /// Absent = 0% (the grok.com "0% used" surface), NOT missing data —
+    /// but only a present `current_period` proves the shape answered.
+    #[serde(default)]
+    credit_usage_percent: Option<f64>,
+    #[serde(default)]
+    current_period: Option<GrokUsagePeriod>,
+    /// Legacy monthly shape (non-unified accounts).
+    #[serde(default)]
+    monthly_limit: GrokCents,
+    #[serde(default)]
+    used: GrokCents,
+    #[serde(default)]
+    billing_period_end: Option<String>,
+    /// Pay-as-you-go overflow.
+    #[serde(default)]
+    on_demand_cap: GrokCents,
+    #[serde(default)]
+    on_demand_used: GrokCents,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrokUsagePeriod {
+    #[serde(rename = "type", default)]
+    period_type: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GrokCents {
+    #[serde(default)]
+    val: u64,
+}
+
+pub fn parse_grok_billing(body: &[u8]) -> Result<MeterReading, MeterUnavailable> {
+    let billing: GrokBilling =
+        serde_json::from_slice(body).map_err(|_| MeterUnavailable::new("malformed_response"))?;
+    let config = &billing.config;
+    let mut windows = Vec::new();
+    if let Some(period) = &config.current_period {
+        let window = match period.period_type.as_deref() {
+            Some("USAGE_PERIOD_TYPE_WEEKLY") => "weekly",
+            Some("USAGE_PERIOD_TYPE_MONTHLY") => "monthly",
+            _ => "quota",
+        };
+        windows.push(UsageWindowV1 {
+            window: window.to_owned(),
+            utilization: (config.credit_usage_percent.unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
+            resets_at_ms: period.end.as_deref().and_then(parse_rfc3339_to_unix_ms),
+            label: None,
+        });
+    } else if config.monthly_limit.val > 0 {
+        // Legacy monthly shape: absolute included quota.
+        #[allow(clippy::cast_precision_loss)]
+        let utilization =
+            (config.used.val as f64 / config.monthly_limit.val as f64).clamp(0.0, 1.0);
+        windows.push(UsageWindowV1 {
+            window: "monthly".to_owned(),
+            utilization,
+            resets_at_ms: config
+                .billing_period_end
+                .as_deref()
+                .and_then(parse_rfc3339_to_unix_ms),
+            label: None,
+        });
+    }
+    if config.on_demand_cap.val > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let utilization =
+            (config.on_demand_used.val as f64 / config.on_demand_cap.val as f64).clamp(0.0, 1.0);
+        windows.push(UsageWindowV1 {
+            window: "on-demand".to_owned(),
+            utilization,
+            resets_at_ms: None,
+            label: None,
+        });
+    }
+    if windows.is_empty() {
+        return Err(MeterUnavailable::new("no_windows_reported"));
+    }
+    Ok(MeterReading {
+        windows,
+        plan: billing.subscription_tier,
+    })
+}
+
 // --- RFC 3339 -------------------------------------------------------------
 
 /// Parses an RFC 3339 timestamp (`2026-08-05T09:50:00.833669+00:00`,
@@ -549,4 +688,99 @@ pub fn parse_rfc3339_to_unix_ms(value: &str) -> Option<u64> {
         .checked_mul(1_000)?
         .checked_add(i64::try_from(millis).ok()?)?;
     u64::try_from(unix_ms).ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod grok_billing_tests {
+    use super::*;
+
+    /// MUTATION CHECK: treat proto3 omission as failure (absent
+    /// creditUsagePercent, `{}` cents), drop the weekly window naming, or
+    /// lose the legacy-monthly fallback / on-demand window. Expected
+    /// RUNTIME failures below — the proxy omits every zero field.
+    #[test]
+    fn grok_billing_parses_credits_legacy_and_omission_shapes() {
+        // Unified weekly shape, live-observed field set.
+        let body = br#"{
+            "subscriptionTier": "SuperGrok",
+            "config": {
+                "creditUsagePercent": 42.5,
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-03T04:01:09.238389+00:00",
+                    "end": "2026-07-10T04:01:09.238389+00:00"
+                },
+                "onDemandCap": {"val": 2500},
+                "onDemandUsed": {"val": 300}
+            }
+        }"#;
+        let reading = parse_grok_billing(body).expect("credits shape parses");
+        assert_eq!(reading.plan.as_deref(), Some("SuperGrok"));
+        assert_eq!(reading.windows.len(), 2);
+        assert_eq!(reading.windows[0].window, "weekly");
+        assert!((reading.windows[0].utilization - 0.425).abs() < 1e-9);
+        assert!(reading.windows[0].resets_at_ms.is_some(), "weekly reset");
+        assert_eq!(reading.windows[1].window, "on-demand");
+        assert!((reading.windows[1].utilization - 0.12).abs() < 1e-9);
+
+        // proto3 omission: absent creditUsagePercent = 0%, `{}` cents = 0.
+        let body = br#"{
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "end": "2026-07-10T04:01:09+00:00"
+                },
+                "onDemandCap": {}
+            }
+        }"#;
+        let reading = parse_grok_billing(body).expect("omission shape parses");
+        assert_eq!(reading.windows.len(), 1, "zero cap = no on-demand window");
+        assert!(
+            reading.windows[0].utilization.abs() < f64::EPSILON,
+            "absent = 0%"
+        );
+
+        // Legacy monthly shape (non-unified account).
+        let body = br#"{
+            "config": {
+                "monthlyLimit": {"val": 2000},
+                "used": {"val": 1234},
+                "billingPeriodEnd": "2026-09-01T00:00:00Z"
+            }
+        }"#;
+        let reading = parse_grok_billing(body).expect("legacy shape parses");
+        assert_eq!(reading.windows[0].window, "monthly");
+        assert!((reading.windows[0].utilization - 0.617).abs() < 1e-9);
+
+        // Nothing usable = honest unavailability, never a fabricated bar.
+        let unavailable = parse_grok_billing(br#"{"config": {}}"#).expect_err("no windows");
+        assert_eq!(unavailable.reason, "no_windows_reported");
+    }
+
+    /// MUTATION CHECK: drop a proxy identity header from the meter, change
+    /// the URL off the credits shape, or tighten the poll floor below the
+    /// community 5-minute consensus. Expected RUNTIME failure.
+    #[test]
+    fn grok_meter_endpoint_pins_identity_url_and_floor() {
+        let endpoint = UsageMeterEndpoint::GrokOauth;
+        assert_eq!(
+            endpoint.url(),
+            "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+        );
+        assert!(endpoint.min_poll_interval_ms() >= 300_000);
+        let headers = endpoint.extra_headers();
+        for required in [
+            "x-grok-client-identifier",
+            "x-grok-client-version",
+            "x-grok-client-mode",
+            "X-XAI-Token-Auth",
+            "user-agent",
+        ] {
+            assert!(
+                headers.iter().any(|(name, _)| *name == required),
+                "meter must send {required}"
+            );
+        }
+    }
 }
