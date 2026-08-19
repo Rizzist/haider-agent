@@ -144,6 +144,12 @@ pub struct HarnessConfig {
     /// Local equivalents advertised after one exact provider-hosted-tool
     /// rejection. Empty means this provider has no safe fallback pack.
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
+    /// Frozen turn-authorized tool pack before provider-specific local web
+    /// selection. `None` leaves standalone embedders' packs untouched.
+    pub provider_tool_base: Option<Vec<ToolDefinition>>,
+    /// Turn-authorized local web definitions within [`Self::provider_tool_base`].
+    /// Non-web user and registry tools never enter this pool.
+    pub provider_local_web_tools: Vec<ToolDefinition>,
     /// CAS-backed attachments resolved before crossing the provider boundary.
     pub attachments: Vec<ResolvedAttachment>,
     /// Whether the resolved provider/model accepts vision inputs. Unsupported
@@ -233,6 +239,8 @@ impl HarnessConfig {
             volatile_user_tail: None,
             tools: Vec::new(),
             provider_tool_fallback_tools: Vec::new(),
+            provider_tool_base: None,
+            provider_local_web_tools: Vec::new(),
             attachments: Vec::new(),
             tool_result_images_supported: false,
             usage_account: None,
@@ -278,6 +286,47 @@ impl HarnessConfig {
         self.started_at_ms = Some(started_at_ms);
         self
     }
+
+    /// Replaces only provider-selected local web definitions, preserving the
+    /// rest of the turn-authorized tool pack byte-for-byte.
+    pub fn install_provider_derived_request_state(&mut self, state: &ProviderDerivedRequestState) {
+        if let Some(base) = self.provider_tool_base.as_ref() {
+            self.tools = select_provider_tools(
+                base,
+                &self.provider_local_web_tools,
+                &state.local_web_tool_names,
+            );
+            self.provider_tool_fallback_tools =
+                if state.provider_fallback_local_web_tool_names.is_empty() {
+                    Vec::new()
+                } else {
+                    select_provider_tools(
+                        base,
+                        &self.provider_local_web_tools,
+                        &state.provider_fallback_local_web_tool_names,
+                    )
+                };
+        } else {
+            self.provider_tool_fallback_tools.clear();
+        }
+        self.tool_result_images_supported = state.tool_result_images_supported;
+    }
+}
+
+fn select_provider_tools(
+    base: &[ToolDefinition],
+    provider_local_web_tools: &[ToolDefinition],
+    selected_names: &[String],
+) -> Vec<ToolDefinition> {
+    base.iter()
+        .filter(|definition| {
+            !provider_local_web_tools
+                .iter()
+                .any(|candidate| candidate == *definition)
+                || selected_names.iter().any(|name| name == &definition.name)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Thread-safe event-ID namespace shared by core and tool journals.
@@ -498,6 +547,16 @@ impl ProviderPairSwitchCause {
     }
 }
 
+/// Provider-capability-derived request state resolved by the daemon for one
+/// live lane. Tool names are materialized only from the actor's turn-scoped,
+/// already-authorized local web definition pool.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderDerivedRequestState {
+    pub tool_result_images_supported: bool,
+    pub local_web_tool_names: Vec<String>,
+    pub provider_fallback_local_web_tool_names: Vec<String>,
+}
+
 /// A fully resolved replacement lane. Daemon resolution proves the
 /// credential and constructs the provider before core crosses the durable
 /// switch boundary; core then installs every live request coordinate only
@@ -510,6 +569,7 @@ pub struct ProviderPairSwitchTarget {
     pub model: String,
     pub context_window: Option<u64>,
     pub cached_input_is_subset: bool,
+    pub provider_request_state: ProviderDerivedRequestState,
     pub auth_scope: String,
     pub attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
     pub cause: ProviderPairSwitchCause,
@@ -524,6 +584,7 @@ impl std::fmt::Debug for ProviderPairSwitchTarget {
             .field("model", &self.model)
             .field("context_window", &self.context_window)
             .field("cached_input_is_subset", &self.cached_input_is_subset)
+            .field("provider_request_state", &self.provider_request_state)
             .field("auth_scope", &self.auth_scope)
             .field("cause", &self.cause)
             .finish_non_exhaustive()
@@ -535,6 +596,7 @@ impl std::fmt::Debug for ProviderPairSwitchTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPairSwitch {
     pub run_id: RunId,
+    pub switch_ordinal: u32,
     pub from_provider: String,
     pub from_model: String,
     pub to_provider: String,
@@ -1803,6 +1865,9 @@ impl HarnessActor {
         // Once an ineffective compaction promotes this turn, later request
         // rounds may use the larger hard budget but must never compact again.
         let mut compaction_guard_consumed = false;
+        // Durable automatic switch commands are distinct per successful hop,
+        // even when a fallback chain revisits the same provider/model pair.
+        let mut provider_pair_switch_ordinal = 0u32;
         let mut provider_attempt = 0usize;
         let mut completed_usage: Option<Usage> = None;
         // W-B: provider-executed tool rows and cited web sources are
@@ -1850,6 +1915,7 @@ impl HarnessActor {
                     &mut usage_account,
                     &mut stable_history_end,
                     &mut compaction_guard_consumed,
+                    &mut provider_pair_switch_ordinal,
                 )
                 .await
             {
@@ -2051,6 +2117,7 @@ impl HarnessActor {
                                 &mut latest_compaction_summary_end,
                                 &mut rotation_budget_consumed,
                                 &mut capability_fallback_consumed,
+                                &mut provider_pair_switch_ordinal,
                                 error,
                             )
                             .await
@@ -2208,6 +2275,7 @@ impl HarnessActor {
                                 &mut latest_compaction_summary_end,
                                 &mut rotation_budget_consumed,
                                 &mut capability_fallback_consumed,
+                                &mut provider_pair_switch_ordinal,
                                 error,
                             )
                             .await
@@ -3256,6 +3324,7 @@ impl HarnessActor {
         latest_compaction_summary_end: &mut Option<usize>,
         rotation_budget_consumed: &mut bool,
         capability_fallback_consumed: &mut bool,
+        provider_pair_switch_ordinal: &mut u32,
         error: ProviderError,
     ) -> Result<(), DriveError> {
         let hosted_fallback = error.presentation.subcode.as_str() == "provider-web-tool-rejected"
@@ -3358,6 +3427,7 @@ impl HarnessActor {
                         stable_history_end,
                         current_turn_start,
                         latest_compaction_summary_end,
+                        provider_pair_switch_ordinal,
                     )
                     .await?;
                     *provider_attempt = 0;
@@ -3387,6 +3457,7 @@ impl HarnessActor {
                                     stable_history_end,
                                     current_turn_start,
                                     latest_compaction_summary_end,
+                                    provider_pair_switch_ordinal,
                                 )
                                 .await
                                 .inspect(|()| *provider_attempt = 0);
@@ -3427,6 +3498,7 @@ impl HarnessActor {
                         stable_history_end,
                         current_turn_start,
                         latest_compaction_summary_end,
+                        provider_pair_switch_ordinal,
                     )
                     .await
                     .inspect(|()| *provider_attempt = 0),
@@ -3452,14 +3524,21 @@ impl HarnessActor {
         stable_history_end: &mut usize,
         current_turn_start: &mut usize,
         latest_compaction_summary_end: &mut Option<usize>,
+        provider_pair_switch_ordinal: &mut u32,
     ) -> Result<(), DriveError> {
         let Some(committer) = self.config.provider_pair_switch_committer.clone() else {
             return Err(DriveError::Provider(provider_protocol_error(
                 "automatic provider/model switch has no durable committer",
             )));
         };
+        let next_switch_ordinal = provider_pair_switch_ordinal.checked_add(1).ok_or_else(|| {
+            DriveError::Provider(provider_protocol_error(
+                "automatic provider/model switch ordinal overflowed",
+            ))
+        })?;
         let switch = ProviderPairSwitch {
             run_id: run_id.clone(),
+            switch_ordinal: *provider_pair_switch_ordinal,
             from_provider: self.config.usage_scope.provider.clone(),
             from_model: self.config.model.clone(),
             to_provider: target.provider_name.clone(),
@@ -3472,6 +3551,7 @@ impl HarnessActor {
             )));
         }
         committer.commit(&switch).await.map_err(DriveError::Store)?;
+        *provider_pair_switch_ordinal = next_switch_ordinal;
 
         remap_after_provider_opaque_strip(
             messages,
@@ -3494,11 +3574,18 @@ impl HarnessActor {
         self.config.model = target.model.clone();
         self.config.context_window = target.context_window;
         self.config.cached_input_is_subset = target.cached_input_is_subset;
+        self.config
+            .install_provider_derived_request_state(&target.provider_request_state);
+        self.config.cache_expected_later_reads = u32::from(!self.config.tools.is_empty()) * 2;
         self.config.usage_account = Some(target.account.clone());
         self.config.usage_scope.provider = target.provider_name.clone();
         self.config.usage_scope.model = target.model.clone();
         self.config.usage_scope.account_scope = Some(target.account.clone());
         self.config.usage_scope.auth_scope = target.auth_scope.clone();
+        let tool_pack_digest = canonical_tool_definitions_digest(&self.config.tools);
+        if let Some(boundaries) = self.config.usage_scope.cache_boundaries.as_mut() {
+            boundaries.tool_pack = tool_pack_digest.clone();
+        }
         self.config.usage_scope.cache_epoch = digest_json(&serde_json::json!({
             "provider": target.provider_name,
             "model": target.model,
@@ -3506,10 +3593,9 @@ impl HarnessActor {
             "auth": target.auth_scope,
             "reasoning": self.config.reasoning_settings,
             "system": digest_json(&self.config.system_prompt),
-            "tools": canonical_tool_definitions_digest(&self.config.tools),
+            "tools": tool_pack_digest,
         }));
         self.config.cache_reuse_gap_ms = None;
-        self.config.provider_tool_fallback_tools.clear();
         // A compactor is bound to the provider/model used to construct it.
         // Continuing with that stale lane would be a silent reverse switch.
         self.config.context_compactor = None;
@@ -3687,18 +3773,14 @@ impl HarnessActor {
         account: &mut Option<CredentialAlias>,
         stable_history_end: &mut usize,
         compaction_guard_consumed: &mut bool,
+        provider_pair_switch_ordinal: &mut u32,
     ) -> Result<bool, DriveError> {
         // Volatile context is excluded from durable cache boundaries, but it
         // still consumes real provider input capacity. Measure a request-only
         // projection so the hard-fit policy remains honest without allowing
         // the tail into compaction or journal history.
-        let before = if let Some(tail) = volatile_user_tail {
-            let mut measured = messages.clone();
-            measured.push(Message::user_text(tail));
-            estimated_context_footprint(&self.config, &measured)
-        } else {
-            estimated_context_footprint(&self.config, messages)
-        };
+        let before =
+            estimated_request_shaped_context_footprint(&self.config, messages, volatile_user_tail);
         if self.config.context_compaction_v1 {
             self.commit_context_footprint(run_id, &before)
                 .await
@@ -3756,8 +3838,14 @@ impl HarnessActor {
                 .await
                 .map_err(DriveError::Store)?;
         }
+        let after_for_guard =
+            estimated_request_shaped_context_footprint(&self.config, messages, volatile_user_tail);
         if self.config.compaction_guard_v1
-            && compaction_guard_tripped(before.used_tokens, after.used_tokens, input_budget)
+            && compaction_guard_tripped(
+                before.used_tokens,
+                after_for_guard.used_tokens,
+                input_budget,
+            )
         {
             *compaction_guard_consumed = true;
             let promotion = self.config.compaction_promotion.take().filter(|target| {
@@ -3770,7 +3858,7 @@ impl HarnessActor {
             let Some(promotion) = promotion else {
                 return Err(compaction_runaway_guard_error(
                     before.used_tokens,
-                    after.used_tokens,
+                    after_for_guard.used_tokens,
                     input_budget,
                 ));
             };
@@ -3783,6 +3871,7 @@ impl HarnessActor {
                 stable_history_end,
                 current_turn_start,
                 latest_compaction_summary_end,
+                provider_pair_switch_ordinal,
             )
             .await?;
             let promoted = estimated_context_footprint(&self.config, messages);
@@ -3791,27 +3880,34 @@ impl HarnessActor {
                     .await
                     .map_err(DriveError::Store)?;
             }
+            let promoted_for_fit = estimated_request_shaped_context_footprint(
+                &self.config,
+                messages,
+                volatile_user_tail,
+            );
             let promoted_budget = self
                 .config
                 .context_window
                 .and_then(|promoted_window| {
                     promoted_window.checked_sub(self.config.reserved_output_tokens)
                 })
-                .ok_or_else(|| compaction_guard_repeat_error(promoted.used_tokens, input_budget))?;
-            if promoted.used_tokens > promoted_budget {
+                .ok_or_else(|| {
+                    compaction_guard_repeat_error(promoted_for_fit.used_tokens, input_budget)
+                })?;
+            if promoted_for_fit.used_tokens > promoted_budget {
                 return Err(compaction_guard_repeat_error(
-                    promoted.used_tokens,
+                    promoted_for_fit.used_tokens,
                     promoted_budget,
                 ));
             }
             return Ok(true);
         }
-        if after.used_tokens > input_budget {
+        if after_for_guard.used_tokens > input_budget {
             return Err(DriveError::Provider(ProviderError::new(
                 ProviderErrorKind::ContextExceeded,
                 format!(
                     "compacted provider input estimate {} exceeds budget {input_budget}",
-                    after.used_tokens
+                    after_for_guard.used_tokens
                 ),
             )));
         }
@@ -7014,6 +7110,19 @@ fn estimated_context_footprint(config: &HarnessConfig, messages: &[Message]) -> 
         0,
         ContextFootprintTruth::Estimated,
     )
+}
+
+fn estimated_request_shaped_context_footprint(
+    config: &HarnessConfig,
+    messages: &[Message],
+    volatile_user_tail: Option<&str>,
+) -> ContextFootprint {
+    let Some(tail) = volatile_user_tail else {
+        return estimated_context_footprint(config, messages);
+    };
+    let mut measured = messages.to_vec();
+    measured.push(Message::user_text(tail));
+    estimated_context_footprint(config, &measured)
 }
 
 fn context_footprint_from_usage(

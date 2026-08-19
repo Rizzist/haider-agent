@@ -55,12 +55,13 @@ use haider_core::{
     DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
     GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
-    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, ProviderPairSwitch,
-    ProviderPairSwitchCommitter, RequestInputCheckpoint, SessionSelectModelCommand,
-    SessionSelectModelOutcome, StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn,
-    SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
-    presentation_for_haider_error, sanitized_failure_message,
+    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, ProviderDerivedRequestState,
+    ProviderPairSwitch, ProviderPairSwitchCommitter, RequestInputCheckpoint,
+    SessionSelectModelCommand, SessionSelectModelOutcome, StoreHandle, SubmitCheckpointTurn,
+    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
+    estimate_provider_request_input_tokens, presentation_for_haider_error,
+    sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
@@ -94,8 +95,8 @@ use haider_protocol::permission::{
 };
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{
-    AccountUsage, CacheBoundaryIdentity, FeatureResolve, FinishReason, PrefixDigests, StreamEvent,
-    Usage, UsageRequestKind, UsageScope,
+    AccountUsage, CacheBoundaryIdentity, CapabilityDoc, FeatureResolve, FinishReason,
+    PrefixDigests, StreamEvent, Usage, UsageRequestKind, UsageScope,
 };
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
@@ -259,6 +260,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             "automatic": true,
             "session_id": self.store.session_id(),
             "run_id": switch.run_id,
+            "switch_ordinal": switch.switch_ordinal,
             "worker_generation": self.store.worker_generation(),
             "from_provider": switch.from_provider,
             "from_model": switch.from_model,
@@ -4851,8 +4853,11 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
-    config.tool_result_images_supported =
-        provider_capabilities.vision != FeatureResolve::Unsupported;
+    let provider_request_state = provider_derived_request_state(
+        &resolved.provider_name,
+        &provider_capabilities,
+        web_degrade,
+    );
     config.cached_input_is_subset = cached_input_is_subset_for_provider(&resolved.provider_name);
     config.context_compaction_v1 = true;
     config.compaction_guard_v1 = true;
@@ -4883,32 +4888,20 @@ async fn start_turn(
         handoff_dir.as_deref(),
     ));
     config.volatile_user_tail = graph_brief;
-    config.tools = advertised_tool_definitions(
-        &dependencies.tool_factory,
-        grant.as_ref(),
-        &resolved.provider_name,
-        web_degrade,
-    );
+    let provider_tool_base =
+        authorized_tool_definitions(&dependencies.tool_factory, grant.as_ref());
+    config.provider_local_web_tools = provider_tool_base
+        .iter()
+        .filter(|definition| is_local_web_tool(&definition.name))
+        .cloned()
+        .collect();
+    config.provider_tool_base = Some(provider_tool_base);
+    config.install_provider_derived_request_state(&provider_request_state);
     // Instruct pipe: the tools ride the wire as minimal stubs; their signatures
     // and semantics ride the cached system prompt as one compact manual for the
     // exact advertised set.
     if let Some(system_prompt) = config.system_prompt.as_mut() {
         system_prompt.push_str(&tool_manual(&config.tools));
-    }
-    if matches!(
-        resolved.provider_name.as_str(),
-        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
-    ) && !web_degrade.anthropic_web_tools
-    {
-        config.provider_tool_fallback_tools = advertised_tool_definitions(
-            &dependencies.tool_factory,
-            grant.as_ref(),
-            &resolved.provider_name,
-            WebCapabilityDegrade {
-                anthropic_web_tools: true,
-                ..web_degrade
-            },
-        );
     }
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let account_scope = resolved
@@ -5140,7 +5133,7 @@ async fn start_turn(
 /// Whether a provider's reported cache-read count is already included in its
 /// input count. DeepSeek is deliberately disjoint: its adapter maps cache
 /// misses to `input` and cache hits to `cached` from separate wire fields.
-fn cached_input_is_subset_for_provider(provider: &str) -> bool {
+pub(crate) fn cached_input_is_subset_for_provider(provider: &str) -> bool {
     !matches!(
         provider,
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME | DEEPSEEK_PROVIDER_NAME
@@ -7172,6 +7165,21 @@ pub(crate) fn advertised_tool_definitions(
     provider_name: &str,
     web_degrade: WebCapabilityDegrade,
 ) -> Vec<ToolDefinition> {
+    let mut definitions = authorized_tool_definitions(tool_factory, grant);
+    let (local_web_tool_names, _) = provider_web_tool_names(provider_name, web_degrade);
+    definitions.retain(|definition| {
+        !is_local_web_tool(&definition.name)
+            || local_web_tool_names
+                .iter()
+                .any(|name| name == &definition.name)
+    });
+    definitions
+}
+
+fn authorized_tool_definitions(
+    tool_factory: &Arc<dyn TurnToolFactory>,
+    grant: Option<&Grant>,
+) -> Vec<ToolDefinition> {
     let mut definitions = tool_factory.definitions();
     if let Some(grant) = grant {
         let registry = registered_tools();
@@ -7191,23 +7199,48 @@ pub(crate) fn advertised_tool_definitions(
     } else {
         definitions.retain(|definition| definition.name != "workflow_author");
     }
-    // First-party Anthropic pairs carry the SERVER `web_fetch` tool, so the
-    // local client tool is withheld — UNLESS the session's server tools
-    // degraded (400), which is exactly the "local fallback on refusal".
-    if matches!(
+    definitions
+}
+
+fn is_local_web_tool(name: &str) -> bool {
+    matches!(name, "web_fetch" | "web_search")
+}
+
+fn provider_web_tool_names(
+    provider_name: &str,
+    web_degrade: WebCapabilityDegrade,
+) -> (Vec<String>, Vec<String>) {
+    let native_anthropic_web = matches!(
         provider_name,
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
-    ) && !web_degrade.anthropic_web_tools
-    {
-        definitions.retain(|definition| definition.name != "web_fetch");
+    ) && !web_degrade.anthropic_web_tools;
+    let mut local = Vec::new();
+    if !native_anthropic_web {
+        local.push("web_fetch".to_owned());
     }
-    // The client `web_search` tool exists for responses-lite pairs only —
-    // every other family either has a provider-native search or honestly
-    // none — and a latched 404/410 stops advertising it for the session.
-    if provider_name != OPENAI_OAUTH_PROVIDER_NAME || web_degrade.openai_alpha_search {
-        definitions.retain(|definition| definition.name != "web_search");
+    if provider_name == OPENAI_OAUTH_PROVIDER_NAME && !web_degrade.openai_alpha_search {
+        local.push("web_search".to_owned());
     }
-    definitions
+    let fallback = if native_anthropic_web {
+        vec!["web_fetch".to_owned()]
+    } else {
+        Vec::new()
+    };
+    (local, fallback)
+}
+
+pub(crate) fn provider_derived_request_state(
+    provider_name: &str,
+    capabilities: &CapabilityDoc,
+    web_degrade: WebCapabilityDegrade,
+) -> ProviderDerivedRequestState {
+    let (local_web_tool_names, provider_fallback_local_web_tool_names) =
+        provider_web_tool_names(provider_name, web_degrade);
+    ProviderDerivedRequestState {
+        tool_result_images_supported: capabilities.vision != FeatureResolve::Unsupported,
+        local_web_tool_names,
+        provider_fallback_local_web_tool_names,
+    }
 }
 
 #[async_trait]

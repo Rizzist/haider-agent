@@ -58,8 +58,9 @@ use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
     ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_REMOVE_REFUSED,
     ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData,
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderRemoveRefusalReasonWire,
-    ProviderSummaryWire, RequestId, ResponseBody, StagePurpose, WireFrame,
+    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
+    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestId, ResponseBody, StagePurpose,
+    WireFrame,
 };
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{mpsc, watch};
@@ -6490,6 +6491,22 @@ fn adapter_construction_error(
     )
 }
 
+fn provider_tuning_with_web_degrade(
+    metadata: &haider_protocol::session::SessionMetadataV1,
+    web_degrade: crate::worker::WebCapabilityDegrade,
+) -> ProviderTuning {
+    let mut tuning = ProviderTuning::from_metadata(metadata);
+    if web_degrade.anthropic_web_tools
+        && matches!(
+            metadata.provider.as_str(),
+            ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+        )
+    {
+        tuning.web_tools = false;
+    }
+    tuning
+}
+
 #[derive(Clone)]
 pub(crate) struct AccountsProviderFactory {
     snapshot: AccountsSnapshot,
@@ -6614,12 +6631,34 @@ impl AccountsProviderFactory {
             .and_then(|detail| detail.context_window)
     }
 
+    #[cfg(test)]
     async fn resolve_compaction_promotion(
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
     ) -> Option<haider_core::ProviderPairSwitchTarget> {
+        self.resolve_compaction_promotion_with_web(
+            metadata,
+            crate::worker::WebCapabilityDegrade::default(),
+        )
+        .await
+    }
+
+    async fn resolve_compaction_promotion_with_web(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        web_degrade: crate::worker::WebCapabilityDegrade,
+    ) -> Option<haider_core::ProviderPairSwitchTarget> {
         let target = self.resilience.promotion_targets.get(&metadata.provider)?;
         if target.provider != metadata.provider {
+            return None;
+        }
+        let target_profile = self.provider_profile(&target.provider)?;
+        if !target_profile.enabled
+            || !matches!(
+                target_profile.availability,
+                ProviderAvailabilityWire::Available
+            )
+        {
             return None;
         }
         let model = target.model.as_ref()?.clone();
@@ -6647,10 +6686,16 @@ impl AccountsProviderFactory {
             .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
         let mut target_metadata = metadata.clone();
         target_metadata.model = model.clone();
-        let tuning = ProviderTuning::from_metadata(&target_metadata);
+        let tuning = provider_tuning_with_web_degrade(&target_metadata, web_degrade);
         let provider = self
             .build_provider(&resolved.descriptor, credential, &target_metadata, &tuning)
             .ok()?;
+        let capabilities = provider.capabilities().await;
+        let provider_request_state = crate::worker::provider_derived_request_state(
+            &target.provider,
+            &capabilities,
+            web_degrade,
+        );
         let auth_scope = match provider.credential_surface() {
             haider_provider::ProviderCredentialSurface::Opaque => "opaque",
             haider_provider::ProviderCredentialSurface::ApiKey => "api_key",
@@ -6665,17 +6710,18 @@ impl AccountsProviderFactory {
             target_metadata,
             tuning,
             oauth_access_fingerprint,
-        );
+        )
+        .with_web_degrade(web_degrade);
         Some(haider_core::ProviderPairSwitchTarget {
             provider,
             account: resolved.descriptor.alias,
             provider_name: target.provider.clone(),
             model,
             context_window: Some(target_window),
-            cached_input_is_subset: !matches!(
-                target.provider.as_str(),
-                ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME | DEEPSEEK_PROVIDER_NAME
+            cached_input_is_subset: crate::worker::cached_input_is_subset_for_provider(
+                &target.provider,
             ),
+            provider_request_state,
             auth_scope,
             attempt_resolver: Some(Arc::new(next_resolver)),
             cause: haider_core::ProviderPairSwitchCause::CompactionGuard,
@@ -6898,6 +6944,7 @@ struct AccountsAttemptResolver {
     auth_refresh_attempted: AtomicBool,
     web_fallback_attempted: AtomicBool,
     oauth_access_fingerprint: Option<[u8; 32]>,
+    web_degrade: crate::worker::WebCapabilityDegrade,
     /// Index of the chain entry that produced this lane. `None` means the
     /// turn started from session metadata and must locate that pair once.
     /// Carrying the cursor across hops makes traversal strictly no-wrap even
@@ -6919,8 +6966,14 @@ impl AccountsAttemptResolver {
             auth_refresh_attempted: AtomicBool::new(false),
             web_fallback_attempted: AtomicBool::new(false),
             oauth_access_fingerprint,
+            web_degrade: crate::worker::WebCapabilityDegrade::default(),
             fallback_cursor: None,
         }
+    }
+
+    fn with_web_degrade(mut self, web_degrade: crate::worker::WebCapabilityDegrade) -> Self {
+        self.web_degrade = web_degrade;
+        self
     }
 
     fn at_fallback_cursor(mut self, cursor: usize) -> Self {
@@ -7122,6 +7175,13 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             if entry.provider == self.metadata.provider {
                 continue;
             }
+            let target_profile = self.factory.provider_profile(&entry.provider);
+            if target_profile.as_ref().is_some_and(|profile| {
+                !profile.enabled
+                    || !matches!(profile.availability, ProviderAvailabilityWire::Available)
+            }) {
+                continue;
+            }
             let has_signed_in_credential = self.factory.snapshot.lock().ok().is_some_and(|rows| {
                 rows.iter()
                     .any(|row| row.provider == entry.provider && row.active)
@@ -7129,11 +7189,11 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             if !has_signed_in_credential {
                 continue;
             }
-            let model = match entry.model.clone().or_else(|| {
-                self.factory
-                    .provider_profile(&entry.provider)
-                    .and_then(|profile| profile.default_model)
-            }) {
+            let model = match entry
+                .model
+                .clone()
+                .or_else(|| target_profile.and_then(|profile| profile.default_model))
+            {
                 Some(model) if !model.trim().is_empty() => model,
                 _ => continue,
             };
@@ -7154,7 +7214,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             let mut metadata = self.metadata.clone();
             metadata.provider = entry.provider.clone();
             metadata.model = model.clone();
-            let tuning = ProviderTuning::from_metadata(&metadata);
+            let tuning = provider_tuning_with_web_degrade(&metadata, self.web_degrade);
             let provider = match self.factory.build_provider(
                 &resolved.descriptor,
                 credential,
@@ -7164,6 +7224,12 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 Ok(provider) => provider,
                 Err(_) => continue,
             };
+            let capabilities = provider.capabilities().await;
+            let provider_request_state = crate::worker::provider_derived_request_state(
+                &entry.provider,
+                &capabilities,
+                self.web_degrade,
+            );
             let auth_scope = match provider.credential_surface() {
                 haider_provider::ProviderCredentialSurface::Opaque => "opaque",
                 haider_provider::ProviderCredentialSurface::ApiKey => "api_key",
@@ -7180,6 +7246,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 tuning,
                 oauth_access_fingerprint,
             )
+            .with_web_degrade(self.web_degrade)
             .at_fallback_cursor(index);
             return Ok(haider_core::ProviderAttemptDecision::Switch(
                 haider_core::ProviderPairSwitchTarget {
@@ -7188,12 +7255,10 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                     provider_name: entry.provider.clone(),
                     model,
                     context_window,
-                    cached_input_is_subset: !matches!(
-                        entry.provider.as_str(),
-                        ANTHROPIC_PROVIDER_NAME
-                            | ANTHROPIC_OAUTH_PROVIDER_NAME
-                            | DEEPSEEK_PROVIDER_NAME
+                    cached_input_is_subset: crate::worker::cached_input_is_subset_for_provider(
+                        &entry.provider,
                     ),
+                    provider_request_state,
                     auth_scope,
                     attempt_resolver: Some(Arc::new(next_resolver)),
                     cause: haider_core::ProviderPairSwitchCause::FallbackChain,
@@ -7213,12 +7278,15 @@ impl AccountsProviderFactory {
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
         tuning: ProviderTuning,
+        web_degrade: crate::worker::WebCapabilityDegrade,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
         let (resolved, provider, oauth_access_fingerprint) =
             self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
         let context_window = self.model_context_window(&metadata.provider, &metadata.model);
-        let compaction_promotion = self.resolve_compaction_promotion(metadata).await;
+        let compaction_promotion = self
+            .resolve_compaction_promotion_with_web(metadata, web_degrade)
+            .await;
         Ok(crate::worker::ResolvedTurnProvider {
             provider,
             provider_name: metadata.provider.clone(),
@@ -7228,12 +7296,15 @@ impl AccountsProviderFactory {
             initial_rotation: resolved.rotation,
             rotation_budget_consumed,
             attempt_resolver: self.broker.as_ref().map(|_| {
-                Arc::new(AccountsAttemptResolver::new(
-                    self.clone(),
-                    metadata.clone(),
-                    tuning.clone(),
-                    oauth_access_fingerprint,
-                )) as Arc<dyn haider_core::ProviderAttemptResolver>
+                Arc::new(
+                    AccountsAttemptResolver::new(
+                        self.clone(),
+                        metadata.clone(),
+                        tuning.clone(),
+                        oauth_access_fingerprint,
+                    )
+                    .with_web_degrade(web_degrade),
+                ) as Arc<dyn haider_core::ProviderAttemptResolver>
             }),
             compaction_promotion,
         })
@@ -7246,8 +7317,13 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
-        self.resolve_turn_tuned(metadata, ProviderTuning::from_metadata(metadata))
-            .await
+        let web_degrade = crate::worker::WebCapabilityDegrade::default();
+        self.resolve_turn_tuned(
+            metadata,
+            provider_tuning_with_web_degrade(metadata, web_degrade),
+            web_degrade,
+        )
+        .await
     }
 
     /// W-B (decision 1, "local fallback on refusal"): once this session's
@@ -7261,17 +7337,12 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
         metadata: &haider_protocol::session::SessionMetadataV1,
         degrade: crate::worker::WebCapabilityDegrade,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
-        let mut tuning = ProviderTuning::from_metadata(metadata);
-        if degrade.anthropic_web_tools
-            && matches!(
-                metadata.provider.as_str(),
-                haider_provider::ANTHROPIC_PROVIDER_NAME
-                    | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
-            )
-        {
-            tuning.web_tools = false;
-        }
-        self.resolve_turn_tuned(metadata, tuning).await
+        self.resolve_turn_tuned(
+            metadata,
+            provider_tuning_with_web_degrade(metadata, degrade),
+            degrade,
+        )
+        .await
     }
 
     async fn reconcile_cache_scope(
