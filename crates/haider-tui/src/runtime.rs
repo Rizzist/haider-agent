@@ -1557,6 +1557,10 @@ impl DemoDriver {
                 model.flash = Some(format!("· browser (demo): {url}"));
                 model.dirty = true;
             }
+            AppRequest::RevealPath { path } => {
+                model.flash = Some(format!("· reveal (demo): {path}"));
+                model.dirty = true;
+            }
             AppRequest::AccountSetActive { alias, .. } => {
                 let Some(row) = model
                     .accounts
@@ -2626,6 +2630,8 @@ pub enum ShellRequest {
     CopyText(String),
     /// Open a URL in the user's browser (the OAuth authorize hop).
     OpenUrl(String),
+    /// Reveal a durable image-created payload in the OS file explorer.
+    RevealPath(String),
     /// Read + magic-sniff an `/attach` file (B4b — needs the filesystem).
     /// The outcome re-enters through [`attach_read_effects`]: an honest
     /// flash, or a chip + upload request on the model.
@@ -2690,6 +2696,7 @@ pub fn live_pass(
             AppRequest::CopySelection => shell.push(ShellRequest::CopySelection),
             AppRequest::CopyText(text) => shell.push(ShellRequest::CopyText(text)),
             AppRequest::OpenUrl { url } => shell.push(ShellRequest::OpenUrl(url)),
+            AppRequest::RevealPath { path } => shell.push(ShellRequest::RevealPath(path)),
             AppRequest::AttachRead { path } => shell.push(ShellRequest::AttachRead(path)),
             AppRequest::TalkShell(command) => shell.push(ShellRequest::Talk(command)),
             AppRequest::Quit => shell.push(ShellRequest::Quit),
@@ -2931,6 +2938,12 @@ pub async fn run_live(
                 ShellRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
                 ShellRequest::OpenUrl(url) => {
                     open_url_effects(&mut model, &url, &crate::browser::open_url);
+                }
+                ShellRequest::RevealPath(path) => {
+                    if crate::browser::reveal_path(&path).is_err() {
+                        model.flash = Some(format!("· couldn't reveal image — {path}"));
+                        model.dirty = true;
+                    }
                 }
                 ShellRequest::AttachRead(path) => attach_read_effects(&mut model, &path),
                 ShellRequest::Talk(command) => talk_runtime.execute(command),

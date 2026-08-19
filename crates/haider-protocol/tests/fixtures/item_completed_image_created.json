@@ -1,0 +1,18 @@
+{
+  "event": "completed",
+  "item_id": "it-image-created-1",
+  "item": {
+    "item": "extension",
+    "kind": "image_created_v1",
+    "data": {
+      "byte_len": 12345,
+      "call_id": "call-image-1",
+      "display_path": "output/chart.png",
+      "height": 480,
+      "media_type": "image/png",
+      "path": "/workspace/output/chart.png",
+      "tool": "process_exec",
+      "width": 640
+    }
+  }
+}

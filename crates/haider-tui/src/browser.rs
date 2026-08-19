@@ -9,6 +9,7 @@
 //!   makes the hop probeable: a PTY probe points `$BROWSER` at a recorder
 //!   script and asserts the REAL authorize URL arrived.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Build the platform's opener command for `url` without spawning it.
@@ -62,4 +63,42 @@ pub fn open_url_command_with_env(
 /// and never inherits its stdio (the terminal is ours).
 pub fn open_url(url: &str) -> std::io::Result<()> {
     open_url_command(url)?.spawn().map(drop)
+}
+
+/// Build the platform file-explorer command for an existing payload path.
+///
+/// Command construction is kept pure (apart from validating filesystem
+/// existence), allowing the exact program and argument boundary to be pinned
+/// without launching an OS application in tests.
+pub fn reveal_path_command(path: &Path) -> std::io::Result<Command> {
+    std::fs::metadata(path)?;
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("/usr/bin/open");
+        command.arg("-R").arg(path);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    } else {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image path has no parent directory",
+            )
+        })?;
+        let mut command = Command::new("xdg-open");
+        command.arg(parent);
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
+}
+
+/// Reveal `path` in the platform file explorer, detached from the TUI.
+pub fn reveal_path(path: &str) -> std::io::Result<()> {
+    reveal_path_command(Path::new(path))?.spawn().map(drop)
 }

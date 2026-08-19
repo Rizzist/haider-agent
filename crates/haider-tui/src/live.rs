@@ -4180,6 +4180,9 @@ impl LiveDriver {
             // demo driver's arms and clears its token meters. Live mode has
             // neither, so there is nothing to do and nothing to say.
             AppRequest::ResetAllSessions => Vec::new(),
+            // Shell-owned and drained by `live_pass` before requests reach
+            // this RPC translator. This arm keeps direct harness calls inert.
+            AppRequest::RevealPath { .. } => Vec::new(),
         }
     }
 

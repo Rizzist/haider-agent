@@ -245,6 +245,46 @@ fn virtualized_transcript_lines(
     (lines, base, total)
 }
 
+/// Register the visible portion of every durable image row. Geometry uses
+/// the same wrapped-row coordinates as transcript virtualization, so a click
+/// remains aligned after resizing and scroll-back.
+fn image_reveal_hits(
+    cache: &TranscriptLayoutCache,
+    prefix_rows: u16,
+    scroll: u16,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let viewport_end = scroll.saturating_add(area.height);
+    for entry in &cache.entries {
+        let TranscriptEntry::Item(block) = &entry.source else {
+            continue;
+        };
+        let TurnItem::Extension { kind, data } = &block.item else {
+            continue;
+        };
+        let Some((image, _)) = crate::projection::image_created_fact(kind, data) else {
+            continue;
+        };
+        let start = prefix_rows.saturating_add(entry.row_start);
+        let end = start.saturating_add(entry.height);
+        let visible_start = start.max(scroll);
+        let visible_end = end.min(viewport_end);
+        if visible_start >= visible_end {
+            continue;
+        }
+        hits.push((
+            Rect {
+                x: area.x,
+                y: area.y.saturating_add(visible_start.saturating_sub(scroll)),
+                width: area.width,
+                height: visible_end.saturating_sub(visible_start),
+            },
+            Hit::RevealPath(image.path),
+        ));
+    }
+}
+
 /// Workspace version shown on boot/launcher (single source: the crate).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -3658,6 +3698,7 @@ fn render_session(
             paragraph.scroll((scroll.saturating_sub(visible_base), 0)),
             transcript_area,
         );
+        image_reveal_hits(&transcript_cache, 0, scroll, transcript_area, hits);
     }
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
@@ -6552,6 +6593,13 @@ fn render_subagent(
             .wrap(Wrap { trim: false })
             .scroll((scroll.saturating_sub(visible_base), 0)),
         transcript_area,
+    );
+    image_reveal_hits(
+        &transcript_cache,
+        wrapped_lines_height(&prefix, transcript_area.width),
+        scroll,
+        transcript_area,
+        hits,
     );
 
     // ---- Composer / question card ----
@@ -9764,7 +9812,14 @@ fn item_lines<'a>(
             ]));
         }
         TurnItem::Extension { kind, data } => {
-            if let Some(transition) =
+            if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
+                let suffix = label.strip_prefix("🖼 image").unwrap_or(&label);
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("🖼 image", theme.gold_style()),
+                    Span::styled(suffix.to_owned(), theme.dim_style()),
+                ]));
+            } else if let Some(transition) =
                 haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(&block.item)
             {
                 lines.push(Line::styled(

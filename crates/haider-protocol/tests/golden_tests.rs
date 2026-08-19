@@ -27,6 +27,7 @@ use haider_protocol::hook::{
     HookRuntimeKind,
 };
 use haider_protocol::ids::*;
+use haider_protocol::image::{IMAGE_CREATED_EXTENSION_KIND, ImageCreatedV1};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption,
@@ -194,6 +195,33 @@ fn golden_session_idle_interrupted() {
     golden(
         "session_idle_interrupted",
         &SessionState::Idle { interrupted: true },
+    );
+}
+
+/// MUTATION CHECK: remove an image location, producer identity, or image
+/// metadata field, or rename the extension kind. Expected runtime failure:
+/// the additive durable image-event fixture differs or no longer round-trips.
+#[test]
+fn golden_image_created_extension() {
+    let image = ImageCreatedV1 {
+        path: "/workspace/output/chart.png".into(),
+        display_path: "output/chart.png".into(),
+        media_type: "image/png".into(),
+        byte_len: 12_345,
+        width: Some(640),
+        height: Some(480),
+        call_id: "call-image-1".into(),
+        tool: "process_exec".into(),
+    };
+    additive_golden(
+        "item_completed_image_created",
+        &ItemEvent::Completed {
+            item_id: ItemId::new("it-image-created-1"),
+            item: TurnItem::Extension {
+                kind: IMAGE_CREATED_EXTENSION_KIND.into(),
+                data: serde_json::to_value(image).expect("serialize image-created payload"),
+            },
+        },
     );
 }
 

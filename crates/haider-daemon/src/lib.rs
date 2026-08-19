@@ -62,6 +62,7 @@ mod endpoint;
 mod error;
 mod gcloud;
 mod hooks;
+mod image_events;
 mod lifecycle;
 #[cfg(test)]
 mod manual_retry_tests;

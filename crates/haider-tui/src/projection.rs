@@ -1584,6 +1584,32 @@ pub(crate) fn retry_marker_label(kind: &str, data: &serde_json::Value) -> Option
     }
 }
 
+/// Decode and format the durable image-created fact shared by styled and
+/// plain transcript renderers. Keeping this at the projection boundary makes
+/// the extension payload, rather than a renderer-specific side channel, the
+/// complete UI contract.
+#[must_use]
+pub(crate) fn image_created_fact(
+    kind: &str,
+    data: &serde_json::Value,
+) -> Option<(haider_protocol::image::ImageCreatedV1, String)> {
+    if kind != haider_protocol::image::IMAGE_CREATED_EXTENSION_KIND {
+        return None;
+    }
+    let image =
+        serde_json::from_value::<haider_protocol::image::ImageCreatedV1>(data.clone()).ok()?;
+    let dimensions = match (image.width, image.height) {
+        (Some(width), Some(height)) => format!(" · {width}×{height}"),
+        _ => String::new(),
+    };
+    let kilobytes = image.byte_len.div_ceil(1024);
+    let label = format!(
+        "🖼 image · {}{dimensions} · {kilobytes} KB",
+        image.display_path
+    );
+    Some((image, label))
+}
+
 /// The fact line's request-id form: the first 8 chars, `…`-marked when
 /// shortened. Support-grade full ids stay in the transcript string and
 /// the journal.

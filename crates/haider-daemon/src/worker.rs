@@ -32,6 +32,9 @@ mod cu2_computer_runtime_tests;
 #[path = "g1_todo_runtime_tests.rs"]
 mod g1_todo_runtime_tests;
 #[cfg(test)]
+#[path = "image_event_runtime_tests.rs"]
+mod image_event_runtime_tests;
+#[cfg(test)]
 #[path = "pair_switch_runtime_tests.rs"]
 mod pair_switch_runtime_tests;
 #[cfg(test)]
@@ -39,6 +42,7 @@ mod pair_switch_runtime_tests;
 mod wd_pdf_runtime_tests;
 
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
+use crate::image_events::{detect_created_images, image_created_payload};
 use crate::project_instructions::{self, LoadedProjectInstructions};
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
 use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payloads};
@@ -77,6 +81,7 @@ use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EffectId, EventId, GraphId, ItemId, MenuId, NodeId, RunId,
     SessionId,
 };
+use haider_protocol::image::{IMAGE_CREATED_EXTENSION_KIND, ImageCreatedV1};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
@@ -117,7 +122,7 @@ use haider_tools::{
     ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -7338,7 +7343,37 @@ struct ComputerObservationRecord<'a> {
     detail: String,
 }
 
+struct CreatedImageScan<'a> {
+    run_id: &'a RunId,
+    call_id: &'a str,
+    tool: &'a str,
+    command: &'a str,
+    output_preview: &'a str,
+    cwd: &'a Path,
+    started: SystemTime,
+}
+
 impl BrokerToolDispatcher {
+    async fn emit_created_images(&self, scan: CreatedImageScan<'_>) -> ToolResult<()> {
+        for path in detect_created_images(scan.command, scan.output_preview, scan.cwd, scan.started)
+        {
+            let Some(image) = image_created_payload(
+                &path,
+                Path::new(&self.metadata.cwd),
+                scan.call_id,
+                scan.tool,
+            )
+            .map_err(|error| ToolError::Runtime {
+                message: format!("cannot inspect created image {}: {error}", path.display()),
+            })?
+            else {
+                continue;
+            };
+            self.output.append_image_created(scan.run_id, image).await?;
+        }
+        Ok(())
+    }
+
     fn permission_menu(
         intent: &EffectIntent,
         permission: haider_protocol::permission::SystemPermission,
@@ -8417,6 +8452,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let cwd = optional_string(&args, "cwd")?;
                 let background = optional_bool(&args, "background")?.unwrap_or(false);
                 if background {
+                    // Image discovery is foreground-only: detached tasks have
+                    // no completed bounded transcript at this dispatch seam.
                     // W-A: the detached shape returns IMMEDIATELY with the
                     // typed running receipt; supervision is session-scoped.
                     let name = optional_string(&args, "name")?;
@@ -8437,7 +8474,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         )
                         .await
                 } else {
-                    let mut operation = ProcessExec::new(call_id, command);
+                    let effective_cwd = command_cwd(&self.metadata.cwd, cwd.as_deref());
+                    let mut operation = ProcessExec::new(call_id, command.clone());
                     if let Some(cwd) = cwd {
                         operation = operation.with_cwd(cwd);
                     }
@@ -8448,6 +8486,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         call_id.to_owned(),
                         PromptRender::Omit,
                     );
+                    let started = SystemTime::now();
                     match broker
                         .process_exec(&operation, &policy, cas, output, ProcessBounds::default())
                         .await
@@ -8456,6 +8495,25 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             Ok(result) => {
                                 match self.output.record_process_signal(run_id, &result).await {
                                     Ok(signal) => {
+                                        if result.status
+                                            == haider_protocol::item::ToolStatus::Completed
+                                        {
+                                            let preview = process_output_preview(&result);
+                                            if let Err(error) = self
+                                                .emit_created_images(CreatedImageScan {
+                                                    run_id,
+                                                    call_id,
+                                                    tool: "process_exec",
+                                                    command: &command,
+                                                    output_preview: &preview,
+                                                    cwd: &effective_cwd,
+                                                    started,
+                                                })
+                                                .await
+                                            {
+                                                return Err(tool_error(error));
+                                            }
+                                        }
                                         Ok(process_result_with_signal(result, Some(&signal)))
                                     }
                                     Err(error) => Err(ToolError::Runtime {
@@ -8733,14 +8791,33 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let path = required_string(&args, "path")?;
                 let content = required_string_allow_empty(&args, "content")?;
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
-                broker
+                let started = SystemTime::now();
+                let result = broker
                     .fs_write(
-                        &FsWrite::new(path, content),
+                        &FsWrite::new(path.clone(), content),
                         &policy,
                         &attribution,
                         &self.ledger,
                     )
-                    .await
+                    .await;
+                if result
+                    .as_ref()
+                    .is_ok_and(|result| result.status == ToolResultStatus::Completed)
+                    && let Err(error) = self
+                        .emit_created_images(CreatedImageScan {
+                            run_id,
+                            call_id,
+                            tool: "fs_write",
+                            command: &path,
+                            output_preview: "",
+                            cwd: Path::new(&self.metadata.cwd),
+                            started,
+                        })
+                        .await
+                {
+                    return Err(tool_error(error));
+                }
+                result
             }
             RegisteredToolRoute::FsEdit => {
                 let path = required_string(&args, "path")?;
@@ -10054,6 +10131,34 @@ pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
     process_result_with_signal(result, None)
 }
 
+fn command_cwd(workspace: &str, requested: Option<&str>) -> PathBuf {
+    let workspace = Path::new(workspace);
+    requested.map_or_else(
+        || workspace.to_path_buf(),
+        |requested| {
+            let requested = Path::new(requested);
+            if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                workspace.join(requested)
+            }
+        },
+    )
+}
+
+fn process_output_preview(result: &ProcessResult) -> String {
+    let mut bytes = Vec::with_capacity(result.output_bytes);
+    for chunk in &result.inline_output {
+        if chunk.stream != haider_protocol::item::OutputStream::Stdout {
+            continue;
+        }
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&chunk.chunk_b64) {
+            bytes.extend_from_slice(&decoded);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn process_result_with_signal(
     result: ProcessResult,
     signal: Option<&ProcessSignalRecorded>,
@@ -10203,6 +10308,52 @@ impl HubCommandOutputContext {
             device_id: self.device_id.clone(),
             event_ids: Arc::clone(&self.event_ids),
         }
+    }
+
+    async fn append_image_created(&self, run_id: &RunId, image: ImageCreatedV1) -> ToolResult<()> {
+        let mut identity = blake3::Hasher::new();
+        identity.update(image.call_id.as_bytes());
+        identity.update(image.path.as_bytes());
+        let item_id = ItemId::new(format!("image-created-{}", identity.finalize().to_hex()));
+        let data = serde_json::to_value(image).map_err(|error| ToolError::Runtime {
+            message: format!("cannot serialize image-created payload: {error}"),
+        })?;
+        let mut envelopes = [EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: self.event_ids.next(),
+            seq: 0,
+            session_id: self.store.session_id().clone(),
+            branch_id: self.branch_id.clone(),
+            run_id: Some(run_id.clone()),
+            agent_id: self.agent_id.clone(),
+            device_id: self.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: self.store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item: TurnItem::Extension {
+                    kind: IMAGE_CREATED_EXTENSION_KIND.into(),
+                    data,
+                },
+            }))
+            .map_err(|error| ToolError::Runtime {
+                message: format!("cannot serialize image-created envelope: {error}"),
+            })?,
+        }];
+        StoreHandle::append(&self.store, &mut envelopes)
+            .await
+            .map_err(|error| ToolError::Runtime {
+                message: error.message,
+            })?;
+        Ok(())
     }
 
     async fn append_permission_payload(

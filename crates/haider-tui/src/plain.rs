@@ -513,7 +513,10 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         },
         TurnItem::Refusal { reason } => out.push_str(&format!("✗ model refused — {reason}\n")),
         TurnItem::Extension { kind, data } => {
-            if let Some(transition) =
+            if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
+                out.push_str(&label);
+                out.push('\n');
+            } else if let Some(transition) =
                 haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(&block.item)
             {
                 out.push_str(&transition.display_label());

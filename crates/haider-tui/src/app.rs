@@ -2324,6 +2324,8 @@ pub enum AppRequest {
     /// flashes it instead). Carried for the OAuth authorize hop — the URL
     /// always originates from the daemon's sanctioned registration.
     OpenUrl { url: String },
+    /// Reveal an image-created transcript payload in the OS file explorer.
+    RevealPath { path: String },
     /// T2: read the vaulted Deepgram key (`transcription.secret_get`,
     /// UDS-only). A READ — never outboxed; the answer routes by
     /// [`crate::talk::TalkState::secret_intent`].
@@ -2420,6 +2422,9 @@ pub enum Hit {
     /// the `/graph` screen (status + telemetry: rollups, tool-selection,
     /// evidence provenance), the owner's "click the workflow → stats" gesture.
     GraphStrip,
+    /// A durable image-created transcript row. The absolute payload path is
+    /// carried by value so a stale frame can never reveal a different file.
+    RevealPath(String),
     /// Owner 2026-08-16: the manual-retry ambient row — click retries the
     /// failed turn.
     RetryRun,
@@ -11549,6 +11554,9 @@ impl AppModel {
                 self.requests.push(AppRequest::GraphRefresh);
                 self.requests.push(AppRequest::GraphInspectRefresh);
                 self.screen = Screen::Graph;
+            }
+            Hit::RevealPath(path) if matches!(self.screen, Screen::Session | Screen::Subagent) => {
+                self.requests.push(AppRequest::RevealPath { path });
             }
             // Every hit below re-checks its OWNING SURFACE: the map may be
             // one frame stale, so a rect from a screen we have since left
