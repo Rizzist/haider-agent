@@ -54,6 +54,25 @@ It runs your model however you pay for it: twelve builtin providers — Anthropi
 
 > 🏛️ Sessions, subagents, typed workflows, permissions, voice, computer use, and usage metering are all wired into one evented core — not added on as plugins.
 
+## ⚡ At a glance
+
+**Codex, Claude Code, and opencode are agents in a terminal. Haider is the harness underneath** — the daemon owns sessions, accounts, and state; every surface is a view of it. Nothing is inferred, everything is declared.
+
+| | |
+|---|---|
+| 🌳 **Sessions** | History is a tree — branch, fork, replay; attach from anywhere; kill anything, resume everything |
+| 📡 **The Pipe** | Every session is a live, seekable event stream — the ADE folds it, `grep` reads it |
+| 🔥 **Cachemaxxing** | Byte-stable prefixes + cache-riding compaction, with the live hit-rate on screen |
+| 🧵 **Loom** | Agents with type signatures — capabilities declared, least-privilege by construction |
+| 🕸️ **Convergence Graph** | Long work runs on a typed DAG with evidence-graded gates, not hope |
+| 🤖 **Fleet** | Subagents are scheduled, leased citizens of the daemon — not orphaned child processes |
+| 🔑 **Every model, your accounts** | Twelve provider lanes — subscription OAuth + API keys, harness-owned; switch without losing the session |
+| 🪝 **Transparent Hooks** | Any editor, ADE, or script builds on the typed surface — no PTY scraping, ever |
+| 🛰️ **LionWire** | One typed protocol under every encoding — TUI, JSON, RPC, msgpack wire; built for slow links |
+| 🎙️ **Talk** | Push-to-transcribe on every surface |
+| 🏠 **Local-first** | The daemon runs on your machine; code, transcripts, and credentials need nobody's cloud |
+| 🔜 **Aura · Peers** | Voice orchestration; place agents on any enrolled device — leased, recovered, migrated |
+
 ## 🧭 Philosophy
 
 - **Typed events over vibes.** Interior state is never a string soup. Protocol contracts are golden-fixture tested, schema changes are versioned migrations, and old daemons and new clients degrade honestly instead of guessing.
