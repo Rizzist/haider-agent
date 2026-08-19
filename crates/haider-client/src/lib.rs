@@ -42,10 +42,10 @@ pub use headless::{
     HeadlessAttachment, HeadlessBackgroundTask, HeadlessBlockingReason, HeadlessEvent,
     HeadlessFailureCode, HeadlessFileAttachment, HeadlessImageAttachment, HeadlessOutcome,
     HeadlessPdfAttachment, HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure,
-    HeadlessRunRequest, HeadlessRunResult, load_attachment, load_image_attachment,
-    load_pdf_attachment, load_text_attachment, required_headless_features,
+    HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, load_attachment,
+    load_image_attachment, load_pdf_attachment, load_text_attachment, required_headless_features,
     required_headless_features_with_attachments, required_headless_features_with_hook_trust,
-    run_headless,
+    run_headless, run_headless_with_session_config,
 };
 pub use observe::{
     ObserveClient, ObserveError, observe_stream_all, observe_stream_session,

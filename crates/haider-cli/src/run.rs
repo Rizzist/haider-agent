@@ -8,8 +8,8 @@ use std::time::Duration;
 use haider_client::{
     ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
     EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome, HeadlessRunError,
-    HeadlessRunRequest, HeadlessRunResult, ProfileEnv, load_attachment, resolve_profile,
-    run_headless,
+    HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, ProfileEnv, load_attachment,
+    resolve_profile, run_headless_with_session_config,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::session::SessionPermissionOverridesV1;
@@ -63,7 +63,17 @@ pub(crate) struct RunOptions {
     pub attachments: Vec<PathBuf>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
+    parse_run_options_with_config(rest).map(|parsed| parsed.options)
+}
+
+struct ParsedRunOptions {
+    options: RunOptions,
+    session_config: HeadlessSessionConfig,
+}
+
+fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, String> {
     let mut output = None;
     let mut legacy_jsonl = false;
     let mut timeout = None;
@@ -73,6 +83,9 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
     let mut trust_hooks = false;
     let mut provider = None;
     let mut model = None;
+    let mut effort = None;
+    let mut fast = None;
+    let mut account = None;
     let mut attachments = Vec::new();
     let mut prompt = None;
     let mut index = 0;
@@ -127,13 +140,42 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
                 index += 1;
                 let value = rest
                     .get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
                     .ok_or_else(|| "--model requires a model id".to_owned())?;
-                if value.is_empty() {
-                    return Err("--model requires a non-empty model id".into());
-                }
                 model = Some(value.clone());
             }
             "--model" => return Err("duplicate --model flag".into()),
+            "--effort" if effort.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or_else(|| "--effort requires a level".to_owned())?;
+                effort = Some(value.clone());
+            }
+            "--effort" => return Err("duplicate --effort flag".into()),
+            "--speed" if fast.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or_else(|| "--speed requires fast|normal".to_owned())?;
+                fast = Some(match value.as_str() {
+                    "fast" => true,
+                    "normal" => false,
+                    _ => return Err("--speed requires fast|normal".into()),
+                });
+            }
+            "--speed" => return Err("duplicate --speed flag".into()),
+            "--account" if account.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or_else(|| "--account requires an alias".to_owned())?;
+                account = Some(value.clone());
+            }
+            "--account" => return Err("duplicate --account flag".into()),
             "--attach" => {
                 index += 1;
                 let value = rest
@@ -158,17 +200,26 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
         (false, None) => RunOutput::Print,
     };
     let prompt = prompt.ok_or_else(|| "a prompt argument is required".to_owned())?;
-    Ok(RunOptions {
-        prompt,
-        output,
-        timeout,
-        allow_writes,
-        allow_exec,
-        auto_allow,
-        trust_hooks,
-        provider,
-        model,
-        attachments,
+    let session_config = HeadlessSessionConfig {
+        model: model.clone(),
+        effort,
+        fast,
+        account,
+    };
+    Ok(ParsedRunOptions {
+        options: RunOptions {
+            prompt,
+            output,
+            timeout,
+            allow_writes,
+            allow_exec,
+            auto_allow,
+            trust_hooks,
+            provider,
+            model,
+            attachments,
+        },
+        session_config,
     })
 }
 
@@ -201,13 +252,15 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
 }
 
 pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
-    let options = match parse_run_options(rest) {
-        Ok(options) => options,
+    let parsed = match parse_run_options_with_config(rest) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("haider run: {message}");
             return ExitCode::from(EX_USAGE);
         }
     };
+    let options = parsed.options;
+    let session_config = parsed.session_config;
     let profile = match resolve_profile(&ProfileEnv::capture()) {
         Ok(profile) => profile,
         Err(error) => {
@@ -280,7 +333,14 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let (events, receiver) = mpsc::channel(OUTPUT_BUFFER);
     let output_mode = options.output;
     let adapter = tokio::task::spawn_blocking(move || adapt_events(output_mode, receiver));
-    let result = run_headless(&profile, EnsureOptions::default(), request, events).await;
+    let result = run_headless_with_session_config(
+        &profile,
+        EnsureOptions::default(),
+        request,
+        session_config,
+        events,
+    )
+    .await;
     let adapter_result = match adapter.await {
         Ok(result) => result,
         Err(error) => Err(io::Error::other(format!("output adapter failed: {error}"))),
@@ -386,6 +446,13 @@ fn write_error_json(
         HeadlessRunError::Bootstrap {
             code, retryable, ..
         } => ("errored", (*code).to_owned(), *retryable),
+        HeadlessRunError::Ensure(EnsureError::MissingFeatures { .. }) => {
+            ("errored", "missing_feature".to_owned(), false)
+        }
+        HeadlessRunError::Ensure(
+            EnsureError::ProtocolMismatch(_) | EnsureError::ProfileMismatch { .. },
+        )
+        | HeadlessRunError::Protocol { .. } => ("errored", "protocol_mismatch".to_owned(), false),
         _ => ("errored", "internal".to_owned(), false),
     };
     let message = serde_json::to_string(&error.to_string()).map_err(io::Error::other)?;
@@ -624,6 +691,10 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
             code: ERROR_CODE_NO_ACTIVE_ACCOUNT | ERROR_CODE_NO_DEFAULT_MODEL,
             ..
         } => EX_PROVIDER,
+        HeadlessRunError::Bootstrap {
+            code: "missing_feature",
+            ..
+        } => EX_PROTOCOL,
         HeadlessRunError::Bootstrap { .. } => EX_SOFTWARE,
         HeadlessRunError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,
         HeadlessRunError::Rpc { code, .. }
