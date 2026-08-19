@@ -7,7 +7,7 @@ use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep};
 use haider_tui::app::AppModel;
 use haider_tui::demo_store::DemoStore;
-use haider_tui::runtime::{detect_system_theme, run_demo, run_demo_plain, run_live};
+use haider_tui::runtime::{LiveExit, detect_system_theme, run_demo, run_demo_plain, run_live};
 use haider_tui::sanctum::SanctumTier;
 use haider_tui::settings::SettingsStore;
 use haider_tui::theme::ThemeChoice;
@@ -83,6 +83,14 @@ fn main() -> ExitCode {
 
 async fn dispatch() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_bare_tui_options(&args) {
+        Ok(Some(options)) => return front_door_with_options(FrontDoor::Tui, options).await,
+        Ok(None) => {}
+        Err(message) => {
+            eprintln!("haider: {message}");
+            return ExitCode::from(2);
+        }
+    }
     match args.as_slice() {
         [version] if matches!(version.as_str(), "--version" | "-V" | "version") => {
             println!("haider {VERSION}");
@@ -93,14 +101,6 @@ async fn dispatch() -> ExitCode {
         // leaving the daemon running. The scriptable half of the front
         // door (bare `haider` on a TTY enters the live TUI instead).
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
-        // ADE seam: open the live TUI attached to one session.
-        [flag, session] if flag == "--session" && !session.is_empty() => {
-            front_door_with_session(FrontDoor::Tui, Some(session.clone())).await
-        }
-        [flag] if flag == "--session" => {
-            eprintln!("haider: --session requires a session id");
-            ExitCode::from(2)
-        }
         [command, rest @ ..] if command == "run" => run::run_command(rest).await,
         [command, rest @ ..] if command == "status" => observe::status_command(rest).await,
         [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
@@ -128,16 +128,50 @@ async fn dispatch() -> ExitCode {
                  export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \
-                 tui [--theme system|light|dark|desert|oasis] [--session <id>], tui --demo [--plain], \
-                 import [codex|claude-code], --session <id>, --ready)"
+                 tui [--theme system|light|dark|desert|oasis] [--session <id>] [--no-update-check], tui --demo [--plain], \
+                 import [codex|claude-code], [--session <id>] [--no-update-check], --ready)"
             );
             ExitCode::from(2)
         }
-        // The keystone front door (report R8 + R11): bare `haider` connects
-        // to — or spawns — the profile daemon and enters the LIVE TUI on
-        // that connection.
-        [] => front_door(FrontDoor::Tui).await,
+        // Bare-TUI arguments were handled before command dispatch.
+        [] => unreachable!("bare TUI dispatch is handled above"),
     }
+}
+
+/// Additive options accepted by the bare `haider` live-TUI front door.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct BareTuiOptions {
+    pub session: Option<String>,
+    pub no_update_check: bool,
+}
+
+/// Parse only the bare-TUI argument vocabulary. `Ok(None)` leaves ordinary
+/// subcommands to the main dispatcher.
+pub(crate) fn parse_bare_tui_options(args: &[String]) -> Result<Option<BareTuiOptions>, String> {
+    if args.is_empty() {
+        return Ok(Some(BareTuiOptions::default()));
+    }
+    if !matches!(args[0].as_str(), "--session" | "--no-update-check") {
+        return Ok(None);
+    }
+    let mut options = BareTuiOptions::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--no-update-check" if !options.no_update_check => options.no_update_check = true,
+            "--no-update-check" => return Err("--no-update-check was supplied twice".into()),
+            "--session" if options.session.is_none() => {
+                let id = iter
+                    .next()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| "--session requires a session id".to_owned())?;
+                options.session = Some(id.clone());
+            }
+            "--session" => return Err("--session was supplied twice".into()),
+            other => return Err(format!("unknown bare-TUI flag `{other}`")),
+        }
+    }
+    Ok(Some(options))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,13 +321,16 @@ enum FrontDoor {
 /// verify features, and enter the live TUI. The daemon outlives us either
 /// way — closing this connection never implies daemon shutdown (R8).
 async fn front_door(mode: FrontDoor) -> ExitCode {
-    front_door_with_session(mode, None).await
+    front_door_with_options(mode, BareTuiOptions::default()).await
 }
 
-/// ADE seam: `haider --session <id>` (and `haider tui --session <id>`) —
-/// the live TUI opens attached to the given session once the daemon's list
-/// proves it exists.
-async fn front_door_with_session(mode: FrontDoor, initial_session: Option<String>) -> ExitCode {
+/// ADE seam: optional `--session <id>` opens attached once the daemon's list
+/// proves it exists; the update policy bit controls only automatic checks.
+async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> ExitCode {
+    let BareTuiOptions {
+        session: initial_session,
+        no_update_check,
+    } = options;
     let env = haider_client::ProfileEnv::capture();
     let profile = match haider_client::resolve_profile(&env) {
         Ok(profile) => profile,
@@ -331,8 +368,36 @@ async fn front_door_with_session(mode: FrontDoor, initial_session: Option<String
             }
             let mut model = live_model(&profile);
             model.initial_session = initial_session.map(haider_protocol::ids::SessionId::new);
-            match run_live(model, ensured.client, profile, live_client_config()).await {
-                Ok(()) => ExitCode::SUCCESS,
+            let updates =
+                update::tui::live_update_bridge(profile.store_dir.clone(), no_update_check);
+            match run_live(
+                model,
+                ensured.client,
+                profile,
+                live_client_config(),
+                updates,
+            )
+            .await
+            {
+                Ok(LiveExit::Quit) => ExitCode::SUCCESS,
+                Ok(LiveExit::UpdateInstalled) => {
+                    let executable = match std::env::current_exe() {
+                        Ok(executable) => executable,
+                        Err(error) => {
+                            eprintln!("haider: cannot resolve updated executable: {error}");
+                            return ExitCode::from(EX_IOERR);
+                        }
+                    };
+                    let argv: Vec<_> = std::env::args_os().collect();
+                    let plan = update::tui_restart::restart_plan(executable, &argv);
+                    match update::tui_restart::execute_restart(plan) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("haider: cannot restart updated TUI: {error}");
+                            ExitCode::from(EX_IOERR)
+                        }
+                    }
+                }
                 Err(error) => {
                     eprintln!("haider: terminal error: {error}");
                     ExitCode::from(EX_IOERR)
@@ -373,11 +438,17 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     let mut plain = false;
     let mut theme: Option<ThemeChoice> = None;
     let mut session: Option<String> = None;
+    let mut no_update_check = false;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--demo" => demo = true,
             "--plain" => plain = true,
+            "--no-update-check" if !no_update_check => no_update_check = true,
+            "--no-update-check" => {
+                eprintln!("haider tui: --no-update-check was supplied twice");
+                return ExitCode::from(2);
+            }
             "--session" => match iter.next().filter(|id| !id.is_empty()) {
                 Some(id) => session = Some(id.clone()),
                 None => {
@@ -407,7 +478,18 @@ async fn tui_command(rest: &[String]) -> ExitCode {
             eprintln!("haider tui: --plain is a demo-only oracle; use `--demo --plain`");
             return ExitCode::from(2);
         }
-        return front_door_with_session(FrontDoor::Tui, session).await;
+        return front_door_with_options(
+            FrontDoor::Tui,
+            BareTuiOptions {
+                session,
+                no_update_check,
+            },
+        )
+        .await;
+    }
+    if no_update_check {
+        eprintln!("haider tui: --no-update-check is live-only; drop --demo");
+        return ExitCode::from(2);
     }
     if session.is_some() {
         // Demo sessions are fabricated locally — a daemon session id has

@@ -136,7 +136,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Mid-turn input mode — steer, subturn (next tool), or queue (turn end)",
         "<steer|subturn|turn>",
     ),
-    session_cmd("update", "Check for updates — install as a menu card", ""),
+    session_cmd("update", "Check for and install a production update", ""),
     session_cmd("rename", "Rename this session", "<name>"),
     cmd("reset", "Reset the demo — restore the seed sessions", ""),
 ];
@@ -458,10 +458,10 @@ pub const HELP_TEXT: &[&str] = &[
     "  /talk [setup·wave] dictate into the composer (live) — ◉ chip or /talk toggles; ⏎ sends · esc cancels · typing keeps the words",
     "  /tools             core + custom tools · register with a dispatch mode (menu card) — demo only",
     "  /queue <steer|subturn|turn> mid-turn input — safe boundary, next tool call, or turn end",
-    "  /update            check for updates — FULL-SCREEN startup gate (harness-level)",
+    "  /update            check for and install production updates",
     "  /rename <name>     rename this session",
     "  /reset             reset the demo to the seed sessions",
-    "menus — every card (permission · hook trust · update · recovery · voice · tools) is a typed menu:",
+    "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
     "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
     "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
 ];

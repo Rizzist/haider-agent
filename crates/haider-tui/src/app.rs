@@ -2035,6 +2035,15 @@ impl RuntimeMode {
 /// never performs IO).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppRequest {
+    /// `/update` without a pending release: ask the process shell to run an
+    /// immediate release check. Unlike the quiet startup check, this user-
+    /// initiated check bypasses the persisted rate limit and reports its
+    /// outcome through an [`AppEvent`].
+    CheckForUpdate,
+    /// `/update` with a pending release: ask the process shell to run the
+    /// existing atomic update transaction. The reducer performs no release,
+    /// filesystem, daemon, terminal, or process IO.
+    RunUpdate,
     /// W8b: live `!` shell escape — one exact command for the SESSION
     /// daemon's workspace (receipt-backed `shell.exec`; zero provider
     /// requests). Never demo vocabulary.
@@ -2686,6 +2695,19 @@ impl std::fmt::Debug for ArtifactBytes {
 pub const MAX_TURN_ATTACHMENTS: usize = 5;
 pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 
+/// Render a release version with exactly one conventional `v` prefix.
+/// Discovery may hand the UI either a semver (`0.0.933`) or a GitHub tag
+/// (`v0.0.933`); visible copy must not depend on that transport detail.
+#[must_use]
+pub fn update_version_label(version: &str) -> String {
+    let version = version.trim();
+    if version.starts_with('v') {
+        version.to_owned()
+    } else {
+        format!("v{version}")
+    }
+}
+
 /// Pasted text at the TUI ingress (TUI6.3 fix 2, review r3 finding 2).
 ///
 /// A paste is how API keys usually arrive, and the W3c2 `SecretWire`
@@ -2742,6 +2764,23 @@ pub enum AppEvent {
     Paste(Pasted),
     /// Boxed: `EventPayload` is much larger than the other variants.
     Envelope(Box<EventPayload>),
+    /// Release discovery found a version newer than the running binary.
+    /// Shell-owned discovery feeds this fact back as data; the reducer only
+    /// stores it and announces it once.
+    UpdateAvailable {
+        version: String,
+    },
+    /// A user-initiated release check found no newer version. Startup checks
+    /// deliberately do not inject this event, so their equal/older outcome
+    /// remains silent.
+    UpdateCurrent {
+        version: String,
+    },
+    /// A user-visible update check or transaction failed. Quiet startup
+    /// network failures are filtered by the shell and never reach this arm.
+    UpdateFailed {
+        message: String,
+    },
     /// The demo script (or stream) ended.
     StreamEnded,
 }
@@ -3229,6 +3268,11 @@ pub struct AppModel {
     /// One-line transient notice shown in the status bar until the next
     /// keystroke (honest stubs: "/tree lands with the daemon").
     pub flash: Option<String>,
+    /// A production release newer than this process, discovered by the
+    /// shell. Profile-wide and screen-independent: the quiet status-bar
+    /// indicator persists until a later check proves the process current or
+    /// the process restarts into the installed binary.
+    pub update_available: Option<String>,
     /// Persistent profile-level diagnostic, cleared only by an explicit
     /// healthy edge from the daemon after a real write probe succeeds.
     pub profile_diagnostic: Option<haider_protocol::error::ErrorPresentation>,
@@ -3488,6 +3532,7 @@ impl Default for AppModel {
             palette_dismissed: false,
             help_open: false,
             flash: None,
+            update_available: None,
             profile_diagnostic: None,
             compatibility_diagnostic: None,
             voice_diagnostic: None,
@@ -4548,6 +4593,21 @@ impl AppModel {
                     self.record_prompt(text.clone());
                 }
                 self.handle_envelope(&payload);
+            }
+            AppEvent::UpdateAvailable { version } => {
+                self.dirty = true;
+                let display = update_version_label(&version);
+                self.update_available = Some(version);
+                self.flash = Some(format!("· update available — {display} · /update"));
+            }
+            AppEvent::UpdateCurrent { version } => {
+                self.dirty = true;
+                self.update_available = None;
+                self.flash = Some(format!("· up to date — {}", update_version_label(&version)));
+            }
+            AppEvent::UpdateFailed { message } => {
+                self.dirty = true;
+                self.flash = Some(format!("· update failed — {message}"));
             }
             AppEvent::StreamEnded => {}
         }
@@ -9596,6 +9656,23 @@ impl AppModel {
                 self.restore_draft();
                 self.flash = Some("· demo reset".to_owned());
             }
+            "update" if self.mode.fabricates_locally() => {
+                // Demo remains a UI-only world. It must never run release,
+                // filesystem, daemon, or process effects.
+                self.flash = Some(
+                    "· /update — UI ready; lands with the gates wave (live mode installs)"
+                        .to_owned(),
+                );
+            }
+            "update" => {
+                if let Some(version) = self.update_available.as_deref() {
+                    self.requests.push(AppRequest::RunUpdate);
+                    self.flash = Some(format!("· updating to {}", update_version_label(version)));
+                } else {
+                    self.requests.push(AppRequest::CheckForUpdate);
+                    self.flash = Some("· checking for updates…".to_owned());
+                }
+            }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
             "aura" => self.enter_aura(),
             "tokens" => self.toggle_token_panel(),
@@ -9867,7 +9944,6 @@ impl AppModel {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
                     "fork" => Some("the daemon wave (W3)"),
-                    "update" => Some("the gates wave (W4)"),
                     _ => None,
                 };
                 self.flash = Some(match wave {

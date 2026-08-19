@@ -4161,6 +4161,8 @@ impl LiveDriver {
             // routing bug, not a discard.
             AppRequest::CopySelection
             | AppRequest::CopyText(_)
+            | AppRequest::CheckForUpdate
+            | AppRequest::RunUpdate
             | AppRequest::AttachRead { .. }
             | AppRequest::TalkShell(_)
             | AppRequest::Quit => Vec::new(),

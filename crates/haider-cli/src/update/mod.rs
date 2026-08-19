@@ -1,9 +1,12 @@
 //! `haider update`: discovery, verified staging, pair commit, and restart.
 
+pub(crate) mod check_policy;
 pub(crate) mod discovery;
 pub(crate) mod restart;
 pub(crate) mod staging;
 pub(crate) mod transaction;
+pub(crate) mod tui;
+pub(crate) mod tui_restart;
 
 use discovery::{CurlTransport, DiscoveryOutcome, ReleaseSource, compiled_target, discover};
 use restart::{detect_incumbent, restart_committed};
@@ -29,6 +32,28 @@ pub(crate) struct UpdateOptions {
 pub(crate) enum UpdateAvailability {
     Current { version: String },
     Available { current: String, latest: String },
+}
+
+/// Structured result shared by the CLI command and the live-TUI host. Only
+/// `Updated` means the pair commit and daemon restart completed, and therefore
+/// only that variant authorizes replacing the running TUI process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateRunOutcome {
+    Current { version: String },
+    Available { current: String, latest: String },
+    Updated { version: String },
+}
+
+impl UpdateRunOutcome {
+    fn cli_message(&self) -> String {
+        match self {
+            Self::Current { version } => format!("haider {version} is current"),
+            Self::Available { current, latest } => {
+                format!("haider {current}; update available: {latest}")
+            }
+            Self::Updated { version } => format!("updated haider to {version}"),
+        }
+    }
 }
 
 pub(crate) fn parse_update_options(rest: &[String]) -> Result<UpdateOptions, UpdateError> {
@@ -94,9 +119,9 @@ pub(crate) async fn update_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(error.exit_code());
         }
     };
-    match run_update(options).await {
-        Ok(message) => {
-            println!("{message}");
+    match run_update_with_reporter(options, |message| eprintln!("haider update: {message}")).await {
+        Ok(outcome) => {
+            println!("{}", outcome.cli_message());
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -106,7 +131,16 @@ pub(crate) async fn update_command(rest: &[String]) -> ExitCode {
     }
 }
 
-async fn run_update(options: UpdateOptions) -> Result<String, UpdateError> {
+/// Runs the existing verified update transaction without writing to stdout or
+/// stderr. Embedded callers surface progress and errors through their own UI.
+pub(crate) async fn run_update(options: UpdateOptions) -> Result<UpdateRunOutcome, UpdateError> {
+    run_update_with_reporter(options, |_| {}).await
+}
+
+async fn run_update_with_reporter(
+    options: UpdateOptions,
+    mut report: impl FnMut(&str),
+) -> Result<UpdateRunOutcome, UpdateError> {
     // Discovery and the gate precede profile resolution and every local
     // mutation. `resolve_profile` creates directories, so moving it above
     // this point would violate both --check and equal-version no-op laws.
@@ -116,14 +150,15 @@ async fn run_update(options: UpdateOptions) -> Result<String, UpdateError> {
     let outcome = discover_update_with(&mut transport, &source, super::VERSION, target)?;
     let selection = match outcome {
         DiscoveryOutcome::Current(version) => {
-            return Ok(format!("haider {version} is current"));
+            return Ok(UpdateRunOutcome::Current {
+                version: version.to_string(),
+            });
         }
         DiscoveryOutcome::Update(selection) if options.check => {
-            return Ok(format!(
-                "haider {}; update available: {}",
-                super::VERSION,
-                selection.version
-            ));
+            return Ok(UpdateRunOutcome::Available {
+                current: super::VERSION.to_owned(),
+                latest: selection.version.to_string(),
+            });
         }
         DiscoveryOutcome::Update(selection) => selection,
     };
@@ -138,9 +173,9 @@ async fn run_update(options: UpdateOptions) -> Result<String, UpdateError> {
     let profile = haider_client::resolve_profile(&haider_client::ProfileEnv::capture())
         .map_err(|error| UpdateError::Io(format!("cannot resolve current profile: {error}")))?;
     let incumbent = detect_incumbent(&profile).await?;
-    eprintln!(
-        "haider update: active turns on this profile may be cancelled by drain; \
-         daemons for other profiles are outside this update and are not restarted"
+    report(
+        "active turns on this profile may be cancelled by drain; daemons for other profiles are \
+         outside this update and are not restarted",
     );
 
     let mut committed = commit_pair(
@@ -151,7 +186,9 @@ async fn run_update(options: UpdateOptions) -> Result<String, UpdateError> {
         super::VERSION,
     )?;
     restart_committed(&mut committed, incumbent, &profile).await?;
-    Ok(format!("updated haider to {}", selection.version))
+    Ok(UpdateRunOutcome::Updated {
+        version: selection.version.to_string(),
+    })
 }
 
 /// Performs only W9's list-and-SemVer gate. This function never calls the

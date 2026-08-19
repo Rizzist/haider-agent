@@ -4,7 +4,7 @@
 //! Visual authority: the `/tui` sim — typography, chips, and row shapes are
 //! copied from it deliberately.
 
-use crate::app::{AppModel, Hit, LauncherRow, Screen};
+use crate::app::{AppModel, Hit, LauncherRow, Screen, update_version_label};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_TEXT, PALETTE_MAX_ROWS};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
@@ -9037,9 +9037,22 @@ fn render_status_bar(
         ));
     }
 
-    let hint_shown = model.flash.is_none() && model.screen == Screen::Launcher && !model.help_open;
+    // OTA: a discovered release is durable model data, not a modal. It
+    // quietly occupies the status-bar hint slot on every surface, yielding
+    // only while a transient flash is speaking. The launcher help hint
+    // returns automatically after a later current-version fact clears it.
+    let update_hint = model
+        .update_available
+        .as_deref()
+        .map(|version| format!("⬆ {} — /update ", update_version_label(version)));
+    let hint_shown = model.flash.is_none()
+        && update_hint.is_none()
+        && model.screen == Screen::Launcher
+        && !model.help_open;
     let right = if let Some(flash) = &model.flash {
         flash.clone()
+    } else if let Some(update_hint) = update_hint {
+        update_hint
     } else if hint_shown {
         format!(
             "/help · theme {} ",
