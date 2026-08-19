@@ -557,11 +557,15 @@ pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
         resume_cause: CompactionResume,
     ) -> Result<CompactionIntent, HaiderError>;
 
+    /// `attachments` (round 5): the replay's resolved attachments — the
+    /// SAME resolution the live lane applied, so an image-bearing history
+    /// replays byte-identically instead of always falling back uncached.
     async fn compact(
         &self,
         run_id: &RunId,
         intent: &CompactionIntent,
         covered_messages: Vec<Message>,
+        attachments: Vec<haider_provider::ResolvedAttachment>,
     ) -> Result<Message, HaiderError>;
 }
 
@@ -3294,9 +3298,16 @@ impl HarnessActor {
             .map_err(DriveError::Store)?;
 
         let suffix = messages.split_off(current_turn_start);
-        let covered = std::mem::take(messages);
+        let mut covered = std::mem::take(messages);
+        // Round 5: resolve tool-result images exactly as the live lane does
+        // — the compactor's replay must be the bytes the provider actually
+        // saw, attachments included.
+        let attachments = self
+            .resolve_tool_result_images(&mut covered)
+            .await
+            .map_err(DriveError::Store)?;
         let summary = compactor
-            .compact(run_id, &intent, covered)
+            .compact(run_id, &intent, covered, attachments)
             .await
             .map_err(DriveError::Store)?;
         messages.push(summary);

@@ -13012,18 +13012,31 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
             || matches!(
                 character,
                 '\u{00AD}'
+                    | '\u{034F}'
                     | '\u{061C}'
+                    | '\u{180B}'..='\u{180F}'
                     | '\u{200B}'..='\u{200F}'
                     | '\u{202A}'..='\u{202E}'
                     | '\u{2028}'
                     | '\u{2029}'
                     | '\u{2060}'..='\u{206F}'
+                    | '\u{FE00}'..='\u{FE0F}'
                     | '\u{FEFF}'
+                    | '\u{E0100}'..='\u{E01EF}'
             )
     };
-    if record.glyph.len() > 16 || record.glyph.chars().any(invisible) {
+    // A glyph must LEAD with a visible base character — a combining-only
+    // glyph renders as a mutation of whatever cell precedes it.
+    let leads_combining = record.glyph.chars().next().is_some_and(|character| {
+        matches!(
+            character,
+            '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{20D0}'..='\u{20FF}'
+        )
+    });
+    if record.glyph.len() > 16 || leads_combining || record.glyph.chars().any(invisible) {
         return reject(
-            "agent type glyph must be ≤16 bytes with no control/invisible/reordering characters",
+            "agent type glyph must be ≤16 bytes, lead with a base character, and carry no \
+             control/invisible/reordering characters",
         );
     }
     for list in [&record.clis, &record.apis, &record.skills, &record.scripts] {
@@ -13054,6 +13067,24 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
         return reject(
             "agent type CLI entries must be bare program names or absolute paths \
              (alphanumeric plus . _ - + / only)",
+        );
+    }
+    // Round 5 — the charset admits shell BUILTINS and DISPATCHERS that
+    // execute a program named by their arguments (`.`, `eval`, `xargs`,
+    // shells themselves): declaring one grants everything. Deny the known
+    // dispatcher set and require at least one alphanumeric byte.
+    const CLI_DISPATCHERS: [&str; 24] = [
+        ".", "source", "eval", "exec", "command", "builtin", "env", "xargs", "sh", "bash", "zsh",
+        "dash", "ksh", "csh", "tcsh", "fish", "nohup", "time", "nice", "sudo", "doas", "su",
+        "setsid", "stdbuf",
+    ];
+    if record.clis.iter().any(|cli| {
+        let base = cli.rsplit('/').next().unwrap_or(cli);
+        CLI_DISPATCHERS.contains(&base) || !cli.bytes().any(|byte| byte.is_ascii_alphanumeric())
+    }) {
+        return reject(
+            "agent type CLI entries must name a concrete program, never a shell \
+             builtin/dispatcher (., source, eval, exec, env, xargs, a shell, ...)",
         );
     }
     // An API grant is a HOST the network fence compares literally — never a

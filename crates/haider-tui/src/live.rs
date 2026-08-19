@@ -581,6 +581,11 @@ pub enum LiveReply {
         /// Echoed from the LoomList command — round 4's stale-reply fence.
         epoch: u64,
     },
+    /// Round 5: a loom.list that FAILED without killing the socket — the
+    /// request latch must release or /loom loads forever this connection.
+    LoomListFailed {
+        epoch: u64,
+    },
     Listed {
         sessions: Vec<SessionSummary>,
         next_cursor: Option<String>,
@@ -1589,6 +1594,16 @@ impl LiveDriver {
                     }
                 }
                 model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::LoomListFailed { epoch } => {
+                if self.connected && epoch == self.connection_epoch {
+                    // Release the dedup latch so the next Listed pass can
+                    // re-request; truth (`loom_loaded`) stays false, so
+                    // /loom keeps reporting LOADING rather than lying.
+                    model.loom_requested = false;
+                    model.dirty = true;
+                }
                 Vec::new()
             }
             LiveReply::Listed {

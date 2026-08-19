@@ -476,6 +476,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
             &RunId::new("cu1-compactor-run"),
             &intent,
             covered_messages.clone(),
+            Vec::new(),
         )
         .await;
 
@@ -597,6 +598,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
             &RunId::new("cu1-compactor-fallback-run"),
             &intent,
             covered_messages.clone(),
+            Vec::new(),
         )
         .await
         .expect_err("fixture has no durable accepted run for the final commit");

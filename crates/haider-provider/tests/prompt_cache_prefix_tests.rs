@@ -18,6 +18,27 @@ enum PrefixError {
     },
 }
 
+/// Round 5: `cache_control` markers are request METADATA the provider never
+/// hashes — a stable-boundary advance legitimately moves them between
+/// turns. Strip them before comparing so the detector pins the TOKEN
+/// prefix, not marker placement (breakpoint budgets are asserted
+/// separately on the unstripped payloads).
+fn without_cache_markers(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(without_cache_markers).collect())
+        }
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "cache_control")
+                .map(|(key, inner)| (key.clone(), without_cache_markers(inner)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn assert_serialized_strict_prefix(
     prefix: &[serde_json::Value],
     extended: &[serde_json::Value],
@@ -29,8 +50,10 @@ fn assert_serialized_strict_prefix(
         });
     }
     for (index, (left, right)) in prefix.iter().zip(extended).enumerate() {
-        if serde_json::to_vec(left).expect("serialize prefix element")
-            != serde_json::to_vec(right).expect("serialize extended element")
+        let left = without_cache_markers(left);
+        let right = without_cache_markers(right);
+        if serde_json::to_vec(&left).expect("serialize prefix element")
+            != serde_json::to_vec(&right).expect("serialize extended element")
         {
             return Err(PrefixError::Diverged { index });
         }

@@ -5181,21 +5181,23 @@ fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus)
 /// scrolls VERTICALLY with exact line math (no Paragraph wrap), so long
 /// job/pipe lines fold here instead of clipping.
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
-    if text.chars().count() <= width {
-        return vec![text.to_owned()];
-    }
+    use unicode_width::UnicodeWidthChar;
+    // Round 5: fold by TERMINAL CELLS, not scalars — CJK/emoji are two
+    // cells wide and combining marks are zero — so a folded line never
+    // overruns the pane.
     let mut chunks = Vec::new();
     let mut current = String::new();
-    let mut count = 0;
+    let mut cells = 0usize;
     for character in text.chars() {
-        current.push(character);
-        count += 1;
-        if count == width {
+        let advance = character.width().unwrap_or(0);
+        if cells + advance > width && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
-            count = 0;
+            cells = 0;
         }
+        current.push(character);
+        cells += advance;
     }
-    if !current.is_empty() {
+    if !current.is_empty() || chunks.is_empty() {
         chunks.push(current);
     }
     chunks

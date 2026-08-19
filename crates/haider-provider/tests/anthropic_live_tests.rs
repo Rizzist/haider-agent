@@ -76,13 +76,26 @@ async fn live_anthropic_second_turn_reads_cached_prompt_prefix() {
     let vault = import_live_key();
     let model = selected_model();
     let provider = live_provider(&vault, &model);
-    let stable_system = "Stable cache-test context. Keep every word unchanged. ".repeat(500);
+    // Round 5: the SYSTEM stays tiny and the HISTORY carries the bulk —
+    // a fat system alone could satisfy the coverage threshold while the
+    // message-history cache silently regressed. With ~150 system tokens
+    // and a multi-thousand-token first turn, 50% coverage is impossible
+    // without the history riding the cache.
+    let stable_system = "Stable cache-test context. Keep every word unchanged. ".repeat(3);
+    let fat_history = format!(
+        "Background dossier (verbatim, unchanging): {}",
+        "the caravan crossed the salt flats at dawn carrying ledgers of amber and tin. "
+            .repeat(600)
+    );
     let mut first_request = cache_assertion_request(
         &model,
         stable_system.clone(),
-        vec![Message::user_text("Reply with exactly: cache-turn-one")],
-        0,
-        0,
+        vec![
+            Message::user_text(fat_history),
+            Message::user_text("Reply with exactly: cache-turn-one"),
+        ],
+        1,
+        1,
     );
 
     let (first_reply, first_usage) = run_live_cache_turn(&provider, first_request.clone()).await;
@@ -95,6 +108,10 @@ async fn live_anthropic_second_turn_reads_cached_prompt_prefix() {
         "turn 1 must report cache_creation_input_tokens > 0: {first_normalized:?}"
     );
     let prior_prompt_tokens = first_normalized.logical_input;
+    assert!(
+        prior_prompt_tokens > 2_000,
+        "harness: the history must dominate the prompt ({prior_prompt_tokens} tokens)"
+    );
 
     first_request.messages.extend([
         Message::assistant(vec![Block::Text { text: first_reply }]),
@@ -104,8 +121,8 @@ async fn live_anthropic_second_turn_reads_cached_prompt_prefix() {
         .cache_metadata
         .as_mut()
         .expect("cache metadata");
-    metadata.stable_history_end = 2;
-    metadata.current_user_start = 2;
+    metadata.stable_history_end = 3;
+    metadata.current_user_start = 3;
     let (_, second_usage) = run_live_cache_turn(&provider, first_request).await;
     let second_normalized = second_usage
         .normalized

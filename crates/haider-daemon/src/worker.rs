@@ -383,6 +383,7 @@ impl ContextCompactor for DaemonContextCompactor {
         run_id: &RunId,
         intent: &CompactionIntent,
         covered_messages: Vec<Message>,
+        attachments: Vec<haider_provider::ResolvedAttachment>,
     ) -> Result<Message, HaiderError> {
         let immutable_history_digest = digest_json(&covered_messages);
         let covered_history_end = covered_messages.len();
@@ -404,10 +405,15 @@ impl ContextCompactor for DaemonContextCompactor {
         let mut request = TurnRequest {
             messages: replay_messages,
             model: self.model.clone(),
-            max_tokens: self.max_tokens.min(4096),
+            // Round 5: a lossless summary of a near-window history needs
+            // real output room — 4K forced truncation into total failure.
+            max_tokens: self.max_tokens.min(8_192),
             system_prompt: self.post_compaction_system_prompt.clone(),
             tools: self.post_compaction_tools.clone(),
-            attachments: Vec::new(),
+            // Round 5: the ACTOR resolved these exactly as the live lane
+            // does, so an image-bearing prefix replays instead of always
+            // detouring through the uncached fallback.
+            attachments,
             cache_metadata: Some(cache_metadata.clone()),
         };
         if let Some(rendered) = self.provider.rendered_cache_prefix_digests(&request) {
@@ -426,6 +432,17 @@ impl ContextCompactor for DaemonContextCompactor {
             .await
         {
             Ok(stream) => (stream, replay_request_messages, prefix_digests),
+            // Round 5: a RETRYABLE start failure (transport, overload,
+            // rate limit) propagates so the caller's retry semantics run —
+            // burning it as an uncached full-price fallback both lies about
+            // the failure class and pays for the lie.
+            Err(error) if error.retryable => {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    format!("context summarization could not start: {error}"),
+                    true,
+                ));
+            }
             Err(_) => {
                 // Some provider families cannot replay durable multimodal
                 // blocks. Preserve the old text-only request as a single
@@ -469,7 +486,9 @@ impl ContextCompactor for DaemonContextCompactor {
                     immutable_history: immutable_history_digest.clone(),
                     model: digest_json(&self.model),
                     auth_mode: digest_json(&self.usage_scope.auth_scope),
-                    reasoning_settings: digest_json(&"compaction-default"),
+                    // Round 5: the same configured provider ran this request
+                    // — usage must not claim a default it did not use.
+                    reasoning_settings: digest_json(&self.reasoning_settings),
                 };
                 (stream, request_messages, fallback_prefix_digests)
             }
@@ -3880,14 +3899,15 @@ async fn perform_manual_compaction(
         &Some(post_compaction_system_prompt.clone()),
         &post_compaction_tools,
     );
-    let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
-        lease,
-        lease,
-        lease.session_id(),
-        branch_id.as_ref(),
-        agent_id.as_ref(),
-    )
-    .await?;
+    let (mut messages, latest_compaction_summary_end) =
+        PromptHistoryCompiler::compile_idle_with_artifacts_and_boundary(
+            lease,
+            lease,
+            lease.session_id(),
+            branch_id.as_ref(),
+            agent_id.as_ref(),
+        )
+        .await?;
     prepare_compaction_messages(lease, &mut messages).await?;
     let (run_id, accepted_seq, intent) = if let Some(existing) = existing {
         (existing.run_id, existing.accepted_seq, existing.intent)
@@ -3961,7 +3981,9 @@ async fn perform_manual_compaction(
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
         post_compaction_tools,
         reasoning_settings,
-        latest_compaction_summary_end: None,
+        // Round 5: a manual compaction after an earlier one marks the SAME
+        // prior-summary breakpoint the live lane would.
+        latest_compaction_summary_end,
         cache_expected_later_reads,
         cache_reuse_gap_ms: None,
         device_id: device_id.clone(),
@@ -3971,7 +3993,10 @@ async fn perform_manual_compaction(
         usage_scope,
         usage_account,
     };
-    if let Err(error) = compactor.compact(&run_id, &intent, messages).await {
+    if let Err(error) = compactor
+        .compact(&run_id, &intent, messages, Vec::new())
+        .await
+    {
         append_failure(
             lease,
             device_id,
@@ -4867,6 +4892,11 @@ async fn start_turn(
     // decision into provider-specific behavior. G1: children do NOT retain
     // `todo_write` — the plan surface is root-only (L5).
     config.attachments = attachments;
+    // Round 5 (known, accepted): these lane facts FREEZE at turn setup.
+    // Mid-turn account rotation or web-tool degradation can drift the live
+    // lane away from them; the replay then simply misses the cache (and may
+    // take the degraded fallback) — a cost edge, never a correctness one.
+    // Re-resolving at compact time needs live-lane threading; tracked.
     config.context_compactor = Some(Arc::new(DaemonContextCompactor {
         store: lease.clone(),
         provider: Arc::clone(&resolved.provider),

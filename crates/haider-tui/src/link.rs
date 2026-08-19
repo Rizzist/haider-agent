@@ -1629,6 +1629,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                         message: message.clone(),
                     }];
                 }
+                // Round 5: a loom.list error is identity-tagged like the
+                // other receipt-free reads — the reply releases the request
+                // latch instead of stranding /loom in a permanent LOADING.
+                if let Some(epoch) = context.loom_epoch {
+                    return vec![LiveReply::LoomListFailed { epoch }];
+                }
                 vec![LiveReply::Failed {
                     command_id: context.command_id.clone(),
                     code: code.clone(),

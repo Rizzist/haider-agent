@@ -278,6 +278,44 @@ impl PromptHistoryCompiler {
         Ok(projection.messages)
     }
 
+    /// Round 5 — the idle compile plus its latest prior-compaction boundary,
+    /// so a MANUAL compaction's replay request marks the same breakpoint the
+    /// live lane would (metadata parity, not a fresh cache epoch claim).
+    pub async fn compile_idle_with_artifacts_and_boundary(
+        store: &dyn StoreHandle,
+        artifacts: &dyn ArtifactReader,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+    ) -> Result<(Vec<Message>, Option<usize>), HaiderError> {
+        let envelopes = read_all(store, session_id).await?;
+        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        let ancestry = tree
+            .latest_ancestry(lineage.head.as_ref())?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "there is no durable history to compact",
+                    false,
+                )
+            })?;
+        let tree_head_seq = ancestry.last().map_or(0, |entry| entry.seq);
+        let mut projection =
+            compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None).await?;
+        let boundary = projection.latest_compaction_summary_end;
+        let tail = envelopes
+            .iter()
+            .filter(|envelope| {
+                envelope.seq > tree_head_seq && scoped(envelope, branch_id, agent_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let rendered = render_journal(&tail, &envelopes, branch_id, agent_id, None, false)?;
+        projection.messages.extend(rendered.messages);
+        Ok((projection.messages, boundary))
+    }
+
     /// Returns the latest committed tree head in one branch/agent scope.
     #[doc(hidden)]
     pub async fn latest_head(

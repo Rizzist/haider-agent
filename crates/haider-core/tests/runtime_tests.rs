@@ -562,6 +562,7 @@ impl ContextCompactor for FakeContextCompactor {
         _run_id: &RunId,
         _intent: &CompactionIntent,
         covered_messages: Vec<Message>,
+        _attachments: Vec<haider_provider::ResolvedAttachment>,
     ) -> Result<Message, HaiderError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(covered_messages, [Message::user_text("old history")]);
@@ -594,6 +595,7 @@ impl ContextCompactor for ShrinkingContextCompactor {
         _run_id: &RunId,
         _intent: &CompactionIntent,
         covered_messages: Vec<Message>,
+        _attachments: Vec<haider_provider::ResolvedAttachment>,
     ) -> Result<Message, HaiderError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(covered_messages.len(), 1);

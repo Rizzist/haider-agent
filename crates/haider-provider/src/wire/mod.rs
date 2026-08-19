@@ -143,7 +143,13 @@ pub(crate) fn request_json(
             // boundary that leaves at most the lookback window uncovered.
             // cache_control is request METADATA, never prompt content, so a
             // moving marker cannot itself disturb the byte prefix.
-            if metadata.latest_compaction_summary_end.is_none()
+            // Round 5: the slot is free when no compaction boundary exists
+            // OR it coincides with the stable boundary (both mark the same
+            // block — one physical marker).
+            let compaction_slot_free = metadata
+                .latest_compaction_summary_end
+                .is_none_or(|boundary| boundary == metadata.stable_history_end);
+            if compaction_slot_free
                 && let Some(intermediate) =
                     anthropic_intermediate_boundary(&request.messages, metadata.stable_history_end)
             {
@@ -234,6 +240,13 @@ const ANTHROPIC_LOOKBACK_BLOCKS: usize = 20;
 /// [`ANTHROPIC_LOOKBACK_BLOCKS`] content blocks between it and the end of
 /// the message list. `None` when the tail already fits the window. Pure and
 /// deterministic — a function of the request alone.
+///
+/// Known limitation (round 5, accepted): the marker is recomputed per
+/// request, so when MORE than a full lookback window of blocks lands
+/// between two provider calls, consecutive markers can sit further apart
+/// than the window and the older entry goes unfound. Bridging that needs a
+/// persisted marker ladder; per-drive-round growth is far below the window
+/// in practice, so the recomputed marker bounds the common case.
 fn anthropic_intermediate_boundary(
     messages: &[crate::Message],
     stable_history_end: usize,
@@ -248,13 +261,28 @@ fn anthropic_intermediate_boundary(
     if counts.iter().sum::<usize>() <= ANTHROPIC_LOOKBACK_BLOCKS {
         return None;
     }
+    let annotatable = |boundary: usize| {
+        messages[boundary - 1]
+            .blocks
+            .last()
+            .is_some_and(|block| !matches!(block, Block::ProviderOpaque { .. }))
+    };
     let mut suffix = 0usize;
     for (offset, count) in counts.iter().enumerate().rev() {
         suffix += count;
         if suffix > ANTHROPIC_LOOKBACK_BLOCKS {
-            let boundary = stable_history_end + offset + 1;
-            return (boundary > stable_history_end && boundary < messages.len())
-                .then_some(boundary);
+            // Round 5: the LAST message is a legal boundary (the annotator
+            // accepts boundary == len), and a ProviderOpaque-terminated
+            // candidate walks back to the nearest annotatable message so
+            // the slot is never silently wasted.
+            let mut boundary = stable_history_end + offset + 1;
+            while boundary > stable_history_end + 1 && !annotatable(boundary) {
+                boundary -= 1;
+            }
+            return (boundary > stable_history_end
+                && boundary <= messages.len()
+                && annotatable(boundary))
+            .then_some(boundary);
         }
     }
     None

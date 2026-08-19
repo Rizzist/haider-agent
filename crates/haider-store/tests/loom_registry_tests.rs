@@ -286,12 +286,31 @@ fn registration_bounds_types_color_and_glyph() {
             "cli `{bad}` must be rejected"
         );
     }
+    // Round 5: shell builtins/dispatchers grant everything — rejected even
+    // though they fit the charset. Same for a path form of one.
+    for dispatcher in [".", "eval", "xargs", "zsh", "/bin/sh", "env"] {
+        let mut record = agent_type("dispatchy", "A", "B");
+        record.clis = vec![(*dispatcher).to_owned()];
+        assert!(
+            store.loom_register_agent_type(&record).is_err(),
+            "dispatcher `{dispatcher}` must be rejected"
+        );
+    }
     // Bare names and absolute paths remain declarable.
     let mut record = agent_type("shelly", "A", "B");
     record.clis = vec!["ffmpeg".to_owned(), "/opt/homebrew/bin/yt-dlp".to_owned()];
     assert!(store.loom_register_agent_type(&record).is_ok());
-    // Round 4: invisible format characters never reach a glyph cell.
-    for bad_glyph in ["\u{2060}", "\u{061C}", "\u{00AD}"] {
+    // Rounds 4-5: invisible/format/variation characters never reach a
+    // glyph cell, and a glyph never LEADS with a combining mark.
+    for bad_glyph in [
+        "\u{2060}",
+        "\u{061C}",
+        "\u{00AD}",
+        "\u{034F}",
+        "\u{180E}",
+        "\u{FE0F}",
+        "\u{0301}x",
+    ] {
         let mut record = agent_type("ghosty", "A", "B");
         record.glyph = (*bad_glyph).to_owned();
         assert!(
