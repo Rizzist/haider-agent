@@ -1,6 +1,6 @@
 //! Shared client seam for the Haider daemon (report §6.2, R8/R9).
 //!
-//! Four cooperating pieces, deliberately below both binaries:
+//! Five cooperating pieces, deliberately below both binaries:
 //!
 //! - [`profile`] — the ONE profile resolver `haider` and `haiderd` share
 //!   (store dir, profile id, runtime dir, endpoint path, release-owned
@@ -15,6 +15,8 @@
 //!   daemon.
 //! - [`headless`] — the reusable daemon-backed one-shot transaction used by
 //!   non-interactive clients.
+//! - [`surface`] — typed volatile input/status publication, watch, and
+//!   injection helpers shared by TUI and embedding composers.
 //!
 //! This crate owns no TUI, daemon lifecycle, or persistence.
 
@@ -26,6 +28,7 @@ pub mod permission;
 pub mod profile;
 pub mod shell;
 pub mod spawn;
+pub mod surface;
 pub mod transcription;
 
 pub use client::{
@@ -68,6 +71,13 @@ pub use spawn::{
     DAEMON_LOG_FILE, EnsureError, EnsureOptions, EnsuredDaemon, RACE_LOSER_EXIT_CODE,
     STARTUP_DEADLINE, ensure_daemon, required_live_features, signal_authenticated_peer,
     spawn_daemon_retained,
+};
+pub use surface::{
+    SurfaceClientError, SurfaceInjectAck, SurfaceInjectOp, SurfaceInputPublishWire,
+    SurfaceInputWire, SurfacePublishAck, SurfaceStatusPublishWire, SurfaceStatusWire,
+    SurfaceWatchSnapshot, input_inject_ack, input_inject_request, session_input_inject,
+    session_surface_publish, session_surface_watch, surface_publish_ack, surface_publish_request,
+    surface_watch_request, surface_watch_snapshot,
 };
 
 /// Crate marker used by the workspace self-test.

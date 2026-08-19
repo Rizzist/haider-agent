@@ -139,10 +139,12 @@ use haider_rpc::{
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
     ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
     ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
-    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
-    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
-    TodoGraphOpenedWire, WireFrame,
+    ERROR_CODE_SURFACE_TEXT_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS,
+    ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput,
+    ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
+    SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
+    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
+    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -546,9 +548,12 @@ struct HubInner {
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
     actors: Mutex<HashMap<SessionId, SessionActorHandle>>,
-    /// Connection-level diagnostic sinks. Store failures cannot rely on a
-    /// session journal, so the shared profile fault watcher fans out here.
+    /// Connection-level unsolicited sinks. Store failures fan out here, and
+    /// volatile input injection uses the current publisher's indexed route.
     diagnostic_sinks: Mutex<HashMap<String, Arc<dyn FrameSink>>>,
+    /// Daemon-generation-only composer/status truth. This state is never
+    /// journaled or projected into prompts; clients republish after restart.
+    surfaces: Mutex<HashMap<SessionId, SessionSurfaceState>>,
     /// Permanent tombstones for sessions deleted in this daemon lifetime.
     /// `actor_for` checks them at both sides of its await so deletion cannot
     /// race actor recreation or fresh admission.
@@ -588,6 +593,32 @@ struct HubInner {
     /// Ephemeral compiled-prompt acceleration. Journal bytes remain the
     /// authority; the cache is discarded with this daemon generation.
     prompt_history: PromptHistoryCache,
+}
+
+#[derive(Default)]
+struct SessionSurfaceState {
+    input: Option<SurfaceInputWire>,
+    status: Option<SurfaceStatusWire>,
+    input_revisions: HashMap<String, u64>,
+    status_revisions: HashMap<String, u64>,
+    change_generation: u64,
+}
+
+#[derive(Clone)]
+struct SessionSurfaceSnapshot {
+    input: Option<SurfaceInputWire>,
+    status: Option<SurfaceStatusWire>,
+    change_generation: u64,
+}
+
+struct SurfacePublishOutcome {
+    accepted_input_revision: Option<u64>,
+    accepted_status_revision: Option<u64>,
+}
+
+struct SurfaceWatchState {
+    registrations: Arc<Mutex<HashMap<SessionId, u64>>>,
+    task: JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -944,6 +975,8 @@ pub struct HubConnection {
     /// connection clone, so aborting this handle tears the watch down
     /// immediately on close or drop.
     roster_watch: Mutex<Option<JoinHandle<()>>>,
+    /// One ticker serves a bounded set of per-session volatile watches.
+    surface_watch: Mutex<Option<SurfaceWatchState>>,
     closed: AtomicBool,
 }
 
@@ -954,6 +987,12 @@ impl Drop for HubConnection {
         {
             task.abort();
         }
+        if let Ok(watch) = self.surface_watch.get_mut()
+            && let Some(watch) = watch.take()
+        {
+            watch.task.abort();
+        }
+        self.hub.clear_surface_owner(&self.connection_id);
     }
 }
 
@@ -1074,6 +1113,7 @@ impl SessionHub {
             metrics: Arc::new(HubMetrics::default()),
             actors: Mutex::new(HashMap::new()),
             diagnostic_sinks: Mutex::new(HashMap::new()),
+            surfaces: Mutex::new(HashMap::new()),
             deleting_sessions: Mutex::new(HashSet::new()),
             actor_tasks: Mutex::new(Vec::new()),
             replay_tasks: Mutex::new(Vec::new()),
@@ -1628,6 +1668,7 @@ impl SessionHub {
             transport,
             stages: Mutex::new(crate::accounts::StagedSecrets::default()),
             roster_watch: Mutex::new(None),
+            surface_watch: Mutex::new(None),
             closed: AtomicBool::new(false),
         })
     }
@@ -2484,6 +2525,7 @@ impl SessionHub {
         // after the actor is provably stopped and before the durable delete.
         self.fence_background_tasks(session_id).await;
         self.inner.store.delete_session(session_id.clone()).await?;
+        self.clear_session_surface(session_id);
         crate::delegation::DelegationHandle::new(self.clone())
             .cleanup_handoff_for_deleted_parent(&metadata.cwd, session_id)
             .await;
@@ -2853,8 +2895,189 @@ impl SessionHub {
         Ok(true)
     }
 
+    fn live_surface_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSurfaceSnapshot>, SessionHubError> {
+        let deleting = lock(&self.inner.deleting_sessions)?;
+        if deleting.contains(session_id) {
+            return Ok(None);
+        }
+        let mut surfaces = self
+            .inner
+            .surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = surfaces.entry(session_id.clone()).or_default();
+        Ok(Some(SessionSurfaceSnapshot {
+            input: state.input.clone(),
+            status: state.status.clone(),
+            change_generation: state.change_generation,
+        }))
+    }
+
+    fn surface_snapshot(&self, session_id: &SessionId) -> SessionSurfaceSnapshot {
+        let surfaces = self
+            .inner
+            .surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = surfaces.get(session_id);
+        SessionSurfaceSnapshot {
+            input: state.and_then(|state| state.input.clone()),
+            status: state.and_then(|state| state.status.clone()),
+            change_generation: state.map_or(0, |state| state.change_generation),
+        }
+    }
+
+    fn publish_surface(
+        &self,
+        connection_id: &str,
+        session_id: &SessionId,
+        input: Option<SurfaceInputPublishWire>,
+        status: Option<SurfaceStatusPublishWire>,
+    ) -> Result<Option<SurfacePublishOutcome>, SessionHubError> {
+        // Serialize the final volatile publication with deletion-fence
+        // minting, just as attachment ownership does. A publication that
+        // wins this lock is cleared by the later successful delete; one that
+        // loses observes the permanent daemon-lifetime tombstone.
+        let deleting = lock(&self.inner.deleting_sessions)?;
+        if deleting.contains(session_id) {
+            return Ok(None);
+        }
+        let mut surfaces = self
+            .inner
+            .surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = surfaces.entry(session_id.clone()).or_default();
+        let mut accepted_input_revision = None;
+        let mut accepted_status_revision = None;
+
+        if let Some(input) = input
+            && state
+                .input_revisions
+                .get(connection_id)
+                .is_none_or(|revision| input.revision > *revision)
+        {
+            state
+                .input_revisions
+                .insert(connection_id.to_owned(), input.revision);
+            accepted_input_revision = Some(input.revision);
+            state.input = Some(SurfaceInputWire {
+                text: input.text,
+                revision: input.revision,
+                owner: connection_id.to_owned(),
+            });
+        }
+        if let Some(status) = status
+            && state
+                .status_revisions
+                .get(connection_id)
+                .is_none_or(|revision| status.revision > *revision)
+        {
+            state
+                .status_revisions
+                .insert(connection_id.to_owned(), status.revision);
+            accepted_status_revision = Some(status.revision);
+            state.status = Some(SurfaceStatusWire {
+                line: status.line,
+                revision: status.revision,
+                owner: connection_id.to_owned(),
+            });
+        }
+        if accepted_input_revision.is_some() || accepted_status_revision.is_some() {
+            state.change_generation = state.change_generation.saturating_add(1);
+        }
+        Ok(Some(SurfacePublishOutcome {
+            accepted_input_revision,
+            accepted_status_revision,
+        }))
+    }
+
+    fn inject_session_input(
+        &self,
+        session_id: &SessionId,
+        op: SurfaceInjectOp,
+    ) -> Result<bool, SessionHubError> {
+        let sink = {
+            let deleting = lock(&self.inner.deleting_sessions)?;
+            if deleting.contains(session_id) {
+                return Ok(false);
+            }
+            let surfaces = self
+                .inner
+                .surfaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(owner) = surfaces
+                .get(session_id)
+                .and_then(|state| state.input.as_ref())
+                .map(|input| input.owner.as_str())
+            else {
+                return Ok(false);
+            };
+            lock(&self.inner.diagnostic_sinks)?.get(owner).cloned()
+        };
+        let Some(sink) = sink else {
+            return Ok(false);
+        };
+        Ok(sink
+            .try_send_droppable(WireFrame::SessionInputInjected {
+                session_id: session_id.clone(),
+                op,
+            })
+            .is_ok())
+    }
+
+    fn clear_surface_owner(&self, connection_id: &str) {
+        let mut surfaces = self
+            .inner
+            .surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for state in surfaces.values_mut() {
+            state.input_revisions.remove(connection_id);
+            state.status_revisions.remove(connection_id);
+            let clears_input = state
+                .input
+                .as_ref()
+                .is_some_and(|input| input.owner == connection_id);
+            let clears_status = state
+                .status
+                .as_ref()
+                .is_some_and(|status| status.owner == connection_id);
+            if clears_input {
+                state.input = None;
+            }
+            if clears_status {
+                state.status = None;
+            }
+            if clears_input || clears_status {
+                state.change_generation = state.change_generation.saturating_add(1);
+            }
+        }
+    }
+
+    fn clear_session_surface(&self, session_id: &SessionId) {
+        let mut surfaces = self
+            .inner
+            .surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = surfaces.entry(session_id.clone()).or_default();
+        state.input = None;
+        state.status = None;
+        state.input_revisions.clear();
+        state.status_revisions.clear();
+        // Session death itself is a change even when both fields were empty;
+        // a registered watcher must receive the cleared terminal snapshot.
+        state.change_generation = state.change_generation.saturating_add(1);
+    }
+
     async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
         lock(&self.inner.diagnostic_sinks)?.remove(connection_id);
+        self.clear_surface_owner(connection_id);
         let attachments = {
             let owners = lock(&self.inner.attachments)?;
             owners

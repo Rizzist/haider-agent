@@ -528,7 +528,8 @@ impl RpcClient {
     }
 
     /// Takes the uncorrelated frame stream (events, caught-up markers,
-    /// lag/drain notices). Yields `None` once for a second caller.
+    /// roster/surface notifications, injection, and lag/drain notices).
+    /// Yields `None` once for a second caller.
     pub fn take_events(&self) -> Option<mpsc::Receiver<WireFrame>> {
         self.events.lock().ok().and_then(|mut slot| slot.take())
     }
