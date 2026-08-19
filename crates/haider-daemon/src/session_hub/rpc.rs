@@ -33,6 +33,7 @@ const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_PDF_TURN: usize = 64 * 1024 * 1024;
+const MAX_SURFACE_WATCHES_PER_CONNECTION: usize = 16;
 
 /// Profile-vault alias holding the transcription secret (the Deepgram API
 /// key). Daemon-internal: clients only ever speak
@@ -1216,6 +1217,47 @@ impl HubConnection {
                     );
                 }
                 self.session_list_watch(request_id)
+            }
+            RequestBody::SessionSurfacePublish {
+                session_id,
+                input,
+                status,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_surface_publish(request_id, session_id, input, status)
+                    .await
+            }
+            RequestBody::SessionSurfaceWatch { session_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_surface_watch(request_id, session_id).await
+            }
+            RequestBody::SessionInputInject { session_id, op } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_input_inject(request_id, session_id, op)
             }
             RequestBody::SessionPipePath { session_id } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
@@ -5954,6 +5996,245 @@ impl HubConnection {
         Ok(())
     }
 
+    async fn session_surface_publish(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        input: Option<SurfaceInputPublishWire>,
+        status: Option<SurfaceStatusPublishWire>,
+    ) -> Result<(), SessionHubError> {
+        let input = match input {
+            Some(input) => {
+                if input.text.len() > SURFACE_INPUT_MAX_BYTES {
+                    return self.surface_text_too_large(
+                        request_id,
+                        "input",
+                        input.text.len(),
+                        SURFACE_INPUT_MAX_BYTES,
+                    );
+                }
+                Some(SurfaceInputPublishWire {
+                    text: strip_input_controls(input.text),
+                    revision: input.revision,
+                })
+            }
+            None => None,
+        };
+        let status = match status {
+            Some(status) => {
+                if status.line.len() > SURFACE_STATUS_MAX_BYTES {
+                    return self.surface_text_too_large(
+                        request_id,
+                        "status",
+                        status.line.len(),
+                        SURFACE_STATUS_MAX_BYTES,
+                    );
+                }
+                Some(SurfaceStatusPublishWire {
+                    line: strip_status_controls(status.line),
+                    revision: status.revision,
+                })
+            }
+            None => None,
+        };
+        if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        let Some(outcome) =
+            self.hub
+                .publish_surface(&self.connection_id, &session_id, input, status)?
+        else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        };
+        if self.closed.load(Ordering::Acquire) {
+            self.hub.clear_surface_owner(&self.connection_id);
+            return Err(SessionHubError::Closed);
+        }
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionSurfacePublished {
+                session_id,
+                accepted_input_revision: outcome.accepted_input_revision,
+                accepted_status_revision: outcome.accepted_status_revision,
+            },
+        })
+    }
+
+    async fn session_surface_watch(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        let Some(snapshot) = self.hub.live_surface_snapshot(&session_id)? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        };
+
+        let mut watch = lock(&self.surface_watch)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        if watch.as_ref().is_some_and(|watch| watch.task.is_finished()) {
+            watch.take();
+        }
+        if watch.is_none() {
+            let registrations = Arc::new(Mutex::new(HashMap::new()));
+            let hub = self.hub.clone();
+            let sink = Arc::clone(&self.sink);
+            let task_registrations = Arc::clone(&registrations);
+            let task = tokio::spawn(run_surface_watch(hub, sink, task_registrations));
+            *watch = Some(SurfaceWatchState {
+                registrations,
+                task,
+            });
+        }
+        let Some(watch_state) = watch.as_ref() else {
+            return Err(SessionHubError::Task(
+                "surface watch failed to initialize".into(),
+            ));
+        };
+        let registrations = Arc::clone(&watch_state.registrations);
+        {
+            let registrations = lock(&registrations)?;
+            if !registrations.contains_key(&session_id)
+                && registrations.len() >= MAX_SURFACE_WATCHES_PER_CONNECTION
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_OVERLOADED,
+                    "connection surface-watch limit reached",
+                    true,
+                    None,
+                );
+            }
+        }
+        // The ack enters the system lane before the registration can produce
+        // a delta. Its captured generation is installed afterwards so a
+        // publication racing this response remains visible to the ticker.
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionSurfaceWatching {
+                session_id: session_id.clone(),
+                input: snapshot.input,
+                status: snapshot.status,
+            },
+        })?;
+        lock(&registrations)?.insert(session_id, snapshot.change_generation);
+        if self.closed.load(Ordering::Acquire) {
+            if let Some(watch) = watch.take() {
+                watch.task.abort();
+            }
+            return Err(SessionHubError::Closed);
+        }
+        Ok(())
+    }
+
+    fn session_input_inject(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        op: SurfaceInjectOp,
+    ) -> Result<(), SessionHubError> {
+        let op = match op {
+            SurfaceInjectOp::Set { text } => {
+                if text.len() > SURFACE_INPUT_MAX_BYTES {
+                    return self.surface_text_too_large(
+                        request_id,
+                        "input",
+                        text.len(),
+                        SURFACE_INPUT_MAX_BYTES,
+                    );
+                }
+                SurfaceInjectOp::Set {
+                    text: strip_input_controls(text),
+                }
+            }
+            SurfaceInjectOp::Insert { text } => {
+                if text.len() > SURFACE_INPUT_MAX_BYTES {
+                    return self.surface_text_too_large(
+                        request_id,
+                        "input",
+                        text.len(),
+                        SURFACE_INPUT_MAX_BYTES,
+                    );
+                }
+                SurfaceInjectOp::Insert {
+                    text: strip_input_controls(text),
+                }
+            }
+            SurfaceInjectOp::Clear => SurfaceInjectOp::Clear,
+            SurfaceInjectOp::Submit => SurfaceInjectOp::Submit,
+            _ => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "input injection operation is not supported",
+                    false,
+                    None,
+                );
+            }
+        };
+        let delivered = self.hub.inject_session_input(&session_id, op)?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionInputInjectAck {
+                session_id,
+                delivered,
+            },
+        })
+    }
+
+    fn surface_text_too_large(
+        &self,
+        request_id: RequestId,
+        field: &str,
+        actual_bytes: usize,
+        max_bytes: usize,
+    ) -> Result<(), SessionHubError> {
+        let actual_bytes = u64::try_from(actual_bytes).unwrap_or(u64::MAX);
+        let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        self.respond_error(
+            request_id,
+            ERROR_CODE_SURFACE_TEXT_TOO_LARGE,
+            &format!("surface {field} is {actual_bytes} bytes; the hard limit is {max_bytes}"),
+            false,
+            Some(ErrorData::SurfaceTextTooLarge {
+                field: field.to_owned(),
+                actual_bytes,
+                max_bytes,
+            }),
+        )
+    }
+
     async fn session_pipe_path(
         &self,
         request_id: RequestId,
@@ -6710,12 +6991,56 @@ impl HubConnection {
         {
             task.abort();
         }
+        if let Ok(mut watch) = self.surface_watch.lock()
+            && let Some(watch) = watch.take()
+        {
+            watch.task.abort();
+        }
         if let Ok(Some(facade)) = self.hub.accounts()
             && let Some(oauth) = facade.oauth
         {
             oauth.cancel_connection(&self.connection_id);
         }
         self.hub.detach_connection(&self.connection_id).await
+    }
+}
+
+async fn run_surface_watch(
+    hub: SessionHub,
+    sink: Arc<dyn FrameSink>,
+    registrations: Arc<Mutex<HashMap<SessionId, u64>>>,
+) {
+    let period = std::time::Duration::from_millis(50);
+    let mut ticker = interval_at(tokio::time::Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let watched = match registrations.lock() {
+            Ok(registrations) => registrations
+                .iter()
+                .map(|(session_id, generation)| (session_id.clone(), *generation))
+                .collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        for (session_id, pushed_generation) in watched {
+            let snapshot = hub.surface_snapshot(&session_id);
+            if snapshot.change_generation == pushed_generation {
+                continue;
+            }
+            let sent = sink
+                .try_send_droppable(WireFrame::SessionSurfaceDelta {
+                    session_id: session_id.clone(),
+                    input: snapshot.input,
+                    status: snapshot.status,
+                })
+                .is_ok();
+            if sent
+                && let Ok(mut registrations) = registrations.lock()
+                && registrations.get(&session_id) == Some(&pushed_generation)
+            {
+                registrations.insert(session_id, snapshot.change_generation);
+            }
+        }
     }
 }
 
@@ -6768,6 +7093,18 @@ async fn session_summaries(
 }
 
 const ROSTER_DELTA_CHUNK_SIZE: usize = 64;
+
+fn strip_input_controls(text: String) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect()
+}
+
+fn strip_status_controls(line: String) -> String {
+    line.chars()
+        .filter(|character| !character.is_control())
+        .collect()
+}
 
 fn roster_fold_candidates(
     pushed_heads: &BTreeMap<String, u64>,

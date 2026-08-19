@@ -210,6 +210,8 @@ pub const ERROR_CODE_EFFORT_UNSUPPORTED: &str = "effort_unsupported";
 /// A `session.select_fast` refusal (G3): the CURRENT pair is not in the
 /// static fast-mode gate. Turning fast OFF is always accepted.
 pub const ERROR_CODE_FAST_UNSUPPORTED: &str = "fast_unsupported";
+/// Stable refusal for input-mirroring text above its field-specific byte cap.
+pub const ERROR_CODE_SURFACE_TEXT_TOO_LARGE: &str = "surface_text_too_large";
 /// A cache-sensitive live-session change needs an explicit second-step
 /// confirmation to create a fresh epoch.
 pub const ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED: &str = "cache_epoch_confirmation_required";
@@ -335,6 +337,10 @@ pub const FEATURE_LOOM_V1: &str = "loom_v1";
 /// Daemon can push changed/new session summaries after a read-only roster
 /// watch is accepted.
 pub const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
+/// Daemon-owned volatile composer mirroring, watching, and input injection.
+pub const FEATURE_INPUT_MIRROR_V1: &str = "input_mirror_v1";
+/// Daemon-owned volatile status-segment publication and watching.
+pub const FEATURE_STATUS_SEGMENT_V1: &str = "status_segment_v1";
 /// Daemon supports opt-in MessagePack encoding after the JSON handshake.
 pub const FEATURE_WIRE_MSGPACK_V1: &str = "wire_msgpack_v1";
 /// Daemon can omit superseded item deltas from the durable store phase of a
@@ -351,6 +357,11 @@ pub const FEATURE_EXPORT_SEQ_V1: &str = "export_seq_v1";
 /// when it equals the roster/status `head_seq`. V2 readers must ignore unknown
 /// row keys and unknown line kinds.
 pub const FEATURE_PIPE_NATIVE_V2: &str = "pipe_native_v2";
+
+/// Maximum UTF-8 bytes accepted for one mirrored input value or injected text.
+pub const SURFACE_INPUT_MAX_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 bytes accepted for one mirrored status line.
+pub const SURFACE_STATUS_MAX_BYTES: usize = 4 * 1024;
 
 /// One todo child returned by `graph.run_set.open`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -964,6 +975,56 @@ pub struct SessionSummary {
     pub agent_metrics: Option<AgentMetricsSnapshot>,
 }
 
+/// Publisher-authored input value. Ownership is assigned by the daemon from
+/// the authenticated connection and therefore has no request field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceInputPublishWire {
+    pub text: String,
+    pub revision: u64,
+}
+
+/// Publisher-authored status value. Ownership is assigned by the daemon from
+/// the authenticated connection and therefore has no request field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceStatusPublishWire {
+    pub line: String,
+    pub revision: u64,
+}
+
+/// Current daemon-owned volatile input snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceInputWire {
+    pub text: String,
+    pub revision: u64,
+    pub owner: String,
+}
+
+/// Current daemon-owned volatile status snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceStatusWire {
+    pub line: String,
+    pub revision: u64,
+    pub owner: String,
+}
+
+/// An operation routed to the current input owner. The daemon validates and
+/// forwards it but never applies it to the mirrored buffer itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SurfaceInjectOp {
+    Set {
+        text: String,
+    },
+    Insert {
+        text: String,
+    },
+    Clear,
+    Submit,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Result of a non-subscribing session read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionReadResult {
@@ -1238,6 +1299,25 @@ pub enum RequestBody {
     /// Starts a connection-scoped watch of changed/new session summaries.
     #[serde(rename = "session.list_watch")]
     SessionListWatch {},
+    /// Publishes one or both daemon-owned volatile session surfaces. An
+    /// omitted field leaves that surface unchanged; empty text is a value.
+    #[serde(rename = "session.surface_publish")]
+    SessionSurfacePublish {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<SurfaceInputPublishWire>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<SurfaceStatusPublishWire>,
+    },
+    /// Watches the complete latest volatile surface snapshot for one session.
+    #[serde(rename = "session.surface_watch")]
+    SessionSurfaceWatch { session_id: SessionId },
+    /// Routes an input operation to the current live input owner.
+    #[serde(rename = "session.input_inject")]
+    SessionInputInject {
+        session_id: SessionId,
+        op: SurfaceInjectOp,
+    },
     /// Resolves the daemon-owned native JSONL sidecar path for one session.
     /// Clients must not derive this path from the raw session id.
     #[serde(rename = "session.pipe_path")]
@@ -1763,6 +1843,31 @@ pub enum ResponseBody {
     /// Acknowledges a connection-scoped session roster watch.
     #[serde(rename = "session.list_watch")]
     SessionListWatch { accepted: bool },
+    /// Reports exactly which supplied revisions were accepted. `None` means
+    /// that field was omitted or its publisher-local revision was stale.
+    #[serde(rename = "session.surface_publish")]
+    SessionSurfacePublished {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accepted_input_revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accepted_status_revision: Option<u64>,
+    },
+    /// Acknowledges a surface watch with its current complete snapshot.
+    #[serde(rename = "session.surface_watch")]
+    SessionSurfaceWatching {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<SurfaceInputWire>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<SurfaceStatusWire>,
+    },
+    /// Whether an input operation entered the current owner's outbox.
+    #[serde(rename = "session.input_inject")]
+    SessionInputInjectAck {
+        session_id: SessionId,
+        delivered: bool,
+    },
     /// Absolute daemon-resolved native JSONL sidecar path.
     #[serde(rename = "session.pipe_path")]
     SessionPipePath { path: String },
@@ -2148,9 +2253,9 @@ pub enum ResponseBody {
     ///
     /// Stable v0.1 codes include [`ERROR_CODE_CURSOR_AHEAD`],
     /// [`ERROR_CODE_CAPABILITY_DENIED`], [`ERROR_CODE_ALREADY_RESOLVED`],
-    /// [`ERROR_CODE_NOT_FOUND`], [`ERROR_CODE_DRAINING`], and
-    /// [`ERROR_CODE_OVERLOADED`]. Unknown future string codes remain carryable
-    /// by older clients.
+    /// [`ERROR_CODE_NOT_FOUND`], [`ERROR_CODE_DRAINING`],
+    /// [`ERROR_CODE_OVERLOADED`], and [`ERROR_CODE_SURFACE_TEXT_TOO_LARGE`].
+    /// Unknown future string codes remain carryable by older clients.
     #[serde(rename = "error")]
     Error {
         /// Stable machine-readable `snake_case` code.
@@ -2268,6 +2373,12 @@ pub enum ErrorData {
     RevisionConflict {
         expected_revision: u64,
         current_revision: u64,
+    },
+    /// A volatile surface or injected input value exceeded its byte cap.
+    SurfaceTextTooLarge {
+        field: String,
+        actual_bytes: u64,
+        max_bytes: u64,
     },
     /// The provider did not serve a model catalog to the active credential.
     ProviderModelsUnavailable { provider: String, reason: String },
@@ -2452,6 +2563,19 @@ pub enum WireFrame {
     /// v1 deliberately does not report removed sessions. Clients that need
     /// deletion reconciliation must occasionally issue `session.list`.
     SessionRosterDelta { summaries: Vec<SessionSummary> },
+    /// Complete latest volatile surface snapshot after one or more accepted
+    /// changes. `None` means the corresponding surface is cleared.
+    SessionSurfaceDelta {
+        session_id: SessionId,
+        input: Option<SurfaceInputWire>,
+        status: Option<SurfaceStatusWire>,
+    },
+    /// Input operation delivered to the current input publisher. The owner
+    /// applies it to its composer and republishes the resulting snapshot.
+    SessionInputInjected {
+        session_id: SessionId,
+        op: SurfaceInjectOp,
+    },
     /// Wire shape of the durable compare-and-set menu command: first
     /// committed answer wins, and `request_seq` plus `worker_generation`
     /// fence stale answers. Only the shape lives here — validation,
@@ -2543,6 +2667,15 @@ enum WireFrameRef<'a> {
     SessionRosterDelta {
         summaries: &'a [SessionSummary],
     },
+    SessionSurfaceDelta {
+        session_id: &'a SessionId,
+        input: &'a Option<SurfaceInputWire>,
+        status: &'a Option<SurfaceStatusWire>,
+    },
+    SessionInputInjected {
+        session_id: &'a SessionId,
+        op: &'a SurfaceInjectOp,
+    },
     MenuAnswer {
         #[serde(skip_serializing_if = "Option::is_none")]
         request_id: &'a Option<RequestId>,
@@ -2601,6 +2734,17 @@ enum WireFrameOwned {
     SessionRosterDelta {
         #[serde(default)]
         summaries: Vec<SessionSummary>,
+    },
+    SessionSurfaceDelta {
+        session_id: SessionId,
+        #[serde(default)]
+        input: Option<SurfaceInputWire>,
+        #[serde(default)]
+        status: Option<SurfaceStatusWire>,
+    },
+    SessionInputInjected {
+        session_id: SessionId,
+        op: SurfaceInjectOp,
     },
     MenuAnswer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2680,6 +2824,18 @@ impl Serialize for WireFrame {
             },
             Self::SessionRosterDelta { summaries } => {
                 WireFrameRef::SessionRosterDelta { summaries }
+            }
+            Self::SessionSurfaceDelta {
+                session_id,
+                input,
+                status,
+            } => WireFrameRef::SessionSurfaceDelta {
+                session_id,
+                input,
+                status,
+            },
+            Self::SessionInputInjected { session_id, op } => {
+                WireFrameRef::SessionInputInjected { session_id, op }
             }
             Self::MenuAnswer {
                 request_id,
@@ -2768,6 +2924,18 @@ impl<'de> Deserialize<'de> for WireFrame {
             },
             WireFrameOwned::SessionRosterDelta { summaries } => {
                 Self::SessionRosterDelta { summaries }
+            }
+            WireFrameOwned::SessionSurfaceDelta {
+                session_id,
+                input,
+                status,
+            } => Self::SessionSurfaceDelta {
+                session_id,
+                input,
+                status,
+            },
+            WireFrameOwned::SessionInputInjected { session_id, op } => {
+                Self::SessionInputInjected { session_id, op }
             }
             WireFrameOwned::MenuAnswer {
                 request_id,
