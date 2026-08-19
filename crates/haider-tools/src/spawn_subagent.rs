@@ -38,6 +38,11 @@ pub struct SpawnSubagent {
     /// The daemon grants this only for a deeper-workflow trigger.
     #[serde(default, skip_serializing_if = "is_false")]
     pub workflow_author: bool,
+    /// C2 — a registered Loom agent type: the daemon injects the type's Job
+    /// as the child's role and (B3) scopes the child to the type's grants.
+    /// Unknown types reject as a completed tool result, never a turn failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 impl SpawnSubagent {
@@ -76,6 +81,7 @@ impl SpawnSubagent {
             ));
         }
         let parent_slot = selector(request.parent_slot, "parent_slot")?;
+        let agent_type = selector(request.agent_type, "agent_type")?;
         Ok(Self {
             task: task.to_owned(),
             prompt: prompt.to_owned(),
@@ -85,6 +91,7 @@ impl SpawnSubagent {
             workflow_trigger: request.workflow_trigger,
             parent_slot,
             workflow_author: request.workflow_author,
+            agent_type,
         })
     }
 }
@@ -154,6 +161,12 @@ pub fn spawn_subagent_manifest() -> ToolManifest {
                     "minLength": 1,
                     "maxLength": MAX_SELECTOR_BYTES,
                     "description": "Declared parent graph evidence slot for the single collapsed child contract"
+                },
+                "agent_type": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Registered Loom agent type for a TYPED child (capability-scoped specialist)"
                 },
                 "workflow_author": {
                     "type": "boolean",

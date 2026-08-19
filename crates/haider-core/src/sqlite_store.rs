@@ -1027,6 +1027,22 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.loom_workflows())).await
     }
 
+    pub async fn loom_workflow(
+        &self,
+        id: String,
+    ) -> Result<Option<haider_protocol::loom::LoomWorkflow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.loom_workflow(&id))).await
+    }
+
+    pub async fn loom_agent_type(
+        &self,
+        id: String,
+    ) -> Result<Option<haider_protocol::loom::LoomAgentType>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.loom_agent_type(&id))).await
+    }
+
     pub async fn loom_register_agent_type(
         &self,
         record: haider_protocol::loom::LoomAgentType,

@@ -1474,6 +1474,44 @@ impl Store {
         Ok(records)
     }
 
+    /// C1 — one workflow by id (registry read used by the worker's Loom tail).
+    pub fn loom_workflow(&self, id: &str) -> StoreResult<Option<LoomWorkflow>> {
+        let connection = self.connection()?;
+        let record = connection
+            .query_row(
+                "SELECT record_json FROM loom_workflows WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        record
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|_| corrupt("loom workflow record is not decodable"))
+            })
+            .transpose()
+    }
+
+    /// C2 — one agent type by id (registry read used by typed spawns).
+    pub fn loom_agent_type(&self, id: &str) -> StoreResult<Option<LoomAgentType>> {
+        let connection = self.connection()?;
+        let record = connection
+            .query_row(
+                "SELECT record_json FROM loom_agent_types WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        record
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|_| corrupt("loom agent type record is not decodable"))
+            })
+            .transpose()
+    }
+
     /// B1 — register (or revise) one agent type. The registry rev law:
     /// a NEW id lands at rev 1 regardless of the caller's counter; identical
     /// CONTENT (digest) is an idempotent no-op; changed content advances the
@@ -2660,13 +2698,14 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let template = graph_template(&command.template).ok_or_else(|| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("unknown graph template `{}`", command.template),
-                false,
-            )
-        })?;
+        let template =
+            resolve_graph_template_tx(&transaction, &command.template)?.ok_or_else(|| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown graph template `{}`", command.template),
+                    false,
+                )
+            })?;
         validate_pinned_graph_template(&template)?;
         let current = self
             .graph_reductions(&transaction, &command.session_id)?
@@ -3245,13 +3284,15 @@ impl Store {
                     false,
                 ));
             }
-            None => graph_template(&command.template).ok_or_else(|| {
-                store_error(
-                    ErrorCode::InvalidArgument,
-                    format!("unknown graph template `{}`", command.template),
-                    false,
-                )
-            })?,
+            None => {
+                resolve_graph_template_tx(&transaction, &command.template)?.ok_or_else(|| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        format!("unknown graph template `{}`", command.template),
+                        false,
+                    )
+                })?
+            }
         };
         validate_pinned_graph_template(&template)?;
         let reductions = self.graph_reductions(&transaction, &command.session_id)?;
@@ -12824,6 +12865,33 @@ fn map_sqlite_error(error: SqliteError) -> HaiderError {
             false,
         ),
     }
+}
+
+/// C1 — template resolution: the built-in catalog first, then the Loom
+/// registry. A registered pipe workflow is pinnable BY NAME exactly like a
+/// catalog entry, everywhere templates resolve (pin, switch, child refs).
+fn resolve_graph_template_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+) -> StoreResult<Option<haider_protocol::graph::GraphTemplateSpec>> {
+    if let Some(template) = graph_template(name) {
+        return Ok(Some(template));
+    }
+    let record = transaction
+        .query_row(
+            "SELECT record_json FROM loom_workflows WHERE id = ?1",
+            [name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    record
+        .map(|json| {
+            let workflow: LoomWorkflow = serde_json::from_str(&json)
+                .map_err(|_| corrupt("loom workflow record is not decodable"))?;
+            Ok(workflow.template)
+        })
+        .transpose()
 }
 
 /// B1 registration bounds: identifiers, non-empty semantics, bounded lists.

@@ -117,3 +117,32 @@ async fn spawn_effect_terminalizes_at_establishment_not_child_completion() {
     ));
     broker.close().await.expect("close broker");
 }
+
+/// C2 MUTATION CHECK: drop the agent_type plumbing or its selector bounds.
+/// Expected RUNTIME failure below.
+#[test]
+fn agent_type_rides_the_spawn_args() {
+    let request = SpawnSubagent::from_tool_args(serde_json::json!({
+        "task": "thumbnail",
+        "prompt": "make the cover",
+        "agent_type": "thumbnailer",
+    }))
+    .expect("typed spawn parses");
+    assert_eq!(request.agent_type.as_deref(), Some("thumbnailer"));
+    // Absent stays None; an over-long selector rejects.
+    let bare = SpawnSubagent::from_tool_args(serde_json::json!({
+        "task": "t",
+        "prompt": "p",
+    }))
+    .expect("bare spawn parses");
+    assert!(bare.agent_type.is_none());
+    let long = "x".repeat(400);
+    assert!(
+        SpawnSubagent::from_tool_args(serde_json::json!({
+            "task": "t",
+            "prompt": "p",
+            "agent_type": long,
+        }))
+        .is_err()
+    );
+}

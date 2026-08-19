@@ -5,8 +5,8 @@ use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
     WebCapabilityDegrade, advertised_tool_definitions, defer_shell_handoff,
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
-    explicit_computer_use_intent, registered_tool_route, registered_tools, stub_schema,
-    tool_inventory_snapshot, tool_manual, tool_manual_line, typed_tool_result,
+    explicit_computer_use_intent, loom_run_tail, registered_tool_route, registered_tools,
+    stub_schema, tool_inventory_snapshot, tool_manual, tool_manual_line, typed_tool_result,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -1038,4 +1038,29 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         full_prefix - new_total > full_prefix / 3,
         "instruct pipe must cut the advertised prefix by >1/3 (new {new_total} vs full {full_prefix})"
     );
+}
+
+/// C1 MUTATION CHECK: drop the node walk or the agent-type/task rendering.
+/// Expected RUNTIME failure: the volatile Loom tail stops teaching the model
+/// which specialist runs which node.
+#[test]
+fn loom_run_tail_teaches_typed_nodes() {
+    use haider_protocol::loom::{LoomTypeSig, compile_pipe, parse_pipe};
+    let source = "clip: SourceURL -> Transcript\nresearch @researcher \"pull and transcribe\" :cmd\npublish \"approve\" :human";
+    let workflow = compile_pipe(&parse_pipe(source), |id| {
+        (id == "researcher").then(|| LoomTypeSig {
+            in_type: "SourceURL".into(),
+            out_type: "Transcript".into(),
+        })
+    })
+    .expect("compiles");
+    let tail = loom_run_tail(&workflow);
+    assert!(tail.contains("loom clip rev 1"), "{tail}");
+    assert!(tail.contains("SourceURL -> Transcript"), "{tail}");
+    assert!(
+        tail.contains("research@researcher \"pull and transcribe\""),
+        "{tail}"
+    );
+    assert!(tail.contains("→ publish \"approve\""), "{tail}");
+    assert!(tail.contains("spawn_subagent(agent_type"), "{tail}");
 }

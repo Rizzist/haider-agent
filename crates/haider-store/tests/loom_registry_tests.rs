@@ -4,8 +4,9 @@
 //! identical content → idempotent no-op, changed content → rev + 1.
 #![allow(clippy::expect_used)]
 
+use haider_protocol::ids::{DeviceId, EventId, GraphId, SessionId};
 use haider_protocol::loom::LoomAgentType;
-use haider_store::Store;
+use haider_store::{GraphPinCommand, GraphPinOutcome, SessionCreateCommand, Store};
 
 fn agent_type(id: &str, in_type: &str, out_type: &str) -> LoomAgentType {
     LoomAgentType {
@@ -129,4 +130,69 @@ fn registry_survives_reopen() {
     let reopened = Store::open(root.path()).expect("reopen");
     assert_eq!(reopened.loom_agent_types().expect("types").len(), 1);
     assert_eq!(reopened.loom_workflows().expect("workflows").len(), 1);
+}
+
+/// C1 MUTATION CHECK: drop the registry fallback from template resolution.
+/// Expected RUNTIME failure: a registered pipe workflow stops being pinnable
+/// BY NAME through the ordinary graph machinery.
+#[test]
+fn registered_workflow_is_pinnable_by_name() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("open");
+    store
+        .loom_register_agent_type(&agent_type("researcher", "SourceURL", "Transcript"))
+        .expect("agent type");
+    store.loom_register_workflow(PIPE).expect("workflow");
+
+    let session_id = SessionId::new("loom-pin-session");
+    store
+        .create_session(&SessionCreateCommand {
+            command_id: "create-loom-pin".into(),
+            request_digest: "create-loom-pin-digest".into(),
+            request_json: r#"{"session":"loom-pin"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: "fake".into(),
+            model: "fake-v1".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "loom-test-v1".into(),
+            event_id: EventId::new("created-loom-pin"),
+            device_id: DeviceId::new("loom-test"),
+        })
+        .expect("create typed session");
+
+    // An unknown name still rejects...
+    let bad = store.pin_graph(&GraphPinCommand {
+        command_id: "pin-ghost".into(),
+        request_digest: "pin-ghost-digest".into(),
+        request_json: r#"{"template":"ghost-flow"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        graph_id: GraphId::new("graph-ghost"),
+        template: "ghost-flow".into(),
+        device_id: DeviceId::new("loom-test"),
+    });
+    assert!(bad.is_err());
+
+    // ...but the REGISTERED pipe workflow pins exactly like a catalog entry.
+    let outcome = store
+        .pin_graph(&GraphPinCommand {
+            command_id: "pin-clip-flow".into(),
+            request_digest: "pin-clip-flow-digest".into(),
+            request_json: r#"{"template":"clip-flow"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            graph_id: GraphId::new("graph-clip-flow"),
+            template: "clip-flow".into(),
+            device_id: DeviceId::new("loom-test"),
+        })
+        .expect("pin registered workflow");
+    let GraphPinOutcome::Committed { pinned, .. } = outcome else {
+        panic!("fresh pin must commit");
+    };
+    assert_eq!(pinned.template, "clip-flow");
 }

@@ -1263,6 +1263,22 @@ impl SessionHub {
         self.inner.store.session_metadata(session_id).await
     }
 
+    /// C1 — one registered Loom workflow (worker's typed-node tail).
+    pub(crate) async fn loom_workflow(
+        &self,
+        id: &str,
+    ) -> Result<Option<haider_protocol::loom::LoomWorkflow>, HaiderError> {
+        self.inner.store.loom_workflow(id.to_owned()).await
+    }
+
+    /// C2 — one registered Loom agent type (typed spawns).
+    pub(crate) async fn loom_agent_type(
+        &self,
+        id: &str,
+    ) -> Result<Option<haider_protocol::loom::LoomAgentType>, HaiderError> {
+        self.inner.store.loom_agent_type(id.to_owned()).await
+    }
+
     /// Narrow daemon-internal session creation used by local delegation.
     /// It preserves the same unfenced receipt preflight and actor-routed
     /// transaction as the wire method without fabricating an RPC connection.

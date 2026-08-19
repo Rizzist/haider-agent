@@ -316,6 +316,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         workflow_trigger: None,
         parent_slot: None,
         workflow_author: false,
+        agent_type: None,
     };
     let delegation = DelegationHandle::new(hub.clone());
     let first = delegation
@@ -595,6 +596,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 workflow_trigger: None,
                 parent_slot: None,
                 workflow_author: false,
+                agent_type: None,
             },
         )
         .await
@@ -827,6 +829,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 workflow_trigger: None,
                 parent_slot: None,
                 workflow_author: false,
+                agent_type: None,
             },
         )
         .await
@@ -1018,6 +1021,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 workflow_trigger: None,
                 parent_slot: None,
                 workflow_author: false,
+                agent_type: None,
             },
         )
         .await

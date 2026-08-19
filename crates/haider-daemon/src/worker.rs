@@ -4544,15 +4544,34 @@ async fn start_turn(
     let workflow_child = grant
         .as_ref()
         .is_some_and(|grant| grant.tools.iter().any(|tool| tool == "graph_evidence"));
-    let graph_brief = if agent_id.is_none() || workflow_child {
+    let graph_status = if agent_id.is_none() || workflow_child {
         lease
             .hub()
             .graph_status(lease.session_id())
             .await
             .map_err(hub_error)?
-            .and_then(|status| status.graph_brief())
     } else {
         None
+    };
+    let graph_brief = graph_status
+        .as_ref()
+        .and_then(|status| status.graph_brief());
+    // C1: when the pinned template is a REGISTERED LOOM WORKFLOW, ride its
+    // typed-node manual beside the graph brief so the model runs each node
+    // through the node's agent type (C2's typed spawn).
+    let loom_tail = match graph_status.as_ref().map(|status| status.template.as_str()) {
+        Some(name) => lease
+            .hub()
+            .loom_workflow(name)
+            .await?
+            .map(|workflow| loom_run_tail(&workflow)),
+        None => None,
+    };
+    let graph_brief = match (graph_brief, loom_tail) {
+        (Some(brief), Some(tail)) => Some(format!("{brief}\n{tail}")),
+        (Some(brief), None) => Some(brief),
+        (None, Some(tail)) => Some(tail),
+        (None, None) => None,
     };
     let dispatcher = dependencies
         .tool_factory
@@ -6580,7 +6599,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "web_search" => "web_search(query) — search the web, returning a bounded text summary",
         "spawn_subagent" => {
-            "spawn_subagent(task, prompt, model?, provider?, workflow?, workflow_trigger?, parent_slot?, workflow_author?) — delegate one bounded task to a depth-capped child; task = short label, prompt = full brief"
+            "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?) — delegate one bounded task to a depth-capped child; task = short label, prompt = full brief; agent_type = a registered Loom specialist (its Job frames the child)"
         }
         "message_subagent" => {
             "message_subagent(agent, message) — steer a running direct child or start an idle one (agent = id returned by spawn_subagent)"
@@ -6609,6 +6628,35 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
 /// a tool never sees a signature for one it cannot call. Returns `""` when no
 /// advertised tool is manual-described (e.g. a computer-only child), leaving
 /// the base prompt byte-identical.
+/// C1 — the compact typed-node manual for a pinned Loom workflow. Rides the
+/// volatile user tail (never durable history) beside the graph brief; each
+/// work node names its agent type and task so the model dispatches it with
+/// `spawn_subagent(agent_type=..)`. Bounded: task text is already ≤200B/node.
+pub(crate) fn loom_run_tail(workflow: &haider_protocol::loom::LoomWorkflow) -> String {
+    let mut tail = format!(
+        "loom {} rev {} · {} -> {} — run each OPEN node with spawn_subagent(agent_type, task): ",
+        workflow.id, workflow.rev, workflow.in_type, workflow.out_type
+    );
+    let mut first = true;
+    for meta in &workflow.meta {
+        if !first {
+            tail.push_str(" → ");
+        }
+        first = false;
+        tail.push_str(&meta.source_name);
+        if let Some(atype) = &meta.agent_type {
+            tail.push('@');
+            tail.push_str(atype);
+        }
+        if !meta.task.is_empty() {
+            tail.push_str(" \"");
+            tail.push_str(&meta.task);
+            tail.push('"');
+        }
+    }
+    tail
+}
+
 pub(crate) fn tool_manual(tools: &[ToolDefinition]) -> String {
     let lines: Vec<&str> = tools
         .iter()
@@ -7658,7 +7706,45 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
                 return Err(error);
             }
-            let request = SpawnSubagent::from_tool_args(args).map_err(tool_error)?;
+            let mut request = SpawnSubagent::from_tool_args(args).map_err(tool_error)?;
+            // C2: a TYPED child. Resolve the agent type from the Loom registry
+            // BEFORE any durable spawn work: the type's Job becomes the
+            // child's role framing and the display label carries `@type ·` so
+            // surfaces can color the chip. Unknown types are a completed
+            // rejection the model can correct — never a turn failure.
+            if let Some(type_id) = request.agent_type.clone() {
+                let record = self.output.store.hub().loom_agent_type(&type_id).await?;
+                let Some(record) = record else {
+                    return Ok(ToolDispatchResult::Completed(BoundedResult {
+                        preview: serde_json::json!({
+                            "ok": false,
+                            "error": format!(
+                                "unknown agent type `{type_id}` — register it in the Loom registry or drop agent_type"
+                            ),
+                        })
+                        .to_string(),
+                        truncated: false,
+                        artifact: None,
+                        images: Vec::new(),
+                        cursor: None,
+                        status: ToolResultStatus::Completed,
+                        reason: None,
+                        presentation: None,
+                    }));
+                };
+                request.prompt = format!(
+                    "[agent type @{} — {} · {} -> {}]\n{}\n\n{}",
+                    record.id,
+                    record.name,
+                    record.in_type,
+                    record.out_type,
+                    record.job,
+                    request.prompt
+                );
+                if !request.task.starts_with('@') {
+                    request.task = format!("@{} · {}", record.id, request.task);
+                }
+            }
             // F1: resolve the child's pair BEFORE any durable spawn work. A
             // typed selection refusal is a completed tool result — the model
             // retries with an explicit pair — never a turn failure.
