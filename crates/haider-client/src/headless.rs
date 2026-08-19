@@ -49,6 +49,8 @@ pub const ERROR_CODE_NO_ACTIVE_ACCOUNT: &str = "no_active_account";
 /// The selected provider publishes neither a default nor a fallback model.
 pub const ERROR_CODE_NO_DEFAULT_MODEL: &str = "no_default_model";
 
+const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
+
 const MAX_RECONNECTS: u8 = 3;
 const ATTACH_HEALTH_POLL: Duration = Duration::from_millis(10);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -372,6 +374,23 @@ pub struct HeadlessRunRequest {
     pub trust_hooks: bool,
     pub timeout: Option<Duration>,
     pub terminal_grace: Duration,
+}
+
+/// Optional durable session configuration applied after creation and control
+/// attachment, before the first turn is submitted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeadlessSessionConfig {
+    /// A model id or `provider/model` selector. A slash is treated as a
+    /// provider separator only when its prefix is a registered provider.
+    pub model: Option<String>,
+    /// Provider-vocabulary effort level, validated by the daemon against the
+    /// selected pair's current catalog.
+    pub effort: Option<String>,
+    /// `Some(true)` selects fast; `Some(false)` durably selects normal.
+    pub fast: Option<bool>,
+    /// Reserved for the future per-session account selector. Current daemons
+    /// reject this through the named feature gate before session creation.
+    pub account: Option<String>,
 }
 
 /// Incremental facts exposed to output adapters.
@@ -982,6 +1001,25 @@ pub async fn run_headless(
     request: HeadlessRunRequest,
     output: mpsc::Sender<HeadlessEvent>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
+    run_headless_with_session_config(
+        profile,
+        ensure,
+        request,
+        HeadlessSessionConfig::default(),
+        output,
+    )
+    .await
+}
+
+/// [`run_headless`] with an optional durable configuration phase between
+/// session attachment and the first turn submission.
+pub async fn run_headless_with_session_config(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    request: HeadlessRunRequest,
+    session_config: HeadlessSessionConfig,
+    output: mpsc::Sender<HeadlessEvent>,
+) -> Result<HeadlessRunResult, HeadlessRunError> {
     let (reducer_output, mut pending_output) = mpsc::unbounded_channel();
     let forwarder = tokio::spawn(async move {
         while let Some(event) = pending_output.recv().await {
@@ -990,7 +1028,7 @@ pub async fn run_headless(
             }
         }
     });
-    let result = run_headless_inner(profile, ensure, request, reducer_output).await;
+    let result = run_headless_inner(profile, ensure, request, session_config, reducer_output).await;
     let _ = forwarder.await;
     result
 }
@@ -999,6 +1037,7 @@ async fn run_headless_inner(
     profile: &ResolvedProfile,
     mut ensure: EnsureOptions,
     request: HeadlessRunRequest,
+    session_config: HeadlessSessionConfig,
     output: mpsc::UnboundedSender<HeadlessEvent>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
@@ -1017,6 +1056,7 @@ async fn run_headless_inner(
         !request.attachments.is_empty(),
         request.trust_hooks,
     );
+    normalize_session_config_features(&mut ensure, &session_config);
     let timeout_deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let submit_command_id = CommandId::new(command_id("headless-submit"));
     let mut reconnects = ReconnectBudget::new();
@@ -1024,6 +1064,20 @@ async fn run_headless_inner(
         timeout_deadline,
         "connect",
         HeadlessConnection::open(profile, ensure.clone()),
+    )
+    .await?;
+    let (explicit_provider, explicit_model, selected_provider) = before_acceptance_deadline(
+        timeout_deadline,
+        "model selector bootstrap",
+        resolve_run_model_selector(
+            profile,
+            &ensure,
+            &mut connection,
+            &mut reconnects,
+            request.provider.clone(),
+            request.model.clone(),
+            session_config.model.as_deref(),
+        ),
     )
     .await?;
     let (provider, model) = before_acceptance_deadline(
@@ -1034,8 +1088,8 @@ async fn run_headless_inner(
             &ensure,
             &mut connection,
             &mut reconnects,
-            request.provider.clone(),
-            request.model.clone(),
+            explicit_provider,
+            explicit_model,
         ),
     )
     .await?;
@@ -1134,6 +1188,19 @@ async fn run_headless_inner(
             &mut connection,
             &mut reducer,
             &mut reconnects,
+        ),
+    )
+    .await?;
+
+    before_acceptance_deadline(
+        timeout_deadline,
+        "session config",
+        apply_headless_session_config(
+            &mut connection,
+            &session_id,
+            &model,
+            selected_provider,
+            &session_config,
         ),
     )
     .await?;
@@ -1638,6 +1705,185 @@ async fn resolve_run_identity(
     }
 }
 
+async fn resolve_run_model_selector(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    connection: &mut HeadlessConnection,
+    reconnects: &mut ReconnectBudget,
+    explicit_provider: Option<String>,
+    legacy_model: Option<String>,
+    selector: Option<&str>,
+) -> Result<(Option<String>, Option<String>, Option<String>), HeadlessRunError> {
+    let Some(selector) = selector else {
+        return Ok((explicit_provider, legacy_model, None));
+    };
+    if let Some((candidate, model)) = selector.split_once('/') {
+        let registered = provider_summary(profile, ensure, connection, reconnects, candidate)
+            .await?
+            .is_some();
+        if registered {
+            if model.is_empty() {
+                return Err(HeadlessRunError::Bootstrap {
+                    stage: "model selector bootstrap",
+                    code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT,
+                    message: "provider/model selector has an empty model".into(),
+                    retryable: false,
+                });
+            }
+            if let Some(explicit_provider) = explicit_provider.as_ref()
+                && explicit_provider != candidate
+            {
+                return Err(HeadlessRunError::Bootstrap {
+                    stage: "model selector bootstrap",
+                    code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT,
+                    message: format!(
+                        "model selector names provider `{candidate}`, which conflicts with explicit provider `{explicit_provider}`"
+                    ),
+                    retryable: false,
+                });
+            }
+            return Ok((
+                Some(candidate.to_owned()),
+                Some(model.to_owned()),
+                Some(candidate.to_owned()),
+            ));
+        }
+    }
+    Ok((explicit_provider, Some(selector.to_owned()), None))
+}
+
+async fn apply_headless_session_config(
+    connection: &mut HeadlessConnection,
+    session_id: &SessionId,
+    resolved_model: &str,
+    selected_provider: Option<String>,
+    config: &HeadlessSessionConfig,
+) -> Result<(), HeadlessRunError> {
+    if config.account.is_some() {
+        return Err(HeadlessRunError::Bootstrap {
+            stage: "session config",
+            code: "missing_feature",
+            message: format!(
+                "daemon does not provide the required `{FEATURE_SESSION_ACCOUNT_SELECT_V1}` capability"
+            ),
+            retryable: false,
+        });
+    }
+    if config.model.is_some() {
+        let response = connection
+            .client
+            .request(RequestBody::SessionSelectModel {
+                command_id: CommandId::new(command_id("headless-select-model")),
+                session_id: session_id.clone(),
+                worker_generation: connection.worker_generation,
+                model: resolved_model.to_owned(),
+                provider: selected_provider,
+                confirm_new_epoch: false,
+            })
+            .await
+            .map_err(|error| client_error_as_headless("session.select_model", error))?;
+        connection.worker_generation = headless_selection_generation(
+            response,
+            session_id,
+            HeadlessSelectionKind::Model,
+            "session.select_model",
+        )?;
+    }
+    if let Some(effort) = config.effort.as_ref() {
+        let response = connection
+            .client
+            .request(RequestBody::SessionSelectEffort {
+                command_id: CommandId::new(command_id("headless-select-effort")),
+                session_id: session_id.clone(),
+                worker_generation: connection.worker_generation,
+                effort: Some(effort.clone()),
+                confirm_new_epoch: false,
+            })
+            .await
+            .map_err(|error| client_error_as_headless("session.select_effort", error))?;
+        connection.worker_generation = headless_selection_generation(
+            response,
+            session_id,
+            HeadlessSelectionKind::Effort,
+            "session.select_effort",
+        )?;
+    }
+    if let Some(enabled) = config.fast {
+        let response = connection
+            .client
+            .request(RequestBody::SessionSelectFast {
+                command_id: CommandId::new(command_id("headless-select-fast")),
+                session_id: session_id.clone(),
+                worker_generation: connection.worker_generation,
+                enabled,
+                confirm_new_epoch: false,
+            })
+            .await
+            .map_err(|error| client_error_as_headless("session.select_fast", error))?;
+        connection.worker_generation = headless_selection_generation(
+            response,
+            session_id,
+            HeadlessSelectionKind::Fast,
+            "session.select_fast",
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum HeadlessSelectionKind {
+    Model,
+    Effort,
+    Fast,
+}
+
+fn headless_selection_generation(
+    response: ResponseBody,
+    expected_session: &SessionId,
+    kind: HeadlessSelectionKind,
+    stage: &'static str,
+) -> Result<u64, HeadlessRunError> {
+    match (kind, response) {
+        (
+            HeadlessSelectionKind::Model,
+            ResponseBody::SessionSelectModel {
+                session_id,
+                worker_generation,
+                ..
+            },
+        )
+        | (
+            HeadlessSelectionKind::Effort,
+            ResponseBody::SessionSelectEffort {
+                session_id,
+                worker_generation,
+                ..
+            },
+        )
+        | (
+            HeadlessSelectionKind::Fast,
+            ResponseBody::SessionSelectFast {
+                session_id,
+                worker_generation,
+                ..
+            },
+        ) if &session_id == expected_session => Ok(worker_generation),
+        (
+            _,
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            },
+        ) => Err(rpc_error(stage, code, message, retryable)),
+        _ => Err(protocol_error(
+            stage,
+            "response method or session did not match request",
+        )),
+    }
+}
+
 async fn active_account_provider(
     profile: &ResolvedProfile,
     ensure: &EnsureOptions,
@@ -1765,6 +2011,38 @@ fn normalize_ensure_options(
         capabilities: CapabilitySet::from([Capability::View, Capability::Control]),
         ..options.client.clone()
     };
+}
+
+fn normalize_session_config_features(options: &mut EnsureOptions, config: &HeadlessSessionConfig) {
+    if config.model.is_some()
+        || config.effort.is_some()
+        || config.fast.is_some()
+        || config.account.is_some()
+    {
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned());
+    }
+    if config.model.is_some() {
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned());
+    }
+    if config.effort.is_some() {
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned());
+    }
+    if config.fast.is_some() {
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned());
+    }
+    if config.account.is_some() {
+        options
+            .required_features
+            .insert(FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned());
+    }
 }
 
 async fn reconnect_before_session(

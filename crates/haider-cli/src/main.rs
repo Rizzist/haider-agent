@@ -19,8 +19,10 @@ use std::sync::Arc;
 pub(crate) mod export;
 pub(crate) mod graph;
 pub(crate) mod hooks;
+pub(crate) mod models;
 pub(crate) mod observe;
 pub(crate) mod run;
+pub(crate) mod session_config;
 pub(crate) mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -104,7 +106,13 @@ async fn dispatch() -> ExitCode {
         [command, rest @ ..] if command == "run" => run::run_command(rest).await,
         [command, rest @ ..] if command == "status" => observe::status_command(rest).await,
         [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
+        [command, session_id, subcommand, rest @ ..]
+            if command == "session" && subcommand == "config" =>
+        {
+            session_config::session_config_command(session_id, rest).await
+        }
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
+        [command, rest @ ..] if command == "models" => models::models_command(rest).await,
         [command, rest @ ..] if command == "fleet" => observe::fleet_command(rest).await,
         [command, rest @ ..] if command == "events" => observe::events_command(rest).await,
         [command, rest @ ..] if command == "graph" => graph::graph_command(rest).await,
@@ -118,9 +126,12 @@ async fn dispatch() -> ExitCode {
                 "haider: unknown or incomplete command `{other}` \
                  (supports: --version, self-test, run <prompt> \
                  [--output print|json|jsonl] [--timeout <dur>] \
+                 [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--allow-writes] [--allow-exec] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], sessions [--json] [--no-spawn], \
                  session <id> [--json|--watch] [--no-spawn], \
+                 session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
+                 models [--json], \
                  fleet [<session-id>] [--json] [--no-spawn], \
                  events [--follow] [--no-spawn], \
                  graph status <session-id> [--json], graph pin <session-id>, \

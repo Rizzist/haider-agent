@@ -256,6 +256,11 @@ pub const FEATURE_PROVIDER_CONFIGURE_V1: &str = "provider_configure_v1";
 pub const FEATURE_PROVIDER_REMOVE_V1: &str = "provider_remove_v1";
 /// Daemon implements provider-owned model discovery refresh.
 pub const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
+
+/// Headless enumeration of every registered provider and its complete
+/// published model inventory, composed from `provider.list` and
+/// `account.list` without probing providers inline.
+pub const FEATURE_MODELS_LIST_V1: &str = "models_list_v1";
 /// Daemon implements live same-provider account rotation.
 pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 /// Daemon implements receipt-backed direct user shell execution.
@@ -297,6 +302,11 @@ pub const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
 /// (`session.select_fast`), statically gated to the pairs Anthropic
 /// documents for the fast-mode research preview (G3).
 pub const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
+
+/// Headless read/write access to the durable per-session provider/model,
+/// effort, and speed configuration through the existing observation and
+/// receipted selection methods.
+pub const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
