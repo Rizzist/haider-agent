@@ -78,6 +78,12 @@ pub struct DiscoveredModelExtensions {
     pub supports_vision: bool,
     pub supports_tool_use: bool,
     pub supports_thinking_type: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_reasoning_effort: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The result of one discovery attempt.
@@ -119,12 +125,16 @@ pub enum CatalogSource {
     AnthropicSubscription,
     /// Kimi Code's nonstandard OAuth catalog.
     KimiOAuth,
+    /// xAI's Grok subscription proxy catalog.
+    GrokOAuth,
     /// Gemini's fixed model catalog authenticated by `x-goog-api-key`.
     GeminiApiKey,
     /// An OpenAI-compatible custom profile's stored API origin.
     OpenAiCompatible { origin: String },
     /// DeepSeek's fixed OpenAI-compatible API-key catalog.
     DeepSeekApi,
+    /// xAI's fixed OpenAI-compatible API-key catalog.
+    XaiApi,
 }
 
 /// The final request URL for a source's model catalog.
@@ -142,9 +152,11 @@ pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
         }
         CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
+        | CatalogSource::GrokOAuth
         | CatalogSource::GeminiApiKey
         | CatalogSource::OpenAiCompatible { .. }
-        | CatalogSource::DeepSeekApi => endpoint.to_owned(),
+        | CatalogSource::DeepSeekApi
+        | CatalogSource::XaiApi => endpoint.to_owned(),
     }
 }
 
@@ -160,11 +172,13 @@ impl CatalogSource {
                 format!("{}/v1/models", crate::ANTHROPIC_OAUTH_BASE_URL)
             }
             Self::KimiOAuth => format!("{}/models", crate::KIMI_OAUTH_BASE_URL),
+            Self::GrokOAuth => format!("{}/models", crate::GROK_OAUTH_BASE_URL),
             Self::GeminiApiKey => crate::GEMINI_MODELS_URL.to_owned(),
             Self::OpenAiCompatible { origin } => {
                 format!("{}/models", origin.trim().trim_end_matches('/'))
             }
             Self::DeepSeekApi => format!("{}/models", crate::DEEPSEEK_BASE_URL),
+            Self::XaiApi => format!("{}/models", crate::XAI_BASE_URL),
         }
     }
 
@@ -173,9 +187,11 @@ impl CatalogSource {
             Self::OpenAiSubscription => Some("chatgpt.com"),
             Self::AnthropicSubscription => Some("api.anthropic.com"),
             Self::KimiOAuth => Some("api.kimi.com"),
+            Self::GrokOAuth => Some("cli-chat-proxy.grok.com"),
             Self::GeminiApiKey => Some("generativelanguage.googleapis.com"),
             Self::OpenAiCompatible { .. } => None,
             Self::DeepSeekApi => Some("api.deepseek.com"),
+            Self::XaiApi => Some("api.x.ai"),
         }
     }
 }
@@ -202,8 +218,10 @@ impl CatalogSource {
             Self::OpenAiSubscription
             | Self::AnthropicSubscription
             | Self::KimiOAuth
+            | Self::GrokOAuth
             | Self::OpenAiCompatible { .. }
-            | Self::DeepSeekApi => CatalogAuthMode::Bearer,
+            | Self::DeepSeekApi
+            | Self::XaiApi => CatalogAuthMode::Bearer,
         }
     }
 }
@@ -295,8 +313,10 @@ pub async fn discover_models_with_resolver(
         CatalogSource::OpenAiSubscription
         | CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
+        | CatalogSource::GrokOAuth
         | CatalogSource::GeminiApiKey
-        | CatalogSource::DeepSeekApi => {
+        | CatalogSource::DeepSeekApi
+        | CatalogSource::XaiApi => {
             let endpoint = source.endpoint();
             let Some(trusted_host) = source.trusted_host() else {
                 return Err(CatalogError::Unavailable {
@@ -338,6 +358,9 @@ pub async fn discover_models_with_resolver(
         .header(reqwest::header::CONNECTION, "close")
         .header(reqwest::header::ACCEPT, "application/json");
     request = apply_catalog_credential(request, &source, access_token)?;
+    if matches!(source, CatalogSource::GrokOAuth) {
+        request = crate::openai::apply_grok_subscription_headers(request, None);
+    }
     if let Some(etag) = etag {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
@@ -422,8 +445,10 @@ pub fn parse_catalog(
         // Anthropic and OpenAI-compatible: `{ "data": [ … ] }`
         CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
+        | CatalogSource::GrokOAuth
         | CatalogSource::OpenAiCompatible { .. }
-        | CatalogSource::DeepSeekApi => value.get("data"),
+        | CatalogSource::DeepSeekApi
+        | CatalogSource::XaiApi => value.get("data"),
     }
     .and_then(serde_json::Value::as_array)
     .ok_or_else(|| CatalogError::Unavailable {
@@ -459,7 +484,9 @@ pub fn parse_catalog(
         }
         if matches!(
             source,
-            CatalogSource::OpenAiCompatible { .. } | CatalogSource::DeepSeekApi
+            CatalogSource::OpenAiCompatible { .. }
+                | CatalogSource::DeepSeekApi
+                | CatalogSource::XaiApi
         ) {
             let Some(slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
@@ -497,6 +524,7 @@ pub fn parse_catalog(
         };
         let display_name = entry
             .get("display_name")
+            .or_else(|| entry.get("name"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or(slug)
             .to_owned();
@@ -525,10 +553,15 @@ pub fn parse_catalog(
                 .get("context_length")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|window| *window > 0),
+            CatalogSource::GrokOAuth => entry
+                .get("context_window")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|window| *window > 0),
             CatalogSource::AnthropicSubscription
             | CatalogSource::GeminiApiKey
             | CatalogSource::OpenAiCompatible { .. }
-            | CatalogSource::DeepSeekApi => None,
+            | CatalogSource::DeepSeekApi
+            | CatalogSource::XaiApi => None,
         };
         let kimi_extensions =
             matches!(source, CatalogSource::KimiOAuth).then(|| DiscoveredModelExtensions {
@@ -551,6 +584,22 @@ pub fn parse_catalog(
                     .unwrap_or(false),
                 supports_thinking_type: entry
                     .get("supports_thinking_type")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                supports_reasoning_effort: false,
+            });
+        let grok_extensions =
+            matches!(source, CatalogSource::GrokOAuth).then(|| DiscoveredModelExtensions {
+                protocol: "openai".to_owned(),
+                supports_reasoning: entry
+                    .get("supports_reasoning_effort")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                supports_vision: true,
+                supports_tool_use: true,
+                supports_thinking_type: false,
+                supports_reasoning_effort: entry
+                    .get("supports_reasoning_effort")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
             });
@@ -589,7 +638,7 @@ pub fn parse_catalog(
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|visibility| visibility == "list"),
             priority: entry.get("priority").and_then(serde_json::Value::as_i64),
-            extensions: kimi_extensions,
+            extensions: kimi_extensions.or(grok_extensions),
         });
     }
     Ok(models)

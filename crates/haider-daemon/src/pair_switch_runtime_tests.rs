@@ -1469,6 +1469,8 @@ fn opaque_tag_table_and_strip_are_exact() {
         ("openai-compatible", "openai-compatible"),
         ("kimi-oauth", "openai-compatible"),
         ("deepseek", "openai-compatible"),
+        ("xai", "openai-compatible"),
+        ("grok-oauth", "openai-compatible"),
         ("custom-lab", "openai-compatible"),
     ] {
         assert_eq!(accepted_opaque_provider(provider), accepted, "{provider}");

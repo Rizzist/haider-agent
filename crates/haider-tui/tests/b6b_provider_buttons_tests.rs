@@ -69,11 +69,15 @@ fn draw(model: &AppModel, width: u16, height: u16) -> (String, Vec<(ratatui::lay
 /// seams the older buttons use: kimi through `AppRequest::OAuthAddStart` →
 /// `LiveCommand::OAuthStart` under provider `kimi-oauth`, gemini through the
 /// masked login card under provider `gemini` (whose submit is the existing
-/// vault.stage → account.login_api transaction).
+/// vault.stage → account.login_api transaction). Grok/xAI pin those same
+/// seams for the new device-code and API-key lanes.
 ///
 /// MUTATION CHECK: map `AccountAddKind::KimiOAuth` to `"openai-oauth"` in
 /// `open_oauth_add` (a plausible copy-paste). Expected RUNTIME failure: the
 /// issued `OAuthStart` below carries the wrong provider.
+/// MUTATION CHECK: map `GrokOAuth` to `kimi-oauth`, remove its device-code
+/// render classification, or map `XaiApi` to `deepseek`; the provider,
+/// alias, flow-copy, and hit assertions below fail at runtime.
 /// Verified by revert on 2026-08-02.
 #[test]
 fn kimi_and_gemini_buttons_dispatch_the_daemon_flows() {
@@ -115,6 +119,37 @@ fn kimi_and_gemini_buttons_dispatch_the_daemon_flows() {
         model.oauth_add.is_none(),
         "an API add never opens the OAuth card"
     );
+
+    // Grok subscription: the same device-code wire, under its distinct
+    // subscription provider id.
+    let mut model = live_accounts_model(&["account_oauth_device_v1"]);
+    model.handle_hit(Hit::AccountAdd(AccountAddKind::GrokOAuth));
+    let card = model.oauth_add.as_ref().expect("grok device card opens");
+    assert_eq!(card.provider, "grok-oauth");
+    assert_eq!(card.alias, "grok-oauth");
+    assert!(model.requests.iter().any(|request| matches!(
+        request,
+        AppRequest::OAuthAddStart { provider, alias, .. }
+            if provider == "grok-oauth" && alias == "grok-oauth"
+    )));
+    let attempt = card.attempt;
+    model.oauth_add_phase(
+        attempt,
+        haider_tui::app::OAuthAddPhase::WaitingDevice {
+            url: "https://auth.x.ai/activate?code=GROK-4620".to_owned(),
+            origin: "auth.x.ai".to_owned(),
+        },
+    );
+    let (text, _) = draw(&model, 130, 45);
+    assert!(text.contains("authorize Grok — xAI — OAuth (device code)"));
+    assert!(text.contains("enter the code at https://auth.x.ai/activate?code=GROK-4620"));
+
+    // xAI API-key lane: the named builtin uses the masked key card.
+    let mut model = live_accounts_model(&[]);
+    model.handle_hit(Hit::AccountAdd(AccountAddKind::XaiApi));
+    let card = model.login.as_ref().expect("xAI key card opens");
+    assert_eq!(card.provider, "xai");
+    assert_eq!(card.alias, "xai-api");
 }
 
 /// LAW — `/login kimi oauth` and `/login gemini api` parse into the same
@@ -269,6 +304,8 @@ fn providers_screen_shares_the_same_buttons() {
         text.contains("[+ Gemini (API)]"),
         "gemini renders on /providers"
     );
+    assert!(text.contains("[+ Grok (OAuth)]"));
+    assert!(text.contains("[+ xAI (API)]"));
     assert!(
         hits.iter()
             .any(|(_, hit)| matches!(hit, Hit::AccountAdd(AccountAddKind::KimiOAuth))),
@@ -278,6 +315,14 @@ fn providers_screen_shares_the_same_buttons() {
         hits.iter()
             .any(|(_, hit)| matches!(hit, Hit::AccountAdd(AccountAddKind::GeminiApi))),
         "gemini carries a hit region"
+    );
+    assert!(
+        hits.iter()
+            .any(|(_, hit)| matches!(hit, Hit::AccountAdd(AccountAddKind::GrokOAuth)))
+    );
+    assert!(
+        hits.iter()
+            .any(|(_, hit)| matches!(hit, Hit::AccountAdd(AccountAddKind::XaiApi)))
     );
 
     // A providers-screen click jumps home and opens the flow (the cards

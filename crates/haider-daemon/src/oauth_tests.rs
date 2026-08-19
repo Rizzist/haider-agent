@@ -1024,7 +1024,7 @@ async fn wait_ready(coordinator: &OAuthCoordinator, flow_id: &OAuthFlowId) -> OA
 /// Verified by revert on 2026-07-29.
 #[test]
 fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
-    assert_eq!(SANCTIONED_PROVIDER_REGISTRATIONS.len(), 3);
+    assert_eq!(SANCTIONED_PROVIDER_REGISTRATIONS.len(), 4);
     let openai = SANCTIONED_PROVIDER_REGISTRATIONS
         .iter()
         .find(|registration| registration.provider_id == "openai-oauth")
@@ -1140,8 +1140,54 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
         }
     );
 
+    // MUTATION CHECK: any endpoint, client-id, scope, encoding, flow, or
+    // proxy-origin drift must fail this release-owned Grok registration pin.
+    let grok = SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == "grok-oauth")
+        .expect("Grok OAuth registration");
+    assert_eq!(grok.issuer, "https://auth.x.ai");
+    assert_eq!(
+        grok.authorization_endpoint,
+        "https://auth.x.ai/oauth2/device/code"
+    );
+    assert_eq!(grok.token_endpoint, "https://auth.x.ai/oauth2/token");
+    assert_eq!(grok.client_id, "b1a00492-073a-47ea-816f-4c329264a828");
+    assert_eq!(
+        grok.scopes,
+        &[
+            "openid",
+            "profile",
+            "email",
+            "offline_access",
+            "grok-cli:access",
+            "api:access",
+            "conversations:read",
+            "conversations:write",
+        ]
+    );
+    assert_eq!(grok.flow_mode, OAuthFlowMode::DeviceCode);
+    assert_eq!(grok.auth_header_set, OAuthAuthHeaderSet::Standard);
+    assert_eq!(grok.refresh_policy, OAuthRefreshPolicy::Conservative);
+    assert_eq!(grok.refresh_encoding, OAuthTokenRequestEncoding::Form);
+    assert!(!grok.refresh_includes_binding);
+    assert!(grok.retain_refresh_on_omission);
+    assert_eq!(
+        grok.inference,
+        OAuthInferenceRegistration {
+            base_url: "https://cli-chat-proxy.grok.com/v1",
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::GrokOpenAiChatCompletions,
+        }
+    );
+
     let catalog = OAuthProviderCatalog::default();
-    for provider in ["openai-oauth", "anthropic-oauth", "kimi-oauth"] {
+    for provider in [
+        "openai-oauth",
+        "anthropic-oauth",
+        "kimi-oauth",
+        "grok-oauth",
+    ] {
         assert_eq!(
             catalog.availability(provider, true),
             OAuthAvailabilityWire {
@@ -1573,6 +1619,47 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
         bundle.identity.subject_hash,
         blake3::hash(b"fake-account-id-1").to_hex().to_string()
     );
+}
+
+/// MUTATION CHECK: remove either untagged Grok CLI auth.json arm, lose the
+/// refresh token, or trust a mismatched issuer. Each official shape below
+/// must yield the same sanctioned provider identity without exposing bytes.
+#[test]
+fn grok_cli_import_accepts_bare_and_bundle_auth_json_shapes() {
+    let registration = OAuthProviderCatalog::default()
+        .registration(haider_provider::GROK_OAUTH_PROVIDER_NAME)
+        .expect("Grok OAuth registration");
+    let bare = grok_import_bundle(
+        Path::new("/tmp/fake-grok-auth.json"),
+        br#""fake-grok-bare-access""#,
+        &registration,
+        1,
+    )
+    .expect("bare Grok token");
+    assert_eq!(bare.provider_id, "grok-oauth");
+    assert_eq!(bare.access_token(), b"fake-grok-bare-access");
+    assert!(bare.refresh_token().is_none());
+
+    let object = grok_import_bundle(
+        Path::new("/tmp/fake-grok-auth.json"),
+        br#"{
+            "access_token":"fake-grok-object-access",
+            "refresh_token":"fake-grok-object-refresh",
+            "expires_in":3600,
+            "issuer":"https://auth.x.ai"
+        }"#,
+        &registration,
+        2,
+    )
+    .expect("object Grok token bundle");
+    assert_eq!(object.provider_id, "grok-oauth");
+    assert_eq!(object.access_token(), b"fake-grok-object-access");
+    assert_eq!(
+        object.refresh_token(),
+        Some(b"fake-grok-object-refresh".as_slice())
+    );
+    assert_eq!(object.generation, 2);
+    assert_eq!(object.granted_scopes, registration.scopes);
 }
 
 /// MUTATION CHECK: give native-store bytes a separate parser or bypass the
@@ -3328,7 +3415,7 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
         .build()
         .expect("device fixture client");
 
-    let authorization = request_device_authorization(&client, &registration, &device_id)
+    let authorization = request_device_authorization(&client, &registration, Some(&device_id))
         .await
         .expect("device authorization");
     assert_eq!(authorization.user_code.0.as_slice(), b"ABCD-EFGH");
@@ -3337,7 +3424,7 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
             &client,
             &registration,
             authorization.device_code.0.as_slice(),
-            &device_id,
+            Some(&device_id),
         )
         .await
         .expect("pending poll"),
@@ -3348,7 +3435,7 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
             &client,
             &registration,
             authorization.device_code.0.as_slice(),
-            &device_id,
+            Some(&device_id),
         )
         .await
         .expect("slow-down poll"),
@@ -3358,7 +3445,7 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
         &client,
         &registration,
         authorization.device_code.0.as_slice(),
-        &device_id,
+        Some(&device_id),
     )
     .await
     .expect("successful poll") else {

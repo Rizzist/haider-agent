@@ -219,13 +219,13 @@ fn scroll_indicator_marks_hidden_content_honestly() {
     let (rows, _) = draw(&model, 100, 24);
     assert!(rows[0].starts_with('⋮'), "content hidden above at the end");
 
-    // A short roster (the seed alone, including the named DeepSeek card) at
-    // a tall frame: no marks at all.
+    // A short roster (the seed alone, including the named DeepSeek, xAI,
+    // and Grok OAuth cards) at a tall frame: no marks at all.
     let mut short = launcher_model();
     run_slash(&mut short, "/providers");
     short.requests.clear();
     short.providers.apply_snapshot(seed_provider_summaries(), 1);
-    let (rows, _) = draw(&short, 100, 56);
+    let (rows, _) = draw(&short, 100, 64);
     assert!(
         !rows.iter().any(|row| row.starts_with('⋮')),
         "no phantom scroll marks when everything fits"

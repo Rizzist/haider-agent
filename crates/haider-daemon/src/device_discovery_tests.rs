@@ -28,6 +28,7 @@ const DISCOVERY_ENV_VARS: &[&str] = &[
     "HAIDER_CLAUDE_OAUTH_PATH",
     "HAIDER_KIMI_CREDS_PATH",
     "HAIDER_KIMI_DEVICE_ID_PATH",
+    "HAIDER_GROK_AUTH_PATH",
     "HAIDER_GEMINI_CREDS_PATH",
     "HAIDER_DEVICE_DISCOVERY_DISABLED",
 ];
@@ -305,6 +306,16 @@ fn populated_home(home: &Path) -> (String, String) {
     write_store(home, ".kimi/device_id", KIMI_DEVICE_ID_FIXTURE.as_bytes());
     write_store(
         home,
+        ".grok/auth.json",
+        br#"{
+  "access_token": "fake-grok-access-token-d1",
+  "refresh_token": "fake-grok-refresh-token-d1",
+  "expires_in": 3600,
+  "issuer": "https://auth.x.ai"
+}"#,
+    );
+    write_store(
+        home,
         ".gemini/oauth_creds.json",
         br#"{
   "access_token": "fake-gemini-access-token-d1",
@@ -338,8 +349,8 @@ fn discovery_reports_metadata_never_token_bytes() {
     let candidates = discover_device_candidates(false);
     assert_eq!(
         candidates.len(),
-        4,
-        "expected codex + claude + kimi + gemini candidates, got {candidates:?}"
+        5,
+        "expected codex + claude + kimi + grok + gemini candidates, got {candidates:?}"
     );
 
     let response = serde_json::to_string(&haider_rpc::ResponseBody::AccountDeviceCandidates {
@@ -360,6 +371,8 @@ fn discovery_reports_metadata_never_token_bytes() {
         "fake-claude-refresh-token-d1",
         "fake-kimi-access-token-d1",
         "fake-kimi-refresh-token-d1",
+        "fake-grok-access-token-d1",
+        "fake-grok-refresh-token-d1",
         "fake-gemini-access-token-d1",
         "fake-gemini-refresh-token-d1",
         KIMI_DEVICE_ID_FIXTURE,
@@ -413,6 +426,11 @@ fn discovery_reports_metadata_never_token_bytes() {
         "valid device id supports import"
     );
     assert_eq!(kimi.import_source, Some("kimi-code"));
+
+    let grok = by_provider("grok-oauth");
+    assert_eq!(grok.wire.source_label, "Grok CLI");
+    assert!(grok.wire.import_supported);
+    assert_eq!(grok.import_source, Some("grok-cli"));
 
     let gemini = by_provider("gemini");
     assert!(!gemini.wire.import_supported);

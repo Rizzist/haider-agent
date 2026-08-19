@@ -1080,9 +1080,10 @@ fn mv6_terminal_snapshot_drops_live_and_retains_error_cancel_partials() {
     }
 }
 
-/// LAW (meter_routing_is_flavor_and_provider_strict): only the three
-/// sanctioned OAuth subscriptions route to a meter; the SAME provider names
-/// under an API key, and any other provider under OAuth, are meterless.
+/// LAW (meter_routing_is_flavor_and_provider_strict): only the three OAuth
+/// subscriptions with supported server meters route to one; Grok's quota
+/// lane, the SAME provider names under an API key, and unknown providers are
+/// meterless.
 #[test]
 fn meter_routing_is_flavor_and_provider_strict() {
     use haider_provider::UsageMeterEndpoint;
@@ -1090,10 +1091,14 @@ fn meter_routing_is_flavor_and_provider_strict() {
         ("openai-oauth", Some(UsageMeterEndpoint::OpenAiOauth)),
         ("anthropic-oauth", Some(UsageMeterEndpoint::AnthropicOauth)),
         ("kimi-oauth", Some(UsageMeterEndpoint::KimiOauth)),
+        // Grok's proxy exposes quota rather than a stable metering endpoint;
+        // local usage remains zero-cost under the subscription pricing lane.
+        ("grok-oauth", None),
         ("openai", None),
         ("anthropic", None),
         ("gemini", None),
         ("deepseek", None),
+        ("xai", None),
         ("opencode-zen", None),
     ];
     for (provider, expected) in cases {

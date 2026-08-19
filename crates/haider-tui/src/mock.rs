@@ -484,6 +484,28 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             Some("deepseek-chat"),
             true,
         ),
+        summary(
+            "xai",
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            Some("https://api.x.ai/v1"),
+            &["grok-4.6", "grok-4.5", "grok-4.3", "grok-build-0.1"],
+            &[AuthMethod::ApiKey],
+            ProviderAvailabilityWire::Unavailable,
+            Some("provider has no credential"),
+            Some("grok-4.6"),
+            true,
+        ),
+        summary(
+            "grok-oauth",
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            Some("https://cli-chat-proxy.grok.com/v1"),
+            &["grok-4.6", "grok-4.5"],
+            &[AuthMethod::OAuth],
+            ProviderAvailabilityWire::Unavailable,
+            Some("provider has no credential"),
+            Some("grok-4.6"),
+            true,
+        ),
     ]
 }
 

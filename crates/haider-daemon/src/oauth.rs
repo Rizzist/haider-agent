@@ -266,6 +266,7 @@ pub enum OAuthInferenceHeaderSet {
     OpenAiCodexResponsesLite,
     AnthropicOAuthBeta,
     KimiOpenAiChatCompletions,
+    GrokOpenAiChatCompletions,
 }
 
 /// The only callback policy supported by the generic engine.
@@ -393,6 +394,45 @@ pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
         flow_mode: OAuthFlowMode::DeviceCode,
         auth_header_set: OAuthAuthHeaderSet::KimiMsh,
         refresh_policy: OAuthRefreshPolicy::SerializedRotating,
+    },
+    SanctionedOAuthRegistration {
+        provider_id: haider_provider::GROK_OAUTH_PROVIDER_NAME,
+        issuer: "https://auth.x.ai",
+        authorization_endpoint: "https://auth.x.ai/oauth2/device/code",
+        token_endpoint: "https://auth.x.ai/oauth2/token",
+        client_id: "b1a00492-073a-47ea-816f-4c329264a828",
+        scopes: &[
+            "openid",
+            "profile",
+            "email",
+            "offline_access",
+            "grok-cli:access",
+            "api:access",
+            "conversations:read",
+            "conversations:write",
+        ],
+        audience: "b1a00492-073a-47ea-816f-4c329264a828",
+        resource: None,
+        redirect_policy: OAuthRedirectPolicy::EphemeralIpv4Loopback,
+        authorize_parameters: &[],
+        send_nonce_in_authorize: false,
+        send_audience_in_authorize: false,
+        authorization_code_encoding: OAuthTokenRequestEncoding::Form,
+        authorization_code_includes_state: false,
+        refresh_encoding: OAuthTokenRequestEncoding::Form,
+        refresh_includes_binding: false,
+        retain_refresh_on_omission: true,
+        identity_mode: OAuthIdentityMode::TokenEndpointGrant {
+            display_identity: "SuperGrok/X Premium subscription",
+        },
+        inference: OAuthInferenceRegistration {
+            base_url: haider_provider::GROK_OAUTH_BASE_URL,
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::GrokOpenAiChatCompletions,
+        },
+        flow_mode: OAuthFlowMode::DeviceCode,
+        auth_header_set: OAuthAuthHeaderSet::Standard,
+        refresh_policy: OAuthRefreshPolicy::Conservative,
     },
 ];
 
@@ -992,9 +1032,16 @@ pub(crate) fn oauth_import_source_spec(source: &str) -> Result<OAuthImportSource
             env_override: "HAIDER_KIMI_CREDS_PATH",
             home_relative_path: ".kimi/credentials/kimi-code.json",
         }),
+        "grok-cli" => Ok(OAuthImportSourceSpec {
+            source: "grok-cli",
+            provider: haider_provider::GROK_OAUTH_PROVIDER_NAME,
+            default_alias: haider_provider::GROK_OAUTH_PROVIDER_NAME,
+            env_override: "HAIDER_GROK_AUTH_PATH",
+            home_relative_path: ".grok/auth.json",
+        }),
         _ => Err(HaiderError::new(
             ErrorCode::InvalidArgument,
-            "OAuth import source must be codex, claude-code, or kimi-code",
+            "OAuth import source must be codex, claude-code, kimi-code, or grok-cli",
             false,
         )),
     }
@@ -1527,6 +1574,7 @@ fn load_oauth_import_material_from_input(
         "codex" => codex_import_bundle(&path, &bytes, &registration, generation),
         "claude-code" => claude_import_bundle(&path, &bytes, &registration, generation),
         "kimi-code" => kimi_import_bundle(&path, &bytes, &registration, generation),
+        "grok-cli" => grok_import_bundle(&path, &bytes, &registration, generation),
         _ => unreachable!("source spec is closed"),
     }?;
     match spec.source {
@@ -1540,6 +1588,7 @@ fn load_oauth_import_material_from_input(
                 " · independently imported"
             }),
         "kimi-code" => bundle.identity.display_identity.push_str(" · Kimi Code"),
+        "grok-cli" => bundle.identity.display_identity.push_str(" · Grok CLI"),
         _ => {}
     }
     let kimi_device_id = if spec.source == "kimi-code" {
@@ -1913,6 +1962,84 @@ fn kimi_import_bundle(
             )
     })
     .map_err(|_| invalid_import(path, "kimi-code"))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GrokCredentials {
+    Bare(SecretJson),
+    Bundle {
+        access_token: SecretJson,
+        #[serde(default)]
+        refresh_token: Option<SecretJson>,
+        #[serde(default)]
+        expires_in: Option<u64>,
+        #[serde(default)]
+        issuer: Option<String>,
+    },
+}
+
+/// Converts both official Grok CLI auth-store shapes without retaining the
+/// source JSON. The bare-token legacy shape has no expiry metadata, so it is
+/// deliberately short-lived and cannot refresh; a 401 then drives re-login.
+fn grok_import_bundle(
+    path: &Path,
+    bytes: &[u8],
+    registration: &OAuthProviderRegistration,
+    generation: u64,
+) -> Result<OAuthTokenBundleV1, HaiderError> {
+    let credentials: GrokCredentials = serde_json::from_slice(bytes)
+        .map_err(|error| malformed_import(path, "grok-cli", &error))?;
+    let (access_token, refresh_token, expires_in, issuer) = match credentials {
+        GrokCredentials::Bare(token) => (token.0, None, 15 * 60, None),
+        GrokCredentials::Bundle {
+            access_token,
+            refresh_token,
+            expires_in,
+            issuer,
+        } => (
+            access_token.0,
+            refresh_token.map(|token| token.0),
+            expires_in.unwrap_or(60 * 60),
+            issuer,
+        ),
+    };
+    if access_token.is_empty()
+        || refresh_token.as_ref().is_some_and(|token| token.is_empty())
+        || expires_in == 0
+        || expires_in > MAX_TOKEN_LIFETIME_SECS
+        || issuer
+            .as_deref()
+            .is_some_and(|value| value != registration.issuer)
+    {
+        return Err(invalid_import(path, "grok-cli"));
+    }
+    let now = now_ms().ok_or_else(|| invalid_import(path, "grok-cli"))?;
+    let expires_at_unix_ms = now
+        .checked_add(expires_in.saturating_mul(1000))
+        .ok_or_else(|| invalid_import(path, "grok-cli"))?;
+    let source_access_fingerprint = *blake3::hash(&access_token).as_bytes();
+    OAuthTokenBundleV1::new(
+        registration.provider_id.clone(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".to_owned(),
+        access_token,
+        refresh_token,
+        expires_at_unix_ms,
+        None,
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: blake3::Hash::from_bytes(source_access_fingerprint)
+                .to_hex()
+                .to_string(),
+            display_identity: "SuperGrok/X Premium subscription".into(),
+        },
+        generation,
+    )
+    .map(|bundle| bundle.with_import_source_access_fingerprint(source_access_fingerprint))
+    .map_err(|_| invalid_import(path, "grok-cli"))
 }
 
 fn decode_unverified_jwt_payload<T>(token: &[u8]) -> Option<T>
@@ -2655,7 +2782,10 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
 struct DeviceAuthorizationResponse {
     device_code: SecretJson,
     user_code: SecretJson,
-    verification_uri_complete: SecretJson,
+    #[serde(default)]
+    verification_uri_complete: Option<SecretJson>,
+    #[serde(default)]
+    verification_uri: Option<SecretJson>,
     expires_in: u64,
     #[serde(default = "default_device_poll_interval")]
     interval: u64,
@@ -2680,21 +2810,30 @@ async fn begin_device_flow(
     registration: Arc<OAuthProviderRegistration>,
 ) {
     let owner_connection = job.owner.connection_id.clone();
-    let device_id = match load_or_create_kimi_device_id(Arc::clone(&inner.vault)).await {
-        Ok(device_id) => device_id,
+    let device_id = if registration.auth_header_set == OAuthAuthHeaderSet::KimiMsh {
+        match load_or_create_kimi_device_id(Arc::clone(&inner.vault)).await {
+            Ok(device_id) => Some(device_id),
+            Err(error) => {
+                respond_public_error(&job.route, error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let authorization = match request_device_authorization(
+        &inner.client,
+        &registration,
+        device_id.as_ref(),
+    )
+    .await
+    {
+        Ok(authorization) => authorization,
         Err(error) => {
             respond_public_error(&job.route, error);
             return;
         }
     };
-    let authorization =
-        match request_device_authorization(&inner.client, &registration, &device_id).await {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                respond_public_error(&job.route, error);
-                return;
-            }
-        };
     if authorization.expires_in == 0
         || authorization.expires_in > MAX_TOKEN_LIFETIME_SECS
         || authorization.interval == 0
@@ -2707,11 +2846,23 @@ async fn begin_device_flow(
         );
         return;
     }
-    let verification = match std::str::from_utf8(&authorization.verification_uri_complete.0)
-        .ok()
+    let verification = authorization
+        .verification_uri_complete
+        .as_ref()
+        .and_then(|value| std::str::from_utf8(&value.0).ok())
         .and_then(|value| Url::parse(value).ok())
-        .filter(|url| same_origin(url, &registration.authorization_endpoint))
-    {
+        .or_else(|| {
+            let mut url = authorization
+                .verification_uri
+                .as_ref()
+                .and_then(|value| std::str::from_utf8(&value.0).ok())
+                .and_then(|value| Url::parse(value).ok())?;
+            let user_code = std::str::from_utf8(&authorization.user_code.0).ok()?;
+            url.query_pairs_mut().append_pair("user_code", user_code);
+            Some(url)
+        })
+        .filter(|url| same_origin(url, &registration.authorization_endpoint));
+    let verification = match verification {
         Some(verification) => verification,
         None => {
             respond_public_error(
@@ -2829,7 +2980,7 @@ async fn run_device_token_flow(
     flow_id: OAuthFlowId,
     registration: Arc<OAuthProviderRegistration>,
     device_code: Zeroizing<Vec<u8>>,
-    device_id: SecretHandle,
+    device_id: Option<SecretHandle>,
     mut interval: Duration,
     flow_ttl: Duration,
     mut cancel: watch::Receiver<bool>,
@@ -2850,7 +3001,12 @@ async fn run_device_token_flow(
             }
             () = tokio::time::sleep(interval) => {}
         }
-        let poll = poll_device_token(&inner.client, &registration, &device_code, &device_id);
+        let poll = poll_device_token(
+            &inner.client,
+            &registration,
+            &device_code,
+            device_id.as_ref(),
+        );
         tokio::pin!(poll);
         let result = tokio::select! {
             _ = &mut deadline => {
@@ -2972,11 +3128,14 @@ async fn validate_kimi_oauth_bundle(bundle: &OAuthTokenBundleV1) -> Result<(), O
 async fn request_device_authorization(
     client: &reqwest::Client,
     registration: &OAuthProviderRegistration,
-    device_id: &SecretHandle,
+    device_id: Option<&SecretHandle>,
 ) -> Result<DeviceAuthorizationResponse, OAuthPublicError> {
     let body = {
         let mut encoded = url::form_urlencoded::Serializer::new(SecretFormBody::empty());
         encoded.append_pair("client_id", &registration.client_id);
+        if !registration.scopes.is_empty() {
+            encoded.append_pair("scope", &registration.scopes.join(" "));
+        }
         encoded.finish()
     };
     let request = client
@@ -2987,7 +3146,7 @@ async fn request_device_authorization(
         )
         .header(reqwest::header::CONNECTION, "close")
         .body(reqwest::Body::from(bytes::Bytes::from_owner(body)));
-    let response = apply_oauth_auth_headers(request, registration, Some(device_id))?
+    let response = apply_oauth_auth_headers(request, registration, device_id)?
         .send()
         .await
         .map_err(|_| OAuthPublicError::new("device_authorization_unavailable", true))?;
@@ -3010,7 +3169,7 @@ async fn poll_device_token(
     client: &reqwest::Client,
     registration: &OAuthProviderRegistration,
     device_code: &[u8],
-    device_id: &SecretHandle,
+    device_id: Option<&SecretHandle>,
 ) -> Result<DeviceTokenPoll, OAuthPublicError> {
     let device_code = std::str::from_utf8(device_code)
         .map_err(|_| OAuthPublicError::new("invalid_device_code", false))?;
@@ -3030,7 +3189,7 @@ async fn poll_device_token(
         )
         .header(reqwest::header::CONNECTION, "close")
         .body(reqwest::Body::from(bytes::Bytes::from_owner(body)));
-    let response = apply_oauth_auth_headers(request, registration, Some(device_id))?
+    let response = apply_oauth_auth_headers(request, registration, device_id)?
         .send()
         .await
         .map_err(|_| OAuthPublicError::new("token_endpoint_unavailable", true))?;
@@ -4810,7 +4969,14 @@ impl CredentialBroker {
                         .refresh_after_unix_ms
                         .is_none_or(|refresh_after| now >= refresh_after)
             } else {
-                rejection_marker_active || bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
+                let proactive_skew_ms =
+                    if descriptor.provider == haider_provider::GROK_OAUTH_PROVIDER_NAME {
+                        duration_ms(Duration::from_secs(5 * 60))
+                    } else {
+                        skew_ms
+                    };
+                rejection_marker_active
+                    || bundle.expires_at_unix_ms <= now.saturating_add(proactive_skew_ms)
             };
             if force_refresh
                 || refresh_due

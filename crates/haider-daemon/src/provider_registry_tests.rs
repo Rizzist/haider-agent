@@ -483,6 +483,65 @@ fn wh1_deepseek_registry_is_builtin_chat_completions_api_key() {
     );
 }
 
+/// MUTATION CHECK: xAI and Grok OAuth must remain two distinct release-owned
+/// profiles: API-key traffic uses api.x.ai while subscription traffic uses
+/// the dedicated CLI proxy and OAuth authentication.
+#[test]
+fn xai_and_grok_oauth_registry_profiles_pin_lane_boundaries() {
+    let names = std::collections::BTreeSet::from([
+        XAI_PROVIDER_NAME.to_owned(),
+        GROK_OAUTH_PROVIDER_NAME.to_owned(),
+    ]);
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(&names, "unused"),
+        model_source([]),
+    )
+    .expect("xAI provider registry");
+
+    let xai = registry
+        .summary(XAI_PROVIDER_NAME, &|provider| provider == XAI_PROVIDER_NAME)
+        .expect("xAI API summary");
+    assert_eq!(xai.api_family, ProviderApiFamilyWire::OpenAiChatCompletions);
+    assert_eq!(xai.endpoint.as_deref(), Some(XAI_BASE_URL));
+    assert_eq!(xai.auth_methods, vec![AuthMethod::ApiKey]);
+    assert_eq!(xai.models, XAI_SEED_MODELS);
+    assert_eq!(
+        xai.model_details
+            .iter()
+            .map(|detail| (detail.name.as_str(), detail.context_window))
+            .collect::<Vec<_>>(),
+        vec![
+            ("grok-4.6", Some(500_000)),
+            ("grok-4.5", Some(500_000)),
+            ("grok-4.3", Some(1_000_000)),
+            ("grok-build-0.1", Some(256_000)),
+        ]
+    );
+    assert_eq!(xai.availability, ProviderAvailabilityWire::Available);
+
+    let grok = registry
+        .summary(GROK_OAUTH_PROVIDER_NAME, &|provider| {
+            provider == GROK_OAUTH_PROVIDER_NAME
+        })
+        .expect("Grok OAuth summary");
+    assert_eq!(
+        grok.api_family,
+        ProviderApiFamilyWire::OpenAiChatCompletions
+    );
+    assert_eq!(grok.endpoint.as_deref(), Some(GROK_OAUTH_BASE_URL));
+    assert_eq!(grok.auth_methods, vec![AuthMethod::OAuth]);
+    assert_eq!(grok.models, GROK_OAUTH_SEED_MODELS);
+    assert_eq!(
+        grok.model_details
+            .iter()
+            .map(|detail| (detail.name.as_str(), detail.context_window))
+            .collect::<Vec<_>>(),
+        vec![("grok-4.6", Some(500_000)), ("grok-4.5", Some(500_000))]
+    );
+    assert_eq!(grok.availability, ProviderAvailabilityWire::Available);
+}
+
 /// MUTATION CHECK (W5g-5 live fix): revert `configured_profiles` to
 /// validating against the bare discovery cache (no stated-inventory
 /// fallback). Expected runtime failure: the one-shot enabled create below

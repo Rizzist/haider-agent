@@ -706,7 +706,15 @@ fn enter_on_a_partial_arg_command_enters_its_slot() {
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
     assert_eq!(
         labels,
-        ["anthropic", "openai", "gemini", "kimi", "deepseek"],
+        [
+            "anthropic",
+            "openai",
+            "gemini",
+            "kimi",
+            "grok",
+            "xai",
+            "deepseek",
+        ],
         "slot rows now offered"
     );
 }

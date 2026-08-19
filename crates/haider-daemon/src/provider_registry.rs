@@ -12,10 +12,13 @@ use haider_provider::{
     ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
     ANTHROPIC_PROVIDER_NAME, BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME,
     BEDROCK_SEED_MODELS, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
-    DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME, KIMI_OAUTH_BASE_URL,
-    KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
-    VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS, azure_openai_origin, pickable,
+    DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME, GROK_OAUTH_BASE_URL,
+    GROK_OAUTH_PROVIDER_NAME, GROK_OAUTH_SEED_MODEL_CONTEXT_WINDOWS, GROK_OAUTH_SEED_MODELS,
+    KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME,
+    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
+    OPENAI_SUBSCRIPTION_RESPONSES_URL, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS, XAI_BASE_URL,
+    XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS, XAI_SEED_MODELS, azure_openai_origin,
+    pickable,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -585,7 +588,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             profile
                 .configured_models
                 .iter()
-                .map(|slug| model_detail_wire(&profile.provider_id, seeded_model(slug)))
+                .map(|slug| {
+                    model_detail_wire(
+                        &profile.provider_id,
+                        seeded_model(&profile.provider_id, slug),
+                    )
+                })
                 .collect()
         } else {
             discovered
@@ -613,7 +621,11 @@ fn seeded_inventory(profile: &ProviderProfileV1) -> bool {
         return false;
     }
     match profile.provider_id.as_str() {
-        BEDROCK_PROVIDER_NAME | VERTEX_PROVIDER_NAME | DEEPSEEK_PROVIDER_NAME => true,
+        BEDROCK_PROVIDER_NAME
+        | VERTEX_PROVIDER_NAME
+        | DEEPSEEK_PROVIDER_NAME
+        | XAI_PROVIDER_NAME
+        | GROK_OAUTH_PROVIDER_NAME => true,
         _ => {
             matches!(profile.provenance, ProviderProvenance::Custom)
                 && profile.base_url.as_deref().is_some_and(azure_openai_origin)
@@ -621,14 +633,21 @@ fn seeded_inventory(profile: &ProviderProfileV1) -> bool {
     }
 }
 
-/// A bare discovered-model row for one seeded slug: no window, no pricing,
-/// no declared efforts — "never a guess"; the static tables enrich it in
-/// [`model_detail_wire`] exactly like a discovered row.
-fn seeded_model(slug: &str) -> DiscoveredModel {
+/// A discovered-model row for one release-owned seed. Most builtins have no
+/// static window; xAI's published Grok seeds retain their pinned windows.
+fn seeded_model(provider: &str, slug: &str) -> DiscoveredModel {
+    let context_windows: &[(&str, u64)] = match provider {
+        XAI_PROVIDER_NAME => &XAI_SEED_MODEL_CONTEXT_WINDOWS,
+        GROK_OAUTH_PROVIDER_NAME => &GROK_OAUTH_SEED_MODEL_CONTEXT_WINDOWS,
+        _ => &[],
+    };
+    let context_window = context_windows
+        .iter()
+        .find_map(|(model, window)| (*model == slug).then_some(*window));
     DiscoveredModel {
         slug: slug.to_owned(),
         display_name: slug.to_owned(),
-        context_window: None,
+        context_window,
         description: None,
         default_effort: None,
         supported_efforts: Vec::new(),
@@ -837,6 +856,38 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
                 .map(|slug| (*slug).to_owned())
                 .collect(),
             default_model: Some(DEEPSEEK_SEED_MODELS[0].to_owned()),
+            provenance: ProviderProvenance::BuiltIn,
+        };
+    }
+    if provider == XAI_PROVIDER_NAME {
+        return ProviderProfileV1 {
+            provider_id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some(XAI_BASE_URL.to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: XAI_SEED_MODELS
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect(),
+            default_model: Some(XAI_SEED_MODELS[0].to_owned()),
+            provenance: ProviderProvenance::BuiltIn,
+        };
+    }
+    if provider == GROK_OAUTH_PROVIDER_NAME {
+        return ProviderProfileV1 {
+            provider_id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some(GROK_OAUTH_BASE_URL.to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::OAuth,
+            configured_models: GROK_OAUTH_SEED_MODELS
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect(),
+            default_model: Some(GROK_OAUTH_SEED_MODELS[0].to_owned()),
             provenance: ProviderProvenance::BuiltIn,
         };
     }

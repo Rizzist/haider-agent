@@ -196,6 +196,18 @@ pub const CACHE_PRICING_POLICIES: &[CachePricingPolicy] = &[
         storage_per_mtok_hour: None,
         requires_write_telemetry: false,
     },
+    CachePricingPolicy {
+        prefix: "grok-",
+        provider_prefixes: &["xai"],
+        read_semantics: CacheReadSemantics::SubsetOfInput,
+        input_per_mtok: None,
+        cached_input_per_mtok: None,
+        default_write_multiplier: 1.0,
+        write_5m_multiplier: 1.0,
+        write_1h_multiplier: 1.0,
+        storage_per_mtok_hour: None,
+        requires_write_telemetry: false,
+    },
 ];
 
 /// The bundled table (snapshot 2026-08-05; see module docs for sources).
@@ -329,6 +341,33 @@ pub const MODEL_RATES: &[ModelRate] = &[
         input_per_mtok: 2.0,
         output_per_mtok: 8.0,
         cached_input_per_mtok: Some(0.5),
+    },
+    // --- xAI (base tier below 200k prompt tokens) ---
+    // The generic pricing registry has no prompt-length tier dimension, so
+    // callers use these base rates; xAI doubles them at >=200k prompt tokens.
+    ModelRate {
+        prefix: "grok-4.6",
+        input_per_mtok: 2.0,
+        output_per_mtok: 6.0,
+        cached_input_per_mtok: Some(0.5),
+    },
+    ModelRate {
+        prefix: "grok-4.5",
+        input_per_mtok: 2.0,
+        output_per_mtok: 6.0,
+        cached_input_per_mtok: Some(0.3),
+    },
+    ModelRate {
+        prefix: "grok-4.3",
+        input_per_mtok: 1.25,
+        output_per_mtok: 2.5,
+        cached_input_per_mtok: Some(0.2),
+    },
+    ModelRate {
+        prefix: "grok-build-0.1",
+        input_per_mtok: 1.0,
+        output_per_mtok: 2.0,
+        cached_input_per_mtok: Some(0.2),
     },
     // --- Google Gemini ---
     ModelRate {
@@ -574,4 +613,35 @@ pub fn estimate_normalized_usage_cost_usd(
         }
     };
     Some(input_cost + (billed_output as f64) * base.output_per_mtok / 1_000_000.0)
+}
+
+#[cfg(test)]
+mod xai_tests {
+    use super::*;
+
+    /// MUTATION CHECK: each independently different input/cache/output rate
+    /// is pinned, including cheap `-latest` aliases through prefix matching.
+    #[test]
+    fn xai_base_tier_pricing_pins_all_seed_models() {
+        for (model, input, cached, output) in [
+            ("grok-4.6", 2.0, 0.5, 6.0),
+            ("grok-4.5", 2.0, 0.3, 6.0),
+            ("grok-4.3", 1.25, 0.2, 2.5),
+            ("grok-build-0.1", 1.0, 0.2, 2.0),
+        ] {
+            let Some(rate) = model_rate(model) else {
+                panic!("missing xAI price row for {model}");
+            };
+            assert_eq!(rate.input_per_mtok, input, "{model} input");
+            assert_eq!(rate.cached_input_per_mtok, Some(cached), "{model} cache");
+            assert_eq!(rate.output_per_mtok, output, "{model} output");
+            assert_eq!(model_rate(&format!("{model}-latest")), Some(rate));
+        }
+    }
+
+    #[test]
+    fn xai_cache_policy_is_api_lane_only() {
+        assert!(cache_pricing_policy_for("xai", "grok-4.6").is_some());
+        assert!(cache_pricing_policy_for("grok-oauth", "grok-4.6").is_none());
+    }
 }

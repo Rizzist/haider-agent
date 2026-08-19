@@ -147,9 +147,9 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
     }
 }
 
-/// Which meter (if any) serves one descriptor. Only the three sanctioned
-/// OAuth subscriptions have a server meter; every API-key, custom, or
-/// unknown provider is honest local-only accounting.
+/// Which meter (if any) serves one descriptor. Only subscriptions with a
+/// documented server meter are probed; Grok OAuth, every API-key/custom, and
+/// unknown providers remain honest local-only accounting.
 pub(crate) fn meter_for(descriptor: &CredentialDescriptor) -> Option<UsageMeterEndpoint> {
     if descriptor.auth_method != AuthMethod::OAuth {
         return None;

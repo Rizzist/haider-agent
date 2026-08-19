@@ -1427,7 +1427,7 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
     }
 }
 
-/// The account add-button rows (OAuth/API/Kimi/Gemini/HF/custom) with
+/// The account add-button rows (OAuth/API/Kimi/Grok/Gemini/HF/custom) with
 /// per-button relative hit rects — shared by /accounts and /providers
 /// (owner ask: providers should offer the SAME add options in place).
 /// B6b: the two new providers slot between the sim rows and the HF/custom
@@ -1454,8 +1454,10 @@ fn push_account_add_buttons<'a>(
                 crate::app::AccountAddKind::AnthropicApi,
             ),
             ("+ Kimi (OAuth)", crate::app::AccountAddKind::KimiOAuth),
+            ("+ Grok (OAuth)", crate::app::AccountAddKind::GrokOAuth),
             ("+ Gemini (API)", crate::app::AccountAddKind::GeminiApi),
             ("+ DeepSeek (API)", crate::app::AccountAddKind::DeepSeekApi),
+            ("+ xAI (API)", crate::app::AccountAddKind::XaiApi),
         ],
         &[
             ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
@@ -1685,10 +1687,10 @@ fn render_accounts(
     // The OAuth add card (W5e-1, sim authFlow MenuBox tui.js:3629-3682) —
     // rendered with the bottom chrome, above the add row.
     if let Some(card) = &model.oauth_add {
-        // B6b: name the flow honestly — Kimi is a device-code grant, not a
-        // loopback PKCE exchange (the daemon owns both; the card only
-        // reports).
-        let flow = if card.provider == "kimi-oauth" {
+        // B6b: name the flow honestly — Kimi and Grok are device-code
+        // grants, not loopback PKCE exchanges (the daemon owns both; the
+        // card only reports).
+        let flow = if matches!(card.provider.as_str(), "kimi-oauth" | "grok-oauth") {
             "OAuth (device code)"
         } else {
             "OAuth (loopback PKCE)"

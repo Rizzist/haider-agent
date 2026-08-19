@@ -73,6 +73,9 @@ pub(crate) fn discover_device_candidates_with_native_event(
     if let Some(candidate) = discover_kimi() {
         candidates.push(candidate);
     }
+    if let Some(candidate) = discover_grok() {
+        candidates.push(candidate);
+    }
     if let Some(candidate) = discover_gemini() {
         candidates.push(candidate);
     }
@@ -280,6 +283,65 @@ fn discover_kimi() -> Option<DeviceCandidate> {
         path,
         device_id_ok,
         (!device_id_ok).then(|| KIMI_DEVICE_REASON.to_owned()),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GrokFile {
+    Bare(SecretJson),
+    Bundle {
+        access_token: SecretJson,
+        #[serde(default)]
+        refresh_token: Option<SecretJson>,
+        #[serde(default)]
+        expires_in: Option<u64>,
+        #[serde(default)]
+        issuer: Option<String>,
+    },
+}
+
+/// Discovers both auth.json layouts written by official Grok CLI releases.
+/// Only freshness and the public source label leave this parser.
+fn discover_grok() -> Option<DeviceCandidate> {
+    let path = env_or_home("HAIDER_GROK_AUTH_PATH", ".grok/auth.json")?;
+    let bytes = read_bounded(&path)?;
+    let parsed: GrokFile = serde_json::from_slice(&bytes).ok()?;
+    let expires_at_ms = match parsed {
+        GrokFile::Bare(token) => {
+            if token.0.is_empty() {
+                return None;
+            }
+            None
+        }
+        GrokFile::Bundle {
+            access_token,
+            refresh_token,
+            expires_in,
+            issuer,
+        } => {
+            if access_token.0.is_empty()
+                || refresh_token
+                    .as_ref()
+                    .is_some_and(|token| token.0.is_empty())
+                || issuer
+                    .as_deref()
+                    .is_some_and(|value| value != "https://auth.x.ai")
+            {
+                return None;
+            }
+            expires_in.and_then(|seconds| now_ms()?.checked_add(seconds.checked_mul(1000)?))
+        }
+    };
+    Some(candidate(
+        "grok-cli",
+        haider_provider::GROK_OAUTH_PROVIDER_NAME,
+        "Grok CLI",
+        None,
+        expires_at_ms,
+        path,
+        true,
+        None,
     ))
 }
 

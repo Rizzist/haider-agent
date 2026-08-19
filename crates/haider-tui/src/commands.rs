@@ -271,13 +271,15 @@ fn login_args(slot: usize, fragment: &str) -> Vec<PaletteItem> {
             ("openai", "OpenAI — ChatGPT (oauth · api)"),
             ("gemini", "Google — Gemini (api)"),
             ("kimi", "Moonshot — Kimi (oauth, device code)"),
+            ("grok", "xAI — Grok (oauth, device code)"),
+            ("xai", "xAI — Grok (api)"),
             ("deepseek", "DeepSeek (api)"),
         ],
         1 => &[
             ("api", "paste an API key (masked, stored in the OS vault)"),
             (
                 "oauth",
-                "browser sign-in — loopback PKCE (device code for kimi)",
+                "browser sign-in — loopback PKCE (device code for kimi/grok)",
             ),
         ],
         _ => &[],
@@ -431,7 +433,7 @@ pub fn palette_items(query: &str, in_session: bool, slots: &DynamicSlots) -> Vec
 pub const HELP_TEXT: &[&str] = &[
     "commands",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
-    "  /provider [name]   anthropic · openai · gemini · kimi · deepseek",
+    "  /provider [name]   anthropic · openai · gemini · kimi · grok · xai · deepseek",
     "  /effort [level]    reasoning effort for the CURRENT pair — bare /effort opens the ladder picker · default reverts",
     "  /fast              toggle fast mode — supported pairs only (anthropic opus-5 · opus-4-8)",
     "  /providers         provider registry — endpoints, models, defaults, health",

@@ -24,7 +24,9 @@ fn catalog_auth_mode_is_source_specific_and_existing_sources_are_identical() {
         CatalogSource::OpenAiSubscription,
         CatalogSource::AnthropicSubscription,
         CatalogSource::KimiOAuth,
+        CatalogSource::GrokOAuth,
         CatalogSource::DeepSeekApi,
+        CatalogSource::XaiApi,
         CatalogSource::OpenAiCompatible {
             origin: "https://models.example.invalid/v1".into(),
         },
@@ -59,8 +61,10 @@ fn catalog_without_a_credential_keeps_auth_headers_absent() {
         CatalogSource::OpenAiSubscription,
         CatalogSource::AnthropicSubscription,
         CatalogSource::KimiOAuth,
+        CatalogSource::GrokOAuth,
         CatalogSource::GeminiApiKey,
         CatalogSource::DeepSeekApi,
+        CatalogSource::XaiApi,
         CatalogSource::OpenAiCompatible {
             origin: "http://127.0.0.1:11434/v1".into(),
         },
@@ -103,4 +107,39 @@ fn wh3_deepseek_catalog_source_builds_fixed_models_get() {
         b"Bearer DEEPSEEK_CATALOG_KEY_SENTINEL_19be"
     );
     assert!(authorization.is_sensitive());
+}
+
+/// MUTATION CHECK: treating the proxy catalog as a generic OpenAI list loses
+/// its provider-declared context and reasoning facts.
+#[test]
+fn grok_oauth_catalog_parses_proxy_model_metadata() {
+    let models = crate::parse_catalog(
+        CatalogSource::GrokOAuth,
+        &serde_json::json!({"data": [{
+            "id": "grok-4.6",
+            "name": "Grok 4.6",
+            "context_window": 500_000,
+            "supports_reasoning_effort": true
+        }]}),
+    )
+    .expect("parse Grok proxy catalog");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].slug, "grok-4.6");
+    assert_eq!(models[0].display_name, "Grok 4.6");
+    assert_eq!(models[0].context_window, Some(500_000));
+    assert!(
+        models[0]
+            .extensions
+            .as_ref()
+            .expect("Grok metadata")
+            .supports_reasoning_effort
+    );
+    assert_eq!(
+        CatalogSource::GrokOAuth.endpoint(),
+        "https://cli-chat-proxy.grok.com/v1/models"
+    );
+    assert_eq!(
+        CatalogSource::XaiApi.endpoint(),
+        "https://api.x.ai/v1/models"
+    );
 }

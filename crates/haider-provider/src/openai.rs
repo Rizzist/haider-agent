@@ -47,6 +47,26 @@ pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 /// returns the live inventory. V4 slugs deliberately come from `/models`
 /// rather than this fallback.
 pub const DEEPSEEK_SEED_MODELS: [&str; 2] = ["deepseek-chat", "deepseek-reasoner"];
+pub const XAI_PROVIDER_NAME: &str = "xai";
+pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
+pub const XAI_SEED_MODELS: [&str; 4] = ["grok-4.6", "grok-4.5", "grok-4.3", "grok-build-0.1"];
+pub const XAI_SEED_MODEL_CONTEXT_WINDOWS: [(&str, u64); 4] = [
+    ("grok-4.6", 500_000),
+    ("grok-4.5", 500_000),
+    ("grok-4.3", 1_000_000),
+    ("grok-build-0.1", 256_000),
+];
+pub const GROK_OAUTH_PROVIDER_NAME: &str = "grok-oauth";
+pub const GROK_OAUTH_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+pub const GROK_OAUTH_SEED_MODELS: [&str; 2] = ["grok-4.6", "grok-4.5"];
+pub const GROK_OAUTH_SEED_MODEL_CONTEXT_WINDOWS: [(&str, u64); 2] =
+    [("grok-4.6", 500_000), ("grok-4.5", 500_000)];
+/// Version admitted by the Grok subscription proxy. The proxy hard-gates
+/// this value, so it may need bumping when xAI advances the grok-shell client.
+pub const GROK_SHELL_CLIENT_VERSION: &str = "0.2.101";
+pub const GROK_SHELL_CLIENT_IDENTIFIER: &str = "grok-shell";
+pub const GROK_SHELL_CLIENT_MODE: &str = "interactive";
+pub const GROK_XAI_TOKEN_AUTH: &str = "xai-grok-cli";
 pub const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
 pub const OPENAI_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const OPENAI_SUBSCRIPTION_RESPONSES_URL: &str =
@@ -61,6 +81,8 @@ pub const OPENAI_ALPHA_SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex
 const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
 const KIMI_OAUTH_HOST: &str = "api.kimi.com";
 const DEEPSEEK_HOST: &str = "api.deepseek.com";
+const XAI_HOST: &str = "api.x.ai";
+const GROK_OAUTH_HOST: &str = "cli-chat-proxy.grok.com";
 
 // The preview tool requires an explicit display coordinate space before the
 // first screenshot exists. Use one bounded 16:9 CU-1 bootstrap viewport, then
@@ -253,6 +275,7 @@ struct OpenAiHttp {
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
     codex_responses_lite: bool,
     auth_header_mode: OpenAiAuthHeaderMode,
+    grok_subscription_headers: bool,
 }
 
 impl OpenAiHttp {
@@ -283,6 +306,7 @@ impl OpenAiHttp {
             fixed_origin_guard: None,
             codex_responses_lite: false,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
+            grok_subscription_headers: false,
         }
     }
 
@@ -363,6 +387,7 @@ impl OpenAiHttp {
             fixed_origin_guard: Some(guard),
             codex_responses_lite,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
+            grok_subscription_headers: false,
         })
     }
 
@@ -387,6 +412,7 @@ impl OpenAiHttp {
             fixed_origin_guard,
             codex_responses_lite,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
+            grok_subscription_headers: false,
         })
     }
 
@@ -479,6 +505,9 @@ impl OpenAiHttp {
                 OPENAI_CODEX_RESPONSES_LITE_VALUE,
             );
         }
+        if self.grok_subscription_headers {
+            request = apply_grok_subscription_headers(request, Some(&self.model));
+        }
         request.json(payload).build().map_err(transport_error)
     }
 
@@ -494,9 +523,14 @@ impl OpenAiHttp {
 
     async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
         self.validate_origin(url).await?;
-        self.with_auth_header(self.client.get(url).header(ACCEPT, "application/json"))?
-            .build()
-            .map_err(transport_error)
+        let request =
+            self.with_auth_header(self.client.get(url).header(ACCEPT, "application/json"))?;
+        let request = if self.grok_subscription_headers {
+            apply_grok_subscription_headers(request, None)
+        } else {
+            request
+        };
+        request.build().map_err(transport_error)
     }
 
     async fn validate_origin(&self, url: &str) -> Result<(), ProviderError> {
@@ -515,6 +549,32 @@ impl OpenAiHttp {
             Some(guard) => guard.validate().await,
             None => Ok(()),
         }
+    }
+}
+
+pub(crate) fn apply_grok_subscription_headers(
+    request: reqwest::RequestBuilder,
+    model: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+    let request = request
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("grok-shell/{GROK_SHELL_CLIENT_VERSION} ({platform})"),
+        )
+        .header("x-grok-client-identifier", GROK_SHELL_CLIENT_IDENTIFIER)
+        .header("x-grok-client-version", GROK_SHELL_CLIENT_VERSION)
+        .header("x-grok-client-mode", GROK_SHELL_CLIENT_MODE)
+        .header("X-XAI-Token-Auth", GROK_XAI_TOKEN_AUTH);
+    match model {
+        Some(model) => request.header("x-grok-model-override", model),
+        None => request,
     }
 }
 
@@ -746,6 +806,8 @@ enum CompatibleDialect {
     Generic,
     KimiOAuth,
     DeepSeekApi,
+    XaiApi,
+    GrokOAuth,
 }
 
 /// Kimi's opt-in `extra_body.thinking` request extension.
@@ -1035,6 +1097,105 @@ impl OpenAiCompatibleProvider {
         })
     }
 
+    /// Constructs xAI's fixed API-key Chat Completions adapter.
+    pub fn new_xai_api(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        if base_url != XAI_BASE_URL {
+            return Err(invalid_request("xAI inference base URL is not sanctioned"));
+        }
+        Self::new_fixed_builtin(
+            credential,
+            model,
+            base_url,
+            XAI_HOST,
+            CompatibleDialect::XaiApi,
+        )
+    }
+
+    /// Constructs the fixed SuperGrok/X Premium subscription proxy adapter.
+    pub fn new_grok_subscription(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        if base_url != GROK_OAUTH_BASE_URL {
+            return Err(invalid_request(
+                "Grok OAuth inference base URL is not sanctioned",
+            ));
+        }
+        let mut provider = Self::new_fixed_builtin(
+            credential,
+            model,
+            base_url,
+            GROK_OAUTH_HOST,
+            CompatibleDialect::GrokOAuth,
+        )?;
+        provider.http.grok_subscription_headers = true;
+        Ok(provider)
+    }
+
+    fn new_fixed_builtin(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        host: &str,
+        dialect: CompatibleDialect,
+    ) -> Result<Self, ProviderError> {
+        let endpoints = compatible_endpoints(base_url, CompatibleOriginPolicy::Strict)?;
+        let http = OpenAiHttp::new_fixed_origins_shared_system(
+            credential,
+            model,
+            &[&endpoints.chat_url, &endpoints.models_url],
+            host,
+            false,
+        )?;
+        Ok(Self {
+            http,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+            dialect,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_grok_subscription_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if base_url != GROK_OAUTH_BASE_URL {
+            return Err(invalid_request(
+                "Grok OAuth inference base URL is not sanctioned",
+            ));
+        }
+        let endpoints = compatible_endpoints(base_url, CompatibleOriginPolicy::Strict)?;
+        let mut http = OpenAiHttp::new_fixed_origins(
+            credential,
+            model,
+            &[&endpoints.chat_url, &endpoints.models_url],
+            GROK_OAUTH_HOST,
+            resolver,
+            false,
+        )?;
+        http.grok_subscription_headers = true;
+        Ok(Self {
+            http,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+            dialect: CompatibleDialect::GrokOAuth,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
+    }
+
     /// Enables or explicitly disables Kimi thinking passthrough. Generic
     /// compatible adapters reject this provider-specific seam.
     pub fn with_kimi_thinking(
@@ -1106,7 +1267,13 @@ impl OpenAiCompatibleProvider {
     pub async fn probe_capabilities(&self) -> Result<CapabilityDoc, ProviderError> {
         let response = self.http.get(&self.models_url).await?;
         if !response.status().is_success() {
-            return Err(http_error_from_response(response).await);
+            let status = response.status().as_u16();
+            let error = http_error_from_response(response).await;
+            return Err(if self.dialect == CompatibleDialect::GrokOAuth {
+                grok_version_gate_error(status, error)
+            } else {
+                error
+            });
         }
         let body =
             read_body_bounded(response, MODELS_BODY_LIMIT, "OpenAI-compatible /models").await?;
@@ -1116,6 +1283,8 @@ impl OpenAiCompatibleProvider {
             CompatibleDialect::DeepSeekApi => {
                 replay_deepseek_models_response(&self.http.model, &body)
             }
+            CompatibleDialect::XaiApi => replay_xai_models_response(&self.http.model, &body),
+            CompatibleDialect::GrokOAuth => replay_grok_models_response(&self.http.model, &body),
         }
     }
 
@@ -1140,10 +1309,10 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         match self.dialect {
-            CompatibleDialect::Generic | CompatibleDialect::DeepSeekApi => {
-                crate::ProviderCredentialSurface::ApiKey
-            }
-            CompatibleDialect::KimiOAuth => {
+            CompatibleDialect::Generic
+            | CompatibleDialect::DeepSeekApi
+            | CompatibleDialect::XaiApi => crate::ProviderCredentialSurface::ApiKey,
+            CompatibleDialect::KimiOAuth | CompatibleDialect::GrokOAuth => {
                 crate::ProviderCredentialSurface::OAuthSubscriptionBearer
             }
         }
@@ -1177,6 +1346,8 @@ impl Provider for OpenAiCompatibleProvider {
             CompatibleDialect::Generic => OPENAI_COMPATIBLE_PROVIDER_NAME,
             CompatibleDialect::KimiOAuth => KIMI_OAUTH_PROVIDER_NAME,
             CompatibleDialect::DeepSeekApi => DEEPSEEK_PROVIDER_NAME,
+            CompatibleDialect::XaiApi => XAI_PROVIDER_NAME,
+            CompatibleDialect::GrokOAuth => GROK_OAUTH_PROVIDER_NAME,
         };
         self.probe_capabilities()
             .await
@@ -1220,7 +1391,14 @@ async fn checked_stream(
     decoder: DecoderKind,
 ) -> Result<ProviderStream, ProviderError> {
     if !response.status().is_success() {
-        return Err(http_error_from_response(response).await);
+        let status = response.status().as_u16();
+        let error = http_error_from_response(response).await;
+        return Err(match decoder {
+            DecoderKind::Chat(CompatibleDialect::GrokOAuth) => {
+                grok_version_gate_error(status, error)
+            }
+            _ => error,
+        });
     }
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
     let producer = tokio::spawn(async move {
@@ -1234,6 +1412,21 @@ async fn checked_stream(
         .await;
     });
     Ok(ProviderStream::owned(receiver, producer))
+}
+
+fn grok_version_gate_error(status: u16, error: ProviderError) -> ProviderError {
+    if matches!(status, 402 | 426) {
+        ProviderError::new(
+            ProviderErrorKind::ConnectionConfiguration,
+            format!(
+                "Grok subscription proxy rejected grok-shell client version {GROK_SHELL_CLIENT_VERSION} (HTTP {}); update Haider's admitted Grok client version and retry",
+                status
+            ),
+        )
+        .with_http_metadata(status, None)
+    } else {
+        error
+    }
 }
 
 async fn http_error_from_response(response: reqwest::Response) -> ProviderError {
@@ -2683,6 +2876,16 @@ pub fn replay_deepseek_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
     replay_chat_sse(bytes, CompatibleDialect::DeepSeekApi)
 }
 
+#[must_use]
+pub fn replay_xai_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    replay_chat_sse(bytes, CompatibleDialect::XaiApi)
+}
+
+#[must_use]
+pub fn replay_grok_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    replay_chat_sse(bytes, CompatibleDialect::GrokOAuth)
+}
+
 /// Replays a fake/captured `GET /v1/models` body through the live capability
 /// parser without requiring a listening socket.
 pub fn replay_openai_models_response(
@@ -2700,6 +2903,46 @@ pub fn replay_deepseek_models_response(
     body: &[u8],
 ) -> Result<CapabilityDoc, ProviderError> {
     replay_compatible_models_response(DEEPSEEK_PROVIDER_NAME, model, body)
+}
+
+/// Replays xAI's OpenAI-shaped API model inventory.
+pub fn replay_xai_models_response(
+    model: &str,
+    body: &[u8],
+) -> Result<CapabilityDoc, ProviderError> {
+    replay_compatible_models_response(XAI_PROVIDER_NAME, model, body)
+}
+
+/// Replays the Grok proxy's richer model inventory, retaining its declared
+/// context window and reasoning-effort support.
+pub fn replay_grok_models_response(
+    model: &str,
+    body: &[u8],
+) -> Result<CapabilityDoc, ProviderError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| malformed(format!("Grok models response is not valid JSON: {error}")))?;
+    let models = crate::parse_catalog(crate::CatalogSource::GrokOAuth, &value)
+        .map_err(|_| malformed("Grok models response has no usable model array"))?;
+    let model = models
+        .into_iter()
+        .find(|entry| entry.slug == model)
+        .ok_or_else(|| invalid_request("Grok does not advertise the configured model"))?;
+    let reasoning = model
+        .extensions
+        .is_some_and(|extension| extension.supports_reasoning_effort);
+    Ok(CapabilityDoc {
+        provider: GROK_OAUTH_PROVIDER_NAME.into(),
+        parallel_tools: FeatureResolve::Unsupported,
+        streaming_tool_args: FeatureResolve::Unsupported,
+        vision: FeatureResolve::Native,
+        pdf_documents: FeatureResolve::ExplicitlyEmulated,
+        thinking_visible: if reasoning {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::Unsupported
+        },
+        context_limit: model.context_window.unwrap_or(0),
+    })
 }
 
 fn replay_compatible_models_response(
@@ -3740,7 +3983,10 @@ fn chat_request_json(
         .as_object_mut()
         .ok_or_else(|| internal("Chat request payload was not an object"))?;
     match dialect {
-        CompatibleDialect::Generic | CompatibleDialect::DeepSeekApi => {
+        CompatibleDialect::Generic
+        | CompatibleDialect::DeepSeekApi
+        | CompatibleDialect::XaiApi
+        | CompatibleDialect::GrokOAuth => {
             object.insert("max_tokens".into(), serde_json::json!(request.max_tokens));
         }
         CompatibleDialect::KimiOAuth => {

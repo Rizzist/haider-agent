@@ -158,7 +158,15 @@ fn palette_login_slots_name_the_real_roster() {
         .collect();
     assert_eq!(
         providers,
-        ["anthropic", "openai", "gemini", "kimi", "deepseek"]
+        [
+            "anthropic",
+            "openai",
+            "gemini",
+            "kimi",
+            "grok",
+            "xai",
+            "deepseek",
+        ]
     );
     let methods = palette_items("login anthropic ", true, &slots);
     let oauth = methods

@@ -145,17 +145,22 @@ pub use gemini::{
 };
 pub use openai::{
     CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
-    KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig, KimiThinkingType,
-    OPENAI_ALPHA_SEARCH_URL, OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
+    GROK_OAUTH_BASE_URL, GROK_OAUTH_PROVIDER_NAME, GROK_OAUTH_SEED_MODEL_CONTEXT_WINDOWS,
+    GROK_OAUTH_SEED_MODELS, GROK_SHELL_CLIENT_IDENTIFIER, GROK_SHELL_CLIENT_MODE,
+    GROK_SHELL_CLIENT_VERSION, GROK_XAI_TOKEN_AUTH, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME,
+    KimiThinkingConfig, KimiThinkingType, OPENAI_ALPHA_SEARCH_URL,
+    OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
     OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
-    OpenAiTransportConfig, azure_openai_origin, codex_alpha_search_request_body,
+    OpenAiTransportConfig, XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS,
+    XAI_SEED_MODELS, azure_openai_origin, codex_alpha_search_request_body,
     codex_alpha_search_response_text, codex_alpha_search_url, openai_http_client_build_count,
-    replay_deepseek_chat_sse, replay_deepseek_models_response, replay_kimi_chat_sse,
-    replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
-    replay_openai_models_response, replay_openai_native_computer_sse, replay_openai_responses_sse,
-    validate_openai_compatible_endpoint,
+    replay_deepseek_chat_sse, replay_deepseek_models_response, replay_grok_chat_sse,
+    replay_grok_models_response, replay_kimi_chat_sse, replay_kimi_models_response,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_native_computer_sse, replay_openai_responses_sse, replay_xai_chat_sse,
+    replay_xai_models_response, validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{
@@ -179,7 +184,7 @@ pub use webfetch::{
 /// Provider classes backed by production account credentials in this release.
 /// New named providers append to this stable roster; custom endpoint profiles
 /// remain a separate registry concern.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 10] = [
+pub const BUILTIN_PROVIDER_NAMES: [&str; 12] = [
     ANTHROPIC_PROVIDER_NAME,
     ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
@@ -190,6 +195,8 @@ pub const BUILTIN_PROVIDER_NAMES: [&str; 10] = [
     BEDROCK_PROVIDER_NAME,
     VERTEX_PROVIDER_NAME,
     DEEPSEEK_PROVIDER_NAME,
+    XAI_PROVIDER_NAME,
+    GROK_OAUTH_PROVIDER_NAME,
 ];
 
 /// Provider-catalog declaration for PDF shaping. Every Anthropic Messages
@@ -1564,6 +1571,13 @@ impl Utf8Assembler {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod e2_contract_tests {
     use super::*;
+
+    #[test]
+    fn builtin_provider_roster_includes_both_xai_lanes() {
+        assert_eq!(BUILTIN_PROVIDER_NAMES.len(), 12);
+        assert!(BUILTIN_PROVIDER_NAMES.contains(&XAI_PROVIDER_NAME));
+        assert!(BUILTIN_PROVIDER_NAMES.contains(&GROK_OAUTH_PROVIDER_NAME));
+    }
 
     #[test]
     fn user_command_json_fields_cannot_forge_the_record_boundary() {

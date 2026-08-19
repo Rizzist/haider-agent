@@ -48,10 +48,11 @@ use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
     BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DEEPSEEK_BASE_URL,
-    DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, GEMINI_PROVIDER_NAME, GeminiProvider,
-    KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
-    TurnRequest, VERTEX_PROVIDER_NAME, azure_openai_origin, discover_models,
+    DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, GEMINI_PROVIDER_NAME, GROK_OAUTH_PROVIDER_NAME,
+    GeminiProvider, KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME,
+    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider,
+    Provider, ProviderErrorKind, TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL,
+    XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -193,6 +194,7 @@ impl CredentialValidator for ProviderCredentialValidator {
                 | BEDROCK_PROVIDER_NAME
                 | VERTEX_PROVIDER_NAME
                 | DEEPSEEK_PROVIDER_NAME
+                | XAI_PROVIDER_NAME
         )
     }
 
@@ -211,10 +213,51 @@ impl CredentialValidator for ProviderCredentialValidator {
         }
         if provider == DEEPSEEK_PROVIDER_NAME {
             validate_deepseek_api_key(secret).await
+        } else if provider == XAI_PROVIDER_NAME {
+            validate_xai_api_key(secret).await
         } else {
             validate_provider_api_key(provider, model, secret, endpoint).await
         }
     }
+}
+
+async fn validate_xai_api_key(secret: &[u8]) -> Result<ValidatedIdentity, ValidationError> {
+    validate_openai_compatible_catalog_key(secret, CatalogSource::XaiApi, "xAI", "xai api key")
+        .await
+}
+
+async fn validate_openai_compatible_catalog_key(
+    secret: &[u8],
+    source: CatalogSource,
+    display_name: &str,
+    identity: &str,
+) -> Result<ValidatedIdentity, ValidationError> {
+    let secret = std::str::from_utf8(secret).map_err(|_| ValidationError {
+        kind: ValidationFailureKind::Unauthorized,
+        message: format!("{display_name} API key is not valid UTF-8"),
+    })?;
+    discover_models(source, Some(secret), None)
+        .await
+        .map_err(|error| {
+            let kind = match &error {
+                CatalogError::Unavailable { reason } if reason.contains("(401)") => {
+                    ValidationFailureKind::Unauthorized
+                }
+                CatalogError::Unavailable { reason } if reason.contains("(403)") => {
+                    ValidationFailureKind::PermissionDenied
+                }
+                CatalogError::NotModified
+                | CatalogError::Unavailable { .. }
+                | CatalogError::Transport { .. } => ValidationFailureKind::Unavailable,
+            };
+            ValidationError {
+                kind,
+                message: format!("{display_name} credential validation could not read /models"),
+            }
+        })?;
+    Ok(ValidatedIdentity {
+        identity: identity.to_owned(),
+    })
 }
 
 /// DeepSeek key validation uses the same fixed-origin catalog source as
@@ -329,7 +372,7 @@ fn custom_login_target(
     management: Option<&ManagementSnapshot>,
     provider: &str,
 ) -> Option<(String, Option<String>)> {
-    if provider == DEEPSEEK_PROVIDER_NAME {
+    if matches!(provider, DEEPSEEK_PROVIDER_NAME | XAI_PROVIDER_NAME) {
         return None;
     }
     let view = management?.read()?;
@@ -1863,10 +1906,14 @@ fn catalog_source(
         KIMI_OAUTH_PROVIDER_NAME => {
             Some((CatalogSource::KimiOAuth, ProviderAuthRequirementWire::OAuth))
         }
+        GROK_OAUTH_PROVIDER_NAME => {
+            Some((CatalogSource::GrokOAuth, ProviderAuthRequirementWire::OAuth))
+        }
         DEEPSEEK_PROVIDER_NAME => Some((
             CatalogSource::DeepSeekApi,
             ProviderAuthRequirementWire::ApiKey,
         )),
+        XAI_PROVIDER_NAME => Some((CatalogSource::XaiApi, ProviderAuthRequirementWire::ApiKey)),
         GEMINI_PROVIDER_NAME => Some((
             CatalogSource::GeminiApiKey,
             ProviderAuthRequirementWire::ApiKey,
@@ -6063,6 +6110,11 @@ fn build_account_provider(
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),
+        (XAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
+            OpenAiCompatibleProvider::new_xai_api(credential, model, XAI_BASE_URL)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
+        ),
         (OPENAI_COMPATIBLE_PROVIDER_NAME, AuthMethod::ApiKey) => {
             let base_url = compatible_base_url.ok_or_else(|| {
                 HaiderError::new(
@@ -6232,6 +6284,33 @@ fn build_account_provider(
                 };
             }
             Arc::new(adapter)
+        }
+        (GROK_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {
+            let inference = sanctioned_inference(provider).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "Grok OAuth registration is unavailable",
+                    false,
+                )
+            })?;
+            if inference.auth_mode != OAuthInferenceAuthMode::Bearer
+                || inference.header_set != OAuthInferenceHeaderSet::GrokOpenAiChatCompletions
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "Grok OAuth inference metadata is invalid",
+                    false,
+                ));
+            }
+            Arc::new(
+                OpenAiCompatibleProvider::new_grok_subscription(
+                    credential,
+                    model,
+                    inference.base_url,
+                )
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
+            )
         }
         _ => {
             return Err(HaiderError::new(
@@ -6716,7 +6795,7 @@ impl AccountsProviderFactory {
         };
         let oauth_access_fingerprint = (matches!(
             resolved.descriptor.provider.as_str(),
-            KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME
+            KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME | GROK_OAUTH_PROVIDER_NAME
         ) && resolved.descriptor.auth_method == AuthMethod::OAuth)
             .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
         let provider = self.build_provider(&resolved.descriptor, credential, metadata, tuning)?;

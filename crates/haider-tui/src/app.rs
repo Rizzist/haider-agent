@@ -2561,6 +2561,9 @@ pub enum AccountAddKind {
     OpenAiApi,
     AnthropicApi,
     KimiOAuth,
+    /// SuperGrok/X Premium subscription sign-in via xAI's RFC-8628 device
+    /// grant and dedicated CLI chat proxy.
+    GrokOAuth,
     GeminiApi,
     HuggingFace,
     OpencodeZen,
@@ -2585,6 +2588,9 @@ pub enum AccountAddKind {
     /// Named DeepSeek builtin — masked API-key entry at the fixed vendor
     /// endpoint, followed by authenticated model discovery.
     DeepSeekApi,
+    /// Named xAI builtin — masked API-key entry at the fixed API origin,
+    /// followed by authenticated model discovery.
+    XaiApi,
 }
 
 /// One answer on its way to the client, tagged with the SURFACE GENERATION
@@ -8025,6 +8031,7 @@ impl AppModel {
             // status/add wire — only the provider id differs; the card is
             // flow-agnostic by design.
             AccountAddKind::KimiOAuth => ("kimi-oauth", "Kimi — Moonshot"),
+            AccountAddKind::GrokOAuth => ("grok-oauth", "Grok — xAI"),
             AccountAddKind::OpenAiApi
             | AccountAddKind::AnthropicApi
             | AccountAddKind::GeminiApi
@@ -8037,7 +8044,8 @@ impl AppModel {
             | AccountAddKind::Bedrock
             | AccountAddKind::Vertex
             | AccountAddKind::Custom
-            | AccountAddKind::DeepSeekApi => return,
+            | AccountAddKind::DeepSeekApi
+            | AccountAddKind::XaiApi => return,
         };
         let alias = smallest_free_alias(provider, &self.accounts.rows);
         self.oauth_attempt_seq += 1;
@@ -8069,6 +8077,7 @@ impl AppModel {
             "openai-oauth" => "OpenAI — ChatGPT",
             "anthropic-oauth" => "Anthropic — Claude",
             "kimi-oauth" => "Kimi — Moonshot",
+            "grok-oauth" => "Grok — xAI",
             _ => {
                 self.accounts.message = Some(format!(
                     "· re-login is not available for {provider}; add it again"
@@ -8214,6 +8223,7 @@ impl AppModel {
                             // group, so it lands under the daemon-truth
                             // provider id.
                             "kimi-oauth" => ("kimi-oauth", "you@kimi.com · Kimi Code"),
+                            "grok-oauth" => ("grok-oauth", "you@x.ai · SuperGrok"),
                             _ => ("anthropic", "you@me.com · Claude Max"),
                         };
                         let alias = card.alias.clone();
@@ -9486,7 +9496,7 @@ impl AppModel {
                     // gate and card open run unchanged (mirror by
                     // construction, never a second dispatch). The daemon
                     // owns every flow: loopback PKCE for openai/anthropic,
-                    // the device-code grant for kimi.
+                    // and the device-code grants for kimi/grok.
                     ("openai", "oauth") => {
                         self.enter_accounts();
                         self.handle_hit(Hit::AccountAdd(AccountAddKind::OpenAiOAuth));
@@ -9498,6 +9508,10 @@ impl AppModel {
                     ("kimi", "oauth") => {
                         self.enter_accounts();
                         self.handle_hit(Hit::AccountAdd(AccountAddKind::KimiOAuth));
+                    }
+                    ("grok", "oauth") => {
+                        self.enter_accounts();
+                        self.handle_hit(Hit::AccountAdd(AccountAddKind::GrokOAuth));
                     }
                     (provider, "oauth") => {
                         self.flash = Some(format!(
@@ -11614,6 +11628,14 @@ impl AppModel {
                             self.dirty = true;
                         }
                     }
+                    AccountAddKind::XaiApi => {
+                        if self.daemon_lists_provider("xai") {
+                            self.open_login_card("xai", None);
+                        } else {
+                            self.accounts.message = Some(self.stale_daemon_note("xAI accounts"));
+                            self.dirty = true;
+                        }
+                    }
                     // OAuth adds run the REAL loopback flow (W5e-1): the
                     // card drives account.oauth_start/status + account.add
                     // live, and the sim's simulated authorize in demo.
@@ -11627,15 +11649,24 @@ impl AppModel {
                             self.dirty = true;
                         }
                     }
-                    // B6b: Kimi rides the DEVICE flow — its own feature bit
-                    // (shipped beside the kimi-oauth builtin, v0.0.52), the
-                    // same §4.1 gate as the PKCE pair above.
+                    // B6b: device flows ride their own feature bit (shipped
+                    // beside kimi-oauth, then shared by grok-oauth), with
+                    // the same §4.1 gate as the PKCE pair above.
                     AccountAddKind::KimiOAuth => {
                         if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
                             self.open_oauth_add(kind);
                         } else {
                             self.accounts.message =
                                 Some(self.stale_daemon_note("Kimi OAuth sign-in"));
+                            self.dirty = true;
+                        }
+                    }
+                    AccountAddKind::GrokOAuth => {
+                        if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
+                            self.open_oauth_add(kind);
+                        } else {
+                            self.accounts.message =
+                                Some(self.stale_daemon_note("Grok OAuth sign-in"));
                             self.dirty = true;
                         }
                     }

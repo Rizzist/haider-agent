@@ -668,6 +668,7 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
             fixed_origin_guard: None,
             codex_responses_lite: false,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
+            grok_subscription_headers: false,
         },
         base_url: endpoints.base_url,
         chat_url: endpoints.chat_url,
@@ -2030,6 +2031,113 @@ async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
         b"Bearer DEEPSEEK_API_KEY_SENTINEL_3d72"
     );
     assert!(authorization.is_sensitive());
+}
+
+/// MUTATION CHECK: deleting any proxy identity header, applying the model
+/// override to discovery, or changing the single admitted client version
+/// breaks these exact request assertions.
+#[tokio::test]
+async fn grok_oauth_proxy_request_pins_complete_header_contract() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("grok-oauth-header-contract");
+    vault
+        .put(&alias, b"GROK_OAUTH_BEARER_SENTINEL_294e")
+        .expect("store Grok bearer");
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        443,
+    ))]]));
+    let provider = OpenAiCompatibleProvider::new_grok_subscription_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve Grok bearer"),
+        "grok-4.6",
+        GROK_OAUTH_BASE_URL,
+        resolver,
+    )
+    .expect("construct Grok subscription adapter");
+    let request = TurnRequest {
+        messages: vec![crate::Message::user_text("hello")],
+        model: "grok-4.6".to_owned(),
+        max_tokens: 17,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        cache_metadata: None,
+    };
+    let payload = provider.request_payload(&request).expect("Grok payload");
+    let outbound = provider
+        .http
+        .post_json_request(&provider.chat_url, &payload)
+        .await
+        .expect("build Grok proxy request");
+    assert_eq!(
+        outbound.url().as_str(),
+        "https://cli-chat-proxy.grok.com/v1/chat/completions"
+    );
+    let headers = outbound.headers();
+    assert_eq!(
+        headers.get(AUTHORIZATION).expect("bearer").as_bytes(),
+        b"Bearer GROK_OAUTH_BEARER_SENTINEL_294e"
+    );
+    assert_eq!(headers["x-grok-client-identifier"], "grok-shell");
+    assert_eq!(headers["x-grok-client-version"], "0.2.101");
+    assert_eq!(headers["x-grok-client-mode"], "interactive");
+    assert_eq!(headers["X-XAI-Token-Auth"], "xai-grok-cli");
+    assert_eq!(headers["x-grok-model-override"], "grok-4.6");
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+    assert_eq!(
+        headers[reqwest::header::USER_AGENT],
+        format!("grok-shell/0.2.101 ({platform})")
+    );
+
+    let discovery = provider
+        .http
+        .get_request(&provider.models_url)
+        .await
+        .expect("build Grok catalog request");
+    assert!(discovery.headers().contains_key("x-grok-client-version"));
+    assert!(!discovery.headers().contains_key("x-grok-model-override"));
+}
+
+/// MUTATION CHECK: treating the hard version gate as billing/transport or
+/// omitting the actionable pinned version breaks both status cases.
+#[test]
+fn grok_oauth_402_and_426_are_actionable_version_gate_errors() {
+    for status in [402, 426] {
+        let ordinary = replay_openai_http_error(status, None, br#"{"error":{}}"#);
+        let error = grok_version_gate_error(status, ordinary);
+        assert_eq!(error.kind, ProviderErrorKind::ConnectionConfiguration);
+        assert!(!error.retryable);
+        assert!(error.message.contains(GROK_SHELL_CLIENT_VERSION));
+        assert!(error.message.contains(&format!("HTTP {status}")));
+        assert_eq!(error.presentation.provider_http_status, Some(status));
+    }
+}
+
+/// xAI uses the standard nested OpenAI cached-token telemetry, so no
+/// provider-specific usage fork may discard it.
+#[test]
+fn xai_cached_prompt_details_map_to_normalized_usage() {
+    let usage = chat_usage(
+        &serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 40}
+        }),
+        None,
+        CompatibleDialect::XaiApi,
+    )
+    .expect("xAI usage");
+    assert_eq!(usage.cached, 40);
+    let normalized = usage.normalized.expect("normalized xAI usage");
+    assert_eq!(normalized.logical_input, 100);
+    assert_eq!(normalized.uncached_input, 60);
+    assert_eq!(normalized.cache_read_input, 40);
 }
 
 /// WH4 — DeepSeek's top-level cache counters are the accounting authority:

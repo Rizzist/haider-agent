@@ -1542,6 +1542,7 @@ impl DemoDriver {
                     // B6b: the kimi demo authorize points at the real
                     // device-flow host (the daemon's sanctioned issuer).
                     "kimi-oauth" => "auth.kimi.com",
+                    "grok-oauth" => "auth.x.ai",
                     _ => "claude.ai",
                 };
                 model.oauth_add_phase(
