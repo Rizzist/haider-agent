@@ -333,6 +333,17 @@ pub struct AccountsState {
     pub revealed: bool,
 }
 
+/// Round 4 — a plan proposal's identity for scroll-reset purposes: menu id
+/// plus a CONTENT hash of the body. Byte-length alone let a same-id,
+/// same-length body swap keep the old offset.
+#[must_use]
+pub fn plan_menu_key(menu: &haider_protocol::menu::Menu) -> (MenuId, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    menu.body.hash(&mut hasher);
+    (menu.id.clone(), hasher.finish())
+}
+
 impl AppModel {
     /// D1 — resolve a Loom agent type by id (chip coloring, graph rows).
     #[must_use]
@@ -3078,6 +3089,9 @@ pub struct AppModel {
     pub loom_types: Vec<haider_protocol::loom::LoomAgentType>,
     pub loom_workflows: Vec<haider_protocol::loom::LoomWorkflow>,
     pub loom_loaded: bool,
+    /// Round 4: the per-connection loom.list dedup latch — separate from
+    /// `loom_loaded` (truth) so an in-flight read renders as LOADING.
+    pub loom_requested: bool,
     /// D3 — /loom browser state: the flat selection over types then
     /// workflows, and whether the detail pane is open.
     pub loom_selection: usize,
@@ -3185,7 +3199,7 @@ pub struct AppModel {
     /// The plan the scroll belongs to — a NEW proposal starts at the top.
     /// Keyed by (menu id, body byte length) so a re-issued id with different
     /// content still reads as a new proposal (round 3).
-    pub plan_menu_seen: std::cell::RefCell<Option<(MenuId, usize)>>,
+    pub plan_menu_seen: std::cell::RefCell<Option<(MenuId, u64)>>,
     /// Selected row in the slash palette (open while composer starts with /).
     /// Ranges over the FULL match list; the render window follows.
     pub palette_selection: usize,
@@ -3413,6 +3427,7 @@ impl Default for AppModel {
             loom_types: Vec::new(),
             loom_workflows: Vec::new(),
             loom_loaded: false,
+            loom_requested: false,
             loom_selection: 0,
             loom_detail: false,
             loom_scroll: 0,
@@ -5362,7 +5377,7 @@ impl AppModel {
             && menu.origin == "plan"
             && !menu.options.is_empty()
         {
-            let plan_key = (menu.id.clone(), menu.body.iter().map(String::len).sum());
+            let plan_key = plan_menu_key(menu);
             if self.plan_menu_seen.borrow().as_ref() != Some(&plan_key) {
                 *self.plan_menu_seen.borrow_mut() = Some(plan_key);
                 self.plan_scroll.set(0);

@@ -349,6 +349,7 @@ fn disconnect_clears_the_loom_snapshot() {
     model.loom_types = vec![researcher()];
     model.loom_workflows = Vec::new();
     model.loom_loaded = true;
+    model.loom_requested = true;
 
     let mut driver = haider_tui::live::LiveDriver::new("test");
     driver.apply(
@@ -360,6 +361,10 @@ fn disconnect_clears_the_loom_snapshot() {
     assert!(
         !model.loom_loaded,
         "the hydration latch dies with the socket"
+    );
+    assert!(
+        !model.loom_requested,
+        "round 4: the request-dedup latch dies with it"
     );
     assert!(model.loom_types.is_empty(), "stale types must not survive");
     assert!(model.loom_workflows.is_empty());

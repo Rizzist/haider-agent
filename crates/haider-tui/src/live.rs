@@ -234,7 +234,11 @@ pub enum LiveCommand {
     /// `loom.list` — a receipt-free READ of the Loom registry (agent types +
     /// compiled workflows). Fetched once per connection; colors the typed
     /// chips and annotates the graph screen.
-    LoomList,
+    LoomList {
+        /// Round 4: the connection epoch this read belongs to — a reply that
+        /// crossed a reconnect installs nothing.
+        epoch: u64,
+    },
     /// `graph.inspect` (M2c) — a ONE-SHOT paged read of graph telemetry
     /// (template rollups, tool-selection stats, evidence provenance with real
     /// workspace-revision provenance). Issued when the `/graph` screen opens;
@@ -550,7 +554,7 @@ impl LiveCommand {
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
             | Self::GraphStatus { .. }
-            | Self::LoomList
+            | Self::LoomList { .. }
             | Self::OpenPermissionSettings { .. }
             | Self::GraphInspect { .. }
             // A stage carries no durable identity BY DESIGN (see above).
@@ -574,6 +578,8 @@ pub enum LiveReply {
     LoomRegistry {
         agent_types: Vec<haider_protocol::loom::LoomAgentType>,
         workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+        /// Echoed from the LoomList command — round 4's stale-reply fence.
+        epoch: u64,
     },
     Listed {
         sessions: Vec<SessionSummary>,
@@ -1071,6 +1077,10 @@ impl Cold {
 /// The live driver. See the module charter.
 #[derive(Debug)]
 pub struct LiveDriver {
+    /// Round 4: monotone connection epoch — bumped on every Disconnected.
+    /// Reads that must not cross a reconnect (loom.list) carry it out and
+    /// their replies echo it back; a mismatch installs nothing.
+    connection_epoch: u64,
     /// Attachment ids by session, and the reverse map used to REJECT an
     /// event for an attachment we do not hold (report §6.3: "unknown
     /// attachment ids are rejected").
@@ -1244,6 +1254,7 @@ impl LiveDriver {
     #[must_use]
     pub fn new(instance: impl Into<String>) -> Self {
         Self {
+            connection_epoch: 0,
             attachments: HashMap::new(),
             routes: HashMap::new(),
             lru: Vec::new(),
@@ -1555,21 +1566,25 @@ impl LiveDriver {
             LiveReply::LoomRegistry {
                 agent_types,
                 workflows,
+                epoch,
             } => {
-                // Round 3: a reply that outlived its socket is stale — the
-                // disconnect cleared the snapshot, and reinstalling it here
-                // would latch loom_loaded against the NEXT connection's
-                // hydration. Drop it.
-                if self.connected {
+                // Round 3/4: a reply that outlived its socket is stale. The
+                // connection epoch is the fence — `connected` alone races a
+                // reply that slept across a full disconnect/reconnect cycle.
+                if self.connected && epoch == self.connection_epoch {
+                    // Round 4: a CHANGED registry under an open detail pane
+                    // may silently swap the pane's subject even when the
+                    // index still clamps — close it on any content change.
+                    let changed =
+                        model.loom_types != agent_types || model.loom_workflows != workflows;
                     model.loom_types = agent_types;
                     model.loom_workflows = workflows;
                     model.loom_loaded = true;
-                    // The registry moved under the browser: keep the stored
-                    // selection inside the new list and close a detail pane
-                    // whose subject may be gone.
                     let total = model.loom_types.len() + model.loom_workflows.len();
                     if model.loom_selection >= total {
                         model.loom_selection = total.saturating_sub(1);
+                    }
+                    if changed {
                         model.loom_detail = false;
                     }
                 }
@@ -1605,9 +1620,14 @@ impl LiveDriver {
                 });
                 // D1: hydrate the Loom registry once per connection — the
                 // typed-chip colors and graph annotations read from it.
-                if !model.loom_loaded && model.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
-                    model.loom_loaded = true;
-                    follow.push(LiveCommand::LoomList);
+                // Round 4: the dedup latch (`loom_requested`) is separate
+                // from the truth latch (`loom_loaded`, set only when the
+                // reply installs) so /loom can render LOADING honestly.
+                if !model.loom_requested && model.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
+                    model.loom_requested = true;
+                    follow.push(LiveCommand::LoomList {
+                        epoch: self.connection_epoch,
+                    });
                 }
                 follow
             }
@@ -2918,8 +2938,10 @@ impl LiveDriver {
                 // truth — the next daemon may hold a different registry (or
                 // none), so stale types/colors must not survive the socket.
                 model.loom_loaded = false;
+                model.loom_requested = false;
                 model.loom_types.clear();
                 model.loom_workflows.clear();
+                self.connection_epoch = self.connection_epoch.wrapping_add(1);
                 // Round 3: capability facts die with the socket as well; the
                 // reconnect handshake re-grounds them before work resumes.
                 model.daemon_features.clear();

@@ -589,6 +589,9 @@ pub struct CommandContext {
     /// pattern: neither carries a durable command id, so the error reply
     /// is tagged with WHICH operation failed and lands on the talk flow.
     transcription: Option<crate::live::TranscriptionOp>,
+    /// Round 4: the connection epoch a `loom.list` was issued under — the
+    /// reply echoes it so a read that crossed a reconnect installs nothing.
+    loom_epoch: Option<u64>,
 }
 
 impl CommandContext {
@@ -650,6 +653,10 @@ impl CommandContext {
                 LiveCommand::TranscriptionSecretSet { .. } => {
                     Some(crate::live::TranscriptionOp::Set)
                 }
+                _ => None,
+            },
+            loom_epoch: match command {
+                LiveCommand::LoomList { epoch } => Some(*epoch),
                 _ => None,
             },
         }
@@ -844,7 +851,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::GraphStatus { session } => RequestBody::GraphStatus {
             session_id: session,
         },
-        LiveCommand::LoomList => RequestBody::LoomList {},
+        LiveCommand::LoomList { .. } => RequestBody::LoomList {},
         LiveCommand::OpenPermissionSettings {
             session,
             request_id,
@@ -1268,6 +1275,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         } => vec![LiveReply::LoomRegistry {
             agent_types,
             workflows,
+            epoch: context.loom_epoch.unwrap_or(0),
         }],
         ResponseBody::GraphStatus { status } => match context.graph.clone() {
             Some(session) => vec![LiveReply::Graph {

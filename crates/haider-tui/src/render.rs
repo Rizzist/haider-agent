@@ -3644,7 +3644,7 @@ fn render_session(
         // from the top even before any keypress reaches the key handler.
         // Round 3: keyed by (id, body length) so a re-issued id with new
         // content still resets.
-        let plan_key = (plan.id.clone(), plan.body.iter().map(String::len).sum());
+        let plan_key = crate::app::plan_menu_key(plan);
         if model.plan_menu_seen.borrow().as_ref() != Some(&plan_key) {
             *model.plan_menu_seen.borrow_mut() = Some(plan_key);
             model.plan_scroll.set(0);
@@ -5177,6 +5177,30 @@ fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus)
     Line::from(spans)
 }
 
+/// Round 4 — plain character wrap for /loom detail lines: the screen
+/// scrolls VERTICALLY with exact line math (no Paragraph wrap), so long
+/// job/pipe lines fold here instead of clipping.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    if text.chars().count() <= width {
+        return vec![text.to_owned()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut count = 0;
+    for character in text.chars() {
+        current.push(character);
+        count += 1;
+        if count == width {
+            chunks.push(std::mem::take(&mut current));
+            count = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// D3 — the Loom registry browser: agent types + pipe workflows from the
 /// once-per-connection snapshot, each in its registry accent; ⏎ opens a
 /// detail pane (type: job + grants + know-how; workflow: typed signature +
@@ -5252,8 +5276,11 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             ]));
             lines.push(Line::raw(""));
             lines.push(Line::styled("JOB", theme.gold_style()));
+            let width = (area.width as usize).saturating_sub(4).max(8);
             for line in record.job.lines() {
-                lines.push(Line::styled(format!("  {line}"), theme.text_style()));
+                for chunk in wrap_plain(line, width) {
+                    lines.push(Line::styled(format!("  {chunk}"), theme.text_style()));
+                }
             }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
@@ -5335,8 +5362,11 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             }
             lines.push(Line::raw(""));
             lines.push(Line::styled("PIPE SOURCE", theme.gold_style()));
+            let width = (area.width as usize).saturating_sub(4).max(8);
             for line in workflow.source.lines() {
-                lines.push(Line::styled(format!("  {line}"), theme.text_style()));
+                for chunk in wrap_plain(line, width) {
+                    lines.push(Line::styled(format!("  {chunk}"), theme.text_style()));
+                }
             }
         }
         lines.push(Line::raw(""));

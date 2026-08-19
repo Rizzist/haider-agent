@@ -276,4 +276,27 @@ fn registration_bounds_types_color_and_glyph() {
         store.loom_register_agent_type(&record).is_ok(),
         "composite in-type with sane display fields registers"
     );
+    // Round 4: shell-expandable CLI declarations are rejected up front —
+    // `$SHELL`, quotes, and backslashes would re-resolve at exec time.
+    for bad in ["$SHELL", "\"ffmpeg\"", "\\ffmpeg", "ffm*peg"] {
+        let mut record = agent_type("shelly", "A", "B");
+        record.clis = vec![bad.to_owned()];
+        assert!(
+            store.loom_register_agent_type(&record).is_err(),
+            "cli `{bad}` must be rejected"
+        );
+    }
+    // Bare names and absolute paths remain declarable.
+    let mut record = agent_type("shelly", "A", "B");
+    record.clis = vec!["ffmpeg".to_owned(), "/opt/homebrew/bin/yt-dlp".to_owned()];
+    assert!(store.loom_register_agent_type(&record).is_ok());
+    // Round 4: invisible format characters never reach a glyph cell.
+    for bad_glyph in ["\u{2060}", "\u{061C}", "\u{00AD}"] {
+        let mut record = agent_type("ghosty", "A", "B");
+        record.glyph = (*bad_glyph).to_owned();
+        assert!(
+            store.loom_register_agent_type(&record).is_err(),
+            "glyph {bad_glyph:?} must be rejected"
+        );
+    }
 }

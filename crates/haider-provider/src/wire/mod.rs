@@ -134,6 +134,26 @@ pub(crate) fn request_json(
                 metadata.stable_history_end,
                 ttl,
             );
+            // Round 4 (cache): Anthropic's per-breakpoint lookback scans at
+            // most 20 content blocks. A tool-heavy turn appending more than
+            // that after the stable boundary would leave the NEXT request's
+            // boundary unable to find the entry this one writes — a silent
+            // full re-read despite a perfect byte prefix. When the fourth
+            // slot is free (no compaction boundary), mark an intermediate
+            // boundary that leaves at most the lookback window uncovered.
+            // cache_control is request METADATA, never prompt content, so a
+            // moving marker cannot itself disturb the byte prefix.
+            if metadata.latest_compaction_summary_end.is_none()
+                && let Some(intermediate) =
+                    anthropic_intermediate_boundary(&request.messages, metadata.stable_history_end)
+            {
+                annotate_anthropic_message_boundary(
+                    &mut messages,
+                    &request.messages,
+                    intermediate,
+                    ttl,
+                );
+            }
         }
     }
     let mut payload = serde_json::json!({
@@ -204,6 +224,40 @@ pub(crate) fn request_json(
 
 fn anthropic_cache_control(ttl: crate::AnthropicCacheTtl) -> serde_json::Value {
     serde_json::json!({"type": "ephemeral", "ttl": ttl.wire()})
+}
+
+/// Anthropic's documented cache-entry lookback: each breakpoint walks back
+/// at most this many content blocks for a prior entry.
+const ANTHROPIC_LOOKBACK_BLOCKS: usize = 20;
+
+/// The intermediate boundary (exclusive message index) that leaves at most
+/// [`ANTHROPIC_LOOKBACK_BLOCKS`] content blocks between it and the end of
+/// the message list. `None` when the tail already fits the window. Pure and
+/// deterministic — a function of the request alone.
+fn anthropic_intermediate_boundary(
+    messages: &[crate::Message],
+    stable_history_end: usize,
+) -> Option<usize> {
+    if stable_history_end >= messages.len() {
+        return None;
+    }
+    let counts: Vec<usize> = messages[stable_history_end..]
+        .iter()
+        .map(|message| message.blocks.len().max(1))
+        .collect();
+    if counts.iter().sum::<usize>() <= ANTHROPIC_LOOKBACK_BLOCKS {
+        return None;
+    }
+    let mut suffix = 0usize;
+    for (offset, count) in counts.iter().enumerate().rev() {
+        suffix += count;
+        if suffix > ANTHROPIC_LOOKBACK_BLOCKS {
+            let boundary = stable_history_end + offset + 1;
+            return (boundary > stable_history_end && boundary < messages.len())
+                .then_some(boundary);
+        }
+    }
+    None
 }
 
 fn annotate_anthropic_message_boundary(
@@ -1830,4 +1884,46 @@ fn malformed(message: impl Into<String>) -> ProviderError {
 
 fn stream_interrupted(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::StreamInterrupted, message)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod lookback_tests {
+    use super::*;
+
+    fn message(blocks: usize) -> crate::Message {
+        let mut message = crate::Message::user_text("b");
+        while message.blocks.len() < blocks {
+            message.blocks.push(Block::Text { text: "b".into() });
+        }
+        message
+    }
+
+    /// Round 4 MUTATION CHECK: drop the intermediate-boundary computation or
+    /// let it land outside (stable_end, len). Expected RUNTIME failure: a
+    /// tool-heavy tail leaves more than the 20-block lookback window between
+    /// the last marked boundary and the end — the next request's breakpoint
+    /// silently misses its cache entry.
+    #[test]
+    fn intermediate_boundary_keeps_the_tail_inside_the_lookback_window() {
+        // 3 stable messages, then a heavy turn: 10 messages × 4 blocks = 40.
+        let mut messages: Vec<crate::Message> = (0..3).map(|_| message(1)).collect();
+        messages.extend((0..10).map(|_| message(4)));
+        let boundary = anthropic_intermediate_boundary(&messages, 3)
+            .expect("a 40-block tail must earn an intermediate boundary");
+        assert!(boundary > 3 && boundary < messages.len(), "{boundary}");
+        let tail_blocks: usize = messages[boundary..]
+            .iter()
+            .map(|message| message.blocks.len().max(1))
+            .sum();
+        assert!(
+            tail_blocks <= ANTHROPIC_LOOKBACK_BLOCKS,
+            "tail after the boundary must fit the window: {tail_blocks}"
+        );
+        // A short tail needs no extra marker (the slot stays free).
+        assert_eq!(anthropic_intermediate_boundary(&messages, 12), None);
+        // Degenerate shapes never panic or emit out-of-range boundaries.
+        assert_eq!(anthropic_intermediate_boundary(&messages, 13), None);
+        assert_eq!(anthropic_intermediate_boundary(&[], 0), None);
+    }
 }

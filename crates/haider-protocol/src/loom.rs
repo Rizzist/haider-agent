@@ -89,7 +89,7 @@ impl LoomAgentType {
                 part(item.as_bytes());
             }
         }
-        hasher.finalize().to_hex()[..16].to_string()
+        hasher.finalize().to_hex()[..32].to_string()
     }
 
     /// The compiler's view of this type.
@@ -594,7 +594,7 @@ fn workflow_digest(workflow: &LoomWorkflow) -> String {
         part(meta.in_type.as_deref().unwrap_or("").as_bytes());
         part(meta.out_type.as_deref().unwrap_or("").as_bytes());
     }
-    hasher.finalize().to_hex()[..16].to_string()
+    hasher.finalize().to_hex()[..32].to_string()
 }
 
 #[cfg(test)]

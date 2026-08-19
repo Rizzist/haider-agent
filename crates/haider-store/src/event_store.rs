@@ -1653,22 +1653,35 @@ impl Store {
             })?;
         let existing = transaction
             .query_row(
-                "SELECT rev, digest FROM loom_workflows WHERE id = ?1",
+                "SELECT rev, digest, record_json FROM loom_workflows WHERE id = ?1",
                 [workflow.id.as_str()],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_sqlite_error)?;
         let now = now_ms()?;
         let outcome = match existing {
-            Some((rev, ref current)) if *current == workflow.digest => {
+            Some((rev, ref current, ref stored_json)) if *current == workflow.digest => {
                 let rev =
                     u32::try_from(rev).map_err(|_| corrupt("loom workflow rev is out of range"))?;
-                // Round 3: a pre-stamp record (template.version != rev) is
-                // healed HERE — the no-op path is the only chance a legacy
-                // row gets, and an unstamped row breaks the tail/TUI join.
+                // Round 3/4: a pre-stamp record (STORED template.version !=
+                // rev) is healed HERE — the no-op path is the only chance a
+                // legacy row gets, and an unstamped row breaks the tail/TUI
+                // join. The decision reads the STORED row, never the freshly
+                // compiled template (whose version is the compile-time
+                // constant).
                 workflow.rev = rev;
-                if workflow.template.version != rev {
+                let stored_version = serde_json::from_str::<LoomWorkflow>(stored_json)
+                    .map_err(|_| corrupt("loom workflow record is not decodable"))?
+                    .template
+                    .version;
+                if stored_version != rev {
                     workflow.template.version = rev;
                     let json = serde_json::to_string(&workflow)
                         .map_err(|_| corrupt("loom workflow record is not encodable"))?;
@@ -1687,7 +1700,7 @@ impl Store {
                     updated: false,
                 }
             }
-            Some((rev, _)) => {
+            Some((rev, _, _)) => {
                 let next = u32::try_from(rev)
                     .ok()
                     .and_then(|rev| rev.checked_add(1))
@@ -12998,11 +13011,13 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
         character.is_control()
             || matches!(
                 character,
-                '\u{200B}'..='\u{200F}'
+                '\u{00AD}'
+                    | '\u{061C}'
+                    | '\u{200B}'..='\u{200F}'
                     | '\u{202A}'..='\u{202E}'
                     | '\u{2028}'
                     | '\u{2029}'
-                    | '\u{2066}'..='\u{2069}'
+                    | '\u{2060}'..='\u{206F}'
                     | '\u{FEFF}'
             )
     };
@@ -13025,11 +13040,21 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
             return reject("agent type capability entries must not carry control characters");
         }
     }
-    // Round 3 — a CLI grant is a PROGRAM NAME the exec fence compares by
-    // exact first token: an `=` would read as an env assignment and
-    // whitespace would split into two tokens, both fence bypass shapes.
-    if record.clis.iter().any(|cli| cli.contains(['=', ' ', '\t'])) {
-        return reject("agent type CLI entries must be bare program names (no `=`, no spaces)");
+    // Round 4 — a CLI grant is a PROGRAM NAME the exec fence compares by
+    // exact first token, and that token then meets a SHELL: any byte the
+    // shell can expand or re-quote ($VAR, quotes, backslashes, globs) turns
+    // a declared literal into a different program. Allowlist, not denylist.
+    let cli_byte_ok =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+' | b'/');
+    if record
+        .clis
+        .iter()
+        .any(|cli| cli.starts_with('-') || !cli.bytes().all(cli_byte_ok))
+    {
+        return reject(
+            "agent type CLI entries must be bare program names or absolute paths \
+             (alphanumeric plus . _ - + / only)",
+        );
     }
     // An API grant is a HOST the network fence compares literally — never a
     // URL, port, or credential-bearing form.
