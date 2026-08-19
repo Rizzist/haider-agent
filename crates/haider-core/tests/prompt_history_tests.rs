@@ -94,6 +94,52 @@ impl ArtifactReader for TestArtifacts {
     }
 }
 
+#[tokio::test]
+async fn same_event_log_compiles_to_byte_identical_message_bytes() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("deterministic-prompt-history-session");
+    let run_id = RunId::new("deterministic-prompt-history-run");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "deterministic-initial-user",
+            EventPayload::UserMessage {
+                text: "Inspect the cache projection.".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_id,
+            "deterministic-steer-user",
+            EventPayload::UserMessage {
+                text: "Also verify byte-for-byte determinism.".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append deterministic event log");
+
+    let first = PromptHistoryCompiler::compile(&store, &session_id, None, None, &run_id)
+        .await
+        .expect("first independent compile");
+    let second = PromptHistoryCompiler::compile(&store, &session_id, None, None, &run_id)
+        .await
+        .expect("second independent compile");
+
+    assert_eq!(
+        serde_json::to_vec(&first).expect("serialize first projection"),
+        serde_json::to_vec(&second).expect("serialize second projection")
+    );
+}
+
 /// MUTATION CHECK: restore the current-run `!current_user_seen` filter.
 /// Expected RUNTIME failure: the durable mid-round STEER disappears from the
 /// restarted provider prompt even though its acceptance committed.
