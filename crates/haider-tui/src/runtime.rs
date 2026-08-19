@@ -1414,6 +1414,10 @@ impl DemoDriver {
             // no-ops, never a panic.
             AppRequest::CopySelection
             | AppRequest::CopyText(_)
+            // OTA is production-shell vocabulary. The demo reducer keeps
+            // `/update` as a stub and never emits either request.
+            | AppRequest::CheckForUpdate
+            | AppRequest::RunUpdate
             | AppRequest::Reattach { .. }
             | AppRequest::CreateSession { .. }
             // W8b live-only vocabulary: the reducer's demo gates flash
@@ -2625,6 +2629,13 @@ pub struct LivePass {
 /// the executor as a full `AppRequest` and died in its catch-all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellRequest {
+    /// Run an immediate (user-requested) release check, bypassing the quiet
+    /// startup rate limit. Its outcome re-enters as an update [`AppEvent`].
+    CheckForUpdate,
+    /// Run the existing atomic update transaction, then restart this TUI.
+    /// The host executable owns the implementation because `haider-tui`
+    /// deliberately has no dependency on the CLI update pipeline.
+    RunUpdate,
     /// Copy the rendered selection (needs the terminal's frame).
     CopySelection,
     /// Copy model-known text (composer selection).
@@ -2643,6 +2654,47 @@ pub enum ShellRequest {
     Talk(crate::talk::TalkShellCommand),
     /// End the process.
     Quit,
+}
+
+/// A fact produced by the executable that embeds the live TUI. Availability
+/// and failures reduce as ordinary data; `Installed` is process control and
+/// is acted on only by the runtime after the transaction has fully finished.
+#[derive(Debug)]
+pub enum LiveUpdateEvent {
+    App(AppEvent),
+    Installed,
+}
+
+/// Host-owned OTA effects injected into the live runtime. The callbacks only
+/// start background work; their results return on `events`, so neither
+/// discovery nor the update transaction can stall input/rendering.
+pub struct LiveUpdateBridge {
+    events: mpsc::UnboundedReceiver<LiveUpdateEvent>,
+    check_now: Box<dyn Fn() + Send>,
+    run_update: Box<dyn Fn() + Send>,
+}
+
+impl LiveUpdateBridge {
+    #[must_use]
+    pub fn new(
+        events: mpsc::UnboundedReceiver<LiveUpdateEvent>,
+        check_now: impl Fn() + Send + 'static,
+        run_update: impl Fn() + Send + 'static,
+    ) -> Self {
+        Self {
+            events,
+            check_now: Box::new(check_now),
+            run_update: Box::new(run_update),
+        }
+    }
+}
+
+/// Why the live terminal loop returned successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveExit {
+    Quit,
+    /// The CLI+daemon pair is committed and healthy; restart the process.
+    UpdateInstalled,
 }
 
 /// ONE PASS of the live loop's tail — the ordering that makes live mode
@@ -2694,6 +2746,8 @@ pub fn live_pass(
     let requests: Vec<AppRequest> = model.requests.drain(..).collect();
     for request in requests {
         match request {
+            AppRequest::CheckForUpdate => shell.push(ShellRequest::CheckForUpdate),
+            AppRequest::RunUpdate => shell.push(ShellRequest::RunUpdate),
             AppRequest::CopySelection => shell.push(ShellRequest::CopySelection),
             AppRequest::CopyText(text) => shell.push(ShellRequest::CopyText(text)),
             AppRequest::OpenUrl { url } => shell.push(ShellRequest::OpenUrl(url)),
@@ -2735,7 +2789,8 @@ pub async fn run_live(
     client: haider_client::RpcClient,
     profile: haider_client::ResolvedProfile,
     config: haider_client::ClientConfig,
-) -> std::io::Result<()> {
+    mut updates: LiveUpdateBridge,
+) -> std::io::Result<LiveExit> {
     use crate::live::LiveDriver;
 
     model.mode = crate::app::RuntimeMode::Live;
@@ -2845,6 +2900,8 @@ pub async fn run_live(
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
     // The last pointer cell, for post-draw hover settling (W5g-7).
     let mut pointer: Option<(u16, u16)> = None;
+    let mut update_events_open = true;
+    let mut update_in_progress = false;
 
     while !model.should_quit {
         // Issue whatever the driver asked for. `try_send` keeps the UI loop
@@ -2900,6 +2957,21 @@ pub async fn run_live(
                 };
                 model.handle_talk(event);
             }
+            update_event = updates.events.recv(), if update_events_open => {
+                match update_event {
+                    Some(LiveUpdateEvent::App(event)) => {
+                        if matches!(
+                            &event,
+                            AppEvent::UpdateCurrent { .. } | AppEvent::UpdateFailed { .. }
+                        ) {
+                            update_in_progress = false;
+                        }
+                        model.handle(event);
+                    }
+                    Some(LiveUpdateEvent::Installed) => return Ok(LiveExit::UpdateInstalled),
+                    None => update_events_open = false,
+                }
+            }
             _ = anim_tick.tick(), if model.animated() => {
                 model.anim_phase = model.anim_phase.wrapping_add(1);
                 // S4: the same tick is the live chips' elapsed clock — no
@@ -2929,6 +3001,15 @@ pub async fn run_live(
         // without an arm here is a compile error, never a silent drop.
         for request in pass.shell {
             match request {
+                ShellRequest::CheckForUpdate => (updates.check_now)(),
+                ShellRequest::RunUpdate if !update_in_progress => {
+                    update_in_progress = true;
+                    (updates.run_update)();
+                }
+                ShellRequest::RunUpdate => {
+                    model.flash = Some("· update already in progress".to_owned());
+                    model.dirty = true;
+                }
                 ShellRequest::CopySelection => {
                     if let Some(selection) = model.selection {
                         let size = terminal.size()?;
@@ -2967,5 +3048,5 @@ pub async fn run_live(
             sync_window_title(&active_title);
         }
     }
-    Ok(())
+    Ok(LiveExit::Quit)
 }
