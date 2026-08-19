@@ -1403,12 +1403,17 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
     // session can never OOM the exporter (M4).
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let collector = tokio::spawn(collect_bounded_replay(receiver, MAX_REPLAY_EVENTS));
-    let stream = haider_client::observe_stream_session(
+    // Verify round 2 (F1): collection starts AT the cursor, so the bounded
+    // collector is a sliding WINDOW — with `--since`, every suffix of an
+    // over-long session is reachable across successive calls; nothing is
+    // ever stranded behind the cap.
+    let stream = haider_client::observe_stream_session_after(
         &profile,
         !options.no_spawn,
         session_id,
         false,
         sender,
+        options.since.unwrap_or(0),
     )
     .await;
     let (events, truncated) = collector.await.unwrap_or_default();
@@ -1417,9 +1422,12 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
         return ExitCode::from(EX_UNAVAILABLE);
     }
     if truncated {
+        // The window slid from the cursor, so head_seq below is the honest
+        // cursor of THIS window — the named follow-up reaches the rest.
         eprintln!(
-            "haider export: session replay truncated at {MAX_REPLAY_EVENTS} events — the export covers the first {} of them",
-            events.len()
+            "haider export: replay window capped at {MAX_REPLAY_EVENTS} events — continue with \
+             `haider export {} --format pipe --since <head_seq from this export's header>`",
+            options.session_id
         );
     }
 

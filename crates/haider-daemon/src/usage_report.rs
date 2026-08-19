@@ -1215,18 +1215,24 @@ impl SessionFolder {
                     priced: value.priced,
                 })
                 .collect::<Vec<_>>();
+            // Verify round 2 (roster digests): the fold's HashMap key includes
+            // the auth method, so the sort must too — rows sharing every
+            // other coordinate would otherwise reorder run-to-run and turn
+            // serialized-summary digests into false deltas.
             breakdowns.sort_by(|left, right| {
                 (
                     left.provider.as_str(),
                     left.model.as_str(),
                     left.cache_epoch.as_str(),
                     request_kind_rank(left.request_kind),
+                    format!("{:?}", left.auth_method),
                 )
                     .cmp(&(
                         right.provider.as_str(),
                         right.model.as_str(),
                         right.cache_epoch.as_str(),
                         request_kind_rank(right.request_kind),
+                        format!("{:?}", right.auth_method),
                     ))
             });
             AgentUsageMetrics {

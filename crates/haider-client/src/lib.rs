@@ -47,7 +47,10 @@ pub use headless::{
     required_headless_features_with_attachments, required_headless_features_with_hook_trust,
     run_headless,
 };
-pub use observe::{ObserveClient, ObserveError, observe_stream_all, observe_stream_session};
+pub use observe::{
+    ObserveClient, ObserveError, observe_stream_all, observe_stream_session,
+    observe_stream_session_after,
+};
 pub use permission::{
     ComputerPermissionClientError, open_permission_settings, open_permission_settings_request,
     restart_daemon_for_permission,

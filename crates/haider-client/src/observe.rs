@@ -321,7 +321,30 @@ pub async fn observe_stream_session(
     follow: bool,
     output: mpsc::UnboundedSender<RawEnvelope>,
 ) -> Result<(), ObserveError> {
-    stream_shard(profile.clone(), spawn, vec![session_id], follow, output).await
+    stream_shard(profile.clone(), spawn, vec![session_id], follow, output, 0).await
+}
+
+/// [`observe_stream_session`] with a starting cursor: replay begins strictly
+/// after `after_seq`. The incremental-export windowing seam — a bounded
+/// collector plus a moving cursor reaches EVERY suffix across calls, so
+/// truncation can never strand history.
+pub async fn observe_stream_session_after(
+    profile: &ResolvedProfile,
+    spawn: bool,
+    session_id: SessionId,
+    follow: bool,
+    output: mpsc::UnboundedSender<RawEnvelope>,
+    after_seq: u64,
+) -> Result<(), ObserveError> {
+    stream_shard(
+        profile.clone(),
+        spawn,
+        vec![session_id],
+        follow,
+        output,
+        after_seq,
+    )
+    .await
 }
 
 /// Streams every session, sharding view attachments at the daemon's default
@@ -341,6 +364,7 @@ pub async fn observe_stream_all(
                 shard.to_vec(),
                 false,
                 output.clone(),
+                0,
             )
             .await?;
         }
@@ -359,6 +383,7 @@ pub async fn observe_stream_all(
             shard.to_vec(),
             true,
             output.clone(),
+            0,
         ));
     }
     let mut discovery = tokio::time::interval(SESSION_DISCOVERY_POLL);
@@ -386,6 +411,7 @@ pub async fn observe_stream_all(
                         shard.to_vec(),
                         true,
                         output.clone(),
+                        0,
                     ));
                 }
             }
@@ -409,13 +435,14 @@ async fn stream_shard(
     sessions: Vec<SessionId>,
     follow: bool,
     output: mpsc::UnboundedSender<RawEnvelope>,
+    initial_after_seq: u64,
 ) -> Result<(), ObserveError> {
     if sessions.is_empty() {
         return Ok(());
     }
     let mut cursors = sessions
         .iter()
-        .map(|session_id| (session_id.as_str().to_owned(), 0_u64))
+        .map(|session_id| (session_id.as_str().to_owned(), initial_after_seq))
         .collect::<HashMap<_, _>>();
     loop {
         let observer = ObserveClient::connect(&profile, spawn).await?;
