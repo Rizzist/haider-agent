@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use haider_accounts::{CredentialAlias, MemoryVault, Vault, import_env};
 use haider_protocol::ids::ArtifactRef;
-use haider_protocol::provider::{Block, FinishReason, StreamEvent, UsageSource};
+use haider_protocol::provider::{
+    Block, FinishReason, PrefixDigests, StreamEvent, Usage, UsageSource,
+};
 use haider_protocol::tool::AttachmentBlock;
 use haider_provider::{
     AnthropicCapture, AnthropicProvider, Message, MessageRole, Provider, ProviderError,
@@ -63,6 +65,137 @@ async fn live_anthropic_text_smoke_is_explicitly_gated() {
     }
     assert!(saw_text);
     assert!(saw_finish);
+}
+
+#[tokio::test]
+#[ignore = "live Anthropic cache assertion; requires HAIDER_LIVE_PROVIDER_TESTS=1"]
+async fn live_anthropic_second_turn_reads_cached_prompt_prefix() {
+    if std::env::var(LIVE_GATE).as_deref() != Ok("1") {
+        return;
+    }
+    let vault = import_live_key();
+    let model = selected_model();
+    let provider = live_provider(&vault, &model);
+    let stable_system = "Stable cache-test context. Keep every word unchanged. ".repeat(500);
+    let mut first_request = cache_assertion_request(
+        &model,
+        stable_system.clone(),
+        vec![Message::user_text("Reply with exactly: cache-turn-one")],
+        0,
+        0,
+    );
+
+    let (first_reply, first_usage) = run_live_cache_turn(&provider, first_request.clone()).await;
+    let first_normalized = first_usage
+        .normalized
+        .as_ref()
+        .expect("turn 1 reports normalized cache usage");
+    assert!(
+        first_normalized.cache_write_input > 0,
+        "turn 1 must report cache_creation_input_tokens > 0: {first_normalized:?}"
+    );
+    let prior_prompt_tokens = first_normalized.logical_input;
+
+    first_request.messages.extend([
+        Message::assistant(vec![Block::Text { text: first_reply }]),
+        Message::user_text("Reply with exactly: cache-turn-two"),
+    ]);
+    let metadata = first_request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata");
+    metadata.stable_history_end = 2;
+    metadata.current_user_start = 2;
+    let (_, second_usage) = run_live_cache_turn(&provider, first_request).await;
+    let second_normalized = second_usage
+        .normalized
+        .as_ref()
+        .expect("turn 2 reports normalized cache usage");
+    assert!(
+        second_normalized.cache_read_input > 0,
+        "turn 2 must report cache_read_input_tokens > 0: {second_normalized:?}"
+    );
+    assert!(
+        second_normalized.cache_read_input >= prior_prompt_tokens.div_ceil(2),
+        "turn 2 cache read ({}) must cover at least 50% of turn 1 prompt ({prior_prompt_tokens})",
+        second_normalized.cache_read_input
+    );
+}
+
+fn cache_assertion_request(
+    model: &str,
+    system_prompt: String,
+    messages: Vec<Message>,
+    stable_history_end: usize,
+    current_user_start: usize,
+) -> TurnRequest {
+    TurnRequest {
+        messages,
+        model: model.into(),
+        max_tokens: 32,
+        system_prompt: Some(system_prompt),
+        tools: vec![ToolDefinition {
+            name: "cache_probe".into(),
+            description: "A stable no-op tool definition used only to verify prompt caching".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }],
+        attachments: Vec::new(),
+        cache_metadata: Some(haider_provider::PromptCacheMetadata {
+            stable_history_end,
+            current_user_start,
+            latest_compaction_summary_end: None,
+            prefix_digests: PrefixDigests {
+                system: "live-stable-system".into(),
+                tools: "live-stable-tools".into(),
+                immutable_history: "live-stable-history".into(),
+                model: "live-stable-model".into(),
+                auth_mode: "live-api-key".into(),
+                reasoning_settings: "live-default-reasoning".into(),
+            },
+            cache_epoch: "live-cache-assertion-v1".into(),
+            compaction_epoch: "live-root-compaction".into(),
+            provider: "anthropic".into(),
+            session_scope: "live-cache-assertion-session".into(),
+            account_scope: Some("anthropic-env".into()),
+            stable_prefix_tokens: 5_000,
+            expected_later_reads: 2,
+            reuse_gap_ms: Some(1_000),
+        }),
+    }
+}
+
+async fn run_live_cache_turn(
+    provider: &AnthropicProvider,
+    request: TurnRequest,
+) -> (String, Usage) {
+    let mut stream = provider
+        .stream_turn(request)
+        .await
+        .expect("live cache stream starts");
+    let mut text = String::new();
+    let mut usage = None;
+    let mut saw_finish = false;
+    while let Some(item) = stream.recv().await {
+        match item.expect("live cache stream item") {
+            StreamEvent::TextDelta { text: delta } => text.push_str(&delta),
+            StreamEvent::UsageUpdate(update) => usage = Some(update),
+            StreamEvent::Finish { .. } => {
+                saw_finish = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_finish, "live cache turn must finish");
+    assert!(
+        !text.is_empty(),
+        "live cache turn must return assistant text"
+    );
+    (text, usage.expect("live cache turn reports usage"))
 }
 
 #[tokio::test]
