@@ -23,9 +23,13 @@ pub fn detect_created_images(
     command: &str,
     output_preview: &str,
     cwd: &Path,
+    workspace_root: &Path,
     started: SystemTime,
 ) -> Vec<PathBuf> {
-    let Ok(workspace) = cwd.canonicalize() else {
+    let Ok(resolve_root) = cwd.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok(workspace) = workspace_root.canonicalize() else {
         return Vec::new();
     };
     let earliest_mtime = started
@@ -34,9 +38,24 @@ pub fn detect_created_images(
     let mut detected = Vec::new();
     let mut seen = HashSet::new();
 
+    // Verify round 2: whitespace tokens miss quoted paths WITH spaces and
+    // `--flag=path` forms — nominate those shapes too. Nominations stay
+    // cheap text guesses; the fence and metadata gates decide.
+    let mut quoted = Vec::new();
+    for text in [command, output_preview] {
+        for quote in ['"', '\''] {
+            let mut parts = text.split(quote);
+            let _ = parts.next();
+            while let (Some(inner), Some(_)) = (parts.next(), parts.next()) {
+                quoted.push(inner);
+            }
+        }
+    }
     for token in command
         .split_whitespace()
         .chain(output_preview.split_whitespace())
+        .map(|token| token.rsplit_once('=').map_or(token, |(_, tail)| tail))
+        .chain(quoted)
     {
         if detected.len() == IMAGE_EVENT_LIMIT {
             break;
@@ -49,7 +68,7 @@ pub fn detect_created_images(
         let unresolved = if candidate.is_absolute() {
             candidate.to_path_buf()
         } else {
-            workspace.join(candidate)
+            resolve_root.join(candidate)
         };
         let Ok(path) = unresolved.canonicalize() else {
             continue;
@@ -243,6 +262,7 @@ mod tests {
             "encoder command.PNG",
             "saved stdout.jpeg",
             workspace.path(),
+            workspace.path(),
             started,
         );
 
@@ -261,7 +281,13 @@ mod tests {
             .checked_sub(Duration::from_secs(1))
             .expect("recent start");
 
-        let detected = detect_created_images(&outside.to_string_lossy(), "", &workspace, started);
+        let detected = detect_created_images(
+            &outside.to_string_lossy(),
+            "",
+            &workspace,
+            &workspace,
+            started,
+        );
 
         assert!(detected.is_empty());
     }
@@ -276,7 +302,13 @@ mod tests {
             .checked_add(Duration::from_secs(5))
             .expect("future start");
 
-        let detected = detect_created_images("old.webp", "", workspace.path(), future_start);
+        let detected = detect_created_images(
+            "old.webp",
+            "",
+            workspace.path(),
+            workspace.path(),
+            future_start,
+        );
 
         assert!(detected.is_empty());
     }
@@ -296,6 +328,7 @@ mod tests {
             "0.gif 0.gif 1.gif 2.gif",
             "3.gif 4.gif",
             workspace.path(),
+            workspace.path(),
             started,
         );
 
@@ -314,6 +347,7 @@ mod tests {
         let detected = detect_created_images(
             "tool 'quoted.svg',",
             "created (wrapped.bmp).",
+            workspace.path(),
             workspace.path(),
             started,
         );
@@ -364,5 +398,53 @@ mod tests {
             .expect("inspect candidate");
 
         assert!(payload.is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod verify_round_2_tests {
+    use super::*;
+
+    /// Verify round 2 MUTATION CHECK: fence against the exec cwd again, or
+    /// drop the quoted/`--flag=` nominations. Expected RUNTIME failures.
+    #[test]
+    fn workspace_fence_and_nomination_shapes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sub = workspace.path().join("sub");
+        std::fs::create_dir(&sub).expect("subdir");
+        let started = SystemTime::now();
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0,
+            0, 0, 2, 0, 0, 0, 3, 8, 6, 0, 0, 0,
+        ];
+        // An exec in workspace/sub writing ../out.png is INSIDE the workspace.
+        std::fs::write(workspace.path().join("out.png"), png).expect("write");
+        let detected =
+            detect_created_images("magick ../out.png", "", &sub, workspace.path(), started);
+        assert_eq!(
+            detected.len(),
+            1,
+            "parent-relative inside workspace publishes"
+        );
+        // Quoted path with spaces + --flag=path nominate.
+        std::fs::write(workspace.path().join("two words.png"), png).expect("write");
+        let detected = detect_created_images(
+            "render \"two words.png\"",
+            "",
+            workspace.path(),
+            workspace.path(),
+            started,
+        );
+        assert_eq!(detected.len(), 1, "quoted spaces publish");
+        std::fs::write(workspace.path().join("flagged.png"), png).expect("write");
+        let detected = detect_created_images(
+            "plot --output=flagged.png",
+            "",
+            workspace.path(),
+            workspace.path(),
+            started,
+        );
+        assert_eq!(detected.len(), 1, "--flag=path publishes");
     }
 }

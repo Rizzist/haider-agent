@@ -70,8 +70,43 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
 /// Command construction is kept pure (apart from validating filesystem
 /// existence), allowing the exact program and argument boundary to be pinned
 /// without launching an OS application in tests.
+/// Reveal round 2 — the TRUST BOUNDARY. The path arrives from a durable
+/// event an old or foreign daemon could have authored, so nothing about it
+/// is trusted: it must already be absolute (a relative token could parse as
+/// an OPTION to the opener), never a Windows UNC/device form (`metadata`
+/// alone would touch the network before Explorer even starts), and after
+/// canonicalization it must be a REGULAR FILE with an image extension —
+/// this surface reveals images the harness reported, nothing else.
+fn validated_reveal_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let refused =
+        |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_owned());
+    if !path.is_absolute() {
+        return Err(refused("reveal requires an absolute path"));
+    }
+    let raw = path.as_os_str().to_string_lossy();
+    if raw.starts_with("\\\\") || raw.starts_with("//") {
+        return Err(refused("reveal refuses UNC/device paths"));
+    }
+    const IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+    let extension_ok = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        });
+    if !extension_ok {
+        return Err(refused("reveal is scoped to image files"));
+    }
+    let canonical = path.canonicalize()?;
+    if !std::fs::metadata(&canonical)?.is_file() {
+        return Err(refused("reveal target is not a regular file"));
+    }
+    Ok(canonical)
+}
+
 pub fn reveal_path_command(path: &Path) -> std::io::Result<Command> {
-    std::fs::metadata(path)?;
+    let path = validated_reveal_target(path)?;
+    let path = path.as_path();
     let mut command = if cfg!(target_os = "macos") {
         let mut command = Command::new("/usr/bin/open");
         command.arg("-R").arg(path);

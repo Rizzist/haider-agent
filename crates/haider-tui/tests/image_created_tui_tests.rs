@@ -108,6 +108,11 @@ fn reveal_command_selects_the_file_on_this_platform() {
     let file = dir.path().join("created.png");
     std::fs::write(&file, b"png").expect("test file");
     let command = reveal_path_command(&file).expect("existing paths are revealable");
+    // Verify round 2: the trust boundary canonicalizes before spawning, so
+    // the platform arg is the CANONICAL form (tempdir symlinks resolved).
+    let file = file.canonicalize().expect("canonical");
+    #[allow(unused_variables)]
+    let dir_canonical = dir.path().canonicalize().expect("canonical dir");
     let program = command.get_program().to_string_lossy();
     let args = command
         .get_args()
@@ -125,11 +130,34 @@ fn reveal_command_selects_the_file_on_this_platform() {
         assert_eq!(args, vec![format!("/select,{}", file.display())]);
     } else {
         assert_eq!(program, "xdg-open");
-        assert_eq!(args, vec![dir.path().to_string_lossy().into_owned()]);
+        assert_eq!(args, vec![dir_canonical.to_string_lossy().into_owned()]);
     }
 
     assert!(
         reveal_path_command(&dir.path().join("missing.png")).is_err(),
         "non-existent payloads are refused before spawn"
     );
+}
+
+/// Verify round 2 MUTATION CHECK: drop any reveal trust-boundary check
+/// (absolute, image extension, regular file). Expected RUNTIME failure: an
+/// untrusted durable path reaches the OS opener.
+#[test]
+fn reveal_refuses_untrusted_shapes() {
+    use haider_tui::browser::reveal_path_command;
+    use std::path::Path;
+    // Relative (option-shaped) paths refuse outright.
+    assert!(reveal_path_command(Path::new("-e")).is_err());
+    assert!(reveal_path_command(Path::new("--help/x.png")).is_err());
+    // Absolute non-image refuses even when it exists.
+    assert!(reveal_path_command(Path::new("/etc/hosts")).is_err());
+    // A directory with an image-ish name refuses.
+    let dir = tempfile::tempdir().expect("dir");
+    let fake = dir.path().join("folder.png");
+    std::fs::create_dir(&fake).expect("mkdir");
+    assert!(reveal_path_command(&fake).is_err());
+    // A real absolute image file passes.
+    let good = dir.path().join("real.png");
+    std::fs::write(&good, [0x89, b'P', b'N', b'G']).expect("write");
+    assert!(reveal_path_command(&good).is_ok());
 }

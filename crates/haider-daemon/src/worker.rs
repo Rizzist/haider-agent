@@ -7355,8 +7355,16 @@ struct CreatedImageScan<'a> {
 
 impl BrokerToolDispatcher {
     async fn emit_created_images(&self, scan: CreatedImageScan<'_>) -> ToolResult<()> {
-        for path in detect_created_images(scan.command, scan.output_preview, scan.cwd, scan.started)
-        {
+        // Verify round 2: relative tokens resolve against the EXEC cwd, but
+        // the publication fence is the SESSION workspace root — an exec in
+        // workspace/sub writing ../out.png is inside the workspace.
+        for path in detect_created_images(
+            scan.command,
+            scan.output_preview,
+            scan.cwd,
+            Path::new(&self.metadata.cwd),
+            scan.started,
+        ) {
             let Some(image) = image_created_payload(
                 &path,
                 Path::new(&self.metadata.cwd),
@@ -8808,7 +8816,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             run_id,
                             call_id,
                             tool: "fs_write",
-                            command: &path,
+                            // Verify round 2: the EXACT argument, quoted, so
+                            // a path with spaces nominates whole instead of
+                            // fragmenting into whitespace tokens.
+                            command: &format!("\"{path}\""),
                             output_preview: "",
                             cwd: Path::new(&self.metadata.cwd),
                             started,
@@ -10314,13 +10325,17 @@ impl HubCommandOutputContext {
         let mut identity = blake3::Hasher::new();
         identity.update(image.call_id.as_bytes());
         identity.update(image.path.as_bytes());
-        let item_id = ItemId::new(format!("image-created-{}", identity.finalize().to_hex()));
+        let identity = identity.finalize().to_hex();
+        let item_id = ItemId::new(format!("image-created-{identity}"));
         let data = serde_json::to_value(image).map_err(|error| ToolError::Runtime {
             message: format!("cannot serialize image-created payload: {error}"),
         })?;
+        // Verify round 2: the event id derives from the SAME (call_id, path)
+        // identity — the store's unique event-id constraint makes a retried
+        // or replayed emission an idempotent no-op instead of a duplicate row.
         let mut envelopes = [EventEnvelope {
             schema_version: SCHEMA_VERSION,
-            event_id: self.event_ids.next(),
+            event_id: EventId::new(format!("image-created-{identity}")),
             seq: 0,
             session_id: self.store.session_id().clone(),
             branch_id: self.branch_id.clone(),

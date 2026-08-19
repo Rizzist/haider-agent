@@ -3758,7 +3758,12 @@ fn render_session(
                 spans.push(Span::raw(" ".repeat(pad)));
             }
             frame.render_widget(Paragraph::new(Line::from(spans)).style(band), sticky_rect);
-            hits.push((sticky_rect, Hit::StickyJump(jump)));
+            // Verify round 2: hit dispatch is FIRST-match, and the sticky
+            // band paints OVER whatever transcript row (an image row's
+            // full-width hit included) occupies row zero — so its hit must
+            // lead the map, or a click on the visible band would fire the
+            // hidden row underneath.
+            hits.insert(0, (sticky_rect, Hit::StickyJump(jump)));
         }
     }
 
