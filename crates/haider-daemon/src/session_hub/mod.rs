@@ -1279,6 +1279,37 @@ impl SessionHub {
         self.inner.store.loom_agent_type(id.to_owned()).await
     }
 
+    /// E1 — the whole registry in one read (the volatile-tail inventory).
+    pub(crate) async fn loom_registry(
+        &self,
+    ) -> Result<
+        (
+            Vec<haider_protocol::loom::LoomAgentType>,
+            Vec<haider_protocol::loom::LoomWorkflow>,
+        ),
+        HaiderError,
+    > {
+        Ok((
+            self.inner.store.loom_agent_types().await?,
+            self.inner.store.loom_workflows().await?,
+        ))
+    }
+
+    /// E2 — plan-gated registration from the session agent's tool path.
+    pub(crate) async fn loom_register_workflow(
+        &self,
+        source: String,
+    ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
+        self.inner.store.loom_register_workflow(source).await
+    }
+
+    pub(crate) async fn loom_register_agent_type(
+        &self,
+        record: haider_protocol::loom::LoomAgentType,
+    ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
+        self.inner.store.loom_register_agent_type(record).await
+    }
+
     /// Narrow daemon-internal session creation used by local delegation.
     /// It preserves the same unfenced receipt preflight and actor-routed
     /// transaction as the wire method without fabricating an RPC connection.

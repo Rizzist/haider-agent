@@ -4598,11 +4598,19 @@ async fn start_turn(
             .map(|workflow| loom_run_tail(&workflow)),
         None => None,
     };
-    let graph_brief = match (graph_brief, loom_tail) {
-        (Some(brief), Some(tail)) => Some(format!("{brief}\n{tail}")),
-        (Some(brief), None) => Some(brief),
-        (None, Some(tail)) => Some(tail),
-        (None, None) => None,
+    // E1: the registry inventory rides the SAME volatile tail — the model
+    // learns what specialists/workflows exist without a cache-epoch cost
+    // (registrations move tail bytes only, never history).
+    let loom_inventory = {
+        let (types, workflows) = lease.hub().loom_registry().await?;
+        loom_inventory_line(&types, &workflows)
+    };
+    let graph_brief = {
+        let parts: Vec<String> = [graph_brief, loom_tail, loom_inventory]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
     };
     let dispatcher = dependencies
         .tool_factory
@@ -5010,6 +5018,49 @@ async fn prior_cache_domain_gap_ms(
         return Ok(None);
     };
     Ok(Some(now.saturating_sub(latest)))
+}
+
+/// E2 — every `plan` proposal body the human ACCEPTED on this branch. The
+/// scan pairs durable MenuOpened(origin="plan") bodies with their committed
+/// accept answers (key preferred; index 0 is the accept slot).
+async fn accepted_plan_bodies(
+    store: &HubStoreHandle,
+    branch_id: Option<&BranchId>,
+) -> Result<Vec<String>, HaiderError> {
+    let mut opened: HashMap<haider_protocol::ids::MenuId, String> = HashMap::new();
+    let mut accepted = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            return Ok(accepted);
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.branch_id.as_ref() != branch_id {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            match payload {
+                EventPayload::MenuOpened(menu) if menu.origin == "plan" => {
+                    opened.insert(menu.id.clone(), menu.body.join("\n"));
+                }
+                EventPayload::MenuAnswered(answer) => {
+                    let accepts = match answer.option_key.as_deref() {
+                        Some(key) => key == "accept",
+                        None => answer.option_index == 0,
+                    };
+                    if accepts && let Some(body) = opened.get(&answer.menu) {
+                        accepted.push(body.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 async fn find_committed_menu_answer(
@@ -6194,6 +6245,7 @@ impl BrokerToolFactory {
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
     Plan,
+    LoomRegister,
     TodoWrite,
     GraphEvidence,
     FsRead,
@@ -6273,6 +6325,16 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             DispatchMode::Await,
             ToolPermissionDefault::NotApplicable,
             RegisteredToolRoute::Plan,
+        ),
+        // E2: registration is plan-gated, not broker-gated — the ACCEPTED
+        // plan carrying the exact registration IS the human authorization,
+        // so no effect class rides here.
+        registered_tool(
+            loom_register_definition(),
+            vec![],
+            DispatchMode::Await,
+            ToolPermissionDefault::NotApplicable,
+            RegisteredToolRoute::LoomRegister,
         ),
         {
             // G1: actor-owned like request_input — no brokered effect.
@@ -6427,6 +6489,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::GraphEvidence
                         | RegisteredToolRoute::WorkflowAuthor
                         | RegisteredToolRoute::Plan
+                        | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
                 )
             })
@@ -6441,6 +6504,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::GraphEvidence
                         | RegisteredToolRoute::WorkflowAuthor
                         | RegisteredToolRoute::Plan
+                        | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
                 )
             })
@@ -6758,6 +6822,9 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "request_input" => {
             "request_input(kind, title, body?, options?) — ask the user one blocking prompt; options=[{key, label, detail?}] for a choice"
+        }
+        "loom_register" => {
+            "loom_register(kind, source?|record?) — register a Loom workflow (kind=workflow, source=pipe text `name: In -> Out` + node lines) or agent type (kind=agent_type, record={id,name,job,in_type,out_type,clis,apis,skills,scripts,color,glyph}); refused unless a human-ACCEPTED plan body contains the registration content"
         }
         "plan" => {
             "plan(title, body) — present a full markdown plan/proposal for review before acting; the user answers accept / revise (with a note) / reject and the result is {decision, note}. Use for designs, migrations, architectures — anything that deserves approval first"
@@ -8241,6 +8308,118 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     }
                 }
             }
+            RegisteredToolRoute::LoomRegister => {
+                let kind = required_string(&args, "kind")?;
+                let completed = |value: serde_json::Value| BoundedResult {
+                    preview: value.to_string(),
+                    truncated: false,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: ToolResultStatus::Completed,
+                    reason: None,
+                    presentation: None,
+                };
+                let refusal = |error: String| {
+                    completed(serde_json::json!({ "ok": false, "error": error }))
+                };
+                let receipt = |kind: &str,
+                               registration: haider_protocol::loom::LoomRegistration| {
+                    completed(serde_json::json!({
+                        "ok": true,
+                        "kind": kind,
+                        "id": registration.id,
+                        "rev": registration.rev,
+                        "digest": registration.digest,
+                        "updated": registration.updated,
+                    }))
+                };
+                let bodies =
+                    accepted_plan_bodies(&self.output.store, self.branch_id.as_ref()).await?;
+                match kind.as_str() {
+                    "workflow" => {
+                        let source = required_string(&args, "source")?;
+                        if plan_gate_admits(&bodies, &[source.trim()]) {
+                            match self.output.store.hub().loom_register_workflow(source).await {
+                                Ok(registration) => Ok(receipt("workflow", registration)),
+                                Err(error) if error.code == ErrorCode::InvalidArgument => {
+                                    Ok(refusal(format!(
+                                        "registration rejected: {}",
+                                        error.message
+                                    )))
+                                }
+                                Err(error) => Err(ToolError::Runtime {
+                                    message: error.message,
+                                }),
+                            }
+                        } else {
+                            Ok(refusal(
+                                "registration requires a plan the human ACCEPTED whose body \
+                                 contains this exact pipe source — present one with the `plan` \
+                                 tool first"
+                                    .into(),
+                            ))
+                        }
+                    }
+                    "agent_type" => {
+                        let mut value = args.get("record").cloned().ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                "kind=agent_type requires `record`",
+                                false,
+                            )
+                        })?;
+                        if let Some(object) = value.as_object_mut() {
+                            // The registry owns revs; the model never picks one.
+                            object.insert("rev".into(), serde_json::json!(1));
+                        }
+                        let record: haider_protocol::loom::LoomAgentType =
+                            serde_json::from_value(value).map_err(|error| {
+                                HaiderError::new(
+                                    ErrorCode::InvalidArgument,
+                                    format!("agent type record does not decode: {error}"),
+                                    false,
+                                )
+                            })?;
+                        let signature = format!("{} -> {}", record.in_type, record.out_type);
+                        let needles = [record.id.as_str(), record.job.trim(), signature.as_str()];
+                        if plan_gate_admits(&bodies, &needles) {
+                            match self
+                                .output
+                                .store
+                                .hub()
+                                .loom_register_agent_type(record)
+                                .await
+                            {
+                                Ok(registration) => Ok(receipt("agent_type", registration)),
+                                Err(error) if error.code == ErrorCode::InvalidArgument => {
+                                    Ok(refusal(format!(
+                                        "registration rejected: {}",
+                                        error.message
+                                    )))
+                                }
+                                Err(error) => Err(ToolError::Runtime {
+                                    message: error.message,
+                                }),
+                            }
+                        } else {
+                            Ok(refusal(
+                                "registration requires a plan the human ACCEPTED whose body \
+                                 contains the type id, its job text, and its `In -> Out` \
+                                 signature — present one with the `plan` tool first"
+                                    .into(),
+                            ))
+                        }
+                    }
+                    other => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("loom_register kind `{other}` is not workflow|agent_type"),
+                            false,
+                        ));
+                    }
+                }
+            }
             RegisteredToolRoute::TaskOutput => {
                 let task_id = required_string(&args, "task_id")?;
                 let cursor = optional_u64(&args, "cursor")?;
@@ -9486,6 +9665,86 @@ fn request_input_definition() -> ToolDefinition {
             "additionalProperties": false
         }),
     }
+}
+
+/// E2: plan-gated Loom registration. The gate law: the registration's
+/// content must appear inside a plan proposal the human ACCEPTED — the
+/// review the plan tool already provides IS the permission.
+fn loom_register_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "loom_register".into(),
+        description: "Register a Loom workflow (kind=workflow, source=pipe text) or agent type                       (kind=agent_type, record object). Requires a plan the human ACCEPTED whose                       body contains the registration content; present one first."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["workflow", "agent_type"]},
+                "source": {"type": "string", "minLength": 1, "maxLength": 16384},
+                "record": {"type": "object"}
+            },
+            "required": ["kind"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// E2 — the pure gate: some accepted plan body must contain EVERY needle.
+/// Workflows bind by full pipe source; agent types by id + job + signature
+/// (verbatim substrings a proposal card naturally carries).
+pub(crate) fn plan_gate_admits(accepted_plan_bodies: &[String], needles: &[&str]) -> bool {
+    !needles.is_empty()
+        && needles.iter().all(|needle| !needle.trim().is_empty())
+        && accepted_plan_bodies
+            .iter()
+            .any(|body| needles.iter().all(|needle| body.contains(needle.trim())))
+}
+
+/// E1 — the registry inventory line for the VOLATILE user tail. Cache law:
+/// a registration changes only tail bytes — never durable history, never
+/// the system prompt's cache epoch. Names and typed signatures only.
+pub(crate) fn loom_inventory_line(
+    types: &[haider_protocol::loom::LoomAgentType],
+    workflows: &[haider_protocol::loom::LoomWorkflow],
+) -> Option<String> {
+    if types.is_empty() && workflows.is_empty() {
+        return None;
+    }
+    let mut line = String::from("loom registry —");
+    if !types.is_empty() {
+        line.push_str(" types:");
+        for record in types {
+            line.push_str(&format!(
+                " @{} {} -> {}",
+                record.id, record.in_type, record.out_type
+            ));
+            line.push(',');
+        }
+        line.pop();
+        line.push(';');
+    }
+    if !workflows.is_empty() {
+        line.push_str(" workflows (run via spawn_subagent(workflow=<id>)):");
+        for workflow in workflows {
+            line.push_str(&format!(
+                " @{} {} -> {}",
+                workflow.id, workflow.in_type, workflow.out_type
+            ));
+            line.push(',');
+        }
+        line.pop();
+        line.push(';');
+    }
+    line.push_str(" new ones: present the registration in a `plan`, then loom_register.");
+    const LOOM_INVENTORY_MAX_BYTES: usize = 700;
+    if line.len() > LOOM_INVENTORY_MAX_BYTES {
+        let mut end = LOOM_INVENTORY_MAX_BYTES - '…'.len_utf8();
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+        line.push('…');
+    }
+    Some(line)
 }
 
 /// D4: the generic plan tool. The full markdown proposal parks the run on a

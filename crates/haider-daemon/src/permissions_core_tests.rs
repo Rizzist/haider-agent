@@ -5,10 +5,10 @@ use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
     WebCapabilityDegrade, advertised_tool_definitions, cli_scope_admits, defer_shell_handoff,
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
-    explicit_computer_use_intent, grant_admits_manifest_effect, loom_run_tail, loom_task_type_id,
-    registered_tool_route, registered_tools, scoped_network_hosts, stub_schema,
-    tool_inventory_snapshot, tool_manual, tool_manual_line, typed_child_grant, typed_tool_result,
-    web_fetch_host_allowed,
+    explicit_computer_use_intent, grant_admits_manifest_effect, loom_inventory_line, loom_run_tail,
+    loom_task_type_id, plan_gate_admits, registered_tool_route, registered_tools,
+    scoped_network_hosts, stub_schema, tool_inventory_snapshot, tool_manual, tool_manual_line,
+    typed_child_grant, typed_tool_result, web_fetch_host_allowed,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -556,6 +556,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
         [
             "request_input",
             "plan",
+            "loom_register",
             "todo_write",
             "graph_evidence",
             "fs_read",
@@ -1216,4 +1217,100 @@ fn typed_child_grants_are_least_privilege_and_host_scoped() {
             host: String::new()
         }
     ));
+}
+
+/// E1 MUTATION CHECK: drop the inventory (return None on a populated
+/// registry), leak more than names+signatures, or lose the byte cap.
+/// Expected RUNTIME failure below.
+#[test]
+fn loom_inventory_rides_the_tail_bounded() {
+    use haider_protocol::loom::{LoomAgentType, LoomTypeSig, compile_pipe, parse_pipe};
+    assert_eq!(
+        loom_inventory_line(&[], &[]),
+        None,
+        "empty registry = no tail"
+    );
+    let record = |id: &str| LoomAgentType {
+        id: id.into(),
+        name: id.into(),
+        job: "job text never leaks into the inventory".into(),
+        in_type: "SourceURL".into(),
+        out_type: "Transcript".into(),
+        clis: Vec::new(),
+        apis: Vec::new(),
+        skills: Vec::new(),
+        scripts: Vec::new(),
+        color: "#c2701c".into(),
+        glyph: "▲".into(),
+        rev: 1,
+    };
+    let workflow = compile_pipe(
+        &parse_pipe("clip: SourceURL -> Transcript\nresearch @researcher \"pull\" :cmd"),
+        |_| {
+            Some(LoomTypeSig {
+                in_type: "SourceURL".into(),
+                out_type: "Transcript".into(),
+            })
+        },
+    )
+    .expect("compiles");
+    let line = loom_inventory_line(&[record("researcher")], std::slice::from_ref(&workflow))
+        .expect("populated registry teaches");
+    assert!(
+        line.contains("@researcher SourceURL -> Transcript"),
+        "{line}"
+    );
+    assert!(line.contains("@clip"), "{line}");
+    assert!(line.contains("spawn_subagent(workflow="), "{line}");
+    assert!(line.contains("loom_register"), "{line}");
+    assert!(
+        !line.contains("job text"),
+        "jobs never ride the tail: {line}"
+    );
+    // The cap holds against a large registry.
+    let many: Vec<LoomAgentType> = (0..64)
+        .map(|index| record(&format!("specialist-number-{index:02}")))
+        .collect();
+    let capped = loom_inventory_line(&many, &[workflow]).expect("still teaches");
+    assert!(capped.len() <= 700, "cap must hold: {} bytes", capped.len());
+    assert!(capped.ends_with('…'), "truncation must be marked");
+}
+
+/// E2 MUTATION CHECK: let loom_register through without an accepted plan
+/// containing the registration (drop a needle, or admit any body). Expected
+/// RUNTIME failure below — the accepted plan IS the human authorization.
+#[test]
+fn loom_register_binds_to_an_accepted_plan() {
+    let source = "clip: SourceURL -> Transcript\nresearch @researcher \"pull\" :cmd";
+    let accepted = vec![format!(
+        "# Register the clip workflow\n\n```\n{source}\n```\nWhy: automation."
+    )];
+    assert!(plan_gate_admits(&accepted, &[source]));
+    // A plan that never showed this source does not authorize it.
+    assert!(!plan_gate_admits(
+        &["# Some other proposal entirely".to_owned()],
+        &[source]
+    ));
+    assert!(
+        !plan_gate_admits(&[], &[source]),
+        "no accepted plans = no gate"
+    );
+    // Agent types bind by id + job + signature — ALL must appear.
+    let needles = [
+        "researcher",
+        "Pull a source and transcribe it.",
+        "SourceURL -> Transcript",
+    ];
+    let card = "## New specialist: researcher\nJob: Pull a source and transcribe it.\nSignature: SourceURL -> Transcript".to_owned();
+    assert!(plan_gate_admits(std::slice::from_ref(&card), &needles));
+    assert!(
+        !plan_gate_admits(
+            &[card],
+            &["researcher", "a DIFFERENT job", "SourceURL -> Transcript"]
+        ),
+        "every needle must bind"
+    );
+    // Empty needles never admit (a vacuous gate is an open gate).
+    assert!(!plan_gate_admits(&["anything".to_owned()], &[]));
+    assert!(!plan_gate_admits(&["anything".to_owned()], &[" "]));
 }
