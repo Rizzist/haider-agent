@@ -57,6 +57,8 @@ mod connection;
 #[cfg(test)]
 mod context_core_tests;
 mod delegation;
+#[cfg(all(test, unix))]
+mod delegation_rollup_tests;
 mod device_discovery;
 mod endpoint;
 mod error;
@@ -76,7 +78,7 @@ mod project_instructions;
 mod provider_registry;
 mod runtime;
 mod session_hub;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod subagent_core_tests;
 mod tasks;
 #[cfg(all(test, unix))]

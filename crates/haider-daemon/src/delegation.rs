@@ -24,8 +24,9 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::{
-    AgentManifest, AgentMessageDelivery, AgentMessageReceipt, AgentMessaged, AgentRole,
-    ChildReport, ChipState, Grant, Placement, ReportVerification,
+    AGENT_GRAPH_ROLLUP_EXTENSION_KIND, AgentGraphRollupV1, AgentManifest, AgentMessageDelivery,
+    AgentMessageReceipt, AgentMessaged, AgentRole, ChildReport, ChipState, Grant, Placement,
+    ReportVerification,
 };
 use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{
@@ -34,14 +35,16 @@ use haider_protocol::envelope::{
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildWorkflowDecision,
-    ChildWorkflowTrigger, EvidenceAuthority, EvidenceVerdict, GraphPhase, ParentGraphAttempt,
-    child_contract_subject_digest, child_gate_structure, decide_child_workflow, graph_template,
-    graph_template_digest, validate_graph_template,
+    ChildWorkflowTrigger, EvidenceAuthority, EvidenceVerdict, GraphGateKind, GraphPhase,
+    GraphStatus, ParentGraphAttempt, child_contract_subject_digest, child_gate_structure,
+    decide_child_workflow, graph_template, graph_template_digest, reduce_graphs,
+    validate_graph_template,
 };
 use haider_protocol::ids::{
     AgentId, BranchId, EventId, GraphId, ItemId, LeaseId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::loom::{LoomGate, LoomWorkflow, parse_pipe};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::task::TaskEventPayload;
@@ -1701,6 +1704,7 @@ impl DelegationHandle {
         let mut cursor = 0;
         let mut projected_events = HashSet::new();
         let mut last_chip = None;
+        let mut last_rollup = None;
         loop {
             let page = self
                 .hub
@@ -1723,6 +1727,10 @@ impl DelegationHandle {
                         .event_id
                         .as_str()
                         .starts_with(&format!("delegation-metrics-{}-", record.agent_id.as_str()))
+                    || envelope.event_id.as_str().starts_with(&format!(
+                        "delegation-graph-rollup-{}-",
+                        record.agent_id.as_str()
+                    ))
                 {
                     projected_events.insert(envelope.event_id.as_str().to_owned());
                 }
@@ -1732,10 +1740,22 @@ impl DelegationHandle {
                     continue;
                 }
                 if let Ok(haider_protocol::EventPayload::AgentChipState { agent, chip }) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                    serde_json::from_value::<haider_protocol::EventPayload>(
+                        envelope.payload.clone(),
+                    )
                     && agent == record.agent_id
                 {
                     last_chip = Some(chip);
+                }
+                if let Ok(haider_protocol::EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data },
+                    ..
+                })) = serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                    && kind == AGENT_GRAPH_ROLLUP_EXTENSION_KIND
+                    && let Ok(rollup) = serde_json::from_value::<AgentGraphRollupV1>(data)
+                    && rollup.agent == record.agent_id
+                {
+                    last_rollup = Some(rollup);
                 }
             }
         }
@@ -1748,6 +1768,9 @@ impl DelegationHandle {
             child_cursor: 0,
             projected_events,
             last_chip,
+            last_rollup,
+            graph_envelopes: Vec::new(),
+            child_run_terminal: false,
             metrics_folder: SessionFolder::new(&initial_model),
             terminal_idle_seen: false,
         })
@@ -1773,66 +1796,115 @@ impl DelegationHandle {
             let mut projections = Vec::new();
             for envelope in page {
                 mirror.metrics_folder.push(&envelope);
-                let Ok(payload) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
-                else {
+                if graph_reduction_event(&envelope.payload) {
+                    mirror.graph_envelopes.push(envelope.clone());
+                }
+                let Ok(payload) = serde_json::from_value::<haider_protocol::EventPayload>(
+                    envelope.payload.clone(),
+                ) else {
                     continue;
                 };
+                let graph_boundary = graph_rollup_boundary(&payload);
                 if matches!(
                     &payload,
                     haider_protocol::EventPayload::SessionState(SessionState::Idle { .. })
                 ) {
                     mirror.terminal_idle_seen = true;
                 }
-                if envelope.run_id.as_ref() != Some(&record.child_run_id) {
-                    continue;
+                let child_run_event = envelope.run_id.as_ref() == Some(&record.child_run_id);
+                let terminal_boundary = child_run_event
+                    && matches!(
+                        &payload,
+                        haider_protocol::EventPayload::RunState(state) if state.is_terminal()
+                    );
+                if terminal_boundary {
+                    mirror.child_run_terminal = true;
                 }
-                if let haider_protocol::EventPayload::UserMessage { text, .. } = payload {
+                if child_run_event {
+                    if let haider_protocol::EventPayload::UserMessage { text, .. } = &payload {
+                        let event_id = format!(
+                            "delegation-prompt-{}-{}",
+                            record.agent_id.as_str(),
+                            envelope.seq
+                        );
+                        if mirror.projected_events.insert(event_id.clone()) {
+                            projections.push(child_prompt_projection_envelope(
+                                record,
+                                &event_id,
+                                envelope.event_id.clone(),
+                                text,
+                                self.hub.device_id(),
+                                self.hub.worker_generation(),
+                            )?);
+                        }
+                    }
+                    if let haider_protocol::EventPayload::RunState(state) = &payload
+                        && let Some(chip) = chip_for_run_state(state)
+                    {
+                        let event_id = format!(
+                            "delegation-chip-{}-{}",
+                            record.agent_id.as_str(),
+                            envelope.seq
+                        );
+                        if mirror.projected_events.contains(&event_id) {
+                            mirror.last_chip = Some(chip);
+                        } else if mirror.last_chip.as_ref() != Some(&chip) {
+                            projections.push(chip_projection_envelope(
+                                record,
+                                &event_id,
+                                envelope.event_id.clone(),
+                                chip.clone(),
+                                self.hub.device_id(),
+                                self.hub.worker_generation(),
+                            )?);
+                            mirror.projected_events.insert(event_id);
+                            mirror.last_chip = Some(chip);
+                        }
+                    }
+                }
+                if graph_boundary || terminal_boundary {
+                    let reductions = reduce_graphs(&mirror.graph_envelopes);
+                    let Some(status) = rollup_graph_status(&reductions, &payload) else {
+                        continue;
+                    };
+                    let workflow =
+                        self.hub
+                            .loom_workflow(&status.template)
+                            .await?
+                            .filter(|workflow| {
+                                graph_template_digest(&workflow.template) == status.digest
+                            });
+                    let Some(rollup) = graph_rollup(
+                        &record.agent_id,
+                        status,
+                        workflow.as_ref(),
+                        mirror.child_run_terminal,
+                    ) else {
+                        continue;
+                    };
+                    if !rollup_is_material(&payload, mirror.last_rollup.as_ref(), &rollup) {
+                        continue;
+                    }
                     let event_id = format!(
-                        "delegation-prompt-{}-{}",
+                        "delegation-graph-rollup-{}-{}",
                         record.agent_id.as_str(),
                         envelope.seq
                     );
-                    if mirror.projected_events.insert(event_id.clone()) {
-                        projections.push(child_prompt_projection_envelope(
+                    if mirror.projected_events.contains(&event_id) {
+                        mirror.last_rollup = Some(rollup);
+                    } else if !same_rollup_transition(mirror.last_rollup.as_ref(), &rollup) {
+                        projections.push(graph_rollup_projection_envelope(
                             record,
                             &event_id,
                             envelope.event_id,
-                            &text,
+                            rollup.clone(),
                             self.hub.device_id(),
                             self.hub.worker_generation(),
                         )?);
+                        mirror.projected_events.insert(event_id);
+                        mirror.last_rollup = Some(rollup);
                     }
-                    continue;
                 }
-                let haider_protocol::EventPayload::RunState(state) = payload else {
-                    continue;
-                };
-                let Some(chip) = chip_for_run_state(&state) else {
-                    continue;
-                };
-                let event_id = format!(
-                    "delegation-chip-{}-{}",
-                    record.agent_id.as_str(),
-                    envelope.seq
-                );
-                if mirror.projected_events.contains(&event_id) {
-                    mirror.last_chip = Some(chip);
-                    continue;
-                }
-                if mirror.last_chip.as_ref() == Some(&chip) {
-                    continue;
-                }
-                projections.push(chip_projection_envelope(
-                    record,
-                    &event_id,
-                    envelope.event_id,
-                    chip.clone(),
-                    self.hub.device_id(),
-                    self.hub.worker_generation(),
-                )?);
-                mirror.projected_events.insert(event_id);
-                mirror.last_chip = Some(chip);
             }
             let metrics_event_id = format!(
                 "delegation-metrics-{}-{next_cursor}",
@@ -2032,6 +2104,9 @@ struct ChipMirror {
     child_cursor: u64,
     projected_events: HashSet<String>,
     last_chip: Option<ChipState>,
+    last_rollup: Option<AgentGraphRollupV1>,
+    graph_envelopes: Vec<RawEnvelope>,
+    child_run_terminal: bool,
     metrics_folder: SessionFolder,
     terminal_idle_seen: bool,
 }
@@ -2073,6 +2148,161 @@ fn deadline_elapsed(committed_at_ms: u64, deadline: Duration) -> bool {
         .as_millis();
     let committed_at_ms = u128::from(committed_at_ms);
     now_ms.saturating_sub(committed_at_ms) >= deadline.as_millis()
+}
+
+fn graph_reduction_event(payload: &serde_json::Value) -> bool {
+    payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| {
+            kind.starts_with("graph_")
+                || kind == "todo_graph_attached"
+                || kind == "evidence_recorded"
+                || kind.starts_with("menu_")
+        })
+}
+
+fn graph_rollup_boundary(payload: &haider_protocol::EventPayload) -> bool {
+    matches!(
+        payload,
+        haider_protocol::EventPayload::GraphAttemptOpened(_)
+            | haider_protocol::EventPayload::GraphGateSatisfied(_)
+            | haider_protocol::EventPayload::GraphAdvanced(_)
+            | haider_protocol::EventPayload::GraphBlocked(_)
+            | haider_protocol::EventPayload::GraphCompleted(_)
+            | haider_protocol::EventPayload::GraphAbandoned(_)
+            | haider_protocol::EventPayload::GraphSuperseded(_)
+            | haider_protocol::EventPayload::MenuOpened(haider_protocol::menu::Menu {
+                kind: haider_protocol::menu::MenuKind::GraphHumanConfirm { .. },
+                ..
+            })
+    )
+}
+
+fn rollup_graph_status<'a>(
+    reductions: &'a haider_protocol::graph::GraphReductions,
+    payload: &haider_protocol::EventPayload,
+) -> Option<&'a GraphStatus> {
+    let reduction = match payload {
+        haider_protocol::EventPayload::GraphSuperseded(superseded) => {
+            reductions.graph(&superseded.old)
+        }
+        _ => reductions.active(),
+    }?;
+    reduction.status.as_ref()
+}
+
+pub(crate) fn graph_rollup(
+    agent: &AgentId,
+    status: &GraphStatus,
+    workflow: Option<&LoomWorkflow>,
+    child_run_terminal: bool,
+) -> Option<AgentGraphRollupV1> {
+    let terminal = child_run_terminal
+        || matches!(
+            status.phase,
+            GraphPhase::Completed
+                | GraphPhase::Blocked
+                | GraphPhase::Abandoned
+                | GraphPhase::Superseded
+        );
+    let node = status.current_node.as_ref().or_else(|| {
+        terminal
+            .then(|| status.nodes.last().map(|node| &node.node))
+            .flatten()
+    })?;
+    let node_index = status.nodes.iter().position(|entry| &entry.node == node)?;
+    let node_status = &status.nodes[node_index];
+    let node_meta = workflow.and_then(|workflow| {
+        workflow
+            .meta
+            .iter()
+            .find(|candidate| candidate.node == *node)
+    });
+    let human_gate = matches!(node_status.gate, Some(GraphGateKind::HumanConfirm))
+        || (node_status.gate.is_none() && node.as_str() == "SHIP");
+    let gate_pending = status.phase == GraphPhase::Active
+        && human_gate
+        && (status.pending_menu.is_some() || !status.pending_menus.is_empty());
+    let state = match status.phase {
+        GraphPhase::Completed => "complete",
+        GraphPhase::Blocked | GraphPhase::Abandoned | GraphPhase::Superseded => "failed",
+        GraphPhase::Active if child_run_terminal => "failed",
+        GraphPhase::Active if gate_pending => "gate",
+        GraphPhase::Active => "running",
+    };
+    let gate = (state == "gate").then(|| {
+        loom_gate_name(workflow, node_meta.map(|meta| meta.source_name.as_str()))
+            .unwrap_or_else(|| graph_gate_name(node_status.gate.as_ref(), node))
+    });
+    Some(AgentGraphRollupV1 {
+        agent: agent.clone(),
+        workflow_id: workflow.map(|workflow| workflow.id.clone()),
+        template_digest: status.digest.clone(),
+        state: state.into(),
+        node_index: u64::try_from(node_index.saturating_add(1)).unwrap_or(u64::MAX),
+        nodes_total: u64::try_from(status.nodes.len()).unwrap_or(u64::MAX),
+        nodes_green: u64::try_from(status.nodes.iter().filter(|node| node.satisfied).count())
+            .unwrap_or(u64::MAX),
+        node_label: Some(
+            node_meta.map_or_else(|| node.label().to_owned(), |meta| meta.source_name.clone()),
+        ),
+        agent_type: node_meta.and_then(|meta| meta.agent_type.clone()),
+        gate,
+    })
+}
+
+fn loom_gate_name(workflow: Option<&LoomWorkflow>, source_name: Option<&str>) -> Option<String> {
+    let source_name = source_name?;
+    let gate = parse_pipe(&workflow?.source)
+        .nodes
+        .into_iter()
+        .find(|node| node.name == source_name)?
+        .gate;
+    Some(match gate {
+        LoomGate::Cmd => "cmd".into(),
+        LoomGate::Ship => "ship".into(),
+        LoomGate::AllOf(n) => format!("all-of-{n}"),
+        LoomGate::Human => "human".into(),
+    })
+}
+
+fn graph_gate_name(
+    gate: Option<&GraphGateKind>,
+    node: &haider_protocol::graph::GraphNodeName,
+) -> String {
+    match gate {
+        Some(GraphGateKind::CommandGreen) => "cmd".into(),
+        Some(GraphGateKind::AllOfN { n }) => format!("all-of-{n}"),
+        Some(GraphGateKind::HumanConfirm) => "human".into(),
+        None if node.as_str() == "SHIP" => "human".into(),
+        None if node.as_str() == "VERIFY" => "all-of-3".into(),
+        None => "cmd".into(),
+    }
+}
+
+pub(crate) fn rollup_is_material(
+    payload: &haider_protocol::EventPayload,
+    previous: Option<&AgentGraphRollupV1>,
+    next: &AgentGraphRollupV1,
+) -> bool {
+    !matches!(
+        payload,
+        haider_protocol::EventPayload::GraphGateSatisfied(_)
+    ) || next.state != "running"
+        || previous.is_none_or(|previous| previous.node_index != next.node_index)
+}
+
+pub(crate) fn same_rollup_transition(
+    previous: Option<&AgentGraphRollupV1>,
+    next: &AgentGraphRollupV1,
+) -> bool {
+    previous.is_some_and(|previous| {
+        previous.state == next.state
+            && previous.node_index == next.node_index
+            && previous.nodes_green == next.nodes_green
+            && previous.gate == next.gate
+    })
 }
 
 fn chip_for_run_state(state: &RunState) -> Option<ChipState> {
@@ -2141,6 +2371,46 @@ pub(crate) fn metrics_projection_envelope(
     let payload = snapshot
         .to_payload_value()
         .map_err(internal_serialization)?;
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: record.parent_session_id.clone(),
+        branch_id: record.parent_branch_id.clone(),
+        run_id: Some(record.parent_run_id.clone()),
+        agent_id: record.parent_agent_id.clone(),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: Some(causation_id),
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    })
+}
+
+pub(crate) fn graph_rollup_projection_envelope(
+    record: &DelegationRecord,
+    event_id: &str,
+    causation_id: EventId,
+    rollup: AgentGraphRollupV1,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    let item_id = ItemId::new(event_id);
+    let payload = serde_json::to_value(haider_protocol::EventPayload::Item(ItemEvent::Completed {
+        item_id,
+        item: TurnItem::Extension {
+            kind: AGENT_GRAPH_ROLLUP_EXTENSION_KIND.into(),
+            data: serde_json::to_value(rollup).map_err(internal_serialization)?,
+        },
+    }))
+    .map_err(internal_serialization)?;
     Ok(EventEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id: EventId::new(event_id),
