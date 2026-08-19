@@ -102,7 +102,7 @@ use haider_protocol::tool::{
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
-    OPENAI_OAUTH_PROVIDER_NAME, ProviderCredentialSurface, ResolvedAttachment,
+    OPENAI_OAUTH_PROVIDER_NAME, PromptCacheMetadata, ProviderCredentialSurface, ResolvedAttachment,
     apply_tool_result_image_budget, canonical_tool_definitions_digest,
     degrade_tool_result_images_to_placeholders,
 };
@@ -235,6 +235,10 @@ struct DaemonContextCompactor {
     reserved_output_tokens: u64,
     post_compaction_system_prompt: Option<String>,
     post_compaction_tools: Vec<ToolDefinition>,
+    reasoning_settings: String,
+    latest_compaction_summary_end: Option<usize>,
+    cache_expected_later_reads: u32,
+    cache_reuse_gap_ms: Option<u64>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
     agent_id: Option<AgentId>,
@@ -243,6 +247,8 @@ struct DaemonContextCompactor {
     usage_account: Option<haider_protocol::ids::CredentialAlias>,
 }
 
+const COMPACTION_SUMMARY_INSTRUCTION: &str = "Summarize the preceding conversation for lossless continuation. Preserve decisions, constraints, exact identifiers, unresolved work, and tool outcomes. Return only the summary.";
+
 impl std::fmt::Debug for DaemonContextCompactor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -250,6 +256,56 @@ impl std::fmt::Debug for DaemonContextCompactor {
             .field("session_id", self.store.session_id())
             .field("model", &self.model)
             .finish_non_exhaustive()
+    }
+}
+
+impl DaemonContextCompactor {
+    fn compaction_cache_metadata(
+        &self,
+        messages: &[Message],
+        stable_history_end: usize,
+        prefix_digests: PrefixDigests,
+    ) -> PromptCacheMetadata {
+        let latest_compaction_summary_end = self
+            .latest_compaction_summary_end
+            .filter(|boundary| *boundary > 0 && *boundary <= stable_history_end);
+        let compaction_epoch = latest_compaction_summary_end.map_or_else(
+            || digest_json(&"root-compaction-epoch"),
+            |boundary| digest_json(&messages[boundary - 1]),
+        );
+        let cache_epoch = digest_json(&serde_json::json!({
+            "provider": self.usage_scope.provider,
+            "model": self.model,
+            "account_scope": self.usage_account,
+            "system_digest": prefix_digests.system,
+            "tool_digest": prefix_digests.tools,
+            "auth_digest": prefix_digests.auth_mode,
+            "reasoning_digest": prefix_digests.reasoning_settings,
+            "compaction_epoch": compaction_epoch,
+        }));
+        let stable_prefix_tokens = estimate_provider_request_input_tokens(
+            &messages[..stable_history_end],
+            &self.post_compaction_system_prompt,
+            &self.post_compaction_tools,
+            &[],
+        );
+        PromptCacheMetadata {
+            stable_history_end,
+            current_user_start: stable_history_end,
+            latest_compaction_summary_end,
+            prefix_digests,
+            cache_epoch,
+            compaction_epoch,
+            provider: self.usage_scope.provider.clone(),
+            session_scope: self.store.session_id().as_str().to_owned(),
+            account_scope: self
+                .usage_account
+                .as_ref()
+                .map(|scope| scope.as_str().to_owned()),
+            stable_prefix_tokens,
+            expected_later_reads: self.cache_expected_later_reads,
+            reuse_gap_ms: self.cache_reuse_gap_ms,
+        }
     }
 }
 
@@ -326,40 +382,98 @@ impl ContextCompactor for DaemonContextCompactor {
         &self,
         run_id: &RunId,
         intent: &CompactionIntent,
-        mut covered_messages: Vec<Message>,
+        covered_messages: Vec<Message>,
     ) -> Result<Message, HaiderError> {
-        for message in &mut covered_messages {
-            message.blocks.retain(|block| {
-                !matches!(
-                    block,
-                    haider_protocol::provider::Block::Attachment(
-                        haider_protocol::tool::AttachmentBlock::Image { .. }
-                    )
-                )
-            });
-        }
-        let artifact_store = self.store.clone();
-        prepare_tool_images_for_text_only_request(&artifact_store, &mut covered_messages).await?;
         let immutable_history_digest = digest_json(&covered_messages);
-        covered_messages.push(Message::user_text(
-            "Summarize the preceding conversation for lossless continuation. Preserve decisions, constraints, exact identifiers, unresolved work, and tool outcomes. Return only the summary.",
-        ));
-        let request = TurnRequest {
-            messages: covered_messages.clone(),
+        let covered_history_end = covered_messages.len();
+        let mut replay_messages = covered_messages.clone();
+        replay_messages.push(Message::user_text(COMPACTION_SUMMARY_INSTRUCTION));
+        let mut prefix_digests = PrefixDigests {
+            system: digest_json(&self.post_compaction_system_prompt),
+            tools: canonical_tool_definitions_digest(&self.post_compaction_tools),
+            immutable_history: immutable_history_digest.clone(),
+            model: digest_json(&self.model),
+            auth_mode: digest_json(&self.usage_scope.auth_scope),
+            reasoning_settings: digest_json(&self.reasoning_settings),
+        };
+        let mut cache_metadata = self.compaction_cache_metadata(
+            &replay_messages,
+            covered_history_end,
+            prefix_digests.clone(),
+        );
+        let mut request = TurnRequest {
+            messages: replay_messages,
             model: self.model.clone(),
             max_tokens: self.max_tokens.min(4096),
-            system_prompt: None,
-            tools: Vec::new(),
+            system_prompt: self.post_compaction_system_prompt.clone(),
+            tools: self.post_compaction_tools.clone(),
             attachments: Vec::new(),
-            cache_metadata: None,
+            cache_metadata: Some(cache_metadata.clone()),
         };
-        let mut stream = self.provider.stream_turn(request).await.map_err(|error| {
-            HaiderError::new(
-                ErrorCode::ProviderError,
-                format!("context summarization could not start: {error}"),
-                error.retryable,
-            )
-        })?;
+        if let Some(rendered) = self.provider.rendered_cache_prefix_digests(&request) {
+            prefix_digests = rendered;
+            cache_metadata = self.compaction_cache_metadata(
+                &request.messages,
+                covered_history_end,
+                prefix_digests.clone(),
+            );
+            request.cache_metadata = Some(cache_metadata);
+        }
+        let replay_request_messages = request.messages.clone();
+        let (mut stream, request_messages, request_prefix_digests) = match self
+            .provider
+            .stream_turn(request)
+            .await
+        {
+            Ok(stream) => (stream, replay_request_messages, prefix_digests),
+            Err(_) => {
+                // Some provider families cannot replay durable multimodal
+                // blocks. Preserve the old text-only request as a single
+                // degraded fallback, but never mutate the cache-riding
+                // attempt or the history digest describing this summary.
+                let mut degraded_messages = covered_messages.clone();
+                for message in &mut degraded_messages {
+                    message.blocks.retain(|block| {
+                        !matches!(
+                            block,
+                            haider_protocol::provider::Block::Attachment(
+                                haider_protocol::tool::AttachmentBlock::Image { .. }
+                            )
+                        )
+                    });
+                }
+                let artifact_store = self.store.clone();
+                prepare_tool_images_for_text_only_request(&artifact_store, &mut degraded_messages)
+                    .await?;
+                degraded_messages.push(Message::user_text(COMPACTION_SUMMARY_INSTRUCTION));
+                let request_messages = degraded_messages.clone();
+                let fallback = TurnRequest {
+                    messages: degraded_messages,
+                    model: self.model.clone(),
+                    max_tokens: self.max_tokens.min(4096),
+                    system_prompt: None,
+                    tools: Vec::new(),
+                    attachments: Vec::new(),
+                    cache_metadata: None,
+                };
+                let stream = self.provider.stream_turn(fallback).await.map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::ProviderError,
+                        format!("context summarization could not start: {error}"),
+                        error.retryable,
+                    )
+                })?;
+                let fallback_prefix_digests = PrefixDigests {
+                    system: digest_json(&Option::<String>::None),
+                    tools: canonical_tool_definitions_digest(&[]),
+                    immutable_history: immutable_history_digest.clone(),
+                    model: digest_json(&self.model),
+                    auth_mode: digest_json(&self.usage_scope.auth_scope),
+                    reasoning_settings: digest_json(&"compaction-default"),
+                };
+                (stream, request_messages, fallback_prefix_digests)
+            }
+        };
         let mut summary = String::new();
         let mut finished = false;
         let mut reported_usage: Option<Usage> = None;
@@ -378,14 +492,7 @@ impl ContextCompactor for DaemonContextCompactor {
                     scope.request_kind = UsageRequestKind::Compaction;
                     scope.run = Some(run_id.clone());
                     scope.agent = self.agent_id.clone();
-                    scope.prefix_digests = Some(PrefixDigests {
-                        system: digest_json(&Option::<String>::None),
-                        tools: canonical_tool_definitions_digest(&[]),
-                        immutable_history: immutable_history_digest.clone(),
-                        model: digest_json(&self.model),
-                        auth_mode: digest_json(&scope.auth_scope),
-                        reasoning_settings: digest_json(&"compaction-default"),
-                    });
+                    scope.prefix_digests = Some(request_prefix_digests.clone());
                     if let Some(account) = &self.usage_account {
                         usage.account = Some(account.clone());
                         scope.account_scope = Some(account.clone());
@@ -473,7 +580,7 @@ impl ContextCompactor for DaemonContextCompactor {
             self.agent_id.as_ref(),
         )
         .await?;
-        let tokens_before = approximate_message_tokens(&covered_messages);
+        let tokens_before = approximate_message_tokens(&request_messages);
         let tokens_after = approximate_text_tokens(&summary);
         let item_id = ItemId::new(format!("compaction-item-{}", intent.operation_id));
         let item = TurnItem::ContextCompaction {
@@ -3843,6 +3950,7 @@ async fn perform_manual_compaction(
         let range = StoreHandle::append(lease, &mut envelopes).await?;
         (run_id, range.first_seq.saturating_add(1), intent)
     };
+    let cache_expected_later_reads = u32::from(!post_compaction_tools.is_empty()) * 2;
     let compactor = DaemonContextCompactor {
         store: lease.clone(),
         provider: resolved.provider,
@@ -3852,6 +3960,10 @@ async fn perform_manual_compaction(
         reserved_output_tokens: metadata.max_tokens,
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
         post_compaction_tools,
+        reasoning_settings,
+        latest_compaction_summary_end: None,
+        cache_expected_later_reads,
+        cache_reuse_gap_ms: None,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id,
@@ -4764,6 +4876,10 @@ async fn start_turn(
         reserved_output_tokens: config.reserved_output_tokens,
         post_compaction_system_prompt: config.system_prompt.clone(),
         post_compaction_tools: config.tools.clone(),
+        reasoning_settings: config.reasoning_settings.clone(),
+        latest_compaction_summary_end: config.cache_compaction_summary_end,
+        cache_expected_later_reads: config.cache_expected_later_reads,
+        cache_reuse_gap_ms: config.cache_reuse_gap_ms,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id: config.agent_id.clone(),

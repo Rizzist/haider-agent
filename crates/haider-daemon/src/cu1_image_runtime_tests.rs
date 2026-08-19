@@ -20,14 +20,18 @@ use haider_protocol::EventPayload;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume};
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
-use haider_protocol::provider::{Block, FeatureResolve, FinishReason, UsageScope};
+use haider_protocol::provider::{Block, CapabilityDoc, FeatureResolve, FinishReason, UsageScope};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
-use haider_protocol::tool::{BoundedResult, ImageBlockRef, ToolResultStatus};
-use haider_provider::{FakeProvider, FakeStep, Message, Provider, ToolDefinition, TurnRequest};
+use haider_protocol::tool::{AttachmentBlock, BoundedResult, ImageBlockRef, ToolResultStatus};
+use haider_provider::{
+    FakeProvider, FakeStep, Message, MessageRole, Provider, ProviderError, ProviderErrorKind,
+    ProviderStream, ToolDefinition, TurnRequest,
+};
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
 
 fn png_fixture() -> Vec<u8> {
@@ -61,6 +65,58 @@ impl ArtifactReader for FixtureArtifact {
 
 struct FixedProviderFactory {
     provider: Arc<FakeProvider>,
+}
+
+#[derive(Debug)]
+struct RejectFirstReplayProvider {
+    calls: AtomicUsize,
+    requests: Mutex<Vec<TurnRequest>>,
+    fallback: FakeProvider,
+}
+
+impl RejectFirstReplayProvider {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            fallback: FakeProvider::new(vec![
+                FakeStep::EmitText {
+                    text: "summary".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ]),
+        }
+    }
+
+    fn requests(&self) -> Vec<TurnRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Provider for RejectFirstReplayProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        self.fallback.capabilities().await
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "fixture rejects multimodal replay",
+            ));
+        }
+        self.fallback.stream_turn(request).await
+    }
 }
 
 #[async_trait]
@@ -306,7 +362,7 @@ async fn text_only_compaction_validates_before_budget_then_degrades_the_retained
 }
 
 #[tokio::test]
-async fn daemon_compactor_sends_the_validated_budgeted_placeholder_projection() {
+async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
     let root = tempfile::tempdir().expect("profile");
     let sqlite = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(sqlite.clone(), SessionHubConfig::default()).expect("hub");
@@ -343,7 +399,7 @@ async fn daemon_compactor_sends_the_validated_budgeted_placeholder_projection() 
         .put_image_artifact(png_fixture(), "image/png".into())
         .await
         .expect("store compactor image");
-    let covered_messages = (0..6)
+    let mut covered_messages = (0..6)
         .map(|index| {
             Message::tool_result_with_images(
                 format!("call-{index}"),
@@ -353,6 +409,29 @@ async fn daemon_compactor_sends_the_validated_budgeted_placeholder_projection() 
             )
         })
         .collect::<Vec<_>>();
+    covered_messages.insert(
+        0,
+        Message {
+            role: MessageRole::User,
+            blocks: vec![
+                Block::Text {
+                    text: "inspect this image".into(),
+                },
+                Block::Attachment(AttachmentBlock::Image {
+                    artifact: image.artifact.clone(),
+                    mime: image.media_type.clone(),
+                    width: Some(image.width),
+                    height: Some(image.height),
+                }),
+            ],
+        },
+    );
+    let lane_system_prompt = Some("byte-identical lane system prompt".to_owned());
+    let lane_tools = vec![ToolDefinition {
+        name: "lane_tool".into(),
+        description: "byte-identical lane tool".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }];
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
             text: "summary".into(),
@@ -368,13 +447,21 @@ async fn daemon_compactor_sends_the_validated_budgeted_placeholder_projection() 
         max_tokens: 4096,
         context_window: None,
         reserved_output_tokens: 4096,
-        post_compaction_system_prompt: None,
-        post_compaction_tools: Vec::new(),
+        post_compaction_system_prompt: lane_system_prompt.clone(),
+        post_compaction_tools: lane_tools.clone(),
+        reasoning_settings: "lane-reasoning".into(),
+        latest_compaction_summary_end: None,
+        cache_expected_later_reads: 2,
+        cache_reuse_gap_ms: Some(17),
         device_id,
         event_ids: Arc::new(EventIdGenerator::new("cu1-compactor-event")),
         agent_id: None,
         branch_id: None,
-        usage_scope: UsageScope::default(),
+        usage_scope: UsageScope {
+            provider: "fake".into(),
+            auth_scope: "fixture-auth".into(),
+            ..UsageScope::default()
+        },
         usage_account: None,
     };
     let intent = CompactionIntent {
@@ -385,28 +472,164 @@ async fn daemon_compactor_sends_the_validated_budgeted_placeholder_projection() 
     };
 
     let _result = compactor
-        .compact(&RunId::new("cu1-compactor-run"), &intent, covered_messages)
+        .compact(
+            &RunId::new("cu1-compactor-run"),
+            &intent,
+            covered_messages.clone(),
+        )
         .await;
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].attachments.is_empty());
-    let projected = &requests[0].messages[..6];
-    assert!(projected[0].blocks.iter().any(|block| {
-        matches!(block, Block::ToolResult { preview, images, .. }
-            if images.is_empty() && preview.contains("oldest first"))
-    }));
-    assert_eq!(
-        projected
+    let request = &requests[0];
+    let mut expected_messages = covered_messages.clone();
+    expected_messages.push(Message::user_text(super::COMPACTION_SUMMARY_INSTRUCTION));
+    // Mutation pin: eager image rewriting, dropping the direct attachment,
+    // or changing the single appended instruction breaks exact replay.
+    assert_eq!(request.messages, expected_messages);
+    assert_eq!(request.system_prompt, lane_system_prompt);
+    assert_eq!(request.tools, lane_tools);
+    let metadata = request
+        .cache_metadata
+        .as_ref()
+        .expect("cache-riding replay metadata");
+    // Mutation pin: the appended instruction is volatile; only the exact
+    // covered conversation belongs behind the stable cache breakpoint.
+    assert_eq!(metadata.stable_history_end, covered_messages.len());
+    assert_eq!(metadata.current_user_start, covered_messages.len());
+}
+
+#[tokio::test]
+async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() {
+    let root = tempfile::tempdir().expect("profile");
+    let sqlite = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(sqlite, SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("cu1-compactor-fallback-session");
+    let device_id = DeviceId::new("cu1-compactor-fallback-device");
+    let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonical cwd")
+        .to_string_lossy()
+        .into_owned();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-cu1-compactor-fallback".into(),
+        request_digest: "create-cu1-compactor-fallback-digest".into(),
+        request_json: r#"{"session":"cu1-compactor-fallback"}"#.into(),
+        session_id: session_id.clone(),
+        cwd,
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("cu1-compactor-fallback-created"),
+        device_id: device_id.clone(),
+    })
+    .await
+    .expect("create fallback compactor session");
+    let lease = hub
+        .acquire_worker_lease(session_id)
+        .await
+        .expect("fallback compactor lease");
+    let image = lease
+        .put_image_artifact(png_fixture(), "image/png".into())
+        .await
+        .expect("store fallback image");
+    let covered_messages = vec![
+        Message {
+            role: MessageRole::User,
+            blocks: vec![
+                Block::Text {
+                    text: "inspect this image".into(),
+                },
+                Block::Attachment(AttachmentBlock::Image {
+                    artifact: image.artifact.clone(),
+                    mime: image.media_type.clone(),
+                    width: Some(image.width),
+                    height: Some(image.height),
+                }),
+            ],
+        },
+        Message::tool_result_with_images("call-fallback", "captured", false, vec![image]),
+    ];
+    let lane_system_prompt = Some("fallback lane system".to_owned());
+    let lane_tools = vec![ToolDefinition {
+        name: "fallback_lane_tool".into(),
+        description: "fallback lane tool".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }];
+    let provider = Arc::new(RejectFirstReplayProvider::new());
+    let compactor = super::DaemonContextCompactor {
+        store: lease,
+        provider: Arc::clone(&provider) as Arc<dyn Provider>,
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        context_window: None,
+        reserved_output_tokens: 4096,
+        post_compaction_system_prompt: lane_system_prompt.clone(),
+        post_compaction_tools: lane_tools.clone(),
+        reasoning_settings: "lane-reasoning".into(),
+        latest_compaction_summary_end: None,
+        cache_expected_later_reads: 2,
+        cache_reuse_gap_ms: None,
+        device_id,
+        event_ids: Arc::new(EventIdGenerator::new("cu1-compactor-fallback-event")),
+        agent_id: None,
+        branch_id: None,
+        usage_scope: UsageScope {
+            provider: "fake".into(),
+            auth_scope: "fixture-auth".into(),
+            ..UsageScope::default()
+        },
+        usage_account: None,
+    };
+    let intent = CompactionIntent {
+        operation_id: "cu1-compaction-fallback".into(),
+        covers_from: NodeId::new("cu1-fallback-from"),
+        covers_to: NodeId::new("cu1-fallback-to"),
+        resume_cause: CompactionResume::ManualIdle,
+    };
+
+    let post_summary_error = compactor
+        .compact(
+            &RunId::new("cu1-compactor-fallback-run"),
+            &intent,
+            covered_messages.clone(),
+        )
+        .await
+        .expect_err("fixture has no durable accepted run for the final commit");
+    assert_eq!(post_summary_error.code, ErrorCode::RunNotActive);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let mut exact_replay = covered_messages.clone();
+    exact_replay.push(Message::user_text(super::COMPACTION_SUMMARY_INSTRUCTION));
+    // Mutation pin: the cheap first attempt must remain cache-compatible;
+    // degrading it eagerly would hide the defect this fallback repairs.
+    assert_eq!(requests[0].messages, exact_replay);
+    assert_eq!(requests[0].system_prompt, lane_system_prompt);
+    assert_eq!(requests[0].tools, lane_tools);
+    assert!(requests[0].cache_metadata.is_some());
+
+    // Mutation pin: deleting this one-shot fallback turns a provider's
+    // multimodal replay rejection into a failed compaction.
+    assert_eq!(requests[1].system_prompt, None);
+    assert!(requests[1].tools.is_empty());
+    assert!(requests[1].cache_metadata.is_none());
+    assert_eq!(requests[1].messages.len(), covered_messages.len() + 1);
+    assert!(
+        requests[1].messages[0]
+            .blocks
             .iter()
-            .filter(|message| message.blocks.iter().any(|block| {
-                matches!(block, Block::ToolResult { preview, images, .. }
-                    if images.is_empty()
-                        && preview.contains("unavailable to this provider"))
-            }))
-            .count(),
-        5
+            .all(|block| !matches!(block, Block::Attachment(AttachmentBlock::Image { .. })))
     );
+    assert!(requests[1].messages[1].blocks.iter().any(|block| {
+        matches!(block, Block::ToolResult { preview, images, .. }
+            if images.is_empty() && preview.contains("unavailable to this provider"))
+    }));
+    assert_eq!(requests[1].messages.last(), exact_replay.last());
 }
 
 #[tokio::test]
