@@ -317,7 +317,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Hooks
         | Screen::Usage
         | Screen::Fleet
-        | Screen::Graph => 1,
+        | Screen::Graph
+        | Screen::Loom => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -340,6 +341,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Usage => render_usage(model, theme, frame, body, &mut hits),
             Screen::Fleet => render_fleet(model, theme, frame, body, &mut hits),
             Screen::Graph => render_graph(model, theme, frame, body, &mut hits),
+            Screen::Loom => render_loom(model, theme, frame, body),
         }
     }
     if model.help_open {
@@ -5151,6 +5153,255 @@ fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus)
         spans.push(Span::styled(format!("  {badge}"), badge_style));
     }
     Line::from(spans)
+}
+
+/// D3 — the Loom registry browser: agent types + pipe workflows from the
+/// once-per-connection snapshot, each in its registry accent; ⏎ opens a
+/// detail pane (type: job + grants + know-how; workflow: typed signature +
+/// node chain + pipe source).
+fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("loom", theme.bright_style().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(
+                " — {} agent type{} · {} workflow{}",
+                model.loom_types.len(),
+                if model.loom_types.len() == 1 { "" } else { "s" },
+                model.loom_workflows.len(),
+                if model.loom_workflows.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+            theme.dim_style(),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    if model.loom_types.is_empty() && model.loom_workflows.is_empty() {
+        lines.push(Line::styled(
+            "registry empty — register agent types and pipe workflows over loom.*",
+            theme.dim_style(),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("esc back", theme.dim_style()));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
+    let type_count = model.loom_types.len();
+    let selection = model
+        .loom_selection
+        .min((type_count + model.loom_workflows.len()).saturating_sub(1));
+
+    if model.loom_detail {
+        if selection < type_count {
+            let record = &model.loom_types[selection];
+            let accent = crate::style::loom_accent_style(&record.color)
+                .unwrap_or_else(|| theme.gold_style());
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", record.glyph), accent),
+                Span::styled(
+                    record.name.clone(),
+                    theme.bright_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  @{}", record.id), accent),
+                Span::styled(
+                    format!(
+                        "  {} -> {}  · rev {}",
+                        record.in_type, record.out_type, record.rev
+                    ),
+                    theme.dim_style(),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("JOB", theme.gold_style()));
+            for line in record.job.lines() {
+                lines.push(Line::styled(format!("  {line}"), theme.text_style()));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "GRANTS — what it may touch, nothing else",
+                theme.gold_style(),
+            ));
+            for (label, list) in [("cli", &record.clis), ("api", &record.apis)] {
+                for item in list {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {label} "), theme.dim_style()),
+                        Span::styled(item.clone(), accent),
+                    ]));
+                }
+            }
+            if record.clis.is_empty() && record.apis.is_empty() {
+                lines.push(Line::styled(
+                    "  none — narrower privilege",
+                    theme.faint_style(),
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("KNOW-HOW", theme.gold_style()));
+            for (label, list) in [("skill", &record.skills), ("script", &record.scripts)] {
+                for item in list {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {label} "), theme.dim_style()),
+                        Span::styled(item.clone(), theme.text_style()),
+                    ]));
+                }
+            }
+            if record.skills.is_empty() && record.scripts.is_empty() {
+                lines.push(Line::styled("  none yet", theme.faint_style()));
+            }
+        } else if let Some(workflow) = model.loom_workflows.get(selection - type_count) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("@{}", workflow.id),
+                    theme.bright_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} -> {}  · rev {} · {} · {}",
+                        workflow.in_type,
+                        workflow.out_type,
+                        workflow.rev,
+                        workflow.pipe_version,
+                        crate::graph::digest_short(&workflow.digest),
+                    ),
+                    theme.dim_style(),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("NODES", theme.gold_style()));
+            for meta in &workflow.meta {
+                let mut spans = vec![Span::styled(
+                    format!("  {}", meta.source_name),
+                    theme.bright_style(),
+                )];
+                if let Some(type_id) = &meta.agent_type {
+                    let accent = model
+                        .loom_type(type_id)
+                        .and_then(|record| crate::style::loom_accent_style(&record.color))
+                        .unwrap_or_else(|| theme.gold_style());
+                    spans.push(Span::styled(format!(" @{type_id}"), accent));
+                }
+                if !meta.task.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" \"{}\"", meta.task),
+                        theme.dim_style(),
+                    ));
+                }
+                if let Some(back) = &meta.back {
+                    spans.push(Span::styled(
+                        format!(" ↺{}", back.as_str().to_ascii_lowercase()),
+                        theme.warn_style(),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("PIPE SOURCE", theme.gold_style()));
+            for line in workflow.source.lines() {
+                lines.push(Line::styled(format!("  {line}"), theme.text_style()));
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("esc back to the list", theme.dim_style()));
+    } else {
+        lines.push(Line::styled("AGENT TYPES", theme.gold_style()));
+        for (index, record) in model.loom_types.iter().enumerate() {
+            let accent = crate::style::loom_accent_style(&record.color)
+                .unwrap_or_else(|| theme.gold_style());
+            let cursor = if index == selection { "❯ " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(cursor.to_owned(), theme.gold_style()),
+                Span::styled(format!("{} ", record.glyph), accent),
+                Span::styled(
+                    format!("@{}", record.id),
+                    accent.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} -> {}  · {} block{}",
+                        record.in_type,
+                        record.out_type,
+                        record.clis.len()
+                            + record.apis.len()
+                            + record.skills.len()
+                            + record.scripts.len(),
+                        if record.clis.len()
+                            + record.apis.len()
+                            + record.skills.len()
+                            + record.scripts.len()
+                            == 1
+                        {
+                            ""
+                        } else {
+                            "s"
+                        },
+                    ),
+                    theme.dim_style(),
+                ),
+            ]));
+        }
+        if model.loom_types.is_empty() {
+            lines.push(Line::styled("  none registered", theme.faint_style()));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "WORKFLOWS — run with @name <brief>",
+            theme.gold_style(),
+        ));
+        for (index, workflow) in model.loom_workflows.iter().enumerate() {
+            let cursor = if type_count + index == selection {
+                "❯ "
+            } else {
+                "  "
+            };
+            let mut spans = vec![
+                Span::styled(cursor.to_owned(), theme.gold_style()),
+                Span::styled(
+                    format!("@{}", workflow.id),
+                    theme.bright_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} -> {} · ", workflow.in_type, workflow.out_type),
+                    theme.dim_style(),
+                ),
+            ];
+            for meta in &workflow.meta {
+                if let Some(type_id) = &meta.agent_type
+                    && let Some(record) = model.loom_type(type_id)
+                {
+                    let accent = crate::style::loom_accent_style(&record.color)
+                        .unwrap_or_else(|| theme.gold_style());
+                    spans.push(Span::styled(
+                        if record.glyph.is_empty() {
+                            "•".to_owned()
+                        } else {
+                            record.glyph.clone()
+                        },
+                        accent,
+                    ));
+                }
+            }
+            spans.push(Span::styled(
+                format!(" · rev {}", workflow.rev),
+                theme.faint_style(),
+            ));
+            lines.push(Line::from(spans));
+        }
+        if model.loom_workflows.is_empty() {
+            lines.push(Line::styled("  none registered", theme.faint_style()));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "↑↓ select · ⏎ detail · esc back",
+            theme.dim_style(),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_graph(

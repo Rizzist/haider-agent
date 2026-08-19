@@ -168,3 +168,59 @@ fn graph_screen_annotates_loom_nodes() {
         "node task missing:\n{all}"
     );
 }
+
+/// MUTATION CHECK: drop the Loom screen dispatch arm or the registry list
+/// rendering in `render_loom`. Expected RUNTIME failure: the `/loom` screen
+/// loses the accent-painted type row or the workflow row.
+#[test]
+fn loom_screen_lists_registry() {
+    let mut model = launcher_model();
+    submit(&mut model, "open the loom");
+    model.loom_types = vec![researcher()];
+    model.loom_workflows = vec![
+        compile_pipe(
+            &parse_pipe(
+                "clip: SourceURL -> Transcript\nresearch @researcher \"pull and transcribe\" :cmd",
+            ),
+            |id| {
+                (id == "researcher").then(|| LoomTypeSig {
+                    in_type: "SourceURL".into(),
+                    out_type: "Transcript".into(),
+                })
+            },
+        )
+        .expect("compiles"),
+    ];
+    model.screen = Screen::Loom;
+
+    let (rows, colors) = draw(&model);
+    let row = rows
+        .iter()
+        .position(|row| row.contains("@researcher"))
+        .unwrap_or_else(|| panic!("type row missing:\n{}", rows.join("\n")));
+    let column = rows[row].find('▲').expect("glyph column");
+    assert_eq!(
+        colors[row][column],
+        Some(ratatui::style::Color::Rgb(0xc2, 0x70, 0x1c)),
+        "type row must paint the registry accent"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("@clip")),
+        "workflow row missing:\n{}",
+        rows.join("\n")
+    );
+
+    // ⏎ detail: the workflow pane shows the typed signature + pipe source.
+    model.loom_selection = 1;
+    model.loom_detail = true;
+    let (rows, _) = draw(&model);
+    let all = rows.join("\n");
+    assert!(
+        all.contains("PIPE SOURCE"),
+        "workflow detail missing:\n{all}"
+    );
+    assert!(
+        all.contains("SourceURL -> Transcript"),
+        "typed signature missing:\n{all}"
+    );
+}

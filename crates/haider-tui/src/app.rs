@@ -235,6 +235,10 @@ pub enum Screen {
     /// `/graph`. Backed by `graph.status` in live mode; demo has no graph
     /// truth and `/graph` refuses honestly there.
     Graph,
+    /// D3 — the Loom registry browser (`/loom`): agent types (capability-
+    /// scoped specialists) and pipe workflows, from the once-per-connection
+    /// loom.list snapshot. Read-only v1; creation rides the plan gate + RPC.
+    Loom,
 }
 
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
@@ -3068,6 +3072,10 @@ pub struct AppModel {
     pub loom_types: Vec<haider_protocol::loom::LoomAgentType>,
     pub loom_workflows: Vec<haider_protocol::loom::LoomWorkflow>,
     pub loom_loaded: bool,
+    /// D3 — /loom browser state: the flat selection over types then
+    /// workflows, and whether the detail pane is open.
+    pub loom_selection: usize,
+    pub loom_detail: bool,
     /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
@@ -3386,6 +3394,8 @@ impl Default for AppModel {
             loom_types: Vec::new(),
             loom_workflows: Vec::new(),
             loom_loaded: false,
+            loom_selection: 0,
+            loom_detail: false,
             graph_inspect: None,
             retry_inflight: false,
             graph_unsupported: false,
@@ -3886,6 +3896,7 @@ impl AppModel {
             Screen::Usage => "haider — usage".to_owned(),
             Screen::Fleet => "haider — fleet".to_owned(),
             Screen::Graph => "haider — graph".to_owned(),
+            Screen::Loom => "haider — loom".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
@@ -3967,6 +3978,8 @@ impl AppModel {
             // Launcher: a busy row's ◉ dot pulse + rail shimmer
             // (tui.js:4386-4394).
             Screen::Launcher => self.sessions.iter().any(crate::session::SessionState::busy),
+            // Loom: a static registry browse — nothing pulses.
+            Screen::Loom => false,
             // Accounts: a static list — only an in-flight select animates
             // (the pending row's `…` beat).
             Screen::Accounts => self.accounts.pending_select.is_some(),
@@ -5249,6 +5262,34 @@ impl AppModel {
                 self.screen = Screen::Session;
                 self.dirty = true;
             }
+            return;
+        }
+        // D3 — /loom browser: ↑↓ move over types+workflows, ⏎ opens the
+        // detail pane, esc backs out (detail → list → where you came from).
+        if self.screen == Screen::Loom {
+            let total = self.loom_types.len() + self.loom_workflows.len();
+            match key.code {
+                KeyCode::Up => {
+                    self.loom_selection = self.loom_selection.saturating_sub(1);
+                }
+                KeyCode::Down if total > 0 => {
+                    self.loom_selection = (self.loom_selection + 1).min(total - 1);
+                }
+                KeyCode::Enter if total > 0 => {
+                    self.loom_detail = !self.loom_detail;
+                }
+                KeyCode::Esc => {
+                    if self.loom_detail {
+                        self.loom_detail = false;
+                    } else if self.active_session.is_some() {
+                        self.screen = Screen::Session;
+                    } else {
+                        self.screen = Screen::Launcher;
+                    }
+                }
+                _ => {}
+            }
+            self.dirty = true;
             return;
         }
         // The computer-permission grant card replaces the blocking menu and
@@ -8876,6 +8917,23 @@ impl AppModel {
     /// `/graph [pin|abandon|status]`. Bare (or `status`) opens the graph
     /// status view; `pin`/`abandon` are receipt-backed mutations. Session
     /// only; live only (graph state is daemon truth, never fabricated).
+    /// D3 — open the Loom registry browser. Registry truth is daemon-owned:
+    /// live-only, feature-gated; the browse list reads the D1 snapshot.
+    fn enter_loom(&mut self) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /loom — live only; the registry is daemon truth".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
+            self.flash = Some(self.stale_daemon_note("loom"));
+            return;
+        }
+        self.loom_selection = 0;
+        self.loom_detail = false;
+        self.screen = Screen::Loom;
+    }
+
     fn enter_graph(&mut self, arg: Option<&str>) {
         self.dirty = true;
         if self.screen != Screen::Session && self.screen != Screen::Graph {
@@ -9610,6 +9668,7 @@ impl AppModel {
             "hooks" => self.enter_hooks(),
             // CG-M1: `/graph [pin|abandon|status]`.
             "graph" => self.enter_graph(arg.as_deref()),
+            "loom" => self.enter_loom(),
             // Owner 2026-08-16: manual retry of the failed turn — the
             // keyboard path to the ambient retry row's click.
             "retry" => self.issue_run_retry(),
