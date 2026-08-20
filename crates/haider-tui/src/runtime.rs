@@ -1532,8 +1532,11 @@ impl DemoDriver {
             // world has no parked TCC grant to open Settings for.
             | AppRequest::OpenPermissionSettings { .. }
             | AppRequest::FleetMemberGraph { .. }
-            | AppRequest::GraphPin
+            | AppRequest::GraphPin { .. }
             | AppRequest::GraphAbandon { .. }
+            // W-flow live-only read: the loom registry is daemon truth and
+            // the demo reducer refuses /loom upstream.
+            | AppRequest::LoomRefresh
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }

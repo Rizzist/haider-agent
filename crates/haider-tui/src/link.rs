@@ -887,11 +887,15 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             command_id,
             session,
             worker_generation,
+            template,
         } => RequestBody::GraphPin {
             command_id,
             session_id: session,
             worker_generation,
-            template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.to_owned(),
+            // W-flow: pin BY NAME; `None` keeps the legacy ship-loop
+            // fallback for callers that never chose.
+            template: template
+                .unwrap_or_else(|| haider_protocol::graph::SHIP_LOOP_TEMPLATE.to_owned()),
         },
         LiveCommand::GraphAbandon {
             command_id,

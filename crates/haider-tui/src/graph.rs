@@ -101,16 +101,33 @@ pub fn block_reason_label(reason: GraphBlockReason) -> &'static str {
     }
 }
 
+/// One gate KIND's display label — shared by the graph screen's status rows
+/// and the /workflows built-in template detail (W-flow).
+#[must_use]
+pub fn gate_kind_label(gate: &GraphGateKind) -> String {
+    match gate {
+        GraphGateKind::CommandGreen => "command-green".to_owned(),
+        GraphGateKind::AllOfN { n } => format!("all-of-{n}"),
+        GraphGateKind::HumanConfirm => "human-confirm".to_owned(),
+    }
+}
+
+/// A template node's executor shape, in the same detail voice.
+#[must_use]
+pub const fn executor_label(executor: haider_protocol::graph::GraphExecutorShape) -> &'static str {
+    match executor {
+        haider_protocol::graph::GraphExecutorShape::Inline => "inline",
+        haider_protocol::graph::GraphExecutorShape::FanOut => "fan-out",
+        haider_protocol::graph::GraphExecutorShape::Human => "human",
+    }
+}
+
 /// The gate label for a node — derived from its PINNED gate kind (M2b),
 /// with a canonical-name fallback for legacy reductions without a gate field.
 #[must_use]
 pub fn gate_label(node: &GraphNodeStatus) -> String {
     if let Some(gate) = &node.gate {
-        return match gate {
-            GraphGateKind::CommandGreen => "command-green".to_owned(),
-            GraphGateKind::AllOfN { n } => format!("all-of-{n}"),
-            GraphGateKind::HumanConfirm => "human-confirm".to_owned(),
-        };
+        return gate_kind_label(gate);
     }
     match node.node.as_str() {
         "BUILD" => "command-green".to_owned(),

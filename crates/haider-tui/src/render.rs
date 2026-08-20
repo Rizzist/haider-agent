@@ -5045,33 +5045,19 @@ fn render_subtree(
             // spawn convention) — paint the type segment in its Loom accent
             // and glyph so specialization reads at a glance.
             // Review round 2: the `@type · ` prefix is DAEMON truth only on
-            // a Loom-aware daemon (C3 strips cosplay there). An old daemon
-            // passes task text through verbatim, so nothing it sends earns
-            // the trusted specialist paint.
-            let typed = model
-                .daemon_serves(haider_rpc::FEATURE_LOOM_V1)
-                .then_some(chip.name.as_str())
-                .and_then(|name| name.strip_prefix('@'))
-                .and_then(|rest| rest.split_once(" · "))
-                .and_then(|(type_id, remainder)| {
-                    model.loom_type(type_id).map(|record| {
-                        (
-                            record.glyph.clone(),
-                            crate::style::loom_accent_style(&record.color),
-                            type_id.to_owned(),
-                            remainder.to_owned(),
-                        )
-                    })
-                });
-            match typed {
-                Some((glyph_text, accent, type_id, remainder)) if !chip.closed => {
-                    let accent_style = accent.unwrap_or_else(|| theme.gold_style());
+            // a Loom-aware daemon (C3 strips cosplay there); the shared
+            // [`crate::app::AppModel::loom_task_type`] gate enforces it for
+            // this site and the fleet rows alike.
+            match model.loom_task_type(&chip.name) {
+                Some((record, remainder)) if !chip.closed => {
+                    let accent_style = crate::style::loom_accent_style(&record.color)
+                        .unwrap_or_else(|| theme.gold_style());
                     spans.push(Span::styled(" · ".to_owned(), ink));
-                    if !glyph_text.is_empty() {
-                        spans.push(Span::styled(format!("{glyph_text} "), accent_style));
+                    if !record.glyph.is_empty() {
+                        spans.push(Span::styled(format!("{} ", record.glyph), accent_style));
                     }
                     spans.push(Span::styled(
-                        format!("@{type_id}"),
+                        format!("@{}", record.id),
                         accent_style.add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
@@ -5299,10 +5285,14 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     chunks
 }
 
-/// D3 — the Loom registry browser: agent types + pipe workflows from the
-/// once-per-connection snapshot, each in its registry accent; ⏎ opens a
-/// detail pane (type: job + grants + know-how; workflow: typed signature +
-/// node chain + pipe source).
+/// D3 — the Loom registry browser: agent types + workflows from the daemon
+/// snapshot (hydrated per connection, re-read on every pane entry), each in
+/// its registry accent; ⏎ opens a detail pane (type: job + grants +
+/// know-how; workflow: typed signature + node chain + pipe source; built-in:
+/// nodes + gates from the catalog spec; `none`: the honest default line).
+/// W-flow: the workflows pane leads with the synthetic `∅ none` row and the
+/// built-in catalog pair — `p` pins the selected row to the bound session,
+/// `n` opens the describe-it authoring input on both panes.
 fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let on_types = model.loom_pane == LoomPane::Types;
@@ -5322,6 +5312,29 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         ),
     ]));
     lines.push(Line::raw(""));
+    // W-flow authoring: the open `n` input band — house card grammar
+    // (`❯ value▏`); its hint line IS the footer while it is open, so the
+    // pane footers below gate on the input being closed.
+    if let Some(buffer) = &model.loom_input {
+        lines.push(Line::styled(
+            if on_types {
+                "new agent type — describe the job"
+            } else {
+                "new workflow — describe the flow"
+            },
+            theme.bright_style().add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(vec![
+            Span::styled(" ❯ ", theme.gold_style()),
+            Span::styled(buffer.clone(), theme.input_style()),
+            Span::styled("▏", theme.gold_style()),
+        ]));
+        lines.push(Line::styled(
+            "⏎ send to model · ⌥m model · esc cancel",
+            theme.dim_style(),
+        ));
+        lines.push(Line::raw(""));
+    }
     // Round 3: an unhydrated live connection is LOADING, not empty — the
     // once-per-connection loom.list may still be in flight (or the socket
     // just died and the next connection re-hydrates).
@@ -5335,24 +5348,30 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     }
-    if own == 0 {
+    // W-flow: only the TYPES pane can be empty — the workflows row space
+    // always carries the synthetic `none` row and the built-ins, so its
+    // registry emptiness renders inside the REGISTERED section instead.
+    if on_types && own == 0 {
         lines.push(Line::styled(
-            if on_types {
-                "no agent types registered — the model proposes them; a plan you accept registers"
-            } else {
-                "no workflows registered — the model proposes pipe DAGs; a plan you accept registers"
-            },
+            "no agent types registered — press n to describe one; the model proposes it and a plan you accept registers",
             theme.dim_style(),
         ));
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            format!("tab ⇄ {sibling} · esc back"),
-            theme.dim_style(),
-        ));
+        if model.loom_input.is_none() {
+            lines.push(Line::styled(
+                format!("n new · tab ⇄ {sibling} · esc back"),
+                theme.dim_style(),
+            ));
+        }
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     }
-    let selection = model.loom_selection.min(own.saturating_sub(1));
+    let total_rows = if on_types {
+        model.loom_types.len()
+    } else {
+        model.workflow_row_count()
+    };
+    let selection = model.loom_selection.min(total_rows.saturating_sub(1));
     let mut selected_line: usize = 0;
 
     if model.loom_detail {
@@ -5415,7 +5434,80 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             if record.skills.is_empty() && record.scripts.is_empty() {
                 lines.push(Line::styled("  none yet", theme.faint_style()));
             }
-        } else if let Some(workflow) = model.loom_workflows.get(selection) {
+        } else if let Some(crate::app::WorkflowRow::None) = model.workflow_row(selection) {
+            // W-flow: the synthetic default's detail — one honest line.
+            lines.push(Line::from(vec![
+                Span::styled("∅ ", theme.dim_style()),
+                Span::styled("none", theme.bright_style().add_modifier(Modifier::BOLD)),
+                Span::styled("  — no flow · default", theme.dim_style()),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "every session starts here — no graph, no gates",
+                theme.text_style(),
+            ));
+        } else if let Some(crate::app::WorkflowRow::BuiltIn(template)) =
+            model.workflow_row(selection)
+        {
+            // W-flow: a built-in's detail derives from its GraphTemplateSpec
+            // — node names + gates, never a fabricated pipe source.
+            lines.push(Line::from(vec![
+                Span::styled("⛩ ", theme.gold_style()),
+                Span::styled(
+                    template.name.clone(),
+                    theme.bright_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  built-in · v{}", template.version),
+                    theme.dim_style(),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("NODES", theme.gold_style()));
+            for node in &template.nodes {
+                let mut spans = vec![
+                    Span::styled(format!("  {}", node.name.as_str()), theme.bright_style()),
+                    Span::styled(
+                        format!(
+                            "  {} · {}",
+                            crate::graph::gate_kind_label(&node.gate),
+                            crate::graph::executor_label(node.executor),
+                        ),
+                        theme.dim_style(),
+                    ),
+                ];
+                if !node.verify_slots.is_empty() {
+                    spans.push(Span::styled(
+                        format!(
+                            " · slots {}",
+                            node.verify_slots
+                                .iter()
+                                .map(|slot| slot.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        ),
+                        theme.dim_style(),
+                    ));
+                }
+                if !node.depends_on.is_empty() {
+                    spans.push(Span::styled(
+                        format!(
+                            " ← after {}",
+                            node.depends_on
+                                .iter()
+                                .map(haider_protocol::graph::GraphNodeName::as_str)
+                                .collect::<Vec<_>>()
+                                .join("+")
+                        ),
+                        theme.faint_style(),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        } else if let Some(workflow) = match model.workflow_row(selection) {
+            Some(crate::app::WorkflowRow::Registered(index)) => model.loom_workflows.get(index),
+            _ => None,
+        } {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("@{}", workflow.id),
@@ -5513,16 +5605,65 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             ]));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "↑↓ select · ⏎ detail · tab ⇄ workflows · esc back",
-            theme.dim_style(),
-        ));
+        if model.loom_input.is_none() {
+            lines.push(Line::styled(
+                "↑↓ select · ⏎ detail · n new · tab ⇄ workflows · esc back",
+                theme.dim_style(),
+            ));
+        }
     } else {
         lines.push(Line::styled(
             "WORKFLOWS — run with @name <brief>",
             theme.gold_style(),
         ));
-        for (index, workflow) in model.loom_workflows.iter().enumerate() {
+        // W-flow fixed head: the synthetic `∅ none` row is ALWAYS first —
+        // not a registry record, which is exactly what makes it undeletable
+        // — then the built-in catalog pair, then the REGISTERED section.
+        if selection == 0 {
+            selected_line = lines.len();
+        }
+        lines.push(Line::from(vec![
+            Span::styled(if selection == 0 { "❯ " } else { "  " }, theme.gold_style()),
+            Span::styled("∅ ", theme.dim_style()),
+            Span::styled("none", theme.bright_style().add_modifier(Modifier::BOLD)),
+            Span::styled(" — no flow · default", theme.dim_style()),
+        ]));
+        let builtins = crate::app::AppModel::builtin_workflow_templates();
+        for (offset, template) in builtins.iter().enumerate() {
+            let index = 1 + offset;
+            if index == selection {
+                selected_line = lines.len();
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if index == selection { "❯ " } else { "  " },
+                    theme.gold_style(),
+                ),
+                Span::styled("⛩ ", theme.gold_style()),
+                Span::styled(
+                    template.name.clone(),
+                    theme.bright_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  built-in · {} node{}",
+                        template.nodes.len(),
+                        if template.nodes.len() == 1 { "" } else { "s" },
+                    ),
+                    theme.dim_style(),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("REGISTERED", theme.gold_style()));
+        if model.loom_workflows.is_empty() {
+            lines.push(Line::styled(
+                "  none registered — press n: the model proposes a pipe DAG; a plan you accept registers",
+                theme.dim_style(),
+            ));
+        }
+        for (offset, workflow) in model.loom_workflows.iter().enumerate() {
+            let index = 1 + builtins.len() + offset;
             if index == selection {
                 selected_line = lines.len();
             }
@@ -5561,10 +5702,12 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             lines.push(Line::from(spans));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "↑↓ select · ⏎ detail · tab ⇄ loom · esc back",
-            theme.dim_style(),
-        ));
+        if model.loom_input.is_none() {
+            lines.push(Line::styled(
+                "↑↓ select · ⏎ detail · p pin to session · n new · tab ⇄ loom · esc back",
+                theme.dim_style(),
+            ));
+        }
     }
     // Round 3: both views SCROLL — a large registry or a long detail pane
     // must stay reachable. Detail rides loom_scroll against a published
@@ -5989,7 +6132,7 @@ fn render_fleet(
             )),
             Some(node) => {
                 let glyph = fleet::state_glyph(node.state);
-                lines.push(Line::from(vec![
+                let mut header = vec![
                     Span::styled(
                         format!("{glyph} "),
                         fleet_glyph_style(theme, node.state, model.anim_phase),
@@ -5998,8 +6141,31 @@ fn render_fleet(
                         fleet::callsign(node).to_owned(),
                         theme.bright_style().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!(" · {}", node.task), theme.text_style()),
-                ]));
+                ];
+                // W-flow: the detail header speaks the same typed accent as
+                // the row it was drilled from.
+                match model.loom_task_type(&node.task) {
+                    Some((record, remainder)) => {
+                        let accent = crate::style::loom_accent_style(&record.color)
+                            .unwrap_or_else(|| theme.gold_style());
+                        header.push(Span::styled(" · ".to_owned(), theme.text_style()));
+                        if !record.glyph.is_empty() {
+                            header.push(Span::styled(format!("{} ", record.glyph), accent));
+                        }
+                        header.push(Span::styled(
+                            format!("@{}", record.id),
+                            accent.add_modifier(Modifier::BOLD),
+                        ));
+                        header.push(Span::styled(format!(" · {remainder}"), theme.text_style()));
+                    }
+                    None => {
+                        header.push(Span::styled(
+                            format!(" · {}", node.task),
+                            theme.text_style(),
+                        ));
+                    }
+                }
+                lines.push(Line::from(header));
                 let metric = fleet::node_metric(node);
                 if !metric.is_empty() {
                     lines.push(Line::styled(format!("  {metric}"), theme.dim_style()));
@@ -6172,7 +6338,49 @@ fn render_fleet(
                     .saturating_sub(left)
                     .saturating_sub(metric.chars().count())
                     .saturating_sub(5);
-                if !node.task.is_empty() && task_budget >= 4 {
+                // W-flow: a typed member's daemon-stamped `@type · ` task
+                // prefix paints glyph+@type in its Loom accent — the SAME
+                // trust gate as the subtree chips (`loom_task_type`). The
+                // state glyph keeps meaning state; only this segment wears
+                // the accent, and an unparseable (or budget-starved) task
+                // falls back to today's plain dim fragment.
+                let typed = model.loom_task_type(&node.task).filter(|(record, _)| {
+                    let prefix = if record.glyph.is_empty() {
+                        0
+                    } else {
+                        record.glyph.chars().count() + 1
+                    } + 1
+                        + record.id.chars().count();
+                    task_budget >= prefix
+                });
+                if let Some((record, remainder)) = typed {
+                    let accent = crate::style::loom_accent_style(&record.color)
+                        .unwrap_or_else(|| theme.gold_style());
+                    spans.push(Span::styled(" — ".to_owned(), theme.dim_style()));
+                    let mut prefix = 1 + record.id.chars().count();
+                    if !record.glyph.is_empty() {
+                        prefix += record.glyph.chars().count() + 1;
+                        spans.push(Span::styled(format!("{} ", record.glyph), accent));
+                    }
+                    spans.push(Span::styled(
+                        format!("@{}", record.id),
+                        accent.add_modifier(Modifier::BOLD),
+                    ));
+                    let rest_budget = task_budget.saturating_sub(prefix + 3);
+                    if !remainder.is_empty() && rest_budget >= 4 {
+                        let rest: String = if remainder.chars().count() > rest_budget {
+                            let mut cut: String = remainder
+                                .chars()
+                                .take(rest_budget.saturating_sub(1))
+                                .collect();
+                            cut.push('…');
+                            cut
+                        } else {
+                            remainder.to_owned()
+                        };
+                        spans.push(Span::styled(format!(" · {rest}"), theme.dim_style()));
+                    }
+                } else if !node.task.is_empty() && task_budget >= 4 {
                     let task: String = if node.task.chars().count() > task_budget {
                         let mut cut: String = node
                             .task
@@ -6269,12 +6477,20 @@ fn render_fleet(
                         .collect();
                     let name_width = name.chars().count();
                     name.push_str(&" ".repeat(callsign_budget - name_width));
+                    // W-flow: a typed member's grid callsign wears its Loom
+                    // accent (the matrix dots keep speaking STATE); the
+                    // selection band and the queued fade both outrank it.
+                    let typed_accent = model
+                        .loom_task_type(&node.task)
+                        .and_then(|(record, _)| crate::style::loom_accent_style(&record.color));
                     names.push(Span::styled(
                         name,
                         if selected {
                             theme.selection_style().add_modifier(Modifier::BOLD)
                         } else if node.state == haider_rpc::FleetAgentStateWire::Queued {
                             theme.faint_style()
+                        } else if let Some(accent) = typed_accent {
+                            accent
                         } else {
                             theme.dim_style()
                         },

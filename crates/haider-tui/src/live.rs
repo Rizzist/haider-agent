@@ -271,15 +271,18 @@ pub enum LiveCommand {
         request_id: String,
         permission: haider_protocol::permission::SystemPermission,
     },
-    /// `graph.pin` — receipt-backed pin of the built-in ship-loop template
-    /// (CG-M1). DURABLE: a lost response retries under the same command id
-    /// and replays the same committed pin. Installs NOTHING locally — the
-    /// daemon's `GraphPinned` fact (and the chased `graph.status`) move the
-    /// strip.
+    /// `graph.pin` — receipt-backed pin of a template BY NAME (CG-M1;
+    /// W-flow widened it beyond ship-loop — the store resolves the built-in
+    /// catalog first, then the Loom registry). `None` keeps the legacy
+    /// ship-loop fallback. DURABLE: a lost response retries under the same
+    /// command id and replays the same committed pin. Installs NOTHING
+    /// locally — the daemon's `GraphPinned` fact (and the chased
+    /// `graph.status`) move the strip.
     GraphPin {
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
+        template: Option<String>,
     },
     /// `graph.abandon` — receipt-backed abandonment of the active graph.
     /// Same durable discipline as [`Self::GraphPin`].
@@ -1191,6 +1194,12 @@ pub struct LiveDriver {
     /// The in-flight `hooks.trust`/`hooks.revoke`: (command, digest) — a
     /// failure surfaces on the hooks screen and releases its gate (H4).
     pending_hook_trust: Option<(CommandId, String)>,
+    /// W-flow: the in-flight graph pin/abandon — (command, receipt flash,
+    /// failure label). The receipt flashes daemon truth ("· pinned X" /
+    /// "· workflow cleared — none"); a refusal (one-active-graph law)
+    /// flashes the DAEMON's message under the label. Same lifecycle as
+    /// `pending_hook_trust`: retired by receipt or non-retryable failure.
+    pending_graph_mutation: Option<(CommandId, String, String)>,
     /// The cwd the last `hooks.list` was issued for — what a trust receipt
     /// chains its refresh against (captured at issuance by the reducer).
     hooks_cwd: Option<String>,
@@ -1307,6 +1316,7 @@ impl LiveDriver {
             pending_provider_remove: None,
             pending_custom: None,
             pending_hook_trust: None,
+            pending_graph_mutation: None,
             hooks_cwd: None,
             pending_device_import: None,
             oauth_flight: None,
@@ -1615,9 +1625,12 @@ impl LiveDriver {
                     // rev933b finding 9: the clamp is PANE-LOCAL — the
                     // browser shows one list at a time, so a stale index
                     // must fold against the ACTIVE pane, not both combined.
+                    // W-flow: the workflows pane clamps against its ROW
+                    // space (`none` + built-ins + registered), never the
+                    // registry alone.
                     let total = match model.loom_pane {
                         crate::app::LoomPane::Types => model.loom_types.len(),
-                        crate::app::LoomPane::Workflows => model.loom_workflows.len(),
+                        crate::app::LoomPane::Workflows => model.workflow_row_count(),
                     };
                     if model.loom_selection >= total {
                         model.loom_selection = total.saturating_sub(1);
@@ -1890,7 +1903,18 @@ impl LiveDriver {
                 // The receipt retires the gate and INSTALLS NOTHING — the
                 // chained `graph.status` (and the daemon's own facts) move
                 // the strip. Same branch discipline as `hooks.trust`.
+                // W-flow: the correlated receipt flashes daemon truth
+                // ("· pinned X" / "· workflow cleared — none").
                 self.retire(&command_id);
+                if self
+                    .pending_graph_mutation
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| pending == &command_id)
+                    && let Some((_, receipt, _)) = self.pending_graph_mutation.take()
+                {
+                    model.flash = Some(receipt);
+                    model.dirty = true;
+                }
                 self.graph_refresh(model)
             }
             LiveReply::HookTrustChanged {
@@ -2881,6 +2905,23 @@ impl LiveDriver {
                     if code == haider_rpc::ERROR_CODE_REVISION_CONFLICT {
                         return vec![self.enqueue(LiveCommand::ProviderList)];
                     }
+                    return Vec::new();
+                }
+                // W-flow: a refused graph pin/abandon flashes the DAEMON's
+                // reason (one-active-graph law — "a graph is already
+                // active"). Nothing moved locally; nothing auto-switches.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_graph_mutation
+                        .as_ref()
+                        .is_some_and(|(pending, _, _)| pending == id)
+                    && let Some((_, _, label)) = self.pending_graph_mutation.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.flash = Some(format!("· {label} refused — {message}"));
+                    model.dirty = true;
                     return Vec::new();
                 }
                 // A failed hook trust/revoke lands its typed reason on the
@@ -4121,19 +4162,31 @@ impl LiveDriver {
                     permission,
                 })]
             }
-            AppRequest::GraphPin => {
-                // Receipt-backed pin of the built-in ship-loop. Installs
-                // NOTHING locally — the daemon's `GraphPinned` fact and the
-                // chained `graph.status` move the strip (the branch law).
+            AppRequest::GraphPin { template } => {
+                // Receipt-backed pin BY NAME (`None` = the legacy ship-loop
+                // fallback). Installs NOTHING locally — the daemon's
+                // `GraphPinned` fact and the chained `graph.status` move the
+                // strip (the branch law).
                 let Some(session) = model.active_session.clone() else {
                     return Vec::new();
                 };
                 let command_id = self.mint();
                 let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                let name = template
+                    .clone()
+                    .unwrap_or_else(|| haider_protocol::graph::SHIP_LOOP_TEMPLATE.to_owned());
+                // W-flow receipt flash: daemon truth on the receipt; a
+                // refusal (one-active-graph law) flashes the daemon's error.
+                self.pending_graph_mutation = Some((
+                    command_id.clone(),
+                    format!("· pinned {name}"),
+                    format!("pin {name}"),
+                ));
                 vec![self.enqueue(LiveCommand::GraphPin {
                     command_id,
                     session,
                     worker_generation,
+                    template,
                 })]
             }
             AppRequest::GraphAbandon { why } => {
@@ -4142,12 +4195,24 @@ impl LiveDriver {
                 };
                 let command_id = self.mint();
                 let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_graph_mutation = Some((
+                    command_id.clone(),
+                    "· workflow cleared — none".to_owned(),
+                    "abandon".to_owned(),
+                ));
                 vec![self.enqueue(LiveCommand::GraphAbandon {
                     command_id,
                     session,
                     worker_generation,
                     why,
                 })]
+            }
+            AppRequest::LoomRefresh => {
+                // W-flow: a pane-entry re-read of the registry. Receipt-free
+                // (no outbox), epoch-fenced exactly like the hydration read.
+                vec![LiveCommand::LoomList {
+                    epoch: self.connection_epoch,
+                }]
             }
             AppRequest::HooksTrust { digest, trusted } => {
                 let command_id = self.mint();

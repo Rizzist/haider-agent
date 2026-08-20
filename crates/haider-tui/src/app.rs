@@ -351,6 +351,63 @@ impl AppModel {
         self.loom_types.iter().find(|record| record.id == id)
     }
 
+    /// D1/fleet — split a daemon-stamped `@type · rest` task label against
+    /// the loom snapshot. ONE trust gate for every surface that paints the
+    /// specialist accent (subtree chips, fleet rows): the `@type · ` prefix
+    /// is daemon truth only on a Loom-aware daemon (C3 strips cosplay
+    /// there); an old daemon passes task text through verbatim, so nothing
+    /// it sends earns the paint. `None` also when the type is not in the
+    /// snapshot — the caller falls back to its plain styling.
+    #[must_use]
+    pub fn loom_task_type<'a>(
+        &'a self,
+        task: &'a str,
+    ) -> Option<(&'a haider_protocol::loom::LoomAgentType, &'a str)> {
+        self.daemon_serves(haider_rpc::FEATURE_LOOM_V1)
+            .then_some(task)
+            .and_then(|task| task.strip_prefix('@'))
+            .and_then(|rest| rest.split_once(" · "))
+            .and_then(|(type_id, remainder)| {
+                self.loom_type(type_id).map(|record| (record, remainder))
+            })
+    }
+
+    /// W-flow — the MAIN-session built-ins the /workflows pane lists
+    /// (`ship-loop`, `super-ship-loop`). The other catalog entries
+    /// (staggered/sec-audit/docs-sweep) stay pinnable by name but keep the
+    /// pane focused; child templates never belong on a MAIN pane.
+    #[must_use]
+    pub fn builtin_workflow_templates() -> Vec<haider_protocol::graph::GraphTemplateSpec> {
+        use haider_protocol::graph::{SHIP_LOOP_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE};
+        haider_protocol::graph::graph_template_catalog()
+            .into_iter()
+            .filter(|template| {
+                template.name == SHIP_LOOP_TEMPLATE || template.name == SUPER_SHIP_LOOP_TEMPLATE
+            })
+            .collect()
+    }
+
+    /// W-flow — total /workflows rows: `none` + built-ins + registered.
+    /// Never zero, which is why the workflows pane has no empty state.
+    #[must_use]
+    pub fn workflow_row_count(&self) -> usize {
+        1 + Self::builtin_workflow_templates().len() + self.loom_workflows.len()
+    }
+
+    /// W-flow — resolve one /workflows selection index into its row.
+    #[must_use]
+    pub fn workflow_row(&self, index: usize) -> Option<WorkflowRow> {
+        if index == 0 {
+            return Some(WorkflowRow::None);
+        }
+        let builtins = Self::builtin_workflow_templates();
+        if let Some(template) = builtins.get(index - 1) {
+            return Some(WorkflowRow::BuiltIn(template.clone()));
+        }
+        let registered = index - 1 - builtins.len();
+        (registered < self.loom_workflows.len()).then_some(WorkflowRow::Registered(registered))
+    }
+
     /// D2 — the Loom workflow behind a pinned template, if the registry
     /// still holds the PINNED revision. Review round 2: the join requires
     /// the instance digest — annotating graph A with re-registered B's
@@ -2255,13 +2312,23 @@ pub enum AppRequest {
     /// Owner 2026-08-16 (fleet member detail): read the DETAIL member's own
     /// child-graph status for its workflow section.
     FleetMemberGraph { session: SessionId },
-    /// CG-M1: receipt-backed pin of the built-in ship-loop for the active
-    /// session (`/graph pin`). The driver mints the command id + worker
-    /// generation; nothing is installed until the daemon's fact arrives.
-    GraphPin,
+    /// CG-M1: receipt-backed pin of a graph template for the active session
+    /// (`/graph pin`, `p` on the /workflows pane). The driver mints the
+    /// command id + worker generation; nothing is installed until the
+    /// daemon's fact arrives. `template` is the `graph.pin` name (built-in
+    /// catalog first, then the Loom registry — store resolution order);
+    /// `None` keeps the legacy ship-loop fallback for old callers.
+    GraphPin { template: Option<String> },
     /// CG-M1: receipt-backed abandonment of the active graph (`/graph
-    /// abandon`). Carries a public reason string.
+    /// abandon`, `p` on the /workflows `none` row). Carries a public reason
+    /// string.
     GraphAbandon { why: String },
+    /// W-flow: re-read the Loom registry (`loom.list`). Pushed on every
+    /// loom-pane entry so a registration landed by the authoring turn is
+    /// visible on return — the once-per-connection Listed fetch stays the
+    /// hydration path; this is the freshness path. Receipt-free read; the
+    /// reply still rides the connection-epoch fence.
+    LoomRefresh,
     /// `account.set_default_model` under the expected-revision CAS. The
     /// default marker moves only on the correlated reply.
     SetDefaultModel {
@@ -2648,6 +2715,23 @@ pub enum LoomPane {
     #[default]
     Types,
     Workflows,
+}
+
+/// One /workflows row (W-flow). The row space is FIXED-HEAD: the synthetic
+/// `none` row first (not a registry record — which is exactly what makes it
+/// undeletable), then the built-in MAIN-session catalog templates, then the
+/// registered Loom workflows. Selection indices live over this space, never
+/// over `loom_workflows` alone.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowRow {
+    /// "No session workflow" — every session's default. Selecting it means
+    /// abandon the active graph, never a registry mutation.
+    None,
+    /// A built-in catalog template (immutable daemon truth, pinnable by
+    /// name).
+    BuiltIn(haider_protocol::graph::GraphTemplateSpec),
+    /// Index into [`AppModel::loom_workflows`].
+    Registered(usize),
 }
 
 /// The launcher's non-session rows (value-carrying hit payload, P2-9).
@@ -3178,6 +3262,11 @@ pub struct AppModel {
     pub loom_return: Option<Screen>,
     /// Which registry pane `Screen::Loom` shows (`/loom` vs `/workflows`).
     pub loom_pane: LoomPane,
+    /// W-flow authoring: the one-line `n` input on the loom screen —
+    /// `Some(buffer)` while open. The PANE decides what ⏎ asks the model to
+    /// draft (agent type vs workflow); the input itself registers nothing —
+    /// the plan gate + `loom_register` machinery does.
+    pub loom_input: Option<String>,
     /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
@@ -3527,6 +3616,7 @@ impl Default for AppModel {
             loom_scroll_max: std::cell::Cell::new(0),
             loom_return: None,
             loom_pane: LoomPane::default(),
+            loom_input: None,
             graph_inspect: None,
             retry_inflight: false,
             graph_unsupported: false,
@@ -4561,6 +4651,17 @@ impl AppModel {
                     }
                     return;
                 }
+                // W-flow: the loom authoring input is a one-line field —
+                // paste lands there (newlines flattened) and nowhere else,
+                // never in the hidden composer draft beneath the screen.
+                if self.screen == Screen::Loom
+                    && let Some(buffer) = self.loom_input.as_mut()
+                {
+                    for c in text.chars() {
+                        buffer.push(if c == '\n' || c == '\r' { ' ' } else { c });
+                    }
+                    return;
+                }
                 // T2: pasting while a talk session is engaged COMMITS the
                 // partial transcript first (the typing-commits law), then
                 // the paste itself flows the normal path below.
@@ -5390,9 +5491,41 @@ impl AppModel {
         // D3 — /loom browser: ↑↓ move over types+workflows, ⏎ opens the
         // detail pane, esc backs out (detail → list → where you came from).
         if self.screen == Screen::Loom {
+            // W-flow authoring: an open `n` input owns every key. ⌥m hops
+            // to the model picker and must be matched BEFORE the Char arm —
+            // a plain `m` stays typeable inside a description; other
+            // modified chars are excluded like the login card's.
+            if self.loom_input.is_some() {
+                match key.code {
+                    KeyCode::Esc => self.loom_input = None,
+                    KeyCode::Enter => self.loom_submit_authoring(),
+                    KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        self.open_model_picker(String::new());
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(buffer) = self.loom_input.as_mut() {
+                            buffer.pop();
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        if let Some(buffer) = self.loom_input.as_mut() {
+                            buffer.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                self.dirty = true;
+                return;
+            }
             let total = match self.loom_pane {
                 LoomPane::Types => self.loom_types.len(),
-                LoomPane::Workflows => self.loom_workflows.len(),
+                // W-flow: the workflows row space is synthetic-`none` +
+                // built-ins + registered — never empty.
+                LoomPane::Workflows => self.workflow_row_count(),
             };
             // Round 3: a registry that emptied under an open detail pane
             // leaves no subject — fold the pane so esc means one press.
@@ -5401,6 +5534,15 @@ impl AppModel {
             }
             let ceiling = self.loom_scroll_max.get();
             match key.code {
+                // W-flow: `p` binds the SELECTED workflows row to the bound
+                // session (pin by name / `none` abandons).
+                KeyCode::Char('p') if self.loom_pane == LoomPane::Workflows => {
+                    self.pin_selected_workflow();
+                }
+                // W-flow authoring: describe it, the model makes it.
+                KeyCode::Char('n') => {
+                    self.loom_input = Some(String::new());
+                }
                 KeyCode::Up if self.loom_detail => {
                     self.loom_scroll = self.loom_scroll.min(ceiling).saturating_sub(1);
                 }
@@ -9141,12 +9283,120 @@ impl AppModel {
         self.loom_selection = 0;
         self.loom_detail = false;
         self.loom_scroll = 0;
+        self.loom_input = None;
+        // W-flow: EVERY pane entry re-reads the registry, so a
+        // `loom_register` landed by an authoring turn is visible on return.
+        // The Listed-driven fetch stays the once-per-connection hydration
+        // path; the reply still rides the connection-epoch fence.
+        self.requests.push(AppRequest::LoomRefresh);
         // Re-entering from the browser itself (pane hop) must keep the
         // ORIGINAL return screen, not overwrite it with Screen::Loom.
         if self.screen != Screen::Loom {
             self.loom_return = Some(self.screen);
         }
         self.screen = Screen::Loom;
+    }
+
+    /// W-flow — `p` on the /workflows pane: bind the SELECTED row to the
+    /// bound session. Registry/built-in rows pin BY NAME over the existing
+    /// `graph.pin` (store resolution: built-in catalog first, then the Loom
+    /// registry); the synthetic `none` row abandons the active graph.
+    /// Live-and-bound sessions only; a pin over an active graph is the
+    /// DAEMON's refusal to make (one-active-graph law) — the flash carries
+    /// its error, and nothing here auto-switches.
+    fn pin_selected_workflow(&mut self) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· pin — live only; graphs are daemon truth".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1) {
+            self.flash = Some(self.stale_daemon_note("graph pin"));
+            return;
+        }
+        if self.active_session.is_none() {
+            self.flash = Some("· pin — no bound session; open a session first".to_owned());
+            return;
+        }
+        match self.workflow_row(self.loom_selection) {
+            Some(WorkflowRow::None) => {
+                if self.graph.is_some() {
+                    self.requests.push(AppRequest::GraphAbandon {
+                        why: "workflow cleared from /workflows".to_owned(),
+                    });
+                    self.flash = Some("· clearing workflow…".to_owned());
+                } else {
+                    self.flash = Some("· already none — no graph pinned".to_owned());
+                }
+            }
+            Some(WorkflowRow::BuiltIn(template)) => {
+                self.flash = Some(format!("· pinning {}…", template.name));
+                self.requests.push(AppRequest::GraphPin {
+                    template: Some(template.name),
+                });
+            }
+            Some(WorkflowRow::Registered(index)) => {
+                let name = self.loom_workflows[index].id.clone();
+                self.flash = Some(format!("· pinning {name}…"));
+                self.requests.push(AppRequest::GraphPin {
+                    template: Some(name),
+                });
+            }
+            None => {}
+        }
+    }
+
+    /// W-flow authoring — ⏎ on the `n` input: leave for the bound session
+    /// and submit ONE ordinary turn whose text instructs the model to draft
+    /// the described agent type / workflow and propose it as a plan; the
+    /// plan-gate + `loom_register` machinery does the rest (root sessions
+    /// only — the daemon enforces that, not this client).
+    fn loom_submit_authoring(&mut self) {
+        let description = self
+            .loom_input
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if description.is_empty() {
+            self.flash = Some("· describe it first".to_owned());
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· authoring runs live — the daemon's plan gate registers".to_owned());
+            return;
+        }
+        if self.active_session.is_none() {
+            self.flash = Some("· no bound session — open a session, then n".to_owned());
+            return;
+        }
+        let text = match self.loom_pane {
+            LoomPane::Types => format!(
+                "Draft a Loom agent type for: {description}. Propose it as a plan \
+                 (id, name, job, In -> Out types, color #rrggbb, glyph) and after \
+                 I accept the plan register it with loom_register."
+            ),
+            LoomPane::Workflows => format!(
+                "Draft a Loom workflow for: {description}. Propose it as a plan \
+                 carrying the pipe DSL source (header `name: In -> Out`, one node \
+                 per line — the registered agent types are listed in your loom \
+                 inventory) and after I accept the plan register it with \
+                 loom_register."
+            ),
+        };
+        self.loom_input = None;
+        self.loom_return = None;
+        self.screen = Screen::Session;
+        self.turn_active = true;
+        self.scroll_back.set(0);
+        self.requests.push(AppRequest::SubmitText {
+            text,
+            voice: false,
+            title: self.session_title.is_none(),
+            branch: self.branch_state.active().cloned(),
+            attachments: Vec::new(),
+        });
     }
 
     fn enter_graph(&mut self, arg: Option<&str>) {
@@ -9179,7 +9429,7 @@ impl AppModel {
                             .to_owned(),
                     );
                 } else {
-                    self.requests.push(AppRequest::GraphPin);
+                    self.requests.push(AppRequest::GraphPin { template: None });
                     self.flash = Some("· pinning ship-loop…".to_owned());
                 }
             }
@@ -12536,10 +12786,14 @@ impl AppModel {
             return;
         }
         // Demo fabricates locally; the launcher (no attached session)
-        // sets the default pair used by the next CreateSession.
-        let live_session = (!self.mode.fabricates_locally() && self.screen == Screen::Session)
-            .then(|| self.active_session.clone())
-            .flatten();
+        // sets the default pair used by the next CreateSession. W-flow: the
+        // loom authoring input's ⌥m hop selects for the BOUND session too —
+        // the receipted select is the authoring model choice.
+        let live_session = (!self.mode.fabricates_locally()
+            && (self.screen == Screen::Session
+                || (self.screen == Screen::Loom && self.loom_input.is_some())))
+        .then(|| self.active_session.clone())
+        .flatten();
         let Some(session) = live_session else {
             self.identity.provider = row.provider.clone();
             self.identity.model_short = row.model.clone();

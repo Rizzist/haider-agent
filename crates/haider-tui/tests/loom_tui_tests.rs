@@ -223,7 +223,9 @@ fn loom_screen_lists_registry() {
     );
 
     // ⏎ detail: the workflow pane shows the typed signature + pipe source.
-    model.loom_selection = 0;
+    // W-flow: registered rows sit AFTER the fixed head (`∅ none` + the two
+    // built-ins), so the first registered workflow is row 3.
+    model.loom_selection = 3;
     model.loom_detail = true;
     let (rows, _) = draw(&model);
     let all = rows.join("\n");
@@ -377,6 +379,56 @@ fn disconnect_clears_the_loom_snapshot() {
     );
     assert!(model.loom_types.is_empty(), "stale types must not survive");
     assert!(model.loom_workflows.is_empty());
+}
+
+/// W-flow verification MUTATION CHECK: paint the /loom type rows in the
+/// theme accent instead of `record.color`. Expected RUNTIME failure: a
+/// boot-seeded scout's glyph/@id cells stop carrying #7aa2f7 — every
+/// asserted cell below must wear the REGISTRY accent, so the default gold
+/// (or any theme color) on one of them fails.
+#[test]
+fn seeded_scout_renders_its_registry_accent_never_gold() {
+    let mut model = launcher_model();
+    submit(&mut model, "browse the loom");
+    // The daemon's boot seed (loom_seed.rs): scout #7aa2f7 ⌖.
+    model.loom_types = vec![LoomAgentType {
+        id: "scout".into(),
+        name: "Scout".into(),
+        job: "Read-only reconnaissance.".into(),
+        in_type: "Brief".into(),
+        out_type: "Map".into(),
+        clis: Vec::new(),
+        apis: Vec::new(),
+        skills: Vec::new(),
+        scripts: Vec::new(),
+        color: "#7aa2f7".into(),
+        glyph: "⌖".into(),
+        rev: 0,
+    }];
+    model.screen = Screen::Loom;
+
+    let (rows, colors) = draw(&model);
+    let accent = Some(ratatui::style::Color::Rgb(0x7a, 0xa2, 0xf7));
+    let row = rows
+        .iter()
+        .position(|row| row.contains("@scout"))
+        .unwrap_or_else(|| panic!("scout row missing:\n{}", rows.join("\n")));
+    // Multi-byte glyphs precede the matches: byte offsets must fold to
+    // CELL columns before indexing the color grid.
+    let cell = |byte: usize| rows[row][..byte].chars().count();
+    let glyph_column = cell(rows[row].find('⌖').expect("glyph column"));
+    assert_eq!(
+        colors[row][glyph_column], accent,
+        "the seeded glyph wears #7aa2f7, never the default gold"
+    );
+    let id_column = cell(rows[row].find("@scout").expect("id column"));
+    for offset in 0.."@scout".len() {
+        assert_eq!(
+            colors[row][id_column + offset],
+            accent,
+            "every @scout cell wears the registry accent, never the gold fallback"
+        );
+    }
 }
 
 /// Round 3 MUTATION CHECK: render "registry empty" for an unhydrated live
