@@ -10,7 +10,7 @@
 use haider_core::{SqliteStoreHandle, StoreHandle};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::SessionId;
-use haider_protocol::pipe::sidecar_row_line;
+use haider_protocol::pipe::TranscriptProjector;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -22,15 +22,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const RECONCILE_PAGE_ENVELOPES: usize = 1_024;
 const RECONCILE_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+const JOIN_PREWARM_ENVELOPES: u64 = 1_024;
 const COVERAGE_COALESCE_ENVELOPES: u64 = 256;
 const TAIL_SCAN_BYTES: usize = 8 * 1_024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const SIDECAR_MAGIC: &str = "haider.session.jsonl";
-// V2 adds coverage line kinds and `(seq, ordinal)` row identity with optional
-// branches. Readers are forward-compatible by ignoring unknown row keys and
-// unknown line kinds.
-const SIDECAR_VERSION: u64 = 2;
+// V2 added coverage lines and `(seq, ordinal)` row identity. V3 guarantees
+// cold tool preview projection; the version bump forces existing at-head V2
+// files through journal rebuild rather than leaving their rows preview-less.
+const SIDECAR_VERSION: u64 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarCursor {
@@ -40,6 +41,11 @@ struct SidecarCursor {
     /// of `seq` while non-projecting hot batches are being coalesced.
     pending_seq: u64,
     generation: u64,
+}
+
+struct ReconciledSidecar {
+    cursor: SidecarCursor,
+    projector: TranscriptProjector,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,7 +84,7 @@ impl From<std::io::Error> for PipeNativeError {
 /// first-touch reconciliation in this daemon lifetime.
 pub(crate) struct PipeNativeWriter {
     pipe_dir: PathBuf,
-    reconciled: Mutex<HashMap<SessionId, SidecarCursor>>,
+    reconciled: Mutex<HashMap<SessionId, ReconciledSidecar>>,
     dirty: Mutex<HashSet<SessionId>>,
 }
 
@@ -122,22 +128,23 @@ impl PipeNativeWriter {
         committed: &[RawEnvelope],
     ) -> Result<(), PipeNativeError> {
         let path = self.sidecar_path(session_id)?;
-        let known_cursor = self
+        let known = self
             .reconciled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .copied();
+            .remove(session_id);
 
         let dirty = self
             .dirty
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(session_id);
-        let cursor = if let Some(cursor) = known_cursor {
-            let (data, next_cursor) = render_hot_batch(committed, cursor)?;
+        let state = if let Some(mut state) = known {
+            let (data, next_cursor) =
+                render_hot_batch(committed, state.cursor, &mut state.projector)?;
             append_once(path, data).await?;
-            next_cursor
+            state.cursor = next_cursor;
+            state
         } else {
             let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
             if dirty {
@@ -167,7 +174,7 @@ impl PipeNativeWriter {
         self.reconciled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.clone(), cursor);
+            .insert(session_id.clone(), state);
         self.dirty
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -184,7 +191,8 @@ impl PipeNativeWriter {
         session_id: &SessionId,
         path: PathBuf,
         cursor: SidecarCursor,
-    ) -> Result<SidecarCursor, PipeNativeError> {
+    ) -> Result<ReconciledSidecar, PipeNativeError> {
+        let mut projector = prewarm_projector(store, session_id, cursor.seq).await?;
         let mut read_cursor = cursor.seq;
         let mut append_file = None;
         loop {
@@ -203,7 +211,7 @@ impl PipeNativeWriter {
                 break;
             };
             read_cursor = last.seq;
-            let chunk = render_rows_after(&page, cursor.seq);
+            let chunk = render_rows_after(&page, cursor.seq, &mut projector);
             if !chunk.is_empty() {
                 let file = match append_file.take() {
                     Some(file) => file,
@@ -212,6 +220,14 @@ impl PipeNativeWriter {
                 append_file = Some(write_open(file, chunk).await?);
             }
         }
+        let trailing = render_projected_rows(projector.finish());
+        if !trailing.is_empty() {
+            let file = match append_file.take() {
+                Some(file) => file,
+                None => open_append(path.clone()).await?,
+            };
+            append_file = Some(write_open(file, trailing).await?);
+        }
         let file = match append_file.take() {
             Some(file) => file,
             None => open_append(path).await?,
@@ -219,10 +235,13 @@ impl PipeNativeWriter {
         let file = write_open(file, coverage_line(read_cursor, cursor.generation)?).await?;
         // Reconciliation is a repair path, so retain an explicit sync here.
         sync_open(file).await?;
-        Ok(SidecarCursor {
-            seq: read_cursor,
-            pending_seq: read_cursor,
-            ..cursor
+        Ok(ReconciledSidecar {
+            cursor: SidecarCursor {
+                seq: read_cursor,
+                pending_seq: read_cursor,
+                ..cursor
+            },
+            projector,
         })
     }
 
@@ -232,7 +251,7 @@ impl PipeNativeWriter {
         session_id: &SessionId,
         path: PathBuf,
         generation: u64,
-    ) -> Result<SidecarCursor, PipeNativeError> {
+    ) -> Result<ReconciledSidecar, PipeNativeError> {
         let (mut file, temp_path) = create_temp(path.clone()).await?;
         let generation = generation
             .checked_add(1)
@@ -249,6 +268,7 @@ impl PipeNativeWriter {
         header.push('\n');
         file = write_temp(file, header).await?;
         let mut read_cursor = 0;
+        let mut projector = TranscriptProjector::default();
         loop {
             let page = store
                 .read_page(
@@ -263,15 +283,19 @@ impl PipeNativeWriter {
                 break;
             };
             read_cursor = last.seq;
-            let chunk = render_rows_after(&page, 0);
+            let chunk = render_rows_after(&page, 0, &mut projector);
             file = write_temp(file, chunk).await?;
         }
+        file = write_temp(file, render_projected_rows(projector.finish())).await?;
         file = write_temp(file, coverage_line(read_cursor, generation)?).await?;
         finish_temp(file, temp_path, path).await?;
-        Ok(SidecarCursor {
-            seq: read_cursor,
-            pending_seq: read_cursor,
-            generation,
+        Ok(ReconciledSidecar {
+            cursor: SidecarCursor {
+                seq: read_cursor,
+                pending_seq: read_cursor,
+                generation,
+            },
+            projector,
         })
     }
 
@@ -304,6 +328,42 @@ impl PipeNativeWriter {
     }
 }
 
+async fn prewarm_projector(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    through_seq: u64,
+) -> Result<TranscriptProjector, PipeNativeError> {
+    let mut projector = TranscriptProjector::default();
+    let mut read_cursor = through_seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
+    while read_cursor < through_seq {
+        let page = store
+            .read_page(
+                session_id,
+                read_cursor,
+                RECONCILE_PAGE_ENVELOPES,
+                RECONCILE_PAGE_BYTES,
+            )
+            .await
+            .map_err(|error| PipeNativeError(format!("journal join prewarm failed: {error:?}")))?;
+        let mut advanced = false;
+        for envelope in ordered_after(&page, read_cursor) {
+            if envelope.seq > through_seq {
+                break;
+            }
+            // These rows are already represented by the durable cursor. Only
+            // rebuild call/result join state; normal projection here would
+            // buffer and later duplicate an unresolved row from the sidecar.
+            projector.prewarm(envelope);
+            read_cursor = envelope.seq;
+            advanced = true;
+        }
+        if !advanced {
+            break;
+        }
+    }
+    Ok(projector)
+}
+
 fn ordered_after(envelopes: &[RawEnvelope], cursor: u64) -> Vec<&RawEnvelope> {
     let mut ordered: Vec<&RawEnvelope> = envelopes
         .iter()
@@ -313,10 +373,24 @@ fn ordered_after(envelopes: &[RawEnvelope], cursor: u64) -> Vec<&RawEnvelope> {
     ordered
 }
 
-fn render_rows_after(envelopes: &[RawEnvelope], cursor: u64) -> String {
+fn render_rows_after(
+    envelopes: &[RawEnvelope],
+    cursor: u64,
+    projector: &mut TranscriptProjector,
+) -> String {
     let mut data = String::new();
     for envelope in ordered_after(envelopes, cursor) {
-        if let Some(line) = sidecar_row_line(envelope) {
+        data.push_str(&render_projected_rows(projector.push(envelope)));
+    }
+    data
+}
+
+fn render_projected_rows(
+    rows: impl IntoIterator<Item = haider_protocol::pipe::SidecarRow>,
+) -> String {
+    let mut data = String::new();
+    for row in rows {
+        if let Ok(line) = serde_json::to_string(&row) {
             data.push_str(&line);
             data.push('\n');
         }
@@ -340,6 +414,7 @@ fn coverage_line(coverage: u64, generation: u64) -> Result<String, PipeNativeErr
 fn render_hot_batch(
     envelopes: &[RawEnvelope],
     cursor: SidecarCursor,
+    projector: &mut TranscriptProjector,
 ) -> Result<(String, SidecarCursor), PipeNativeError> {
     let ordered = ordered_after(envelopes, cursor.pending_seq);
     let Some(last) = ordered.last() else {
@@ -349,17 +424,21 @@ fn render_hot_batch(
     let mut data = String::new();
     let mut produced_row = false;
     for envelope in ordered {
-        if let Some(line) = sidecar_row_line(envelope) {
-            data.push_str(&line);
-            data.push('\n');
+        let rows = projector.push(envelope);
+        if !rows.is_empty() {
+            data.push_str(&render_projected_rows(rows));
             produced_row = true;
         }
     }
+    let coverable_seq = projector
+        .blocked_seq()
+        .map_or(pending_seq, |seq| seq.saturating_sub(1));
     let should_cover =
-        produced_row || pending_seq.saturating_sub(cursor.seq) >= COVERAGE_COALESCE_ENVELOPES;
+        produced_row || coverable_seq.saturating_sub(cursor.seq) >= COVERAGE_COALESCE_ENVELOPES;
     let seq = if should_cover {
-        data.push_str(&coverage_line(pending_seq, cursor.generation)?);
-        pending_seq
+        let seq = coverable_seq.max(cursor.seq);
+        data.push_str(&coverage_line(seq, cursor.generation)?);
+        seq
     } else {
         cursor.seq
     };

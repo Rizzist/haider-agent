@@ -18,6 +18,7 @@
 //! a given session always exports to the same bytes (which is also what makes
 //! the "never overwrite a foreign session file" collision refusal meaningful).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use haider_protocol::EventPayload;
@@ -25,7 +26,7 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorPresentation;
 use haider_protocol::history::NodeKind;
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::pipe::{escape_pipe_field, pipe_body_line, sidecar_row};
+use haider_protocol::pipe::{TranscriptJoiner, TranscriptProjector, escape_pipe_field};
 use haider_tui::notify::mask_text;
 use serde_json::{Value, json};
 
@@ -72,6 +73,8 @@ pub enum Turn {
     Tool {
         name: String,
         summary: String,
+        args_preview: Option<String>,
+        result_preview: Option<String>,
         at_ms: u64,
         seq: u64,
     },
@@ -109,6 +112,7 @@ pub struct SessionExport {
     /// Source facts retained for shared unmasked pipe/JSON row rendering.
     /// Other formats continue to consume the transcript projection above.
     envelopes: Vec<RawEnvelope>,
+    projection_after_seq: u64,
     /// The highest journal seq SEEN in the replay (not just of rendered
     /// turns) — the exact catch-up cursor: subscribe `after_seq=head_seq`
     /// or re-export `--since head_seq` and nothing is missed or repeated.
@@ -201,7 +205,10 @@ impl SessionExport {
         let head_seq = ordered.last().map_or(0, |envelope| envelope.seq);
         let envelopes = ordered.iter().map(|envelope| (*envelope).clone()).collect();
         let mut turns = Vec::new();
+        let mut joiner = TranscriptJoiner::default();
+        let mut pending_tools = HashMap::<(Option<String>, Option<String>, String), usize>::new();
         for envelope in ordered {
+            let tool_join = joiner.observe(envelope);
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
             else {
                 continue;
@@ -217,12 +224,33 @@ impl SessionExport {
                         turns.push(Turn::Assistant { text, at_ms, seq });
                     }
                     NodeKind::ToolExchange { tool, summary, .. } => {
+                        let pending_key = tool_join.as_ref().and_then(|join| {
+                            join.result.is_none().then(|| {
+                                (
+                                    envelope
+                                        .branch_id
+                                        .as_ref()
+                                        .map(|branch| branch.as_str().to_owned()),
+                                    envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
+                                    join.call_id.clone(),
+                                )
+                            })
+                        });
                         turns.push(Turn::Tool {
                             name: tool,
                             summary,
+                            args_preview: tool_join
+                                .as_ref()
+                                .and_then(haider_protocol::pipe::ToolExchangeJoin::args_preview),
+                            result_preview: tool_join
+                                .as_ref()
+                                .and_then(haider_protocol::pipe::ToolExchangeJoin::result_preview),
                             at_ms,
                             seq,
                         });
+                        if let Some(key) = pending_key {
+                            pending_tools.insert(key, turns.len() - 1);
+                        }
                     }
                     _ => {}
                 },
@@ -243,6 +271,21 @@ impl SessionExport {
                     at_ms,
                     seq,
                 }),
+                EventPayload::ToolResult { call_id, result } => {
+                    let key = (
+                        envelope
+                            .branch_id
+                            .as_ref()
+                            .map(|branch| branch.as_str().to_owned()),
+                        envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
+                        call_id,
+                    );
+                    if let Some(index) = pending_tools.remove(&key)
+                        && let Some(Turn::Tool { result_preview, .. }) = turns.get_mut(index)
+                    {
+                        *result_preview = haider_protocol::pipe::result_preview(&result);
+                    }
+                }
                 _ => {}
             }
         }
@@ -250,6 +293,7 @@ impl SessionExport {
             meta,
             turns,
             envelopes,
+            projection_after_seq: 0,
             head_seq,
         }
     }
@@ -257,7 +301,7 @@ impl SessionExport {
     /// Retain only facts after an incremental export cursor in both the raw
     /// native-pipe source and the turn projection used by other formats.
     pub(crate) fn retain_after(&mut self, since: u64) {
-        self.envelopes.retain(|envelope| envelope.seq > since);
+        self.projection_after_seq = since;
         self.turns.retain(|turn| turn.seq() > since);
     }
 
@@ -312,7 +356,7 @@ impl SessionExport {
     /// A  <seq> <at_ms> |assistant text|
     /// A! <seq> <at_ms> |partial text| interrupted=|title: detail|
     /// E  <seq> <at_ms> |title: detail|
-    /// T  <seq> <at_ms> |tool-name| |summary|
+    /// T  <seq> <at_ms> |tool-name| |summary| [args=|preview|] [result=|preview|]
     /// ```
     ///
     /// Text and tool names ride between pipes with `\` `|` and newline
@@ -336,7 +380,23 @@ impl SessionExport {
             escape_pipe_field(&self.title(masked).unwrap_or_default()),
         ));
         if !masked {
-            lines.extend(self.envelopes.iter().filter_map(pipe_body_line));
+            let mut projector = TranscriptProjector::default();
+            for envelope in &self.envelopes {
+                lines.extend(
+                    projector
+                        .push(envelope)
+                        .into_iter()
+                        .filter(|row| row.seq() > self.projection_after_seq)
+                        .map(|row| row.pipe_body_line()),
+                );
+            }
+            lines.extend(
+                projector
+                    .finish()
+                    .into_iter()
+                    .filter(|row| row.seq() > self.projection_after_seq)
+                    .map(|row| row.pipe_body_line()),
+            );
             let mut body = lines.join("\n");
             body.push('\n');
             return body;
@@ -382,13 +442,26 @@ impl SessionExport {
                 Turn::Tool {
                     name,
                     summary,
+                    args_preview,
+                    result_preview,
                     at_ms,
                     seq,
-                } => format!(
-                    "T  {seq} {at_ms} {} {}",
-                    escape_pipe_field(name),
-                    escape_pipe_field(&self.text(summary, masked))
-                ),
+                } => {
+                    let mut line = format!(
+                        "T  {seq} {at_ms} {} {}",
+                        escape_pipe_field(name),
+                        escape_pipe_field(&self.text(summary, masked))
+                    );
+                    if let Some(args) = args_preview {
+                        line.push_str(" args=");
+                        line.push_str(&escape_pipe_field(&self.text(args, masked)));
+                    }
+                    if let Some(result) = result_preview {
+                        line.push_str(" result=");
+                        line.push_str(&escape_pipe_field(&self.text(result, masked)));
+                    }
+                    line
+                }
             });
         }
         let mut body = lines.join("\n");
@@ -486,6 +559,22 @@ impl SessionExport {
                 turns: T,
             }
 
+            let mut projector = TranscriptProjector::default();
+            let mut turns = Vec::new();
+            for envelope in &self.envelopes {
+                turns.extend(
+                    projector
+                        .push(envelope)
+                        .into_iter()
+                        .filter(|row| row.seq() > self.projection_after_seq),
+                );
+            }
+            turns.extend(
+                projector
+                    .finish()
+                    .into_iter()
+                    .filter(|row| row.seq() > self.projection_after_seq),
+            );
             let document = JsonDocument {
                 schema: "haider.export.v1",
                 session_id: &self.meta.session_id,
@@ -496,11 +585,7 @@ impl SessionExport {
                 created_at_ms: self.meta.created_at_ms,
                 head_seq: self.head_seq,
                 masked: false,
-                turns: self
-                    .envelopes
-                    .iter()
-                    .filter_map(sidecar_row)
-                    .collect::<Vec<_>>(),
+                turns,
             };
             return serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_owned());
         }
@@ -547,15 +632,26 @@ impl SessionExport {
                 Turn::Tool {
                     name,
                     summary,
+                    args_preview,
+                    result_preview,
                     at_ms,
                     seq,
-                } => json!({
-                    "role": "tool",
-                    "name": name,
-                    "summary": self.text(summary, masked),
-                    "at_ms": at_ms,
-                    "seq": seq,
-                }),
+                } => {
+                    let mut object = serde_json::Map::from_iter([
+                        ("role".into(), "tool".into()),
+                        ("name".into(), name.clone().into()),
+                        ("summary".into(), self.text(summary, masked).into()),
+                        ("at_ms".into(), (*at_ms).into()),
+                        ("seq".into(), (*seq).into()),
+                    ]);
+                    if let Some(args) = args_preview {
+                        object.insert("args_preview".into(), self.text(args, masked).into());
+                    }
+                    if let Some(result) = result_preview {
+                        object.insert("result_preview".into(), self.text(result, masked).into());
+                    }
+                    Value::Object(object)
+                }
             })
             .collect();
         let document = json!({
@@ -1281,6 +1377,7 @@ const EX_BLOCKED: u8 = 77;
 /// `--since` advances the window to the remaining journal suffix. Unlike this
 /// windowed view, the daemon-maintained JSONL sidecar covers the full journal.
 const MAX_REPLAY_EVENTS: usize = 500_000;
+const JOIN_PREWARM_EVENTS: u64 = 1_024;
 
 /// Drain `receiver` into a BOUNDED buffer of at most `max_events` items,
 /// returning the retained items and whether the replay was truncated. The
@@ -1466,7 +1563,10 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
         session_id,
         false,
         sender,
-        options.since.unwrap_or(0),
+        options
+            .since
+            .map(|since| since.saturating_sub(JOIN_PREWARM_EVENTS))
+            .unwrap_or(0),
     )
     .await;
     let (events, truncated) = collector.await.unwrap_or_default();

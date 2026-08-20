@@ -23,6 +23,7 @@ pub(crate) mod models;
 pub(crate) mod observe;
 pub(crate) mod run;
 pub(crate) mod session_config;
+pub(crate) mod session_item;
 pub(crate) mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -111,6 +112,11 @@ async fn dispatch() -> ExitCode {
         {
             session_config::session_config_command(session_id, rest).await
         }
+        [command, session_id, subcommand, seq, rest @ ..]
+            if command == "session" && subcommand == "item" =>
+        {
+            session_item::session_item_command(session_id, seq, rest).await
+        }
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
         [command, rest @ ..] if command == "models" => models::models_command(rest).await,
         [command, rest @ ..] if command == "fleet" => observe::fleet_command(rest).await,
@@ -131,6 +137,7 @@ async fn dispatch() -> ExitCode {
                  status [--json] [--no-spawn], sessions [--json] [--no-spawn], \
                  session <id> [--json|--watch] [--no-spawn], \
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
+                 session <id> item <seq> --json [--masked] [--no-spawn], \
                  models [--json], \
                  fleet [<session-id>] [--json] [--no-spawn], \
                  events [--follow] [--no-spawn], \

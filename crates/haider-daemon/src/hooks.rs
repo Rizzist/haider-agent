@@ -12,6 +12,8 @@
 //! Surface identity is intentionally absent: preserving that 1:1 fact/event
 //! mapping gives every submission surface identical hook semantics.
 
+#[path = "hooks_server.rs"]
+mod hooks_server;
 #[cfg(test)]
 #[path = "hooks_tests.rs"]
 mod tests;
@@ -34,6 +36,7 @@ use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind}
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_rpc::{CommandId, HookSummaryWire, HookTrustStateWire};
+use hooks_server::{HookServerRegistry, ServerReply};
 #[cfg(unix)]
 use rustix::fd::OwnedFd;
 #[cfg(unix)]
@@ -68,6 +71,7 @@ const MAX_HOOK_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_HOOK_ANCESTORS: usize = 256;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_SERVER_IDLE_TIMEOUT_MS: u64 = 60_000;
 const INLINE_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_STREAM_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_USER_MESSAGE_TEXT_BYTES: usize = 32 * 1024;
@@ -109,9 +113,16 @@ impl HookTrustPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookKind {
+    Exec,
+    Subscribe,
+    Server { idle_timeout_ms: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum HookKind {
+enum HookConfigKind {
     Exec,
     Subscribe,
 }
@@ -121,8 +132,17 @@ impl HookKind {
         match self {
             Self::Exec => "exec",
             Self::Subscribe => "subscribe",
+            Self::Server { .. } => "exec",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HookMode {
+    #[default]
+    Spawn,
+    Server,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -178,12 +198,16 @@ struct HookMatcher {
 #[derive(Debug, Deserialize)]
 struct HookEntry {
     matcher: HookMatcher,
-    kind: HookKind,
+    kind: HookConfigKind,
     command: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
     decision: bool,
+    #[serde(default)]
+    mode: HookMode,
+    #[serde(default)]
+    idle_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +265,7 @@ struct HookServiceInner {
     hub: SessionHub,
     committed: mpsc::UnboundedSender<EngineMessage>,
     shutdown: watch::Sender<bool>,
+    servers: HookServerRegistry,
     pins: RwLock<HashSet<String>>,
     workspace_baselines: Mutex<HashMap<String, String>>,
     /// Hook identity → latest digest the daemon itself observed as trusted.
@@ -281,8 +306,30 @@ impl HookService {
         &self,
         cwd: PathBuf,
     ) -> Result<(HookTrustPolicy, u64, Vec<HookSummaryWire>), String> {
+        let workspace_cwd = cwd.clone();
         let discovery = discover_async(cwd, self.inner.profile_root.clone()).await?;
         self.prepare_workspace_trust(&discovery).await;
+        let current_servers = discovery
+            .hooks
+            .values()
+            .filter(|definition| matches!(definition.kind, HookKind::Server { .. }))
+            .map(HookDefinition::subscriber_key)
+            .collect::<HashSet<_>>();
+        let trusted_servers = discovery
+            .hooks
+            .values()
+            .filter(|definition| {
+                matches!(definition.kind, HookKind::Server { .. })
+                    && self.is_trusted(definition, false, discovery.policy)
+            })
+            .map(HookDefinition::subscriber_key)
+            .collect::<HashSet<_>>();
+        self.inner.servers.reconcile_workspace(
+            &workspace_cwd,
+            &current_servers,
+            &trusted_servers,
+            None,
+        );
         let revision = self
             .inner
             .store
@@ -376,6 +423,7 @@ impl HookService {
                 pins.insert(change.digest.clone());
             } else {
                 pins.remove(&change.digest);
+                self.inner.servers.kill_digest(&change.digest);
                 self.inner
                     .observed_trusted
                     .lock()
@@ -621,6 +669,7 @@ impl HookEngine {
                 hub,
                 committed: sender,
                 shutdown,
+                servers: HookServerRegistry::default(),
                 pins: RwLock::new(pins),
                 workspace_baselines: Mutex::new(workspace_baselines),
                 observed_trusted: Mutex::new(observed_trusted),
@@ -641,6 +690,7 @@ impl HookEngine {
 
     pub(crate) async fn shutdown(mut self) {
         let _ = self.service.inner.shutdown.send(true);
+        self.service.inner.servers.shutdown().await;
         let (done, wait) = oneshot::channel();
         let _ = self
             .service
@@ -656,6 +706,8 @@ impl HookEngine {
 
 impl Drop for HookEngine {
     fn drop(&mut self) {
+        let _ = self.service.inner.shutdown.send(true);
+        self.service.inner.servers.abort_all();
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -686,6 +738,94 @@ struct SubscriberHandle {
 struct SubscriberMessage {
     input: Arc<[u8]>,
     delivered: oneshot::Sender<()>,
+}
+
+enum PendingServerResponse {
+    Waiting(oneshot::Receiver<ServerReply>),
+    Ready(ServerReply),
+}
+
+struct PendingServerFire {
+    definition: HookDefinition,
+    cause: RawEnvelope,
+    decision: Option<DecisionContext>,
+    response: PendingServerResponse,
+}
+
+impl PendingServerFire {
+    async fn complete(self, service: &HookService) -> bool {
+        let reply = match self.response {
+            PendingServerResponse::Waiting(wait) => match wait.await {
+                Ok(reply) => reply,
+                Err(_) if *service.inner.shutdown.borrow() => return false,
+                Err(_) => ServerReply::DefinitionChanged,
+            },
+            PendingServerResponse::Ready(reply) => reply,
+        };
+        match reply {
+            ServerReply::DefinitionChanged => {
+                let decision = self.decision.is_some();
+                service
+                    .journal(
+                        &self.cause,
+                        HookEventPayload::HookNotice(HookNotice {
+                            hook: Some(self.definition.name),
+                            digest: Some(self.definition.digest),
+                            source: self.definition.source_path.display().to_string(),
+                            reason: if decision {
+                                "decision hook digest or trust changed before spawn".into()
+                            } else {
+                                "hook digest or trust changed before spawn".into()
+                            },
+                        }),
+                    )
+                    .await
+            }
+            ServerReply::Result(mut result) => {
+                if result.cancelled {
+                    return false;
+                }
+                let (kind, proposed_decision, menu_id, decision_applied) =
+                    if let Some(decision) = self.decision {
+                        let proposed = strict_decision(&result);
+                        let applied = if let Some(proposed) = proposed {
+                            resolve_decision(service, &self.definition, &decision, proposed)
+                                .await
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        result.proposed_decision = proposed;
+                        (
+                            HookRuntimeKind::Decision,
+                            proposed,
+                            Some(decision.permission.menu.id),
+                            applied,
+                        )
+                    } else {
+                        (HookRuntimeKind::Exec, None, None, false)
+                    };
+                service
+                    .journal(
+                        &self.cause,
+                        HookEventPayload::HookFired(HookFired {
+                            hook: self.definition.name,
+                            digest: self.definition.digest,
+                            kind,
+                            observed_seq: self.cause.seq,
+                            exit_code: result.exit_code,
+                            timed_out: result.timed_out,
+                            stdout: result.stdout,
+                            stderr: result.stderr,
+                            proposed_decision,
+                            menu_id,
+                            decision_applied,
+                        }),
+                    )
+                    .await
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -769,13 +909,14 @@ async fn run_engine(
             message = messages.recv() => match message {
                 Some(EngineMessage::Committed(envelopes)) => {
                     for envelope in envelopes {
-                        if !handle_and_complete(&service, &mut state, &mut jobs, envelope).await {
+                        if !handle_and_complete(&service, &mut state, &mut jobs, envelope, true).await {
                             break;
                         }
                     }
                 }
                 Some(EngineMessage::TrustChanged(change)) => {
                     if !change.trusted {
+                        service.inner.servers.kill_digest(&change.digest);
                         state.subscribers.retain(|_, handle| handle.digest != change.digest);
                     }
                 }
@@ -810,7 +951,7 @@ async fn replay_pending_dispatches(
             return true;
         }
         for envelope in pending {
-            if !handle_and_complete(service, state, jobs, envelope).await {
+            if !handle_and_complete(service, state, jobs, envelope, false).await {
                 return false;
             }
         }
@@ -822,9 +963,46 @@ async fn handle_and_complete(
     state: &mut EngineState,
     jobs: &mut JoinSet<()>,
     envelope: RawEnvelope,
+    defer_servers: bool,
 ) -> bool {
-    if !handle_committed(service, state, jobs, envelope.clone()).await {
+    let mut pending = Vec::new();
+    let mut terminal_scope = None;
+    if !handle_committed(
+        service,
+        state,
+        jobs,
+        envelope.clone(),
+        &mut pending,
+        &mut terminal_scope,
+    )
+    .await
+    {
         return false;
+    }
+    if defer_servers && !pending.is_empty() {
+        let service = service.clone();
+        jobs.spawn(async move {
+            let handled = complete_server_fires(&service, pending).await;
+            if let Some(scope) = terminal_scope {
+                service.inner.servers.kill_scope(&scope);
+            }
+            if handled
+                && let Err(error) = service
+                    .inner
+                    .store
+                    .complete_hook_dispatch(&envelope.session_id, envelope.seq)
+                    .await
+            {
+                tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox acknowledgement failed");
+            }
+        });
+        return true;
+    }
+    if !complete_server_fires(service, pending).await {
+        return false;
+    }
+    if let Some(scope) = terminal_scope {
+        service.inner.servers.kill_scope(&scope);
     }
     if let Err(error) = service
         .inner
@@ -838,21 +1016,37 @@ async fn handle_and_complete(
     true
 }
 
+async fn complete_server_fires(service: &HookService, pending: Vec<PendingServerFire>) -> bool {
+    for fire in pending {
+        if !fire.complete(service).await {
+            return false;
+        }
+    }
+    true
+}
+
 async fn handle_committed(
     service: &HookService,
     state: &mut EngineState,
     jobs: &mut JoinSet<()>,
     envelope: RawEnvelope,
+    pending_servers: &mut Vec<PendingServerFire>,
+    terminal_server_scope: &mut Option<(SessionId, RunId)>,
 ) -> bool {
     if HookEventPayload::is_engine_fact(&envelope.payload) {
         return true;
     }
 
     let decision = reduce_durable_state(state, &envelope);
-    if matches!(
-        HookEventPayload::from_payload_value(envelope.payload.clone()),
-        Ok(HookEventPayload::HookRunTrust { .. })
-    ) {
+    if let Ok(HookEventPayload::HookRunTrust { enabled }) =
+        HookEventPayload::from_payload_value(envelope.payload.clone())
+    {
+        if !enabled && let Some(run_id) = envelope.run_id.clone() {
+            service
+                .inner
+                .servers
+                .kill_scope(&(envelope.session_id.clone(), run_id));
+        }
         return true;
     }
     let Some(facts) = classify(&envelope) else {
@@ -894,6 +1088,27 @@ async fn handle_committed(
         }
     };
     service.prepare_workspace_trust(&discovery).await;
+    let current_servers = discovery
+        .hooks
+        .values()
+        .filter(|definition| matches!(definition.kind, HookKind::Server { .. }))
+        .map(HookDefinition::subscriber_key)
+        .collect::<HashSet<_>>();
+    let trusted_servers = discovery
+        .hooks
+        .values()
+        .filter(|definition| {
+            matches!(definition.kind, HookKind::Server { .. })
+                && service.is_trusted(definition, false, discovery.policy)
+        })
+        .map(HookDefinition::subscriber_key)
+        .collect::<HashSet<_>>();
+    service.inner.servers.reconcile_workspace(
+        Path::new(&metadata.cwd),
+        &current_servers,
+        &trusted_servers,
+        Some(&state.run_trust),
+    );
     for notice in discovery.notices {
         if !journal_notice_once(service, state, &envelope, notice).await {
             return false;
@@ -964,7 +1179,29 @@ async fn handle_committed(
             let Some(decision) = decision.clone() else {
                 continue;
             };
-            if !fire_decision(
+            if matches!(definition.kind, HookKind::Server { .. }) {
+                let input = match serde_json::to_vec(&json!({
+                    "schema": "haider.hook.decision.v1",
+                    "envelope": &envelope,
+                    "effect": &decision.intent,
+                    "menu": &decision.permission.menu,
+                })) {
+                    Ok(input) => Arc::from(input),
+                    Err(error) => {
+                        tracing::warn!(target: "haider.hooks", ?error, "decision input serialization failed");
+                        return false;
+                    }
+                };
+                let run_scope = server_run_scope(profile_trusted, &envelope);
+                pending_servers.push(queue_server_fire(
+                    service,
+                    definition,
+                    envelope.clone(),
+                    input,
+                    run_scope,
+                    Some(decision),
+                ));
+            } else if !fire_decision(
                 service.clone(),
                 definition,
                 envelope.clone(),
@@ -1043,14 +1280,62 @@ async fn handle_committed(
                     return false;
                 }
             }
+            HookKind::Server { .. } => {
+                let run_scope = server_run_scope(profile_trusted, &envelope);
+                pending_servers.push(queue_server_fire(
+                    service,
+                    definition,
+                    envelope.clone(),
+                    input,
+                    run_scope,
+                    None,
+                ));
+            }
         }
     }
     if let Some(terminal_scope) = terminal_scope {
         state
             .subscribers
             .retain(|_, handle| handle.run_scope.as_ref() != Some(&terminal_scope));
+        *terminal_server_scope = Some(terminal_scope);
     }
     true
+}
+
+fn server_run_scope(profile_trusted: bool, envelope: &RawEnvelope) -> Option<(SessionId, RunId)> {
+    (!profile_trusted)
+        .then(|| {
+            envelope
+                .run_id
+                .clone()
+                .map(|run_id| (envelope.session_id.clone(), run_id))
+        })
+        .flatten()
+}
+
+fn queue_server_fire(
+    service: &HookService,
+    definition: HookDefinition,
+    cause: RawEnvelope,
+    input: Arc<[u8]>,
+    run_scope: Option<(SessionId, RunId)>,
+    decision: Option<DecisionContext>,
+) -> PendingServerFire {
+    let response = match service.inner.servers.try_dispatch(
+        service.clone(),
+        definition.clone(),
+        input,
+        run_scope,
+    ) {
+        Ok(wait) => PendingServerResponse::Waiting(wait),
+        Err(error) => PendingServerResponse::Ready(ServerReply::Result(error.process_result())),
+    };
+    PendingServerFire {
+        definition,
+        cause,
+        decision,
+        response,
+    }
 }
 
 async fn deliver_subscriber(
@@ -2347,16 +2632,21 @@ fn read_document(
             }
         };
         let timeout_ms = entry.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+        let idle_timeout_ms = entry
+            .idle_timeout_ms
+            .unwrap_or(DEFAULT_SERVER_IDLE_TIMEOUT_MS);
         let invalid = if entry.command.trim().is_empty() {
             Some("hook command must not be empty")
         } else if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
             Some("hook timeout must be between 1ms and 300000ms")
         } else if entry.decision
-            && (entry.kind != HookKind::Exec
+            && (entry.kind != HookConfigKind::Exec
                 || entry.matcher.event != MatchEvent::RunParked
                 || entry.matcher.parked_kind.as_deref() != Some("permission"))
         {
             Some("decision hooks must be exec hooks matching run_parked(permission)")
+        } else if entry.mode == HookMode::Server && entry.kind != HookConfigKind::Exec {
+            Some("server mode is supported only for exec hooks")
         } else {
             None
         };
@@ -2365,12 +2655,20 @@ fn read_document(
             continue;
         }
         let digest = hook_digest(&bytes, &entry.command);
+        let kind = if entry.mode == HookMode::Server {
+            HookKind::Server { idle_timeout_ms }
+        } else {
+            match entry.kind {
+                HookConfigKind::Exec => HookKind::Exec,
+                HookConfigKind::Subscribe => HookKind::Subscribe,
+            }
+        };
         hooks.insert(
             name.clone(),
             HookDefinition {
                 name,
                 matcher: entry.matcher,
-                kind: entry.kind,
+                kind,
                 command: entry.command,
                 timeout: Duration::from_millis(timeout_ms),
                 decision: entry.decision,

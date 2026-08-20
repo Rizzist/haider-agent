@@ -153,6 +153,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V2.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V3.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
+            haider_rpc::FEATURE_HOOKS_SERVER_V1.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
@@ -1407,4 +1408,42 @@ async fn pinging_peer_stays_attached_across_quiescence() {
     // NotConnected; either shape ends the task, which is the law under test.
     let _ = serve_task.await.expect("serve joins");
     let _ = hub.shutdown().await;
+}
+
+/// The TOTAL Welcome barrier (v0.0.934 wire fix): while the JSON Welcome
+/// is queued, no OTHER lane pops — a frame admitted after negotiation may
+/// already be MessagePack encoded, and a client decodes JSON until it has
+/// seen the Welcome. Only the Welcome's own FIFO lane advances (its
+/// earlier frames are pre-switch JSON by construction).
+///
+/// MUTATION CHECK: restore the unguarded round-robin pop while
+/// `welcome_queued`. Expected runtime failure: `event-before` — pushed
+/// FIRST overall, on another lane — is returned before the Welcome below.
+#[tokio::test]
+async fn welcome_barrier_holds_every_other_lane_until_the_welcome_writes() {
+    let lane = OutboundLane::new(8, 4_096, 512);
+    let other = LaneKey::Attachment(AttachmentId::new("early-events"));
+    lane.try_push(other.clone(), ordinary(b"event-before"))
+        .expect("event queues");
+    lane.try_push(LaneKey::System, ordinary(b"pre-welcome-json"))
+        .expect("pre-welcome queues");
+    lane.try_push(
+        LaneKey::System,
+        QueuedFrame::welcome(b"the-welcome".to_vec()),
+    )
+    .expect("welcome queues");
+
+    assert_eq!(
+        lane.recv().await.expect("first").bytes,
+        b"pre-welcome-json",
+        "the welcome's own lane advances in FIFO order"
+    );
+    let second = lane.recv().await.expect("second");
+    assert_eq!(second.bytes, b"the-welcome");
+    assert!(second.welcome);
+    assert_eq!(
+        lane.recv().await.expect("third").bytes,
+        b"event-before",
+        "the held lane flows only after the welcome popped"
+    );
 }

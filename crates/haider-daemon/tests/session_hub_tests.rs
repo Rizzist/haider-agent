@@ -550,7 +550,7 @@ fn expected_sidecar_batches(
     batches: &[&[RawEnvelope]],
 ) -> String {
     let mut expected = format!(
-        "{{\"pipe\":\"haider.session.jsonl\",\"version\":2,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
+        "{{\"pipe\":\"haider.session.jsonl\",\"version\":3,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
     );
     for batch in batches {
         expected.push_str(&expected_sidecar_body(batch));
@@ -6186,7 +6186,7 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     std::fs::write(
         &path,
         format!(
-            "{{\"pipe\":\"haider.session.jsonl\",\"version\":2,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":3,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
         ),
     )
     .expect("corruption writes");
@@ -6257,11 +6257,12 @@ async fn native_pipe_coverage_tail_ahead_rebuilds_and_increments_generation() {
     hub.shutdown().await.expect("second hub stops");
 }
 
-/// MUTATION CHECK: accepting the old header version would append v2 line
-/// kinds beneath a v1 header instead of performing the generation-bumped
-/// atomic rebuild.
+/// MUTATION CHECK: accepting an old header version would append current
+/// line kinds beneath a stale header instead of performing the
+/// generation-bumped atomic rebuild (v1 and v2 alike rebuild to v3 — the
+/// v3 bump is what backfills tool previews onto existing cold rows).
 #[tokio::test]
-async fn native_pipe_v1_header_rebuilds_to_v2_with_generation_bump() {
+async fn native_pipe_v1_header_rebuilds_to_v3_with_generation_bump() {
     let (root, store, hub) = open_hub(None, 8).await;
     let session_id = SessionId::new("native-pipe-v1-rebuild");
     let generation = store.worker_generation();
@@ -6281,7 +6282,7 @@ async fn native_pipe_v1_header_rebuilds_to_v2_with_generation_bump() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "rebuild-trigger").await;
     assert_eq!(
-        std::fs::read_to_string(path).expect("rebuilt v2 sidecar reads"),
+        std::fs::read_to_string(path).expect("rebuilt v3 sidecar reads"),
         stored_sidecar(&store, &session_id, 5).await
     );
     hub.shutdown().await.expect("second hub stops");
@@ -6309,7 +6310,7 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     std::fs::create_dir(root.path().join("pipe")).expect("sidecar directory creates");
     std::fs::write(
         sidecar_path(&root, &session_id),
-        b"{\"pipe\":\"haider.session.jsonl\",\"version\":2,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
+        b"{\"pipe\":\"haider.session.jsonl\",\"version\":3,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
     )
     .expect("stale sidecar writes");
     append_one(&hub, &session_id, generation, "retry-trigger").await;

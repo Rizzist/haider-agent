@@ -4,7 +4,321 @@ use crate::EventPayload;
 use crate::envelope::RawEnvelope;
 use crate::history::NodeKind;
 use crate::item::{ItemEvent, TurnItem};
+use crate::tool::BoundedResult;
 use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
+
+/// Maximum number of Unicode scalar values carried by a cold-history tool
+/// argument or result preview.
+pub const TOOL_PREVIEW_CHARS: usize = 160;
+const MAX_PENDING_TOOL_RESULTS: usize = 1_024;
+type ToolJoinKey = (Option<String>, Option<String>, String);
+
+/// Full journal facts joined to one committed tool-exchange node.
+#[derive(Debug, Clone)]
+pub struct ToolExchangeJoin {
+    pub call_id: String,
+    pub args: serde_json::Value,
+    pub result: Option<BoundedResult>,
+    pub tool_call_seq: u64,
+    pub tool_result_seq: Option<u64>,
+}
+
+impl ToolExchangeJoin {
+    #[must_use]
+    pub fn args_preview(&self) -> Option<String> {
+        args_preview(&self.args)
+    }
+
+    #[must_use]
+    pub fn result_preview(&self) -> Option<String> {
+        self.result.as_ref().and_then(result_preview)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    seq: u64,
+    name: String,
+    call_id: String,
+    args: serde_json::Value,
+    branch_id: Option<String>,
+    run_id: Option<String>,
+}
+
+/// Stateful, bounded join over the durable transcript facts. A tool node is
+/// paired only with the immediately preceding completed call item; the
+/// call-id then resolves its independently committed result.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptJoiner {
+    previous_tool_call: Option<PendingToolCall>,
+    pending_results: HashMap<ToolJoinKey, (u64, BoundedResult)>,
+    result_order: VecDeque<ToolJoinKey>,
+}
+
+#[derive(Default)]
+pub struct TranscriptProjector {
+    joiner: TranscriptJoiner,
+    buffered: VecDeque<BufferedRow>,
+}
+
+struct BufferedRow {
+    row: SidecarRow,
+    unresolved_tool: Option<ToolJoinKey>,
+    remaining_facts: usize,
+}
+
+impl TranscriptProjector {
+    /// Rebuild join state through a cursor without projecting rows that are
+    /// already durable. Rows after that cursor still enter through [`Self::push`]
+    /// and may wait for a later result as usual.
+    pub fn prewarm(&mut self, envelope: &RawEnvelope) {
+        let _ = self.joiner.observe(envelope);
+    }
+
+    /// Project one ordered envelope. Rows following an unresolved tool stay
+    /// buffered so a provider result committed after its node can be joined
+    /// without reordering the transcript. The fact bound makes corruption or
+    /// an absent result degrade to an args-only row with bounded memory.
+    pub fn push(&mut self, envelope: &RawEnvelope) -> Vec<SidecarRow> {
+        for buffered in &mut self.buffered {
+            if buffered.unresolved_tool.is_some() {
+                buffered.remaining_facts = buffered.remaining_facts.saturating_sub(1);
+                if buffered.remaining_facts == 0 {
+                    buffered.unresolved_tool = None;
+                }
+            }
+        }
+
+        let result = matching_result(envelope);
+        if let Some(projection) = sidecar_projection(&mut self.joiner, envelope) {
+            self.buffered.push_back(BufferedRow {
+                row: projection.row,
+                unresolved_tool: projection.unresolved_tool,
+                remaining_facts: MAX_PENDING_TOOL_RESULTS,
+            });
+        }
+        if let Some((key, result)) = result
+            && let Some(buffered) = self
+                .buffered
+                .iter_mut()
+                .find(|buffered| buffered.unresolved_tool.as_ref() == Some(&key))
+        {
+            buffered.row.set_result_preview(result_preview(&result));
+            buffered.unresolved_tool = None;
+            self.joiner.remove_result(&key);
+        }
+
+        let mut rows = Vec::new();
+        while self
+            .buffered
+            .front()
+            .is_some_and(|buffered| buffered.unresolved_tool.is_none())
+        {
+            if let Some(buffered) = self.buffered.pop_front() {
+                rows.push(buffered.row);
+            }
+        }
+        rows
+    }
+
+    /// Flush final unresolved rows without fabricating results.
+    pub fn finish(&mut self) -> Vec<SidecarRow> {
+        self.buffered
+            .drain(..)
+            .map(|buffered| buffered.row)
+            .collect()
+    }
+
+    /// Earliest row withheld from durable sidecar coverage.
+    #[must_use]
+    pub fn blocked_seq(&self) -> Option<u64> {
+        self.buffered.front().map(|buffered| buffered.row.seq())
+    }
+}
+
+fn matching_result(envelope: &RawEnvelope) -> Option<(ToolJoinKey, BoundedResult)> {
+    let EventPayload::ToolResult { call_id, result } =
+        serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+    else {
+        return None;
+    };
+    Some((
+        (
+            envelope
+                .branch_id
+                .as_ref()
+                .map(|branch| branch.as_str().to_owned()),
+            envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
+            call_id,
+        ),
+        result,
+    ))
+}
+
+impl TranscriptJoiner {
+    #[must_use]
+    pub fn observe(&mut self, envelope: &RawEnvelope) -> Option<ToolExchangeJoin> {
+        let payload = &envelope.payload;
+        let type_tag = payload.get("type").and_then(serde_json::Value::as_str);
+        let relevant = match type_tag {
+            Some("tool_result") => true,
+            Some("item") => {
+                payload.get("event").and_then(serde_json::Value::as_str) == Some("completed")
+                    && payload
+                        .get("item")
+                        .and_then(|item| item.get("item"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("tool_call")
+            }
+            Some("node_committed") => {
+                payload
+                    .get("kind")
+                    .and_then(|kind| kind.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("tool_exchange")
+            }
+            _ => false,
+        };
+        if !relevant {
+            self.previous_tool_call = None;
+            return None;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            self.previous_tool_call = None;
+            return None;
+        };
+        match payload {
+            EventPayload::ToolResult { call_id, result } => {
+                self.previous_tool_call = None;
+                self.insert_result(
+                    envelope
+                        .branch_id
+                        .as_ref()
+                        .map(|branch| branch.as_str().to_owned()),
+                    envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
+                    call_id,
+                    envelope.seq,
+                    result,
+                );
+                None
+            }
+            EventPayload::Item(ItemEvent::Completed {
+                item:
+                    TurnItem::ToolCall {
+                        call_id,
+                        name,
+                        args,
+                        ..
+                    },
+                ..
+            }) => {
+                self.previous_tool_call = Some(PendingToolCall {
+                    seq: envelope.seq,
+                    name,
+                    call_id,
+                    args,
+                    branch_id: envelope
+                        .branch_id
+                        .as_ref()
+                        .map(|branch| branch.as_str().to_owned()),
+                    run_id: envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
+                });
+                None
+            }
+            EventPayload::NodeCommitted(node) => {
+                let NodeKind::ToolExchange { tool, .. } = node.kind else {
+                    self.previous_tool_call = None;
+                    return None;
+                };
+                let call = self.previous_tool_call.take().filter(|call| {
+                    call.seq.checked_add(1) == Some(envelope.seq) && call.name == tool
+                })?;
+                let result_key = (call.branch_id, call.run_id, call.call_id.clone());
+                let result = self.pending_results.remove(&result_key);
+                if result.is_some() {
+                    self.result_order.retain(|key| key != &result_key);
+                }
+                Some(ToolExchangeJoin {
+                    call_id: call.call_id,
+                    args: call.args,
+                    result: result.as_ref().map(|(_, result)| result.clone()),
+                    tool_call_seq: call.seq,
+                    tool_result_seq: result.map(|(seq, _)| seq),
+                })
+            }
+            _ => {
+                self.previous_tool_call = None;
+                None
+            }
+        }
+    }
+
+    fn insert_result(
+        &mut self,
+        branch_id: Option<String>,
+        run_id: Option<String>,
+        call_id: String,
+        seq: u64,
+        result: BoundedResult,
+    ) {
+        let key = (branch_id, run_id, call_id);
+        if !self.pending_results.contains_key(&key) {
+            self.result_order.push_back(key.clone());
+        }
+        self.pending_results.insert(key, (seq, result));
+        while self.pending_results.len() > MAX_PENDING_TOOL_RESULTS {
+            let Some(oldest) = self.result_order.pop_front() else {
+                break;
+            };
+            self.pending_results.remove(&oldest);
+        }
+    }
+
+    fn remove_result(&mut self, key: &ToolJoinKey) {
+        self.pending_results.remove(key);
+        self.result_order.retain(|candidate| candidate != key);
+    }
+}
+
+/// Normalize a preview to one line and cap it by characters, never bytes.
+#[must_use]
+pub fn normalize_tool_preview(raw: &str) -> Option<String> {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.chars().take(TOOL_PREVIEW_CHARS).collect())
+    }
+}
+
+/// Prefer the argument a human scans for, falling back to compact JSON.
+#[must_use]
+pub fn args_preview(args: &serde_json::Value) -> Option<String> {
+    if let Some(object) = args.as_object() {
+        for key in ["url", "path", "cmd", "pattern"] {
+            let Some(value) = object.get(key) else {
+                continue;
+            };
+            let raw = match value {
+                serde_json::Value::Null => continue,
+                serde_json::Value::String(value) => value.clone(),
+                value => serde_json::to_string(value).ok()?,
+            };
+            if let Some(preview) = normalize_tool_preview(&raw) {
+                return Some(preview);
+            }
+        }
+    }
+    normalize_tool_preview(&serde_json::to_string(args).ok()?)
+}
+
+/// Prefer a result's bounded preview and fall back to its typed reason.
+#[must_use]
+pub fn result_preview(result: &BoundedResult) -> Option<String> {
+    normalize_tool_preview(&result.preview)
+        .or_else(|| result.reason.as_deref().and_then(normalize_tool_preview))
+}
 
 #[derive(Serialize)]
 struct TextRow {
@@ -46,6 +360,10 @@ struct ToolRow {
     role: &'static str,
     name: String,
     summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_preview: Option<String>,
     at_ms: u64,
     seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,6 +385,90 @@ enum SidecarRowKind {
     Tool(ToolRow),
 }
 
+impl SidecarRow {
+    fn set_result_preview(&mut self, preview: Option<String>) {
+        if let SidecarRowKind::Tool(row) = &mut self.0 {
+            row.result_preview = preview;
+        }
+    }
+
+    /// Journal sequence that produced this transcript row.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        match &self.0 {
+            SidecarRowKind::Text(row) => row.seq,
+            SidecarRowKind::Incomplete(row) => row.seq,
+            SidecarRowKind::Error(row) => row.seq,
+            SidecarRowKind::Tool(row) => row.seq,
+        }
+    }
+
+    /// Render this structured transcript row in the instruct-pipe grammar.
+    #[must_use]
+    pub fn pipe_body_line(&self) -> String {
+        match &self.0 {
+            SidecarRowKind::Text(row) if row.role == "user" => {
+                format!(
+                    "U  {} {} {}",
+                    row.seq,
+                    row.at_ms,
+                    escape_pipe_field(&row.text)
+                )
+            }
+            SidecarRowKind::Text(row) => {
+                format!(
+                    "A  {} {} {}",
+                    row.seq,
+                    row.at_ms,
+                    escape_pipe_field(&row.text)
+                )
+            }
+            SidecarRowKind::Incomplete(row) => format!(
+                "A! {} {} {} interrupted={}",
+                row.seq,
+                row.at_ms,
+                escape_pipe_field(&row.text),
+                escape_pipe_field(&format!(
+                    "{}: {}",
+                    row.interruption.title, row.interruption.detail
+                )),
+            ),
+            SidecarRowKind::Error(row) => format!(
+                "E  {} {} {}",
+                row.seq,
+                row.at_ms,
+                escape_pipe_field(&format!(
+                    "{}: {}",
+                    row.presentation.title, row.presentation.detail
+                )),
+            ),
+            SidecarRowKind::Tool(row) => {
+                let mut line = format!(
+                    "T  {} {} {} {}",
+                    row.seq,
+                    row.at_ms,
+                    escape_pipe_field(&row.name),
+                    escape_pipe_field(&row.summary)
+                );
+                if let Some(args) = &row.args_preview {
+                    line.push_str(" args=");
+                    line.push_str(&escape_pipe_field(args));
+                }
+                if let Some(result) = &row.result_preview {
+                    line.push_str(" result=");
+                    line.push_str(&escape_pipe_field(result));
+                }
+                line
+            }
+        }
+    }
+}
+
+struct SidecarProjection {
+    row: SidecarRow,
+    unresolved_tool: Option<ToolJoinKey>,
+}
+
 /// Render one durable envelope as one JSONL sidecar row.
 ///
 /// This is also the source of every unmasked JSON export turn within one
@@ -79,9 +481,37 @@ pub fn sidecar_row_line(envelope: &RawEnvelope) -> Option<String> {
     serde_json::to_string(&sidecar_row(envelope)?).ok()
 }
 
+/// Stateful form of [`sidecar_row_line`] used by journal readers that can
+/// resolve the adjacent tool-call/result facts.
+#[must_use]
+pub fn sidecar_row_line_with(
+    joiner: &mut TranscriptJoiner,
+    envelope: &RawEnvelope,
+) -> Option<String> {
+    serde_json::to_string(&sidecar_row_with(joiner, envelope)?).ok()
+}
+
 /// Build the structured form serialized by [`sidecar_row_line`].
 #[must_use]
 pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
+    sidecar_row_with(&mut TranscriptJoiner::default(), envelope)
+}
+
+/// Stateful form of [`sidecar_row`] that adds joined tool previews when the
+/// relevant facts are present in the same ordered journal read.
+#[must_use]
+pub fn sidecar_row_with(
+    joiner: &mut TranscriptJoiner,
+    envelope: &RawEnvelope,
+) -> Option<SidecarRow> {
+    sidecar_projection(joiner, envelope).map(|projection| projection.row)
+}
+
+fn sidecar_projection(
+    joiner: &mut TranscriptJoiner,
+    envelope: &RawEnvelope,
+) -> Option<SidecarProjection> {
+    let tool_join = joiner.observe(envelope);
     // Ship-gate round 2: the peek goes DEEP enough that the common case —
     // item Started/Delta/ordinary-Completed, non-projecting node kinds —
     // never pays the full payload clone+decode. Only the exact five
@@ -125,61 +555,84 @@ pub fn sidecar_row(envelope: &RawEnvelope) -> Option<SidecarRow> {
         .map(|branch_id| branch_id.as_str().to_owned());
     match payload {
         EventPayload::NodeCommitted(node) => match node.kind {
-            NodeKind::UserTurn { text, .. } => Some(SidecarRow(SidecarRowKind::Text(TextRow {
-                role: "user",
-                text,
-                at_ms,
-                seq,
-                branch_id,
-                ordinal: 0,
-            }))),
-            NodeKind::AssistantCommit { text, .. } => {
-                Some(SidecarRow(SidecarRowKind::Text(TextRow {
+            NodeKind::UserTurn { text, .. } => Some(SidecarProjection {
+                row: SidecarRow(SidecarRowKind::Text(TextRow {
+                    role: "user",
+                    text,
+                    at_ms,
+                    seq,
+                    branch_id,
+                    ordinal: 0,
+                })),
+                unresolved_tool: None,
+            }),
+            NodeKind::AssistantCommit { text, .. } => Some(SidecarProjection {
+                row: SidecarRow(SidecarRowKind::Text(TextRow {
                     role: "assistant",
                     text,
                     at_ms,
                     seq,
                     branch_id,
                     ordinal: 0,
-                })))
-            }
-            NodeKind::ToolExchange { tool, summary, .. } => {
-                Some(SidecarRow(SidecarRowKind::Tool(ToolRow {
+                })),
+                unresolved_tool: None,
+            }),
+            NodeKind::ToolExchange { tool, summary, .. } => Some(SidecarProjection {
+                unresolved_tool: tool_join.as_ref().and_then(|join| {
+                    join.result.is_none().then(|| {
+                        (
+                            branch_id.clone(),
+                            envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
+                            join.call_id.clone(),
+                        )
+                    })
+                }),
+                row: SidecarRow(SidecarRowKind::Tool(ToolRow {
                     role: "tool",
                     name: tool,
                     summary,
+                    args_preview: tool_join.as_ref().and_then(ToolExchangeJoin::args_preview),
+                    result_preview: tool_join
+                        .as_ref()
+                        .and_then(ToolExchangeJoin::result_preview),
                     at_ms,
                     seq,
                     branch_id,
                     ordinal: 0,
-                })))
-            }
+                })),
+            }),
             _ => None,
         },
         EventPayload::Item(ItemEvent::Completed {
             item: TurnItem::IncompleteAgentMessage { text, interruption },
             ..
-        }) => Some(SidecarRow(SidecarRowKind::Incomplete(IncompleteRow {
-            role: "assistant",
-            text,
-            incomplete: true,
-            interruption,
-            at_ms,
-            seq,
-            branch_id,
-            ordinal: 0,
-        }))),
+        }) => Some(SidecarProjection {
+            row: SidecarRow(SidecarRowKind::Incomplete(IncompleteRow {
+                role: "assistant",
+                text,
+                incomplete: true,
+                interruption,
+                at_ms,
+                seq,
+                branch_id,
+                ordinal: 0,
+            })),
+            unresolved_tool: None,
+        }),
         EventPayload::RunFailed {
             presentation: Some(presentation),
             ..
-        } => Some(SidecarRow(SidecarRowKind::Error(ErrorRow {
-            role: "error",
-            presentation,
-            at_ms,
-            seq,
-            branch_id,
-            ordinal: 0,
-        }))),
+        } => Some(SidecarProjection {
+            row: SidecarRow(SidecarRowKind::Error(ErrorRow {
+                role: "error",
+                presentation,
+                at_ms,
+                seq,
+                branch_id,
+                ordinal: 0,
+            })),
+            unresolved_tool: None,
+        }),
         _ => None,
     }
 }
@@ -209,41 +662,17 @@ pub fn escape_pipe_field(text: &str) -> String {
 /// return `None` and do not create a body line.
 #[must_use]
 pub fn pipe_body_line(envelope: &RawEnvelope) -> Option<String> {
-    let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
-    let seq = envelope.seq;
-    let at_ms = envelope.committed_at_ms;
-    match payload {
-        EventPayload::NodeCommitted(node) => match node.kind {
-            NodeKind::UserTurn { text, .. } => {
-                Some(format!("U  {seq} {at_ms} {}", escape_pipe_field(&text)))
-            }
-            NodeKind::AssistantCommit { text, .. } => {
-                Some(format!("A  {seq} {at_ms} {}", escape_pipe_field(&text)))
-            }
-            NodeKind::ToolExchange { tool, summary, .. } => Some(format!(
-                "T  {seq} {at_ms} {} {}",
-                escape_pipe_field(&tool),
-                escape_pipe_field(&summary)
-            )),
-            _ => None,
-        },
-        EventPayload::Item(ItemEvent::Completed {
-            item: TurnItem::IncompleteAgentMessage { text, interruption },
-            ..
-        }) => Some(format!(
-            "A! {seq} {at_ms} {} interrupted={}",
-            escape_pipe_field(&text),
-            escape_pipe_field(&format!("{}: {}", interruption.title, interruption.detail)),
-        )),
-        EventPayload::RunFailed {
-            presentation: Some(presentation),
-            ..
-        } => Some(format!(
-            "E  {seq} {at_ms} {}",
-            escape_pipe_field(&format!("{}: {}", presentation.title, presentation.detail)),
-        )),
-        _ => None,
-    }
+    pipe_body_line_with(&mut TranscriptJoiner::default(), envelope)
+}
+
+/// Stateful form of [`pipe_body_line`] with the same joined previews as the
+/// structured sidecar row.
+#[must_use]
+pub fn pipe_body_line_with(
+    joiner: &mut TranscriptJoiner,
+    envelope: &RawEnvelope,
+) -> Option<String> {
+    sidecar_row_with(joiner, envelope).map(|row| row.pipe_body_line())
 }
 
 #[cfg(test)]

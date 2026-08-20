@@ -2392,3 +2392,220 @@ async fn fire_time_reverification_refuses_a_swapped_pinned_definition() {
     assert!(crate::hooks::definition_current(&fixture.service, &swapped, false).await);
     fixture.close().await;
 }
+
+// ── hooks_server_v1 lifecycle (v0.0.934) ────────────────────────────────
+
+fn write_server_hook(workspace: &Path, command: &str, idle_timeout_ms: u64) {
+    std::fs::write(
+        workspace.join("hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "haider.hooks.v1",
+            "hooks": {
+                "test_hook": {
+                    "matcher": {"event": "user_message"},
+                    "kind": "exec",
+                    "command": command,
+                    "timeout_ms": 2_000,
+                    "decision": false,
+                    "mode": "server",
+                    "idle_timeout_ms": idle_timeout_ms,
+                }
+            }
+        }))
+        .expect("server hooks JSON"),
+    )
+    .expect("write server hooks");
+}
+
+async fn server_fixture(
+    idle_timeout_ms: u64,
+    script_body: &str,
+) -> (EngineFixture, std::path::PathBuf) {
+    let fixture = EngineFixture::start_with_event_and_trust(
+        "printf placeholder",
+        2_000,
+        false,
+        "exec",
+        false,
+        "run_started",
+    )
+    .await;
+    let spawn_log = fixture.workspace.join("spawns.log");
+    let script = fixture.workspace.join("server.sh");
+    std::fs::write(
+        &script,
+        script_body.replace("SPAWN_LOG", spawn_log.to_str().expect("UTF-8 log path")),
+    )
+    .expect("write server script");
+    write_server_hook(
+        &fixture.workspace,
+        &format!("/bin/sh {}", script.display()),
+        idle_timeout_ms,
+    );
+    let (_, _, hooks) = fixture
+        .service
+        .list(fixture.workspace.clone())
+        .await
+        .expect("list server hook");
+    let digest = hooks
+        .first()
+        .expect("discovered server hook")
+        .digest
+        .clone();
+    fixture
+        .service
+        .apply_trust(CommandId::new("trust-server-hook"), digest, true)
+        .await
+        .expect("trust server hook");
+    (fixture, spawn_log)
+}
+
+fn spawn_count(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+async fn fired_count(fixture: &EngineFixture) -> usize {
+    fixture
+        .events()
+        .await
+        .iter()
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+        .count()
+}
+
+async fn fire_user_message(fixture: &EngineFixture, index: usize) {
+    let generation = fixture.store.worker_generation();
+    let mut events = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        generation,
+        &format!("server-user-{index}"),
+        EventPayload::UserMessage {
+            text: "fire".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        },
+    )];
+    fixture
+        .hub
+        .append(&mut events)
+        .await
+        .expect("append user message fact");
+}
+
+const RESIDENT_SERVER: &str =
+    "echo $$ >> SPAWN_LOG\nwhile IFS= read -r line; do printf '\"ok\"\\n'; done\n";
+
+/// MUTATION CHECK (hooks_server_v1): make server-mode dispatch spawn per
+/// event like spawn mode. Expected runtime failure: the spawn log below
+/// records three pids instead of one.
+#[tokio::test]
+async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
+    let (fixture, spawn_log) = server_fixture(0, RESIDENT_SERVER).await;
+    for index in 0..3 {
+        fire_user_message(&fixture, index).await;
+        let expected = index + 1;
+        wait_for(&fixture, |events| {
+            events
+                .iter()
+                .filter_map(|event| {
+                    HookEventPayload::from_payload_value(event.payload.clone()).ok()
+                })
+                .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+                .count()
+                >= expected
+        })
+        .await;
+    }
+    assert_eq!(fired_count(&fixture).await, 3, "every event got a response");
+    assert_eq!(
+        spawn_count(&spawn_log),
+        1,
+        "idle_timeout_ms=0 keeps ONE resident server across events"
+    );
+    let pid = std::fs::read_to_string(&spawn_log)
+        .expect("spawn log")
+        .lines()
+        .next()
+        .expect("pid line")
+        .trim()
+        .to_owned();
+    fixture.close().await;
+    // Drain killed the resident server: signal 0 delivery must now fail.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid])
+        .status()
+        .expect("kill probe runs")
+        .success();
+    assert!(
+        !alive,
+        "engine shutdown kills the resident server (pid {pid})"
+    );
+}
+
+/// MUTATION CHECK (hooks_server_v1): drop the idle reaper (treat every
+/// idle_timeout_ms as 0). Expected runtime failure: the second event below
+/// reuses the first pid and the spawn log stays at one line.
+#[tokio::test]
+async fn server_mode_reaps_idle_and_respawns_for_the_next_event() {
+    let (fixture, spawn_log) = server_fixture(150, RESIDENT_SERVER).await;
+    fire_user_message(&fixture, 0).await;
+    wait_for(&fixture, |events| {
+        events
+            .iter()
+            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+            .any(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+    })
+    .await;
+    // Idle past the reap deadline: the server is torn down from IDLE only.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    fire_user_message(&fixture, 1).await;
+    wait_for(&fixture, |events| {
+        events
+            .iter()
+            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+            .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+            .count()
+            >= 2
+    })
+    .await;
+    assert_eq!(
+        spawn_count(&spawn_log),
+        2,
+        "a clean idle reap respawns lazily on the next event"
+    );
+    fixture.close().await;
+}
+
+/// A server that exits after one response is a crash from the registry's
+/// view: the NEXT event respawns and still succeeds — no wedged hook.
+#[tokio::test]
+async fn server_mode_respawns_after_the_process_exits() {
+    let one_shot = "echo $$ >> SPAWN_LOG\nIFS= read -r line\nprintf '\"ok\"\\n'\n";
+    let (fixture, spawn_log) = server_fixture(0, one_shot).await;
+    for index in 0..2 {
+        fire_user_message(&fixture, index).await;
+        let expected = index + 1;
+        wait_for(&fixture, |events| {
+            events
+                .iter()
+                .filter_map(|event| {
+                    HookEventPayload::from_payload_value(event.payload.clone()).ok()
+                })
+                .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+                .count()
+                >= expected
+        })
+        .await;
+    }
+    assert_eq!(
+        spawn_count(&spawn_log),
+        2,
+        "each exit is followed by a lazy respawn for the next event"
+    );
+    fixture.close().await;
+}

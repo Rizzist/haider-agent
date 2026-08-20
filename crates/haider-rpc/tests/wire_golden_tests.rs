@@ -2713,3 +2713,60 @@ fn session_select_agent_type_is_additive_and_old_decoder_tolerant() {
     .expect("older summary decodes");
     assert_eq!(older_summary.agent_type, None, "absence is unknown");
 }
+
+/// The pipelined-handshake law (v0.0.934 wire fix): one OS read may carry
+/// the final JSON handshake frame AND the first MessagePack frame. The
+/// decoder must stop at the frame boundary, let the caller switch
+/// encodings, and decode the coalesced suffix as MessagePack.
+///
+/// MUTATION CHECK: make `push_one` consume past the first frame (or make
+/// the handshake caller feed the whole chunk through `push` before
+/// switching). Expected runtime failure: the MessagePack suffix decodes as
+/// JSON and poisons the decoder below.
+#[test]
+fn a_pipelined_handshake_chunk_switches_encodings_at_the_frame_boundary() {
+    use haider_rpc::WireEncoding;
+    let hello = WireFrame::Ping { nonce: 1 };
+    let event = WireFrame::Pong { nonce: 2 };
+    let json_part = uds_codec::encode(&hello, TEST_FRAME_LIMIT).expect("json encode");
+    let msgpack_part = uds_codec::encode_with(&event, TEST_FRAME_LIMIT, WireEncoding::MessagePack)
+        .expect("msgpack encode");
+    let mut chunk = json_part.clone();
+    chunk.extend_from_slice(&msgpack_part);
+
+    let mut decoder = uds_codec::Decoder::new(TEST_FRAME_LIMIT);
+    let step = decoder.push_one(&chunk);
+    assert!(
+        step.error.is_none(),
+        "first frame decodes: {:?}",
+        step.error
+    );
+    assert!(matches!(step.frame, Some(WireFrame::Ping { nonce: 1 })));
+    assert_eq!(
+        step.consumed,
+        json_part.len(),
+        "push_one stops exactly at the frame boundary"
+    );
+    decoder.set_encoding(WireEncoding::MessagePack);
+    assert!(!decoder.is_poisoned(), "a boundary switch is legal");
+    let batch = decoder.push(&chunk[step.consumed..]);
+    assert!(batch.error.is_none(), "suffix decodes: {:?}", batch.error);
+    assert_eq!(batch.frames.len(), 1);
+    assert!(matches!(batch.frames[0], WireFrame::Pong { nonce: 2 }));
+}
+
+/// The boundary law is a REAL invariant, not a debug assert: switching
+/// encodings mid-frame poisons the decoder instead of misdecoding bytes.
+#[test]
+fn a_mid_frame_encoding_switch_poisons_the_decoder() {
+    use haider_rpc::WireEncoding;
+    let frame = uds_codec::encode(&WireFrame::Ping { nonce: 1 }, TEST_FRAME_LIMIT).expect("encode");
+    let mut decoder = uds_codec::Decoder::new(TEST_FRAME_LIMIT);
+    let step = decoder.push_one(&frame[..3]);
+    assert!(step.frame.is_none());
+    decoder.set_encoding(WireEncoding::MessagePack);
+    assert!(
+        decoder.is_poisoned(),
+        "a mid-frame switch fails closed rather than misdecoding"
+    );
+}

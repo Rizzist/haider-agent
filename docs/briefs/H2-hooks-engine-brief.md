@@ -9,8 +9,8 @@ screen).
 1. **Discovery**: `hooks.json` at workspace root via the B3 upward-walk
    discipline (canonical, symlink-refusing, bounded, nearest wins per
    name) + a profile-level `~/.haider/<profile>/hooks.json`. Schema:
-   named hooks, each {matcher, kind, command, timeout_ms?,
-   decision?}. Additive schema versioned `haider.hooks.v1`; malformed
+   named hooks, each {matcher, kind, command, timeout_ms?, decision?,
+   mode?, idle_timeout_ms?}. Additive schema versioned `haider.hooks.v1`; malformed
    entries are skipped with an honest journaled notice, never fatal.
 2. **Matchers on journal facts**: event-kind match plus optional
    filters (session, provider, run outcome, parked kind). Cover at
@@ -33,6 +33,15 @@ screen).
    count and `{mime, bytes, artifact}` per attachment. `bytes` is the
    length and `artifact` is the BLAKE3 digest; resolved bytes are never
    serialized.
+   `mode` defaults to `"spawn"`, preserving this one-process-per-event
+   behavior. `mode:"server"` opts an exec hook into a lazily spawned,
+   long-lived process: requests are the same JSON value followed by LF and
+   each request receives exactly one JSON response line. JSON string responses
+   expose their inner text, so decision servers answer `"allow"` or `"deny"`.
+   A server handles one request at a time behind a bounded queue, is killed on
+   timeout/crash/trust change/drain, and respawns with bounded backoff for the
+   next event. It is reaped after `idle_timeout_ms` idle milliseconds (default
+   60000); zero deliberately keeps it resident until another lifecycle stop.
 4. **Subscribe hooks**: one long-running process per hook, restarted
    with backoff on exit, receiving LF-framed envelopes matching its
    matcher; `user_message` uses the same sanitized bytes as exec;

@@ -281,12 +281,7 @@ async fn read_handshake<R>(
 where
     R: AsyncRead + Unpin,
 {
-    const PREFIX_LEN: usize = 4;
-
-    let mut json_decoder = uds_codec::Decoder::new_zeroizing(frame_limit);
-    let mut prefix = [0_u8; PREFIX_LEN];
-    let mut prefix_filled = 0_usize;
-    let mut body_remaining = None;
+    let mut decoder = uds_codec::Decoder::new_zeroizing(frame_limit);
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
@@ -295,62 +290,30 @@ where
             return Err(ConnectError::ClosedDuringHandshake);
         }
 
-        let mut cursor = 0_usize;
-        while cursor < read {
-            if prefix_filled < PREFIX_LEN {
-                let take = (PREFIX_LEN - prefix_filled).min(read - cursor);
-                prefix[prefix_filled..prefix_filled + take]
-                    .copy_from_slice(&buffer[cursor..cursor + take]);
-                prefix_filled += take;
-
-                let batch = json_decoder.push(&buffer[cursor..cursor + take]);
-                cursor += take;
-                debug_assert!(batch.frames.is_empty());
-                if let Some(error) = batch.error {
-                    return Err(ConnectError::Frame(error));
-                }
-                if prefix_filled == PREFIX_LEN {
-                    body_remaining = Some(u32::from_be_bytes(prefix) as usize);
-                }
-                continue;
-            }
-
-            let Some(remaining) = body_remaining else {
-                return Err(ConnectError::UnexpectedFrame);
-            };
-            let take = remaining.min(read - cursor);
-            let batch = json_decoder.push(&buffer[cursor..cursor + take]);
-            cursor += take;
-            body_remaining = Some(remaining - take);
-
-            if let Some(error) = batch.error {
-                return Err(ConnectError::Frame(error));
-            }
-            if body_remaining != Some(0) {
-                debug_assert!(batch.frames.is_empty());
-                continue;
-            }
-
-            let mut frames = batch.frames.into_iter();
-            let first = frames.next().ok_or(ConnectError::UnexpectedFrame)?;
-            debug_assert!(frames.next().is_none());
-            let welcome = match first {
-                WireFrame::Welcome(welcome) => welcome,
-                WireFrame::ProtocolError(error) => return Err(ConnectError::Rejected(error)),
-                _ => return Err(ConnectError::UnexpectedFrame),
-            };
-            let encoding = match welcome.encoding.as_deref() {
-                Some("msgpack") => WireEncoding::MessagePack,
-                _ => WireEncoding::Json,
-            };
-            let mut decoder =
-                uds_codec::Decoder::new_zeroizing_with_encoding(frame_limit, encoding);
-            let remainder = decoder.push(&buffer[cursor..read]);
-            if let Some(error) = remainder.error {
-                return Err(ConnectError::Frame(error));
-            }
-            return Ok((welcome, decoder, remainder.frames.into()));
+        let step = decoder.push_one(&buffer[..read]);
+        if let Some(error) = step.error {
+            return Err(ConnectError::Frame(error));
         }
+        let Some(first) = step.frame else {
+            continue;
+        };
+        let welcome = match first {
+            WireFrame::Welcome(welcome) => welcome,
+            WireFrame::ProtocolError(error) => return Err(ConnectError::Rejected(error)),
+            _ => return Err(ConnectError::UnexpectedFrame),
+        };
+        let encoding = match welcome.encoding.as_deref() {
+            Some("msgpack") => WireEncoding::MessagePack,
+            _ => WireEncoding::Json,
+        };
+        // The decoder stopped at the Welcome boundary. Switch the same
+        // zeroizing decoder, then decode only the unread coalesced suffix.
+        decoder.set_encoding(encoding);
+        let remainder = decoder.push(&buffer[step.consumed..read]);
+        if let Some(error) = remainder.error {
+            return Err(ConnectError::Frame(error));
+        }
+        return Ok((welcome, decoder, remainder.frames.into()));
     }
 }
 

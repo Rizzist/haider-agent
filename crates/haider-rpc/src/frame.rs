@@ -284,6 +284,8 @@ pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 pub const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 /// Daemon-owned hook discovery, execution, decision answers, and trust receipts.
 pub const FEATURE_HOOKS_V1: &str = "hooks_v1";
+/// Daemon supports trusted long-lived JSONL hook processes.
+pub const FEATURE_HOOKS_SERVER_V1: &str = "hooks_server_v1";
 /// Daemon implements owned direct-child messaging for tools and chip composers.
 pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// Daemon implements receipted live-session model selection

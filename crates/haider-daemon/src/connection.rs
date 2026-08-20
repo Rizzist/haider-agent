@@ -49,8 +49,8 @@ use haider_rpc::{
     FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1, FEATURE_BRANCH_CREATE_V1,
     FEATURE_COMPACTION_GUARD_V1, FEATURE_CONTEXT_COMPACTION_V1, FEATURE_CONVERGENCE_GRAPH_V1,
     FEATURE_CONVERGENCE_GRAPH_V2, FEATURE_CONVERGENCE_GRAPH_V3, FEATURE_CONVERGENCE_GRAPH_V4,
-    FEATURE_EXPORT_SEQ_V1, FEATURE_FALLBACK_CHAIN_V1, FEATURE_HOOKS_V1, FEATURE_LOOM_V1,
-    FEATURE_MODELS_LIST_V1, FEATURE_PIPE_NATIVE_V2, FEATURE_PROVIDER_CONFIGURE_V1,
+    FEATURE_EXPORT_SEQ_V1, FEATURE_FALLBACK_CHAIN_V1, FEATURE_HOOKS_SERVER_V1, FEATURE_HOOKS_V1,
+    FEATURE_LOOM_V1, FEATURE_MODELS_LIST_V1, FEATURE_PIPE_NATIVE_V2, FEATURE_PROVIDER_CONFIGURE_V1,
     FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1,
     FEATURE_RUN_RETRY_V1, FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_FLEET_V1,
     FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_V1,
@@ -599,15 +599,59 @@ impl OutboundLane {
                     Ok(state) => state,
                     Err(_) => return None,
                 };
-                // Floor first: reply turnover must not wait behind camped
-                // event traffic — EXCEPT while the Welcome is still queued
-                // (ship-gate round): a floor-admitted fatal could otherwise
-                // be written msgpack-encoded before the JSON handshake
-                // frame. The welcome pops within one or two round-robin
-                // turns, so the deferral is momentary.
-                if !state.welcome_queued
-                    && let Some(frame) = state.floor.pop_front()
-                {
+                // The JSON Welcome is a TOTAL encoding barrier. While it is
+                // queued, advance only its own FIFO lane (including JSON
+                // frames already ahead of it); every floor and other-lane
+                // frame may already be MessagePack encoded at admission.
+                if state.welcome_queued {
+                    let welcome_on_floor = state.floor.front().is_some_and(|frame| frame.welcome);
+                    if welcome_on_floor {
+                        let Some(frame) = state.floor.pop_front() else {
+                            state.closed = true;
+                            return None;
+                        };
+                        finish_pop(&mut state, &frame);
+                        return Some(frame);
+                    }
+                    let welcome_key = state.lanes.iter().find_map(|(key, lane)| {
+                        lane.iter().any(|frame| frame.welcome).then(|| key.clone())
+                    });
+                    let Some(key) = welcome_key else {
+                        // A stale marker must fail closed; allowing another
+                        // lane to advance could cross the encoding barrier.
+                        state.closed = true;
+                        return None;
+                    };
+                    if let Some(position) = state
+                        .round_robin
+                        .iter()
+                        .position(|candidate| candidate == &key)
+                    {
+                        state.round_robin.remove(position);
+                    }
+                    let (frame, still_active) = match state.lanes.get_mut(&key) {
+                        Some(lane) => {
+                            let frame = lane.pop_front();
+                            (frame, !lane.is_empty())
+                        }
+                        None => (None, false),
+                    };
+                    if still_active {
+                        state.round_robin.push_back(key.clone());
+                    } else {
+                        state.lanes.remove(&key);
+                    }
+                    let Some(frame) = frame else {
+                        state.closed = true;
+                        return None;
+                    };
+                    state.queued_frames = state.queued_frames.saturating_sub(1);
+                    finish_pop(&mut state, &frame);
+                    return Some(frame);
+                }
+                // Outside the handshake barrier, the reserved reply floor
+                // retains its strict priority over ordinary event lanes.
+                if let Some(frame) = state.floor.pop_front() {
                     finish_pop(&mut state, &frame);
                     return Some(frame);
                 }
@@ -1105,25 +1149,37 @@ where
                         break;
                     }
                     last_read = Instant::now();
-                    let batch = decoder.push(&buffer[..read]);
-                    for frame in batch.frames {
-                        close = handle_frame(
-                            frame,
-                            &context,
-                            &drain,
-                            &lane,
-                            &mut grant,
-                            &mut hub_connection,
-                            &mut outbound_limit,
-                            &mut encoding,
-                        ).await?;
-                        decoder.set_encoding(encoding);
-                        if close {
+                    let mut cursor = 0;
+                    let mut decode_error = None;
+                    while cursor < read && !close {
+                        let step = decoder.push_one(&buffer[cursor..read]);
+                        cursor = cursor.saturating_add(step.consumed);
+                        if let Some(frame) = step.frame {
+                            close = handle_frame(
+                                frame,
+                                &context,
+                                &drain,
+                                &lane,
+                                &mut grant,
+                                &mut hub_connection,
+                                &mut outbound_limit,
+                                &mut encoding,
+                            ).await?;
+                            // `push_one` stops at Prefix{filled:0}; the
+                            // negotiated encoding therefore applies to an
+                            // unread coalesced suffix, never a partial frame.
+                            decoder.set_encoding(encoding);
+                        }
+                        if let Some(error) = step.error {
+                            decode_error = Some(error);
+                            break;
+                        }
+                        if step.consumed == 0 {
                             break;
                         }
                     }
                     if !close
-                        && let Some(error) = batch.error
+                        && let Some(error) = decode_error
                     {
                         let protocol_error = ProtocolError {
                             code: "invalid_frame".into(),
@@ -1560,6 +1616,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
         FEATURE_EXPORT_SEQ_V1.to_owned(),
         FEATURE_FALLBACK_CHAIN_V1.to_owned(),
+        FEATURE_HOOKS_SERVER_V1.to_owned(),
         FEATURE_HOOKS_V1.to_owned(),
         FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
         FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),

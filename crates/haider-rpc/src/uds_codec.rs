@@ -131,6 +131,18 @@ pub struct DecodeBatch {
     pub error: Option<CodecError>,
 }
 
+/// One boundary-aware decoder step. A completed frame stops consumption
+/// immediately, leaving any suffix for the caller to feed after negotiation.
+#[derive(Debug)]
+pub struct DecodeStep {
+    /// The single frame completed by this step, if any.
+    pub frame: Option<WireFrame>,
+    /// Exact bytes consumed from the supplied chunk.
+    pub consumed: usize,
+    /// The terminal error, if this step poisoned the decoder.
+    pub error: Option<CodecError>,
+}
+
 impl DecodeBatch {
     fn complete(frames: Vec<WireFrame>) -> Self {
         Self {
@@ -198,10 +210,13 @@ impl Decoder {
     /// Switches the post-handshake decoder encoding.
     ///
     /// Callers must switch only at a frame boundary, immediately after the
-    /// JSON Hello has been fully decoded.
+    /// JSON Hello (daemon) or Welcome (client) has been fully decoded.
     pub fn set_encoding(&mut self, encoding: WireEncoding) {
-        debug_assert!(matches!(&self.state, DecodeState::Prefix { filled: 0, .. }));
-        self.encoding = encoding;
+        if matches!(&self.state, DecodeState::Prefix { filled: 0, .. }) {
+            self.encoding = encoding;
+        } else {
+            self.poison();
+        }
     }
 
     /// Returns whether a prior protocol violation permanently poisoned this
@@ -218,24 +233,59 @@ impl Decoder {
     /// delivers `frames`, observes `error`, then discards the decoder with its
     /// connection.
     pub fn push(&mut self, mut chunk: &[u8]) -> DecodeBatch {
-        if self.is_poisoned() {
-            return DecodeBatch::failed(Vec::new(), CodecError::DecoderPoisoned);
-        }
-
         let mut frames = Vec::new();
         while !chunk.is_empty() {
+            let step = self.push_one(chunk);
+            chunk = &chunk[step.consumed..];
+            if let Some(frame) = step.frame {
+                frames.push(frame);
+            }
+            if let Some(error) = step.error {
+                return DecodeBatch::failed(frames, error);
+            }
+            if step.consumed == 0 {
+                break;
+            }
+        }
+        if self.is_poisoned() {
+            DecodeBatch::failed(frames, CodecError::DecoderPoisoned)
+        } else {
+            DecodeBatch::complete(frames)
+        }
+    }
+
+    /// Consume through at most one completed frame. The decoder stops at the
+    /// clean prefix boundary after that frame even when `chunk` contains more
+    /// bytes, so a handshake caller can switch codecs before offering the
+    /// suffix.
+    pub fn push_one(&mut self, chunk: &[u8]) -> DecodeStep {
+        if self.is_poisoned() {
+            return DecodeStep {
+                frame: None,
+                consumed: 0,
+                error: Some(CodecError::DecoderPoisoned),
+            };
+        }
+
+        let mut consumed = 0;
+        while consumed < chunk.len() {
             match &mut self.state {
                 DecodeState::Prefix { bytes, filled } => {
                     let remaining = PREFIX_LEN - *filled;
-                    let take = remaining.min(chunk.len());
-                    bytes[*filled..*filled + take].copy_from_slice(&chunk[..take]);
+                    let take = remaining.min(chunk.len() - consumed);
+                    bytes[*filled..*filled + take]
+                        .copy_from_slice(&chunk[consumed..consumed + take]);
                     *filled += take;
-                    chunk = &chunk[take..];
+                    consumed += take;
 
                     if *filled == PREFIX_LEN {
                         let announced_len = u32::from_be_bytes(*bytes) as usize;
                         if let Err(error) = self.start_body(announced_len) {
-                            return DecodeBatch::failed(frames, error);
+                            return DecodeStep {
+                                frame: None,
+                                consumed,
+                                error: Some(error),
+                            };
                         }
                     }
                 }
@@ -244,9 +294,9 @@ impl Decoder {
                     bytes,
                 } => {
                     let remaining = *announced_len - bytes.len();
-                    let take = remaining.min(chunk.len());
-                    bytes.extend_from_slice(&chunk[..take]);
-                    chunk = &chunk[take..];
+                    let take = remaining.min(chunk.len() - consumed);
+                    bytes.extend_from_slice(&chunk[consumed..consumed + take]);
+                    consumed += take;
 
                     if bytes.len() == *announced_len {
                         let mut body = match std::mem::replace(
@@ -258,8 +308,12 @@ impl Decoder {
                         ) {
                             DecodeState::Body { bytes, .. } => bytes,
                             _ => {
-                                self.state = DecodeState::Poisoned;
-                                return DecodeBatch::failed(frames, CodecError::DecoderPoisoned);
+                                self.poison();
+                                return DecodeStep {
+                                    frame: None,
+                                    consumed,
+                                    error: Some(CodecError::DecoderPoisoned),
+                                };
                             }
                         };
                         let decoded = match self.encoding {
@@ -273,20 +327,38 @@ impl Decoder {
                             body.zeroize();
                         }
                         match decoded {
-                            Ok(frame) => frames.push(frame),
+                            Ok(frame) => {
+                                return DecodeStep {
+                                    frame: Some(frame),
+                                    consumed,
+                                    error: None,
+                                };
+                            }
                             Err(error) => {
-                                self.state = DecodeState::Poisoned;
-                                return DecodeBatch::failed(frames, error);
+                                self.poison();
+                                return DecodeStep {
+                                    frame: None,
+                                    consumed,
+                                    error: Some(error),
+                                };
                             }
                         }
                     }
                 }
                 DecodeState::Poisoned => {
-                    return DecodeBatch::failed(frames, CodecError::DecoderPoisoned);
+                    return DecodeStep {
+                        frame: None,
+                        consumed,
+                        error: Some(CodecError::DecoderPoisoned),
+                    };
                 }
             }
         }
-        DecodeBatch::complete(frames)
+        DecodeStep {
+            frame: None,
+            consumed,
+            error: None,
+        }
     }
 
     fn start_body(&mut self, announced_len: usize) -> Result<(), CodecError> {
@@ -314,6 +386,15 @@ impl Decoder {
             bytes,
         };
         Ok(())
+    }
+
+    fn poison(&mut self) {
+        if self.zeroize_bodies
+            && let DecodeState::Body { bytes, .. } = &mut self.state
+        {
+            bytes.zeroize();
+        }
+        self.state = DecodeState::Poisoned;
     }
 }
 
