@@ -100,23 +100,24 @@ use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
 use haider_core::{
-    AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, BranchCreateCommand,
-    BranchCreateOutcome, CancelledTurn, ChildGraphAttachCommand, ChildGraphAttachOutcome,
-    ChildTemplateCacheEntry, ChildTemplateObservation, ChildTemplateObservationCommand,
-    ComputerEvidenceCommand, ComputerEvidenceOutcome, CreatedBranch, CreatedSession,
-    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
-    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
-    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
-    GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
-    PromptHistoryCache, RenamedSession, RunRetryCommand, RunRetryOutcome, SelectedAgentType,
-    SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
-    SessionRenameCommand, SessionRenameOutcome, SessionSelectAgentTypeCommand,
-    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AppendGroupBatch,
+    BranchCreateCommand, BranchCreateOutcome, CancelledTurn, ChildGraphAttachCommand,
+    ChildGraphAttachOutcome, ChildTemplateCacheEntry, ChildTemplateObservation,
+    ChildTemplateObservationCommand, ComputerEvidenceCommand, ComputerEvidenceOutcome,
+    CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
+    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
+    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
+    GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand,
+    MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand,
+    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, RunRetryCommand,
+    RunRetryOutcome, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
+    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
+    SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -272,6 +273,46 @@ pub enum SendAdmission {
 /// identity is the reservation token, so no numeric ticket counter exists.
 pub type AdmissionTicket = Arc<Notify>;
 
+/// One logical frame prepared once for repeated outbox admission attempts.
+/// Production stores shared encoded bytes; the logical fallback preserves
+/// the existing public sink seam for deterministic test implementations.
+pub struct PreparedFrame {
+    representation: PreparedFrameRepresentation,
+}
+
+enum PreparedFrameRepresentation {
+    Logical(WireFrame),
+    Encoded(crate::connection::OutboundBytes),
+}
+
+impl PreparedFrame {
+    fn logical(frame: WireFrame) -> Self {
+        Self {
+            representation: PreparedFrameRepresentation::Logical(frame),
+        }
+    }
+
+    pub(crate) fn encoded(bytes: crate::connection::OutboundBytes) -> Self {
+        Self {
+            representation: PreparedFrameRepresentation::Encoded(bytes),
+        }
+    }
+
+    pub(crate) fn logical_frame(&self) -> Option<&WireFrame> {
+        match &self.representation {
+            PreparedFrameRepresentation::Logical(frame) => Some(frame),
+            PreparedFrameRepresentation::Encoded(_) => None,
+        }
+    }
+
+    pub(crate) fn encoded_bytes(&self) -> Option<&crate::connection::OutboundBytes> {
+        match &self.representation {
+            PreparedFrameRepresentation::Logical(_) => None,
+            PreparedFrameRepresentation::Encoded(bytes) => Some(bytes),
+        }
+    }
+}
+
 /// A nonblocking destination for frames produced by one hub connection.
 ///
 /// The production implementation is the connection's bounded fair outbox.
@@ -339,6 +380,35 @@ pub trait FrameSink: Send + Sync {
         }
     }
 
+    /// Prepares one frame before the pacing loop. Bounded production sinks
+    /// encode here once; logical test sinks retain their existing behavior.
+    fn prepare(&self, frame: &WireFrame) -> Result<PreparedFrame, FrameSendError> {
+        Ok(PreparedFrame::logical(frame.clone()))
+    }
+
+    /// Borrowed EVENT preparation avoids cloning the durable envelope solely
+    /// to serialize it. The default keeps compatibility for custom sinks.
+    fn prepare_event(
+        &self,
+        attachment_id: &AttachmentId,
+        session_id: &SessionId,
+        envelope: &RawEnvelope,
+    ) -> Result<PreparedFrame, FrameSendError> {
+        self.prepare(&WireFrame::Event {
+            attachment_id: attachment_id.clone(),
+            session_id: session_id.clone(),
+            envelope: envelope.clone(),
+        })
+    }
+
+    fn offer_prepared(&self, attachment_id: &AttachmentId, frame: &PreparedFrame) -> SendAdmission {
+        frame
+            .logical_frame()
+            .map_or(SendAdmission::Refused, |frame| {
+                self.offer(attachment_id, frame)
+            })
+    }
+
     /// Re-offers with the reservation token returned by
     /// [`Self::drain_ticket`]. A sink that can answer `Busy` must admit
     /// ordinary attachment traffic only when its waiter queue is empty or
@@ -351,6 +421,19 @@ pub trait FrameSink: Send + Sync {
         _ticket: &AdmissionTicket,
     ) -> SendAdmission {
         self.offer(attachment_id, frame)
+    }
+
+    fn offer_prepared_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &PreparedFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        frame
+            .logical_frame()
+            .map_or(SendAdmission::Refused, |frame| {
+                self.offer_ticketed(attachment_id, frame, ticket)
+            })
     }
 
     /// Enqueues one FIFO admission ticket. Capacity wakes the head without
@@ -552,6 +635,8 @@ pub struct SessionHub {
 
 struct HubInner {
     store: SqliteStoreHandle,
+    append_committer: AppendCommitter,
+    append_commit_task: Mutex<Option<JoinHandle<()>>>,
     pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
     config: SessionHubConfig,
     observer: Arc<dyn SessionHubObserver>,
@@ -563,6 +648,10 @@ struct HubInner {
     /// Daemon-generation-only composer/status truth. This state is never
     /// journaled or projected into prompts; clients republish after restart.
     surfaces: Mutex<HashMap<SessionId, SessionSurfaceState>>,
+    /// Coalescing wake for surface watchers. Per-session change generations
+    /// remain the delivery/deduplication authority; this only replaces the
+    /// 50ms discovery delay on the common path.
+    surface_publications: watch::Sender<u64>,
     /// Permanent tombstones for sessions deleted in this daemon lifetime.
     /// `actor_for` checks them at both sides of its await so deletion cannot
     /// race actor recreation or fresh admission.
@@ -731,6 +820,108 @@ struct SessionActorHandle {
     commands: mpsc::Sender<ActorCommand>,
 }
 
+#[derive(Clone, Copy)]
+enum AppendCommitKind {
+    General,
+    Worker,
+}
+
+struct AppendCommitRequest {
+    kind: AppendCommitKind,
+    envelopes: Vec<RawEnvelope>,
+    completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
+}
+
+enum AppendCommitMessage {
+    Commit(AppendCommitRequest),
+    Shutdown(oneshot::Sender<()>),
+}
+
+/// Profile-global group-commit admission shared by every session actor.
+#[derive(Clone)]
+struct AppendCommitter {
+    requests: mpsc::UnboundedSender<AppendCommitMessage>,
+}
+
+impl AppendCommitter {
+    async fn commit(
+        &self,
+        kind: AppendCommitKind,
+        envelopes: Vec<RawEnvelope>,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let (completed, result) = oneshot::channel();
+        self.requests
+            .send(AppendCommitMessage::Commit(AppendCommitRequest {
+                kind,
+                envelopes,
+                completed,
+            }))
+            .map_err(|_| hub_closed_store_error())?;
+        result.await.map_err(|_| hub_closed_store_error())?
+    }
+
+    async fn shutdown(&self) {
+        let (completed, result) = oneshot::channel();
+        if self
+            .requests
+            .send(AppendCommitMessage::Shutdown(completed))
+            .is_ok()
+        {
+            let _ = result.await;
+        }
+    }
+}
+
+async fn run_append_committer(
+    store: SqliteStoreHandle,
+    mut requests: mpsc::UnboundedReceiver<AppendCommitMessage>,
+) {
+    while let Some(message) = requests.recv().await {
+        let first = match message {
+            AppendCommitMessage::Commit(first) => first,
+            AppendCommitMessage::Shutdown(completed) => {
+                let _ = completed.send(());
+                break;
+            }
+        };
+        let mut pending = vec![first];
+        let mut shutdown = None;
+        while let Ok(message) = requests.try_recv() {
+            match message {
+                AppendCommitMessage::Commit(request) => pending.push(request),
+                AppendCommitMessage::Shutdown(completed) => {
+                    shutdown = Some(completed);
+                    break;
+                }
+            }
+        }
+
+        let batches = pending
+            .iter_mut()
+            .map(|request| AppendGroupBatch {
+                envelopes: std::mem::take(&mut request.envelopes),
+                validate_worker_transitions: matches!(request.kind, AppendCommitKind::Worker),
+            })
+            .collect::<Vec<_>>();
+        match store.append_group(batches).await {
+            Ok(outcomes) => {
+                for (request, outcome) in pending.into_iter().zip(outcomes) {
+                    let _ = request.completed.send(outcome);
+                }
+            }
+            Err(error) => {
+                for request in pending {
+                    let _ = request.completed.send(Err(error.clone()));
+                }
+            }
+        }
+        if let Some(completed) = shutdown {
+            let _ = completed.send(());
+            break;
+        }
+    }
+}
+
 /// Opaque same-process worker authority. Store generation fences restarts;
 /// this token additionally fences a replaced supervisor in one generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -784,7 +975,7 @@ struct AttachmentOwner {
 /// weight it was charged so receive-side credit is exactly symmetric.
 struct QueuedEnvelope {
     weight: usize,
-    envelope: RawEnvelope,
+    envelope: Arc<RawEnvelope>,
 }
 
 /// Actor-side delivery state for one registered attachment.
@@ -830,7 +1021,7 @@ enum ActorRegisterResult {
 enum ActorCommand {
     Append {
         envelopes: Vec<RawEnvelope>,
-        completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
+        completed: oneshot::Sender<Result<Arc<[RawEnvelope]>, HaiderError>>,
     },
     CreateSession {
         command: SessionCreateCommand,
@@ -920,7 +1111,7 @@ enum ActorCommand {
         lease_id: WorkerLeaseId,
         expected_head: Option<u64>,
         envelopes: Vec<RawEnvelope>,
-        completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
+        completed: oneshot::Sender<Result<Arc<[RawEnvelope]>, HaiderError>>,
     },
     WorkerSettleIdle {
         lease_id: WorkerLeaseId,
@@ -1118,8 +1309,16 @@ impl SessionHub {
         config.validate().map_err(SessionHubError::InvalidConfig)?;
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
         let pipe_native = Arc::new(crate::pipe_native::PipeNativeWriter::new(store.root()));
+        let (append_requests, append_receiver) = mpsc::unbounded_channel();
+        let append_committer = AppendCommitter {
+            requests: append_requests,
+        };
+        let append_commit_task = tokio::spawn(run_append_committer(store.clone(), append_receiver));
+        let (surface_publications, _) = watch::channel(0_u64);
         let inner = Arc::new(HubInner {
             store,
+            append_committer,
+            append_commit_task: Mutex::new(Some(append_commit_task)),
             pipe_native,
             config,
             observer,
@@ -1127,6 +1326,7 @@ impl SessionHub {
             actors: Mutex::new(HashMap::new()),
             diagnostic_sinks: Mutex::new(HashMap::new()),
             surfaces: Mutex::new(HashMap::new()),
+            surface_publications,
             deleting_sessions: Mutex::new(HashSet::new()),
             actor_tasks: Mutex::new(Vec::new()),
             replay_tasks: Mutex::new(Vec::new()),
@@ -2707,6 +2907,7 @@ impl SessionHub {
             self.inner.store.worker_generation(),
             self.inner.config.catch_up_byte_budget,
             self.inner.store.clone(),
+            self.inner.append_committer.clone(),
             Arc::clone(&self.inner.pipe_native),
             Arc::clone(&self.inner.observer),
             Arc::clone(&self.inner.metrics),
@@ -2991,6 +3192,12 @@ impl SessionHub {
         })
     }
 
+    fn notify_surface_watchers(&self) {
+        self.inner
+            .surface_publications
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+    }
+
     fn publish_surface(
         &self,
         connection_id: &str,
@@ -3097,6 +3304,7 @@ impl SessionHub {
             .surfaces
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
         for state in surfaces.values_mut() {
             state.input_revisions.remove(connection_id);
             state.status_revisions.remove(connection_id);
@@ -3116,7 +3324,12 @@ impl SessionHub {
             }
             if clears_input || clears_status {
                 state.change_generation = state.change_generation.saturating_add(1);
+                changed = true;
             }
+        }
+        drop(surfaces);
+        if changed {
+            self.notify_surface_watchers();
         }
     }
 
@@ -3134,6 +3347,8 @@ impl SessionHub {
         // Session death itself is a change even when both fields were empty;
         // a registered watcher must receive the cleared terminal snapshot.
         state.change_generation = state.change_generation.saturating_add(1);
+        drop(surfaces);
+        self.notify_surface_watchers();
     }
 
     async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
@@ -3174,11 +3389,11 @@ impl SessionHub {
         }))
     }
 
-    fn offer_attachment(
+    fn offer_attachment_prepared(
         &self,
         attachment_id: &AttachmentId,
         sink: &Arc<dyn FrameSink>,
-        frame: &WireFrame,
+        frame: &PreparedFrame,
     ) -> SendAdmission {
         let Ok(attachments) = lock(&self.inner.attachments) else {
             return SendAdmission::Refused;
@@ -3188,14 +3403,14 @@ impl SessionHub {
         }
         // The ownership lock makes admit-vs-detach atomic: detach removes the
         // owner before purging its lane, so no frame can appear after purge.
-        sink.offer(attachment_id, frame)
+        sink.offer_prepared(attachment_id, frame)
     }
 
-    fn offer_attachment_ticketed(
+    fn offer_attachment_prepared_ticketed(
         &self,
         attachment_id: &AttachmentId,
         sink: &Arc<dyn FrameSink>,
-        frame: &WireFrame,
+        frame: &PreparedFrame,
         ticket: &AdmissionTicket,
     ) -> SendAdmission {
         let Ok(attachments) = lock(&self.inner.attachments) else {
@@ -3205,7 +3420,7 @@ impl SessionHub {
             return SendAdmission::Refused;
         }
         // Keep the same admit-vs-detach ownership barrier as the fresh offer.
-        sink.offer_ticketed(attachment_id, frame, ticket)
+        sink.offer_prepared_ticketed(attachment_id, frame, ticket)
     }
 
     /// Rejects new hub work synchronously before the runtime announces drain.
@@ -3257,6 +3472,11 @@ impl SessionHub {
         };
         let actor_tasks = std::mem::take(&mut *lock(&self.inner.actor_tasks)?);
         let mut actor_tasks = OwnedTasks::new(actor_tasks, Arc::clone(&self.inner.force_stop));
+        let append_commit_task = lock(&self.inner.append_commit_task)?.take();
+        let mut append_commit_task = OwnedTasks::new(
+            append_commit_task.into_iter().collect(),
+            Arc::clone(&self.inner.force_stop),
+        );
         // Backstop: dropped-without-disarm covers any cancellation window the
         // task guards cannot see (declared LAST so it drops FIRST).
         let mut forced = ForcedStopGuard {
@@ -3273,6 +3493,13 @@ impl SessionHub {
             let _ = actor.commands.send(ActorCommand::Stop).await;
         }
         let _ = actor_tasks.join_all().await;
+        self.inner.append_committer.shutdown().await;
+        let append_outcomes = append_commit_task.join_all().await;
+        if append_outcomes.iter().any(Result::is_err) {
+            return Err(SessionHubError::Task(
+                "append group-commit task failed during shutdown".into(),
+            ));
+        }
         self.inner
             .observer
             .observe(HubObservation::ShutdownActorsStopped);

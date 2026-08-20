@@ -302,7 +302,7 @@ fn recovery_menu(digest: &SessionObserveDigest) -> Result<&ObserveMenuWire, Reco
     digest
         .pending_menus
         .iter()
-        .filter(|menu| menu.kind == "recovery")
+        .filter(|menu| menu.kind == "error_recovery")
         .min_by_key(|menu| menu.request_seq.unwrap_or(u64::MAX))
         .ok_or(RecoverError::NoRecovery {
             state: run_state_name(digest.run_state),

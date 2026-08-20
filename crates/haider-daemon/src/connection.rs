@@ -41,7 +41,8 @@ mod connection_tests;
 
 use crate::DaemonError;
 use crate::session_hub::{
-    AdmissionTicket, FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub,
+    AdmissionTicket, FrameSendError, FrameSink, HubConnection, PreparedFrame, SendAdmission,
+    SessionHub,
 };
 use haider_platform::IpcStream;
 use haider_rpc::{
@@ -60,6 +61,7 @@ use haider_rpc::{
     negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io::IoSlice;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -220,40 +222,51 @@ impl QueuedFrame {
     }
 }
 
-struct OutboundBytes(Zeroizing<Vec<u8>>);
+#[derive(Clone)]
+pub(crate) enum OutboundBytes {
+    Contiguous(Arc<Zeroizing<Vec<u8>>>),
+    Framed(Arc<uds_codec::ZeroizingEncodedFrame>),
+}
+
+impl OutboundBytes {
+    fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(bytes) => bytes.len(),
+            Self::Framed(frame) => frame.framed_len(),
+        }
+    }
+}
 
 impl std::fmt::Debug for OutboundBytes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_tuple("OutboundBytes")
-            .field(&format_args!("[REDACTED; {} bytes]", self.0.len()))
+            .field(&format_args!("[REDACTED; {} bytes]", self.len()))
             .finish()
-    }
-}
-
-impl std::ops::Deref for OutboundBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_slice()
     }
 }
 
 impl<const N: usize> PartialEq<&[u8; N]> for OutboundBytes {
     fn eq(&self, other: &&[u8; N]) -> bool {
-        self.0.as_slice() == other.as_slice()
+        matches!(self, Self::Contiguous(bytes) if bytes.as_slice() == other.as_slice())
     }
 }
 
 impl From<Vec<u8>> for OutboundBytes {
     fn from(bytes: Vec<u8>) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self::Contiguous(Arc::new(Zeroizing::new(bytes)))
     }
 }
 
 impl From<Zeroizing<Vec<u8>>> for OutboundBytes {
     fn from(bytes: Zeroizing<Vec<u8>>) -> Self {
-        Self(bytes)
+        Self::Contiguous(Arc::new(bytes))
+    }
+}
+
+impl From<uds_codec::ZeroizingEncodedFrame> for OutboundBytes {
+    fn from(frame: uds_codec::ZeroizingEncodedFrame) -> Self {
+        Self::Framed(Arc::new(frame))
     }
 }
 
@@ -850,7 +863,7 @@ impl FrameSink for ConnectionFrameSink {
 
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
-        let bytes = encode_outbound(&frame, self.outbound_limit, self.encoding)
+        let bytes = encode_outbound_parts(&frame, self.outbound_limit, self.encoding)
             .map_err(|_| FrameSendError)?;
         self.lane
             .try_push(key, QueuedFrame::ordinary(bytes))
@@ -859,7 +872,7 @@ impl FrameSink for ConnectionFrameSink {
 
     fn try_send_droppable(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
-        let bytes = encode_outbound(&frame, self.outbound_limit, self.encoding)
+        let bytes = encode_outbound_parts(&frame, self.outbound_limit, self.encoding)
             .map_err(|_| FrameSendError)?;
         self.lane
             .try_push_droppable(key, QueuedFrame::ordinary(bytes))
@@ -878,13 +891,13 @@ impl FrameSink for ConnectionFrameSink {
             return self.try_send(frame);
         };
         let marker = Some((attachment_id.clone(), request_id.clone()));
-        let bytes = encode_outbound(&frame, self.outbound_limit, self.encoding)
+        let bytes = encode_outbound_parts(&frame, self.outbound_limit, self.encoding)
             .map_err(|_| FrameSendError)?;
         self.lane
             .try_push(
                 LaneKey::System,
                 QueuedFrame {
-                    bytes: bytes.into(),
+                    bytes,
                     welcome: false,
                     response_for: marker,
                     floor: false,
@@ -898,7 +911,7 @@ impl FrameSink for ConnectionFrameSink {
     }
 
     fn offer(&self, attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
-        let Ok(bytes) = encode_outbound(frame, self.outbound_limit, self.encoding) else {
+        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
             // Exceeds the negotiated frame limit: no amount of draining can
             // ever admit it.
             return SendAdmission::Refused;
@@ -907,18 +920,77 @@ impl FrameSink for ConnectionFrameSink {
             .offer(LaneKey::Attachment(attachment_id.clone()), bytes, None)
     }
 
+    fn prepare(&self, frame: &WireFrame) -> Result<PreparedFrame, FrameSendError> {
+        encode_outbound_parts(frame, self.outbound_limit, self.encoding)
+            .map(PreparedFrame::encoded)
+            .map_err(|_| FrameSendError)
+    }
+
+    fn prepare_event(
+        &self,
+        attachment_id: &AttachmentId,
+        session_id: &haider_protocol::ids::SessionId,
+        envelope: &haider_protocol::envelope::RawEnvelope,
+    ) -> Result<PreparedFrame, FrameSendError> {
+        uds_codec::encode_event_zeroizing_parts_with(
+            attachment_id,
+            session_id,
+            envelope,
+            self.outbound_limit,
+            self.encoding,
+        )
+        .map(OutboundBytes::from)
+        .map(PreparedFrame::encoded)
+        .map_err(|_| FrameSendError)
+    }
+
+    fn offer_prepared(&self, attachment_id: &AttachmentId, frame: &PreparedFrame) -> SendAdmission {
+        let Some(bytes) = frame.encoded_bytes() else {
+            return frame
+                .logical_frame()
+                .map_or(SendAdmission::Refused, |frame| {
+                    self.offer(attachment_id, frame)
+                });
+        };
+        self.lane.offer(
+            LaneKey::Attachment(attachment_id.clone()),
+            bytes.clone(),
+            None,
+        )
+    }
+
     fn offer_ticketed(
         &self,
         attachment_id: &AttachmentId,
         frame: &WireFrame,
         ticket: &AdmissionTicket,
     ) -> SendAdmission {
-        let Ok(bytes) = encode_outbound(frame, self.outbound_limit, self.encoding) else {
+        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
             return SendAdmission::Refused;
         };
         self.lane.offer(
             LaneKey::Attachment(attachment_id.clone()),
             bytes,
+            Some(ticket),
+        )
+    }
+
+    fn offer_prepared_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &PreparedFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let Some(bytes) = frame.encoded_bytes() else {
+            return frame
+                .logical_frame()
+                .map_or(SendAdmission::Refused, |frame| {
+                    self.offer_ticketed(attachment_id, frame, ticket)
+                });
+        };
+        self.lane.offer(
+            LaneKey::Attachment(attachment_id.clone()),
+            bytes.clone(),
             Some(ticket),
         )
     }
@@ -1277,8 +1349,11 @@ where
             let result = if notice_written {
                 match drain_deadline {
                     Some(deadline) => {
-                        match tokio::time::timeout_at(deadline, writer.write_all(&frame.bytes))
-                            .await
+                        match tokio::time::timeout_at(
+                            deadline,
+                            write_outbound(&mut writer, &frame.bytes),
+                        )
+                        .await
                         {
                             Ok(result) => result,
                             Err(_) => Err(std::io::Error::new(
@@ -1287,7 +1362,7 @@ where
                             )),
                         }
                     }
-                    None => writer.write_all(&frame.bytes).await,
+                    None => write_outbound(&mut writer, &frame.bytes).await,
                 }
             } else {
                 write_ordinary(
@@ -1363,7 +1438,7 @@ where
 /// reserved notice appears.
 async fn write_ordinary<W>(
     writer: &mut W,
-    bytes: &[u8],
+    bytes: &OutboundBytes,
     notice: &mut Option<ReservedNotice>,
     reserve_open: &mut bool,
     reserved: &mut mpsc::Receiver<ReservedNotice>,
@@ -1371,7 +1446,7 @@ async fn write_ordinary<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let write = writer.write_all(bytes);
+    let write = write_outbound(writer, bytes);
     tokio::pin!(write);
     loop {
         match notice.as_ref().map(|notice| notice.deadline) {
@@ -1394,6 +1469,44 @@ where
                 }
             }
             None => return (&mut write).await,
+        }
+    }
+}
+
+async fn write_outbound<W>(writer: &mut W, bytes: &OutboundBytes) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match bytes {
+        OutboundBytes::Contiguous(bytes) => writer.write_all(bytes.as_slice()).await,
+        OutboundBytes::Framed(frame) => {
+            let prefix = frame.prefix();
+            let body = frame.body();
+            let mut prefix_offset = 0;
+            let mut body_offset = 0;
+            while prefix_offset < prefix.len() || body_offset < body.len() {
+                let written = if prefix_offset < prefix.len() {
+                    writer
+                        .write_vectored(&[
+                            IoSlice::new(&prefix[prefix_offset..]),
+                            IoSlice::new(&body[body_offset..]),
+                        ])
+                        .await?
+                } else {
+                    writer.write(&body[body_offset..]).await?
+                };
+                if written == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write outbound frame",
+                    ));
+                }
+                let prefix_remaining = prefix.len().saturating_sub(prefix_offset);
+                let prefix_written = written.min(prefix_remaining);
+                prefix_offset += prefix_written;
+                body_offset += written.saturating_sub(prefix_written);
+            }
+            Ok(())
         }
     }
 }
@@ -1710,7 +1823,7 @@ fn enqueue(
     outbound_limit: usize,
     encoding: WireEncoding,
 ) -> Result<(), DaemonError> {
-    let bytes = encode_outbound(frame, outbound_limit, encoding)?;
+    let bytes = encode_outbound_parts(frame, outbound_limit, encoding)?;
     lane.try_push(LaneKey::System, QueuedFrame::ordinary(bytes))
 }
 
@@ -1724,6 +1837,18 @@ fn encode_outbound(
             message: format!("outbound frame rejected by peer limit: {error}"),
         }
     })
+}
+
+fn encode_outbound_parts(
+    frame: &WireFrame,
+    outbound_limit: usize,
+    encoding: WireEncoding,
+) -> Result<OutboundBytes, DaemonError> {
+    uds_codec::encode_zeroizing_parts_with(frame, outbound_limit, encoding)
+        .map(OutboundBytes::from)
+        .map_err(|error| DaemonError::Protocol {
+            message: format!("outbound frame rejected by peer limit: {error}"),
+        })
 }
 
 /// Encodes `ServerDraining` so it fits what this client said it can receive.

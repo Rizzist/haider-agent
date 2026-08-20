@@ -154,7 +154,7 @@ pub(super) async fn run_replay(
                         &sink,
                         &attachment_id,
                         &session_id,
-                        envelope,
+                        envelope.as_ref(),
                         &mut last_sent_seq,
                         DeliveryPhase::Buffered,
                         &mut registration.lagged,
@@ -257,7 +257,7 @@ pub(super) async fn run_replay(
                         &sink,
                         &attachment_id,
                         &session_id,
-                        envelope,
+                        envelope.as_ref(),
                         &mut last_sent_seq,
                         DeliveryPhase::Live,
                         &mut registration.lagged,
@@ -355,10 +355,24 @@ pub(super) async fn deliver_frame(
     lagged: &mut watch::Receiver<Option<u64>>,
     cancel: &mut watch::Receiver<bool>,
 ) -> FrameDelivery {
+    let Ok(frame) = sink.prepare(frame) else {
+        return FrameDelivery::Refused;
+    };
+    deliver_prepared_frame(hub, sink, attachment_id, &frame, lagged, cancel).await
+}
+
+async fn deliver_prepared_frame(
+    hub: &SessionHub,
+    sink: &Arc<dyn FrameSink>,
+    attachment_id: &AttachmentId,
+    frame: &PreparedFrame,
+    lagged: &mut watch::Receiver<Option<u64>>,
+    cancel: &mut watch::Receiver<bool>,
+) -> FrameDelivery {
     if *cancel.borrow() {
         return FrameDelivery::Cancelled;
     }
-    match hub.offer_attachment(attachment_id, sink, frame) {
+    match hub.offer_attachment_prepared(attachment_id, sink, frame) {
         SendAdmission::Sent => return FrameDelivery::Delivered,
         SendAdmission::Refused => return FrameDelivery::Refused,
         SendAdmission::Busy => {}
@@ -373,7 +387,7 @@ pub(super) async fn deliver_frame(
         // Confirming and later re-offers retain the SAME head token: capacity
         // freed between the Busy answer and this call cannot be lost, and no
         // fresh offer may consume it first.
-        match hub.offer_attachment_ticketed(attachment_id, sink, frame, ticket.ticket()) {
+        match hub.offer_attachment_prepared_ticketed(attachment_id, sink, frame, ticket.ticket()) {
             SendAdmission::Sent => {
                 ticket.disarm();
                 return FrameDelivery::Delivered;
@@ -502,7 +516,7 @@ async fn replay_range(
                 sink,
                 attachment_id,
                 session_id,
-                envelope,
+                &envelope,
                 last_sent_seq,
                 DeliveryPhase::Replay,
                 lagged,
@@ -632,7 +646,7 @@ async fn deliver_event(
     sink: &Arc<dyn FrameSink>,
     attachment_id: &AttachmentId,
     session_id: &SessionId,
-    envelope: RawEnvelope,
+    envelope: &RawEnvelope,
     last_sent_seq: &mut u64,
     phase: DeliveryPhase,
     lagged: &mut watch::Receiver<Option<u64>>,
@@ -643,12 +657,10 @@ async fn deliver_event(
         attachment_id: attachment_id.clone(),
         seq,
     });
-    let frame = WireFrame::Event {
-        attachment_id: attachment_id.clone(),
-        session_id: session_id.clone(),
-        envelope,
+    let Ok(frame) = sink.prepare_event(attachment_id, session_id, envelope) else {
+        return Err(FrameDelivery::Refused);
     };
-    match deliver_frame(hub, sink, attachment_id, &frame, lagged, cancel).await {
+    match deliver_prepared_frame(hub, sink, attachment_id, &frame, lagged, cancel).await {
         FrameDelivery::Delivered => {}
         stopped => return Err(stopped),
     }

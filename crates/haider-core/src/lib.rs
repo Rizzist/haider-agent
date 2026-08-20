@@ -69,7 +69,7 @@ pub use prompt_history::{
     USER_COMMAND_OUTPUT_PREVIEW_BYTES, task_event_notice,
 };
 pub use recovery::{RecoveryReport, effect_recovery_evidence, reconcile_dispatched_effects};
-pub use sqlite_store::{ProfileStoreFault, SqliteStoreHandle};
+pub use sqlite_store::{AppendGroupBatch, ProfileStoreFault, SqliteStoreHandle};
 
 use async_trait::async_trait;
 use haider_protocol::branch::BranchDescriptor;

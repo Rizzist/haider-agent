@@ -33,7 +33,7 @@ use haider_protocol::ids::{
     NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{ErrorRecoveryCardKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{FinishReason, Usage, UsageRequestKind, UsageScope, UsageSource};
 use haider_protocol::session::ModelSelected;
 use haider_protocol::state::{RunState, WaitReason};
@@ -577,6 +577,25 @@ async fn stored_sidecar(
 
 fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::PathBuf {
     root.path().join("pipe").join(format!("{session_id}.pipe"))
+}
+
+/// #6 (935): sidecar maintenance runs off the publish path on a per-session
+/// writer task, so a read right after `append` can race the write. Poll the
+/// file until it is non-empty and STABLE across a tick — the atomic
+/// temp+rename rebuild converges to exactly the steady state
+/// `hub.shutdown()` guarantees, with no intermediate stable point.
+async fn stable_sidecar(path: &std::path::Path) -> String {
+    let mut prev: Option<String> = None;
+    for _ in 0..300 {
+        if let Ok(cur) = std::fs::read_to_string(path) {
+            if !cur.is_empty() && prev.as_deref() == Some(cur.as_str()) {
+                return cur;
+            }
+            prev = Some(cur);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    prev.unwrap_or_default()
 }
 
 async fn append_delta(
@@ -2647,9 +2666,11 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let permission_session = SessionId::new("observe-permission");
     let input_session = SessionId::new("observe-input");
     let active_session = SessionId::new("observe-active-versus-queued");
+    let recovery_session = SessionId::new("observe-recovery");
     append_one(&hub, &permission_session, generation, "permission-seed").await;
     append_one(&hub, &input_session, generation, "input-seed").await;
     append_one(&hub, &active_session, generation, "active-seed").await;
+    append_one(&hub, &recovery_session, generation, "recovery-seed").await;
 
     let permission_menu_id = MenuId::new("permission-menu");
     let mut permission_menu = menu_opening(&permission_session, &permission_menu_id, generation);
@@ -2765,6 +2786,54 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
         .await
         .expect("active/queued fixture commits");
 
+    // The daemon-authored crash-window card: its body (probe evidence) and
+    // options (Probe/Retry/…) DO survive the digest so the recover door can
+    // render them — the positive half of the effect_recovery_v1 boundary.
+    let recovery_menu_id = MenuId::new("recovery-menu");
+    let mut recovery_menu = menu_opening(&recovery_session, &recovery_menu_id, generation);
+    recovery_menu.event_id = EventId::new("recovery-menu-opened");
+    recovery_menu.run_id = Some(RunId::new("recovery-run"));
+    recovery_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+        id: recovery_menu_id.clone(),
+        kind: MenuKind::ErrorRecovery {
+            card: ErrorRecoveryCardKind::StoreUnwritable,
+            presentation: ErrorPresentation::new(
+                "effect-outcome-unknown",
+                "Effect outcome unknown",
+                "reconcile before continuing",
+                ErrorScope::Turn,
+                [ErrorAction::Retry],
+            ),
+            option_actions: Vec::new(),
+            provider: None,
+            account: None,
+            source_run: None,
+            source_item: None,
+        },
+        title: "Effect outcome unknown".into(),
+        body: vec!["probe: process dead \u{b7} no result committed".into()],
+        options: vec![MenuOption {
+            key: "probe".into(),
+            label: "Probe".into(),
+            detail: Some("Re-check whether the effect completed.".into()),
+            decision: None,
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "recovery-test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }))
+    .expect("recovery menu serializes");
+    let mut recovery_state = envelope(&recovery_session, "recovery-state", generation);
+    recovery_state.run_id = Some(RunId::new("recovery-run"));
+    recovery_state.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::EffectOutcomeUnknown))
+            .expect("recovery state serializes");
+    hub.append(&mut [recovery_menu, recovery_state])
+        .await
+        .expect("recovery fixture commits");
+
     let sink = Arc::new(CollectSink::default());
     let connection = hub
         .open_connection(
@@ -2777,6 +2846,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
         ("observe-permission", permission_session),
         ("observe-input", input_session),
         ("observe-active", active_session),
+        ("observe-recovery", recovery_session),
     ] {
         connection
             .request(
@@ -2791,7 +2861,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
             .expect("session.observe routes");
     }
     let mut digests = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let WireFrame::Response {
             body: ResponseBody::SessionObserve { digest },
             ..
@@ -2846,6 +2916,33 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let json = serde_json::to_string(&digests).expect("digests serialize");
     assert!(!json.contains(VAULT_SENTINEL));
     assert!(!json.contains(OAUTH_SENTINEL));
+    // effect_recovery_v1 boundary: non-recovery menus expose title +
+    // permission_description ONLY; their durable body/options (which can
+    // carry vaulted credentials) are stripped from the observe digest.
+    assert!(
+        permission.pending_menus[0].body.is_empty()
+            && permission.pending_menus[0].options.is_empty(),
+        "a permission menu's body/options never reach the observe digest"
+    );
+    assert!(
+        input.pending_menus[0].body.is_empty() && input.pending_menus[0].options.is_empty(),
+        "a secret menu's body/options never reach the observe digest"
+    );
+    let recovery = digests
+        .iter()
+        .find(|digest| digest.session_id.as_str() == "observe-recovery")
+        .expect("recovery digest");
+    assert_eq!(recovery.run_state, ObserveRunStateWire::EffectUnknown);
+    let recovery_menu = recovery
+        .pending_menus
+        .iter()
+        .find(|menu| menu.kind == "error_recovery")
+        .expect("recovery menu present");
+    assert!(
+        !recovery_menu.body.is_empty() && !recovery_menu.options.is_empty(),
+        "the recovery card's probe evidence and options DO reach the digest"
+    );
+    assert_eq!(recovery_menu.options[0].key, "probe");
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
@@ -6154,7 +6251,9 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     events[3].branch_id = Some(BranchId::new("branch-sidecar"));
 
     hub.append(&mut events).await.expect("pipe batch commits");
-    let bytes = std::fs::read(sidecar_path(&root, &session_id)).expect("sidecar exists");
+    let bytes = stable_sidecar(&sidecar_path(&root, &session_id))
+        .await
+        .into_bytes();
     assert_eq!(
         bytes,
         expected_sidecar(&session_id, 1, &events).into_bytes()
@@ -6163,7 +6262,7 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         String::from_utf8(bytes).expect("sidecar utf8"),
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar = std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads");
+    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
     let values: Vec<serde_json::Value> = sidecar
         .lines()
         .skip(1)
@@ -6205,34 +6304,35 @@ async fn native_pipe_coalesces_255_non_rows_and_covers_the_256th() {
     let (root, store, hub) = open_hub(None, 8).await;
     let session_id = SessionId::new("native-pipe-coverage-coalesce");
     let generation = store.worker_generation();
+    // #6 (935): sidecar maintenance is off the publish path — the writer
+    // task drains at shutdown, so coalescing is now a SETTLED-STATE law:
+    // 255 non-row deltas plus the 256th collapse to exactly ONE coverage
+    // line at seq+256, observed after the drain, not via live file timing.
     let mut seed = vec![user_pipe_event(&session_id, "seed", generation, "seed")];
     hub.append(&mut seed).await.expect("seed commits");
     let path = sidecar_path(&root, &session_id);
-    let before = std::fs::read_to_string(&path).expect("seed sidecar reads");
 
     let mut deltas: Vec<RawEnvelope> = (0..255)
         .map(|index| delta_pipe_event(&session_id, &format!("coalesce-{index}"), generation))
         .collect();
     hub.append(&mut deltas).await.expect("255 deltas commit");
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("sidecar reads"),
-        before,
-        "255 non-row envelopes must remain coalesced in memory"
-    );
-
     append_delta(&hub, &session_id, generation, "coalesce-256").await;
-    let after = std::fs::read_to_string(path).expect("covered sidecar reads");
-    let appended: Vec<&str> = after
-        .strip_prefix(&before)
-        .expect("append only")
+    hub.shutdown().await.expect("hub stops");
+
+    let settled = stable_sidecar(&path).await;
+    let coverage_lines: Vec<&str> = settled
         .lines()
+        .filter(|line| line.contains("\"coverage\""))
         .collect();
-    assert_eq!(appended.len(), 1, "at most one coverage line per batch");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(appended[0]).expect("coverage JSON"),
+        coverage_lines.len(),
+        1,
+        "255 coalesced deltas plus the 256th settle to one coverage line: {settled}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(coverage_lines[0]).expect("coverage JSON"),
         serde_json::json!({"coverage": seed[0].seq + 256, "generation": 1})
     );
-    hub.shutdown().await.expect("hub stops");
 }
 
 #[tokio::test]
@@ -6256,11 +6356,14 @@ async fn native_pipe_truncates_a_torn_tail_before_resume() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     let mut second = vec![user_pipe_event(&session_id, "second", generation, "second")];
     hub.append(&mut second).await.expect("second commits");
+    // #6 (935): drain the writer task (shutdown) before reading the settled
+    // sidecar — maintenance no longer completes on the publish path.
+    hub.shutdown().await.expect("second hub stops");
+    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
-        std::fs::read_to_string(path).expect("sidecar reads"),
+        std::fs::read_to_string(&path).expect("settled sidecar reads"),
         expected_sidecar_batches(&session_id, 1, &[&first, &second])
     );
-    hub.shutdown().await.expect("second hub stops");
 }
 
 #[tokio::test]
@@ -6275,7 +6378,7 @@ async fn native_pipe_resume_skips_the_already_reconciled_batch() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     let mut second = vec![user_pipe_event(&session_id, "second", generation, "two")];
     hub.append(&mut second).await.expect("second commits");
-    let body = std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads");
+    let body = stable_sidecar(&sidecar_path(&root, &session_id)).await;
     assert_eq!(
         body,
         expected_sidecar_batches(&session_id, 1, &[&first, &second])
@@ -6303,7 +6406,7 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_delta(&hub, &session_id, generation, "resume-trigger").await;
 
-    let sidecar = std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads");
+    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
     let rows: Vec<&str> = sidecar
         .lines()
         .filter(|line| line.contains("\"role\""))
@@ -6340,11 +6443,10 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
     assert_eq!(
-        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads"),
+        stable_sidecar(&sidecar_path(&root, &session_id)).await,
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar =
-        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("sidecar reads twice");
+    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
     let tail: serde_json::Value =
         serde_json::from_str(sidecar.lines().last().expect("coverage tail"))
             .expect("coverage tail JSON");
@@ -6353,7 +6455,6 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
         store.latest_seq(&session_id).await.expect("journal head"),
         "rebuild/reconcile must end with coverage at the journal head"
     );
-    hub.shutdown().await.expect("second hub stops");
 }
 
 #[tokio::test]
@@ -6375,11 +6476,11 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     .expect("corruption writes");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
+    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
-        std::fs::read_to_string(path).expect("sidecar reads"),
+        std::fs::read_to_string(&path).expect("settled sidecar reads"),
         stored_sidecar(&store, &session_id, 2).await
     );
-    hub.shutdown().await.expect("second hub stops");
 }
 
 #[tokio::test]
@@ -6403,12 +6504,12 @@ async fn native_pipe_tail_ahead_of_journal_rebuilds_and_increments_generation() 
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
+    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
-        std::fs::read_to_string(path).expect("rebuilt sidecar reads"),
+        std::fs::read_to_string(&path).expect("settled sidecar reads"),
         stored_sidecar(&store, &session_id, 2).await,
         "a syntactically valid cursor ahead of the journal must not be trusted"
     );
-    hub.shutdown().await.expect("second hub stops");
 }
 
 /// MUTATION CHECK: coverage values participate in the same ahead-of-journal
@@ -6433,11 +6534,11 @@ async fn native_pipe_coverage_tail_ahead_rebuilds_and_increments_generation() {
         .expect("ahead coverage writes");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "rebuild-trigger").await;
+    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
-        std::fs::read_to_string(path).expect("rebuilt sidecar reads"),
+        std::fs::read_to_string(&path).expect("settled sidecar reads"),
         stored_sidecar(&store, &session_id, 2).await
     );
-    hub.shutdown().await.expect("second hub stops");
 }
 
 /// MUTATION CHECK: accepting an old header version would append current
@@ -6464,11 +6565,11 @@ async fn native_pipe_v1_header_rebuilds_to_v3_with_generation_bump() {
     .expect("v1 sidecar writes");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "rebuild-trigger").await;
+    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
-        std::fs::read_to_string(path).expect("rebuilt v3 sidecar reads"),
+        std::fs::read_to_string(&path).expect("settled sidecar reads"),
         stored_sidecar(&store, &session_id, 5).await
     );
-    hub.shutdown().await.expect("second hub stops");
 }
 
 #[tokio::test]
@@ -6497,10 +6598,10 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     )
     .expect("stale sidecar writes");
     append_one(&hub, &session_id, generation, "retry-trigger").await;
+    hub.shutdown().await.expect("hub stops");
     assert_eq!(
-        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("rebuilt sidecar reads"),
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads"),
         stored_sidecar(&store, &session_id, 10).await,
         "a dirty session must rebuild instead of trusting the old numeric tail"
     );
-    hub.shutdown().await.expect("hub stops");
 }

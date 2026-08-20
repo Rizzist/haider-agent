@@ -6,9 +6,9 @@
 //! hub-actor purity rule; provider latency must never hold attach, menu, or
 //! cancel liveness hostage), socket writes, RPC/transport concerns (rpc.rs),
 //! and paced delivery (replay.rs). Awaits inside command arms are durable
-//! store calls or the post-commit native pipe projection; the latter is
-//! best-effort, never changes the journal result, and finishes before the
-//! committed batch is published. The loop's own `recv` is the other await.
+//! store calls. Native-pipe projection is fed post-commit to an actor-owned
+//! writer task and never delays publication; the journal remains its rebuild
+//! authority. The loop's own `recv` is the other await.
 //!
 //! Law owned here — **same-generation worker-lease fencing (R1/R5)**: the
 //! actor holds at most one [`RegisteredWorker`]; `AcquireWorkerLease`
@@ -22,18 +22,90 @@
 
 use super::*;
 
-async fn maintain_pipe_sidecar(
-    writer: &crate::pipe_native::PipeNativeWriter,
-    store: &SqliteStoreHandle,
-    session_id: &SessionId,
-    envelopes: &[RawEnvelope],
-) {
-    if let Err(error) = writer.maintain(store, session_id, envelopes).await {
-        tracing::warn!(
-            session_id = %session_id,
-            %error,
-            "native pipe sidecar maintenance failed; journal append remains committed"
-        );
+const PIPE_SIDECAR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct PipeSidecarTask {
+    session_id: SessionId,
+    writer: Arc<crate::pipe_native::PipeNativeWriter>,
+    batches: Option<mpsc::UnboundedSender<Arc<[RawEnvelope]>>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl PipeSidecarTask {
+    fn spawn(
+        writer: Arc<crate::pipe_native::PipeNativeWriter>,
+        store: SqliteStoreHandle,
+        session_id: SessionId,
+    ) -> Self {
+        let (batches, mut receiver) = mpsc::unbounded_channel::<Arc<[RawEnvelope]>>();
+        let task_writer = Arc::clone(&writer);
+        let task_session = session_id.clone();
+        let task = tokio::spawn(async move {
+            while let Some(envelopes) = receiver.recv().await {
+                if let Err(error) = task_writer
+                    .maintain(&store, &task_session, envelopes.as_ref())
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %task_session,
+                        %error,
+                        "native pipe sidecar maintenance failed; journal append remains committed"
+                    );
+                }
+            }
+        });
+        Self {
+            session_id,
+            writer,
+            batches: Some(batches),
+            task: Some(task),
+        }
+    }
+
+    fn enqueue(&self, envelopes: Arc<[RawEnvelope]>) {
+        if self
+            .batches
+            .as_ref()
+            .is_none_or(|batches| batches.send(envelopes).is_err())
+        {
+            self.writer.invalidate(&self.session_id);
+        }
+    }
+
+    async fn finish(&mut self) {
+        self.batches.take();
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        match tokio::time::timeout(PIPE_SIDECAR_DRAIN_TIMEOUT, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.writer.invalidate(&self.session_id);
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    ?error,
+                    "native pipe sidecar writer task failed; next open will reconcile"
+                );
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                self.writer.invalidate(&self.session_id);
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    "native pipe sidecar writer drain timed out; next open will reconcile"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for PipeSidecarTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            self.writer.invalidate(&self.session_id);
+        }
     }
 }
 
@@ -61,8 +133,20 @@ pub(super) fn selected_effect_recovery_action(
     }
 }
 
-async fn settle_effect_recovery(
-    store: &SqliteStoreHandle,
+async fn settle_effect_recovery_via_committer(
+    append_committer: &AppendCommitter,
+    answer: &RawEnvelope,
+    effect: &haider_protocol::ids::EffectId,
+    action: EffectRecoveryAction,
+    worker_generation: u64,
+) -> Result<Vec<RawEnvelope>, HaiderError> {
+    let envelopes = effect_recovery_envelopes(answer, effect, action, worker_generation)?;
+    append_committer
+        .commit(AppendCommitKind::General, envelopes)
+        .await
+}
+
+fn effect_recovery_envelopes(
     answer: &RawEnvelope,
     effect: &haider_protocol::ids::EffectId,
     action: EffectRecoveryAction,
@@ -106,6 +190,18 @@ async fn settle_effect_recovery(
             })?,
         });
     }
+    Ok(envelopes)
+}
+
+#[cfg(test)]
+async fn settle_effect_recovery(
+    store: &SqliteStoreHandle,
+    answer: &RawEnvelope,
+    effect: &haider_protocol::ids::EffectId,
+    action: EffectRecoveryAction,
+    worker_generation: u64,
+) -> Result<Vec<RawEnvelope>, HaiderError> {
+    let mut envelopes = effect_recovery_envelopes(answer, effect, action, worker_generation)?;
     store.append(&mut envelopes).await?;
     Ok(envelopes)
 }
@@ -184,9 +280,9 @@ fn effect_recovery_payloads(
 ///
 /// Both §5.5 invariants (module doc) hold by code shape here: the only awaits
 /// inside any arm are durable store calls (`append`, `create_session`,
-/// `accept_turn`, `cancel_turn`, `settle_session_idle`, `resolve_menu`) and
-/// best-effort post-commit native pipe maintenance,
-/// publication is a synchronous call after they return in the same arm, and
+/// `accept_turn`, `cancel_turn`, `settle_session_idle`, `resolve_menu`). Native
+/// pipe maintenance is only a nonblocking post-commit wake; publication is a
+/// synchronous call after durable return in the same arm, and
 /// the `Register` arm contains no await at all. Adding an await between a
 /// store return and its `publish`, or anywhere in `Register`, breaks a law —
 /// the forced-boundary tests in `tests/session_hub_tests.rs` will catch it.
@@ -198,6 +294,7 @@ pub(super) async fn run_session_actor(
     worker_generation: u64,
     catch_up_byte_budget: usize,
     store: SqliteStoreHandle,
+    append_committer: AppendCommitter,
     pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
@@ -206,6 +303,8 @@ pub(super) async fn run_session_actor(
     mut commands: mpsc::Receiver<ActorCommand>,
 ) {
     let mut attachments = HashMap::<AttachmentId, ActorAttachment>::new();
+    let mut pipe_sidecar =
+        PipeSidecarTask::spawn(Arc::clone(&pipe_native), store.clone(), session_id.clone());
     let mut worker = Option::<RegisteredWorker>::None;
     // Retained after resolution on purpose: a prior-generation retry must
     // reach the durable CAS and receive AlreadyResolved, not be misreported
@@ -223,15 +322,18 @@ pub(super) async fn run_session_actor(
         }
         match command {
             ActorCommand::Append {
-                mut envelopes,
+                envelopes,
                 completed,
             } => {
                 // INVARIANT 1 (module doc): the append is awaited here, and
                 // `publish` below is synchronous in this same turn.
-                let result = store.append(&mut envelopes).await;
+                let result = append_committer
+                    .commit(AppendCommitKind::General, envelopes)
+                    .await;
                 match result {
-                    Ok(range) => {
-                        head = range.last_seq;
+                    Ok(committed) => {
+                        let envelopes = Arc::<[RawEnvelope]>::from(committed);
+                        head = envelopes.last().map_or(head, |envelope| envelope.seq);
                         if let Some(last) = envelopes.last() {
                             authority_epoch = last.authority_epoch;
                         }
@@ -239,7 +341,7 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        maintain_pipe_sidecar(&pipe_native, &store, &session_id, &envelopes).await;
+                        pipe_sidecar.enqueue(Arc::clone(&envelopes));
                         publish(
                             &mut attachments,
                             &envelopes,
@@ -677,7 +779,7 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    maintain_pipe_sidecar(&pipe_native, &store, &session_id, envelopes).await;
+                    pipe_sidecar.enqueue(Arc::from(envelopes.clone()));
                     publish(
                         &mut attachments,
                         envelopes,
@@ -793,7 +895,7 @@ pub(super) async fn run_session_actor(
             ActorCommand::WorkerAppend {
                 lease_id,
                 expected_head,
-                mut envelopes,
+                envelopes,
                 completed,
             } => {
                 let current = worker.as_ref().map(|worker| &worker.lease_id);
@@ -832,10 +934,12 @@ pub(super) async fn run_session_actor(
                 // batch against the durable run head atomically with append.
                 // Re-routing this to ordinary `append` must make the
                 // cancel-before-Done mutation pin fail.
-                let result = store.append_worker(envelopes).await;
+                let result = append_committer
+                    .commit(AppendCommitKind::Worker, envelopes)
+                    .await;
                 match result {
                     Ok(committed) => {
-                        envelopes = committed;
+                        let envelopes = Arc::<[RawEnvelope]>::from(committed);
                         head = envelopes.last().map_or(head, |envelope| envelope.seq);
                         if let Some(last) = envelopes.last() {
                             authority_epoch = last.authority_epoch;
@@ -844,7 +948,7 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        maintain_pipe_sidecar(&pipe_native, &store, &session_id, &envelopes).await;
+                        pipe_sidecar.enqueue(Arc::clone(&envelopes));
                         publish(
                             &mut attachments,
                             &envelopes,
@@ -1033,8 +1137,8 @@ pub(super) async fn run_session_actor(
                     && let Some(action) = selected_effect_recovery_action(menu, &answer)
                     && action != EffectRecoveryAction::Probe
                 {
-                    match settle_effect_recovery(
-                        &store,
+                    match settle_effect_recovery_via_committer(
+                        &append_committer,
                         envelope,
                         effect,
                         action,
@@ -1047,8 +1151,7 @@ pub(super) async fn run_session_actor(
                                 head = last.seq;
                                 authority_epoch = last.authority_epoch;
                             }
-                            maintain_pipe_sidecar(&pipe_native, &store, &session_id, &envelopes)
-                                .await;
+                            pipe_sidecar.enqueue(Arc::from(envelopes.clone()));
                             publish(
                                 &mut attachments,
                                 &envelopes,
@@ -1143,14 +1246,17 @@ pub(super) async fn run_session_actor(
                     Ok(false)
                 };
                 let should_stop = result.as_ref().is_ok_and(|quiescent| *quiescent);
-                let _ = completed.send(result);
                 if should_stop {
-                    break;
+                    pipe_sidecar.finish().await;
+                    let _ = completed.send(result);
+                    return;
                 }
+                let _ = completed.send(result);
             }
             ActorCommand::Stop => break,
         }
     }
+    pipe_sidecar.finish().await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1256,17 +1362,23 @@ fn publish(
     {
         hooks.observe_committed(envelopes);
     }
+    if !attachments.values().any(|attachment| attachment.active) {
+        return;
+    }
     // Weighed once per envelope, not once per attachment.
     let weights = envelopes
         .iter()
         .map(envelope_weight_bytes)
         .collect::<Vec<_>>();
+    // One durable envelope clone per publication, shared across every
+    // attachment lane. The replay task encodes it by reference.
+    let shared = envelopes.iter().cloned().map(Arc::new).collect::<Vec<_>>();
     let mut orphaned = Vec::new();
     for (attachment_id, attachment) in attachments.iter_mut() {
         if !attachment.active {
             continue;
         }
-        for (envelope, weight) in envelopes.iter().zip(&weights) {
+        for ((envelope, weight), shared) in envelopes.iter().zip(&weights).zip(&shared) {
             let queued = attachment.queued_bytes.load(Ordering::Acquire);
             if queued.saturating_add(*weight) > byte_budget {
                 metrics.catch_up_overflows.fetch_add(1, Ordering::Relaxed);
@@ -1277,7 +1389,7 @@ fn publish(
             attachment.queued_bytes.fetch_add(*weight, Ordering::AcqRel);
             match attachment.events.try_send(QueuedEnvelope {
                 weight: *weight,
-                envelope: envelope.clone(),
+                envelope: Arc::clone(shared),
             }) {
                 Ok(()) => attachment.last_buffered_seq = envelope.seq,
                 Err(_) => {

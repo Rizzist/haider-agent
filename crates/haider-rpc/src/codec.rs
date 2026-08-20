@@ -163,8 +163,15 @@ impl Write for LimitedWriter {
 }
 
 pub(crate) fn encode_json(frame: &WireFrame, frame_limit: usize) -> Result<Vec<u8>, CodecError> {
+    encode_json_value(frame, frame_limit)
+}
+
+pub(crate) fn encode_json_value<T: Serialize + ?Sized>(
+    value: &T,
+    frame_limit: usize,
+) -> Result<Vec<u8>, CodecError> {
     let mut writer = LimitedWriter::new(frame_limit);
-    if let Err(error) = serde_json::to_writer(&mut writer, frame) {
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
         if writer.exceeded {
             return Err(CodecError::FrameLimitExceeded {
                 frame_limit,
@@ -195,9 +202,16 @@ pub(crate) fn decode_json(bytes: &[u8], frame_limit: usize) -> Result<WireFrame,
 /// Encodes one post-handshake frame as MessagePack through the same bounded
 /// writer used by JSON, so the full oversized body is never accumulated.
 pub fn encode_msgpack(frame: &WireFrame, frame_limit: usize) -> Result<Vec<u8>, CodecError> {
+    encode_msgpack_value(frame, frame_limit)
+}
+
+pub(crate) fn encode_msgpack_value<T: Serialize + ?Sized>(
+    value: &T,
+    frame_limit: usize,
+) -> Result<Vec<u8>, CodecError> {
     let mut writer = LimitedWriter::new(frame_limit);
     let mut serializer = rmp_serde::Serializer::new(&mut writer).with_struct_map();
-    if let Err(error) = frame.serialize(&mut serializer) {
+    if let Err(error) = value.serialize(&mut serializer) {
         if writer.exceeded {
             return Err(CodecError::FrameLimitExceeded {
                 frame_limit,

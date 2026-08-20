@@ -21,12 +21,12 @@ use haider_store::{
     GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand,
     GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand, GraphPinOutcome,
     GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome,
-    HookTrustChange, HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome,
-    ProcessSignalCommand, ProcessSignalOutcome, ProfileLease, RunRetryCommand, RunRetryOutcome,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome,
+    HookTrustChange, HookTrustCommand, JournalAppendBatch, MenuResolutionCommand,
+    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
+    RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
+    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -53,6 +53,12 @@ struct StoreOwner {
     injected_append_error: Mutex<Option<HaiderError>>,
     #[cfg(test)]
     injected_profile_write_error: Mutex<Option<HaiderError>>,
+}
+
+/// One logical session-actor append submitted to the profile group committer.
+pub struct AppendGroupBatch {
+    pub envelopes: Vec<RawEnvelope>,
+    pub validate_worker_transitions: bool,
 }
 
 /// Out-of-band durable-store health. This deliberately does not use the
@@ -1196,6 +1202,57 @@ impl SqliteStoreHandle {
             })
         })
         .await
+    }
+
+    /// Commits multiple logical actor appends with one SQLite durability flush.
+    ///
+    /// The nested results preserve each request's semantic success or failure;
+    /// no successful result is returned until the shared outer transaction has
+    /// committed.
+    pub async fn append_group(
+        &self,
+        batches: Vec<AppendGroupBatch>,
+    ) -> Result<Vec<Result<Vec<RawEnvelope>, HaiderError>>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let failed_write_ids = batches
+            .iter()
+            .flat_map(|batch| batch.envelopes.iter())
+            .map(|envelope| envelope.event_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let result = run_blocking(move || {
+            #[cfg(test)]
+            if batches
+                .iter()
+                .any(|batch| !batch.validate_worker_transitions)
+                && let Some(error) = owner
+                    .injected_append_error
+                    .lock()
+                    .map_err(|_| owner_lock_error())?
+                    .take()
+            {
+                return Err(error);
+            }
+            owner.with_store(|store| {
+                let mut batches = batches
+                    .into_iter()
+                    .map(|batch| JournalAppendBatch {
+                        envelopes: batch.envelopes,
+                        validate_worker_transitions: batch.validate_worker_transitions,
+                    })
+                    .collect::<Vec<_>>();
+                let outcomes = store.append_group(&mut batches)?;
+                Ok(batches
+                    .into_iter()
+                    .zip(outcomes)
+                    .map(|(batch, outcome)| outcome.map(|_| batch.envelopes))
+                    .collect())
+            })
+        })
+        .await;
+        if let Err(error) = &result {
+            self.owner.note_failed_write(error, failed_write_ids);
+        }
+        result
     }
 
     pub async fn claim_context_compaction_receipt(

@@ -2829,3 +2829,66 @@ fn effect_recovery_state_and_roster_scalars_are_additive() {
         "account slot stays None until the seam ships"
     );
 }
+
+/// #16 (935): the borrowed EVENT encode (shared envelope, no logical-frame
+/// clone) must produce bytes IDENTICAL to `WireFrame::Event` — prefix and
+/// body, in both encodings — or a fan-out attachment would receive
+/// different wire bytes than a cloned publish.
+///
+/// MUTATION CHECK: change the borrowed serializer's shape (field order,
+/// tag, version). Expected runtime failure: the borrowed bytes diverge
+/// from the owned `WireFrame::Event` encode below.
+#[test]
+fn borrowed_event_encode_is_byte_identical_to_owned() {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
+    use haider_protocol::ids::{DeviceId, EventId, SessionId};
+    use haider_rpc::AttachmentId;
+    use haider_rpc::WireEncoding;
+
+    let attachment = AttachmentId::new("att-1");
+    let session = SessionId::new("s-1");
+    let envelope: haider_protocol::envelope::RawEnvelope = EventEnvelope {
+        schema_version: 1,
+        event_id: EventId::new("e-1"),
+        seq: 7,
+        session_id: session.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("d-1"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 42,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::json!({"type": "idle_decayed"}),
+    };
+    let owned = WireFrame::Event {
+        attachment_id: attachment.clone(),
+        session_id: session.clone(),
+        envelope: envelope.clone(),
+    };
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        let owned_bytes =
+            uds_codec::encode_with(&owned, TEST_FRAME_LIMIT, encoding).expect("owned encode");
+        let borrowed = uds_codec::encode_event_zeroizing_parts_with(
+            &attachment,
+            &session,
+            &envelope,
+            TEST_FRAME_LIMIT,
+            encoding,
+        )
+        .expect("borrowed encode");
+        let mut borrowed_bytes = borrowed.prefix().to_vec();
+        borrowed_bytes.extend_from_slice(borrowed.body());
+        assert_eq!(
+            owned_bytes, borrowed_bytes,
+            "borrowed EVENT encode must match owned bytes for {encoding:?}"
+        );
+    }
+}

@@ -1309,6 +1309,16 @@ pub trait EventStore: Send + Sync {
     fn latest_seq(&self, session: &SessionId) -> StoreResult<u64>;
 }
 
+/// One logical actor append admitted to a shared journal transaction.
+///
+/// The group-commit coordinator may mix ordinary and live-worker appends from
+/// different sessions. Each batch keeps its own validation, timestamp, and
+/// result boundary; only the final SQLite commit is shared.
+pub struct JournalAppendBatch {
+    pub envelopes: Vec<RawEnvelope>,
+    pub validate_worker_transitions: bool,
+}
+
 /// Opaque ownership of the profile's OS-held lifetime lock.
 ///
 /// W3b1 seam (additive): daemon startup acquires this before opening SQLite
@@ -4517,6 +4527,77 @@ impl Store {
     /// `Cancelling` may transition only to `Cancelled`.
     pub fn append_worker(&self, envelopes: &mut [RawEnvelope]) -> StoreResult<CommittedSeqRange> {
         append_envelopes(self, envelopes, true)
+    }
+
+    /// Commits queued actor appends under one outer SQLite transaction.
+    ///
+    /// A savepoint isolates each logical request, preserving the pre-batching
+    /// behavior where a semantically invalid append does not reject valid
+    /// requests queued before or after it. Results become observable only after
+    /// the outer transaction commits.
+    pub fn append_group(
+        &self,
+        batches: &mut [JournalAppendBatch],
+    ) -> StoreResult<Vec<StoreResult<CommittedSeqRange>>> {
+        if batches.is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "cannot commit an empty append group",
+                false,
+            ));
+        }
+        if let [batch] = batches {
+            return append_envelopes(
+                self,
+                &mut batch.envelopes,
+                batch.validate_worker_transitions,
+            )
+            .map(|range| vec![Ok(range)]);
+        }
+
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut outcomes = Vec::with_capacity(batches.len());
+        for batch in batches.iter() {
+            let savepoint = transaction.savepoint().map_err(map_sqlite_error)?;
+            match append_envelopes_in_transaction(
+                &savepoint,
+                &batch.envelopes,
+                batch.validate_worker_transitions,
+            ) {
+                Ok(outcome) => {
+                    savepoint.commit().map_err(map_sqlite_error)?;
+                    outcomes.push(Ok(outcome));
+                }
+                Err(error) if isolatable_append_error(&error) => {
+                    savepoint.finish().map_err(map_sqlite_error)?;
+                    outcomes.push(Err(error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+
+        let mut results = Vec::with_capacity(batches.len());
+        for (batch, outcome) in batches.iter_mut().zip(outcomes) {
+            match outcome {
+                Ok(outcome) => {
+                    batch.envelopes = outcome.stamped;
+                    update_append_caches(
+                        self,
+                        &outcome.range.session_id,
+                        &batch.envelopes,
+                        outcome.changes_graph_reduction,
+                        outcome.changes_graph_telemetry,
+                    );
+                    results.push(Ok(outcome.range));
+                }
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        Ok(results)
     }
 
     /// Claims the global command-id namespace for `session.compact` before
@@ -11672,7 +11753,7 @@ fn resolve_menu_transaction(
 /// Adds one non-engine fact to the durable post-commit hook outbox inside the
 /// event's own transaction. Hook lifecycle/result facts are deliberately not
 /// recursive inputs; run trust and profile update/account facts are inputs.
-fn enqueue_hook_dispatch(transaction: &Transaction<'_>, envelope: &RawEnvelope) -> StoreResult<()> {
+fn enqueue_hook_dispatch(transaction: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
     if HookEventPayload::is_engine_fact(&envelope.payload) {
         return Ok(());
     }
@@ -12033,11 +12114,43 @@ impl EventStore for Store {
     }
 }
 
+struct AppendTransactionOutcome {
+    range: CommittedSeqRange,
+    stamped: Vec<RawEnvelope>,
+    changes_graph_reduction: bool,
+    changes_graph_telemetry: bool,
+}
+
 fn append_envelopes(
     store: &Store,
     envelopes: &mut [RawEnvelope],
     validate_worker_transitions: bool,
 ) -> StoreResult<CommittedSeqRange> {
+    let mut connection = store.connection()?;
+    // IMMEDIATE makes durable-head validation, sequence allocation, and the
+    // batch insert one indivisible write critical section.
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    let outcome =
+        append_envelopes_in_transaction(&transaction, envelopes, validate_worker_transitions)?;
+    transaction.commit().map_err(map_sqlite_error)?;
+    envelopes.clone_from_slice(&outcome.stamped);
+    update_append_caches(
+        store,
+        &outcome.range.session_id,
+        envelopes,
+        outcome.changes_graph_reduction,
+        outcome.changes_graph_telemetry,
+    );
+    Ok(outcome.range)
+}
+
+fn append_envelopes_in_transaction(
+    transaction: &Connection,
+    envelopes: &[RawEnvelope],
+    validate_worker_transitions: bool,
+) -> StoreResult<AppendTransactionOutcome> {
     let (session, batch_len) = same_session_batch(envelopes)?;
     let changes_graph_reduction = envelopes
         .iter()
@@ -12045,14 +12158,8 @@ fn append_envelopes(
     let changes_graph_telemetry = envelopes
         .iter()
         .any(|envelope| graph_telemetry_event(&envelope.payload));
-    let mut connection = store.connection()?;
-    // IMMEDIATE makes durable-head validation, sequence allocation, and the
-    // batch insert one indivisible write critical section.
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(map_sqlite_error)?;
     if validate_worker_transitions {
-        validate_worker_run_transitions(&transaction, &session, envelopes)?;
+        validate_worker_run_transitions(transaction, &session, envelopes)?;
     }
     let committed_at_ms = now_ms()?;
     let committed_at_sql = to_sqlite_integer(committed_at_ms)?;
@@ -12088,7 +12195,7 @@ fn append_envelopes(
             let mut envelope = envelope.clone();
             envelope.seq = seq;
             envelope.committed_at_ms = committed_at_ms;
-            stamp_workspace_mutation(&transaction, &mut envelope)?;
+            stamp_workspace_mutation(transaction, &mut envelope)?;
             let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -12106,25 +12213,47 @@ fn append_envelopes(
                     payload_kind(&envelope),
                 ])
                 .map_err(map_sqlite_error)?;
-            enqueue_hook_dispatch(&transaction, &envelope)?;
+            enqueue_hook_dispatch(transaction, &envelope)?;
             stamped.push(envelope);
         }
     }
-    update_branch_heads(&transaction, &stamped)?;
-    transaction.commit().map_err(map_sqlite_error)?;
-    for (envelope, stamped) in envelopes.iter_mut().zip(stamped) {
-        *envelope = stamped;
-    }
-    if changes_graph_reduction {
-        store.extend_graph_reduction(&session, envelopes);
-    } else if changes_graph_telemetry {
-        store.extend_graph_telemetry(&session, envelopes);
-    }
-    Ok(CommittedSeqRange {
-        session_id: session,
-        first_seq,
-        last_seq,
+    update_branch_heads(transaction, &stamped)?;
+    Ok(AppendTransactionOutcome {
+        range: CommittedSeqRange {
+            session_id: session,
+            first_seq,
+            last_seq,
+        },
+        stamped,
+        changes_graph_reduction,
+        changes_graph_telemetry,
     })
+}
+
+fn update_append_caches(
+    store: &Store,
+    session: &SessionId,
+    envelopes: &[RawEnvelope],
+    changes_graph_reduction: bool,
+    changes_graph_telemetry: bool,
+) {
+    if changes_graph_reduction {
+        store.extend_graph_reduction(session, envelopes);
+    } else if changes_graph_telemetry {
+        store.extend_graph_telemetry(session, envelopes);
+    }
+}
+
+fn isolatable_append_error(error: &HaiderError) -> bool {
+    !matches!(
+        error.code,
+        ErrorCode::StoreCorrupt
+            | ErrorCode::StoreLocked
+            | ErrorCode::StoreFull
+            | ErrorCode::StoreReadOnly
+            | ErrorCode::StoreUnavailable
+            | ErrorCode::Internal
+    )
 }
 
 fn workspace_revision_for_seq(seq: u64) -> WorkspaceRevision {
@@ -12133,7 +12262,7 @@ fn workspace_revision_for_seq(seq: u64) -> WorkspaceRevision {
 
 #[allow(clippy::result_large_err)]
 fn stamp_workspace_mutation(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     envelope: &mut RawEnvelope,
 ) -> StoreResult<()> {
     if let Ok(EventPayload::Effect(EffectPhase::Outcome {
@@ -12192,7 +12321,7 @@ fn stamp_workspace_mutation_fields(seq: u64, effect: &EffectId, mutation: &mut W
 
 #[allow(clippy::result_large_err)]
 fn validate_workspace_mutation_intent(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     envelope: &RawEnvelope,
     effect: &EffectId,
     mutation: &WorkspaceMutation,
@@ -12287,7 +12416,7 @@ fn graph_telemetry_event(payload: &serde_json::Value) -> bool {
 }
 
 fn validate_worker_run_transitions(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: &SessionId,
     envelopes: &[RawEnvelope],
 ) -> StoreResult<()> {
@@ -12716,10 +12845,7 @@ fn validate_branch_fork(
     Ok(())
 }
 
-fn update_branch_heads(
-    transaction: &Transaction<'_>,
-    envelopes: &[RawEnvelope],
-) -> StoreResult<()> {
+fn update_branch_heads(transaction: &Connection, envelopes: &[RawEnvelope]) -> StoreResult<()> {
     for envelope in envelopes {
         let Some(branch_id) = envelope.branch_id.as_ref() else {
             continue;

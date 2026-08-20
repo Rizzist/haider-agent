@@ -5,11 +5,39 @@
 //! storage. An oversized, empty, or invalid body poisons the decoder; callers
 //! must discard it with the connection.
 
-use crate::codec::{decode_json, decode_msgpack, encode_json, encode_msgpack};
-use crate::{CodecError, WireEncoding, WireFrame};
+use crate::codec::{
+    decode_json, decode_msgpack, encode_json, encode_json_value, encode_msgpack,
+    encode_msgpack_value,
+};
+use crate::frame::BorrowedEventFrame;
+use crate::{AttachmentId, CodecError, WireEncoding, WireFrame};
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::ids::SessionId;
+use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
 const PREFIX_LEN: usize = 4;
+
+/// One encoded UDS frame kept as its length prefix plus body so the socket
+/// writer can issue a vectored write without allocating a second copy.
+pub struct ZeroizingEncodedFrame {
+    prefix: [u8; PREFIX_LEN],
+    body: Zeroizing<Vec<u8>>,
+}
+
+impl ZeroizingEncodedFrame {
+    pub fn framed_len(&self) -> usize {
+        PREFIX_LEN + self.body.len()
+    }
+
+    pub fn prefix(&self) -> &[u8; PREFIX_LEN] {
+        &self.prefix
+    }
+
+    pub fn body(&self) -> &[u8] {
+        self.body.as_slice()
+    }
+}
 
 /// Serializes one UDS frame: a four-byte big-endian prefix holding the exact
 /// JSON body length, followed by the body bytes. This legacy entry point is
@@ -68,11 +96,9 @@ pub fn encode_zeroizing_with(
     frame_limit: usize,
     encoding: WireEncoding,
 ) -> Result<Zeroizing<Vec<u8>>, CodecError> {
-    let mut body = encode_body(frame, frame_limit, encoding)?;
+    let parts = encode_zeroizing_parts_with(frame, frame_limit, encoding)?;
+    let mut body = parts.body;
     let result = (|| {
-        let body_len = u32::try_from(body.len()).map_err(|_| CodecError::LengthPrefixOverflow {
-            body_len: body.len(),
-        })?;
         let total_len = PREFIX_LEN
             .checked_add(body.len())
             .ok_or(CodecError::AllocationFailed {
@@ -84,12 +110,56 @@ pub fn encode_zeroizing_with(
             .map_err(|_| CodecError::AllocationFailed {
                 requested: total_len,
             })?;
-        framed.extend_from_slice(&body_len.to_be_bytes());
+        framed.extend_from_slice(&parts.prefix);
         framed.extend_from_slice(&body);
         Ok(Zeroizing::new(framed))
     })();
     body.zeroize();
     result
+}
+
+/// Encodes a frame once while retaining prefix and body as separate buffers.
+pub fn encode_zeroizing_parts_with(
+    frame: &WireFrame,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<ZeroizingEncodedFrame, CodecError> {
+    encode_zeroizing_parts_value(frame, frame_limit, encoding)
+}
+
+/// Borrowed EVENT encode: exactly the same serializer shape as
+/// [`WireFrame::Event`] without cloning its envelope into a logical frame.
+pub fn encode_event_zeroizing_parts_with(
+    attachment_id: &AttachmentId,
+    session_id: &SessionId,
+    envelope: &RawEnvelope,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<ZeroizingEncodedFrame, CodecError> {
+    encode_zeroizing_parts_value(
+        &BorrowedEventFrame {
+            attachment_id,
+            session_id,
+            envelope,
+        },
+        frame_limit,
+        encoding,
+    )
+}
+
+fn encode_zeroizing_parts_value<T: Serialize + ?Sized>(
+    value: &T,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<ZeroizingEncodedFrame, CodecError> {
+    let body = encode_body_value(value, frame_limit, encoding)?;
+    let body_len = u32::try_from(body.len()).map_err(|_| CodecError::LengthPrefixOverflow {
+        body_len: body.len(),
+    })?;
+    Ok(ZeroizingEncodedFrame {
+        prefix: body_len.to_be_bytes(),
+        body: Zeroizing::new(body),
+    })
 }
 
 fn encode_body(
@@ -100,6 +170,17 @@ fn encode_body(
     match encoding {
         WireEncoding::Json => encode_json(frame, frame_limit),
         WireEncoding::MessagePack => encode_msgpack(frame, frame_limit),
+    }
+}
+
+fn encode_body_value<T: Serialize + ?Sized>(
+    value: &T,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<Vec<u8>, CodecError> {
+    match encoding {
+        WireEncoding::Json => encode_json_value(value, frame_limit),
+        WireEncoding::MessagePack => encode_msgpack_value(value, frame_limit),
     }
 }
 

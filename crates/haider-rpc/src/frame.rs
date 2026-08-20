@@ -2924,6 +2924,29 @@ struct VersionedFrameRef<'a> {
     frame: WireFrameRef<'a>,
 }
 
+pub(crate) struct BorrowedEventFrame<'a> {
+    pub(crate) attachment_id: &'a AttachmentId,
+    pub(crate) session_id: &'a SessionId,
+    pub(crate) envelope: &'a RawEnvelope,
+}
+
+impl Serialize for BorrowedEventFrame<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        VersionedFrameRef {
+            version: WIRE_PROTOCOL_VERSION,
+            frame: WireFrameRef::Event {
+                attachment_id: self.attachment_id,
+                session_id: self.session_id,
+                envelope: self.envelope,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
 #[derive(Deserialize)]
 struct VersionedFrameOwned {
     #[serde(rename = "v")]

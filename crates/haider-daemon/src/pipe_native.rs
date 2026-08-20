@@ -84,9 +84,9 @@ impl From<std::io::Error> for PipeNativeError {
     }
 }
 
-/// Profile-scoped reconciliation state. Session actors remain the actual
-/// single writers; this map records which actors have completed their lazy
-/// first-touch reconciliation in this daemon lifetime.
+/// Profile-scoped reconciliation state. Each session actor owns one writer
+/// task, which remains that session's single sidecar writer; this map records
+/// which tasks completed lazy first-touch reconciliation in this daemon life.
 pub(crate) struct PipeNativeWriter {
     pipe_dir: PathBuf,
     reconciled: Mutex<HashMap<SessionId, ReconciledSidecar>>,
@@ -102,6 +102,20 @@ impl PipeNativeWriter {
         }
     }
 
+    /// Forgets an in-memory cursor after an asynchronous writer exits before
+    /// draining its post-commit queue. The next touch must reconcile from the
+    /// journal instead of advancing from a cursor that may have missed a batch.
+    pub(crate) fn invalidate(&self, session_id: &SessionId) {
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.dirty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone());
+    }
+
     /// Maintains one session after its journal batch has committed. Ordinary
     /// appends are intentionally not fsynced: the journal owns durability and
     /// boot reconciliation heals a lost or torn sidecar tail. Errors are
@@ -114,14 +128,7 @@ impl PipeNativeWriter {
     ) -> Result<(), PipeNativeError> {
         let result = self.maintain_inner(store, session_id, committed).await;
         if result.is_err() {
-            self.reconciled
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(session_id);
-            self.dirty
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(session_id.clone());
+            self.invalidate(session_id);
         }
         result
     }

@@ -592,10 +592,32 @@ impl ObserveProjection {
             }
             EventPayload::MenuOpened(menu) => {
                 let kind = observe_menu_kind(&menu.kind);
+                // Secret/permission/other menu bodies and options may carry
+                // vaulted credentials or untrusted payloads; the observe
+                // digest exposes body+options ONLY for the daemon-authored
+                // effect-recovery card (its body is probe evidence, its
+                // options the fixed Probe/Mark done/Retry/Abandon), which is
+                // the sole menu the headless recover door needs to render.
+                let is_effect_recovery = matches!(menu.kind, MenuKind::ErrorRecovery { .. });
                 let (permission_description, presentation) = match menu.kind {
                     MenuKind::Permission { effect_summary } => (Some(effect_summary), None),
                     MenuKind::ErrorRecovery { presentation, .. } => (None, Some(presentation)),
                     _ => (None, None),
+                };
+                let (body, options) = if is_effect_recovery {
+                    (
+                        menu.body,
+                        menu.options
+                            .into_iter()
+                            .map(|option| haider_rpc::ObserveMenuOptionWire {
+                                key: option.key,
+                                label: option.label,
+                                detail: option.detail,
+                            })
+                            .collect(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
                 };
                 self.menus.insert(
                     menu.id.as_str().to_owned(),
@@ -606,16 +628,8 @@ impl ObserveProjection {
                         request_seq: Some(seq),
                         worker_generation: Some(envelope.worker_generation),
                         opened_at_ms: Some(envelope.committed_at_ms),
-                        body: menu.body,
-                        options: menu
-                            .options
-                            .into_iter()
-                            .map(|option| haider_rpc::ObserveMenuOptionWire {
-                                key: option.key,
-                                label: option.label,
-                                detail: option.detail,
-                            })
-                            .collect(),
+                        body,
+                        options,
                         permission_description,
                         presentation,
                     },
@@ -6256,6 +6270,8 @@ impl HubConnection {
             self.hub.clear_surface_owner(&self.connection_id);
             return Err(SessionHubError::Closed);
         }
+        let changed =
+            outcome.accepted_input_revision.is_some() || outcome.accepted_status_revision.is_some();
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionSurfacePublished {
@@ -6263,7 +6279,13 @@ impl HubConnection {
                 accepted_input_revision: outcome.accepted_input_revision,
                 accepted_status_revision: outcome.accepted_status_revision,
             },
-        })
+        })?;
+        // Preserve response-before-delta ordering while removing the polling
+        // delay: generations, not wake count, remain the dedupe authority.
+        if changed {
+            self.hub.notify_surface_watchers();
+        }
+        Ok(())
     }
 
     async fn session_surface_watch(
@@ -6326,7 +6348,13 @@ impl HubConnection {
             let hub = self.hub.clone();
             let sink = Arc::clone(&self.sink);
             let task_registrations = Arc::clone(&registrations);
-            let task = tokio::spawn(run_surface_watch(hub, sink, task_registrations));
+            let publications = self.hub.inner.surface_publications.subscribe();
+            let task = tokio::spawn(run_surface_watch(
+                hub,
+                sink,
+                task_registrations,
+                publications,
+            ));
             *watch = Some(SurfaceWatchState {
                 registrations,
                 task,
@@ -6364,6 +6392,9 @@ impl HubConnection {
             },
         })?;
         lock(&registrations)?.insert(session_id, snapshot.change_generation);
+        // Close the registration race: if a publication's coalesced wake ran
+        // before the generation was installed, this wake rechecks it.
+        self.hub.notify_surface_watchers();
         if self.closed.load(Ordering::Acquire) {
             if let Some(watch) = watch.take() {
                 watch.task.abort();
@@ -7267,12 +7298,20 @@ async fn run_surface_watch(
     hub: SessionHub,
     sink: Arc<dyn FrameSink>,
     registrations: Arc<Mutex<HashMap<SessionId, u64>>>,
+    mut publications: watch::Receiver<u64>,
 ) {
-    let period = std::time::Duration::from_millis(50);
+    let period = std::time::Duration::from_secs(1);
     let mut ticker = interval_at(tokio::time::Instant::now() + period, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            changed = publications.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = ticker.tick() => {}
+        }
         let watched = match registrations.lock() {
             Ok(registrations) => registrations
                 .iter()
