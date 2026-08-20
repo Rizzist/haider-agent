@@ -1938,7 +1938,7 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
                 run_id,
                 branch_id.as_ref(),
                 &event_ids,
-                UnknownReconcile::EvidenceOnly,
+                UnknownReconcile::Cancel,
                 effect_scan,
             )
             .await?;
@@ -2625,8 +2625,17 @@ async fn run_supervisor(
                         {
                             lease.hub().degrade_anthropic_web_tools(lease.session_id());
                         }
+                        let cancellation_requested = matches!(
+                            outcome_state.as_ref(),
+                            Some(RunState::Cancelled)
+                        ) || durable_run_state(&lease, &finished.run_id).await
+                            == Some(RunState::Cancelling);
                         if let Some(dispatcher) = finished.dispatcher.take()
-                            && let Err(error) = dispatcher.close().await
+                            && let Err(error) = if cancellation_requested {
+                                dispatcher.cancel().await
+                            } else {
+                                dispatcher.close().await
+                            }
                         {
                             tracing::warn!(run_id = %finished.run_id, ?error, "turn tool dispatcher close failed");
                         }
@@ -2650,7 +2659,11 @@ async fn run_supervisor(
                                 &finished.run_id,
                                 finished.branch_id.as_ref(),
                                 &event_ids,
-                                UnknownReconcile::Park,
+                                if cancellation_requested {
+                                    UnknownReconcile::Cancel
+                                } else {
+                                    UnknownReconcile::Park
+                                },
                             )
                             .await
                             {
@@ -2713,16 +2726,20 @@ async fn run_supervisor(
                             return true;
                         }
                         // TERMINAL ORDER: core cancellation is deliberately
-                        // non-terminal in daemon mode. Broker close above first
-                        // reconciles every held dispatch to Unknown; only then
-                        // may Cancelled become the durable final envelope.
+                        // non-terminal in daemon mode. Orderly cancellation
+                        // closes every abandoned dispatch as Cancelled before
+                        // the run itself crosses its terminal boundary.
                         let durable = match reconcile_unknown_effects(
                             &lease,
                             &device_id,
                             &finished.run_id,
                             finished.branch_id.as_ref(),
                             &event_ids,
-                            UnknownReconcile::EvidenceOnly,
+                            if cancellation_requested {
+                                UnknownReconcile::Cancel
+                            } else {
+                                UnknownReconcile::EvidenceOnly
+                            },
                         )
                         .await
                         {
@@ -3369,11 +3386,12 @@ enum UnknownReconcile {
     /// left to settle the run, so append Unknown evidence, open the
     /// four-choice recovery card, and park the run as `EffectOutcomeUnknown`.
     Park,
-    /// Settlement-shaped exits (user cancellation, failure terminalization):
-    /// the caller commits its own terminal (Cancelled/Errored) immediately
-    /// after, so append Unknown evidence only — no card and no park. P1-1:
-    /// user cancellation must still end with Cancelled as the final envelope.
+    /// Failure terminalization appends Unknown evidence only — no card and no
+    /// park — before the caller commits its own `Errored` terminal.
     EvidenceOnly,
+    /// Orderly cancellation: a dispatch with no outcome was deliberately
+    /// abandoned and is terminalized as `Cancelled`, never a crash window.
+    Cancel,
 }
 
 #[derive(Default)]
@@ -3580,7 +3598,11 @@ async fn append_unknown_effect_scan(
         if !outcomes.contains_key(&effect) {
             payloads.push(EventPayload::Effect(EffectPhase::Outcome {
                 effect: effect.clone(),
-                outcome: EffectOutcome::Unknown,
+                outcome: if mode == UnknownReconcile::Cancel {
+                    EffectOutcome::Cancelled
+                } else {
+                    EffectOutcome::Unknown
+                },
                 freshness: None,
                 workspace_mutation: None,
             }));
@@ -4298,7 +4320,7 @@ async fn perform_shell_exec(
                     .await?;
                     process_cancel.cancel();
                     let _ = wait.await;
-                    if let Err(error) = broker.close().await {
+                    if let Err(error) = broker.cancel().await {
                         tracing::warn!(
                             %run_id,
                             ?error,
@@ -4324,7 +4346,7 @@ async fn perform_shell_exec(
                 if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
                     process_cancel.cancel();
                     let _ = wait.await;
-                    if let Err(error) = broker.close().await {
+                    if let Err(error) = broker.cancel().await {
                         tracing::warn!(
                             %run_id,
                             ?error,
@@ -4468,7 +4490,7 @@ async fn cancel_shell_exec(
         run_id,
         branch_id,
         event_ids,
-        UnknownReconcile::EvidenceOnly,
+        UnknownReconcile::Cancel,
     )
     .await?;
     let mut payloads = cancelled_resumption_payloads(lease, lease.session_id(), run_id).await?;
@@ -7943,6 +7965,64 @@ impl BrokerToolDispatcher {
             }),
         }
     }
+
+    async fn close_effects(&self, cancelled: bool) -> Result<(), HaiderError> {
+        let pollers = self
+            .permission_pollers
+            .lock()
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "computer permission poller lock is poisoned",
+                    false,
+                )
+            })?
+            .drain()
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in pollers {
+            task.abort();
+        }
+        let emergency_stop = self.computer.emergency_stop().await;
+        let mut broker_guard = self.broker.lock().await;
+        let computer_turn_cancelled = self
+            .active_computer_turn_cancel
+            .lock()
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "computer cancellation state lock is poisoned",
+                    false,
+                )
+            })?
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled);
+        if (cancelled || computer_turn_cancelled)
+            && let Some(broker) = broker_guard.as_mut()
+        {
+            broker.cancel_computer_actions();
+        }
+        let broker = broker_guard.take();
+        drop(broker_guard);
+        let Some(broker) = broker else {
+            return emergency_stop.map_err(computer_error);
+        };
+        let closed = if cancelled || computer_turn_cancelled {
+            broker.cancel().await
+        } else {
+            broker.close().await
+        }
+        .map(|_| ())
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::EffectUnknownOutcome,
+                format!("effect broker close reported unfinished work: {error}"),
+                false,
+            )
+        });
+        closed?;
+        emergency_stop.map_err(computer_error)
+    }
 }
 
 #[async_trait]
@@ -9448,6 +9528,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
         Ok(())
     }
 
+    async fn cancel(&self) -> Result<(), HaiderError> {
+        self.close_effects(true).await
+    }
+
     async fn activate_approval(
         &self,
         run_id: &RunId,
@@ -9499,53 +9583,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
     }
 
     async fn close(&self) -> Result<(), HaiderError> {
-        let pollers = self
-            .permission_pollers
-            .lock()
-            .map_err(|_| {
-                HaiderError::new(
-                    ErrorCode::Internal,
-                    "computer permission poller lock is poisoned",
-                    false,
-                )
-            })?
-            .drain()
-            .map(|(_, task)| task)
-            .collect::<Vec<_>>();
-        for task in pollers {
-            task.abort();
-        }
-        let emergency_stop = self.computer.emergency_stop().await;
-        let mut broker_guard = self.broker.lock().await;
-        let computer_turn_cancelled = self
-            .active_computer_turn_cancel
-            .lock()
-            .map_err(|_| {
-                HaiderError::new(
-                    ErrorCode::Internal,
-                    "computer cancellation state lock is poisoned",
-                    false,
-                )
-            })?
-            .as_ref()
-            .is_some_and(CancelToken::is_cancelled);
-        if computer_turn_cancelled && let Some(broker) = broker_guard.as_mut() {
-            broker.cancel_computer_actions();
-        }
-        let broker = broker_guard.take();
-        drop(broker_guard);
-        let Some(broker) = broker else {
-            return emergency_stop.map_err(computer_error);
-        };
-        let closed = broker.close().await.map(|_| ()).map_err(|error| {
-            HaiderError::new(
-                ErrorCode::EffectUnknownOutcome,
-                format!("effect broker close reported unfinished work: {error}"),
-                false,
-            )
-        });
-        closed?;
-        emergency_stop.map_err(computer_error)
+        self.close_effects(false).await
     }
 }
 

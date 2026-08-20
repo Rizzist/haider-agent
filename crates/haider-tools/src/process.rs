@@ -35,8 +35,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
@@ -688,20 +688,30 @@ struct ActiveProcess {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProcessRegistry {
-    active: Arc<Mutex<HashMap<String, ActiveProcess>>>,
+    active: Arc<StdMutex<HashMap<String, ActiveProcess>>>,
 }
 
 impl ProcessRegistry {
-    async fn get(&self, call_id: &str) -> Option<ActiveProcess> {
-        self.active.lock().await.get(call_id).cloned()
+    fn get(&self, call_id: &str) -> Option<ActiveProcess> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(call_id)
+            .cloned()
     }
 
-    async fn contains(&self, call_id: &str) -> bool {
-        self.active.lock().await.contains_key(call_id)
+    fn contains(&self, call_id: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(call_id)
     }
 
-    async fn insert(&self, call_id: String, process: ActiveProcess) -> ToolResult<()> {
-        let mut active = self.active.lock().await;
+    fn insert(&self, call_id: String, process: ActiveProcess) -> ToolResult<()> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if active.contains_key(&call_id) {
             return Err(ToolError::invalid_argument(format!(
                 "process call_id `{call_id}` is already live"
@@ -711,8 +721,11 @@ impl ProcessRegistry {
         Ok(())
     }
 
-    async fn remove(&self, call_id: &str, effect: &EffectId) {
-        let mut active = self.active.lock().await;
+    fn remove(&self, call_id: &str, effect: &EffectId) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if active
             .get(call_id)
             .is_some_and(|process| &process.effect == effect)
@@ -721,11 +734,11 @@ impl ProcessRegistry {
         }
     }
 
-    pub(crate) async fn leaked_call_ids(&self) -> Vec<String> {
+    pub(crate) fn leaked_call_ids(&self) -> Vec<String> {
         let mut leaked = self
             .active
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|(_, process)| process.leaked.load(Ordering::Acquire))
             .map(|(call_id, _)| call_id.clone())
@@ -734,11 +747,11 @@ impl ProcessRegistry {
         leaked
     }
 
-    pub(crate) async fn cancel_all(&self) {
+    pub(crate) fn cancel_all(&self) {
         let active = self
             .active
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .cloned()
             .collect::<Vec<_>>();
@@ -847,7 +860,7 @@ impl EffectBroker {
             bounds,
         )?;
         let operation = prepared.operation.clone();
-        if self.processes.contains(&operation.call_id).await {
+        if self.processes.contains(&operation.call_id) {
             return Err(ToolError::invalid_argument(format!(
                 "process call_id `{}` is already live",
                 operation.call_id
@@ -967,11 +980,7 @@ impl EffectBroker {
             live: Arc::clone(&live),
             leaked: Arc::clone(&leaked),
         };
-        if let Err(error) = self
-            .processes
-            .insert(operation.call_id.clone(), active)
-            .await
-        {
+        if let Err(error) = self.processes.insert(operation.call_id.clone(), active) {
             let _ = signal_group(pid, Signal::KILL);
             haider_platform::release_process_group(platform_group);
             return self.finish(&intent, Err(error)).await;
@@ -1005,7 +1014,7 @@ impl EffectBroker {
             })
             .await;
             if !process_result.leaked {
-                registry.remove(&call_id, &effect).await;
+                registry.remove(&call_id, &effect);
                 if let Ok(result) = &mut process_result.result {
                     result
                         .lifecycle_events
@@ -1075,7 +1084,7 @@ impl EffectBroker {
         control: &ProcessControl,
         policy: &PermissionPolicy,
     ) -> ToolResult<ProcessControlResult> {
-        let active = self.processes.get(&control.call_id).await.ok_or_else(|| {
+        let active = self.processes.get(&control.call_id).ok_or_else(|| {
             ToolError::invalid_argument(format!(
                 "process call_id `{}` is not live",
                 control.call_id

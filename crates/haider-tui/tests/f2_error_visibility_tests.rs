@@ -396,3 +396,163 @@ fn failed_tool_rows_wear_the_error_glyph() {
         "the failed tool is marked in the view"
     );
 }
+
+// ── One failure, one row (dogfood bug 3) ────────────────────────────────
+//
+// A failed tool call must render ONCE: inline on its tool row. The
+// standalone `effect failed — …` line remains ONLY for failures with no
+// owning tool-call row, and a deferred failure that never finds its owner
+// flushes at the run's terminal state so nothing is silently swallowed.
+
+fn effect_intent(seq_effect: &str, summary: &str) -> EventPayload {
+    EventPayload::Effect(EffectPhase::Intent(haider_protocol::effect::EffectIntent {
+        effect: EffectId::new(seq_effect),
+        class: haider_protocol::effect::EffectClass::ProcessExec,
+        summary: summary.to_owned(),
+        args_digest: format!("digest-{seq_effect}"),
+        workspace_revision: None,
+    }))
+}
+
+fn effect_failed(effect: &str, error: &str) -> EventPayload {
+    EventPayload::Effect(EffectPhase::Outcome {
+        effect: EffectId::new(effect),
+        outcome: EffectOutcome::Failed {
+            error: error.to_owned(),
+        },
+        freshness: None,
+        workspace_mutation: None,
+    })
+}
+
+fn failed_result(reason: &str) -> haider_protocol::tool::BoundedResult {
+    haider_protocol::tool::BoundedResult {
+        preview: String::new(),
+        truncated: false,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: haider_protocol::tool::ToolResultStatus::Failed,
+        reason: Some(reason.to_owned()),
+        presentation: None,
+    }
+}
+
+fn tool_started(item: &str, call: &str) -> EventPayload {
+    EventPayload::Item(ItemEvent::Started {
+        item_id: ItemId::new(item),
+        item: TurnItem::ToolCall {
+            name: "process_exec".to_owned(),
+            args: serde_json::json!({"cmd": "cargo test"}),
+            status: ToolStatus::InProgress,
+            call_id: call.to_owned(),
+        },
+    })
+}
+
+fn tool_completed(item: &str, call: &str, status: ToolStatus) -> EventPayload {
+    EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new(item),
+        item: TurnItem::ToolCall {
+            name: "process_exec".to_owned(),
+            args: serde_json::json!({"cmd": "cargo test"}),
+            status,
+            call_id: call.to_owned(),
+        },
+    })
+}
+
+/// MUTATION CHECK (dogfood bug 3): restore the unconditional
+/// `TranscriptEntry::Error` push in the `EffectOutcome::Failed` arm.
+/// Expected runtime failure: the same failure renders twice — inline on
+/// the tool row AND as a standalone `effect failed` line.
+#[test]
+fn a_failed_tool_call_renders_exactly_one_row() {
+    let mut model = live_session();
+    model.route_raw(&raw(1, &tool_started("tool-9", "call-9")));
+    model.route_raw(&raw(2, &effect_intent("eff-9", "run cargo test")));
+    model.route_raw(&raw(3, &effect_failed("eff-9", "spawn: ENOENT")));
+    model.route_raw(&raw(
+        4,
+        &EventPayload::ToolResult {
+            call_id: "call-9".to_owned(),
+            result: failed_result("spawn: ENOENT"),
+        },
+    ));
+    model.route_raw(&raw(
+        5,
+        &tool_completed("tool-9", "call-9", ToolStatus::Failed),
+    ));
+    model.route_raw(&raw(6, &EventPayload::RunState(RunState::Done)));
+    let errors = error_texts(&model);
+    assert!(
+        errors.is_empty(),
+        "the failure lives on the tool row only — no standalone line: {errors:?}"
+    );
+    let reason = model
+        .projection
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            TranscriptEntry::Item(block) => block.tool_reason.clone(),
+            _ => None,
+        })
+        .expect("the tool row carries its failure reason");
+    assert!(reason.contains("ENOENT"), "{reason}");
+    assert!(
+        draw_text(&model).contains("✗ process_exec"),
+        "one visible failed row"
+    );
+}
+
+/// A failure with NO owning tool-call row keeps its standalone line —
+/// suppression must never swallow an unowned failure.
+#[test]
+fn an_unowned_effect_failure_keeps_its_standalone_row() {
+    let mut model = live_session();
+    // Intent journals while no tool row is live: no owner candidates.
+    model.route_raw(&raw(1, &effect_intent("eff-10", "background work")));
+    model.route_raw(&raw(2, &effect_failed("eff-10", "disk full")));
+    let errors = error_texts(&model);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("effect failed") && errors[0].contains("disk full"));
+}
+
+/// MUTATION CHECK (dogfood bug 3): drop `flush_pending_effect_failures`
+/// from the terminal RunState arm. Expected runtime failure: a deferred
+/// failure whose owner never settles vanishes — a silent failure.
+#[test]
+fn a_deferred_effect_failure_flushes_at_the_terminal_state() {
+    let mut model = live_session();
+    model.route_raw(&raw(1, &tool_started("tool-11", "call-11")));
+    model.route_raw(&raw(2, &effect_intent("eff-11", "run cargo test")));
+    model.route_raw(&raw(3, &effect_failed("eff-11", "boom")));
+    assert!(
+        error_texts(&model).is_empty(),
+        "the failure is deferred while its owner may still settle"
+    );
+    model.route_raw(&raw(4, &EventPayload::RunState(RunState::Done)));
+    let errors = error_texts(&model);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("effect failed") && errors[0].contains("boom"));
+}
+
+/// A result that carries a DIFFERENT error does not suppress the effect's
+/// own line — two distinct failures stay two visible facts.
+#[test]
+fn a_mismatched_result_error_does_not_suppress_the_effect_row() {
+    let mut model = live_session();
+    model.route_raw(&raw(1, &tool_started("tool-12", "call-12")));
+    model.route_raw(&raw(2, &effect_intent("eff-12", "run cargo test")));
+    model.route_raw(&raw(3, &effect_failed("eff-12", "spawn: ENOENT")));
+    model.route_raw(&raw(
+        4,
+        &EventPayload::ToolResult {
+            call_id: "call-12".to_owned(),
+            result: failed_result("different problem"),
+        },
+    ));
+    let errors = error_texts(&model);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("effect failed") && errors[0].contains("ENOENT"));
+}

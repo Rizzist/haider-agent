@@ -813,6 +813,11 @@ pub trait ToolDispatcher: Send + Sync {
         Ok(())
     }
 
+    /// Cancels and drains effects abandoned by an orderly turn cancellation.
+    async fn cancel(&self) -> Result<(), HaiderError> {
+        self.close().await
+    }
+
     /// Drains process/finalizer ownership after the logical turn ends.
     async fn close(&self) -> Result<(), HaiderError> {
         Ok(())
@@ -4407,7 +4412,7 @@ impl HarnessActor {
                 // follow the item's terminal event. Close errors cannot turn a
                 // committed user cancellation into a failure; the daemon owner
                 // repeats/logs its idempotent close after the actor settles.
-                let _ = dispatcher.close().await;
+                let _ = dispatcher.cancel().await;
                 return Err(DriveError::Cancelled);
             };
             let result = result.map_err(DriveError::Store)?;
@@ -5650,16 +5655,24 @@ impl HarnessActor {
         reasoning: &mut Option<TextAccumulator>,
         tools: &mut Vec<ToolAccumulator>,
     ) -> TurnOutcome {
-        if let Some(dispatcher) = self.dispatcher.as_ref()
-            && let Err(error) = dispatcher.cancel_outstanding_deferred().await
-        {
-            return errored_outcome(error);
+        let mut cleanup_error = None;
+        if let Some(dispatcher) = self.dispatcher.as_ref() {
+            if let Err(error) = dispatcher.cancel_outstanding_deferred().await {
+                cleanup_error = Some(error);
+            }
+            // P1-1: a cancel/close failure cannot turn a committed user
+            // cancellation into a failure — the daemon owner reconciles
+            // every abandoned dispatch after the actor settles.
+            let _ = dispatcher.cancel().await;
         }
         if let Err(error) = self
             .complete_open_items(run_id, message, reasoning, tools, ToolStatus::Cancelled)
             .await
         {
             return errored_outcome(drive_error_to_haider(error));
+        }
+        if let Some(error) = cleanup_error {
+            return errored_outcome(error);
         }
         self.cancelled_outcome(run_id).await
     }

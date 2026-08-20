@@ -2633,28 +2633,233 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    // The cancelled run's own content (its user message) is structurally
-    // excluded by the existing run-terminal gate — ONLY the task facts
-    // bypass it, which is exactly why the bypass is load-bearing.
+    // The cancelled run's committed content (its user message) is visible —
+    // any terminal run contributes its committed history. The task-fact
+    // bypass stays load-bearing for facts whose spawning run is non-terminal
+    // and non-current (e.g. parked awaiting input).
+    assert_eq!(text[0], "start the watcher");
     assert_eq!(
-        text[0],
+        text[1],
         "[background task started] watcher (task-11) — cargo watch -x test"
     );
     assert_eq!(
-        text[1],
+        text[2],
         "[background task finished] watcher (task-11) exited with code 0 after 42s — \
          900000 output bytes (truncated; full retained output in the task artifact)\n\
          output tail:\ntest result: ok\n"
     );
-    assert_eq!(text[2], "how did it go");
+    assert_eq!(text[3], "how did it go");
     assert_eq!(
         text.len(),
-        3,
-        "the Omit (steer-delivered) fact renders nothing and the cancelled \
-         run's user message stays excluded: {text:?}"
+        4,
+        "the Omit (steer-delivered) fact renders nothing: {text:?}"
     );
     assert!(
         !text.iter().any(|line| line.contains("steered")),
         "no second prompt copy for a steer-delivered completion: {text:?}"
+    );
+}
+
+/// MUTATION CHECK (dogfood bug 1 — context loss): restore the
+/// `RunState::Done`-only visibility gate in `render_journal`
+/// (`prior_state == Done` instead of `RunState::is_terminal`). Expected
+/// runtime failure: the cancelled and errored runs' committed content —
+/// including the USER'S OWN MESSAGES — vanishes from the next prompt, and
+/// the prefix-stability assertion below breaks (the dogfood cache-miss
+/// bug was this exact divergence).
+#[tokio::test]
+async fn cancelled_and_errored_runs_keep_their_committed_history() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("terminal-history-session");
+    let run_1 = RunId::new("terminal-history-run-1");
+    let run_2 = RunId::new("terminal-history-run-2");
+    let run_3 = RunId::new("terminal-history-run-3");
+    let interruption = haider_protocol::error::ErrorPresentation::new(
+        "stream-interrupted",
+        "Stream interrupted",
+        "the turn was cancelled mid-stream",
+        haider_protocol::error::ErrorScope::Turn,
+        [haider_protocol::error::ErrorAction::Retry],
+    );
+    let mut events = vec![
+        // run 1: CANCELLED after committing real work.
+        envelope(
+            &session_id,
+            &run_1,
+            "th-user-1",
+            EventPayload::UserMessage {
+                text: "fix the parser".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_1,
+            "th-agent-1",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("th-item-agent-1"),
+                item: TurnItem::AgentMessage {
+                    text: "half analysis done".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_1,
+            "th-tool-result-1",
+            EventPayload::ToolResult {
+                call_id: "th-call-1".into(),
+                result: BoundedResult {
+                    preview: "grep output".into(),
+                    truncated: false,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: haider_protocol::tool::ToolResultStatus::Completed,
+                    reason: None,
+                    presentation: None,
+                },
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_1,
+            "th-tool-1",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("th-item-tool-1"),
+                item: TurnItem::ToolCall {
+                    call_id: "th-call-1".into(),
+                    name: "fs_read".into(),
+                    args: serde_json::json!({"path": "parser.rs"}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        // A tool call the cancel closed with NO result: never rendered —
+        // an assistant tool_use without its result would corrupt the wire.
+        envelope(
+            &session_id,
+            &run_1,
+            "th-tool-2",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("th-item-tool-2"),
+                item: TurnItem::ToolCall {
+                    call_id: "th-call-2".into(),
+                    name: "process_exec".into(),
+                    args: serde_json::json!({"cmd": "cargo test"}),
+                    status: ToolStatus::Cancelled,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        // A torn partial stream with NO continue-partial answer: excluded.
+        envelope(
+            &session_id,
+            &run_1,
+            "th-torn-1",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("th-item-torn-1"),
+                item: TurnItem::IncompleteAgentMessage {
+                    text: "torn half-sentence".into(),
+                    interruption,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_1,
+            "th-run-1-state",
+            EventPayload::RunState(RunState::Cancelled),
+            PromptRender::Omit,
+        ),
+        // run 2: ERRORED right after the user message.
+        envelope(
+            &session_id,
+            &run_2,
+            "th-user-2",
+            EventPayload::UserMessage {
+                text: "try again".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_2,
+            "th-run-2-state",
+            EventPayload::RunState(RunState::Errored),
+            PromptRender::Omit,
+        ),
+        // run 3: the current turn.
+        envelope(
+            &session_id,
+            &run_3,
+            "th-user-3",
+            EventPayload::UserMessage {
+                text: "continue".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append terminal history");
+
+    let as_if_run_2 = PromptHistoryCompiler::compile(&store, &session_id, None, None, &run_2)
+        .await
+        .expect("compile as run 2");
+    let messages = PromptHistoryCompiler::compile(&store, &session_id, None, None, &run_3)
+        .await
+        .expect("compile next turn");
+    let text = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text,
+        [
+            "fix the parser",
+            "half analysis done",
+            "try again",
+            "continue"
+        ],
+        "every terminal run's committed content survives; torn content does not"
+    );
+    assert!(
+        messages.iter().flat_map(|message| &message.blocks).any(
+            |block| matches!(block, Block::ToolCall { call_id, .. } if call_id == "th-call-1")
+        ),
+        "the completed tool call is carried forward"
+    );
+    assert!(
+        messages.iter().flat_map(|message| &message.blocks).any(
+            |block| matches!(block, Block::ToolResult { call_id, .. } if call_id == "th-call-1")
+        ),
+        "…with its paired result"
+    );
+    assert!(
+        !messages.iter().flat_map(|message| &message.blocks).any(
+            |block| matches!(block, Block::ToolCall { call_id, .. } if call_id == "th-call-2")
+        ),
+        "a cancelled call with no result never emits an orphaned tool_use"
+    );
+    // Dogfood bug 2 (cache misses) was the divergence this pins: the next
+    // turn's projection must EXTEND the prior turn's — byte-stable prefix.
+    assert!(
+        messages.len() > as_if_run_2.len() && messages[..as_if_run_2.len()] == as_if_run_2[..],
+        "the cancel boundary preserves the carried-forward prompt prefix"
     );
 }

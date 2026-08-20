@@ -2416,7 +2416,8 @@ impl ToolDispatcher for ClosingHeldEffectDispatcher {
     async fn close(&self) -> Result<(), HaiderError> {
         // Exact close-failure schedule: the dispatcher reports failure before
         // writing an outcome. The supervisor must reduce durable truth and
-        // synthesize Unknown itself before it may commit Cancelled.
+        // terminalize the abandoned dispatch itself before it may commit
+        // Cancelled.
         Err(HaiderError::new(
             ErrorCode::EffectUnknownOutcome,
             "injected dispatcher close failure",
@@ -2425,13 +2426,16 @@ impl ToolDispatcher for ClosingHeldEffectDispatcher {
     }
 }
 
-/// Exact P1-1 schedule: cancellation drops a held dispatched execution,
-/// dispatcher close fails without recording an outcome, durable
-/// reconciliation appends Unknown, and only then may Cancelled commit.
+/// Exact P1-1 schedule: cancellation drops a held dispatched execution and
+/// dispatcher close fails without recording an outcome. Orderly cancellation
+/// reconciles the abandoned dispatch to a terminal Cancelled outcome — never
+/// an Unknown crash window — and only then may the run commit Cancelled.
 ///
 /// MUTATION CHECK: remove `reconcile_unknown_effects` or restore the terminal
-/// commit before it. Expected failure: Unknown is absent or follows
-/// Cancelled. Verified by revert in W3c1.1.
+/// commit before it; or make the cancel path reconcile with
+/// `UnknownReconcile::EvidenceOnly`/`Park` instead of `Cancel`. Expected
+/// failure: the Cancelled outcome is absent (or Unknown appears) or the
+/// outcome follows the run terminal. Verified by revert in W3c1.1.
 #[tokio::test]
 async fn held_effect_reconciles_unknown_before_cancelled() {
     let root = test_root("w3c-live-");
@@ -2527,18 +2531,28 @@ async fn held_effect_reconciles_unknown_before_cancelled() {
                 if *candidate == effect
         )
     });
-    let unknown = position(&|payload| {
+    let outcome = position(&|payload| {
         matches!(
             payload,
             EventPayload::Effect(EffectPhase::Outcome {
                 effect: candidate,
-                outcome: EffectOutcome::Unknown,
+                outcome: EffectOutcome::Cancelled,
                 ..
             }) if *candidate == effect
         )
     });
+    assert!(
+        !events.iter().any(|(_, payload)| matches!(
+            payload,
+            EventPayload::Effect(EffectPhase::Outcome {
+                outcome: EffectOutcome::Unknown,
+                ..
+            })
+        )),
+        "an orderly cancellation never records an Unknown crash window"
+    );
     let cancelled = position(&|payload| *payload == EventPayload::RunState(RunState::Cancelled));
-    assert!(dispatched < unknown && unknown < cancelled);
+    assert!(dispatched < outcome && outcome < cancelled);
     assert!(matches!(
         events.last(),
         Some((_, EventPayload::RunState(RunState::Cancelled)))
@@ -2770,6 +2784,31 @@ async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
             )
         })
     }));
+    // Context survives the errored run: its committed user message reaches
+    // the resumed request, while the torn (never-Completed) stream does not.
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    haider_protocol::provider::Block::Text { text } if text == "interrupted prompt"
+                )
+            })
+        }),
+        "the errored run's committed user message is carried forward"
+    );
+    assert!(
+        !requests[1].messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    haider_protocol::provider::Block::Text { text }
+                        if text.contains("partial before crash")
+                )
+            })
+        }),
+        "a torn partial stream is never fed back"
+    );
 
     second_task.shutdown_handle().request("test complete");
     second_task.join().await.expect("daemon joins");

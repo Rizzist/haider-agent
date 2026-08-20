@@ -1187,8 +1187,7 @@ fn render_journal(
         };
         let is_current = current_run.is_some_and(|current| run_id == *current);
         let prior_state = terminal.get(&run_id);
-        let ordinary_visible =
-            is_current || prior_state.is_some_and(|state| *state == RunState::Done);
+        let ordinary_visible = is_current || prior_state.is_some_and(RunState::is_terminal);
         let terminal_user_command_visible =
             !is_current && prior_state.is_some_and(RunState::is_terminal);
         if !ordinary_visible && !terminal_user_command_visible {
