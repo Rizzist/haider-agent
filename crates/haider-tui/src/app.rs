@@ -2921,6 +2921,11 @@ pub enum AppEvent {
     Key(KeyEvent),
     /// Bracketed paste arrives atomically; newlines never submit (rec 14).
     Paste(Pasted),
+    /// Volatile mirror input replaces the active surface's draft. This is
+    /// reducer-local text state: no prompt-history or journal side effect.
+    SurfaceInputReplace {
+        text: String,
+    },
     /// Boxed: `EventPayload` is much larger than the other variants.
     Envelope(Box<EventPayload>),
     /// Release discovery found a version newer than the running binary.
@@ -4756,6 +4761,10 @@ impl AppModel {
                 // Any composer edit re-opens a dismissed palette (sim
                 // `setMenuDismissed(false)` on change).
                 self.palette_dismissed = false;
+            }
+            AppEvent::SurfaceInputReplace { text } => {
+                self.composer.set_text(text);
+                self.dirty = true;
             }
             AppEvent::Envelope(payload) => {
                 self.dirty = true;

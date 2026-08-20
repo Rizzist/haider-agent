@@ -3011,11 +3011,6 @@ pub async fn run_live(
     // W-OSC: outer None = nothing announced yet, so the first tail pass
     // always announces (launcher or the --session target alike).
     let mut announced_session: Option<Option<String>> = None;
-    // W-INP: the composer publishes itself as the session's volatile input
-    // surface — one publish per actual change, revisions monotonic for the
-    // life of this process.
-    let mut published_input: Option<(u64, haider_protocol::ids::SessionId, String)> = None;
-    let mut input_revision: u64 = 0;
     // The status half (status_segment_v1) — same cache shape, own
     // revision counter (`status_publish_pass`).
     let mut published_status: Option<(u64, haider_protocol::ids::SessionId, String)> = None;
@@ -3232,31 +3227,9 @@ pub async fn run_live(
             sync_session_announce(attached.as_deref());
             announced_session = Some(attached);
         }
-        // W-INP: mirror the composer into the daemon's volatile surface —
-        // never journaled, never in prompts, keystroke-latency for an
-        // embedding ADE. Publish only real changes; the daemon drops stale
-        // revisions and reassigns ownership to the latest publisher.
-        if model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_V1)
-            && matches!(
-                model.screen,
-                crate::app::Screen::Session | crate::app::Screen::Subagent
-            )
-            && let Some(session) = model.active_session.clone()
-        {
-            let text = model.composer.text().to_owned();
-            // The epoch keys the cache: a redial cleared the daemon's
-            // surface state, so the same text must publish again.
-            let current = (driver.connection_epoch(), session.clone(), text.clone());
-            if published_input.as_ref() != Some(&current) {
-                input_revision = input_revision.saturating_add(1);
-                pending.push_back(crate::live::LiveCommand::SurfacePublish {
-                    session,
-                    input: Some((text, input_revision)),
-                    status: None,
-                });
-                published_input = Some(current);
-            }
-        }
+        // W-INP: watch and publish the active per-surface composer through
+        // the driver's shared revision fence. Nothing is journaled.
+        pending.extend(driver.sync_input_mirror(&model));
         // The status half (status_segment_v1): the bar's bottom-left strip
         // mirrors under the same dedup discipline, through the one
         // extracted seam.

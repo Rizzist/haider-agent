@@ -120,6 +120,10 @@ pub enum LiveCommand {
         input: Option<(String, u64)>,
         status: Option<(String, u64)>,
     },
+    /// W-INP: watch the latest volatile composer for one session.
+    SurfaceWatch {
+        session: SessionId,
+    },
     Submit {
         command_id: CommandId,
         session: SessionId,
@@ -537,6 +541,120 @@ impl LiveDriver {
     pub fn connection_epoch(&self) -> u64 {
         self.connection_epoch
     }
+
+    /// Synchronize the active composer's bidirectional volatile mirror.
+    #[must_use]
+    pub fn sync_input_mirror(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        if self.input_mirror.epoch != self.connection_epoch {
+            let publish_revision = self.input_mirror.publish_revision;
+            self.input_mirror = InputMirrorState {
+                epoch: self.connection_epoch,
+                publish_revision,
+                ..InputMirrorState::default()
+            };
+        }
+        if !model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_V1)
+            || !matches!(
+                model.screen,
+                crate::app::Screen::Session | crate::app::Screen::Subagent
+            )
+        {
+            self.input_mirror.binding = None;
+            return Vec::new();
+        }
+        let Some(session) = model.active_session.clone() else {
+            self.input_mirror.binding = None;
+            return Vec::new();
+        };
+        let watch = self.input_mirror.binding.as_ref() != Some(&session);
+        if watch {
+            self.input_mirror.binding = Some(session.clone());
+        }
+
+        let text = model.composer.text();
+        let unchanged = self
+            .input_mirror
+            .sessions
+            .get(&session)
+            .and_then(|state| state.published_text.as_deref())
+            == Some(text);
+        let mut commands = Vec::with_capacity(2);
+        if !unchanged {
+            self.input_mirror.publish_revision =
+                self.input_mirror.publish_revision.saturating_add(1);
+            let revision = self.input_mirror.publish_revision;
+            let state = self
+                .input_mirror
+                .sessions
+                .entry(session.clone())
+                .or_default();
+            state.published_text = Some(text.to_owned());
+            state.last_published_revision = Some(revision);
+            commands.push(LiveCommand::SurfacePublish {
+                session: session.clone(),
+                input: Some((text.to_owned(), revision)),
+                status: None,
+            });
+        }
+        if watch {
+            // Preserve the existing local publish edge, then establish the
+            // watch whose complete ack closes any subscription race.
+            commands.push(LiveCommand::SurfaceWatch { session });
+        }
+        commands
+    }
+
+    fn surface_watching(
+        &mut self,
+        model: &mut AppModel,
+        session: SessionId,
+        input: Option<haider_rpc::SurfaceInputWire>,
+    ) {
+        if self.input_mirror.binding.as_ref() != Some(&session) {
+            return;
+        }
+        if let Some(input) = input {
+            self.apply_surface_input(model, session, input);
+        }
+    }
+
+    fn apply_surface_input(
+        &mut self,
+        model: &mut AppModel,
+        session: SessionId,
+        input: haider_rpc::SurfaceInputWire,
+    ) {
+        if !model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_V1)
+            || !matches!(
+                model.screen,
+                crate::app::Screen::Session | crate::app::Screen::Subagent
+            )
+            || model.active_session.as_ref() != Some(&session)
+            || self.input_mirror.binding.as_ref() != Some(&session)
+        {
+            return;
+        }
+        let state = self.input_mirror.sessions.entry(session).or_default();
+        if state
+            .last_published_revision
+            .is_some_and(|revision| input.revision <= revision)
+            || state
+                .last_remote_revision
+                .is_some_and(|revision| input.revision <= revision)
+        {
+            return;
+        }
+
+        // The wire owner is daemon-opaque; revision floors identify echoes.
+        self.input_mirror.publish_revision = self
+            .input_mirror
+            .publish_revision
+            .max(input.revision)
+            .saturating_add(1);
+        state.last_remote_revision = Some(input.revision);
+        state.published_text = Some(input.text.clone());
+        model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
+    }
 }
 
 impl LiveCommand {
@@ -560,7 +678,7 @@ impl LiveCommand {
             Self::GraphPin { command_id, .. } | Self::GraphAbandon { command_id, .. } => {
                 Some(command_id)
             }
-            Self::SurfacePublish { .. } => None,
+            Self::SurfacePublish { .. } | Self::SurfaceWatch { .. } => None,
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::DeviceImport { command_id, .. } => Some(command_id),
@@ -609,6 +727,17 @@ impl LiveCommand {
 /// One inbound fact the driver reduces.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveReply {
+    /// The watch registration landed, with the current complete input
+    /// snapshot when one exists.
+    SurfaceWatching {
+        session: SessionId,
+        input: Option<haider_rpc::SurfaceInputWire>,
+    },
+    /// A watched session's latest volatile input snapshot changed.
+    SurfaceInput {
+        session: SessionId,
+        input: haider_rpc::SurfaceInputWire,
+    },
     /// W-INP: an embedding client injected into this session's live input
     /// surface. The TUI is the owning composer — it applies the op and its
     /// next publish is the acknowledgement.
@@ -1128,6 +1257,21 @@ impl Cold {
     }
 }
 
+#[derive(Debug, Default)]
+struct InputMirrorSession {
+    published_text: Option<String>,
+    last_published_revision: Option<u64>,
+    last_remote_revision: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct InputMirrorState {
+    epoch: u64,
+    binding: Option<SessionId>,
+    publish_revision: u64,
+    sessions: HashMap<SessionId, InputMirrorSession>,
+}
+
 /// The live driver. See the module charter.
 #[derive(Debug)]
 pub struct LiveDriver {
@@ -1135,6 +1279,9 @@ pub struct LiveDriver {
     /// Reads that must not cross a reconnect (loom.list) carry it out and
     /// their replies echo it back; a mismatch installs nothing.
     connection_epoch: u64,
+    /// Bidirectional volatile composer state. Session fences reset on a new
+    /// socket; the process-local publish counter stays monotonic.
+    input_mirror: InputMirrorState,
     /// Attachment ids by session, and the reverse map used to REJECT an
     /// event for an attachment we do not hold (report §6.3: "unknown
     /// attachment ids are rejected").
@@ -1322,6 +1469,7 @@ impl LiveDriver {
     pub fn new(instance: impl Into<String>) -> Self {
         Self {
             connection_epoch: 0,
+            input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
             routes: HashMap::new(),
             lru: Vec::new(),
@@ -1632,6 +1780,14 @@ impl LiveDriver {
     #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         match reply {
+            LiveReply::SurfaceWatching { session, input } => {
+                self.surface_watching(model, session, input);
+                Vec::new()
+            }
+            LiveReply::SurfaceInput { session, input } => {
+                self.apply_surface_input(model, session, input);
+                Vec::new()
+            }
             LiveReply::LoomRegistry {
                 agent_types,
                 workflows,
