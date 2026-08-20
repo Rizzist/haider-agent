@@ -341,6 +341,13 @@ pub const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
 pub const FEATURE_INPUT_MIRROR_V1: &str = "input_mirror_v1";
 /// Daemon-owned volatile status-segment publication and watching.
 pub const FEATURE_STATUS_SEGMENT_V1: &str = "status_segment_v1";
+/// Daemon latches durable-store write health and pushes the transition —
+/// degraded and recovered alike — to every connection as an out-of-band
+/// `ProtocolError` (`store_full`/`store_read_only`/`store_unavailable`,
+/// cleared by `store_healthy`), and replays the latched state to a client
+/// connecting while degraded. Never journaled: the journal is the
+/// component reporting that it cannot write.
+pub const FEATURE_STORE_HEALTH_V1: &str = "store_health_v1";
 /// Daemon supports opt-in MessagePack encoding after the JSON handshake.
 pub const FEATURE_WIRE_MSGPACK_V1: &str = "wire_msgpack_v1";
 /// Daemon can omit superseded item deltas from the durable store phase of a

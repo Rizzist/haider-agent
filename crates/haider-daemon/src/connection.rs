@@ -1577,6 +1577,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
         FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
         haider_rpc::FEATURE_STATUS_SEGMENT_V1.to_owned(),
+        haider_rpc::FEATURE_STORE_HEALTH_V1.to_owned(),
         FEATURE_SHELL_EXEC_V1.to_owned(),
         FEATURE_USER_COMMAND_V1.to_owned(),
         FEATURE_TOOL_INVENTORY_V1.to_owned(),
