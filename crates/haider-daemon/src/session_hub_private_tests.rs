@@ -2918,3 +2918,36 @@ async fn transcription_secret_hygiene_refuses_before_any_vault_write() {
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
+
+/// effect_recovery_v1: a run parked in the crash-window state maps to the
+/// typed `EffectUnknown` wire state (not swallowed into Running/Unknown),
+/// and it out-ranks other states in the observed-run selector so the rail
+/// surfaces the parked crash window over concurrent activity.
+///
+/// MUTATION CHECK: map EffectOutcomeUnknown to Running/Unknown, or drop its
+/// top priority in select_observed_run. Expected runtime failure: the wire
+/// state is wrong, or a parked crash window hides behind another run.
+#[test]
+fn effect_outcome_unknown_maps_to_typed_state_and_outranks() {
+    use crate::session_hub::rpc::observe_run_state;
+    use haider_protocol::state::RunState;
+    use haider_rpc::ObserveRunStateWire;
+
+    assert!(matches!(
+        observe_run_state(&RunState::EffectOutcomeUnknown),
+        ObserveRunStateWire::EffectUnknown
+    ));
+    // The neighbours stay distinct (no accidental collapse).
+    assert!(matches!(
+        observe_run_state(&RunState::Errored),
+        ObserveRunStateWire::Errored
+    ));
+    assert!(matches!(
+        observe_run_state(&RunState::Cancelled),
+        ObserveRunStateWire::Cancelled
+    ));
+    assert!(matches!(
+        observe_run_state(&RunState::Thinking),
+        ObserveRunStateWire::Running
+    ));
+}

@@ -74,10 +74,18 @@ async fn session_summary_truth(
     store: &dyn StoreHandle,
     session_id: &SessionId,
     through_seq: u64,
-) -> Result<(u64, Option<ContextFootprint>), HaiderError> {
+) -> Result<
+    (
+        u64,
+        Option<ContextFootprint>,
+        haider_rpc::ObserveRunStateWire,
+    ),
+    HaiderError,
+> {
     let mut since_seq = 0;
     let mut turns = 0_u64;
     let mut latest = None;
+    let mut runs = HashMap::<RunId, ObservedRun>::new();
     while since_seq < through_seq {
         let page = store.read(session_id, since_seq, REPLAY_PAGE_SIZE).await?;
         if page.is_empty() {
@@ -86,11 +94,14 @@ async fn session_summary_truth(
         let mut advanced = false;
         for envelope in page {
             if envelope.seq > through_seq {
-                return Ok((turns, latest));
+                return Ok((turns, latest, summary_run_state(&runs)));
             }
             since_seq = envelope.seq;
             advanced = true;
             let agent_scoped = envelope.agent_id.is_some();
+            let run_id = envelope.run_id.clone();
+            let branch_id = envelope.branch_id.clone();
+            let seq = envelope.seq;
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
                 continue;
             };
@@ -103,6 +114,18 @@ async fn session_summary_truth(
                         latest = Some(footprint);
                     }
                 }
+                EventPayload::RunState(state) => {
+                    if let Some(run_id) = run_id {
+                        runs.insert(
+                            run_id,
+                            ObservedRun {
+                                state,
+                                seq,
+                                branch_id,
+                            },
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -110,7 +133,13 @@ async fn session_summary_truth(
             break;
         }
     }
-    Ok((turns, latest))
+    Ok((turns, latest, summary_run_state(&runs)))
+}
+
+fn summary_run_state(runs: &HashMap<RunId, ObservedRun>) -> haider_rpc::ObserveRunStateWire {
+    select_observed_run(runs).map_or(haider_rpc::ObserveRunStateWire::Idle, |run| {
+        observe_run_state(&run.state)
+    })
 }
 
 /// Compact direct-agent metrics from the same sealed journal head carried by
@@ -573,6 +602,20 @@ impl ObserveProjection {
                     haider_rpc::ObserveMenuWire {
                         kind: kind.into(),
                         title: menu.title,
+                        menu_id: Some(menu.id),
+                        request_seq: Some(seq),
+                        worker_generation: Some(envelope.worker_generation),
+                        opened_at_ms: Some(envelope.committed_at_ms),
+                        body: menu.body,
+                        options: menu
+                            .options
+                            .into_iter()
+                            .map(|option| haider_rpc::ObserveMenuOptionWire {
+                                key: option.key,
+                                label: option.label,
+                                detail: option.detail,
+                            })
+                            .collect(),
                         permission_description,
                         presentation,
                     },
@@ -691,7 +734,8 @@ impl ObserveProjection {
 }
 
 fn select_observed_run(runs: &HashMap<RunId, ObservedRun>) -> Option<&ObservedRun> {
-    let predicates: [fn(&RunState) -> bool; 4] = [
+    let predicates: [fn(&RunState) -> bool; 5] = [
+        |state| matches!(state, RunState::EffectOutcomeUnknown),
         |state| matches!(state, RunState::PermissionRequired { .. }),
         |state| matches!(state, RunState::InputRequired { .. }),
         |state| !state.is_terminal() && !matches!(state, RunState::Queued),
@@ -709,10 +753,11 @@ fn select_observed_run(runs: &HashMap<RunId, ObservedRun>) -> Option<&ObservedRu
     runs.values().max_by_key(|run| run.seq)
 }
 
-fn observe_run_state(state: &RunState) -> haider_rpc::ObserveRunStateWire {
+pub(crate) fn observe_run_state(state: &RunState) -> haider_rpc::ObserveRunStateWire {
     match state {
         RunState::PermissionRequired { .. } => haider_rpc::ObserveRunStateWire::ParkedPermission,
         RunState::InputRequired { .. } => haider_rpc::ObserveRunStateWire::ParkedInput,
+        RunState::EffectOutcomeUnknown => haider_rpc::ObserveRunStateWire::EffectUnknown,
         RunState::Errored => haider_rpc::ObserveRunStateWire::Errored,
         RunState::Cancelled => haider_rpc::ObserveRunStateWire::Cancelled,
         RunState::Done => haider_rpc::ObserveRunStateWire::Idle,
@@ -725,7 +770,6 @@ fn observe_run_state(state: &RunState) -> haider_rpc::ObserveRunStateWire {
         | RunState::Compacting
         | RunState::Verifying { .. }
         | RunState::Concluding
-        | RunState::EffectOutcomeUnknown
         | RunState::Cancelling => haider_rpc::ObserveRunStateWire::Running,
     }
 }
@@ -6579,7 +6623,7 @@ impl HubConnection {
         let (turn_count, agent_metrics) = if metadata_only {
             (None, None)
         } else {
-            let (turns, _footprint) =
+            let (turns, _footprint, _run_state) =
                 session_summary_truth(&self.hub.inner.store, &session_id, head).await?;
             let initial_model = metadata
                 .as_ref()
@@ -7278,7 +7322,7 @@ pub(crate) async fn session_summaries(
         let metadata = hub.inner.store.session_metadata(session_id).await?;
         // Roster truth for unattached sessions replays the same sealed journal
         // as observation, so watches and explicit lists cannot disagree.
-        let (turns, footprint) =
+        let (turns, footprint, run_state) =
             session_summary_truth(&hub.inner.store, session_id, head_seq).await?;
         let (footprint_tokens, footprint_truth) =
             summary_footprint_fields(turns, footprint.as_ref());
@@ -7309,10 +7353,15 @@ pub(crate) async fn session_summaries(
         let metadata_agent_type = metadata
             .as_ref()
             .and_then(|metadata| metadata.agent_type.clone());
+        let effort = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.effort.clone());
+        let fast = metadata.as_ref().map(|metadata| metadata.fast);
         sessions.push(SessionSummary {
             session_id: session_id.clone(),
             head_seq,
             worker_generation: hub.inner.store.worker_generation(),
+            run_state: Some(run_state),
             workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
             metadata,
             last_model,
@@ -7324,6 +7373,9 @@ pub(crate) async fn session_summaries(
             parent_session_id,
             kind: Some(kind),
             agent_type: metadata_agent_type,
+            effort,
+            fast,
+            account_alias: None,
         });
     }
     Ok(sessions)
@@ -7461,6 +7513,10 @@ mod roster_wave_tests {
             parent_session_id: None,
             kind: None,
             agent_type: None,
+            run_state: None,
+            effort: None,
+            fast: None,
+            account_alias: None,
         }
     }
 

@@ -59,7 +59,7 @@ use haider_core::{
     ProviderPairSwitch, ProviderPairSwitchCommitter, RequestInputCheckpoint,
     SessionSelectModelCommand, SessionSelectModelOutcome, StoreHandle, SubmitCheckpointTurn,
     SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
-    ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
+    ToolDispatcher, TurnHandle, context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_input_tokens, presentation_for_haider_error,
     sanitized_failure_message,
 };
@@ -3593,6 +3593,11 @@ async fn append_unknown_effect_scan(
     if pending.is_empty() {
         return Ok(durable_state);
     }
+    let evidence = if mode == UnknownReconcile::Park {
+        effect_recovery_evidence(store, store.session_id(), Some(run_id), branch_id, &pending).await
+    } else {
+        HashMap::new()
+    };
     let mut payloads = Vec::with_capacity(pending.len().saturating_mul(3));
     for effect in pending {
         if !outcomes.contains_key(&effect) {
@@ -3608,14 +3613,21 @@ async fn append_unknown_effect_scan(
             }));
         }
         if mode == UnknownReconcile::Park {
-            payloads.push(EventPayload::MenuOpened(effect_recovery_menu(
+            let mut menu = effect_recovery_menu(
                 MenuId::new(format!("effect-recovery-{run_id}-{effect}")),
                 effect.clone(),
                 summaries
                     .get(&effect)
                     .map(String::as_str)
                     .unwrap_or("unknown dispatched effect"),
-            )));
+            );
+            menu.body.push(
+                evidence
+                    .get(&effect)
+                    .cloned()
+                    .unwrap_or_else(|| "probe: evidence unavailable".into()),
+            );
+            payloads.push(EventPayload::MenuOpened(menu));
             payloads.push(EventPayload::RunState(RunState::EffectOutcomeUnknown));
             durable_state = Some(RunState::EffectOutcomeUnknown);
         }

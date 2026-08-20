@@ -65,10 +65,10 @@ pub use shell::{
 pub use spawn_subagent::{SpawnSubagent, spawn_subagent_manifest};
 pub use tasks::{
     BACKGROUND_KILL_GRACE, BackgroundExec, BackgroundExitStatus, BackgroundSpawn,
-    MAX_TASK_NAME_CHARS, OrphanReap, PidLiveness, SharedTaskOutput, TaskKillHandle,
-    TaskOutputBuffer, default_task_name, lock_task_output, probe_group_liveness, reap_orphan_group,
-    shared_task_output, supervise_background, task_kill_channel, task_kill_manifest,
-    task_output_manifest,
+    EvidencePidLiveness, MAX_TASK_NAME_CHARS, OrphanReap, PidLiveness, SharedTaskOutput,
+    TaskKillHandle, TaskOutputBuffer, default_task_name, lock_task_output, probe_group_liveness,
+    probe_group_liveness_evidence, reap_orphan_group, shared_task_output, supervise_background,
+    task_kill_channel, task_kill_manifest, task_output_manifest,
 };
 pub use todo_write::{MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TodoWrite, todo_write_manifest};
 pub use webfetch::{

@@ -420,6 +420,7 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         session_id: SessionId::new(session_id),
         head_seq,
         worker_generation: 7,
+        run_state: None,
         metadata: None,
         workspace_cwd: None,
         turn_count: Some(1),
@@ -431,6 +432,9 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         parent_session_id: None,
         kind: None,
         agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
     }
 }
 
@@ -803,6 +807,7 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
         session_id: sid(),
         head_seq: 11,
         worker_generation: 7,
+        run_state: None,
         metadata: None,
         workspace_cwd: None,
         turn_count: Some(1),
@@ -814,6 +819,9 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
         parent_session_id: None,
         kind: None,
         agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
     });
 
     let text = draw_rows(&model, 150, 40).join("\n");

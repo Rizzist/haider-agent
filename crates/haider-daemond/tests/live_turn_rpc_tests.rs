@@ -4841,6 +4841,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             session_id: session_id.clone(),
             head_seq: 1,
             worker_generation: created.worker_generation,
+            run_state: Some(haider_rpc::ObserveRunStateWire::Idle),
             metadata: Some(metadata.clone()),
             workspace_cwd: Some(metadata.cwd.clone()),
             // A just-created session is truly empty: zero committed user
@@ -4858,6 +4859,9 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             // names is a Root — the live daemon reports it typed.
             kind: Some(haider_rpc::SessionKindWire::Root),
             agent_type: None,
+            effort: metadata.effort.clone(),
+            fast: Some(metadata.fast),
+            account_alias: None,
         }
     );
 

@@ -33,7 +33,8 @@ pub mod transcription;
 
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
-    PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient, connect,
+    MenuAnswerRequest, PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient,
+    connect,
 };
 pub use graph::{
     GraphAbandonResult, GraphClientError, GraphInspectPage, GraphPinResult, GraphRunSetOpenResult,

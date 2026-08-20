@@ -563,6 +563,7 @@ fn roster_row_accent_joins_the_summary_and_falls_back() {
         session_id: sid(),
         head_seq: 4,
         worker_generation: 7,
+        run_state: None,
         metadata: None,
         workspace_cwd: None,
         turn_count: Some(2),
@@ -574,6 +575,9 @@ fn roster_row_accent_joins_the_summary_and_falls_back() {
         parent_session_id: None,
         kind: None,
         agent_type: Some("scout".to_owned()),
+        effort: None,
+        fast: None,
+        account_alias: None,
     };
     model.note_summary_counts(&summary);
     assert_eq!(

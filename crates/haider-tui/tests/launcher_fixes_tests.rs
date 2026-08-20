@@ -180,6 +180,7 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         session_id: sid(n),
         head_seq,
         worker_generation: 7,
+        run_state: None,
         metadata: None,
         workspace_cwd: None,
         turn_count: None,
@@ -191,6 +192,9 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         parent_session_id: None,
         kind: None,
         agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
     }
 }
 

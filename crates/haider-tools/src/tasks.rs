@@ -785,6 +785,15 @@ pub enum PidLiveness {
     Dead,
 }
 
+/// Observation-only liveness verdict for crash-window evidence. Unlike the
+/// orphan reaper's fail-safe verdict, probe errors remain explicitly unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidencePidLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
 /// Outcome of one orphan process-group reap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrphanReap {
@@ -805,6 +814,19 @@ pub fn probe_group_liveness(pid_raw: i32) -> PidLiveness {
             Err(_) => PidLiveness::Alive,
         },
         None => PidLiveness::Dead,
+    }
+}
+
+/// Checks process-group existence without signaling or otherwise mutating it.
+#[must_use]
+pub fn probe_group_liveness_evidence(pid_raw: i32) -> EvidencePidLiveness {
+    let Some(pid) = Pid::from_raw(pid_raw) else {
+        return EvidencePidLiveness::Unknown;
+    };
+    match process_group_exists(pid) {
+        Ok(true) => EvidencePidLiveness::Alive,
+        Ok(false) => EvidencePidLiveness::Dead,
+        Err(_) => EvidencePidLiveness::Unknown,
     }
 }
 

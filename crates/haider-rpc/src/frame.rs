@@ -276,6 +276,9 @@ pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
 /// Daemon implements the read-only, journal-derived session observation digest.
 pub const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
+/// Daemon exposes typed crash-window state plus answerable recovery-card
+/// coordinates through the existing observation/menu-answer surfaces.
+pub const FEATURE_EFFECT_RECOVERY_V1: &str = "effect_recovery_v1";
 /// Daemon implements the bounded, durable descendant-tree fleet snapshot.
 pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
@@ -948,6 +951,10 @@ pub struct SessionSummary {
     /// Greatest committed envelope sequence for the session.
     pub head_seq: u64,
     pub worker_generation: u64,
+    /// Additive coarse run state at this committed head. `None` only from an
+    /// older daemon; current list/watch producers always populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<ObserveRunStateWire>,
     /// Additive R2 field: typed configuration for live-created sessions.
     /// `None` for legacy `{}` rows and when an old daemon omits the field —
     /// readers must not infer anything from its absence.
@@ -1013,6 +1020,18 @@ pub struct SessionSummary {
     /// daemons; accent surfaces join the loom snapshot's color by this id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Additive roster truth: the committed effort selection. `None` means
+    /// provider default or an older daemon omitted the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Additive roster truth: the committed fast-mode selection. `Some(false)`
+    /// is the real normal mode; `None` is reserved for older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
+    /// None until the per-session account seam lands; readers must not infer
+    /// the daemon default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
 }
 
 /// Typed session lineage kind (`session_lineage_v1`), from the durable
@@ -1095,15 +1114,15 @@ pub struct SessionReadResult {
 
 /// Stable coarse state used by non-interactive observation clients.
 ///
-/// This intentionally does not expose every internal run phase. The six
-/// values are the automation contract; a newer daemon value remains
-/// decodable by an older client as `unknown`.
+/// This intentionally does not expose every internal run phase. A newer
+/// daemon value remains decodable by an older client as `unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ObserveRunStateWire {
     Idle,
     Running,
+    EffectUnknown,
     ParkedPermission,
     ParkedInput,
     Errored,
@@ -1117,10 +1136,37 @@ pub enum ObserveRunStateWire {
 pub struct ObserveMenuWire {
     pub kind: String,
     pub title: String,
+    /// Additive durable menu identity. `None` only from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_id: Option<MenuId>,
+    /// Sequence of the committed `MenuOpened`; the menu-answer CAS fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_seq: Option<u64>,
+    /// Worker generation that opened the menu; distinct from the digest's
+    /// current daemon generation after startup recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_generation: Option<u64>,
+    /// Commit time of the durable `MenuOpened`; recovery fleet views use it
+    /// as the exact parked-since timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ObserveMenuOptionWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<haider_protocol::error::ErrorPresentation>,
+}
+
+/// Secret-free display/answer coordinates for one durable menu choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveMenuOptionWire {
+    pub key: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Daemon-persisted subagent identity and chip state.

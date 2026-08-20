@@ -95,6 +95,7 @@ fn listed(n: usize) -> LiveReply {
                 session_id: sid(index),
                 head_seq: 0,
                 worker_generation: 7,
+                run_state: None,
                 metadata: None,
                 workspace_cwd: None,
                 turn_count: None,
@@ -106,6 +107,9 @@ fn listed(n: usize) -> LiveReply {
                 parent_session_id: None,
                 kind: None,
                 agent_type: None,
+                effort: None,
+                fast: None,
+                account_alias: None,
             })
             .collect(),
         next_cursor: None,

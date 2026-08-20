@@ -29,6 +29,13 @@ pub(crate) struct SnapshotOptions {
     pub no_spawn: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionsOptions {
+    pub json: bool,
+    pub no_spawn: bool,
+    pub recovery: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionOptions {
     pub session_id: String,
@@ -112,6 +119,7 @@ pub(crate) struct SessionSummaryView {
     pub footprint: Option<FootprintView>,
     pub subagent_count: usize,
     pub updated_at: u64,
+    pub parked_since: Option<u64>,
 }
 
 pub(crate) struct SessionDepthView {
@@ -154,6 +162,10 @@ impl ObserveJson for StatusDocument {
             "daemon": {
                 "version": self.daemon.version,
                 "generation": self.daemon.generation,
+                "pipe_dir": std::path::Path::new(&self.profile_path)
+                    .join("pipe")
+                    .display()
+                    .to_string(),
             },
             "update": {
                 "status": self.update.status,
@@ -194,7 +206,7 @@ impl ObserveJson for SessionDocument {
 
 impl ObserveJson for SessionSummaryView {
     fn json(&self) -> Value {
-        json!({
+        let mut object = json!({
             "id": self.id,
             "title": self.title,
             "run_state": self.run_state,
@@ -208,7 +220,11 @@ impl ObserveJson for SessionSummaryView {
             })),
             "subagent_count": self.subagent_count,
             "updated_at": self.updated_at,
-        })
+        });
+        if let Some(parked_since) = self.parked_since {
+            object["parked_since"] = json!(parked_since);
+        }
+        object
     }
 }
 
@@ -318,6 +334,27 @@ pub(crate) fn parse_session_options(rest: &[String]) -> Result<Parsed<SessionOpt
     }))
 }
 
+pub(crate) fn parse_sessions_options(rest: &[String]) -> Result<Parsed<SessionsOptions>, String> {
+    if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
+        return Ok(Parsed::Help);
+    }
+    let mut options = SessionsOptions::default();
+    for flag in rest {
+        match flag.as_str() {
+            "--json" if !options.json => options.json = true,
+            "--no-spawn" if !options.no_spawn => options.no_spawn = true,
+            "--recovery" if !options.recovery => options.recovery = true,
+            "--json" | "--no-spawn" | "--recovery" => {
+                return Err(format!("duplicate {flag} flag"));
+            }
+            _ => {
+                return Err("usage: haider sessions [--recovery] [--json] [--no-spawn]".into());
+            }
+        }
+    }
+    Ok(Parsed::Run(options))
+}
+
 pub(crate) fn parse_fleet_options(rest: &[String]) -> Result<Parsed<FleetOptions>, String> {
     if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
         return Ok(Parsed::Help);
@@ -418,9 +455,11 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
 }
 
 pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
-    let options = match parse_snapshot_options(rest, "sessions") {
+    let options = match parse_sessions_options(rest) {
         Ok(Parsed::Run(options)) => options,
-        Ok(Parsed::Help) => return write_help("usage: haider sessions [--json] [--no-spawn]"),
+        Ok(Parsed::Help) => {
+            return write_help("usage: haider sessions [--recovery] [--json] [--no-spawn]");
+        }
         Err(error) => return usage("sessions", &error),
     };
     let profile = match profile() {
@@ -431,19 +470,63 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
         Ok(observer) => observer,
         Err(error) => return observe_failure("sessions", &error),
     };
-    let digests = observer.sessions(0).await;
+    let digests = if options.recovery {
+        match observer.require_effect_recovery_feature() {
+            Ok(()) => {
+                let summaries = match observer.session_summaries().await {
+                    Ok(summaries) => summaries,
+                    Err(error) => {
+                        observer.close();
+                        return observe_failure("sessions", &error);
+                    }
+                };
+                let mut digests = Vec::new();
+                for summary in summaries
+                    .into_iter()
+                    .filter(|summary| summary.run_state == Some(ObserveRunStateWire::EffectUnknown))
+                {
+                    let title = summary.title;
+                    match observer.session(summary.session_id, 0).await {
+                        Ok(mut digest) => {
+                            if let Some(title) = title {
+                                digest.title = title;
+                            }
+                            digests.push(digest);
+                        }
+                        Err(error) => {
+                            observer.close();
+                            return observe_failure("sessions", &error);
+                        }
+                    }
+                }
+                Ok(digests)
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        observer.sessions(0).await
+    };
     observer.close();
     let digests = match digests {
         Ok(digests) => digests,
         Err(error) => return observe_failure("sessions", &error),
     };
+    let sessions = digests
+        .into_iter()
+        .filter(|digest| {
+            !options.recovery || digest.run_state == ObserveRunStateWire::EffectUnknown
+        })
+        .map(summary_view)
+        .collect();
     let document = SessionsDocument {
         schema: OBSERVE_SCHEMA,
         kind: "sessions",
-        sessions: digests.into_iter().map(summary_view).collect(),
+        sessions,
     };
     if options.json {
         write_document(&document)
+    } else if options.recovery {
+        write_human(recovery_sessions_human_text(&document))
     } else {
         write_sessions_human(&document)
     }
@@ -699,6 +782,12 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
             }),
         subagent_count: digest.subagents.len(),
         updated_at: digest.updated_at_ms,
+        parked_since: digest
+            .pending_menus
+            .iter()
+            .filter(|menu| menu.kind == "recovery")
+            .filter_map(|menu| menu.opened_at_ms)
+            .min(),
     }
 }
 
@@ -813,6 +902,7 @@ fn run_state_name(state: ObserveRunStateWire) -> &'static str {
     match state {
         ObserveRunStateWire::Idle => "idle",
         ObserveRunStateWire::Running => "running",
+        ObserveRunStateWire::EffectUnknown => "effect_unknown",
         ObserveRunStateWire::ParkedPermission => "parked_permission",
         ObserveRunStateWire::ParkedInput => "parked_input",
         ObserveRunStateWire::Errored => "errored",
@@ -891,6 +981,24 @@ pub(crate) fn sessions_human_text(document: &SessionsDocument) -> String {
             footprint,
             session.subagent_count,
             session.updated_at,
+            session.title.replace('\n', " ")
+        ));
+    }
+    text
+}
+
+pub(crate) fn recovery_sessions_human_text(document: &SessionsDocument) -> String {
+    if document.sessions.is_empty() {
+        return "no parked crash windows\n".to_owned();
+    }
+    let mut text = String::new();
+    for session in &document.sessions {
+        text.push_str(&format!(
+            "{}  parked_since={}  {}\n",
+            session.id,
+            session
+                .parked_since
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
             session.title.replace('\n', " ")
         ));
     }

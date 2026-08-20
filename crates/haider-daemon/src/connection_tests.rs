@@ -149,6 +149,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
             haider_rpc::FEATURE_COMPACTION_GUARD_V1.to_owned(),
             FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
+            haider_rpc::FEATURE_EFFECT_RECOVERY_V1.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V2.to_owned(),
             haider_rpc::FEATURE_CONVERGENCE_GRAPH_V3.to_owned(),

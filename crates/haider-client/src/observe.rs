@@ -13,8 +13,9 @@ use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, ERROR_CODE_NOT_FOUND,
-    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody,
-    ResponseBody, SessionFleetSnapshot, SessionObserveDigest, Welcome, WireFrame,
+    FEATURE_EFFECT_RECOVERY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_V1,
+    LifecyclePhase, RequestBody, ResponseBody, SessionFleetSnapshot, SessionObserveDigest,
+    SessionSummary, Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -147,6 +148,16 @@ impl ObserveClient {
 
     /// Lists every durable session in the daemon's stable byte order.
     pub async fn session_ids(&self) -> Result<Vec<SessionId>, ObserveError> {
+        Ok(self
+            .session_summaries()
+            .await?
+            .into_iter()
+            .map(|summary| summary.session_id)
+            .collect())
+    }
+
+    /// Lists every durable session summary in the daemon's stable byte order.
+    pub async fn session_summaries(&self) -> Result<Vec<SessionSummary>, ObserveError> {
         let mut cursor = None;
         let mut sessions = Vec::new();
         loop {
@@ -162,7 +173,7 @@ impl ObserveClient {
                     sessions: page,
                     next_cursor,
                 } => {
-                    sessions.extend(page.into_iter().map(|summary| summary.session_id));
+                    sessions.extend(page);
                     let Some(next) = next_cursor else {
                         return Ok(sessions);
                     };
@@ -283,6 +294,16 @@ impl ObserveClient {
             Ok(())
         } else {
             Err(ObserveError::MissingFeature(FEATURE_SESSION_FLEET_V1))
+        }
+    }
+
+    /// Fails before a recovery sweep can misread an older daemon's omitted
+    /// additive state as an empty fleet.
+    pub fn require_effect_recovery_feature(&self) -> Result<(), ObserveError> {
+        if self.welcome.features.contains(FEATURE_EFFECT_RECOVERY_V1) {
+            Ok(())
+        } else {
+            Err(ObserveError::MissingFeature(FEATURE_EFFECT_RECOVERY_V1))
         }
     }
 

@@ -40,6 +40,7 @@ fn summary(
         session_id: session_id.clone(),
         head_seq,
         worker_generation: 7,
+        run_state: None,
         metadata: None,
         workspace_cwd: None,
         turn_count: Some(2),
@@ -51,6 +52,9 @@ fn summary(
         parent_session_id: None,
         kind: None,
         agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
     }
 }
 

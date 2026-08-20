@@ -21,10 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use haider_platform::{IpcReadHalf, IpcStream, IpcWriteHalf};
+use haider_rpc::haider_protocol::ids::{MenuId, SessionId};
 use haider_rpc::{
-    Capability, CapabilitySet, ClientKind, CodecError, DEFAULT_FRAME_LIMIT, Hello, ProtocolError,
-    RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireEncoding, WireFrame,
-    uds_codec,
+    Capability, CapabilitySet, ClientKind, CodecError, CommandId, DEFAULT_FRAME_LIMIT, Hello,
+    MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome,
+    WireEncoding, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -41,6 +42,20 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const OUTBOUND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 256;
+
+/// Durable coordinates for the existing receipted top-level menu-answer
+/// frame. Callers must hold a Control attachment to `session_id`.
+#[derive(Debug, Clone)]
+pub struct MenuAnswerRequest {
+    pub command_id: CommandId,
+    pub session_id: SessionId,
+    pub menu_id: MenuId,
+    pub request_seq: u64,
+    pub worker_generation: u64,
+    pub option_key: String,
+    pub option_index: u32,
+    pub input: Option<MenuInput>,
+}
 
 #[derive(Clone, Copy)]
 struct NegotiatedCodec {
@@ -505,6 +520,28 @@ impl RpcClient {
     /// the orphaning shape it was fixed out of.
     pub async fn request(&self, body: RequestBody) -> Result<ResponseBody, ClientError> {
         self.begin_request(body).await?.wait().await
+    }
+
+    /// Sends the same receipted durable menu-answer frame used by interactive
+    /// clients and waits for its correlated resolution receipt.
+    pub async fn answer_menu(
+        &self,
+        request: MenuAnswerRequest,
+    ) -> Result<ResponseBody, ClientError> {
+        self.begin_correlated_frame(move |request_id| WireFrame::MenuAnswer {
+            request_id: Some(request_id),
+            command_id: request.command_id,
+            session_id: request.session_id,
+            menu_id: request.menu_id,
+            request_seq: request.request_seq,
+            worker_generation: request.worker_generation,
+            option_key: request.option_key,
+            option_index: request.option_index,
+            input: request.input,
+        })
+        .await?
+        .wait()
+        .await
     }
 
     /// Registers the correlation, writes the frame, and hands back the

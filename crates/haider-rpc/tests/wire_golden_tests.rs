@@ -628,6 +628,7 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         session_id: haider_protocol::ids::SessionId::new("session-workspace"),
         head_seq: 17,
         worker_generation: 15,
+        run_state: None,
         metadata: None,
         last_model: None,
         workspace_cwd: Some("/work/original".into()),
@@ -639,6 +640,9 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         parent_session_id: None,
         kind: None,
         agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
     };
     let value = serde_json::to_value(&current).expect("encode current summary");
     assert_eq!(value["workspace_cwd"], "/work/original");
@@ -2033,6 +2037,7 @@ fn session_rename_frames_are_additive_and_golden() {
         session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
         head_seq: 9,
         worker_generation: 7,
+        run_state: None,
         metadata: None,
         last_model: None,
         workspace_cwd: None,
@@ -2044,6 +2049,9 @@ fn session_rename_frames_are_additive_and_golden() {
         parent_session_id: None,
         kind: None,
         agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
     })
     .expect("encode bare summary");
     assert!(
@@ -2598,6 +2606,7 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
         session_id: haider_protocol::ids::SessionId::new("session-lineage-child"),
         head_seq: 4,
         worker_generation: 2,
+        run_state: None,
         metadata: None,
         last_model: None,
         workspace_cwd: None,
@@ -2611,6 +2620,9 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
         )),
         kind: Some(haider_rpc::SessionKindWire::Subagent),
         agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
     };
     let value = serde_json::to_value(&child).expect("encode child summary");
     assert_eq!(value["kind"], "subagent");
@@ -2768,5 +2780,52 @@ fn a_mid_frame_encoding_switch_poisons_the_decoder() {
     assert!(
         decoder.is_poisoned(),
         "a mid-frame switch fails closed rather than misdecoding"
+    );
+}
+
+/// effect_recovery_v1 typed run state is additive: an older client with
+/// `#[serde(other)]` decodes `effect_unknown` as Unknown, and a new client
+/// decodes every prior value. Roster scalars (effort/fast/account_alias)
+/// are additive both directions.
+///
+/// MUTATION CHECK: rename the serde case, drop the `other` fallback, or make
+/// SessionSummary strict. Expected failure: an unknown state fails to decode,
+/// or the additive summary rejects.
+#[test]
+fn effect_recovery_state_and_roster_scalars_are_additive() {
+    use haider_rpc::ObserveRunStateWire;
+    // New client decodes the new state.
+    let state: ObserveRunStateWire =
+        serde_json::from_value(serde_json::json!("effect_unknown")).expect("decodes");
+    assert!(matches!(state, ObserveRunStateWire::EffectUnknown));
+    // A future state an even-newer daemon emits decodes as Unknown, not error.
+    let future: ObserveRunStateWire =
+        serde_json::from_value(serde_json::json!("some_future_state_v9")).expect("tolerant");
+    assert!(matches!(future, ObserveRunStateWire::Unknown));
+
+    // Roster scalars: older daemon (absent) → None; newer → decoded.
+    let older: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "s1", "head_seq": 3, "worker_generation": 1,
+    }))
+    .expect("older summary");
+    assert_eq!(older.effort, None);
+    assert_eq!(older.fast, None);
+    assert_eq!(older.account_alias, None);
+
+    let newer: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "s1", "head_seq": 3, "worker_generation": 1,
+        "effort": "high", "fast": false, "run_state": "effect_unknown",
+        "future_summary_field": true,
+    }))
+    .expect("newer summary");
+    assert_eq!(newer.effort.as_deref(), Some("high"));
+    assert_eq!(newer.fast, Some(false), "Some(false) is a real normal mode");
+    assert!(matches!(
+        newer.run_state,
+        Some(ObserveRunStateWire::EffectUnknown)
+    ));
+    assert_eq!(
+        newer.account_alias, None,
+        "account slot stays None until the seam ships"
     );
 }
