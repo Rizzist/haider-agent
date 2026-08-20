@@ -471,6 +471,18 @@ pub enum LiveCommand {
         enabled: bool,
         confirm_new_epoch: bool,
     },
+    /// `session.select_agent_type` (W-flow inline identity): receipted
+    /// agent-type binding. DURABLE — a reconnect resends under the same
+    /// command id and the daemon replays the committed receipt. `None`
+    /// reverts to plain; a present id is registry-validated by the daemon.
+    /// Installs NOTHING locally — identity moves on the
+    /// `agent_type_selected` fact.
+    SelectAgentType {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        agent_type: Option<String>,
+    },
     /// `provider.configure` for a custom OpenAI-compatible provider
     /// (W5g-4) or a G4b enterprise builtin. Identity fields are fixed by
     /// the card: the stated family, api-key auth (or auth NONE for the G4a
@@ -557,6 +569,7 @@ impl LiveCommand {
             Self::Rename { command_id, .. } => Some(command_id),
             Self::SelectEffort { command_id, .. } => Some(command_id),
             Self::SelectFast { command_id, .. } => Some(command_id),
+            Self::SelectAgentType { command_id, .. } => Some(command_id),
             Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::List { .. }
@@ -951,6 +964,12 @@ pub enum LiveReply {
         enabled: bool,
         worker_generation: u64,
     },
+    /// `session.select_agent_type` committed (W-flow inline identity). The
+    /// RECEIPT only: it retires the outbox and flashes — identity moves on
+    /// the `agent_type_selected` fact (attach replay included), never here.
+    AgentTypeBound {
+        command_id: CommandId,
+    },
     /// `provider.configure` committed (W5g-4).
     ProviderConfigured {
         command_id: CommandId,
@@ -1185,6 +1204,13 @@ pub struct LiveDriver {
     pending_effort_select: Option<(CommandId, SessionId, Option<String>)>,
     /// In-flight `session.select_fast` (G3): failure correlation.
     pending_fast_select: Option<(CommandId, SessionId, bool)>,
+    /// W-flow inline identity: the in-flight `session.select_agent_type` —
+    /// (command, receipt flash, failure label). Same grammar as
+    /// `pending_graph_mutation`: the receipt flashes daemon truth
+    /// ("· agent type @scout" / "· agent type cleared — plain"); a typed
+    /// refusal (registry miss) flashes the DAEMON's message under the
+    /// label. Retired by receipt or non-retryable failure.
+    pending_agent_type: Option<(CommandId, String, String)>,
     /// W10b in-flight removals: (command, alias/provider) — failures
     /// surface on the owning screen; successes come as typed replies.
     pending_account_remove: Option<(CommandId, String)>,
@@ -1312,6 +1338,7 @@ impl LiveDriver {
             pending_rename: None,
             pending_effort_select: None,
             pending_fast_select: None,
+            pending_agent_type: None,
             pending_account_remove: None,
             pending_provider_remove: None,
             pending_custom: None,
@@ -1625,11 +1652,11 @@ impl LiveDriver {
                     // rev933b finding 9: the clamp is PANE-LOCAL — the
                     // browser shows one list at a time, so a stale index
                     // must fold against the ACTIVE pane, not both combined.
-                    // W-flow: the workflows pane clamps against its ROW
-                    // space (`none` + built-ins + registered), never the
-                    // registry alone.
+                    // W-flow: BOTH panes clamp against their ROW space
+                    // (synthetic `none` + fixed head + registered), never
+                    // the registry alone.
                     let total = match model.loom_pane {
-                        crate::app::LoomPane::Types => model.loom_types.len(),
+                        crate::app::LoomPane::Types => model.type_row_count(),
                         crate::app::LoomPane::Workflows => model.workflow_row_count(),
                     };
                     if model.loom_selection >= total {
@@ -2325,6 +2352,23 @@ impl LiveDriver {
                 model.apply_fast_selected(enabled);
                 Vec::new()
             }
+            LiveReply::AgentTypeBound { command_id } => {
+                // W-flow inline identity: the receipt retires the gate and
+                // INSTALLS NOTHING — the `agent_type_selected` fact moves
+                // identity (attach replay included). The correlated flash
+                // is the daemon's committed truth.
+                self.retire(&command_id);
+                if self
+                    .pending_agent_type
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| pending == &command_id)
+                    && let Some((_, receipt, _)) = self.pending_agent_type.take()
+                {
+                    model.flash = Some(receipt);
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
             LiveReply::DefaultModelSet {
                 command_id,
                 provider,
@@ -2916,6 +2960,24 @@ impl LiveDriver {
                         .as_ref()
                         .is_some_and(|(pending, _, _)| pending == id)
                     && let Some((_, _, label)) = self.pending_graph_mutation.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.flash = Some(format!("· {label} refused — {message}"));
+                    model.dirty = true;
+                    return Vec::new();
+                }
+                // W-flow inline identity: a refused agent-type bind/clear
+                // flashes the DAEMON's typed reason (a registry miss says
+                // "not registered"). Nothing moved locally — identity only
+                // ever follows the committed fact.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_agent_type
+                        .as_ref()
+                        .is_some_and(|(pending, _, _)| pending == id)
+                    && let Some((_, _, label)) = self.pending_agent_type.take()
                 {
                     if !retryable {
                         self.retire(id);
@@ -4020,6 +4082,35 @@ impl LiveDriver {
                     worker_generation,
                     enabled,
                     confirm_new_epoch,
+                })]
+            }
+            AppRequest::SelectAgentType { agent_type } => {
+                // W-flow inline identity: receipted bind/clear for the
+                // ACTIVE session. Installs NOTHING locally — identity moves
+                // on the `agent_type_selected` fact; the receipt/refusal
+                // flash correlates through `pending_agent_type`.
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_agent_type = Some(match agent_type.as_deref() {
+                    Some(id) => (
+                        command_id.clone(),
+                        format!("· agent type @{id}"),
+                        format!("bind @{id}"),
+                    ),
+                    None => (
+                        command_id.clone(),
+                        "· agent type cleared — plain".to_owned(),
+                        "clear agent type".to_owned(),
+                    ),
+                });
+                vec![self.enqueue(LiveCommand::SelectAgentType {
+                    command_id,
+                    session,
+                    worker_generation,
+                    agent_type,
                 })]
             }
             AppRequest::ProviderConfigure {

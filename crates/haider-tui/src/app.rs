@@ -408,6 +408,41 @@ impl AppModel {
         (registered < self.loom_workflows.len()).then_some(WorkflowRow::Registered(registered))
     }
 
+    /// W-flow inline identity — total /loom (Types) rows: `none` +
+    /// registered. Never zero; the types pane lost its whole-pane empty
+    /// state exactly as the workflows pane did.
+    #[must_use]
+    pub fn type_row_count(&self) -> usize {
+        1 + self.loom_types.len()
+    }
+
+    /// W-flow inline identity — resolve one /loom selection index.
+    #[must_use]
+    pub fn type_row(&self, index: usize) -> Option<TypeRow> {
+        if index == 0 {
+            return Some(TypeRow::None);
+        }
+        (index - 1 < self.loom_types.len()).then_some(TypeRow::Registered(index - 1))
+    }
+
+    /// W-flow inline identity — the loom record behind a BOUND agent-type
+    /// id, for the session-accent surfaces (header callsign, composer
+    /// identity rule, roster rows). ONE fallback law: no binding, no
+    /// snapshot entry, or an un-Loom daemon → `None`, and the caller keeps
+    /// today's default styling exactly (a stale accent is never painted —
+    /// the snapshot dies with the socket, so the gate re-judges every
+    /// frame).
+    #[must_use]
+    pub fn bound_loom_type(
+        &self,
+        agent_type: Option<&str>,
+    ) -> Option<&haider_protocol::loom::LoomAgentType> {
+        let id = agent_type?;
+        self.daemon_serves(haider_rpc::FEATURE_LOOM_V1)
+            .then(|| self.loom_type(id))
+            .flatten()
+    }
+
     /// D2 — the Loom workflow behind a pinned template, if the registry
     /// still holds the PINNED revision. Review round 2: the join requires
     /// the instance digest — annotating graph A with re-registered B's
@@ -2365,6 +2400,13 @@ pub enum AppRequest {
         enabled: bool,
         confirm_new_epoch: bool,
     },
+    /// W-flow inline identity: receipted agent-type binding for the ACTIVE
+    /// session (`session.select_agent_type`, `p` on the /loom Types pane).
+    /// `None` reverts to a plain session; a present id is registry-
+    /// validated by the daemon (a miss is a typed refusal that binds
+    /// nothing). Identity moves only on the `agent_type_selected` FACT —
+    /// the response is receipt + flash, never an install.
+    SelectAgentType { agent_type: Option<String> },
     /// Start an OAuth add flow (`account.oauth_start`) for the card.
     OAuthAddStart {
         provider: String,
@@ -2731,6 +2773,19 @@ pub enum WorkflowRow {
     /// name).
     BuiltIn(haider_protocol::graph::GraphTemplateSpec),
     /// Index into [`AppModel::loom_workflows`].
+    Registered(usize),
+}
+
+/// One /loom (Types) row — the workflows pane's fixed-head law mirrored
+/// (W-flow inline identity): the synthetic `∅ none` default first (not a
+/// registry record, which is exactly what makes it undeletable), then the
+/// registered agent types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeRow {
+    /// "Plain session" — every session's default. Selecting it means the
+    /// receipted clear (`agent_type: None`), never a registry mutation.
+    None,
+    /// Index into [`AppModel::loom_types`].
     Registered(usize),
 }
 
@@ -5526,10 +5581,11 @@ impl AppModel {
                 self.dirty = true;
                 return;
             }
+            // W-flow: BOTH row spaces are fixed-head (synthetic `none`
+            // first) — never empty, so the emptied-registry detail fold
+            // below is vestigial but harmless.
             let total = match self.loom_pane {
-                LoomPane::Types => self.loom_types.len(),
-                // W-flow: the workflows row space is synthetic-`none` +
-                // built-ins + registered — never empty.
+                LoomPane::Types => self.type_row_count(),
                 LoomPane::Workflows => self.workflow_row_count(),
             };
             // Round 3: a registry that emptied under an open detail pane
@@ -5539,11 +5595,13 @@ impl AppModel {
             }
             let ceiling = self.loom_scroll_max.get();
             match key.code {
-                // W-flow: `p` binds the SELECTED workflows row to the bound
-                // session (pin by name / `none` abandons).
-                KeyCode::Char('p') if self.loom_pane == LoomPane::Workflows => {
-                    self.pin_selected_workflow();
-                }
+                // W-flow: `p` binds the SELECTED row to the bound session —
+                // workflows pin by name (`none` abandons); types bind the
+                // receipted agent type (`none` clears to plain).
+                KeyCode::Char('p') => match self.loom_pane {
+                    LoomPane::Workflows => self.pin_selected_workflow(),
+                    LoomPane::Types => self.bind_selected_type(),
+                },
                 // W-flow authoring: describe it, the model makes it.
                 KeyCode::Char('n') => {
                     self.loom_input = Some(String::new());
@@ -9351,6 +9409,47 @@ impl AppModel {
         }
     }
 
+    /// W-flow inline identity — `p` on the /loom Types pane: bind the
+    /// SELECTED row's agent type to the bound session over the receipted
+    /// `session.select_agent_type` (`none` clears to plain). Live-and-bound
+    /// sessions only; the daemon validates the id against the registry (a
+    /// miss is a typed refusal the flash carries) and identity moves only
+    /// on the `agent_type_selected` fact — nothing installs here.
+    fn bind_selected_type(&mut self) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· bind — live only; the binding is daemon truth".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_AGENT_TYPE_SELECT_V1) {
+            self.flash = Some(self.stale_daemon_note("agent-type binding"));
+            return;
+        }
+        if self.active_session.is_none() {
+            self.flash = Some("· bind — no bound session; open a session first".to_owned());
+            return;
+        }
+        match self.type_row(self.loom_selection) {
+            Some(TypeRow::None) => {
+                if self.identity.agent_type.is_some() {
+                    self.flash = Some("· clearing agent type…".to_owned());
+                    self.requests
+                        .push(AppRequest::SelectAgentType { agent_type: None });
+                } else {
+                    self.flash = Some("· already plain — no agent type bound".to_owned());
+                }
+            }
+            Some(TypeRow::Registered(index)) => {
+                let id = self.loom_types[index].id.clone();
+                self.flash = Some(format!("· binding @{id}…"));
+                self.requests.push(AppRequest::SelectAgentType {
+                    agent_type: Some(id),
+                });
+            }
+            None => {}
+        }
+    }
+
     /// W-flow authoring — ⏎ on the `n` input: leave for the bound session
     /// and submit ONE ordinary turn whose text instructs the model to draft
     /// the described agent type / workflow and propose it as a plan; the
@@ -11837,6 +11936,21 @@ impl AppModel {
             && entry.model_short != *last_model
         {
             entry.model_short = last_model.clone();
+            self.dirty = true;
+        }
+        // W-flow inline identity: the roster row's bound agent type. Unlike
+        // the count fields, ABSENCE from a feature-serving daemon means
+        // PLAIN (a clear must propagate to the row), so the field copies
+        // whole under the gate; an older daemon never serves the feature
+        // and hydrates nothing.
+        if self.daemon_serves(haider_rpc::FEATURE_SESSION_AGENT_TYPE_SELECT_V1)
+            && let Some(entry) = self
+                .sessions
+                .iter_mut()
+                .find(|row| row.id == summary.session_id)
+            && entry.agent_type != summary.agent_type
+        {
+            entry.agent_type = summary.agent_type.clone();
             self.dirty = true;
         }
         if summary.turn_count.is_none() && summary.footprint_tokens.is_none() {

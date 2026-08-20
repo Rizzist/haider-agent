@@ -451,16 +451,22 @@ fn loom_screen_loading_state_and_esc_origin() {
         "loading must not read as empty:\n{all}"
     );
 
-    // Esc returns to the screen /loom was opened FROM — and an emptied
-    // registry folds an open detail pane so one press suffices.
+    // Esc walks detail → list → the screen /loom was opened FROM. W-flow:
+    // the fixed-head `∅ none` row means an empty REGISTRY no longer strands
+    // a subject-less detail pane (the old one-press fold is retired) — the
+    // open detail is now a legitimate surface and esc folds it first.
     model.loom_loaded = true;
     model.loom_detail = true;
     model.loom_return = Some(Screen::Graph);
-    model.handle(haider_tui::app::AppEvent::Key(
-        ratatui::crossterm::event::KeyEvent::new(
+    let esc = || {
+        haider_tui::app::AppEvent::Key(ratatui::crossterm::event::KeyEvent::new(
             ratatui::crossterm::event::KeyCode::Esc,
             ratatui::crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
+        ))
+    };
+    model.handle(esc());
+    assert_eq!(model.screen, Screen::Loom, "first esc folds the detail");
+    assert!(!model.loom_detail, "the detail pane closed");
+    model.handle(esc());
     assert_eq!(model.screen, Screen::Graph, "esc honors the origin screen");
 }

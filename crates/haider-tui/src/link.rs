@@ -1057,6 +1057,18 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             enabled,
             confirm_new_epoch,
         },
+        // W-flow inline identity: the receipted agent-type bind/clear.
+        LiveCommand::SelectAgentType {
+            command_id,
+            session,
+            worker_generation,
+            agent_type,
+        } => RequestBody::SessionSelectAgentType {
+            command_id,
+            session_id: session,
+            worker_generation,
+            agent_type,
+        },
         // W5g-4: the card CREATES — identity fields are fixed here, never
         // typed. The origin string is data on the wire only; it is never
         // interpolated into a shell or browser command (report §4.4).
@@ -1497,6 +1509,14 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 worker_generation,
             }]
         }),
+        // W-flow inline identity: the agent-type RECEIPT — identity moves
+        // on the `agent_type_selected` fact, so the reply carries only the
+        // correlation id (never an install path).
+        ResponseBody::SessionSelectAgentType { .. } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::AgentTypeBound { command_id: id }]
+            })
+        }
         ResponseBody::ProviderConfigure { provider, revision } => {
             context.command_id.clone().map_or_else(Vec::new, |id| {
                 vec![LiveReply::ProviderConfigured {

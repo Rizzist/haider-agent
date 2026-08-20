@@ -1107,6 +1107,24 @@ fn render_launcher(
                 theme.dim_style(),
             ),
         ];
+        // W-flow inline identity: a row whose summary carries a bound agent
+        // type wears a small `{glyph} @{id}` chip in the type's registry
+        // accent — the SessionSummary.agent_type ↔ loom-snapshot join. The
+        // fallback law is exact: no binding, no snapshot entry, or an
+        // un-Loom daemon renders today's row untouched; the chip also
+        // yields whole when the row is too narrow for it plus some meta.
+        if let Some(record) = model.bound_loom_type(entry.agent_type.as_deref()) {
+            let chip = if record.glyph.is_empty() {
+                format!(" @{}", record.id)
+            } else {
+                format!(" {} @{}", record.glyph, record.id)
+            };
+            if Line::from(spans.clone()).width() + chip.chars().count() + 12 <= area_cap {
+                let accent = crate::style::loom_accent_style(&record.color)
+                    .unwrap_or_else(|| theme.gold_style());
+                spans.push(Span::styled(chip, accent.add_modifier(Modifier::BOLD)));
+            }
+        }
         // Sim `.live` (tui.js:3259-3266): live subagents name themselves;
         // a busy session WITHOUT chips falls back to `running… · `.
         if live > 0 {
@@ -3542,14 +3560,35 @@ fn render_session(
         format!(" · {}", model.session_dir),
         theme.bright_style(),
     ));
+    // W-flow inline identity: a BOUND agent type recolors the session's own
+    // accent — the head callsign trades its gold for the type's registry
+    // color and a `{glyph} @{id}` chip rides beside it. The fallback law is
+    // exact: no binding / no snapshot entry / un-Loom daemon → today's gold,
+    // never a stale accent (`bound_loom_type` re-judges every frame).
+    let bound = model.bound_loom_type(model.identity.agent_type.as_deref());
+    let head_accent = bound
+        .and_then(|record| crate::style::loom_accent_style(&record.color))
+        .unwrap_or_else(|| theme.gold_style());
     header_bottom.extend([
         Span::styled(title, theme.dim_style()),
-        Span::styled(format!(" ▸ {head} {honorific}"), theme.gold_style()),
-        Span::styled(
-            format!(" · branch main · {}", identity.device),
-            theme.dim_style(),
-        ),
+        Span::styled(format!(" ▸ {head} {honorific}"), head_accent),
     ]);
+    if let Some(record) = bound {
+        let accent =
+            crate::style::loom_accent_style(&record.color).unwrap_or_else(|| theme.gold_style());
+        header_bottom.push(Span::styled(" · ".to_owned(), theme.dim_style()));
+        if !record.glyph.is_empty() {
+            header_bottom.push(Span::styled(format!("{} ", record.glyph), accent));
+        }
+        header_bottom.push(Span::styled(
+            format!("@{}", record.id),
+            accent.add_modifier(Modifier::BOLD),
+        ));
+    }
+    header_bottom.push(Span::styled(
+        format!(" · branch main · {}", identity.device),
+        theme.dim_style(),
+    ));
     // Shed chrome renders nothing: a 1-row header keeps only the product
     // line (the area clips line 2), a 0-row header/rule disappears whole.
     let header_top_used = u16::try_from(Line::from(header_top.clone()).width()).unwrap_or(0);
@@ -5348,26 +5387,11 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     }
-    // W-flow: only the TYPES pane can be empty — the workflows row space
-    // always carries the synthetic `none` row and the built-ins, so its
-    // registry emptiness renders inside the REGISTERED section instead.
-    if on_types && own == 0 {
-        lines.push(Line::styled(
-            "no agent types registered — press n to describe one; the model proposes it and a plan you accept registers",
-            theme.dim_style(),
-        ));
-        lines.push(Line::raw(""));
-        if model.loom_input.is_none() {
-            lines.push(Line::styled(
-                format!("n new · tab ⇄ {sibling} · esc back"),
-                theme.dim_style(),
-            ));
-        }
-        frame.render_widget(Paragraph::new(Text::from(lines)), area);
-        return;
-    }
+    // W-flow: NEITHER pane can be empty — both row spaces lead with the
+    // synthetic `∅ none` default, so registry emptiness renders inside the
+    // REGISTERED section of each pane instead of a whole-pane state.
     let total_rows = if on_types {
-        model.loom_types.len()
+        model.type_row_count()
     } else {
         model.workflow_row_count()
     };
@@ -5375,8 +5399,23 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     let mut selected_line: usize = 0;
 
     if model.loom_detail {
-        if on_types {
-            let record = &model.loom_types[selection];
+        if on_types && model.type_row(selection) == Some(crate::app::TypeRow::None) {
+            // W-flow inline identity: the synthetic default's detail.
+            lines.push(Line::from(vec![
+                Span::styled("∅ ", theme.dim_style()),
+                Span::styled("none", theme.bright_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" — plain session · default", theme.dim_style()),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "every session starts plain — no job injected, default accent",
+                theme.text_style(),
+            ));
+        } else if on_types {
+            let Some(crate::app::TypeRow::Registered(index)) = model.type_row(selection) else {
+                unreachable!("clamped selection resolves a row");
+            };
+            let record = &model.loom_types[index];
             let accent = crate::style::loom_accent_style(&record.color)
                 .unwrap_or_else(|| theme.gold_style());
             lines.push(Line::from(vec![
@@ -5566,7 +5605,27 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         lines.push(Line::styled("esc back to the list", theme.dim_style()));
     } else if on_types {
         lines.push(Line::styled("AGENT TYPES", theme.gold_style()));
-        for (index, record) in model.loom_types.iter().enumerate() {
+        // W-flow inline identity: the fixed head mirrors the workflows pane
+        // — the synthetic `∅ none` default is ALWAYS first (not a registry
+        // record, which is exactly what makes it undeletable), then the
+        // registered types.
+        if selection == 0 {
+            selected_line = lines.len();
+        }
+        lines.push(Line::from(vec![
+            Span::styled(if selection == 0 { "❯ " } else { "  " }, theme.gold_style()),
+            Span::styled("∅ ", theme.dim_style()),
+            Span::styled("none", theme.bright_style().add_modifier(Modifier::BOLD)),
+            Span::styled(" — plain session · default", theme.dim_style()),
+        ]));
+        if model.loom_types.is_empty() {
+            lines.push(Line::styled(
+                "  none registered — press n: the model proposes one; a plan you accept registers",
+                theme.dim_style(),
+            ));
+        }
+        for (offset, record) in model.loom_types.iter().enumerate() {
+            let index = 1 + offset;
             let accent = crate::style::loom_accent_style(&record.color)
                 .unwrap_or_else(|| theme.gold_style());
             let cursor = if index == selection { "❯ " } else { "  " };
@@ -5607,7 +5666,7 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         lines.push(Line::raw(""));
         if model.loom_input.is_none() {
             lines.push(Line::styled(
-                "↑↓ select · ⏎ detail · n new · tab ⇄ workflows · esc back",
+                "↑↓ select · ⏎ detail · p bind to session · n new · tab ⇄ workflows · esc back",
                 theme.dim_style(),
             ));
         }
@@ -8261,7 +8320,43 @@ fn render_composer(
     // W-G (owner 2026-08-15): the throughput readout moved OFF this rule to
     // its own ambient row above the composer band — the rule carries the
     // session identity alone again.
+    // W-flow inline identity: a BOUND agent type leads the identity block
+    // with its `{glyph} @{id}` chip in the registry accent (the same
+    // fallback law as the header — absent binding/snapshot renders today's
+    // rule byte-identically). The chip yields WHOLE with the identity text
+    // when the rule is too narrow.
+    let bound_chip = identity_text
+        .as_ref()
+        .and(model.bound_loom_type(model.identity.agent_type.as_deref()))
+        .map(|record| {
+            let chip = if record.glyph.is_empty() {
+                format!(" @{}", record.id)
+            } else {
+                format!(" {} @{}", record.glyph, record.id)
+            };
+            let accent = crate::style::loom_accent_style(&record.color)
+                .unwrap_or_else(|| theme.gold_style());
+            (chip, accent)
+        });
+    let chip_cells = bound_chip
+        .as_ref()
+        .map_or(0, |(chip, _)| chip.chars().count());
     let rule_line = match &identity_text {
+        Some(text) if rule_width > text.chars().count() + chip_cells + 2 => {
+            let fill = rule_width - text.chars().count() - chip_cells - 2;
+            let mut spans = vec![Span::styled("─".repeat(fill), theme.gold_style())];
+            if let Some((chip, accent)) = &bound_chip {
+                spans.push(Span::styled(
+                    chip.clone(),
+                    accent.add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(text.clone(), theme.dim_style()));
+            spans.push(Span::styled("──", theme.gold_style()));
+            Line::from(spans)
+        }
+        // Chip too wide beside the text: drop the chip whole, keep the
+        // identity segment exactly as before the binding existed.
         Some(text) if rule_width > text.chars().count() + 2 => {
             let fill = rule_width - text.chars().count() - 2;
             Line::from(vec![

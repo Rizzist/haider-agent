@@ -106,6 +106,12 @@ pub struct SessionState {
     /// older daemon never sets it and the row degrades to its
     /// projection-derived display (never a fabricated count).
     pub summary_counts: Option<SummaryCounts>,
+    /// W-flow inline identity: the session's bound Loom agent-type id from
+    /// its `session.list` summary (`SessionSummary.agent_type`). Hydrated
+    /// only from a daemon serving `session_agent_type_select_v1` — absence
+    /// there means PLAIN (a clear propagates); an older daemon never sets
+    /// it. The roster row joins the loom snapshot's color by this id.
+    pub agent_type: Option<String>,
 }
 
 /// The additive `session.list` counts one roster row holds (launcher fix 2
@@ -164,6 +170,7 @@ impl SessionState {
             branches_offset: 1,
             turns_offset: 0,
             summary_counts: None,
+            agent_type: None,
         }
     }
 

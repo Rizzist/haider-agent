@@ -1537,6 +1537,9 @@ impl DemoDriver {
             // W-flow live-only read: the loom registry is daemon truth and
             // the demo reducer refuses /loom upstream.
             | AppRequest::LoomRefresh
+            // W-flow inline identity: the receipted agent-type binding is
+            // daemon truth; the demo reducer refuses `p` upstream.
+            | AppRequest::SelectAgentType { .. }
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }
