@@ -543,18 +543,19 @@ fn fresh_session_resets_the_scroll_ceiling() {
 
 #[test]
 fn paste_thresholds_measure_raw_utf16_units() {
-    // 151 emoji = 302 UTF-16 units (> 300) on ONE line → tokenized.
+    // 151 emoji = 302 UTF-16 units (> 300) on ONE line → the pill (the
+    // QoL wave's Claude Code placeholder; the thresholds are unchanged).
     let mut model = launcher_model();
     model.handle(AppEvent::Paste("🌊".repeat(151).into()));
-    assert_eq!(model.composer, "[Pasted 1 lines] ");
+    assert_eq!(model.composer, "[Pasted text #1 +1 lines]");
     // Exactly 300 ASCII units on one line → literal (not > 300).
     let mut model = launcher_model();
     model.handle(AppEvent::Paste("x".repeat(300).into()));
     assert_eq!(model.composer, "x".repeat(300));
-    // Raw newline count beats normalization: 4 CRLF lines → tokenized.
+    // Raw newline count beats normalization: 4 CRLF lines → the pill.
     let mut model = launcher_model();
     model.handle(AppEvent::Paste("a\r\nb\r\nc\r\nd".to_owned().into()));
-    assert_eq!(model.composer, "[Pasted 4 lines] ");
+    assert_eq!(model.composer, "[Pasted text #1 +4 lines]");
 }
 
 // ---- P2-8: menu body lines ----

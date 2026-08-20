@@ -86,6 +86,33 @@ pub struct PendingAttachment {
     pub artifact: Option<ArtifactRef>,
 }
 
+/// One large paste parked beside the draft (QoL pill, Claude Code
+/// behavior): the draft text carries only the atomic placeholder
+/// `[Pasted text #N +K lines]`; the content waits here and expands back
+/// — byte-exact, at the placeholder's position — when the draft submits.
+/// `n` is the 1-based per-draft pill number the placeholder names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedPill {
+    n: u32,
+    lines: usize,
+    content: String,
+}
+
+impl PastedPill {
+    /// The placeholder vocabulary, byte-exact — Claude Code's CLI chip.
+    /// [`Composer::pill_ranges`] and [`Composer::expand_pastes`] both
+    /// locate pills by THIS string, so the format is the identity.
+    #[must_use]
+    pub fn placeholder(&self) -> String {
+        format!("[Pasted text #{} +{} lines]", self.n, self.lines)
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
 impl PendingAttachment {
     /// The wire block, once (and only once) the upload completed.
     #[must_use]
@@ -172,6 +199,14 @@ pub struct Composer {
     /// free-text menu answer consumes the TEXT, never the chips. Only
     /// [`Self::take_ready_attachments`] (a real turn) drains them.
     attachments: Vec<PendingAttachment>,
+    /// Large pastes parked beside the draft (QoL pill). Deliberately
+    /// untouched by [`Self::take_for_submit`] / [`Self::take_silent`] —
+    /// the submit seam expands through [`Self::expand_pastes`] AFTER the
+    /// take — and by history browsing (the browse stash brings the
+    /// placeholders back). Every EDIT passes [`Self::after_edit`], whose
+    /// containment GC drops any pill whose placeholder left the text, so
+    /// the store can never outlive its pill.
+    pastes: Vec<PastedPill>,
 }
 
 /// Text-equality against string literals: the pre-TUI5 test corpus (and
@@ -285,6 +320,7 @@ impl Composer {
         self.sticky_col = None;
         self.history_pos = None;
         self.history_stash = None;
+        self.gc_pastes();
     }
 
     /// Take the draft for submit: returns the raw text; a non-empty
@@ -408,6 +444,111 @@ impl Composer {
             .collect()
     }
 
+    // ---- Paste pills (QoL wave) ----
+
+    #[must_use]
+    pub fn pastes(&self) -> &[PastedPill] {
+        &self.pastes
+    }
+
+    /// Insert a large paste as an ATOMIC placeholder pill at the cursor
+    /// (replacing an active selection, the paste-insert law). N is
+    /// max(live pills)+1: a fresh draft counts from #1 and a removed
+    /// pill's number can never collide with a live one's.
+    pub fn insert_paste(&mut self, content: String, lines: usize) {
+        let n = self
+            .pastes
+            .iter()
+            .map(|pill| pill.n)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let pill = PastedPill { n, lines, content };
+        // Insert FIRST: `after_edit`'s containment GC must not see a
+        // stored pill whose placeholder is not in the text yet.
+        self.insert_str(&pill.placeholder());
+        self.pastes.push(pill);
+    }
+
+    /// Expand every stored pill's placeholder in `text` to its parked
+    /// content, draining the store — THE submit seam. Positions resolve
+    /// against the ORIGINAL text only, so expanded content can never be
+    /// re-matched as a later pill's placeholder; a pill whose placeholder
+    /// is absent (recalled history, a foreign draft) expands nothing and
+    /// drops.
+    #[must_use]
+    pub fn expand_pastes(&mut self, text: &str) -> String {
+        let pills = std::mem::take(&mut self.pastes);
+        let mut found: Vec<(usize, usize, &PastedPill)> = pills
+            .iter()
+            .filter_map(|pill| {
+                let placeholder = pill.placeholder();
+                text.find(&placeholder)
+                    .map(|at| (at, at + placeholder.len(), pill))
+            })
+            .collect();
+        found.sort_unstable_by_key(|(at, ..)| *at);
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (start, end, pill) in found {
+            out.push_str(&text[cursor..start]);
+            out.push_str(pill.content());
+            cursor = end;
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+
+    /// The byte ranges of the live pills' placeholders in the CURRENT
+    /// text, sorted — the atomic regions editing may never bisect. Ranges
+    /// cannot overlap: every placeholder opens with the one `[` it
+    /// contains, so no placeholder can start inside another.
+    #[must_use]
+    pub fn pill_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = self
+            .pastes
+            .iter()
+            .filter_map(|pill| {
+                let placeholder = pill.placeholder();
+                self.text
+                    .find(&placeholder)
+                    .map(|at| (at, at + placeholder.len()))
+            })
+            .collect();
+        ranges.sort_unstable();
+        ranges
+    }
+
+    /// The pill range strictly containing `byte` (edges are OUTSIDE — a
+    /// caret on a pill's edge is legal, a caret inside is not).
+    fn pill_around(&self, byte: usize) -> Option<(usize, usize)> {
+        self.pill_ranges()
+            .into_iter()
+            .find(|&(start, end)| byte > start && byte < end)
+    }
+
+    /// Cursor discipline (QoL pill): a caret may never REST inside a
+    /// pill. Leftward movement that lands inside snaps to the pill's
+    /// start, rightward to its end, and geometric jumps (click, ↑/↓)
+    /// take the nearer edge.
+    fn snap_pill_left(&self, byte: usize) -> usize {
+        self.pill_around(byte).map_or(byte, |(start, _)| start)
+    }
+
+    fn snap_pill_right(&self, byte: usize) -> usize {
+        self.pill_around(byte).map_or(byte, |(_, end)| end)
+    }
+
+    fn snap_pill_nearest(&self, byte: usize) -> usize {
+        self.pill_around(byte).map_or(byte, |(start, end)| {
+            if byte - start <= end - byte {
+                start
+            } else {
+                end
+            }
+        })
+    }
+
     // ---- Editing (item 3) ----
 
     /// Insert at the cursor — never append (the owner's core complaint).
@@ -420,9 +561,21 @@ impl Composer {
     }
 
     /// ⌫ — delete the selection if active (item 4), else the grapheme
-    /// before the cursor.
+    /// before the cursor. A pill ending AT the cursor dies WHOLE (its
+    /// parked content with it, via the containment GC): the pill is
+    /// atomic, never peeled a grapheme at a time.
     pub fn backspace(&mut self) {
         if self.delete_selection_if_any() {
+            self.after_edit();
+            return;
+        }
+        if let Some((start, end)) = self
+            .pill_ranges()
+            .into_iter()
+            .find(|&(_, end)| end == self.cursor)
+        {
+            self.text.replace_range(start..end, "");
+            self.cursor = start;
             self.after_edit();
             return;
         }
@@ -434,9 +587,19 @@ impl Composer {
     }
 
     /// Delete (fn⌫ / kDEL) — the selection if active, else the grapheme
-    /// after the cursor.
+    /// after the cursor. A pill starting AT the cursor dies whole (the
+    /// [`Self::backspace`] mirror).
     pub fn delete_forward(&mut self) {
         if self.delete_selection_if_any() {
+            self.after_edit();
+            return;
+        }
+        if let Some((start, end)) = self
+            .pill_ranges()
+            .into_iter()
+            .find(|&(start, _)| start == self.cursor)
+        {
+            self.text.replace_range(start..end, "");
             self.after_edit();
             return;
         }
@@ -453,7 +616,9 @@ impl Composer {
     /// ⌫/Delete — documented choice).
     pub fn word_backspace(&mut self) {
         self.anchor = None;
-        let target = word_left_of(&self.text, self.cursor);
+        // A word target inside a pill widens to the pill's start: the
+        // kill range may swallow a pill whole, never bisect it.
+        let target = self.snap_pill_left(word_left_of(&self.text, self.cursor));
         self.text.replace_range(target..self.cursor, "");
         self.cursor = target;
         self.after_edit();
@@ -509,6 +674,9 @@ impl Composer {
         if let Some(prev) = prev_boundary(&self.text, self.cursor) {
             self.cursor = prev;
         }
+        // Stepping INTO a pill jumps to its far edge — the pill is one
+        // caret stop, exactly like a grapheme cluster.
+        self.cursor = self.snap_pill_left(self.cursor);
     }
 
     /// → by one grapheme (collapse-to-right-edge law mirrors
@@ -527,6 +695,7 @@ impl Composer {
         if let Some(next) = next_boundary(&self.text, self.cursor) {
             self.cursor = next;
         }
+        self.cursor = self.snap_pill_right(self.cursor); // one caret stop
     }
 
     /// ⌥← — to the start of the previous word (mac option-arrow law;
@@ -543,7 +712,7 @@ impl Composer {
             }
             self.anchor = None;
         }
-        self.cursor = word_left_of(&self.text, self.cursor);
+        self.cursor = self.snap_pill_left(word_left_of(&self.text, self.cursor));
     }
 
     /// ⌥→ — to the end of the next word.
@@ -556,7 +725,7 @@ impl Composer {
             }
             self.anchor = None;
         }
-        self.cursor = word_right_of(&self.text, self.cursor);
+        self.cursor = self.snap_pill_right(word_right_of(&self.text, self.cursor));
     }
 
     /// Home / ⌃A — LOGICAL line start (Claude Code binds ⌃A here).
@@ -632,7 +801,7 @@ impl Composer {
             self.anchor = None;
         }
         let target = self.sticky_col_for(rows[at]);
-        self.cursor = seek_col_in_row(&self.text, rows[at - 1], target);
+        self.cursor = self.snap_pill_nearest(seek_col_in_row(&self.text, rows[at - 1], target));
         true
     }
 
@@ -665,7 +834,7 @@ impl Composer {
             self.anchor = None;
         }
         let target = self.sticky_col_for(rows[at]);
-        self.cursor = seek_col_in_row(&self.text, rows[at + 1], target);
+        self.cursor = self.snap_pill_nearest(seek_col_in_row(&self.text, rows[at + 1], target));
         true
     }
 
@@ -689,7 +858,9 @@ impl Composer {
     /// boundary and park the anchor there (native caret law — the press
     /// places the caret; a drag then grows a selection from it).
     pub fn press_at(&mut self, byte: usize) {
-        let at = snap(&self.text, byte);
+        // A click inside a pill parks the caret at the nearer edge — the
+        // caret-never-inside law, so the anchor obeys it too.
+        let at = self.snap_pill_nearest(snap(&self.text, byte));
         self.cursor = at;
         self.anchor = Some(at);
         self.sticky_col = None;
@@ -697,7 +868,7 @@ impl Composer {
 
     /// Drag with the button held: the cursor follows, the anchor stays.
     pub fn drag_to(&mut self, byte: usize) {
-        self.cursor = snap(&self.text, byte);
+        self.cursor = self.snap_pill_nearest(snap(&self.text, byte));
     }
 
     // ---- History ring (item 6) ----
@@ -807,6 +978,16 @@ impl Composer {
         self.sticky_col = None;
         self.history_pos = None;
         self.history_stash = None;
+        self.gc_pastes();
+    }
+
+    /// Containment GC (QoL pill): a pill whose placeholder no longer
+    /// appears in the text died with its edit — kill/selection deletes
+    /// remove whole pills as plain ranges, and THIS single seam drops the
+    /// parked content, so the store can never outlive its pill.
+    fn gc_pastes(&mut self) {
+        let Self { text, pastes, .. } = self;
+        pastes.retain(|pill| text.contains(&pill.placeholder()));
     }
 }
 

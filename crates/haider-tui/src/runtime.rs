@@ -602,6 +602,48 @@ pub fn now_epoch_ms() -> u64 {
         })
 }
 
+/// One W-INP STATUS mirror pass (`status_segment_v1`) — the composer
+/// publisher's exact shape (epoch-keyed dedup cache, monotonic
+/// revisions), extracted so tests drive the SAME wiring. Publishes only
+/// on a real change of (connection epoch, bound session, strip string):
+/// the string is [`crate::render::status_left_string`] at the width the
+/// LAST frame rendered, so mirror and screen read one composition. A bar
+/// that has never rendered (width 0) publishes nothing — there is no
+/// on-screen strip to mirror yet. Operation::Control gating is
+/// daemon-side.
+pub fn status_publish_pass(
+    model: &AppModel,
+    connection_epoch: u64,
+    published: &mut Option<(u64, haider_protocol::ids::SessionId, String)>,
+    revision: &mut u64,
+) -> Option<crate::live::LiveCommand> {
+    if !model.daemon_serves(haider_rpc::FEATURE_STATUS_SEGMENT_V1)
+        || !matches!(
+            model.screen,
+            crate::app::Screen::Session | crate::app::Screen::Subagent
+        )
+    {
+        return None;
+    }
+    let session = model.active_session.clone()?;
+    let width = model.status_width.get();
+    if width == 0 {
+        return None;
+    }
+    let line = crate::render::status_left_string(model, width);
+    let current = (connection_epoch, session.clone(), line.clone());
+    if published.as_ref() == Some(&current) {
+        return None;
+    }
+    *revision = revision.saturating_add(1);
+    *published = Some(current);
+    Some(crate::live::LiveCommand::SurfacePublish {
+        session,
+        input: None,
+        status: Some((line, *revision)),
+    })
+}
+
 /// One terminal input event through the production dispatch — key/paste
 /// into the reducer, resize into [`AppModel::handle_resize`], mouse through
 /// the last frame's hit map. Extracted from the event loop so tests drive
@@ -712,6 +754,27 @@ pub fn dispatch_input(
                                 model.dirty = true;
                             }
                             _ => {}
+                        }
+                        // QoL autoscroll: with a live selection held, a
+                        // drag event at or past the transcript viewport's
+                        // edges scrolls one line and keeps selecting —
+                        // the anchor cell above stays parked, the head
+                        // keeps following the pointer, and the clamp is
+                        // drag_autoscroll's. A zero-height rect (no
+                        // frame yet) disarms the edges.
+                        if model
+                            .selection
+                            .as_ref()
+                            .is_some_and(|selection| selection.dragging)
+                        {
+                            let view = model.transcript_view.get();
+                            if view.height > 0 {
+                                if mouse.row <= view.y {
+                                    model.drag_autoscroll(true);
+                                } else if mouse.row >= view.y + view.height - 1 {
+                                    model.drag_autoscroll(false);
+                                }
+                            }
                         }
                     }
                 }
@@ -2947,6 +3010,10 @@ pub async fn run_live(
     // life of this process.
     let mut published_input: Option<(u64, haider_protocol::ids::SessionId, String)> = None;
     let mut input_revision: u64 = 0;
+    // The status half (status_segment_v1) — same cache shape, own
+    // revision counter (`status_publish_pass`).
+    let mut published_status: Option<(u64, haider_protocol::ids::SessionId, String)> = None;
+    let mut status_revision: u64 = 0;
 
     while !model.should_quit {
         // Issue whatever the driver asked for. `try_send` keeps the UI loop
@@ -3183,6 +3250,17 @@ pub async fn run_live(
                 });
                 published_input = Some(current);
             }
+        }
+        // The status half (status_segment_v1): the bar's bottom-left strip
+        // mirrors under the same dedup discipline, through the one
+        // extracted seam.
+        if let Some(command) = status_publish_pass(
+            &model,
+            driver.connection_epoch(),
+            &mut published_status,
+            &mut status_revision,
+        ) {
+            pending.push_back(command);
         }
     }
     Ok(LiveExit::Quit)

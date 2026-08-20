@@ -3647,6 +3647,9 @@ fn render_session(
     // writes the true max AND reconciles the model's offset against it, so
     // resizes/new content can never leave invisible debt banked anywhere.
     model.scroll_max.set(max_scroll);
+    // The drag-autoscroll edge geometry (QoL wave) rides the same
+    // frame-feedback discipline as the max above.
+    model.transcript_view.set(transcript_area);
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
@@ -6625,6 +6628,8 @@ fn render_subagent(
         .saturating_add(wrapped_lines_height(&tail, transcript_area.width));
     let max_scroll = total.saturating_sub(transcript_area.height);
     model.scroll_max.set(max_scroll);
+    // Drag-autoscroll edges (QoL wave), as on the session transcript.
+    model.transcript_view.set(transcript_area);
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
@@ -8657,6 +8662,9 @@ fn composer_lines<'a>(
     let text = model.composer.text();
     let cursor = model.composer.cursor();
     let selection = model.composer.selection_range();
+    // QoL pill: the paste placeholders wear the sim's `.ptoken` gold
+    // ground in the draft, so the atomic chip READS as a chip.
+    let pills = model.composer.pill_ranges();
     // Visual rows: the draft wrapped at grapheme boundaries into the
     // frame's budget (TUI6 item 1), published above for every branch so
     // ↑/↓ walk the SAME rows this frame paints (the scroll_max Cell
@@ -8696,7 +8704,7 @@ fn composer_lines<'a>(
         } else {
             spans.push(Span::raw("  "));
         }
-        composer_row_spans(&mut spans, text, *row, cursor, selection, theme);
+        composer_row_spans(&mut spans, text, *row, cursor, selection, &pills, theme);
         if skip + index == cursor_row_index {
             // Inline ghost completion (sim `.ghostline`, tui.js:3028-3034)
             // — it rides the CARET'S visual row (an overlong palette query
@@ -8740,11 +8748,17 @@ fn composer_row_spans<'s>(
     row: crate::composer::WrapRow,
     cursor: usize,
     selection: Option<(usize, usize)>,
+    pills: &[(usize, usize)],
     theme: &Theme,
 ) {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
     let visible = &text[row.start..row.end];
+    // QoL pill ground — the transcript token treatment (`.ptoken`,
+    // tui.js:4480-4486) on the draft's atomic placeholders. Cursor and
+    // selection still win: the caret cell and the band stay distinct on
+    // a pill's edges.
+    let pill_style = theme.gold_style().bg(theme.gold_soft.into());
     let mut run = String::new();
     let mut run_style = theme.bright_style();
     for (grapheme_offset, grapheme) in visible.grapheme_indices(true) {
@@ -8753,6 +8767,8 @@ fn composer_row_spans<'s>(
             theme.cursor_style()
         } else if selection.is_some_and(|(start, end)| abs >= start && abs < end) {
             theme.composer_selection_style()
+        } else if pills.iter().any(|&(start, end)| abs >= start && abs < end) {
+            pill_style
         } else {
             theme.bright_style()
         };
@@ -8949,18 +8965,41 @@ fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     );
 }
 
-/// The status bar (sim StatusBar, tui.js:5492): boxed state chip · model ·
-/// provider [· branch] · meter · voice chip · right hint (launcher)/flash.
-/// Pushes the /help·theme hint's hit region when the hint is displayed.
-fn render_status_bar(
-    model: &AppModel,
-    theme: &Theme,
-    frame: &mut Frame<'_>,
-    area: Rect,
-    hits: &mut Vec<(Rect, Hit)>,
-) {
+/// One text run of the status bar's bottom-left strip: the content and
+/// the tone the renderer styles it with. The TEXT is the shared truth
+/// (`status_segment_v1`); the tone is display-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSegment {
+    pub text: String,
+    pub tone: StatusSegmentTone,
+}
+
+/// The strip's style vocabulary — resolved to real styles only inside
+/// [`render_status_bar`] (pulse phase included), so the segment composer
+/// stays pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSegmentTone {
+    Text,
+    /// The state chip's `[ ` / ` ]` chrome (pulses with the badge).
+    BadgeChrome,
+    /// The state word itself.
+    Badge,
+    Dim,
+    /// The H4 decision-hook chip's chrome / label.
+    HookChrome,
+    Hook,
+}
+
+/// The status bar's bottom-LEFT strip — ONE pure composition over
+/// (model, width) that BOTH the frame and the W-INP status mirror
+/// consume (`status_segment_v1`): the renderer styles these segments,
+/// the mirror publishes [`status_left_string`], so screen and mirror can
+/// never diverge. Width matters: the meter and cache summaries yield
+/// exactly as they do on screen.
+#[must_use]
+pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> {
     // The derived WAITING-on-subagents badge overlays plain IDLE (§2.6).
-    let (badge, tone) = model.status_badge();
+    let (badge, _) = model.status_badge();
     let identity = &model.identity;
     // W7b meter truth: the durable occupancy snapshot beats the
     // cumulative usage sum, and an ESTIMATED snapshot wears `~` so the
@@ -8998,7 +9037,127 @@ fn render_status_bar(
         fmt_tok(window)
     );
 
-    let mut left = vec![Span::styled(" ", theme.text_style())];
+    // F2c: token usage sits DIRECTLY right of the state — the identity
+    // block (model / auth / reasoning) moved to the composer's top rule.
+    // Narrow dignity: the meter YIELDS whole when the bar cannot hold it
+    // beside the badge (the badge always survives, never clipped chrome).
+    let badge_cells = 1 + badge.chars().count() + 4;
+    let mut segments = vec![
+        StatusSegment {
+            text: " ".to_owned(),
+            tone: StatusSegmentTone::Text,
+        },
+        StatusSegment {
+            text: "[ ".to_owned(),
+            tone: StatusSegmentTone::BadgeChrome,
+        },
+        StatusSegment {
+            text: badge.clone(),
+            tone: StatusSegmentTone::Badge,
+        },
+        StatusSegment {
+            text: " ]".to_owned(),
+            tone: StatusSegmentTone::BadgeChrome,
+        },
+    ];
+    let meter_shown = badge_cells + 2 + meter.chars().count() <= width as usize;
+    if meter_shown {
+        segments.push(StatusSegment {
+            text: format!("  {meter}  "),
+            tone: StatusSegmentTone::Dim,
+        });
+    }
+    if meter_shown && !model.cache_usage.is_empty() {
+        let totals = model.cache_usage.totals();
+        let wide = crate::cache_usage::wide_status(&totals);
+        let medium = crate::cache_usage::medium_status(&totals);
+        let branch_reserve = if model.screen == Screen::Session {
+            model.active_branch_name().chars().count() + 4
+        } else {
+            0
+        };
+        let used = badge_cells + 2 + meter.chars().count();
+        let available = (width as usize).saturating_sub(used + branch_reserve);
+        if wide.chars().count() + 2 <= available {
+            segments.push(StatusSegment {
+                text: format!("{wide}  "),
+                tone: StatusSegmentTone::Dim,
+            });
+        } else if medium.chars().count() + 2 <= available {
+            segments.push(StatusSegment {
+                text: format!("{medium}  "),
+                tone: StatusSegmentTone::Dim,
+            });
+        }
+    }
+    // The branch name inside a session, plus ` · q:turn` while queue mode
+    // holds (tui.js:2840-2842). B2b: the ACTIVE branch's name — "main" on
+    // the main branch, the daemon-named fork otherwise.
+    if model.screen == Screen::Session {
+        let queue_tag = if model.queue_mode {
+            " · q:turn"
+        } else if model.subturn_mode {
+            " · q:subturn"
+        } else {
+            ""
+        };
+        segments.push(StatusSegment {
+            text: format!("· {}{queue_tag}  ", model.active_branch_name()),
+            tone: StatusSegmentTone::Text,
+        });
+    }
+    // The voice/dictation chip moved to the TOP-RIGHT header (see
+    // `voice_header_pill`), so the status bar no longer carries it.
+    // H4: the decision-hook chip — visible exactly while the CURRENT run's
+    // permission was answered by a decision hook (journaled fact → chip;
+    // a proposal the menu CAS did not apply never lights it). Session
+    // surfaces only: the chip is that session's automation, not the
+    // launcher's.
+    if matches!(
+        model.screen,
+        Screen::Session | Screen::Subagent | Screen::Hooks | Screen::Tree | Screen::Tools
+    ) && model.hook_facts.decision_chip()
+    {
+        segments.push(StatusSegment {
+            text: "[ ".to_owned(),
+            tone: StatusSegmentTone::HookChrome,
+        });
+        segments.push(StatusSegment {
+            text: "⚙ hook·decided".to_owned(),
+            tone: StatusSegmentTone::Hook,
+        });
+        segments.push(StatusSegment {
+            text: " ]".to_owned(),
+            tone: StatusSegmentTone::HookChrome,
+        });
+    }
+    segments
+}
+
+/// The strip's display STRING, byte-exact with what the frame paints —
+/// the value the W-INP status mirror publishes (`status_segment_v1`).
+#[must_use]
+pub fn status_left_string(model: &AppModel, width: u16) -> String {
+    status_left_segments(model, width)
+        .into_iter()
+        .map(|segment| segment.text)
+        .collect()
+}
+
+/// The status bar (sim StatusBar, tui.js:5492): boxed state chip · model ·
+/// provider [· branch] · meter · voice chip · right hint (launcher)/flash.
+/// Pushes the /help·theme hint's hit region when the hint is displayed.
+fn render_status_bar(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    // The W-INP status mirror composes at the frame's exact width (the
+    // scroll_max frame-feedback discipline).
+    model.status_width.set(area.width);
+    let (badge, tone) = model.status_badge();
     // Sim Badge (tui.js:5541-5547): IDLE wears a FRAME border with dim
     // ink; other outlined states border in their own tone; fills carry the
     // fill on chrome and label alike.
@@ -9018,67 +9177,20 @@ fn render_status_bar(
     } else {
         (badge_chrome, theme.badge_style(tone))
     };
-    // F2c: token usage sits DIRECTLY right of the state — the identity
-    // block (model / auth / reasoning) moved to the composer's top rule.
-    // Narrow dignity: the meter YIELDS whole when the bar cannot hold it
-    // beside the badge (the badge always survives, never clipped chrome).
-    let badge_cells = 1 + badge.chars().count() + 4;
-    left.extend(chip_two_tone(badge, badge_chrome, badge_ink));
-    let meter_shown = badge_cells + 2 + meter.chars().count() <= area.width as usize;
-    if meter_shown {
-        left.push(Span::styled(format!("  {meter}  "), theme.dim_style()));
-    }
-    if meter_shown && !model.cache_usage.is_empty() {
-        let totals = model.cache_usage.totals();
-        let wide = crate::cache_usage::wide_status(&totals);
-        let medium = crate::cache_usage::medium_status(&totals);
-        let branch_reserve = if model.screen == Screen::Session {
-            model.active_branch_name().chars().count() + 4
-        } else {
-            0
-        };
-        let used = badge_cells + 2 + meter.chars().count();
-        let available = (area.width as usize).saturating_sub(used + branch_reserve);
-        if wide.chars().count() + 2 <= available {
-            left.push(Span::styled(format!("{wide}  "), theme.dim_style()));
-        } else if medium.chars().count() + 2 <= available {
-            left.push(Span::styled(format!("{medium}  "), theme.dim_style()));
-        }
-    }
-    // The branch name inside a session, plus ` · q:turn` while queue mode
-    // holds (tui.js:2840-2842). B2b: the ACTIVE branch's name — "main" on
-    // the main branch, the daemon-named fork otherwise.
-    if model.screen == Screen::Session {
-        let queue_tag = if model.queue_mode {
-            " · q:turn"
-        } else if model.subturn_mode {
-            " · q:subturn"
-        } else {
-            ""
-        };
-        left.push(Span::styled(
-            format!("· {}{queue_tag}  ", model.active_branch_name()),
-            theme.text_style(),
-        ));
-    }
-    // The voice/dictation chip moved to the TOP-RIGHT header (see
-    // `voice_header_pill`), so the status bar no longer carries it.
-    // H4: the decision-hook chip — visible exactly while the CURRENT run's
-    // permission was answered by a decision hook (journaled fact → chip;
-    // a proposal the menu CAS did not apply never lights it). Session
-    // surfaces only: the chip is that session's automation, not the
-    // launcher's.
-    if matches!(
-        model.screen,
-        Screen::Session | Screen::Subagent | Screen::Hooks | Screen::Tree | Screen::Tools
-    ) && model.hook_facts.decision_chip()
-    {
-        left.extend(chip_two_tone(
-            "⚙ hook·decided".to_owned(),
-            theme.frame_style(),
-            theme.gold_style(),
-        ));
-    }
+    let left: Vec<Span<'_>> = status_left_segments(model, area.width)
+        .into_iter()
+        .map(|segment| {
+            let style = match segment.tone {
+                StatusSegmentTone::Text => theme.text_style(),
+                StatusSegmentTone::BadgeChrome => badge_chrome,
+                StatusSegmentTone::Badge => badge_ink,
+                StatusSegmentTone::Dim => theme.dim_style(),
+                StatusSegmentTone::HookChrome => theme.frame_style(),
+                StatusSegmentTone::Hook => theme.gold_style(),
+            };
+            Span::styled(segment.text, style)
+        })
+        .collect();
 
     // OTA: a discovered release is durable model data, not a modal. It
     // quietly occupies the status-bar hint slot on every surface, yielding
@@ -9303,9 +9415,21 @@ fn user_text_spans<'a>(text: &'a str, theme: &Theme) -> Vec<Span<'a>> {
     spans
 }
 
-/// Length of a sim paste token (`[Pasted N lines]` / `[Image #N]`) at the
-/// start of `text`, if present.
+/// Length of a paste token at the start of `text`, if present: the QoL
+/// pill placeholder (`[Pasted text #N +K lines]`), the sim's historical
+/// `[Pasted N lines]`, or `[Image #N]`.
 fn paste_token_len(text: &str) -> Option<usize> {
+    if let Some(body) = text.strip_prefix("[Pasted text #") {
+        let n_digits = body.chars().take_while(char::is_ascii_digit).count();
+        if n_digits > 0
+            && let Some(rest) = body[n_digits..].strip_prefix(" +")
+        {
+            let k_digits = rest.chars().take_while(char::is_ascii_digit).count();
+            if k_digits > 0 && rest[k_digits..].starts_with(" lines]") {
+                return Some("[Pasted text #".len() + n_digits + 2 + k_digits + " lines]".len());
+            }
+        }
+    }
     for (prefix, suffix) in [("[Pasted ", " lines]"), ("[Image #", "]")] {
         if let Some(body) = text.strip_prefix(prefix) {
             let digits = body.chars().take_while(char::is_ascii_digit).count();

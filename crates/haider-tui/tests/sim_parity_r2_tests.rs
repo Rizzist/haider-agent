@@ -294,22 +294,24 @@ fn theme_arg_slot_offers_completes_and_runs() {
 fn big_pastes_become_pill_tokens_and_render_gold() {
     let mut model = launcher_model();
     model.handle(AppEvent::Paste("a\nb\nc\nd\ne".to_owned().into()));
-    assert_eq!(model.composer, "[Pasted 5 lines] ");
-    for c in "ship it".chars() {
+    // The QoL wave's Claude Code placeholder (the sim's literal token
+    // retired); the sim's THRESHOLDS still gate it (G15).
+    assert_eq!(model.composer, "[Pasted text #1 +5 lines]");
+    for c in " ship it".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Enter));
-    // The echoed user row (from the canned turn's UserMessage) styles the
-    // token gold on the gold-soft ground.
+    // A user row carrying the pill vocabulary styles the token gold on
+    // the gold-soft ground (`.ptoken`) — the sim law, on the new format.
     model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {
-        text: "[Pasted 5 lines] ship it".to_owned(),
+        text: "[Pasted text #1 +5 lines] ship it".to_owned(),
         attachments: vec![],
         mode: haider_protocol::DeliveryMode::Steer,
     })));
     let theme = model.theme.theme();
     let (rows, _, terminal) = draw(&model, 118, 34);
     // The TRANSCRIPT row (the header title echoes the text too, in dim).
-    let user_y = row_of(&rows, "❯ [Pasted 5 lines] ship it");
+    let user_y = row_of(&rows, "❯ [Pasted text #1 +5 lines] ship it");
     let token_x = col_of(&rows[user_y as usize], "[Pasted");
     let cell = &terminal.backend().buffer()[(token_x, user_y)];
     assert_eq!(cell.fg, Color::from(theme.gold));

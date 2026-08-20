@@ -1,11 +1,12 @@
 //! B4b — attachments in the live TUI (research §seam-plan item 6).
 //!
 //! `/attach` chips the draft with a magic-sniffed image and uploads it
-//! through the receipt-free `artifact.put`; the big-paste pill is REAL
-//! (a `PastedText` artifact, not zeroize-and-drop theater); the chips ride
-//! both `turn.submit` wire forms at their captured coordinates; and every
+//! through the receipt-free `artifact.put`; the chips ride both
+//! `turn.submit` wire forms at their captured coordinates; and every
 //! refusal — demo, feature-ungated daemon, oversized, non-image — is an
-//! honest notice with NO upload behind it.
+//! honest notice with NO upload behind it. The big paste left this
+//! pipeline with the QoL wave: it is a LOCAL draft pill
+//! (`qol_paste_pill_tests.rs`) whose content rides the submit as text.
 #![allow(clippy::expect_used)]
 
 use base64::Engine as _;
@@ -646,55 +647,35 @@ fn attach_text_fallback_chips_a_file_and_submit_carries_the_block() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---- law 3: the paste pill is REAL ------------------------------------
+// ---- law 3: the paste pill is LOCAL (QoL wave) -------------------------
 
+/// MUTATION CHECK: route `big_paste` back through
+/// `begin_attachment_upload`. Expected runtime failure: an `ArtifactPut`
+/// command appears, the composer gains a chip instead of the atomic
+/// placeholder, and the submit's TEXT no longer carries the pasted bytes.
 #[test]
-fn paste_pill_uploads_pasted_text_and_rides_submit() {
+fn paste_is_a_local_pill_never_an_upload() {
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
 
     model.handle(AppEvent::Paste(Pasted::new(
         "line one\r\nline two\nline three\nline four\nline five".to_owned(),
     )));
-    // The REAL pill is a chip, never a text token the submit would carry
-    // as fake prose.
-    assert_eq!(model.composer, "");
-    let chips = model.composer.attachments();
-    assert_eq!(chips.len(), 1);
-    assert_eq!(chips[0].label, "[Pasted 5 lines]");
-    assert!(chips[0].artifact.is_none(), "uploading");
-
-    // The upload carries the NORMALIZED UTF-8 paste bytes.
+    // The pill is an atomic DRAFT placeholder — no chip, no artifact, no
+    // daemon feature consulted.
+    assert_eq!(model.composer, "[Pasted text #1 +5 lines]");
+    assert!(model.composer.attachments().is_empty(), "no chip");
     let commands = drain(&mut driver, &mut model);
-    let put = commands
-        .iter()
-        .find(|command| matches!(command, LiveCommand::ArtifactPut { .. }))
-        .expect("the paste upload")
-        .clone();
-    let LiveCommand::ArtifactPut { bytes, .. } = put.clone() else {
-        unreachable!()
-    };
-    let normalized = "line one\nline two\nline three\nline four\nline five";
-    assert_eq!(bytes.as_slice(), normalized.as_bytes());
-    assert_eq!(
-        request_body(put.clone()),
-        RequestBody::ArtifactPut {
-            data_base64: base64::engine::general_purpose::STANDARD.encode(normalized.as_bytes()),
-        }
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ArtifactPut { .. })),
+        "nothing uploads"
     );
 
-    // Complete the upload through the link context, then submit.
-    let artifact = ArtifactRef::new(format!("blake3:{:0>64}", "paste"));
-    for reply in map_response(
-        &CommandContext::of(&put),
-        ResponseBody::ArtifactPut {
-            artifact: artifact.clone(),
-            bytes: normalized.len() as u64,
-        },
-    ) {
-        driver.apply(&mut model, reply);
-    }
-    submit(&mut model, "summarize the paste");
+    // Submit expands the placeholder byte-exact at its position — the
+    // wire carries the full NORMALIZED paste as text, attachments empty.
+    submit(&mut model, " summarize");
     let commands = drain(&mut driver, &mut model);
     let LiveCommand::Submit {
         text, attachments, ..
@@ -706,20 +687,16 @@ fn paste_pill_uploads_pasted_text_and_rides_submit() {
     else {
         unreachable!()
     };
-    assert_eq!(text, "summarize the paste");
     assert_eq!(
-        attachments,
-        vec![AttachmentBlock::PastedText {
-            artifact: artifact.clone(),
-            lines: 5,
-        }]
+        text,
+        "line one\nline two\nline three\nline four\nline five summarize"
     );
-    assert!(
-        !model.composer.has_attachments(),
-        "the pill cleared on submit"
-    );
+    assert!(attachments.is_empty(), "no blocks ride a paste");
 
-    // Wire shape of the pasted-text block.
+    // Wire shape of the pasted-text block — the vocabulary stays wire-
+    // legal for daemons that store text by ref, even though the TUI's
+    // paste path no longer mints it.
+    let artifact = ArtifactRef::new(format!("blake3:{:0>64}", "paste"));
     let encoded = serde_json::to_value(
         serde_json::to_value(&AttachmentBlock::PastedText { artifact, lines: 5 })
             .expect("block encodes"),
@@ -919,9 +896,10 @@ fn upload_reply_completes_the_issuing_draft_not_the_displayed_surface() {
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
 
-    model.handle(AppEvent::Paste(Pasted::new(
-        "p1\np2\np3\np4\np5".to_owned(),
-    )));
+    // An /attach text upload (pastes are draft-local since the QoL wave
+    // and issue no upload to park).
+    let path = temp_file("parked.md", b"p1\np2\np3\np4\np5");
+    attach_read_effects(&mut model, &path.display().to_string());
     let issuing_surface = model.surface_key();
     let commands = drain(&mut driver, &mut model);
     let LiveCommand::ArtifactPut {
@@ -969,6 +947,7 @@ fn upload_reply_completes_the_issuing_draft_not_the_displayed_surface() {
         Some(&artifact),
         "the reply completed the issuing draft's chip"
     );
+    let _ = std::fs::remove_file(&path);
 }
 
 // ---- disconnect: in-flight uploads die honestly -----------------------
@@ -982,9 +961,10 @@ fn disconnect_drops_uploading_chips_with_an_honest_notice() {
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
 
-    model.handle(AppEvent::Paste(Pasted::new(
-        "d1\nd2\nd3\nd4\nd5".to_owned(),
-    )));
+    // An /attach text upload holds the in-flight chip (pastes issue no
+    // upload since the QoL wave).
+    let path = temp_file("dropped.md", b"d1\nd2\nd3\nd4\nd5");
+    attach_read_effects(&mut model, &path.display().to_string());
     drain(&mut driver, &mut model);
     assert!(model.composer.has_uploading_attachment());
 
@@ -1004,6 +984,7 @@ fn disconnect_drops_uploading_chips_with_an_honest_notice() {
             "· reconnecting — socket closed (1 in-flight attachment upload(s) dropped — /attach again)"
         )
     );
+    let _ = std::fs::remove_file(&path);
 }
 
 // ---- law 5: the ungated daemon fabricates nothing ---------------------
@@ -1023,18 +1004,12 @@ fn feature_ungated_attach_is_honest() {
     assert!(model.requests.is_empty(), "no read, no upload");
     assert!(model.composer.attachments().is_empty(), "no chip");
 
-    // The big paste cannot fabricate a pill either: the text lands
-    // LITERALLY (content preserved, nothing claimed) and the notice
-    // names the stale daemon.
+    // The big paste needs NO daemon feature (QoL wave): the pill is
+    // draft-local and its content rides the submit as text — nothing is
+    // claimed of the stale daemon, nothing uploads.
     model.handle(AppEvent::Paste(Pasted::new("a\nb\nc\nd\ne".to_owned())));
     assert!(model.composer.attachments().is_empty(), "no chip");
-    assert_eq!(model.composer, "a\nb\nc\nd\ne");
-    assert_eq!(
-        model.flash.as_deref(),
-        Some(
-            "· paste attachments needs a newer daemon (running v0.0.50) — restart it to pick up this release"
-        )
-    );
+    assert_eq!(model.composer, "[Pasted text #1 +5 lines]");
     assert!(model.requests.is_empty(), "no upload request");
 }
 
@@ -1055,10 +1030,10 @@ fn demo_attach_refuses() {
     assert!(model.requests.is_empty(), "nothing rides");
     assert!(model.composer.attachments().is_empty(), "no chip");
 
-    // The demo paste pill keeps its sim-verbatim vocabulary — a local
-    // token in a world that is local by design — and still chips nothing.
+    // The demo paste is the SAME local pill (the sim's literal token
+    // retired with the QoL wave) — still no chip, still no request.
     model.handle(AppEvent::Paste(Pasted::new("a\nb\nc\nd\ne".to_owned())));
-    assert_eq!(model.composer, "[Pasted 5 lines] ");
+    assert_eq!(model.composer, "[Pasted text #1 +5 lines]");
     assert!(model.composer.attachments().is_empty(), "no chip");
     assert!(model.requests.is_empty(), "no upload request");
 }

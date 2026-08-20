@@ -3324,6 +3324,17 @@ pub struct AppModel {
     /// (reconcile-then-apply, review r5 P2-2). Starts at 0 (review r2
     /// P2-6).
     pub scroll_max: std::cell::Cell<u16>,
+    /// The transcript viewport of the LAST rendered frame — written by
+    /// the renderer beside [`Self::scroll_max`] (the same frame-feedback
+    /// `Cell` discipline). The drag-autoscroll edge test reads it at the
+    /// dispatch seam; a zero-height rect (nothing rendered yet) disarms
+    /// the edges.
+    pub transcript_view: std::cell::Cell<ratatui::layout::Rect>,
+    /// The status bar width of the LAST rendered frame — the W-INP status
+    /// mirror composes [`crate::render::status_left_string`] at exactly
+    /// the width the frame wrapped its yields against, so mirror and
+    /// screen read the same strip. 0 until a status bar has rendered.
+    pub status_width: std::cell::Cell<u16>,
     /// The frame-geometry epoch (TUI6.1 fix 1). Bumped by every RESIZE
     /// (the reducer's only involvement — it versions the frame, it learns
     /// nothing about wrapping) and by every RENDER (`Cell`: the renderer
@@ -3566,6 +3577,8 @@ impl Default for AppModel {
             turn_active: false,
             scroll_back: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
+            transcript_view: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            status_width: std::cell::Cell::new(0),
             geometry_epoch: std::cell::Cell::new(0),
             login_attempt_seq: 0,
             sticky_suppressed: std::cell::Cell::new(false),
@@ -3854,48 +3867,18 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// A paste over the sim's pill thresholds — B4b makes the pill REAL.
-    ///
-    /// DEMO keeps the sim's verbatim vocabulary (a literal pill token;
-    /// the sim's world is local by design). LIVE on a session surface
-    /// with `artifact_put_v1`, the content uploads as a `PastedText`
-    /// artifact (UTF-8, ref-based — tool.rs's intended composer-token
-    /// vocabulary) and the pill chip rides the next submit; the
-    /// zeroize-and-drop theater is dead. LIVE anywhere else — launcher,
-    /// aura, subagent, or an ungated daemon — the text lands LITERALLY:
-    /// an honest composer full of text beats a pill claiming content no
-    /// daemon holds.
+    /// A paste over the pill thresholds — the Claude Code pill (QoL
+    /// wave, retiring B4b's paste-as-artifact and the sim's literal
+    /// token alike): the draft shows an atomic `[Pasted text #N +K
+    /// lines]` placeholder, the content parks on the draft's side store,
+    /// and submit expands it back byte-exact at the placeholder's
+    /// position ([`crate::composer::Composer::expand_pastes`]). Local on
+    /// every surface and mode — no daemon feature, no upload, nothing
+    /// fabricated: the daemon receives the full text with the submit.
+    /// `/attach` keeps the B4b artifact pipeline; pastes never enter it.
     fn big_paste(&mut self, text: &str, raw_lines: usize) {
-        if self.mode.fabricates_locally() {
-            self.composer
-                .insert_str(&format!("[Pasted {raw_lines} lines] "));
-            return;
-        }
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        if self.screen != Screen::Session {
-            self.composer.insert_str(&normalized);
-            return;
-        }
-        if !self.daemon_serves(haider_rpc::FEATURE_ARTIFACT_PUT_V1) {
-            self.flash = Some(self.stale_daemon_note("paste attachments"));
-            self.composer.insert_str(&normalized);
-            return;
-        }
-        if normalized.len() > MAX_ATTACHMENT_BYTES {
-            self.flash =
-                Some("· paste exceeds the 5 MiB attachment limit — not inserted".to_owned());
-            return;
-        }
-        if self.composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
-            self.flash = Some("· 5 attachments a turn — ⌫ at the start removes one".to_owned());
-            return;
-        }
-        let lines = u32::try_from(raw_lines).unwrap_or(u32::MAX);
-        self.begin_attachment_upload(
-            normalized.into_bytes(),
-            crate::composer::PendingKind::PastedText { lines },
-            format!("[Pasted {raw_lines} lines]"),
-        );
+        self.composer
+            .insert_paste(text.replace("\r\n", "\n").replace('\r', "\n"), raw_lines);
     }
 
     /// Park the live composer under the CURRENT surface's key. Callers
@@ -4548,9 +4531,12 @@ impl AppModel {
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
-                // The zeroizing wrapper is borrowed, never unwrapped: the
-                // one owned copy wipes when `text` drops at the end of
-                // this arm (TUI6.3 fix 2).
+                // The zeroizing wrapper is borrowed, never unwrapped
+                // (TUI6.3 fix 2): the wrapped copy wipes when `text`
+                // drops at the end of this arm. What flows into the
+                // composer — inline text or a pill's side store — is
+                // draft content by intent, retained exactly as long as
+                // the draft itself.
                 let text = text.as_str();
                 // Keys are pasted more often than typed; the paste lands in
                 // the masked buffer and NOWHERE else (no pill token, no
@@ -6016,7 +6002,7 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        let text = if is_slash {
+        let display = if is_slash {
             self.composer.take_silent()
         } else {
             self.composer.take_for_submit()
@@ -6026,7 +6012,7 @@ impl AppModel {
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
-        if text.is_empty() {
+        if display.is_empty() {
             // Empty ⏎ on the launcher re-attaches the most recently left
             // session (a port law; the detach model keeps it honest by id).
             if self.screen == Screen::Launcher
@@ -6036,11 +6022,18 @@ impl AppModel {
             }
             return;
         }
-        if text.starts_with('/') {
-            self.composer.set_text(text);
+        if display.starts_with('/') {
+            self.composer.set_text(display);
             self.execute_slash();
             return;
         }
+        // QoL pill: every route below carries a real message, so the paste
+        // pills expand HERE — once, after the outer trim (the pasted bytes
+        // themselves are never trimmed) and after slash routing (a command
+        // keeps its placeholders and their store). Route DECISIONS below
+        // keep reading the DISPLAY text: a pasted body opening with `!` or
+        // a shell word must never hijack a route the user did not type.
+        let text = self.composer.expand_pastes(&display);
         // §4 step 3: on the aura screen non-slash text drives orchestrate
         // ONLY while the aura is idle (otherwise silently dropped).
         if self.screen == Screen::Aura {
@@ -6079,6 +6072,7 @@ impl AppModel {
         // literal `!x`. Demo mode keeps the sim's six bare VFS commands
         // and says so instead of faking a host shell.
         if self.screen == Screen::Session
+            && display.starts_with('!')
             && let Some(stripped) = text.strip_prefix('!')
         {
             if self.mode.fabricates_locally() {
@@ -6098,7 +6092,7 @@ impl AppModel {
         // Shell builtins run against the VFS — local, instant, NO model
         // turn (sim tui.js:1993-2008) — never on the subagent screen, and
         // they never start a session.
-        let first_word = text.split_whitespace().next().unwrap_or("");
+        let first_word = display.split_whitespace().next().unwrap_or("");
         if self.screen != Screen::Subagent
             && SHELL_CMDS.contains(&first_word.to_ascii_lowercase().as_str())
         {
@@ -12193,6 +12187,31 @@ impl AppModel {
             current.saturating_add(3).min(max)
         } else {
             current.saturating_sub(3)
+        };
+        self.scroll_back.set(next);
+    }
+
+    /// One drag-autoscroll step (QoL wave): a held transcript selection
+    /// dragged to the viewport's edge keeps scrolling — one line per drag
+    /// event (crossterm reports Drag only on movement; no timer exists
+    /// for an edge HOLD, by design), reconcile-then-apply clamped exactly
+    /// like the wheel. The selection itself is untouched: it is
+    /// screen-space ([`crate::select`]), so the anchor CELL stays parked
+    /// while the content slides beneath it and the copy-on-release reads
+    /// the final frame.
+    pub fn drag_autoscroll(&mut self, up: bool) {
+        if !matches!(self.screen, Screen::Session | Screen::Subagent) {
+            return;
+        }
+        self.dirty = true;
+        // A drag scroll is a real scroll (the handle_wheel law).
+        self.sticky_suppressed.set(false);
+        let max = self.scroll_max.get();
+        let current = self.scroll_back.get().min(max);
+        let next = if up {
+            current.saturating_add(1).min(max)
+        } else {
+            current.saturating_sub(1)
         };
         self.scroll_back.set(next);
     }
