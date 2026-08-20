@@ -638,6 +638,7 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         agent_metrics: None,
         parent_session_id: None,
         kind: None,
+        agent_type: None,
     };
     let value = serde_json::to_value(&current).expect("encode current summary");
     assert_eq!(value["workspace_cwd"], "/work/original");
@@ -2042,6 +2043,7 @@ fn session_rename_frames_are_additive_and_golden() {
         agent_metrics: None,
         parent_session_id: None,
         kind: None,
+        agent_type: None,
     })
     .expect("encode bare summary");
     assert!(
@@ -2608,6 +2610,7 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
             "session-lineage-parent",
         )),
         kind: Some(haider_rpc::SessionKindWire::Subagent),
+        agent_type: None,
     };
     let value = serde_json::to_value(&child).expect("encode child summary");
     assert_eq!(value["kind"], "subagent");
@@ -2645,4 +2648,68 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
     .expect("older summary decodes");
     assert_eq!(older.kind, None, "absence is unknown, never root");
     assert_eq!(older.parent_session_id, None);
+}
+
+/// W-flow additive tolerance for the agent-type binding: request and
+/// response decode with unknown additive fields; the summary's
+/// `agent_type` is absent for plain sessions and unknown (never plain)
+/// from older daemons.
+///
+/// MUTATION CHECK: rename the wire methods, default a missing summary
+/// `agent_type` to `Some(..)`, or make either body strict. Expected
+/// failure: a decode below rejects or the absent-field reads change.
+#[test]
+fn session_select_agent_type_is_additive_and_old_decoder_tolerant() {
+    let request = r#"{
+        "method":"session.select_agent_type",
+        "command_id":"bind-1",
+        "session_id":"session-1",
+        "worker_generation":3,
+        "agent_type":"scout",
+        "future_field":true
+    }"#;
+    let body: RequestBody = serde_json::from_str(request).expect("request decodes");
+    let RequestBody::SessionSelectAgentType { agent_type, .. } = body else {
+        panic!("expected select_agent_type request");
+    };
+    assert_eq!(agent_type.as_deref(), Some("scout"));
+
+    let revert = r#"{
+        "method":"session.select_agent_type",
+        "command_id":"bind-2",
+        "session_id":"session-1",
+        "worker_generation":3
+    }"#;
+    let body: RequestBody = serde_json::from_str(revert).expect("revert decodes");
+    let RequestBody::SessionSelectAgentType { agent_type, .. } = body else {
+        panic!("expected select_agent_type request");
+    };
+    assert_eq!(agent_type, None, "absence is the revert");
+
+    let response = r#"{
+        "method":"session.select_agent_type",
+        "session_id":"session-1",
+        "agent_type":"scout",
+        "selected_seq":9,
+        "worker_generation":3
+    }"#;
+    let body: ResponseBody = serde_json::from_str(response).expect("response decodes");
+    let ResponseBody::SessionSelectAgentType {
+        agent_type,
+        selected_seq,
+        ..
+    } = body
+    else {
+        panic!("expected select_agent_type response");
+    };
+    assert_eq!(agent_type.as_deref(), Some("scout"));
+    assert_eq!(selected_seq, 9);
+
+    let older_summary: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-1",
+        "head_seq": 9,
+        "worker_generation": 7,
+    }))
+    .expect("older summary decodes");
+    assert_eq!(older_summary.agent_type, None, "absence is unknown");
 }

@@ -4855,6 +4855,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             last_model: Some(metadata.model.clone()),
             parent_session_id: None,
             kind: None,
+            agent_type: None,
         }
     );
 

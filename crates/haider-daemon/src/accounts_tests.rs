@@ -262,6 +262,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
 
     let openai = factory
@@ -478,6 +479,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             fast: false,
             cache_policy: Default::default(),
             created_at_ms: 1,
+            agent_type: None,
         })
         .await
         .expect("custom family dispatch");
@@ -539,6 +541,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     let resilience = |model: &str| AccountsResilienceConfig {
         fallback_chain: Vec::new(),
@@ -672,6 +675,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
 
     // The placeholder rides the same handle machinery as real secrets and
@@ -765,6 +769,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
                 fast: false,
                 cache_policy: Default::default(),
                 created_at_ms: 1,
+                agent_type: None,
             })
             .await
         else {
@@ -1230,6 +1235,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             fast: false,
             cache_policy: Default::default(),
             created_at_ms: 1,
+            agent_type: None,
         },
         ProviderTuning::default(),
         None,
@@ -1324,6 +1330,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     (
         AccountsAttemptResolver::new(factory, metadata, ProviderTuning::default(), None),
@@ -1494,6 +1501,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             fast: false,
             cache_policy: Default::default(),
             created_at_ms: 1,
+            agent_type: None,
         })
         .await
         .expect("checked alternate resolution");
@@ -1699,6 +1707,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     let (_, _, openai_access_fingerprint) = factory
         .resolve_provider(
@@ -8975,6 +8984,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
         fast: true,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     let tuning = ProviderTuning::from_metadata(&metadata);
     assert_eq!(tuning.effort.as_deref(), Some("xhigh"));
@@ -9168,6 +9178,7 @@ fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session:
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     }
 }
 
@@ -9881,6 +9892,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     let clean = crate::worker::WebCapabilityDegrade::default();
     let latched = crate::worker::WebCapabilityDegrade {

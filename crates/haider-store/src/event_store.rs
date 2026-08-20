@@ -808,6 +808,43 @@ pub enum SessionSelectEffortOutcome {
     },
 }
 
+/// Secret-free coordinates for one atomic live-session agent-type binding
+/// (W-flow inline identity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSelectAgentTypeCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub agent_type: Option<String>,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.select_agent_type`
+/// receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectedAgentType {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic agent-type metadata-update/event/receipt transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionSelectAgentTypeOutcome {
+    Committed {
+        selected: SelectedAgentType,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: SelectedAgentType,
+    },
+}
+
 /// Secret-free coordinates for one atomic live-session fast-mode toggle (G3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSelectFastCommand {
@@ -4646,6 +4683,9 @@ impl Store {
             effort: command.effort.clone(),
             fast: command.fast,
             cache_policy: command.cache_policy,
+            // W-flow: sessions are born plain; `session.select_agent_type`
+            // binds a Loom identity later.
+            agent_type: None,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
@@ -5357,6 +5397,100 @@ impl Store {
             }
             SessionConfigOutcome::IdempotentReplay { selected } => {
                 SessionSelectEffortOutcome::IdempotentReplay { selected }
+            }
+        })
+    }
+
+    /// Looks up a committed `session.select_agent_type` response before
+    /// session, generation, or metadata validation (R2 response-loss replay).
+    pub fn session_select_agent_type_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SelectedAgentType>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.select_agent_type",
+            request_digest,
+            request_json,
+            "session-select-agent-type",
+        )
+    }
+
+    /// Atomically applies one agent-type binding: validates the id against
+    /// the Loom registry (a miss is a typed refusal, never a silent bind),
+    /// updates the session's typed metadata (`agent_type` only), appends the
+    /// `agent_type_selected` fact, and finalizes the command receipt.
+    /// `None` reverts the session to plain.
+    pub fn select_session_agent_type(
+        &self,
+        command: &SessionSelectAgentTypeCommand,
+    ) -> StoreResult<SessionSelectAgentTypeOutcome> {
+        if command
+            .agent_type
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "agent-type selection must carry a non-empty id or an explicit revert",
+                false,
+            ));
+        }
+        if let Some(id) = command.agent_type.as_deref()
+            && self.loom_agent_type(id)?.is_none()
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("agent type `{id}` is not registered in the loom registry"),
+                false,
+            ));
+        }
+        let agent_type = command.agent_type.clone();
+        let fact = haider_protocol::session::AgentTypeSelected {
+            agent_type: agent_type.clone(),
+        }
+        .to_payload_value()
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize agent-type-selected payload: {error}"),
+                false,
+            )
+        })?;
+        let session_id = command.session_id.clone();
+        let generation = self.worker_generation;
+        let outcome = self.select_session_config(
+            SessionConfigSelection {
+                command_id: &command.command_id,
+                request_digest: &command.request_digest,
+                request_json: &command.request_json,
+                session_id: &command.session_id,
+                worker_generation: command.worker_generation,
+                method: "session.select_agent_type",
+                description: "session-select-agent-type",
+                event_id: command.event_id.clone(),
+                device_id: command.device_id.clone(),
+            },
+            fact,
+            |metadata| metadata.agent_type = agent_type.clone(),
+            move |selected_seq| SelectedAgentType {
+                session_id,
+                agent_type: command.agent_type.clone(),
+                selected_seq,
+                worker_generation: generation,
+            },
+        )?;
+        Ok(match outcome {
+            SessionConfigOutcome::Committed { selected, envelope } => {
+                SessionSelectAgentTypeOutcome::Committed { selected, envelope }
+            }
+            SessionConfigOutcome::IdempotentReplay { selected } => {
+                SessionSelectAgentTypeOutcome::IdempotentReplay { selected }
             }
         })
     }

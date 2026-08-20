@@ -50,6 +50,7 @@ fn summary(
         last_model: None,
         parent_session_id: None,
         kind: None,
+        agent_type: None,
     }
 }
 

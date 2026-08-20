@@ -2016,6 +2016,42 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::SessionSelectAgentType {
+                command_id,
+                session_id,
+                worker_generation,
+                agent_type,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "agent-type selection requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_select_agent_type(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    agent_type,
+                )
+                .await
+            }
             RequestBody::SessionSelectFast {
                 command_id,
                 session_id,
@@ -4693,6 +4729,110 @@ impl HubConnection {
         self.respond_effort_selected(request_id, selected)
     }
 
+    /// `session.select_agent_type` — the receipted W-flow inline-identity
+    /// binding: receipt replay precedes validation, the STORE validates the
+    /// id against the Loom registry inside the select transaction, and the
+    /// bound job rides the volatile prompt tail — no cache-epoch assessment
+    /// because no cache-relevant bytes move.
+    async fn session_select_agent_type(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        agent_type: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let agent_type = agent_type
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty());
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "agent-type selection needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "agent_type": &agent_type,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!(
+                "cannot encode agent-type-selection coordinates: {error}"
+            ))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+
+        match self
+            .hub
+            .session_select_agent_type_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(selected)) => return self.respond_agent_type_selected(request_id, selected),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+
+        if (match self.hub.session_metadata(&session_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        })
+        .is_none()
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "agent-type selection requires a live session with typed metadata",
+                false,
+                None,
+            );
+        }
+
+        let command = haider_core::SessionSelectAgentTypeCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            agent_type,
+            event_id: EventId::new(random_id("agent-type-selected")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let selected = match self.hub.select_session_agent_type(command).await {
+            Ok(haider_core::SessionSelectAgentTypeOutcome::Committed { selected, .. })
+            | Ok(haider_core::SessionSelectAgentTypeOutcome::IdempotentReplay { selected }) => {
+                selected
+            }
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_agent_type_selected(request_id, selected)
+    }
+
+    fn respond_agent_type_selected(
+        &self,
+        request_id: RequestId,
+        selected: haider_core::SelectedAgentType,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionSelectAgentType {
+                session_id: selected.session_id,
+                agent_type: selected.agent_type,
+                selected_seq: selected.selected_seq,
+                worker_generation: selected.worker_generation,
+            },
+        })
+    }
+
     /// `session.select_fast` — the receipted fast-mode toggle (G3), same
     /// law set as `session.select_effort`.
     async fn session_select_fast(
@@ -7115,6 +7255,9 @@ pub(crate) async fn session_summaries(
             ),
             None => (haider_rpc::SessionKindWire::Root, None),
         };
+        let metadata_agent_type = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.agent_type.clone());
         sessions.push(SessionSummary {
             session_id: session_id.clone(),
             head_seq,
@@ -7129,6 +7272,7 @@ pub(crate) async fn session_summaries(
             agent_metrics,
             parent_session_id,
             kind: Some(kind),
+            agent_type: metadata_agent_type,
         });
     }
     Ok(sessions)
@@ -7265,6 +7409,7 @@ mod roster_wave_tests {
             agent_metrics: None,
             parent_session_id: None,
             kind: None,
+            agent_type: None,
         }
     }
 

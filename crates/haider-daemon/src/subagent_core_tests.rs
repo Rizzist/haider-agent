@@ -298,6 +298,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     let coordinates = || SpawnCoordinates {
         parent_session_id: parent_session.clone(),
@@ -589,6 +590,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                     fast: false,
                     cache_policy: Default::default(),
                     created_at_ms: 1,
+                    agent_type: None,
                 },
             },
             SpawnSubagent {
@@ -823,6 +825,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                     fast: false,
                     cache_policy: Default::default(),
                     created_at_ms: 1,
+                    agent_type: None,
                 },
             },
             SpawnSubagent {
@@ -866,6 +869,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 fast: false,
                 cache_policy: Default::default(),
                 created_at_ms: 1,
+                agent_type: None,
             },
             store: parent_lease,
             run_id: parent_run.clone(),
@@ -1017,6 +1021,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                     fast: false,
                     cache_policy: Default::default(),
                     created_at_ms: 1,
+                    agent_type: None,
                 },
             },
             SpawnSubagent {
@@ -3258,6 +3263,108 @@ async fn session_summaries_carry_typed_lineage_from_the_delegation_record() {
     let parent_summary = by_id(&parent);
     assert_eq!(parent_summary.kind, Some(haider_rpc::SessionKindWire::Root));
     assert_eq!(parent_summary.parent_session_id, None);
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// W-flow inline identity: `session.select_agent_type` is registry-
+/// validated, receipted, and reversible — a registered id binds (metadata
+/// + fact through the actor arm), an unregistered id is a typed refusal
+/// that binds NOTHING, and `None` reverts to plain.
+///
+/// MUTATION CHECK: drop the loom-registry existence check from
+/// `select_session_agent_type`, or stop writing `metadata.agent_type`.
+/// Expected runtime failure: the typo below binds silently, or the bound
+/// metadata read returns `None`.
+#[tokio::test]
+async fn agent_type_selection_is_registry_validated_receipted_and_reversible() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    crate::loom_seed::seed_loom_registry(&store)
+        .await
+        .expect("seed registry");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("agent-type-session");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-agent-type".into(),
+        request_digest: "create-agent-type-digest".into(),
+        request_json: r#"{"session":"agent-type"}"#.into(),
+        session_id: session.clone(),
+        cwd: test_cwd(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-agent-type"),
+        device_id: DeviceId::new("agent-type-device"),
+    })
+    .await
+    .expect("seed session");
+    let command =
+        |suffix: &str, agent_type: Option<&str>| haider_core::SessionSelectAgentTypeCommand {
+            command_id: format!("select-agent-type-{suffix}"),
+            request_digest: format!("select-agent-type-{suffix}-digest"),
+            request_json: format!(r#"{{"select":"{suffix}"}}"#),
+            session_id: session.clone(),
+            worker_generation: hub.worker_generation(),
+            agent_type: agent_type.map(str::to_owned),
+            event_id: EventId::new(format!("agent-type-selected-{suffix}")),
+            device_id: DeviceId::new("agent-type-device"),
+        };
+
+    let outcome = hub
+        .select_session_agent_type(command("bind", Some("scout")))
+        .await
+        .expect("bind scout");
+    let haider_core::SessionSelectAgentTypeOutcome::Committed { selected, .. } = outcome else {
+        panic!("fresh bind commits");
+    };
+    assert_eq!(selected.agent_type.as_deref(), Some("scout"));
+    let metadata = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata read")
+        .expect("metadata present");
+    assert_eq!(metadata.agent_type.as_deref(), Some("scout"));
+
+    let refusal = hub
+        .select_session_agent_type(command("typo", Some("scoot")))
+        .await
+        .expect_err("unregistered id refuses");
+    assert!(
+        refusal.to_string().contains("not registered"),
+        "the refusal names the registry miss: {refusal}"
+    );
+    let metadata = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata read")
+        .expect("metadata present");
+    assert_eq!(
+        metadata.agent_type.as_deref(),
+        Some("scout"),
+        "a refused selection binds nothing"
+    );
+
+    let outcome = hub
+        .select_session_agent_type(command("revert", None))
+        .await
+        .expect("revert to plain");
+    let haider_core::SessionSelectAgentTypeOutcome::Committed { selected, .. } = outcome else {
+        panic!("revert commits");
+    };
+    assert_eq!(selected.agent_type, None);
+    let metadata = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata read")
+        .expect("metadata present");
+    assert_eq!(metadata.agent_type, None, "None reverts to plain");
 
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");

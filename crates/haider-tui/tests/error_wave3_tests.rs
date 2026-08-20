@@ -260,6 +260,7 @@ fn sustained_unknown_payloads_emit_one_durable_compatibility_diagnostic() {
                 last_model: None,
                 parent_session_id: None,
                 kind: None,
+                agent_type: None,
             }],
             next_cursor: None,
         },

@@ -3576,6 +3576,12 @@ impl LiveDriver {
                     model.dirty = true;
                 }
             }
+            haider_protocol::session::SessionConfigEventPayload::AgentTypeSelected(selected) => {
+                if model.identity.agent_type != selected.agent_type {
+                    model.identity.agent_type = selected.agent_type;
+                    model.dirty = true;
+                }
+            }
             // Owner 2026-08-15 (model truth): the durable fact is the
             // transcript's authority — identity follows it (attach replay
             // included, so a reattached client converges on the model the

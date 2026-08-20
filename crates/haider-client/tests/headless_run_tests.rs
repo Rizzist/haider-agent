@@ -201,6 +201,7 @@ async fn respond_create_and_attach(
                 fast: false,
                 cache_policy: Default::default(),
                 created_at_ms: 1,
+                agent_type: None,
             },
         },
     )

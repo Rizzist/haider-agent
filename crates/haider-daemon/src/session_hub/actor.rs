@@ -612,6 +612,33 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::SelectAgentType { command, completed } => {
+                // W-flow clone of the SelectEffort arm: registry-validated
+                // metadata update, agent_type_selected fact, and R2 receipt
+                // are one transaction; the serialized arm advances the
+                // in-memory head with the fact (F3).
+                let result = store.select_session_agent_type(command).await;
+                if let Ok(SessionSelectAgentTypeOutcome::Committed { envelope, .. }) = &result {
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::SelectFast { command, completed } => {
                 // G3 clone of the SelectModel arm for the fast toggle.
                 let result = store.select_session_fast(command).await;

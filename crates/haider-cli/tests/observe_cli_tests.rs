@@ -75,6 +75,7 @@ fn digest(
             fast: false,
             cache_policy: Default::default(),
             created_at_ms: 1_800_000_000_000,
+            agent_type: None,
         }),
         title: "Inspect durable automation truth".into(),
         run_state,

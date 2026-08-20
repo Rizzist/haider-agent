@@ -30,6 +30,8 @@ pub(crate) struct ConfigOptions {
     pub(crate) effort: Option<String>,
     pub(crate) fast: Option<bool>,
     pub(crate) account: Option<String>,
+    /// W-flow inline identity: `Some("none")` clears; any other id binds.
+    pub(crate) agent_type: Option<String>,
     /// rev933b finding 5: a warmed session's effort/speed change invalidates
     /// the provider cache prefix, and the daemon refuses it without explicit
     /// consent. This flag IS that consent for headless callers.
@@ -42,6 +44,7 @@ impl ConfigOptions {
             || self.effort.is_some()
             || self.fast.is_some()
             || self.account.is_some()
+            || self.agent_type.is_some()
     }
 
     pub(crate) fn required_features(&self) -> BTreeSet<String> {
@@ -61,6 +64,9 @@ impl ConfigOptions {
         if self.account.is_some() {
             features.insert(SESSION_ACCOUNT_SELECT_FEATURE.to_owned());
         }
+        if self.agent_type.is_some() {
+            features.insert(haider_rpc::FEATURE_SESSION_AGENT_TYPE_SELECT_V1.to_owned());
+        }
         features
     }
 }
@@ -77,6 +83,7 @@ struct SessionConfigDocument {
     speed: &'static str,
     fast: bool,
     account_alias: Option<String>,
+    agent_type: Option<String>,
     context_window: Option<u64>,
     workspace_cwd: String,
     max_tokens: u64,
@@ -156,7 +163,7 @@ pub(crate) async fn session_config_command(session_id: &str, rest: &[String]) ->
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] [--confirm-epoch]"
+                "usage: haider session <session-id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] [--agent-type <id|none>] [--confirm-epoch]"
             );
             return ExitCode::SUCCESS;
         }
@@ -247,6 +254,16 @@ pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ConfigOptions>, St
                 options.account = Some(required_value(rest, index, "--account", "an alias")?);
             }
             "--account" => return Err("duplicate --account flag".into()),
+            "--agent-type" if options.agent_type.is_none() => {
+                index += 1;
+                options.agent_type = Some(required_value(
+                    rest,
+                    index,
+                    "--agent-type",
+                    "an id or none",
+                )?);
+            }
+            "--agent-type" => return Err("duplicate --agent-type flag".into()),
             "--confirm-epoch" if !options.confirm_epoch => options.confirm_epoch = true,
             "--confirm-epoch" => return Err("duplicate --confirm-epoch flag".into()),
             other => return Err(format!("unknown flag `{other}`")),
@@ -359,6 +376,26 @@ async fn apply_mutations(
         )?;
         applied.push("effort");
     }
+    if let Some(selector) = options.agent_type.as_ref() {
+        // `none` is the spoken revert — a session goes back to plain.
+        let agent_type = (selector != "none").then(|| selector.clone());
+        let response = client
+            .request(RequestBody::SessionSelectAgentType {
+                command_id: CommandId::new(command_id("session-config-agent-type")),
+                session_id: session_id.clone(),
+                worker_generation: *worker_generation,
+                agent_type,
+            })
+            .await
+            .map_err(ConfigError::Client)?;
+        *worker_generation = selected_generation(
+            response,
+            session_id,
+            SelectionKind::AgentType,
+            "session.select_agent_type response method mismatch",
+        )?;
+        applied.push("agent-type");
+    }
     if let Some(enabled) = options.fast {
         let response = client
             .request(RequestBody::SessionSelectFast {
@@ -386,6 +423,7 @@ enum SelectionKind {
     Model,
     Effort,
     Fast,
+    AgentType,
 }
 
 fn selected_generation(
@@ -414,6 +452,14 @@ fn selected_generation(
         | (
             SelectionKind::Fast,
             ResponseBody::SessionSelectFast {
+                session_id,
+                worker_generation,
+                ..
+            },
+        )
+        | (
+            SelectionKind::AgentType,
+            ResponseBody::SessionSelectAgentType {
                 session_id,
                 worker_generation,
                 ..
@@ -640,6 +686,7 @@ fn document(
         speed: if metadata.fast { "fast" } else { "normal" },
         fast: metadata.fast,
         account_alias: None,
+        agent_type: metadata.agent_type,
         context_window,
         workspace_cwd: metadata.cwd,
         max_tokens: metadata.max_tokens,

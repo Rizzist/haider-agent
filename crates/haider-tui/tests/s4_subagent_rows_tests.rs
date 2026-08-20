@@ -430,6 +430,7 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         last_model: None,
         parent_session_id: None,
         kind: None,
+        agent_type: None,
     }
 }
 
@@ -812,6 +813,7 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
         last_model: None,
         parent_session_id: None,
         kind: None,
+        agent_type: None,
     });
 
     let text = draw_rows(&model, 150, 40).join("\n");

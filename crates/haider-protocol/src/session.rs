@@ -92,6 +92,13 @@ pub struct SessionMetadataV1 {
         skip_serializing_if = "crate::cache::CachePolicySettingsV1::is_default"
     )]
     pub cache_policy: crate::cache::CachePolicySettingsV1,
+    /// Bound Loom agent-type id (W-flow inline identity). `None` means a
+    /// plain session and stays off the wire so earlier metadata rows are
+    /// byte-identical. Validated against the Loom registry at selection
+    /// time; the type's job rides the volatile prompt tail — binding or
+    /// clearing never moves the conversation tree or the cache epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
     /// Durable creation time in Unix milliseconds.
     pub created_at_ms: u64,
 }
@@ -136,6 +143,20 @@ pub struct FastModeSelected {
     pub enabled: bool,
 }
 
+/// Additive replay fact emitted atomically with a committed live-session
+/// agent-type binding and its command receipt (W-flow inline identity).
+///
+/// `None` reverts the session to plain. Like effort, this is a pure
+/// session-config journal movement: it never moves the conversation tree,
+/// and the bound job rides the volatile prompt tail, so the cache epoch
+/// is untouched in both directions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTypeSelected {
+    /// The bound Loom agent-type id, or `None` for a plain session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+}
+
 /// Additive session-configuration event union kept separate from
 /// [`crate::EventPayload`] so existing exhaustive Rust consumers remain
 /// source compatible. Readers should try this decoder before treating an
@@ -154,6 +175,7 @@ pub enum SessionConfigEventPayload {
     },
     EffortSelected(EffortSelected),
     FastModeSelected(FastModeSelected),
+    AgentTypeSelected(AgentTypeSelected),
 }
 
 impl SessionConfigEventPayload {
@@ -184,6 +206,20 @@ impl ModelSelected {
     pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
         match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
             SessionConfigEventPayload::ModelSelected(selected) => Some(selected),
+            _ => None,
+        }
+    }
+}
+
+impl AgentTypeSelected {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(SessionConfigEventPayload::AgentTypeSelected(self.clone()))
+    }
+
+    #[must_use]
+    pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
+        match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
+            SessionConfigEventPayload::AgentTypeSelected(selected) => Some(selected),
             _ => None,
         }
     }

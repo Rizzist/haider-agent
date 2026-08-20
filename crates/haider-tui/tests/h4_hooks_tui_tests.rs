@@ -503,6 +503,7 @@ fn trust_revision_event_refreshes_the_summary_workspace() {
                 last_model: None,
                 parent_session_id: None,
                 kind: None,
+                agent_type: None,
             }],
             next_cursor: None,
         },

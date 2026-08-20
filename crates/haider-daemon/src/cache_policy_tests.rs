@@ -24,6 +24,7 @@ fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
             cold_cost_threshold_microusd: threshold,
         },
         created_at_ms: 1,
+        agent_type: None,
     }
 }
 

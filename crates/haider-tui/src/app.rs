@@ -3036,6 +3036,10 @@ pub struct IdentityLine {
     pub reasoning: Option<String>,
     /// Fast-mode marker (F2c): rides the reasoning segment when active.
     pub fast: bool,
+    /// Bound Loom agent-type id (W-flow inline identity), from the durable
+    /// `agent_type_selected` fact. `None` = plain session. The accent
+    /// surfaces paint from the loom snapshot's color for this id.
+    pub agent_type: Option<String>,
 }
 
 impl Default for IdentityLine {
@@ -3048,6 +3052,7 @@ impl Default for IdentityLine {
             context_window: 200_000,
             reasoning: None,
             fast: false,
+            agent_type: None,
         }
     }
 }

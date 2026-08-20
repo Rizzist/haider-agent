@@ -109,9 +109,10 @@ use haider_core::{
     GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
     GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
     OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
-    PromptHistoryCache, RenamedSession, RunRetryCommand, RunRetryOutcome, SelectedEffort,
-    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand,
-    SessionRenameOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    PromptHistoryCache, RenamedSession, RunRetryCommand, RunRetryOutcome, SelectedAgentType,
+    SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
+    SessionRenameCommand, SessionRenameOutcome, SessionSelectAgentTypeCommand,
+    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
     SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
     StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
@@ -890,6 +891,10 @@ enum ActorCommand {
     SelectEffort {
         command: SessionSelectEffortCommand,
         completed: oneshot::Sender<Result<SessionSelectEffortOutcome, HaiderError>>,
+    },
+    SelectAgentType {
+        command: SessionSelectAgentTypeCommand,
+        completed: oneshot::Sender<Result<SessionSelectAgentTypeOutcome, HaiderError>>,
     },
     SelectFast {
         command: SessionSelectFastCommand,
@@ -2157,6 +2162,42 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::SelectEffort { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_select_agent_type_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SelectedAgentType>, SessionHubError> {
+        self.inner
+            .store
+            .session_select_agent_type_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The W-flow agent-type binding, through the actor arm (same head-CAS
+    /// law as [`Self::select_session_effort`]).
+    pub(crate) async fn select_session_agent_type(
+        &self,
+        command: SessionSelectAgentTypeCommand,
+    ) -> Result<SessionSelectAgentTypeOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SelectAgentType { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

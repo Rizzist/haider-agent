@@ -260,6 +260,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     let decision = |metadata: &SessionMetadataV1, class: EffectClass| {
         effective_permission_defaults(metadata)
@@ -343,6 +344,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         fast: false,
         cache_policy: Default::default(),
         created_at_ms: 1,
+        agent_type: None,
     };
     let defaults = effective_permission_defaults(&metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: false,
@@ -1318,4 +1320,41 @@ fn loom_register_binds_to_an_accepted_plan() {
     // Empty needles never admit (a vacuous gate is an open gate).
     assert!(!plan_gate_admits(&["anything".to_owned()], &[]));
     assert!(!plan_gate_admits(&["anything".to_owned()], &[" "]));
+}
+
+/// W-flow inline identity: the bound type's tail line names the id, the
+/// typed signature, and the job — bounded, with the truncation marked.
+///
+/// MUTATION CHECK: drop the 700-char cap or the ellipsis. Expected
+/// runtime failure: the oversized job below rides the tail whole or
+/// truncates silently.
+#[test]
+fn agent_type_identity_line_is_bounded_and_names_the_signature() {
+    let mut record = haider_protocol::loom::LoomAgentType {
+        id: "scout".into(),
+        name: "Scout".into(),
+        job: "find the seams".into(),
+        in_type: "Brief".into(),
+        out_type: "Map".into(),
+        clis: Vec::new(),
+        apis: Vec::new(),
+        skills: Vec::new(),
+        scripts: Vec::new(),
+        color: "#7aa2f7".into(),
+        glyph: "⌖".into(),
+        rev: 1,
+    };
+    let line = crate::worker::agent_type_identity_line(&record);
+    assert_eq!(
+        line,
+        "session agent type: @scout (Brief -> Map) — find the seams"
+    );
+    record.job = "j".repeat(2_000);
+    let line = crate::worker::agent_type_identity_line(&record);
+    assert!(line.ends_with('…'), "truncation is marked");
+    assert!(
+        line.len() < 800,
+        "the tail line stays bounded: {}",
+        line.len()
+    );
 }

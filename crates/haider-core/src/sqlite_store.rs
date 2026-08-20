@@ -541,6 +541,32 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.select_session_effort(&command))).await
     }
 
+    /// Preflights a durable `session.select_agent_type` receipt (R2 replay).
+    pub async fn session_select_agent_type_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::SelectedAgentType>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_select_agent_type_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically applies one live-session agent-type binding (W-flow).
+    pub async fn select_session_agent_type(
+        &self,
+        command: haider_store::SessionSelectAgentTypeCommand,
+    ) -> Result<haider_store::SessionSelectAgentTypeOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.select_session_agent_type(&command)))
+            .await
+    }
+
     /// Preflights a durable `session.select_fast` receipt (R2 replay).
     pub async fn session_select_fast_receipt(
         &self,

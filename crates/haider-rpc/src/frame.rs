@@ -355,6 +355,10 @@ pub const FEATURE_STORE_HEALTH_V1: &str = "store_health_v1";
 /// embedding ADE that sees it may trust the announce stream for PTY↔session
 /// correlation instead of guessing.
 pub const FEATURE_TUI_ATTACH_ANNOUNCE_V1: &str = "tui_attach_announce_v1";
+/// Receipted per-session Loom agent-type binding (`session.select_agent_type`)
+/// — the inline identity switch: a session takes a registered type's job
+/// (volatile prompt tail, cache-epoch free) and accent until reverted.
+pub const FEATURE_SESSION_AGENT_TYPE_SELECT_V1: &str = "session_agent_type_select_v1";
 /// Session summaries carry typed lineage (`SessionSummary.kind` +
 /// `parent_session_id`) reduced from the durable delegation record —
 /// id-shape sniffing (`session-child-…`) is never the contract.
@@ -1002,6 +1006,11 @@ pub struct SessionSummary {
     /// must not infer root from absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<SessionKindWire>,
+    /// Additive W-flow inline identity: the session's bound Loom agent-type
+    /// id from committed metadata. `None` for plain sessions and from older
+    /// daemons; accent surfaces join the loom snapshot's color by this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 /// Typed session lineage kind (`session_lineage_v1`), from the durable
@@ -1615,6 +1624,18 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "is_false")]
         confirm_new_epoch: bool,
     },
+    /// Receipted live-session agent-type binding (W-flow inline identity).
+    /// `agent_type: null` (absent) reverts to a plain session; a present id
+    /// must exist in the Loom registry. The bound type's job rides the
+    /// volatile prompt tail — the cache epoch is untouched either way.
+    #[serde(rename = "session.select_agent_type")]
+    SessionSelectAgentType {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
+    },
     /// Receipted live-session fast-mode toggle (G3), same law set as
     /// `session.select_effort`. Enabling requires the CURRENT pair to be in
     /// the static fast gate; disabling is always accepted.
@@ -2117,6 +2138,15 @@ pub enum ResponseBody {
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
+    /// Durable coordinates of a committed agent-type binding (W-flow/R2).
+    #[serde(rename = "session.select_agent_type")]
+    SessionSelectAgentType {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
     },

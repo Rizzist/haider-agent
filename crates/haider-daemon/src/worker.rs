@@ -4843,12 +4843,23 @@ async fn start_turn(
     // E1: the registry inventory rides the SAME volatile tail — the model
     // learns what specialists/workflows exist without a cache-epoch cost
     // (registrations move tail bytes only, never history).
-    let loom_inventory = {
+    let (loom_inventory, agent_type_identity) = {
         let (types, workflows) = lease.hub().loom_registry().await?;
-        loom_inventory_line(&types, &workflows)
+        // W-flow inline identity: the session's BOUND agent type performs
+        // inside this session's context — its job rides the same volatile
+        // tail, so binding or clearing never moves the cache epoch. A
+        // binding whose type has left the registry stays silent rather
+        // than teach a job the registry no longer holds.
+        let identity = metadata.agent_type.as_deref().and_then(|bound| {
+            types
+                .iter()
+                .find(|record| record.id == bound)
+                .map(agent_type_identity_line)
+        });
+        (loom_inventory_line(&types, &workflows), identity)
     };
     let graph_brief = {
-        let parts: Vec<String> = [graph_brief, loom_tail, loom_inventory]
+        let parts: Vec<String> = [graph_brief, loom_tail, agent_type_identity, loom_inventory]
             .into_iter()
             .flatten()
             .collect();
@@ -10101,6 +10112,19 @@ pub(crate) fn plan_gate_admits(accepted_plan_bodies: &[String], needles: &[&str]
 /// E1 — the registry inventory line for the VOLATILE user tail. Cache law:
 /// a registration changes only tail bytes — never durable history, never
 /// the system prompt's cache epoch. Names and typed signatures only.
+/// The bound agent type's identity line (W-flow): the session IS this
+/// specialist for now. Bounded like the inventory; volatile-tail only.
+pub(crate) fn agent_type_identity_line(record: &haider_protocol::loom::LoomAgentType) -> String {
+    let mut job = record.job.chars().take(700).collect::<String>();
+    if job.len() < record.job.len() {
+        job.push('…');
+    }
+    format!(
+        "session agent type: @{} ({} -> {}) — {}",
+        record.id, record.in_type, record.out_type, job
+    )
+}
+
 pub(crate) fn loom_inventory_line(
     types: &[haider_protocol::loom::LoomAgentType],
     workflows: &[haider_protocol::loom::LoomWorkflow],

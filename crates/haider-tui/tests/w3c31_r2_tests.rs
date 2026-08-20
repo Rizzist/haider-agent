@@ -105,6 +105,7 @@ fn listed(n: usize) -> LiveReply {
                 last_model: None,
                 parent_session_id: None,
                 kind: None,
+                agent_type: None,
             })
             .collect(),
         next_cursor: None,

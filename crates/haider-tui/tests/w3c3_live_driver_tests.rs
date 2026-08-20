@@ -50,6 +50,7 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         last_model: None,
         parent_session_id: None,
         kind: None,
+        agent_type: None,
     }
 }
 
