@@ -258,6 +258,8 @@ fn sustained_unknown_payloads_emit_one_durable_compatibility_diagnostic() {
                 title: None,
                 agent_metrics: None,
                 last_model: None,
+                parent_session_id: None,
+                kind: None,
             }],
             next_cursor: None,
         },

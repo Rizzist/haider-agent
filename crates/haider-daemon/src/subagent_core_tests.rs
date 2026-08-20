@@ -3155,3 +3155,110 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
 }
+
+/// Lineage truth (`session_lineage_v1`): the sessions listing reduces the
+/// durable delegation record — a delegation's child summarizes as
+/// `Subagent` carrying its exact parent id; a session no delegation names
+/// summarizes as `Root` with no parent. Id shape plays no part.
+///
+/// MUTATION CHECK: drop the `delegation_for_child_session` lookup from
+/// `session_summaries` (hardcode `Root`/`None`), or derive the kind from a
+/// `session-child-` id prefix. Expected runtime failure: the child row
+/// below loses its parent/kind (or a prefix-free child id misclassifies).
+#[tokio::test]
+async fn session_summaries_carry_typed_lineage_from_the_delegation_record() {
+    use haider_core::{DelegationRecord, DelegationState};
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::ids::{ItemId, LeaseId};
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("lineage-parent");
+    // Deliberately prefix-free child id: the delegation record, not the id
+    // shape, must drive the classification.
+    let child = SessionId::new("lineage-offspring");
+    for (session_id, label) in [(&parent, "parent"), (&child, "child")] {
+        hub.create_internal_session(SessionCreateCommand {
+            command_id: format!("create-lineage-{label}"),
+            request_digest: format!("create-lineage-{label}-digest"),
+            request_json: format!(r#"{{"session":"lineage-{label}"}}"#),
+            session_id: session_id.clone(),
+            cwd: test_cwd(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new(format!("created-lineage-{label}")),
+            device_id: DeviceId::new("lineage-device"),
+        })
+        .await
+        .expect("seed session");
+    }
+    let agent_id = AgentId::new("lineage-agent");
+    hub.create_delegation(DelegationRecord {
+        agent_id: agent_id.clone(),
+        child_session_id: child.clone(),
+        child_run_id: RunId::new("lineage-child-run"),
+        parent_session_id: parent.clone(),
+        parent_run_id: RunId::new("lineage-parent-run"),
+        parent_branch_id: None,
+        call_id: "lineage-call".into(),
+        tool_item_id: ItemId::new("lineage-item"),
+        parent_agent_id: None,
+        root_session_id: parent.clone(),
+        depth: 1,
+        task: "lineage".into(),
+        prompt: "lineage".into(),
+        manifest: AgentManifest {
+            agent: agent_id,
+            role: AgentRole::Subagent,
+            task: "lineage".into(),
+            callsign: None,
+            model_profile: "fake-model".into(),
+            grant: Grant {
+                tools: Vec::new(),
+                effect_ceiling: Vec::new(),
+            },
+            budget_tokens: Some(4096),
+            placement: Placement::Local,
+            lease: LeaseId::new("lineage-lease"),
+            fencing_epoch: hub.worker_generation(),
+            attempt: 0,
+            parent: None,
+            coordinates: None,
+            cli_scope: None,
+        },
+        state: DelegationState::Spawned,
+        report: None,
+    })
+    .await
+    .expect("record delegation");
+
+    let summaries =
+        crate::session_hub::rpc::session_summaries(&hub, &[parent.clone(), child.clone()])
+            .await
+            .expect("summaries");
+    let by_id = |id: &SessionId| {
+        summaries
+            .iter()
+            .find(|summary| &summary.session_id == id)
+            .expect("summary present")
+    };
+    let child_summary = by_id(&child);
+    assert_eq!(
+        child_summary.kind,
+        Some(haider_rpc::SessionKindWire::Subagent)
+    );
+    assert_eq!(child_summary.parent_session_id.as_ref(), Some(&parent));
+    let parent_summary = by_id(&parent);
+    assert_eq!(parent_summary.kind, Some(haider_rpc::SessionKindWire::Root));
+    assert_eq!(parent_summary.parent_session_id, None);
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}

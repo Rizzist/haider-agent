@@ -348,6 +348,17 @@ pub const FEATURE_STATUS_SEGMENT_V1: &str = "status_segment_v1";
 /// connecting while degraded. Never journaled: the journal is the
 /// component reporting that it cannot write.
 pub const FEATURE_STORE_HEALTH_V1: &str = "store_health_v1";
+/// The TUI of this release announces its attached session to the embedding
+/// terminal — OSC 7791 `haider;attached=<session_id>`, empty payload back
+/// at the launcher — on every binding change (attach, hop, detach). The bit
+/// rides the daemon Welcome because TUI and daemon ship in lockstep; an
+/// embedding ADE that sees it may trust the announce stream for PTY↔session
+/// correlation instead of guessing.
+pub const FEATURE_TUI_ATTACH_ANNOUNCE_V1: &str = "tui_attach_announce_v1";
+/// Session summaries carry typed lineage (`SessionSummary.kind` +
+/// `parent_session_id`) reduced from the durable delegation record —
+/// id-shape sniffing (`session-child-…`) is never the contract.
+pub const FEATURE_SESSION_LINEAGE_V1: &str = "session_lineage_v1";
 /// Daemon supports opt-in MessagePack encoding after the JSON handshake.
 pub const FEATURE_WIRE_MSGPACK_V1: &str = "wire_msgpack_v1";
 /// Daemon can omit superseded item deltas from the durable store phase of a
@@ -980,6 +991,27 @@ pub struct SessionSummary {
     /// zero-valued snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_metrics: Option<AgentMetricsSnapshot>,
+    /// Additive lineage truth (`session_lineage_v1`): the delegating parent
+    /// when this session is a durable delegation record's child. `None` for
+    /// roots and from older daemons — `kind` is the discriminator, id-shape
+    /// sniffing is never the contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionId>,
+    /// Additive typed kind (`session_lineage_v1`): `Some` from a
+    /// lineage-aware daemon; `None` only from an older daemon — readers
+    /// must not infer root from absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SessionKindWire>,
+}
+
+/// Typed session lineage kind (`session_lineage_v1`), from the durable
+/// delegation record — a subagent is a delegation's child session, a root
+/// is any session no delegation names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKindWire {
+    Root,
+    Subagent,
 }
 
 /// Publisher-authored input value. Ownership is assigned by the daemon from

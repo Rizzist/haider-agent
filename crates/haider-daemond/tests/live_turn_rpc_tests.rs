@@ -4853,6 +4853,8 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             // Model truth: no model_selected fact yet, so the fold falls
             // back to the create-time metadata model.
             last_model: Some(metadata.model.clone()),
+            parent_session_id: None,
+            kind: None,
         }
     );
 

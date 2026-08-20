@@ -428,6 +428,8 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         title: None,
         agent_metrics: None,
         last_model: None,
+        parent_session_id: None,
+        kind: None,
     }
 }
 
@@ -808,6 +810,8 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
         title: None,
         agent_metrics: Some(main),
         last_model: None,
+        parent_session_id: None,
+        kind: None,
     });
 
     let text = draw_rows(&model, 150, 40).join("\n");

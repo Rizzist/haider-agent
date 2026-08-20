@@ -7069,7 +7069,7 @@ async fn run_surface_watch(
     }
 }
 
-async fn session_summaries(
+pub(crate) async fn session_summaries(
     hub: &SessionHub,
     session_ids: &[SessionId],
 ) -> Result<Vec<SessionSummary>, SessionHubError> {
@@ -7100,6 +7100,21 @@ async fn session_summaries(
         let title = metadata
             .as_ref()
             .and_then(|metadata| metadata.title.clone());
+        // Lineage truth (session_lineage_v1): the durable delegation record
+        // is the authority — a session it names as child is a subagent with
+        // that parent; any other session is a root. Never id-shape sniffing.
+        let delegation = hub
+            .inner
+            .store
+            .delegation_for_child_session(session_id.clone())
+            .await?;
+        let (kind, parent_session_id) = match delegation {
+            Some(record) => (
+                haider_rpc::SessionKindWire::Subagent,
+                Some(record.parent_session_id),
+            ),
+            None => (haider_rpc::SessionKindWire::Root, None),
+        };
         sessions.push(SessionSummary {
             session_id: session_id.clone(),
             head_seq,
@@ -7112,6 +7127,8 @@ async fn session_summaries(
             footprint_truth,
             title,
             agent_metrics,
+            parent_session_id,
+            kind: Some(kind),
         });
     }
     Ok(sessions)
@@ -7246,6 +7263,8 @@ mod roster_wave_tests {
             footprint_truth: None,
             title: None,
             agent_metrics: None,
+            parent_session_id: None,
+            kind: None,
         }
     }
 

@@ -636,6 +636,8 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         footprint_truth: None,
         title: None,
         agent_metrics: None,
+        parent_session_id: None,
+        kind: None,
     };
     let value = serde_json::to_value(&current).expect("encode current summary");
     assert_eq!(value["workspace_cwd"], "/work/original");
@@ -2038,6 +2040,8 @@ fn session_rename_frames_are_additive_and_golden() {
         footprint_truth: None,
         title: None,
         agent_metrics: None,
+        parent_session_id: None,
+        kind: None,
     })
     .expect("encode bare summary");
     assert!(
@@ -2575,4 +2579,70 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         serde_json::from_str(&folded_json).expect("old decoder ignores additive witness");
     assert_eq!(old_decoder.agent_id.as_str(), "legacy-agent");
     assert!(old_decoder.children.is_empty());
+}
+
+/// Lineage truth (`session_lineage_v1`) is additive in both directions: an
+/// older daemon's summary decodes with `kind`/`parent_session_id` `None`
+/// (absence is "unknown", never "root"), a lineage-aware summary encodes
+/// snake_case kinds, and a legacy field projection ignores both fields.
+///
+/// MUTATION CHECK: default a missing `kind` to `Some(Root)`, rename the
+/// serde case, or make the decoder strict. Expected failure: the older
+/// summary stops reading as unknown, the encode assertions below break,
+/// or the legacy decode rejects.
+#[test]
+fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
+    let child = haider_rpc::SessionSummary {
+        session_id: haider_protocol::ids::SessionId::new("session-lineage-child"),
+        head_seq: 4,
+        worker_generation: 2,
+        metadata: None,
+        last_model: None,
+        workspace_cwd: None,
+        turn_count: None,
+        footprint_tokens: None,
+        footprint_truth: None,
+        title: None,
+        agent_metrics: None,
+        parent_session_id: Some(haider_protocol::ids::SessionId::new(
+            "session-lineage-parent",
+        )),
+        kind: Some(haider_rpc::SessionKindWire::Subagent),
+    };
+    let value = serde_json::to_value(&child).expect("encode child summary");
+    assert_eq!(value["kind"], "subagent");
+    assert_eq!(value["parent_session_id"], "session-lineage-parent");
+
+    let root = haider_rpc::SessionSummary {
+        parent_session_id: None,
+        kind: Some(haider_rpc::SessionKindWire::Root),
+        ..child.clone()
+    };
+    let value = serde_json::to_value(&root).expect("encode root summary");
+    assert_eq!(value["kind"], "root");
+    assert_eq!(
+        value.get("parent_session_id"),
+        None,
+        "a root never carries a parent"
+    );
+
+    #[derive(Deserialize)]
+    struct LegacySummary {
+        session_id: haider_protocol::ids::SessionId,
+        head_seq: u64,
+    }
+    let value = serde_json::to_value(&child).expect("encode for legacy");
+    let legacy: LegacySummary =
+        serde_json::from_value(value).expect("legacy decoder ignores lineage");
+    assert_eq!(legacy.session_id.as_str(), "session-lineage-child");
+    assert_eq!(legacy.head_seq, 4);
+
+    let older: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-lineage-child",
+        "head_seq": 4,
+        "worker_generation": 2,
+    }))
+    .expect("older summary decodes");
+    assert_eq!(older.kind, None, "absence is unknown, never root");
+    assert_eq!(older.parent_session_id, None);
 }

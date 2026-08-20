@@ -91,7 +91,7 @@ mod session_hub_private_tests;
 
 mod actor;
 mod replay;
-mod rpc;
+pub(crate) mod rpc;
 #[cfg(test)]
 pub(crate) use rpc::pdf_delivery_for_provider;
 

@@ -188,6 +188,8 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         title: None,
         agent_metrics: None,
         last_model: None,
+        parent_session_id: None,
+        kind: None,
     }
 }
 
