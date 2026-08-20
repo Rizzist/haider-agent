@@ -66,9 +66,9 @@ jobs:
           KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
           ORIGINAL_KEYCHAINS=()
           while IFS= read -r listed_keychain; do
-            listed_keychain="${listed_keychain//\"/}"
-            ORIGINAL_KEYCHAINS+=("$listed_keychain")
-          done < <(security list-keychains -d user)
+            [ -n "$listed_keychain" ] && ORIGINAL_KEYCHAINS+=("$listed_keychain")
+          done < <(security list-keychains -d user \
+            | sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
 
           cleanup_signing_keychain() {
             security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || true
