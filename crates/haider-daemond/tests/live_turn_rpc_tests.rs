@@ -4854,7 +4854,9 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             // back to the create-time metadata model.
             last_model: Some(metadata.model.clone()),
             parent_session_id: None,
-            kind: None,
+            // Lineage truth (session_lineage_v1): a session no delegation
+            // names is a Root — the live daemon reports it typed.
+            kind: Some(haider_rpc::SessionKindWire::Root),
             agent_type: None,
         }
     );
