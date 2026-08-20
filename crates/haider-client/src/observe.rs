@@ -195,6 +195,28 @@ impl ObserveClient {
         session_id: SessionId,
         last_event_limit: u32,
     ) -> Result<SessionObserveDigest, ObserveError> {
+        self.session_observe(session_id, last_event_limit, false)
+            .await
+    }
+
+    /// Reads only the authoritative digest fields (`metadata`, `title`,
+    /// `head_seq`, `worker_generation`) for one session. A current daemon
+    /// skips the full-replay projection; an older daemon ignores the flag
+    /// and serves the full digest — the authoritative fields are identical
+    /// either way.
+    pub async fn session_metadata_only(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionObserveDigest, ObserveError> {
+        self.session_observe(session_id, 0, true).await
+    }
+
+    async fn session_observe(
+        &self,
+        session_id: SessionId,
+        last_event_limit: u32,
+        metadata_only: bool,
+    ) -> Result<SessionObserveDigest, ObserveError> {
         if !self.welcome.features.contains(FEATURE_SESSION_OBSERVE_V1) {
             return Err(ObserveError::MissingFeature(FEATURE_SESSION_OBSERVE_V1));
         }
@@ -203,6 +225,7 @@ impl ObserveClient {
             .request(RequestBody::SessionObserve {
                 session_id,
                 last_event_limit,
+                metadata_only,
             })
             .await?
         {

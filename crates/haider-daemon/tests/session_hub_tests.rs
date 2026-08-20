@@ -46,7 +46,8 @@ use haider_rpc::{
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
     ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
     ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, FleetAgentStateWire,
-    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary, WireFrame,
+    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary,
+    SurfaceInputPublishWire, WireFrame,
 };
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -2783,6 +2784,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
                 RequestBody::SessionObserve {
                     session_id,
                     last_event_limit: 20,
+                    metadata_only: false,
                 },
             )
             .await
@@ -2844,6 +2846,187 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let json = serde_json::to_string(&digests).expect("digests serialize");
     assert!(!json.contains(VAULT_SENTINEL));
     assert!(!json.contains(OAUTH_SENTINEL));
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK (v0.0.935 #7/#13): let the metadata-only fast path skip
+/// the user-message scan (empty/foreign title), diverge an authoritative
+/// field from the full replay, or stamp the digest's roster truth from a
+/// different source than session.list. Expected RUNTIME failure: the two
+/// observe modes disagree on metadata/title/head, or turn_count and
+/// agent_metrics disagree with the session listing's.
+#[tokio::test]
+async fn metadata_only_observe_shares_authoritative_fields_and_roster_truth() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let session_id = SessionId::new("observe-metadata-only");
+    create_typed_session(&store, &session_id, "openai").await;
+    let mut message = envelope(&session_id, "meta-user-message", generation);
+    message.run_id = Some(RunId::new("meta-run"));
+    message.payload = serde_json::to_value(EventPayload::UserMessage {
+        text: "compare the two observe doors".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+    })
+    .expect("user message serializes");
+    hub.append(&mut [message]).await.expect("message commits");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let mut digests = Vec::new();
+    for (request, metadata_only) in [("observe-full", false), ("observe-fast", true)] {
+        connection
+            .request(
+                RequestId::new(request),
+                RequestBody::SessionObserve {
+                    session_id: session_id.clone(),
+                    last_event_limit: 0,
+                    metadata_only,
+                },
+            )
+            .await
+            .expect("session.observe routes");
+        let WireFrame::Response {
+            body: ResponseBody::SessionObserve { digest },
+            ..
+        } = sink.next().await
+        else {
+            panic!("expected session.observe response");
+        };
+        digests.push(digest);
+    }
+    let (full, fast) = (&digests[0], &digests[1]);
+    // Authoritative fields are identical across the two modes — the export
+    // door reads only these, so its bytes cannot change.
+    assert_eq!(fast.session_id, full.session_id);
+    assert_eq!(fast.head_seq, full.head_seq);
+    assert_eq!(fast.worker_generation, full.worker_generation);
+    assert_eq!(fast.metadata, full.metadata);
+    assert_eq!(fast.title, full.title);
+    assert_eq!(full.title, "Compare the two observe doors");
+    // Roster truth rides the FULL digest only, from the same truth functions
+    // the session listing uses.
+    assert!(fast.turn_count.is_none());
+    assert!(fast.agent_metrics.is_none());
+    connection
+        .request(
+            RequestId::new("observe-parity-list"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 16,
+            },
+        )
+        .await
+        .expect("session.list routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionList { sessions, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected session.list response");
+    };
+    let summary = sessions
+        .iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("listed summary");
+    assert_eq!(full.turn_count, summary.turn_count);
+    assert!(full.turn_count.is_some());
+    assert_eq!(full.agent_metrics, summary.agent_metrics);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK (v0.0.935 #9): deliver a surface delta on every watch tick
+/// regardless of the generation compare, or break the compare-first snapshot
+/// so a moved generation returns nothing. Expected RUNTIME failure: the idle
+/// window below accumulates extra `SessionSurfaceDelta` frames, or the
+/// published change never reaches the watcher.
+#[tokio::test]
+async fn surface_watch_delivers_on_change_and_stays_silent_when_idle() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let session_id = SessionId::new("surface-watch-idle");
+    append_one(&hub, &session_id, generation, "surface-seed").await;
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("surface-watch"),
+            RequestBody::SessionSurfaceWatch {
+                session_id: session_id.clone(),
+            },
+        )
+        .await
+        .expect("surface watch routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionSurfaceWatching { .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected surface watching response");
+    };
+    connection
+        .request(
+            RequestId::new("surface-publish"),
+            RequestBody::SessionSurfacePublish {
+                session_id: session_id.clone(),
+                input: Some(SurfaceInputPublishWire {
+                    text: "draft in flight".into(),
+                    revision: 1,
+                }),
+                status: None,
+            },
+        )
+        .await
+        .expect("surface publish routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionSurfacePublished { .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected surface published response");
+    };
+    let delta = sink.next().await;
+    let WireFrame::SessionSurfaceDelta {
+        session_id: delta_session,
+        input,
+        ..
+    } = delta
+    else {
+        panic!("expected surface delta, got {delta:?}");
+    };
+    assert_eq!(delta_session, session_id);
+    assert_eq!(
+        input.expect("published input surface").text,
+        "draft in flight"
+    );
+
+    // Idle ticks (50ms period) compare generations under the lock and must
+    // deliver nothing while the surface is unchanged.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let extra = sink.snapshot();
+    assert!(
+        extra.is_empty(),
+        "idle ticks must stay silent, got {extra:?}"
+    );
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

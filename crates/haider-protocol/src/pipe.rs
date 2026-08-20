@@ -138,6 +138,17 @@ impl TranscriptProjector {
 }
 
 fn matching_result(envelope: &RawEnvelope) -> Option<(ToolJoinKey, BoundedResult)> {
+    // Type-tag peek: `push` calls this for EVERY envelope, and only a
+    // `tool_result` can match. Serde's internal tag makes the peek exact,
+    // so everything else skips the payload deep-clone + full decode.
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("tool_result")
+    {
+        return None;
+    }
     let EventPayload::ToolResult { call_id, result } =
         serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
     else {
@@ -728,6 +739,48 @@ mod tests {
             ErrorScope::Turn,
             [ErrorAction::Retry],
         )
+    }
+
+    /// MUTATION CHECK (v0.0.935 #3): peek a wrong tag name, skip the peek's
+    /// full-decode fallback, or treat the tag alone as a parsed result.
+    /// Expected RUNTIME failure: the genuine result below stops matching, or
+    /// the tagged-but-malformed payload starts matching.
+    #[test]
+    fn type_tag_peek_is_exactly_the_full_decode_relevance() {
+        let result = BoundedResult {
+            preview: "ok".into(),
+            truncated: false,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: Default::default(),
+            reason: None,
+            presentation: None,
+        };
+        let genuine = envelope(
+            7,
+            EventPayload::ToolResult {
+                call_id: "call-peek".into(),
+                result: result.clone(),
+            },
+        );
+        let joined = matching_result(&genuine).expect("genuine tool_result matches");
+        assert_eq!(joined.0.2, "call-peek");
+        assert_eq!(joined.1, result);
+
+        let mut tagged_malformed = envelope(8, EventPayload::IdleDecayed);
+        tagged_malformed.payload = serde_json::json!({
+            "type": "tool_result",
+            "call_id": 7,
+        });
+        assert!(matching_result(&tagged_malformed).is_none());
+
+        let mut untagged = envelope(9, EventPayload::IdleDecayed);
+        untagged.payload = serde_json::json!({"call_id": "call-peek"});
+        assert!(matching_result(&untagged).is_none());
+
+        let foreign = envelope(10, EventPayload::IdleDecayed);
+        assert!(matching_result(&foreign).is_none());
     }
 
     #[test]

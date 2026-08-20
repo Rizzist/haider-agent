@@ -11,7 +11,6 @@ use haider_protocol::ids::SessionId;
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId, ModelDetailWire,
     ObserveRunStateWire, ProviderSummaryWire, RequestBody, ResponseBody, SessionObserveDigest,
-    SessionSummary,
 };
 use serde::Serialize;
 
@@ -21,7 +20,6 @@ use super::run::{
 
 const SESSION_CONFIG_SCHEMA: &str = "haider.session_config.v1";
 const SESSION_ACCOUNT_SELECT_FEATURE: &str = "session_account_select_v1";
-const LIST_PAGE: u32 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfigOptions {
@@ -291,11 +289,14 @@ async fn execute(
     session_id: SessionId,
     options: ConfigOptions,
 ) -> Result<SessionConfigDocument, ConfigError> {
-    let mut summary = session_summary(client, &session_id).await?;
+    // #13: one direct per-session observe replaces the session.list page
+    // scan (256 summaries paged linearly to find ONE session). The digest
+    // carries the same roster-truth fields from the same truth functions.
+    let mut digest = session_digest(client, session_id.clone()).await?;
     let providers = provider_summaries(client).await?;
     if options.mutates() {
         let (attachment_id, mut worker_generation) =
-            control_attachment(client, session_id.clone(), summary.head_seq).await?;
+            control_attachment(client, session_id.clone(), digest.head_seq).await?;
         let mut applied = Vec::new();
         let mutation = apply_mutations(
             client,
@@ -317,10 +318,9 @@ async fn execute(
                 }
             }
         })?;
-        summary = session_summary(client, &session_id).await?;
+        digest = session_digest(client, session_id).await?;
     }
-    let digest = session_digest(client, session_id).await?;
-    document(summary, digest, &providers)
+    document(digest, &providers)
 }
 
 async fn apply_mutations(
@@ -501,68 +501,16 @@ pub(crate) fn resolve_model_selector(
     Ok((None, selector.to_owned()))
 }
 
-async fn session_summary(
-    client: &haider_client::RpcClient,
-    session_id: &SessionId,
-) -> Result<SessionSummary, ConfigError> {
-    let mut cursor = None;
-    loop {
-        match client
-            .request(RequestBody::SessionList {
-                cursor,
-                limit: LIST_PAGE,
-            })
-            .await
-            .map_err(ConfigError::Client)?
-        {
-            ResponseBody::SessionList {
-                sessions,
-                next_cursor,
-            } => {
-                if let Some(summary) = sessions
-                    .into_iter()
-                    .find(|summary| &summary.session_id == session_id)
-                {
-                    return Ok(summary);
-                }
-                let Some(next) = next_cursor else {
-                    return Err(ConfigError::Rpc {
-                        code: haider_rpc::ERROR_CODE_NOT_FOUND.to_owned(),
-                        message: format!("session `{}` was not found", session_id.as_str()),
-                        retryable: false,
-                    });
-                };
-                cursor = Some(next);
-            }
-            ResponseBody::Error {
-                code,
-                message,
-                retryable,
-                ..
-            } => {
-                return Err(ConfigError::Rpc {
-                    code,
-                    message,
-                    retryable,
-                });
-            }
-            _ => {
-                return Err(ConfigError::Protocol(
-                    "session.list response method mismatch",
-                ));
-            }
-        }
-    }
-}
-
 async fn session_digest(
     client: &haider_client::RpcClient,
     session_id: SessionId,
 ) -> Result<SessionObserveDigest, ConfigError> {
+    let named = session_id.as_str().to_owned();
     match client
         .request(RequestBody::SessionObserve {
             session_id,
             last_event_limit: 0,
+            metadata_only: false,
         })
         .await
         .map_err(ConfigError::Client)?
@@ -574,8 +522,13 @@ async fn session_digest(
             retryable,
             ..
         } => Err(ConfigError::Rpc {
+            // Keep the pre-#13 CLI wording, which named the session id.
+            message: if code == haider_rpc::ERROR_CODE_NOT_FOUND {
+                format!("session `{named}` was not found")
+            } else {
+                message
+            },
             code,
-            message,
             retryable,
         }),
         _ => Err(ConfigError::Protocol(
@@ -651,7 +604,6 @@ async fn detach(client: &haider_client::RpcClient, attachment_id: AttachmentId) 
 }
 
 fn document(
-    summary: SessionSummary,
     digest: SessionObserveDigest,
     providers: &[ProviderSummaryWire],
 ) -> Result<SessionConfigDocument, ConfigError> {
@@ -693,10 +645,10 @@ fn document(
         created_at_ms: metadata.created_at_ms,
         head_seq: digest.head_seq,
         worker_generation: digest.worker_generation,
-        turn_count: summary.turn_count,
+        turn_count: digest.turn_count,
         footprint,
         subagent_count: digest.subagents.len(),
-        agent_metrics: summary.agent_metrics,
+        agent_metrics: digest.agent_metrics,
         updated_at_ms: digest.updated_at_ms,
     })
 }

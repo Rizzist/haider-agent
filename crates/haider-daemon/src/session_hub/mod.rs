@@ -2965,18 +2965,30 @@ impl SessionHub {
         }))
     }
 
-    fn surface_snapshot(&self, session_id: &SessionId) -> SessionSurfaceSnapshot {
+    /// Snapshots one session's surface only when its change generation moved
+    /// past `seen_generation`. The idle-tick common case compares under the
+    /// lock and clones nothing; delivery semantics are unchanged because the
+    /// caller previously discarded the equal-generation clone unsent.
+    fn surface_snapshot_if_changed(
+        &self,
+        session_id: &SessionId,
+        seen_generation: u64,
+    ) -> Option<SessionSurfaceSnapshot> {
         let surfaces = self
             .inner
             .surfaces
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = surfaces.get(session_id);
-        SessionSurfaceSnapshot {
+        let change_generation = state.map_or(0, |state| state.change_generation);
+        if change_generation == seen_generation {
+            return None;
+        }
+        Some(SessionSurfaceSnapshot {
             input: state.and_then(|state| state.input.clone()),
             status: state.and_then(|state| state.status.clone()),
-            change_generation: state.map_or(0, |state| state.change_generation),
-        }
+            change_generation,
+        })
     }
 
     fn publish_surface(

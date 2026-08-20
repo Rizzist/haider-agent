@@ -1301,6 +1301,16 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Idempotently acknowledges one drain cycle's hook-dispatch outbox rows
+    /// in a single durable transaction.
+    pub async fn complete_hook_dispatches(
+        &self,
+        acks: Vec<(SessionId, u64)>,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.complete_hook_dispatches(&acks))).await
+    }
+
     /// Checkpoints committed WAL pages before orderly close.
     ///
     /// W3b1 daemon seam: the R17 drain barrier flushes before removing the

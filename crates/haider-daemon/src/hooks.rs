@@ -689,7 +689,11 @@ impl HookEngine {
     }
 
     pub(crate) async fn shutdown(mut self) {
-        let _ = self.service.inner.shutdown.send(true);
+        // `send_replace`, not `send`: `watch::Sender::send` does NOT store
+        // the value when no receiver is currently subscribed, so the flip
+        // could be lost exactly when no actor is alive to observe it — and
+        // a late actor's start-check would then read a stale `false`.
+        self.service.inner.shutdown.send_replace(true);
         self.service.inner.servers.shutdown().await;
         let (done, wait) = oneshot::channel();
         let _ = self
@@ -706,7 +710,7 @@ impl HookEngine {
 
 impl Drop for HookEngine {
     fn drop(&mut self) {
-        let _ = self.service.inner.shutdown.send(true);
+        self.service.inner.shutdown.send_replace(true);
         self.service.inner.servers.abort_all();
         if let Some(task) = self.task.take() {
             task.abort();
@@ -906,32 +910,83 @@ async fn run_engine(
     loop {
         tokio::select! {
             biased;
-            message = messages.recv() => match message {
-                Some(EngineMessage::Committed(envelopes)) => {
-                    for envelope in envelopes {
-                        if !handle_and_complete(&service, &mut state, &mut jobs, envelope, true).await {
-                            break;
+            message = messages.recv() => {
+                let Some(message) = message else { break };
+                // Drain cycle: consume the received message plus every
+                // already-queued Committed batch, then acknowledge all
+                // handled outbox rows in ONE durable transaction instead
+                // of one autocommit DELETE per event. A control message
+                // ends the cycle and is handled after the flush, preserving
+                // arrival order; the ack batch is capped so one transaction
+                // never grows unbounded under sustained commit load.
+                let mut next = Some(message);
+                let mut acks: Vec<(SessionId, u64)> = Vec::new();
+                let control = loop {
+                    match next.take() {
+                        Some(EngineMessage::Committed(envelopes)) => {
+                            let mut aborted = false;
+                            for envelope in envelopes {
+                                if !handle_and_complete(
+                                    &service, &mut state, &mut jobs, envelope, true, &mut acks,
+                                )
+                                .await
+                                {
+                                    aborted = true;
+                                    break;
+                                }
+                            }
+                            if aborted || acks.len() >= HOOK_ACK_BATCH_MAX {
+                                break None;
+                            }
+                            match messages.try_recv() {
+                                Ok(message) => next = Some(message),
+                                Err(_) => break None,
+                            }
+                        }
+                        other => break other,
+                    }
+                };
+                let _ = flush_hook_dispatch_acks(&service, acks).await;
+                match control {
+                    Some(EngineMessage::TrustChanged(change)) => {
+                        if !change.trusted {
+                            service.inner.servers.kill_digest(&change.digest);
+                            state.subscribers.retain(|_, handle| handle.digest != change.digest);
                         }
                     }
-                }
-                Some(EngineMessage::TrustChanged(change)) => {
-                    if !change.trusted {
-                        service.inner.servers.kill_digest(&change.digest);
-                        state.subscribers.retain(|_, handle| handle.digest != change.digest);
+                    Some(EngineMessage::Shutdown(done)) => {
+                        state.subscribers.clear();
+                        jobs.abort_all();
+                        while jobs.join_next().await.is_some() {}
+                        let _ = done.send(());
+                        break;
                     }
+                    // The cycle loop only breaks with a non-Committed
+                    // message or None; Committed is consumed above.
+                    Some(EngineMessage::Committed(_)) | None => {}
                 }
-                Some(EngineMessage::Shutdown(done)) => {
-                    state.subscribers.clear();
-                    jobs.abort_all();
-                    while jobs.join_next().await.is_some() {}
-                    let _ = done.send(());
-                    break;
-                }
-                None => break,
-            },
+            }
             _ = jobs.join_next(), if !jobs.is_empty() => {}
         }
     }
+}
+
+/// Upper bound on outbox acknowledgements folded into one drain-cycle
+/// transaction; a longer backlog flushes in successive batches.
+const HOOK_ACK_BATCH_MAX: usize = 256;
+
+/// Acknowledges one drain cycle's handled hook-dispatch rows in a single
+/// durable transaction. On failure the rows stay in the outbox and replay
+/// at-least-once on the next engine start.
+async fn flush_hook_dispatch_acks(service: &HookService, acks: Vec<(SessionId, u64)>) -> bool {
+    if acks.is_empty() {
+        return true;
+    }
+    if let Err(error) = service.inner.store.complete_hook_dispatches(acks).await {
+        tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox acknowledgement failed");
+        return false;
+    }
+    true
 }
 
 async fn replay_pending_dispatches(
@@ -950,10 +1005,20 @@ async fn replay_pending_dispatches(
         if pending.is_empty() {
             return true;
         }
+        // Per-page ack batch: one durable transaction per replay page. The
+        // flush must land before the next `pending_hook_dispatches` read or
+        // the same rows would be returned forever.
+        let mut acks = Vec::with_capacity(pending.len());
         for envelope in pending {
-            if !handle_and_complete(service, state, jobs, envelope, false).await {
+            if !handle_and_complete(service, state, jobs, envelope, false, &mut acks).await {
+                // Rows handled before the failure are still acknowledged so
+                // a restart replays exactly the unhandled remainder.
+                let _ = flush_hook_dispatch_acks(service, acks).await;
                 return false;
             }
+        }
+        if !flush_hook_dispatch_acks(service, acks).await {
+            return false;
         }
     }
 }
@@ -964,6 +1029,7 @@ async fn handle_and_complete(
     jobs: &mut JoinSet<()>,
     envelope: RawEnvelope,
     defer_servers: bool,
+    acks: &mut Vec<(SessionId, u64)>,
 ) -> bool {
     let mut pending = Vec::new();
     let mut terminal_scope = None;
@@ -1004,15 +1070,9 @@ async fn handle_and_complete(
     if let Some(scope) = terminal_scope {
         service.inner.servers.kill_scope(&scope);
     }
-    if let Err(error) = service
-        .inner
-        .store
-        .complete_hook_dispatch(&envelope.session_id, envelope.seq)
-        .await
-    {
-        tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox acknowledgement failed");
-        return false;
-    }
+    // Delete-after-handled is preserved: the caller's cycle flush runs
+    // strictly after this handler returns, in one durable transaction.
+    acks.push((envelope.session_id, envelope.seq));
     true
 }
 

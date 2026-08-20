@@ -52,6 +52,22 @@ fn write_command(value: &str, path: &Path) -> String {
 }
 
 #[cfg(unix)]
+fn append_marker_command(path: &Path) -> String {
+    format!("printf 'x\\n' >> '{}'", path.display())
+}
+
+#[cfg(windows)]
+fn append_marker_command(path: &Path) -> String {
+    format!(">>\"{}\" echo x", path.display())
+}
+
+fn marker_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
 fn echo_stdin_command() -> String {
     "cat".into()
 }
@@ -1625,6 +1641,46 @@ async fn matcher_fires_only_after_commit() {
     fixture.close().await;
 }
 
+/// MUTATION CHECK: drop the drain-cycle acknowledgement flush, or flush a
+/// cycle's rows before handling them. Expected RUNTIME failure: live-handled
+/// rows stay pending below forever — or the markers appear while their rows
+/// were already gone from the outbox (unhandled work a crash would lose).
+#[tokio::test]
+async fn live_drain_cycle_acknowledges_handled_rows_in_one_batch() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("live-batch-lines");
+    let command = append_marker_command(&marker);
+    let fixture = EngineFixture::start(&command, 1_000, false, "exec").await;
+    for id in ["live-batch-1", "live-batch-2", "live-batch-3"] {
+        let mut batch = [raw_event(
+            &fixture.session_id,
+            &fixture.run_id,
+            fixture.store.worker_generation(),
+            id,
+            EventPayload::RunState(RunState::Thinking),
+        )];
+        fixture.hub.append(&mut batch).await.expect("commit fact");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while marker_lines(&marker) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while !fixture
+            .store
+            .pending_hook_dispatches(16)
+            .await
+            .expect("pending")
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("live drain acknowledges every handled row");
+    assert_eq!(marker_lines(&marker), 3, "each committed fact fired once");
+    fixture.close().await;
+}
+
 /// MUTATION CHECK: omit the transaction-coupled hook outbox or acknowledge a
 /// fact before its hook work completes. Expected RUNTIME failure: the
 /// committed pre-crash RunStarted fact survives but never creates the marker
@@ -1715,6 +1771,130 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
     })
     .await
     .expect("recovered hook marker");
+    engine.shutdown().await;
+    hub.shutdown().await.expect("reopen hub shutdown");
+    store.close().await.expect("reopen store close");
+}
+
+/// MUTATION CHECK: acknowledge a replay page before handling it, skip the
+/// per-page flush, or replay acknowledged rows too. Expected RUNTIME failure:
+/// recovery fires a marker for the pre-acknowledged fact, misses one of the
+/// two unacknowledged facts, or leaves outbox rows pending after the drain.
+#[tokio::test]
+async fn recovery_replays_exactly_the_unacknowledged_rows() {
+    let profile_guard = tempfile::tempdir().expect("profile");
+    let workspace_guard = tempfile::tempdir().expect("workspace");
+    let marker_guard = tempfile::tempdir().expect("marker");
+    let profile = canonical(profile_guard.path());
+    let workspace = canonical(workspace_guard.path());
+    let marker = marker_guard.path().join("replayed-lines");
+    write_profile_policy(&profile, "per_digest");
+    write_hook(
+        &workspace,
+        "exact_replay_hook",
+        "run_started",
+        &append_marker_command(&marker),
+        1_000,
+        false,
+        "exec",
+    );
+    let session_id = SessionId::new("hooks-exact-replay-session");
+    let run_id = RunId::new("hooks-exact-replay-run");
+
+    let store = SqliteStoreHandle::open(&profile).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let (service, engine) = HookEngine::start(profile.clone(), store.clone(), hub.clone())
+        .await
+        .expect("engine");
+    hub.install_hooks(service.clone()).expect("install");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-hooks-exact-replay".into(),
+        request_digest: "create-hooks-exact-replay-digest".into(),
+        request_json: r#"{"session":"hooks-exact-replay"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: workspace.to_str().expect("UTF-8").to_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: "hooks-test-v1".into(),
+        event_id: EventId::new("hooks-exact-replay-created"),
+        device_id: DeviceId::new("hooks-test-device"),
+    })
+    .await
+    .expect("create");
+    let digest = service.list(workspace.clone()).await.expect("list").2[0]
+        .digest
+        .clone();
+    service
+        .apply_trust(CommandId::new("trust-hooks-exact-replay"), digest, true)
+        .await
+        .expect("trust");
+    engine.shutdown().await;
+    hub.shutdown().await.expect("hub shutdown");
+    drop(service);
+
+    // Three facts committed with no live engine: three undrained outbox rows.
+    let mut seqs = Vec::new();
+    for id in [
+        "hooks-exact-replay-1",
+        "hooks-exact-replay-2",
+        "hooks-exact-replay-3",
+    ] {
+        let mut batch = [raw_event(
+            &session_id,
+            &run_id,
+            store.worker_generation(),
+            id,
+            EventPayload::RunState(RunState::Thinking),
+        )];
+        store
+            .append(&mut batch)
+            .await
+            .expect("commit without live observer");
+        seqs.push(batch[0].seq);
+    }
+    assert!(!marker.exists());
+    store.close().await.expect("close crashed generation");
+
+    // The middle row was handled and batch-acknowledged before the crash.
+    let store = SqliteStoreHandle::open(&profile)
+        .await
+        .expect("reopen store");
+    store
+        .complete_hook_dispatches(vec![(session_id.clone(), seqs[1])])
+        .await
+        .expect("pre-ack middle row");
+
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
+    let (service, engine) = HookEngine::start(profile, store.clone(), hub.clone())
+        .await
+        .expect("recovery engine");
+    hub.install_hooks(service).expect("reinstall");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while marker_lines(&marker) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while !store
+            .pending_hook_dispatches(16)
+            .await
+            .expect("pending")
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery drains the two unacknowledged rows");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        marker_lines(&marker),
+        2,
+        "the pre-acknowledged fact must not refire"
+    );
     engine.shutdown().await;
     hub.shutdown().await.expect("reopen hub shutdown");
     store.close().await.expect("reopen store close");
@@ -2545,6 +2725,32 @@ async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
         !alive,
         "engine shutdown kills the resident server (pid {pid})"
     );
+}
+
+/// MUTATION CHECK (hooks_server_v1): drop the actor-start shutdown check in
+/// `run_server_actor` and rely on `changed()` alone — `subscribe()` marks
+/// the already-flipped flag as seen. Expected runtime failure: the dispatch
+/// processed after the flag flip spawns a fresh server process and the spawn
+/// log below gains a line.
+#[tokio::test]
+async fn post_shutdown_dispatch_never_spawns_a_server_actor() {
+    let (fixture, spawn_log) = server_fixture(0, RESIDENT_SERVER).await;
+    // Reproduce the shutdown window deterministically: the flag has flipped
+    // and the registry has drained, but the engine is still draining queued
+    // commits (`HookEngine::shutdown` only ENQUEUES its Shutdown message, so
+    // an already-queued Committed batch is processed after both steps).
+    fixture.service.inner.shutdown.send_replace(true);
+    fixture.service.inner.servers.shutdown().await;
+    fire_user_message(&fixture, 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        spawn_count(&spawn_log),
+        0,
+        "a post-shutdown dispatch must exit before its first spawn"
+    );
+    // The pending fire resolved through the shutdown-aware path: the engine
+    // is not wedged and the ordinary drain still completes.
+    fixture.close().await;
 }
 
 /// MUTATION CHECK (hooks_server_v1): drop the idle reaper (treat every

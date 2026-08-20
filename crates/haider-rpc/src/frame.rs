@@ -1163,6 +1163,17 @@ pub struct SessionObserveDigest {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub last_event_kinds: Vec<String>,
+    /// Additive roster-truth field (v0.0.935 #13): committed main-timeline
+    /// user turns at `head_seq`, from the same sealed-journal truth the
+    /// session listing reports. `None` from older daemons and in
+    /// metadata-only responses — readers must not infer zero from absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Additive roster-truth field (v0.0.935 #13): per-agent metrics rollup
+    /// at `head_seq`, same source as the session listing. `None` from older
+    /// daemons and in metadata-only responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_metrics: Option<AgentMetricsSnapshot>,
 }
 
 /// Stable display state for one descendant in a fleet snapshot.
@@ -1385,6 +1396,14 @@ pub enum RequestBody {
         session_id: SessionId,
         #[serde(default)]
         last_event_limit: u32,
+        /// Additive fast path (v0.0.935 #7): when set, the daemon may skip
+        /// the full-replay projection — `metadata`, `title`, `head_seq`, and
+        /// `worker_generation` stay authoritative while every other projected
+        /// field is default/empty. Old daemons ignore the field and serve the
+        /// full digest, so callers reading only the authoritative fields see
+        /// identical values either way.
+        #[serde(default, skip_serializing_if = "is_false")]
+        metadata_only: bool,
     },
     /// Returns the bounded full descendant tree and daemon-side rollup from
     /// durable delegation and child-journal truth. Read-only and receipt-free.

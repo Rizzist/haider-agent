@@ -46,6 +46,11 @@ struct SidecarCursor {
 struct ReconciledSidecar {
     cursor: SidecarCursor,
     projector: TranscriptProjector,
+    /// Append handle kept open across hot batches within one reconciled
+    /// lifetime, so steady-state appends stop paying open/close per batch.
+    /// Any maintenance error evicts the entry, dropping (closing) the handle;
+    /// the next touch re-inspects and reopens from the durable tail.
+    file: File,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -142,7 +147,9 @@ impl PipeNativeWriter {
         let state = if let Some(mut state) = known {
             let (data, next_cursor) =
                 render_hot_batch(committed, state.cursor, &mut state.projector)?;
-            append_once(path, data).await?;
+            if !data.is_empty() {
+                state.file = write_open(state.file, data).await?;
+            }
             state.cursor = next_cursor;
             state
         } else {
@@ -234,7 +241,8 @@ impl PipeNativeWriter {
         };
         let file = write_open(file, coverage_line(read_cursor, cursor.generation)?).await?;
         // Reconciliation is a repair path, so retain an explicit sync here.
-        sync_open(file).await?;
+        // The synced handle is kept for subsequent hot appends.
+        let file = sync_open(file).await?;
         Ok(ReconciledSidecar {
             cursor: SidecarCursor {
                 seq: read_cursor,
@@ -242,6 +250,7 @@ impl PipeNativeWriter {
                 ..cursor
             },
             projector,
+            file,
         })
     }
 
@@ -288,7 +297,10 @@ impl PipeNativeWriter {
         }
         file = write_temp(file, render_projected_rows(projector.finish())).await?;
         file = write_temp(file, coverage_line(read_cursor, generation)?).await?;
-        finish_temp(file, temp_path, path).await?;
+        finish_temp(file, temp_path, path.clone()).await?;
+        // The temp handle was write-positioned, not O_APPEND; reopen the
+        // renamed file in append mode as the retained hot-append handle.
+        let file = open_append(path).await?;
         Ok(ReconciledSidecar {
             cursor: SidecarCursor {
                 seq: read_cursor,
@@ -296,6 +308,7 @@ impl PipeNativeWriter {
                 generation,
             },
             projector,
+            file,
         })
     }
 
@@ -598,19 +611,6 @@ fn find_previous_newline(file: &mut File, exclusive_end: u64) -> std::io::Result
     Ok(None)
 }
 
-async fn append_once(path: PathBuf, data: String) -> Result<(), PipeNativeError> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    tokio::task::spawn_blocking(move || {
-        let mut file = OpenOptions::new().append(true).open(path)?;
-        file.write_all(data.as_bytes())?;
-        Ok(())
-    })
-    .await
-    .map_err(|error| PipeNativeError(format!("sidecar append task failed: {error}")))?
-}
-
 async fn open_append(path: PathBuf) -> Result<File, PipeNativeError> {
     tokio::task::spawn_blocking(move || {
         OpenOptions::new()
@@ -631,10 +631,13 @@ async fn write_open(mut file: File, data: String) -> Result<File, PipeNativeErro
     .map_err(|error| PipeNativeError(format!("sidecar page append task failed: {error}")))?
 }
 
-async fn sync_open(file: File) -> Result<(), PipeNativeError> {
-    tokio::task::spawn_blocking(move || file.sync_data().map_err(PipeNativeError::from))
-        .await
-        .map_err(|error| PipeNativeError(format!("sidecar append sync task failed: {error}")))?
+async fn sync_open(file: File) -> Result<File, PipeNativeError> {
+    tokio::task::spawn_blocking(move || {
+        file.sync_data()?;
+        Ok(file)
+    })
+    .await
+    .map_err(|error| PipeNativeError(format!("sidecar append sync task failed: {error}")))?
 }
 
 async fn create_temp(path: PathBuf) -> Result<(File, PathBuf), PipeNativeError> {

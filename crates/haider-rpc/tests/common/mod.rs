@@ -1091,6 +1091,7 @@ pub fn transcript() -> Vec<WireFrame> {
             body: RequestBody::SessionObserve {
                 session_id: session_id.clone(),
                 last_event_limit: 20,
+                metadata_only: false,
             },
         },
         WireFrame::Response {
@@ -1112,6 +1113,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     subagents: Vec::new(),
                     updated_at_ms: 1_753_500_000_009,
                     last_event_kinds: vec!["run_state".into(), "menu_opened".into()],
+                    turn_count: None,
+                    agent_metrics: None,
                 },
             },
         },

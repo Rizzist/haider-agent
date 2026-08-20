@@ -7114,6 +7114,36 @@ impl Store {
         Ok(())
     }
 
+    /// Idempotently acknowledges one drain cycle's handled hook-dispatch rows
+    /// in a single durable transaction (one fsync instead of one per event).
+    ///
+    /// All-or-nothing: either every listed row is deleted or none are, so a
+    /// crash between the event commit and this acknowledgement leaves exactly
+    /// the unacknowledged completions in the outbox for at-least-once replay.
+    pub fn complete_hook_dispatches(&self, acks: &[(SessionId, u64)]) -> StoreResult<()> {
+        if acks.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        {
+            let mut statement = transaction
+                .prepare_cached(
+                    "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1 AND seq = ?2",
+                )
+                .map_err(map_sqlite_error)?;
+            for (session_id, seq) in acks {
+                statement
+                    .execute(params![session_id.as_str(), to_sqlite_integer(*seq)?])
+                    .map_err(map_sqlite_error)?;
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
     /// Read-only replay/pending preflight used before server-derived resource
     /// validation. `None` means the command id is genuinely new.
     pub fn management_receipt_preflight<T>(
@@ -10766,6 +10796,16 @@ fn main_timeline_run_prompt_source(
             continue;
         }
         let payload = envelope.payload;
+        // Type-tag peek: only `user_message` and `run_retried` can change the
+        // prompt source; skip the payload deep-clone + full decode for every
+        // other envelope. Serde's internal tag makes the peek exact — a
+        // payload that decodes to either relevant variant carries that tag.
+        if !matches!(
+            payload.get("type").and_then(serde_json::Value::as_str),
+            Some("user_message" | "run_retried")
+        ) {
+            continue;
+        }
         if serde_json::from_value::<EventPayload>(payload.clone())
             .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
         {
@@ -10815,6 +10855,14 @@ fn latest_main_timeline_failed_turn(
         };
         let main_timeline = envelope.branch_id.is_none() && envelope.agent_id.is_none();
         let payload = envelope.payload;
+        // Type-tag peek: only these three tags can mutate the scan state
+        // below; skip the payload deep-clone + full decode for the rest.
+        if !matches!(
+            payload.get("type").and_then(serde_json::Value::as_str),
+            Some("user_message" | "run_failed" | "run_retried")
+        ) {
+            continue;
+        }
         match serde_json::from_value::<EventPayload>(payload.clone()) {
             Ok(EventPayload::UserMessage { .. }) if main_timeline => {
                 latest_user = Some((run_id, seq));

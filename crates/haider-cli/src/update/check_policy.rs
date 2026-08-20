@@ -93,6 +93,15 @@ pub(crate) fn background_outcome_from_discovery(
     }
 }
 
+/// Reads the last recorded automatic-check time without mutating the stamp
+/// or touching the network (`haider status` reports from this cache instead
+/// of running its own discovery).
+pub(crate) fn last_check_stamp(profile_dir: &Path) -> Option<u64> {
+    read_stamp(&profile_dir.join(UPDATE_CHECK_STAMP_FILE))
+        .ok()
+        .flatten()
+}
+
 fn read_stamp(path: &Path) -> io::Result<Option<u64>> {
     match std::fs::read_to_string(path) {
         Ok(raw) => Ok(raw.trim().parse::<u64>().ok()),

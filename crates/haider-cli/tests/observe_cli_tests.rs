@@ -25,7 +25,8 @@ use cli_main::observe::{
     SessionsDocument, SnapshotOptions, StatusDocument, UpdateView, depth_view,
     exit_code_for_observe_error, fleet_candidates, fleet_human_text, fleet_list_human_text,
     parse_events_options, parse_fleet_options, parse_session_options, parse_snapshot_options,
-    session_human_text, sessions_human_text, summary_view, write_raw_envelope_jsonl,
+    session_human_text, sessions_human_text, stamp_update_view, summary_view,
+    write_raw_envelope_jsonl,
 };
 use cli_main::run::{
     EX_BLOCKED, EX_CANCELLED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT,
@@ -129,6 +130,8 @@ fn digest(
         ],
         updated_at_ms: 1_800_000_000_012,
         last_event_kinds: vec!["run_state".into(), "future_observe_kind_v9".into()],
+        turn_count: None,
+        agent_metrics: None,
     }
 }
 
@@ -423,6 +426,30 @@ fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
     )));
     assert_eq!(exit_code_for_observe_error(&error), EX_UNAVAILABLE);
     assert_eq!(EX_USAGE, 2);
+}
+
+/// MUTATION CHECK (v0.0.935): reintroduce a discovery call in `haider
+/// status`'s update view, or stop consulting the six-hour stamp policy.
+/// Expected RUNTIME failure: a bare profile with only a stamp FILE cannot
+/// produce `checked_recently` (there is no network and no daemon here), or
+/// the stale/missing-stamp cases stop reading `check_due`.
+#[test]
+fn status_update_view_reads_the_stamp_cache_without_network() {
+    let profile = tempfile::tempdir().expect("profile");
+    let fresh = stamp_update_view(profile.path());
+    assert_eq!(fresh.status, "check_due", "no stamp means a check is due");
+    assert_eq!(fresh.current_version, env!("CARGO_PKG_VERSION"));
+    assert!(fresh.latest_version.is_none());
+    assert!(fresh.error.is_none());
+
+    let now = cli_main::update::check_policy::unix_timestamp_now();
+    let stamp = profile.path().join("update-check.timestamp");
+    std::fs::write(&stamp, format!("{now}\n")).expect("write fresh stamp");
+    assert_eq!(stamp_update_view(profile.path()).status, "checked_recently");
+
+    let stale = now.saturating_sub(7 * 60 * 60);
+    std::fs::write(&stamp, format!("{stale}\n")).expect("write stale stamp");
+    assert_eq!(stamp_update_view(profile.path()).status, "check_due");
 }
 
 /// MUTATION CHECK: invent observe-specific exit values or collapse provider,

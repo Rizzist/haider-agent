@@ -1515,7 +1515,10 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(EX_UNAVAILABLE);
         }
     };
-    let digest = observer.session(session_id.clone(), 0).await;
+    // #7: export needs only metadata + title; the metadata-only door skips
+    // the daemon's full-replay projection (older daemons ignore the flag and
+    // serve the full digest — same authoritative fields either way).
+    let digest = observer.session_metadata_only(session_id.clone()).await;
     observer.close();
     let digest = match digest {
         Ok(digest) => digest,
@@ -1652,7 +1655,17 @@ pub fn write_export(
                     Ok(format!("wrote {}", path.display()))
                 }
                 None => {
-                    print!("{body}");
+                    // Corked: one buffered writer instead of the line-buffered
+                    // stdout's flush-per-line (one syscall per rendered frame).
+                    use std::io::Write as _;
+                    let stdout = std::io::stdout();
+                    let mut writer = std::io::BufWriter::new(stdout.lock());
+                    writer
+                        .write_all(body.as_bytes())
+                        .and_then(|()| writer.flush())
+                        .map_err(|error| {
+                            ExportError::Io(format!("cannot write stdout: {error}"))
+                        })?;
                     Ok(String::new())
                 }
             }

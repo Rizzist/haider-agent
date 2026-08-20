@@ -114,6 +114,117 @@ fn hook_dispatch_outbox_is_atomic_persistent_and_idempotently_acknowledged() {
     );
 }
 
+/// MUTATION CHECK: split the batched acknowledgement into per-row autocommit
+/// deletes, drop the rollback on a poisoned row, or skip rows for a second
+/// session. Expected RUNTIME failure: the poisoned batch leaves a partial
+/// delete behind, or the reopened store's pending set is not exactly the
+/// unacknowledged remainder.
+#[test]
+fn batched_acknowledgement_is_one_atomic_durable_transaction() {
+    let profile = tempfile::tempdir().expect("profile");
+    let store = Store::open(profile.path()).expect("store");
+    let cwd = std::fs::canonicalize(profile.path())
+        .expect("canonical")
+        .to_str()
+        .expect("UTF-8")
+        .to_owned();
+    let mut sessions = Vec::new();
+    for name in ["hook-batch-a", "hook-batch-b"] {
+        let session_id = SessionId::new(name);
+        let created = store
+            .create_session(&SessionCreateCommand {
+                command_id: format!("create-{name}"),
+                request_digest: format!("create-{name}-digest"),
+                request_json: format!(r#"{{"session":"{name}"}}"#),
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+                provider: "fake".into(),
+                model: "fake-model".into(),
+                max_tokens: 4096,
+                permission_overrides: None,
+                effort: None,
+                fast: false,
+                cache_policy: Default::default(),
+                system_prompt_version: "hook-batch-v1".into(),
+                event_id: EventId::new(format!("{name}-created")),
+                device_id: DeviceId::new("hook-outbox-device"),
+            })
+            .expect("create");
+        let SessionCreateOutcome::Committed { .. } = created else {
+            panic!("fresh create must commit");
+        };
+        sessions.push(session_id);
+    }
+    let generation = store.worker_generation();
+    let (session_a, session_b) = (sessions[0].clone(), sessions[1].clone());
+    for (session_id, event_id) in [
+        (&session_a, "hook-batch-a-2"),
+        (&session_a, "hook-batch-a-3"),
+        (&session_b, "hook-batch-b-2"),
+    ] {
+        let mut batch = [event(
+            session_id,
+            event_id,
+            serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("payload"),
+            generation,
+        )];
+        store.append(&mut batch).expect("commit fact");
+    }
+    let pending_pairs = |store: &Store| {
+        let mut pairs: Vec<(String, u64)> = store
+            .pending_hook_dispatches(16)
+            .expect("pending")
+            .into_iter()
+            .map(|envelope| (envelope.session_id.as_str().to_owned(), envelope.seq))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    let all_rows = vec![
+        ("hook-batch-a".to_owned(), 1),
+        ("hook-batch-a".to_owned(), 2),
+        ("hook-batch-a".to_owned(), 3),
+        ("hook-batch-b".to_owned(), 1),
+        ("hook-batch-b".to_owned(), 2),
+    ];
+    assert_eq!(pending_pairs(&store), all_rows);
+
+    // A poisoned batch (seq beyond SQLite INTEGER) must delete NOTHING, even
+    // though a valid row precedes the poison — one transaction, all or none.
+    assert!(
+        store
+            .complete_hook_dispatches(&[(session_a.clone(), 2), (session_b.clone(), u64::MAX)])
+            .is_err()
+    );
+    assert_eq!(pending_pairs(&store), all_rows);
+
+    // Empty batch is a no-op; a valid cross-session batch lands durably.
+    store.complete_hook_dispatches(&[]).expect("empty batch");
+    let acked = [
+        (session_a.clone(), 1),
+        (session_a.clone(), 3),
+        (session_b.clone(), 1),
+    ];
+    store.complete_hook_dispatches(&acked).expect("batch ack");
+    drop(store);
+
+    let store = Store::open(profile.path()).expect("reopen");
+    assert_eq!(
+        pending_pairs(&store),
+        vec![
+            ("hook-batch-a".to_owned(), 2),
+            ("hook-batch-b".to_owned(), 2),
+        ]
+    );
+    store
+        .complete_hook_dispatches(&acked)
+        .expect("idempotent batch re-ack");
+    store
+        .complete_hook_dispatches(&[(session_a, 2), (session_b, 2)])
+        .expect("ack remainder");
+    assert!(store.pending_hook_dispatches(16).expect("empty").is_empty());
+}
+
 /// MUTATION CHECK: recursively enqueue hook lifecycle facts. Expected RUNTIME
 /// failure: a HookNotice produces new hook-dispatch work.
 #[test]

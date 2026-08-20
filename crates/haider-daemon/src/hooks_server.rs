@@ -214,6 +214,15 @@ async fn run_server_actor(
     let mut crash_backoff = None::<Duration>;
     let mut next_backoff = SUBSCRIBE_BACKOFF_MIN;
     let mut shutdown = service.inner.shutdown.subscribe();
+    // A registry drained by `servers.shutdown()` can still receive one late
+    // `try_dispatch` from an in-flight engine message; `subscribe()` marks
+    // the already-flipped flag as seen, so `changed()` alone would never
+    // fire for this receiver. Check the flag once at actor start so a
+    // post-shutdown actor exits before its first spawn instead of outliving
+    // the clean-shutdown path.
+    if *shutdown.borrow() {
+        return;
+    }
     loop {
         let request = if process.is_some() && !idle_timeout.is_zero() {
             tokio::select! {

@@ -681,6 +681,11 @@ impl ObserveProjection {
             subagents: self.subagents.into_values().collect(),
             updated_at_ms: self.updated_at_ms,
             last_event_kinds: self.event_kinds.into_iter().collect(),
+            // Roster-truth fields are stamped by the observe handler from the
+            // same truth functions the session listing uses (None in
+            // metadata-only responses).
+            turn_count: None,
+            agent_metrics: None,
         }
     }
 }
@@ -1286,6 +1291,7 @@ impl HubConnection {
             RequestBody::SessionObserve {
                 session_id,
                 last_event_limit,
+                metadata_only,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -1296,7 +1302,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_observe(request_id, session_id, last_event_limit)
+                self.session_observe(request_id, session_id, last_event_limit, metadata_only)
                     .await
             }
             RequestBody::SessionFleet { session_id } => {
@@ -6504,6 +6510,7 @@ impl HubConnection {
         request_id: RequestId,
         session_id: SessionId,
         last_event_limit: u32,
+        metadata_only: bool,
     ) -> Result<(), SessionHubError> {
         const MAX_EVENT_KINDS: usize = 100;
 
@@ -6523,7 +6530,7 @@ impl HubConnection {
         let metadata = self.hub.inner.store.session_metadata(&session_id).await?;
         let mut projection = ObserveProjection::new(event_limit);
         let mut cursor = 0;
-        while cursor < head {
+        'replay: while cursor < head {
             let page = self
                 .hub
                 .inner
@@ -6540,18 +6547,60 @@ impl HubConnection {
                 }
                 cursor = envelope.seq;
                 advanced = true;
-                projection.apply(envelope);
+                if metadata_only {
+                    // #7 export fast path: only the title projection is
+                    // requested, and only a `user_message` can set it. The
+                    // type-tag peek preserves "first user message in seq
+                    // order" exactly (any payload decoding to UserMessage
+                    // carries that tag), so the fast path's title is
+                    // byte-identical to the full replay's.
+                    if envelope
+                        .payload
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("user_message")
+                    {
+                        projection.apply(envelope);
+                        if projection.title.is_some() {
+                            break 'replay;
+                        }
+                    }
+                } else {
+                    projection.apply(envelope);
+                }
             }
             if !advanced {
                 break;
             }
         }
-        let digest = projection.finish(
+        // #13: the config door reads roster truth from this digest instead of
+        // scanning session.list pages; both fields come from the SAME truth
+        // functions the listing uses, at this observe's sealed head.
+        let (turn_count, agent_metrics) = if metadata_only {
+            (None, None)
+        } else {
+            let (turns, _footprint) =
+                session_summary_truth(&self.hub.inner.store, &session_id, head).await?;
+            let initial_model = metadata
+                .as_ref()
+                .map_or("", |metadata| metadata.model.as_str());
+            let (agent_metrics, _last_model) = session_agent_metrics_truth(
+                &self.hub.inner.store,
+                &session_id,
+                head,
+                initial_model,
+            )
+            .await?;
+            (Some(turns), agent_metrics)
+        };
+        let mut digest = projection.finish(
             session_id,
             head,
             self.hub.inner.store.worker_generation(),
             metadata,
         );
+        digest.turn_count = turn_count;
+        digest.agent_metrics = agent_metrics;
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionObserve { digest },
@@ -7188,10 +7237,12 @@ async fn run_surface_watch(
             Err(_) => return,
         };
         for (session_id, pushed_generation) in watched {
-            let snapshot = hub.surface_snapshot(&session_id);
-            if snapshot.change_generation == pushed_generation {
+            // Generation compare happens under the surfaces lock; an idle
+            // tick clones nothing.
+            let Some(snapshot) = hub.surface_snapshot_if_changed(&session_id, pushed_generation)
+            else {
                 continue;
-            }
+            };
             let sent = sink
                 .try_send_droppable(WireFrame::SessionSurfaceDelta {
                     session_id: session_id.clone(),

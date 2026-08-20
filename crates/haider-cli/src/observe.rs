@@ -17,7 +17,6 @@ use super::run::{
     EX_BLOCKED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT, EX_UNAVAILABLE,
     EX_USAGE,
 };
-use super::update::{UpdateAvailability, check_update_availability};
 
 const OBSERVE_SCHEMA: &str = "haider.observe.v1";
 const LAST_EVENT_LIMIT: u32 = 20;
@@ -397,7 +396,7 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
     };
     let welcome = observer.welcome().clone();
     observer.close();
-    let update = update_view(check_update_availability());
+    let update = stamp_update_view(&profile.store_dir);
     let document = StatusDocument {
         schema: OBSERVE_SCHEMA,
         kind: "status",
@@ -641,26 +640,25 @@ fn profile() -> Result<ResolvedProfile, ExitCode> {
     })
 }
 
-fn update_view(result: Result<UpdateAvailability, super::update::UpdateError>) -> UpdateView {
-    match result {
-        Ok(UpdateAvailability::Current { version }) => UpdateView {
-            status: "current",
-            current_version: version,
-            latest_version: None,
-            error: None,
-        },
-        Ok(UpdateAvailability::Available { current, latest }) => UpdateView {
-            status: "available",
-            current_version: current,
-            latest_version: Some(latest),
-            error: None,
-        },
-        Err(_) => UpdateView {
-            status: "unknown",
-            current_version: super::VERSION.to_owned(),
-            latest_version: None,
-            error: Some("unavailable"),
-        },
+/// v0.0.935: `haider status` never runs the release check itself — the
+/// synchronous discovery curl cost seconds per invocation. It reports the
+/// profile's six-hour stamp cache instead: `checked_recently` when an
+/// automatic check ran within the interval, `check_due` when the next TUI
+/// start or an explicit `haider update` will perform one. Status therefore
+/// completes without any network traffic.
+pub(crate) fn stamp_update_view(profile_dir: &std::path::Path) -> UpdateView {
+    use super::update::check_policy::{check_due, last_check_stamp, unix_timestamp_now};
+    let last = last_check_stamp(profile_dir);
+    let status = if check_due(last, unix_timestamp_now()) {
+        "check_due"
+    } else {
+        "checked_recently"
+    };
+    UpdateView {
+        status,
+        current_version: super::VERSION.to_owned(),
+        latest_version: None,
+        error: None,
     }
 }
 
