@@ -47,11 +47,65 @@ jobs:
       - name: build Wayland portal companion (Linux only)
         if: runner.os == 'Linux'
         run: cargo build --release --locked -p haider-tools --bin haider-wayland-portal --target ${{ matrix.target }}
-      - name: ad-hoc codesign (macOS only — quarantine-friendly unsigned distribution)
+      - name: Developer ID sign macOS binaries
         if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_SIGNING_CERT_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
         run: |
-          codesign --force -s - target/${{ matrix.target }}/release/haider
-          codesign --force -s - target/${{ matrix.target }}/release/haiderd
+          set -euo pipefail
+
+          if [ -z "${MACOS_SIGNING_CERT_P12_BASE64:-}" ] || [ -z "${MACOS_SIGNING_CERT_PASSWORD:-}" ]; then
+            echo "Developer ID signing secrets are required for macOS releases" >&2
+            exit 1
+          fi
+
+          P12="$RUNNER_TEMP/haider-developer-id.p12"
+          KEYCHAIN="$RUNNER_TEMP/haider-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          ORIGINAL_KEYCHAINS=()
+          while IFS= read -r listed_keychain; do
+            listed_keychain="${listed_keychain//\"/}"
+            ORIGINAL_KEYCHAINS+=("$listed_keychain")
+          done < <(security list-keychains -d user)
+
+          cleanup_signing_keychain() {
+            security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || true
+            security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+            rm -f "$P12"
+          }
+          trap cleanup_signing_keychain EXIT
+
+          printf '%s' "$MACOS_SIGNING_CERT_P12_BASE64" | base64 -D > "$P12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$MACOS_SIGNING_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" "${ORIGINAL_KEYCHAINS[@]}"
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' \
+            | head -1)"
+          if [ -z "$IDENTITY" ]; then
+            echo "Recovered certificate does not contain a Developer ID Application identity" >&2
+            exit 1
+          fi
+
+          codesign --force --options runtime --timestamp \
+            --identifier ai.haidercode.haider \
+            --sign "$IDENTITY" \
+            target/${{ matrix.target }}/release/haider
+          codesign --force --options runtime --timestamp \
+            --identifier ai.haidercode.haiderd \
+            --sign "$IDENTITY" \
+            target/${{ matrix.target }}/release/haiderd
+
+          codesign --verify --strict --verbose=4 target/${{ matrix.target }}/release/haider
+          codesign --verify --strict --verbose=4 target/${{ matrix.target }}/release/haiderd
       - name: smoke (binary runs + self-test; strict version match on tag builds)
         shell: bash
         run: |
@@ -65,6 +119,54 @@ jobs:
           else
             "$BIN" --version
           fi
+      - name: notarize macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "Apple notarization secret is unavailable: $name" >&2
+              exit 1
+            fi
+          done
+
+          PAYLOAD="$RUNNER_TEMP/haider-notarization-${{ matrix.target }}"
+          ARCHIVE="$RUNNER_TEMP/haider-notarization-${{ matrix.target }}.zip"
+          RESULT="$RUNNER_TEMP/haider-notarization-result.json"
+          mkdir -p "$PAYLOAD"
+          cp target/${{ matrix.target }}/release/haider "$PAYLOAD/"
+          cp target/${{ matrix.target }}/release/haiderd "$PAYLOAD/"
+          ditto -c -k --keepParent "$PAYLOAD" "$ARCHIVE"
+
+          xcrun notarytool submit "$ARCHIVE" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 20m --output-format json > "$RESULT"
+
+          jq '{id, status, message}' "$RESULT"
+          STATUS="$(jq -r '.status // empty' "$RESULT")"
+          SUBMISSION_ID="$(jq -r '.id // empty' "$RESULT")"
+          if [ "$STATUS" != "Accepted" ]; then
+            if [ -n "$SUBMISSION_ID" ]; then
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID"
+            fi
+            echo "Apple notarization failed with status: ${STATUS:-unknown}" >&2
+            exit 1
+          fi
+
+          # stapler cannot attach tickets to raw Mach-O files or ZIP archives.
+          # Apple publishes the nested-binary tickets for Gatekeeper to resolve
+          # online; the exact signed bytes are packaged below without mutation.
       - name: package
         shell: bash
         run: |
@@ -110,7 +212,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTES="Cross-platform release (macOS aarch64/x86_64, Linux x86_64/arm64, Windows x86_64). Unsigned binaries — verify the sha256. macOS: allow via System Settings → Privacy & Security → Open Anyway. Linux: chmod +x. Windows: unzip and allow via SmartScreen → More info → Run anyway."
+          NOTES="Cross-platform release (macOS aarch64/x86_64, Linux x86_64/arm64, Windows x86_64). macOS binaries are Developer ID signed and Apple-notarized. Verify the sha256. Linux: chmod +x. Windows is currently unsigned; unzip and allow via SmartScreen → More info → Run anyway."
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
