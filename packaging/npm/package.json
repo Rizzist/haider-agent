@@ -1,0 +1,34 @@
+{
+  "name": "haider-agent",
+  "version": "0.0.934",
+  "description": "The Haider coding-agent TUI and runtime",
+  "homepage": "https://github.com/Rizzist/haider-agent",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rizzist/haider-agent.git"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "bin": {
+    "haider": "bin/haider.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md",
+    "LICENSE",
+    "vendor/"
+  ],
+  "keywords": [
+    "haider",
+    "ai",
+    "agent",
+    "cli",
+    "tui"
+  ]
+}

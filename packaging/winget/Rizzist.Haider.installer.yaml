@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+PackageIdentifier: Rizzist.Haider
+PackageVersion: "0.0.934"
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: haider-v0.0.934-x86_64-pc-windows-msvc/haider.exe
+    PortableCommandAlias: haider
+  - RelativeFilePath: haider-v0.0.934-x86_64-pc-windows-msvc/haiderd.exe
+    PortableCommandAlias: haiderd
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Rizzist/haider-agent/releases/download/v0.0.934/haider-v0.0.934-x86_64-pc-windows-msvc.zip
+    InstallerSha256: 83DD105968CEB1FE9675A7DE5BFC8B4EDBB8D34A62D246C49361E098A93E5CA0
+    ArchiveBinariesDependOnPath: true
+ManifestType: installer
+ManifestVersion: 1.9.0

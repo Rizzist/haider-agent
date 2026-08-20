@@ -1,0 +1,13 @@
+VERIFICATION
+
+The haider.exe and haiderd.exe binaries are downloaded from the public GitHub
+Release for this package version:
+
+https://github.com/Rizzist/haider-agent/releases/tag/v0.0.934
+
+The Chocolatey install script verifies the release zip with this SHA-256 value:
+
+83dd105968ceb1fe9675a7de5bfc8b4edbb8d34a62d246c49361e098a93e5ca0
+
+The Windows release binaries are currently unsigned. The archive checksum is
+published beside the release asset as a .sha256 file.

@@ -1,0 +1,35 @@
+{
+  "version": "0.0.934",
+  "description": "Provider-agnostic coding-agent TUI and runtime",
+  "homepage": "https://github.com/Rizzist/haider-agent",
+  "license": {
+    "identifier": "LicenseRef-KOA-P-1.0",
+    "url": "https://github.com/Rizzist/haider-agent/blob/main/LICENSE.md"
+  },
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/Rizzist/haider-agent/releases/download/v0.0.934/haider-v0.0.934-x86_64-pc-windows-msvc.zip",
+      "hash": "83dd105968ceb1fe9675a7de5bfc8b4edbb8d34a62d246c49361e098a93e5ca0",
+      "extract_dir": "haider-v0.0.934-x86_64-pc-windows-msvc"
+    }
+  },
+  "bin": [
+    "haider.exe"
+  ],
+  "checkver": {
+    "url": "https://api.github.com/repos/Rizzist/haider-agent/releases?per_page=20",
+    "regex": "\"tag_name\"\\s*:\\s*\"v([0-9]+(?:\\.[0-9]+)*)\""
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/Rizzist/haider-agent/releases/download/v$version/haider-v$version-x86_64-pc-windows-msvc.zip",
+        "extract_dir": "haider-v$version-x86_64-pc-windows-msvc"
+      }
+    },
+    "hash": {
+      "url": "$url.sha256",
+      "regex": "([a-fA-F0-9]{64})"
+    }
+  }
+}

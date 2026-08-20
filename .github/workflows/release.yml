@@ -221,3 +221,250 @@ jobs:
               --prerelease \
               --notes "$NOTES"
           fi
+
+  npm:
+    name: Publish npm
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Check npm token
+        id: token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::NPM_TOKEN is not set; skipping npm publish"
+          fi
+
+      - name: Check published npm version
+        id: package
+        if: steps.token.outputs.skip != 'true'
+        working-directory: packaging/npm
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if npm view "haider-agent@$VERSION" version --json >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::haider-agent@$VERSION is already published; skipping npm publish"
+          fi
+
+      - name: Publish
+        if: steps.token.outputs.skip != 'true' && steps.package.outputs.skip != 'true'
+        working-directory: packaging/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+          npm publish --access public
+
+  repin-packages:
+    name: Re-pin Homebrew and Scoop manifests
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    concurrency:
+      group: haider-package-manifest-repin
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Re-pin manifests from release artifacts
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          export VERSION="${TAG#v}"
+          sha_file() {
+            shasum -a 256 "artifacts/$1" | awk '{print $1}'
+          }
+          export SHA_DARWIN_ARM
+          export SHA_DARWIN_X64
+          export SHA_LINUX_ARM64
+          export SHA_LINUX_X64
+          export SHA_WIN_X64
+          SHA_DARWIN_ARM=$(sha_file "haider-v${VERSION}-aarch64-apple-darwin.tar.xz")
+          SHA_DARWIN_X64=$(sha_file "haider-v${VERSION}-x86_64-apple-darwin.tar.xz")
+          SHA_LINUX_ARM64=$(sha_file "haider-v${VERSION}-aarch64-unknown-linux-gnu.tar.xz")
+          SHA_LINUX_X64=$(sha_file "haider-v${VERSION}-x86_64-unknown-linux-gnu.tar.xz")
+          SHA_WIN_X64=$(sha_file "haider-v${VERSION}-x86_64-pc-windows-msvc.zip")
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["VERSION"]
+          formula_path = pathlib.Path("packaging/homebrew/haider.rb")
+          formula = formula_path.read_text()
+          formula, count = re.subn(
+              r'(?m)^  version "[^"]+"$',
+              f'  version "{version}"',
+              formula,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("could not update Homebrew version")
+
+          targets = {
+              "aarch64-apple-darwin": os.environ["SHA_DARWIN_ARM"],
+              "x86_64-apple-darwin": os.environ["SHA_DARWIN_X64"],
+              "aarch64-unknown-linux-gnu": os.environ["SHA_LINUX_ARM64"],
+              "x86_64-unknown-linux-gnu": os.environ["SHA_LINUX_X64"],
+          }
+          for target, digest in targets.items():
+              pattern = re.compile(
+                  rf'(?m)^(?P<indent>\s*)url "[^"]*haider-v[^"]*-{re.escape(target)}\.tar\.xz"\n'
+                  rf'(?P=indent)sha256 "[^"]+"'
+              )
+              url = (
+                  "https://github.com/Rizzist/haider-agent/releases/download/"
+                  f"v{version}/haider-v{version}-{target}.tar.xz"
+              )
+              formula, count = pattern.subn(
+                  lambda match: (
+                      f'{match.group("indent")}url "{url}"\n'
+                      f'{match.group("indent")}sha256 "{digest}"'
+                  ),
+                  formula,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(f"could not update Homebrew target {target}")
+          formula_path.write_text(formula)
+
+          scoop_path = pathlib.Path("packaging/scoop/haider.json")
+          scoop = json.loads(scoop_path.read_text())
+          target = "x86_64-pc-windows-msvc"
+          scoop["version"] = version
+          scoop["architecture"]["64bit"].update(
+              {
+                  "url": (
+                      "https://github.com/Rizzist/haider-agent/releases/download/"
+                      f"v{version}/haider-v{version}-{target}.zip"
+                  ),
+                  "hash": os.environ["SHA_WIN_X64"],
+                  "extract_dir": f"haider-v{version}-{target}",
+              }
+          )
+          scoop_path.write_text(json.dumps(scoop, indent=2) + "\n")
+          PY
+
+      - name: Commit manifests to the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- packaging/homebrew/haider.rb packaging/scoop/haider.json
+          if git diff --cached --quiet; then
+            echo "::warning::Homebrew and Scoop manifests are already pinned to $GITHUB_REF_NAME; skipping commit"
+            exit 0
+          fi
+          git commit -m "packaging: re-pin manifests for $GITHUB_REF_NAME"
+          git pull --rebase origin "$DEFAULT_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"
+
+  chocolatey:
+    name: Publish Chocolatey
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Check Chocolatey token
+        id: token
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHOCO_API_KEY)) {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Output "::warning::CHOCO_API_KEY is not set; skipping Chocolatey publish"
+          }
+
+      - name: Check published Chocolatey version
+        id: package
+        if: steps.token.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $Version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $Existing = choco search haider --exact --version $Version --source https://community.chocolatey.org/api/v2/ --limit-output
+          if ($LASTEXITCODE -ne 0) {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Output '::warning::Could not query Chocolatey for the existing package version; skipping this publish attempt'
+            exit 0
+          }
+          if (@($Existing) -contains "haider|$Version") {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Output "::warning::haider $Version is already published; skipping Chocolatey push"
+          }
+
+      # The first-ever Chocolatey version requires manual community moderation.
+      - name: Pack and push
+        if: steps.token.outputs.skip != 'true' && steps.package.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          $Version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $Target = 'x86_64-pc-windows-msvc'
+          $Zip = "haider-v$Version-$Target.zip"
+          $Url = "https://github.com/Rizzist/haider-agent/releases/download/v$Version/$Zip"
+          $Sha = (Get-FileHash -Algorithm SHA256 -Path "artifacts\$Zip").Hash.ToLowerInvariant()
+          Copy-Item packaging\chocolatey dist-choco -Recurse
+
+          $NuspecPath = 'dist-choco\haider.nuspec'
+          $Nuspec = Get-Content $NuspecPath -Raw
+          $Nuspec = $Nuspec -replace '<version>[^<]+</version>', "<version>$Version</version>"
+          Set-Content $NuspecPath $Nuspec
+
+          $InstallPath = 'dist-choco\tools\chocolateyinstall.ps1'
+          $Install = Get-Content $InstallPath -Raw
+          $Install = $Install -replace '(?m)^\$version = ''[^'']+''$', "`$version = '$Version'"
+          $Install = $Install -replace '(?m)^\$url64 = ''[^'']+''$', "`$url64 = '$Url'"
+          $Install = $Install -replace '(?m)^\$checksum64 = ''[^'']+''$', "`$checksum64 = '$Sha'"
+          Set-Content $InstallPath $Install
+
+          $VerificationPath = 'dist-choco\tools\VERIFICATION.txt'
+          $Verification = Get-Content $VerificationPath -Raw
+          $Verification = $Verification -replace 'releases/tag/v[^\s]+', "releases/tag/v$Version"
+          $Verification = $Verification -replace '(?m)^(?:[a-fA-F0-9]{64}|__SHA_WIN_X64__)$', $Sha
+          Set-Content $VerificationPath $Verification
+
+          choco pack $NuspecPath --outputdirectory dist-choco
+          $PushOutput = choco push "dist-choco\haider.$Version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY 2>&1
+          $PushExit = $LASTEXITCODE
+          $PushOutput | Write-Output
+          if ($PushExit -ne 0) {
+            $PushText = $PushOutput -join "`n"
+            if ($PushText -match '(?i)(already exists|conflict|status code 409)') {
+              Write-Output "::warning::haider $Version already exists on Chocolatey; treating the push as an idempotent no-op"
+              exit 0
+            }
+            exit $PushExit
+          }

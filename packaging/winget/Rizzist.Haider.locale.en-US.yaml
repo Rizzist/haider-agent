@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: Rizzist.Haider
+PackageVersion: "0.0.934"
+PackageLocale: en-US
+Publisher: Rizzist
+PublisherUrl: https://github.com/Rizzist
+PublisherSupportUrl: https://github.com/Rizzist/haider-agent/issues
+PackageName: Haider Agent CLI
+PackageUrl: https://github.com/Rizzist/haider-agent
+License: KOA-P-1.0
+LicenseUrl: https://github.com/Rizzist/haider-agent/blob/main/LICENSE.md
+ShortDescription: Provider-agnostic coding-agent TUI and runtime.
+Description: |-
+  Haider is a provider-agnostic coding-agent harness with a terminal UI,
+  headless runtime, and per-device daemon. The portable package installs the
+  haider command together with its required sibling daemon, haiderd.
+Moniker: haider
+Tags:
+  - ai
+  - agent
+  - cli
+  - developer-tools
+  - haider
+  - tui
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0
