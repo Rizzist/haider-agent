@@ -66,6 +66,9 @@ mod gcloud;
 mod hooks;
 mod image_events;
 mod lifecycle;
+mod loom_seed;
+#[cfg(test)]
+mod loom_seed_tests;
 #[cfg(test)]
 mod manual_retry_tests;
 mod model_select;

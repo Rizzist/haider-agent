@@ -2989,12 +2989,16 @@ fn template(name: &str, start: &str, nodes: Vec<GraphNodeSpec>) -> GraphTemplate
 }
 
 fn super_ship_loop_template() -> GraphTemplateSpec {
+    // Owner-specified five-stage loop (2026-08-20): clean code, tests,
+    // implement, verify until SHIP, optimize. Gate attempts supply the
+    // "until": a red node re-attempts instead of advancing. OPTIMIZE sits
+    // before the human SHIP gate so what ships is what was optimized.
     template(
         SUPER_SHIP_LOOP_TEMPLATE,
-        "START",
+        "IMPLEMENT",
         vec![
             node_spec(
-                "START",
+                "IMPLEMENT",
                 GraphGateKind::CommandGreen,
                 GraphExecutorShape::Inline,
                 &[],
@@ -3004,28 +3008,28 @@ fn super_ship_loop_template() -> GraphTemplateSpec {
                 "TESTS",
                 GraphGateKind::AllOfN { n: 2 },
                 GraphExecutorShape::FanOut,
-                &["START"],
+                &["IMPLEMENT"],
                 vec![daemon_slot("tests"), daemon_slot("lint")],
             ),
             node_spec(
-                "REVIEW",
+                "CLEAN",
                 GraphGateKind::AllOfN { n: 1 },
                 GraphExecutorShape::Inline,
-                &["START"],
-                vec![model_slot("review")],
+                &["IMPLEMENT"],
+                vec![model_slot("clean-code")],
             ),
             node_spec(
-                "PACKAGE",
-                GraphGateKind::CommandGreen,
+                "OPTIMIZE",
+                GraphGateKind::AllOfN { n: 1 },
                 GraphExecutorShape::Inline,
-                &["TESTS", "REVIEW"],
-                vec![],
+                &["TESTS", "CLEAN"],
+                vec![model_slot("optimize")],
             ),
             node_spec(
                 "SHIP",
                 GraphGateKind::HumanConfirm,
                 GraphExecutorShape::Human,
-                &["PACKAGE"],
+                &["OPTIMIZE"],
                 vec![],
             ),
         ],

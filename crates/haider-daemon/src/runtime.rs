@@ -318,6 +318,13 @@ async fn run_inner(
         "pre-ready recovery phase completed"
     );
 
+    // Owner defaults (2026-08-20): the Loom registry seeds its two default
+    // agent types before Ready — absent-only, so user revisions are never
+    // clobbered. A seed failure is fatal like any other pre-Ready phase.
+    if let Err(error) = crate::loom_seed::seed_loom_registry(&store).await {
+        let _ = store.close().await;
+        return Err(error.into());
+    }
     let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
     // Startup turn recovery commits directly through the store before a hub
     // exists. Reconcile every journal it changed now: otherwise a terminal E

@@ -2523,9 +2523,9 @@ fn m2b_non_linear_ready_set_is_declaration_ordered() {
         &store,
         &session_id,
         10_000,
-        GraphNodeName::new("START").expect("node"),
+        GraphNodeName::new("IMPLEMENT").expect("node"),
         EvidenceVerdict::Green,
-        "start is green",
+        "implement is green",
     ) else {
         panic!("fresh evidence commits");
     };
@@ -2543,7 +2543,7 @@ fn m2b_non_linear_ready_set_is_declaration_ordered() {
         kinds,
         vec![
             GraphNodeName::new("TESTS").expect("node"),
-            GraphNodeName::new("REVIEW").expect("node"),
+            GraphNodeName::new("CLEAN").expect("node"),
         ]
     );
     let status = store
@@ -4800,5 +4800,62 @@ fn m2e_cached_success_provenance_is_revalidated_on_every_reuse() {
             .and_then(|details| details.get("kind"))
             .and_then(serde_json::Value::as_str),
         Some("poisoned_child_template_cache")
+    );
+}
+
+/// Owner-specified default (2026-08-20): Super Ship Loop is exactly
+/// clean code, tests, implement, verify-until-SHIP, optimize — lowered as
+/// IMPLEMENT → {TESTS(all-of-2 daemon), CLEAN(model)} → OPTIMIZE(model) →
+/// SHIP(human). Gate attempts supply the "until".
+///
+/// MUTATION CHECK: reorder the nodes, drop OPTIMIZE, or demote SHIP from
+/// HumanConfirm. Expected runtime failure: the exact sequence below.
+#[test]
+fn super_ship_loop_carries_the_owner_specified_five_stages() {
+    let template = haider_protocol::graph::graph_template(SUPER_SHIP_LOOP_TEMPLATE)
+        .expect("built-in template");
+    let names = template
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["IMPLEMENT", "TESTS", "CLEAN", "OPTIMIZE", "SHIP"]);
+    assert_eq!(
+        template.start_node.as_ref().map(|node| node.as_str()),
+        Some("IMPLEMENT")
+    );
+    let ship = template
+        .nodes
+        .iter()
+        .find(|node| node.name.as_str() == "SHIP")
+        .expect("ship node");
+    assert!(
+        matches!(
+            ship.gate,
+            haider_protocol::graph::GraphGateKind::HumanConfirm
+        ),
+        "SHIP stays a human gate"
+    );
+    assert_eq!(
+        ship.depends_on
+            .iter()
+            .map(|node| node.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        ["OPTIMIZE"],
+        "what ships is what was optimized"
+    );
+    let optimize = template
+        .nodes
+        .iter()
+        .find(|node| node.name.as_str() == "OPTIMIZE")
+        .expect("optimize node");
+    assert_eq!(
+        optimize
+            .depends_on
+            .iter()
+            .map(|node| node.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        ["TESTS", "CLEAN"],
+        "optimize waits for green tests and clean code"
     );
 }
