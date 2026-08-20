@@ -141,7 +141,13 @@ async fn execute(session_id: SessionId, options: ItemOptions) -> Result<Value, I
     let (envelope, mut join) = collector
         .await
         .map_err(|_| ItemError::Protocol("item journal collector failed"))?;
-    stream.map_err(|error| ItemError::Unavailable(error.to_string()))?;
+    match stream {
+        // `OutputClosed` is the collector's deliberate early-stop: its
+        // receiver drops the moment the target (and any tool join) is
+        // resolved, instead of draining the replay to head.
+        Ok(()) | Err(haider_client::ObserveError::OutputClosed) => {}
+        Err(error) => return Err(ItemError::Unavailable(error.to_string())),
+    }
     let envelope = envelope.ok_or(ItemError::Missing {
         seq: options.seq,
         head,
@@ -161,7 +167,7 @@ async fn execute(session_id: SessionId, options: ItemOptions) -> Result<Value, I
             run_id,
             unresolved.tool_call_seq,
         ));
-        haider_client::observe_stream_session_after(
+        match haider_client::observe_stream_session_after(
             &profile,
             !options.no_spawn,
             session_id.clone(),
@@ -170,7 +176,13 @@ async fn execute(session_id: SessionId, options: ItemOptions) -> Result<Value, I
             0,
         )
         .await
-        .map_err(|error| ItemError::Unavailable(error.to_string()))?;
+        {
+            // Deliberate early-stop: the result collector's receiver drops
+            // once the replay reaches `tool_call_seq`, past which no result
+            // can bind.
+            Ok(()) | Err(haider_client::ObserveError::OutputClosed) => {}
+            Err(error) => return Err(ItemError::Unavailable(error.to_string())),
+        }
         if let Some((seq, result)) = collector
             .await
             .map_err(|_| ItemError::Protocol("tool result collector failed"))?
@@ -192,9 +204,15 @@ async fn collect_result(
 ) -> Option<(u64, BoundedResult)> {
     let mut found = None;
     while let Some(envelope) = receiver.recv().await {
-        if envelope.seq < before_seq
-            && let Ok(EventPayload::ToolResult { call_id, result }) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        if envelope.seq >= before_seq {
+            // Ascending replay: no later envelope can satisfy
+            // `seq < before_seq`. Dropping the receiver ends the upstream
+            // replay here instead of streaming to head (the caller tolerates
+            // the resulting `OutputClosed`).
+            break;
+        }
+        if let Ok(EventPayload::ToolResult { call_id, result }) =
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
             && call_id == wanted_call_id
             && envelope.branch_id.as_ref().map(|branch| branch.as_str())
                 == wanted_branch_id.as_deref()
@@ -221,6 +239,14 @@ async fn collect_target(
             if envelope.seq == target {
                 found = Some(envelope);
                 found_join = join;
+                // Early-stop: a non-tool target (or a join that already
+                // carries its result) is complete the moment it is captured;
+                // dropping the receiver ends the upstream replay instead of
+                // draining it to head (the caller tolerates the resulting
+                // `OutputClosed`).
+                if found_join.as_ref().is_none_or(|join| join.result.is_some()) {
+                    break;
+                }
             }
         } else if let Some(join) = found_join.as_mut()
             && join.result.is_none()
@@ -240,6 +266,8 @@ async fn collect_target(
         {
             join.tool_result_seq = Some(envelope.seq);
             join.result = Some(result);
+            // Early-stop: the join is resolved; nothing later can rebind it.
+            break;
         }
     }
     (found, found_join)
@@ -415,6 +443,169 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "item_not_found: journal seq 99 is absent (head_seq=41)"
+        );
+    }
+
+    fn test_envelope(seq: u64, payload: serde_json::Value) -> RawEnvelope {
+        haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id: haider_protocol::ids::EventId::new(format!("item-early-stop-{seq}")),
+            seq,
+            session_id: SessionId::new("item-early-stop"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: haider_protocol::ids::DeviceId::new("item-early-stop-device"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: seq,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Omit,
+            },
+            payload,
+        }
+    }
+
+    fn test_result(preview: &str) -> BoundedResult {
+        BoundedResult {
+            preview: preview.to_owned(),
+            truncated: false,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: Default::default(),
+            reason: None,
+            presentation: None,
+        }
+    }
+
+    fn tool_result_payload(call_id: &str, preview: &str) -> serde_json::Value {
+        serde_json::to_value(EventPayload::ToolResult {
+            call_id: call_id.to_owned(),
+            result: test_result(preview),
+        })
+        .expect("tool result serializes")
+    }
+
+    /// MUTATION CHECK: remove the `seq >= before_seq` break and stream to
+    /// head again. Expected RUNTIME failure: the collector never resolves
+    /// inside the timeout below (the sender stays open), and the post-resolve
+    /// send succeeds instead of hitting the dropped receiver.
+    #[tokio::test]
+    async fn collect_result_stops_at_the_call_seq_boundary() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(collect_result(receiver, "call-early".into(), None, None, 4));
+        sender
+            .send(test_envelope(1, tool_result_payload("call-early", "bound")))
+            .expect("eligible result delivers");
+        sender
+            .send(test_envelope(4, json!({"type": "irrelevant_kind"})))
+            .expect("boundary envelope delivers");
+        let found = tokio::time::timeout(std::time::Duration::from_secs(2), collector)
+            .await
+            .expect("early-stop resolves without the channel closing")
+            .expect("collector joins");
+        assert_eq!(
+            found.map(|(seq, result)| (seq, result.preview)),
+            Some((1, "bound".to_owned()))
+        );
+        assert!(
+            sender
+                .send(test_envelope(5, json!({"type": "irrelevant_kind"})))
+                .is_err(),
+            "the receiver dropped at the boundary"
+        );
+    }
+
+    /// MUTATION CHECK: remove the non-tool-target break in `collect_target`.
+    /// Expected RUNTIME failure: the collector never resolves inside the
+    /// timeout (the sender stays open past the captured target).
+    #[tokio::test]
+    async fn collect_target_stops_once_a_plain_target_is_captured() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(collect_target(receiver, 2));
+        sender
+            .send(test_envelope(1, json!({"type": "irrelevant_kind"})))
+            .expect("context envelope delivers");
+        sender
+            .send(test_envelope(
+                2,
+                json!({"type": "user_message", "text": "t"}),
+            ))
+            .expect("target envelope delivers");
+        let (found, join) = tokio::time::timeout(std::time::Duration::from_secs(2), collector)
+            .await
+            .expect("early-stop resolves without the channel closing")
+            .expect("collector joins");
+        assert_eq!(found.map(|envelope| envelope.seq), Some(2));
+        assert!(join.is_none());
+        assert!(
+            sender
+                .send(test_envelope(3, json!({"type": "irrelevant_kind"})))
+                .is_err(),
+            "the receiver dropped at the captured target"
+        );
+    }
+
+    /// MUTATION CHECK: remove the resolved-join break in `collect_target`.
+    /// Expected RUNTIME failure: the collector keeps draining after the
+    /// result binds and never resolves inside the timeout.
+    #[tokio::test]
+    async fn collect_target_stops_once_the_tool_join_resolves() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(collect_target(receiver, 2));
+        // The joiner pairs an item-Completed tool call with the ToolExchange
+        // node committed at the NEXT sequence; the node is the target.
+        let tool_call = serde_json::to_value(EventPayload::Item(
+            haider_protocol::item::ItemEvent::Completed {
+                item_id: haider_protocol::ids::ItemId::new("item-early"),
+                item: haider_protocol::item::TurnItem::ToolCall {
+                    name: "process_exec".into(),
+                    args: json!({"cmd": "true"}),
+                    status: haider_protocol::item::ToolStatus::Completed,
+                    call_id: "call-join".into(),
+                },
+            },
+        ))
+        .expect("tool call serializes");
+        let exchange_node = serde_json::to_value(EventPayload::NodeCommitted(
+            haider_protocol::history::TreeNode {
+                node: haider_protocol::ids::NodeId::new("node-early"),
+                parent: None,
+                kind: NodeKind::ToolExchange {
+                    tool: "process_exec".into(),
+                    summary: "run true".into(),
+                    artifact: None,
+                },
+            },
+        ))
+        .expect("exchange node serializes");
+        sender
+            .send(test_envelope(1, tool_call))
+            .expect("tool call delivers");
+        sender
+            .send(test_envelope(2, exchange_node))
+            .expect("target exchange node delivers");
+        sender
+            .send(test_envelope(3, tool_result_payload("call-join", "joined")))
+            .expect("binding result delivers");
+        let (found, join) = tokio::time::timeout(std::time::Duration::from_secs(2), collector)
+            .await
+            .expect("early-stop resolves without the channel closing")
+            .expect("collector joins");
+        assert_eq!(found.map(|envelope| envelope.seq), Some(2));
+        let join = join.expect("tool join resolved");
+        assert_eq!(join.tool_result_seq, Some(3));
+        assert_eq!(join.result.expect("bound result").preview, "joined");
+        assert!(
+            sender
+                .send(test_envelope(4, json!({"type": "irrelevant_kind"})))
+                .is_err(),
+            "the receiver dropped once the join resolved"
         );
     }
 }

@@ -113,6 +113,35 @@ impl PastedPill {
     }
 }
 
+/// The greatest pill number named by any placeholder-SHAPED token in `text`
+/// (`[Pasted text #N +K lines]`, the exact [`PastedPill::placeholder`]
+/// vocabulary), live or orphaned. Minting above this keeps a fresh pill's
+/// placeholder unique even against tokens whose pill store drained at a
+/// prior submit (recalled drafts).
+fn max_placeholder_token(text: &str) -> u32 {
+    const PREFIX: &str = "[Pasted text #";
+    let mut max = 0;
+    let mut rest = text;
+    while let Some(at) = rest.find(PREFIX) {
+        let tail = &rest[at + PREFIX.len()..];
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0
+            && let Some(after_number) = tail.get(digits..)
+            && let Some(lines_part) = after_number.strip_prefix(" +")
+        {
+            let line_digits = lines_part.bytes().take_while(u8::is_ascii_digit).count();
+            if line_digits > 0
+                && lines_part[line_digits..].starts_with(" lines]")
+                && let Ok(n) = tail[..digits].parse::<u32>()
+            {
+                max = max.max(n);
+            }
+        }
+        rest = &rest[at + PREFIX.len()..];
+    }
+    max
+}
+
 impl PendingAttachment {
     /// The wire block, once (and only once) the upload completed.
     #[must_use]
@@ -330,7 +359,14 @@ impl Composer {
     pub fn take_for_submit(&mut self) -> String {
         let text = std::mem::take(&mut self.text);
         self.revision = self.revision.wrapping_add(1);
-        self.record_submitted(text.trim());
+        // The ring records what will be SENT — the EXPANDED form — not the
+        // placeholder draft: the pill store drains at submit, so a recalled
+        // placeholder could never expand again and would ship the literal
+        // `[Pasted text #N +K lines]`. The snapshot mirrors the submit
+        // seam's expansion (same trim, same first-occurrence resolution)
+        // without draining the store.
+        let expanded = self.expanded_snapshot(text.trim());
+        self.record_submitted(&expanded);
         self.cursor = 0;
         self.anchor = None;
         self.sticky_col = None;
@@ -453,15 +489,15 @@ impl Composer {
 
     /// Insert a large paste as an ATOMIC placeholder pill at the cursor
     /// (replacing an active selection, the paste-insert law). N is
-    /// max(live pills)+1: a fresh draft counts from #1 and a removed
-    /// pill's number can never collide with a live one's.
+    /// max(live pills, placeholder-shaped tokens in the text)+1: a fresh
+    /// draft counts from #1, a removed pill's number can never collide with
+    /// a live one's, and an ORPHAN token (a recalled draft whose store
+    /// drained at submit) can never be re-minted — a byte-identical token
+    /// would make first-occurrence resolution expand the wrong site.
     pub fn insert_paste(&mut self, content: String, lines: usize) {
-        let n = self
-            .pastes
-            .iter()
-            .map(|pill| pill.n)
-            .max()
-            .unwrap_or(0)
+        let live_max = self.pastes.iter().map(|pill| pill.n).max().unwrap_or(0);
+        let n = live_max
+            .max(max_placeholder_token(&self.text))
             .saturating_add(1);
         let pill = PastedPill { n, lines, content };
         // Insert FIRST: `after_edit`'s containment GC must not see a
@@ -479,6 +515,18 @@ impl Composer {
     #[must_use]
     pub fn expand_pastes(&mut self, text: &str) -> String {
         let pills = std::mem::take(&mut self.pastes);
+        Self::expansion_of(&pills, text)
+    }
+
+    /// The submit seam's expansion, read-only: what `expand_pastes` WOULD
+    /// send for `text` with the current store. Used to record the history
+    /// ring's entry as the sent bytes rather than the placeholder draft.
+    #[must_use]
+    fn expanded_snapshot(&self, text: &str) -> String {
+        Self::expansion_of(&self.pastes, text)
+    }
+
+    fn expansion_of(pills: &[PastedPill], text: &str) -> String {
         let mut found: Vec<(usize, usize, &PastedPill)> = pills
             .iter()
             .filter_map(|pill| {

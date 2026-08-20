@@ -1187,10 +1187,13 @@ fn render_journal(
         };
         let is_current = current_run.is_some_and(|current| run_id == *current);
         let prior_state = terminal.get(&run_id);
+        // Invariant since the terminal-history flip (f53cb2c): every run that
+        // was previously visible only through the narrow terminal
+        // user-command lane (`!is_current && prior_state is terminal`) is now
+        // ordinarily visible — `ordinary_visible` is a strict superset of the
+        // retired `terminal_user_command_visible`, so it alone gates below.
         let ordinary_visible = is_current || prior_state.is_some_and(RunState::is_terminal);
-        let terminal_user_command_visible =
-            !is_current && prior_state.is_some_and(RunState::is_terminal);
-        if !ordinary_visible && !terminal_user_command_visible {
+        if !ordinary_visible {
             continue;
         }
         if envelope.render.prompt == PromptRender::Omit {
@@ -1214,37 +1217,6 @@ fn render_journal(
                 .entry(item_id.clone())
                 .or_default()
                 .push(*stream, &bytes);
-            continue;
-        }
-        if !ordinary_visible {
-            if let EventPayload::Item(ItemEvent::Completed {
-                item_id,
-                item:
-                    TurnItem::CommandExecution {
-                        call_id,
-                        command,
-                        status,
-                        exit_code,
-                    },
-            }) = payload
-                && user_command_origins
-                    .get(&item_id)
-                    .is_some_and(|origin| origin.call_id == call_id)
-            {
-                let output = user_command_outputs.remove(&item_id).unwrap_or_default();
-                let (output_preview, output_truncated, output_lossy_utf8, output_bytes) =
-                    output.finish();
-                messages.push(Message::user_command(UserCommandRecord {
-                    call_id,
-                    command,
-                    status,
-                    exit_code,
-                    output_preview,
-                    output_bytes,
-                    output_truncated,
-                    output_lossy_utf8,
-                }));
-            }
             continue;
         }
         match payload {

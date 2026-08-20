@@ -128,6 +128,61 @@ fn multiple_pastes_number_per_draft_and_all_expand() {
     );
 }
 
+/// MUTATION CHECK (rev934 P3): record the pre-expansion draft in
+/// `take_for_submit` again. Expected runtime failure: the recalled entry
+/// below reads `before [Pasted text #1 +5 lines] after` and resubmitting it
+/// ships that literal token — the store drained at the first submit.
+#[test]
+fn history_recall_reproduces_the_sent_bytes_not_the_placeholder() {
+    let mut model = live_session();
+    for c in "before ".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    paste(&mut model, "l1\nl2\nl3\nl4\nl5");
+    for c in " after".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    let sent = submitted_text(&model);
+    assert_eq!(sent, "before l1\nl2\nl3\nl4\nl5 after");
+    model.requests.clear();
+
+    assert!(model.composer.history_prev());
+    assert_eq!(model.composer, sent.as_str(), "recall shows what was SENT");
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(
+        submitted_text(&model),
+        sent,
+        "resubmit ships the same bytes"
+    );
+}
+
+/// MUTATION CHECK (rev934 P3): mint pill numbers from the live store's max
+/// alone. Expected runtime failure: the fresh paste below mints a token
+/// byte-identical to the orphan, first-occurrence resolution expands the
+/// ORPHAN's position, and the submitted text swaps the two segments.
+#[test]
+fn fresh_paste_mints_above_orphan_placeholder_tokens() {
+    let mut model = live_session();
+    // An orphan token in the draft (a recalled/foreign draft whose store is
+    // gone) — typed literally, so the side store stays empty.
+    for c in "[Pasted text #1 +5 lines] ".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    assert!(model.composer.pastes().is_empty());
+    paste(&mut model, "b1\nb2\nb3\nb4\nb5");
+    assert_eq!(
+        model.composer,
+        "[Pasted text #1 +5 lines] [Pasted text #2 +5 lines]"
+    );
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(
+        submitted_text(&model),
+        "[Pasted text #1 +5 lines] b1\nb2\nb3\nb4\nb5",
+        "the orphan stays literal; only the fresh pill expands"
+    );
+}
+
 // ---- atomic editing ----------------------------------------------------
 
 /// MUTATION CHECK: drop the pill arm from `Composer::backspace`. Expected

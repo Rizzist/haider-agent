@@ -791,32 +791,60 @@ impl SessionProjection {
         }
     }
 
+    /// Removes one settled row from every remaining pending failure's
+    /// candidate list: a row that already resolved one effect cannot own
+    /// another, so a later-settling row — not this one — resolves the rest.
+    fn retire_effect_owner_row(
+        failures: &mut [PendingEffectFailure],
+        item_id: &ItemId,
+        call_id: &str,
+    ) {
+        for failure in failures {
+            failure
+                .owners
+                .retain(|owner| !(owner.item_id == *item_id && owner.call_id == call_id));
+        }
+    }
+
     fn settle_effect_failures_for_result(
         &mut self,
         item_id: &ItemId,
         call_id: &str,
         result: &haider_protocol::tool::BoundedResult,
     ) {
-        let failures = std::mem::take(&mut self.pending_effect_failures);
-        for failure in failures {
-            let candidate = failure
+        // Core dispatches provider tool calls serially at ToolCallEnd, so one
+        // settling result resolves AT MOST ONE pending effect failure. A
+        // matching error text is the strongest join evidence and wins over
+        // arrival order; otherwise the documented first-settling candidate
+        // law picks the oldest candidate. Either way the settled row retires
+        // from the remaining failures' candidate lists, so a mismatched-error
+        // row never settles (or adopts) a second, foreign effect's text.
+        // Unresolved failures keep the no-silent-swallow law via the
+        // terminal-state flush.
+        let mut failures = std::mem::take(&mut self.pending_effect_failures);
+        let is_owner_row = |failure: &PendingEffectFailure| {
+            failure
                 .owners
                 .iter()
-                .any(|owner| owner.item_id == *item_id && owner.call_id == call_id);
-            if !candidate {
-                self.pending_effect_failures.push(failure);
-                continue;
+                .any(|owner| owner.item_id == *item_id && owner.call_id == call_id)
+        };
+        let matched = tool_result_status_carries_effect_failure(result.status)
+            .then(|| {
+                failures.iter().position(|failure| {
+                    is_owner_row(failure)
+                        && tool_result_carries_effect_error(result, &failure.error)
+                })
+            })
+            .flatten();
+        let selected = matched.or_else(|| failures.iter().position(is_owner_row));
+        if let Some(index) = selected {
+            let failure = failures.remove(index);
+            if matched.is_none() {
+                self.push_effect_failure(&failure.error);
             }
-            if tool_result_status_carries_effect_failure(result.status)
-                && tool_result_carries_effect_error(result, &failure.error)
-            {
-                continue;
-            }
-            // Core dispatches provider tool calls serially at ToolCallEnd. The
-            // first result belonging to any candidate is therefore this
-            // effect's owning call; the remaining live rows have not run yet.
-            self.push_effect_failure(&failure.error);
+            Self::retire_effect_owner_row(&mut failures, item_id, call_id);
         }
+        self.pending_effect_failures = failures;
     }
 
     fn settle_effect_failures_for_completed_tool(
@@ -825,36 +853,69 @@ impl SessionProjection {
         call_id: &str,
         status: haider_protocol::item::ToolStatus,
     ) {
-        let failures = std::mem::take(&mut self.pending_effect_failures);
-        for failure in failures {
-            let candidate = failure
+        // Same one-settle-per-row law as the result door. Containment of an
+        // effect's error in the row's existing reason is the strongest join
+        // evidence; adoption (stamping the effect's error onto the row) is
+        // allowed only into a row that carries NO error text of its own — a
+        // mismatched-error row never adopts a foreign effect's text.
+        let mut failures = std::mem::take(&mut self.pending_effect_failures);
+        let is_owner_row = |failure: &PendingEffectFailure| {
+            failure
                 .owners
                 .iter()
-                .any(|owner| owner.item_id == *item_id && owner.call_id == call_id);
-            if !candidate {
-                self.pending_effect_failures.push(failure);
-                continue;
+                .any(|owner| owner.item_id == *item_id && owner.call_id == call_id)
+        };
+        let carries_failure = tool_status_carries_effect_failure(status);
+        let row_reason = self.entries.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::Item(block) if block.item_id == *item_id => {
+                Some(block.tool_reason.clone())
             }
-            let inline = if tool_status_carries_effect_failure(status) {
-                self.entries.iter_mut().rev().find_map(|entry| match entry {
-                    TranscriptEntry::Item(block) if block.item_id == *item_id => {
-                        if let Some(reason) = &block.tool_reason {
-                            Some(reason.contains(&bounded_effect_error(&failure.error)))
-                        } else {
-                            block.tool_reason = Some(bounded_effect_error(&failure.error));
-                            Some(true)
+            _ => None,
+        });
+        let matched = carries_failure
+            .then(|| {
+                row_reason
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .and_then(|reason| {
+                        failures.iter().position(|failure| {
+                            is_owner_row(failure)
+                                && reason.contains(&bounded_effect_error(&failure.error))
+                        })
+                    })
+            })
+            .flatten();
+        let selected = matched.or_else(|| failures.iter().position(is_owner_row));
+        if let Some(index) = selected {
+            let failure = failures.remove(index);
+            let mut inline = matched.is_some();
+            if !inline && carries_failure && matches!(row_reason, Some(None)) {
+                // The row failed carrying no reason of its own: the
+                // first-settling candidate law lets it adopt the oldest
+                // candidate's error.
+                inline = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        TranscriptEntry::Item(block) if block.item_id == *item_id => {
+                            if block.tool_reason.is_none() {
+                                block.tool_reason = Some(bounded_effect_error(&failure.error));
+                                Some(true)
+                            } else {
+                                Some(false)
+                            }
                         }
-                    }
-                    _ => None,
-                })
-            } else {
-                Some(false)
-            };
-            if inline == Some(true) {
-                continue;
+                        _ => None,
+                    })
+                    .unwrap_or(false);
             }
-            self.push_effect_failure(&failure.error);
+            if !inline {
+                self.push_effect_failure(&failure.error);
+            }
+            Self::retire_effect_owner_row(&mut failures, item_id, call_id);
         }
+        self.pending_effect_failures = failures;
     }
 
     fn apply_tool_result(&mut self, call_id: &str, result: &haider_protocol::tool::BoundedResult) {

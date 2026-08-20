@@ -537,6 +537,103 @@ fn a_deferred_effect_failure_flushes_at_the_terminal_state() {
     assert!(errors[0].contains("effect failed") && errors[0].contains("boom"));
 }
 
+fn tool_reason_of(model: &AppModel, item: &str) -> Option<String> {
+    model
+        .projection
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            TranscriptEntry::Item(block) if block.item_id.as_str() == item => {
+                block.tool_reason.clone()
+            }
+            _ => None,
+        })
+}
+
+/// MUTATION CHECK (rev934 P3): let one settling row resolve EVERY candidate
+/// failure again (drop the one-settle law or the error-evidence preference).
+/// Expected runtime failure: the first-settling row below pushes the OTHER
+/// effect's error as a premature standalone line, or adopts it as its own.
+#[test]
+fn interleaved_results_attribute_each_effect_to_its_own_row() {
+    let mut model = live_session();
+    model.route_raw(&raw(1, &tool_started("tool-a", "call-a")));
+    model.route_raw(&raw(2, &tool_started("tool-b", "call-b")));
+    model.route_raw(&raw(3, &effect_intent("eff-a", "first effect")));
+    model.route_raw(&raw(4, &effect_failed("eff-a", "alpha failed")));
+    model.route_raw(&raw(5, &effect_intent("eff-b", "second effect")));
+    model.route_raw(&raw(6, &effect_failed("eff-b", "beta failed")));
+    // Results interleave: the SECOND effect's row settles first, carrying
+    // its own error. Error evidence must win over arrival order.
+    model.route_raw(&raw(
+        7,
+        &EventPayload::ToolResult {
+            call_id: "call-b".to_owned(),
+            result: failed_result("beta failed"),
+        },
+    ));
+    model.route_raw(&raw(
+        8,
+        &tool_completed("tool-b", "call-b", ToolStatus::Failed),
+    ));
+    model.route_raw(&raw(
+        9,
+        &EventPayload::ToolResult {
+            call_id: "call-a".to_owned(),
+            result: failed_result("alpha failed"),
+        },
+    ));
+    model.route_raw(&raw(
+        10,
+        &tool_completed("tool-a", "call-a", ToolStatus::Failed),
+    ));
+    model.route_raw(&raw(11, &EventPayload::RunState(RunState::Done)));
+    let errors = error_texts(&model);
+    assert!(
+        errors.is_empty(),
+        "each failure lives inline on its own row: {errors:?}"
+    );
+    let reason_a = tool_reason_of(&model, "tool-a").expect("row a reason");
+    let reason_b = tool_reason_of(&model, "tool-b").expect("row b reason");
+    assert!(reason_a.contains("alpha failed"), "{reason_a}");
+    assert!(reason_b.contains("beta failed"), "{reason_b}");
+}
+
+/// MUTATION CHECK (rev934 P3): let one bare-failure row consume BOTH pending
+/// effect failures (stamp one, standalone the other) again. Expected runtime
+/// failure: a premature standalone line appears at the first completion and
+/// the second row completes with no reason at all.
+#[test]
+fn two_bare_failures_settle_one_effect_each_never_two_on_one_row() {
+    let mut model = live_session();
+    model.route_raw(&raw(1, &tool_started("tool-a", "call-a")));
+    model.route_raw(&raw(2, &tool_started("tool-b", "call-b")));
+    model.route_raw(&raw(3, &effect_intent("eff-a", "first effect")));
+    model.route_raw(&raw(4, &effect_failed("eff-a", "alpha failed")));
+    model.route_raw(&raw(5, &effect_intent("eff-b", "second effect")));
+    model.route_raw(&raw(6, &effect_failed("eff-b", "beta failed")));
+    // No ToolResult events at all: both rows complete bare, in reverse
+    // order. The first-settling candidate law adopts ONE failure per row.
+    model.route_raw(&raw(
+        7,
+        &tool_completed("tool-b", "call-b", ToolStatus::Failed),
+    ));
+    model.route_raw(&raw(
+        8,
+        &tool_completed("tool-a", "call-a", ToolStatus::Failed),
+    ));
+    model.route_raw(&raw(9, &EventPayload::RunState(RunState::Done)));
+    let errors = error_texts(&model);
+    assert!(
+        errors.is_empty(),
+        "one adoption per row, no standalone: {errors:?}"
+    );
+    let reason_b = tool_reason_of(&model, "tool-b").expect("first-settling row adopts the oldest");
+    let reason_a = tool_reason_of(&model, "tool-a").expect("second row adopts the remaining");
+    assert!(reason_b.contains("alpha failed"), "{reason_b}");
+    assert!(reason_a.contains("beta failed"), "{reason_a}");
+}
+
 /// A result that carries a DIFFERENT error does not suppress the effect's
 /// own line — two distinct failures stay two visible facts.
 #[test]
