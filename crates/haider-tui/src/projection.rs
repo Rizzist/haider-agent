@@ -21,7 +21,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorAction, ErrorPresentation};
 use haider_protocol::history::{TodoItem, TodoState};
-use haider_protocol::ids::{ItemId, NodeId};
+use haider_protocol::ids::{EffectId, ItemId, NodeId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::Usage;
@@ -123,6 +123,18 @@ impl ItemBlock {
     }
 }
 
+#[derive(Debug, Clone)]
+struct EffectToolOwner {
+    item_id: ItemId,
+    call_id: String,
+}
+
+#[derive(Debug)]
+struct PendingEffectFailure {
+    owners: Vec<EffectToolOwner>,
+    error: String,
+}
+
 /// What one raw envelope did to the reducer (W3c3, report R11 cut 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawOutcome {
@@ -214,6 +226,15 @@ pub struct SessionProjection {
     finished_items: std::collections::HashSet<ItemId>,
     /// Results may precede or follow their completed item during attach.
     pending_tool_results: std::collections::HashMap<String, haider_protocol::tool::BoundedResult>,
+    /// Effect intents are emitted while their owning tool row is live. A
+    /// provider may stream more than one call at once, so retain every live
+    /// candidate until a call-id/item-id join and matching error disambiguate
+    /// the owner.
+    effect_tool_owners: std::collections::HashMap<EffectId, Vec<EffectToolOwner>>,
+    /// A failed effect precedes the actor's matching `ToolResult`; defer its
+    /// fallback row until the call-id join proves whether the inline row owns
+    /// the same failure.
+    pending_effect_failures: Vec<PendingEffectFailure>,
     menu: Option<Menu>,
     /// Menu-id → opening scope (report R11 cut 2). Stream-scoped: hydration
     /// starts it empty, and a menu with no recorded opening falls back to
@@ -395,6 +416,10 @@ impl SessionProjection {
                 }
             }
             EventPayload::RunState(run) => {
+                if run.is_terminal() {
+                    self.flush_pending_effect_failures();
+                    self.effect_tool_owners.clear();
+                }
                 // W-G: a genuine turn OPENING (idle/none → non-terminal) resets
                 // the streamed-output char tally so the throughput fallback
                 // starts each turn from zero — a mid-turn RunState update
@@ -483,16 +508,32 @@ impl SessionProjection {
             // F2e error-visibility sweep: every turn-level failure the
             // wire can carry surfaces as a VISIBLE session-view line with
             // its public reason — never a silent IDLE.
+            EventPayload::Effect(haider_protocol::effect::EffectPhase::Intent(intent)) => {
+                let owners = self.live_tool_owners();
+                if !owners.is_empty() {
+                    self.effect_tool_owners
+                        .insert(intent.effect.clone(), owners);
+                }
+            }
             EventPayload::Effect(haider_protocol::effect::EffectPhase::Outcome {
-                outcome, ..
+                effect,
+                outcome,
+                ..
             }) => {
                 use haider_protocol::effect::EffectOutcome;
+                let owner = self.effect_tool_owners.remove(effect);
                 match outcome {
                     EffectOutcome::Failed { error } => {
-                        self.entries.push(TranscriptEntry::Error {
-                            text: format!("effect failed — {error}"),
-                            presentation: None,
-                        });
+                        if let Some(owners) = owner {
+                            if !self.effect_failure_is_inline(&owners, error) {
+                                self.pending_effect_failures.push(PendingEffectFailure {
+                                    owners,
+                                    error: error.clone(),
+                                });
+                            }
+                        } else {
+                            self.push_effect_failure(error);
+                        }
                     }
                     EffectOutcome::CancelledEscalated { note } => {
                         self.entries.push(TranscriptEntry::Error {
@@ -691,9 +732,134 @@ impl SessionProjection {
         }
     }
 
+    fn live_tool_owners(&self) -> Vec<EffectToolOwner> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Item(block) if block.streaming => match &block.item {
+                    TurnItem::ToolCall { call_id, .. } => Some(EffectToolOwner {
+                        item_id: block.item_id.clone(),
+                        call_id: call_id.clone(),
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn effect_failure_is_inline(&mut self, owners: &[EffectToolOwner], error: &str) -> bool {
+        self.entries.iter_mut().any(|entry| {
+            let TranscriptEntry::Item(block) = entry else {
+                return false;
+            };
+            let TurnItem::ToolCall {
+                call_id, status, ..
+            } = &block.item
+            else {
+                return false;
+            };
+            if !owners
+                .iter()
+                .any(|owner| owner.item_id == block.item_id && owner.call_id == *call_id)
+                || !tool_status_carries_effect_failure(*status)
+            {
+                return false;
+            }
+            if let Some(reason) = &block.tool_reason {
+                return reason.contains(&bounded_effect_error(error));
+            }
+            if block.streaming {
+                return false;
+            }
+            block.tool_reason = Some(bounded_effect_error(error));
+            true
+        })
+    }
+
+    fn push_effect_failure(&mut self, error: &str) {
+        self.entries.push(TranscriptEntry::Error {
+            text: format!("effect failed — {error}"),
+            presentation: None,
+        });
+    }
+
+    fn flush_pending_effect_failures(&mut self) {
+        let failures = std::mem::take(&mut self.pending_effect_failures);
+        for failure in failures {
+            self.push_effect_failure(&failure.error);
+        }
+    }
+
+    fn settle_effect_failures_for_result(
+        &mut self,
+        item_id: &ItemId,
+        call_id: &str,
+        result: &haider_protocol::tool::BoundedResult,
+    ) {
+        let failures = std::mem::take(&mut self.pending_effect_failures);
+        for failure in failures {
+            let candidate = failure
+                .owners
+                .iter()
+                .any(|owner| owner.item_id == *item_id && owner.call_id == call_id);
+            if !candidate {
+                self.pending_effect_failures.push(failure);
+                continue;
+            }
+            if tool_result_status_carries_effect_failure(result.status)
+                && tool_result_carries_effect_error(result, &failure.error)
+            {
+                continue;
+            }
+            // Core dispatches provider tool calls serially at ToolCallEnd. The
+            // first result belonging to any candidate is therefore this
+            // effect's owning call; the remaining live rows have not run yet.
+            self.push_effect_failure(&failure.error);
+        }
+    }
+
+    fn settle_effect_failures_for_completed_tool(
+        &mut self,
+        item_id: &ItemId,
+        call_id: &str,
+        status: haider_protocol::item::ToolStatus,
+    ) {
+        let failures = std::mem::take(&mut self.pending_effect_failures);
+        for failure in failures {
+            let candidate = failure
+                .owners
+                .iter()
+                .any(|owner| owner.item_id == *item_id && owner.call_id == call_id);
+            if !candidate {
+                self.pending_effect_failures.push(failure);
+                continue;
+            }
+            let inline = if tool_status_carries_effect_failure(status) {
+                self.entries.iter_mut().rev().find_map(|entry| match entry {
+                    TranscriptEntry::Item(block) if block.item_id == *item_id => {
+                        if let Some(reason) = &block.tool_reason {
+                            Some(reason.contains(&bounded_effect_error(&failure.error)))
+                        } else {
+                            block.tool_reason = Some(bounded_effect_error(&failure.error));
+                            Some(true)
+                        }
+                    }
+                    _ => None,
+                })
+            } else {
+                Some(false)
+            };
+            if inline == Some(true) {
+                continue;
+            }
+            self.push_effect_failure(&failure.error);
+        }
+    }
+
     fn apply_tool_result(&mut self, call_id: &str, result: &haider_protocol::tool::BoundedResult) {
         let reason = bounded_tool_reason(result);
-        if let Some(block) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+        let item_id = self.entries.iter_mut().rev().find_map(|entry| match entry {
             TranscriptEntry::Item(block) => match &mut block.item {
                 TurnItem::ToolCall {
                     call_id: known,
@@ -701,13 +867,15 @@ impl SessionProjection {
                     ..
                 } if known == call_id => {
                     *status = result.status.item_status();
-                    Some(block)
+                    block.tool_reason = reason.clone();
+                    Some(block.item_id.clone())
                 }
                 _ => None,
             },
             _ => None,
-        }) {
-            block.tool_reason = reason;
+        });
+        if let Some(item_id) = item_id {
+            self.settle_effect_failures_for_result(&item_id, call_id, result);
         } else {
             self.pending_tool_results
                 .insert(call_id.to_owned(), result.clone());
@@ -887,10 +1055,14 @@ impl SessionProjection {
                             )));
                     }
                 }
-                if let TurnItem::ToolCall { call_id, .. } = item
-                    && let Some(result) = self.pending_tool_results.remove(call_id)
+                if let TurnItem::ToolCall {
+                    call_id, status, ..
+                } = item
                 {
-                    self.apply_tool_result(call_id, &result);
+                    if let Some(result) = self.pending_tool_results.remove(call_id) {
+                        self.apply_tool_result(call_id, &result);
+                    }
+                    self.settle_effect_failures_for_completed_tool(item_id, call_id, *status);
                 }
             }
         }
@@ -1433,6 +1605,51 @@ fn bounded_tool_reason(result: &haider_protocol::tool::BoundedResult) -> Option<
     let reason = result.reason.as_deref().unwrap_or("tool did not complete");
     let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     Some(normalized.chars().take(240).collect())
+}
+
+fn tool_result_carries_effect_error(
+    result: &haider_protocol::tool::BoundedResult,
+    error: &str,
+) -> bool {
+    let normalized = bounded_effect_error(error);
+    result
+        .reason
+        .as_deref()
+        .is_some_and(|reason| bounded_effect_error(reason) == normalized)
+        || result.preview.contains(error)
+        || result.presentation.as_ref().is_some_and(|presentation| {
+            presentation.title.contains(error) || presentation.detail.contains(error)
+        })
+}
+
+fn bounded_effect_error(error: &str) -> String {
+    error
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn tool_result_status_carries_effect_failure(
+    status: haider_protocol::tool::ToolResultStatus,
+) -> bool {
+    matches!(
+        status,
+        haider_protocol::tool::ToolResultStatus::Rejected
+            | haider_protocol::tool::ToolResultStatus::Conflict
+            | haider_protocol::tool::ToolResultStatus::Failed
+    )
+}
+
+fn tool_status_carries_effect_failure(status: haider_protocol::item::ToolStatus) -> bool {
+    matches!(
+        status,
+        haider_protocol::item::ToolStatus::Rejected
+            | haider_protocol::item::ToolStatus::Conflict
+            | haider_protocol::item::ToolStatus::Failed
+    )
 }
 
 /// One typed action's lowercase display word — shared by the transcript

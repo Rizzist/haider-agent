@@ -1009,8 +1009,24 @@ impl EffectBroker {
     /// reconciled by the close sweep.
     /// Process death is instead recovered by the W3 dispatched-without-terminal
     /// startup reconciliation seam.
-    pub async fn close(mut self) -> Result<EffectBrokerCloseReport, EffectBrokerCloseError> {
-        self.processes.cancel_all().await;
+    pub async fn close(self) -> Result<EffectBrokerCloseReport, EffectBrokerCloseError> {
+        self.close_with_fallback(false).await
+    }
+
+    /// Drains work abandoned by an orderly caller cancellation.
+    ///
+    /// Authoritative process/computer finalizers still win. Only a residual
+    /// dispatch with no terminal fact is closed as `Cancelled`; ordinary
+    /// [`Self::close`] and startup recovery retain `Unknown` for crash windows.
+    pub async fn cancel(self) -> Result<EffectBrokerCloseReport, EffectBrokerCloseError> {
+        self.close_with_fallback(true).await
+    }
+
+    async fn close_with_fallback(
+        mut self,
+        cancelled: bool,
+    ) -> Result<EffectBrokerCloseReport, EffectBrokerCloseError> {
+        self.processes.cancel_all();
         let mut errors = Vec::new();
         self.drain_finalizers(&mut errors).await;
 
@@ -1026,10 +1042,11 @@ impl EffectBroker {
             let Some(claim) = claim else {
                 continue;
             };
-            let outcome = if self
-                .computer_cancellations
-                .get(&intent.effect)
-                .is_some_and(ComputerCancelToken::is_cancelled)
+            let outcome = if cancelled
+                || self
+                    .computer_cancellations
+                    .get(&intent.effect)
+                    .is_some_and(ComputerCancelToken::is_cancelled)
             {
                 EffectOutcome::Cancelled
             } else {
@@ -1058,7 +1075,7 @@ impl EffectBroker {
                 .iter()
                 .any(|(_, terminal_error)| terminal_error == error)
         });
-        let leaked_processes = self.processes.leaked_call_ids().await;
+        let leaked_processes = self.processes.leaked_call_ids();
         errors.extend(leaked_processes.iter().map(|call_id| ToolError::Runtime {
             message: format!(
                 "process `{call_id}` leaked after process-group termination escalation"

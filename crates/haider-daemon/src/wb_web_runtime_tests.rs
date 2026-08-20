@@ -937,6 +937,17 @@ async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch()
             .any(|tool| tool.name == "web_fetch"),
         "the bounded same-turn retry uses the LOCAL fetch tool"
     );
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    haider_protocol::provider::Block::Text { text } if text == "first"
+                )
+            })
+        }),
+        "the errored turn's committed user message stays in the next prompt"
+    );
     let history = world
         .store
         .read(&world.session_id, 0, 256)

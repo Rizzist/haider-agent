@@ -940,3 +940,103 @@ async fn dispatched_effect_can_be_reconciled_as_unknown() {
         })
     ));
 }
+
+// ── Orderly cancel vs crash window (dogfood bug 4) ──────────────────────
+//
+// The one deliberate exception to the header rule above: these two pins
+// must read the journal AFTER close/cancel consumes the broker, so they
+// share the payload vector behind an Arc.
+
+#[derive(Debug, Clone, Default)]
+struct SharedJournal {
+    payloads: std::sync::Arc<std::sync::Mutex<Vec<EventPayload>>>,
+}
+
+#[async_trait::async_trait]
+impl JournalSink for SharedJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        self.payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(payload);
+        Ok(())
+    }
+}
+
+fn residual_outcomes(journal: &SharedJournal) -> Vec<EffectOutcome> {
+    journal
+        .payloads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(EffectPhase::Outcome { outcome, .. }) => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn dispatch_without_outcome(broker: &mut EffectBroker) {
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::FsRead);
+    let intent = broker
+        .normalize(&FsRead::new("src/lib.rs"))
+        .await
+        .expect("normalize");
+    assert_eq!(
+        broker.authorize(&intent, &policy).await.expect("authorize"),
+        AuthorizationVerdict::Allow
+    );
+    broker
+        .journal_dispatched(&intent)
+        .await
+        .expect("journal dispatched");
+}
+
+/// MUTATION CHECK (dogfood bug 4): make `EffectBroker::cancel` delegate to
+/// the ordinary close fallback (Unknown). Expected runtime failure: an
+/// orderly user cancellation records a crash window and the recovery card
+/// reopens for a turn the user deliberately ended.
+#[tokio::test]
+async fn an_orderly_cancel_terminalizes_a_residual_dispatch_as_cancelled() {
+    let journal = SharedJournal::default();
+    let mut broker = broker_at(journal.clone(), source_root(), 1);
+    dispatch_without_outcome(&mut broker).await;
+    let _ = broker.cancel().await;
+    let outcomes = residual_outcomes(&journal);
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, EffectOutcome::Cancelled)),
+        "the abandoned dispatch closes as Cancelled: {outcomes:?}"
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, EffectOutcome::Unknown)),
+        "an orderly cancel never records a crash window: {outcomes:?}"
+    );
+}
+
+/// The genuine-crash half stays intact: an ORDINARY close of the same
+/// residual dispatch still reconciles it as the Unknown crash window.
+#[tokio::test]
+async fn an_ordinary_close_still_reconciles_a_residual_dispatch_as_unknown() {
+    let journal = SharedJournal::default();
+    let mut broker = broker_at(journal.clone(), source_root(), 1);
+    dispatch_without_outcome(&mut broker).await;
+    let _ = broker.close().await;
+    let outcomes = residual_outcomes(&journal);
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, EffectOutcome::Unknown)),
+        "a non-cancel close keeps the crash-window classification: {outcomes:?}"
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, EffectOutcome::Cancelled)),
+        "no Cancelled is fabricated outside an orderly cancel: {outcomes:?}"
+    );
+}
