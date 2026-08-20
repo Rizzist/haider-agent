@@ -566,42 +566,39 @@ impl LiveDriver {
             self.input_mirror.binding = None;
             return Vec::new();
         };
-        let watch = self.input_mirror.binding.as_ref() != Some(&session);
-        if watch {
+        if self.input_mirror.binding.as_ref() != Some(&session) {
+            // rev934 P1-2: watch FIRST. A fresh binding adopts the surface
+            // from the ack before it may publish anything — the old
+            // publish-then-watch order deterministically wiped a foreign
+            // draft with an empty first publish.
             self.input_mirror.binding = Some(session.clone());
-        }
-
-        let text = model.composer.text();
-        let unchanged = self
-            .input_mirror
-            .sessions
-            .get(&session)
-            .and_then(|state| state.published_text.as_deref())
-            == Some(text);
-        let mut commands = Vec::with_capacity(2);
-        if !unchanged {
-            self.input_mirror.publish_revision =
-                self.input_mirror.publish_revision.saturating_add(1);
-            let revision = self.input_mirror.publish_revision;
             let state = self
                 .input_mirror
                 .sessions
                 .entry(session.clone())
                 .or_default();
-            state.published_text = Some(text.to_owned());
-            state.last_published_revision = Some(revision);
-            commands.push(LiveCommand::SurfacePublish {
-                session: session.clone(),
-                input: Some((text.to_owned(), revision)),
-                status: None,
-            });
+            state.adopting = true;
+            return vec![LiveCommand::SurfaceWatch { session }];
         }
-        if watch {
-            // Preserve the existing local publish edge, then establish the
-            // watch whose complete ack closes any subscription race.
-            commands.push(LiveCommand::SurfaceWatch { session });
+
+        let text = model.composer.text();
+        let state = self
+            .input_mirror
+            .sessions
+            .entry(session.clone())
+            .or_default();
+        if state.adopting || state.published_text.as_deref() == Some(text) {
+            return Vec::new();
         }
-        commands
+        self.input_mirror.publish_revision = self.input_mirror.publish_revision.saturating_add(1);
+        let revision = self.input_mirror.publish_revision;
+        state.published_text = Some(text.to_owned());
+        state.last_published_revision = Some(revision);
+        vec![LiveCommand::SurfacePublish {
+            session,
+            input: Some((text.to_owned(), revision)),
+            status: None,
+        }]
     }
 
     fn surface_watching(
@@ -613,8 +610,23 @@ impl LiveDriver {
         if self.input_mirror.binding.as_ref() != Some(&session) {
             return;
         }
-        if let Some(input) = input {
-            self.apply_surface_input(model, session, input);
+        let state = self
+            .input_mirror
+            .sessions
+            .entry(session.clone())
+            .or_default();
+        state.adopting = false;
+        match input {
+            Some(input) => self.apply_surface_input(model, session, input),
+            None => {
+                // Empty surface adopted. An empty composer seeds the publish
+                // baseline so a fresh binding never publishes "" (P1-2); a
+                // non-empty local stash genuinely differs post-adoption and
+                // may publish on the next pass.
+                if model.composer.text().is_empty() && state.published_text.is_none() {
+                    state.published_text = Some(String::new());
+                }
+            }
         }
     }
 
@@ -635,24 +647,35 @@ impl LiveDriver {
             return;
         }
         let state = self.input_mirror.sessions.entry(session).or_default();
-        if state
-            .last_published_revision
-            .is_some_and(|revision| input.revision <= revision)
-            || state
-                .last_remote_revision
-                .is_some_and(|revision| input.revision <= revision)
+        // Self-echo (P1-1): the daemon broadcasts every accepted publish to
+        // ALL watchers, publisher included, stamping the publisher's
+        // connection id as `owner`. Our own accepted publish arriving back —
+        // revision AND text both matching — names us; that learned identity
+        // is the discriminator, never cross-lane revision comparison.
+        if state.last_published_revision == Some(input.revision)
+            && state.published_text.as_deref() == Some(input.text.as_str())
         {
+            self.input_mirror.self_owner = Some(input.owner);
             return;
         }
-
-        // The wire owner is daemon-opaque; revision floors identify echoes.
-        self.input_mirror.publish_revision = self
-            .input_mirror
-            .publish_revision
-            .max(input.revision)
-            .saturating_add(1);
-        state.last_remote_revision = Some(input.revision);
+        if self.input_mirror.self_owner.as_deref() == Some(input.owner.as_str()) {
+            return;
+        }
+        // Foreign lane: revisions compare only within this owner. A fresh
+        // publisher's revision 1 outranks nothing of ours — it applies.
+        // Duplicate/stale frames within the SAME lane keep the floor.
+        let floor = state.foreign_floors.get(&input.owner).copied();
+        if floor.is_some_and(|floor| input.revision <= floor) {
+            return;
+        }
+        state.foreign_floors.insert(input.owner, input.revision);
+        // The mirror now equals the surface: block an immediate republish.
         state.published_text = Some(input.text.clone());
+        // rev934 P3-5: the same predicate that gates injected ops gates a
+        // remote replace — an in-progress modal answer is never overwritten.
+        if !model.accepts_injected_input() {
+            return;
+        }
         model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
     }
 }
@@ -1261,7 +1284,15 @@ impl Cold {
 struct InputMirrorSession {
     published_text: Option<String>,
     last_published_revision: Option<u64>,
-    last_remote_revision: Option<u64>,
+    /// Watch sent, ack pending: publishes hold until the surface snapshot is
+    /// adopted, so a fresh binding can never wipe a foreign draft with an
+    /// empty first publish (rev934 P1-2).
+    adopting: bool,
+    /// Per-owner applied floors. Daemon revision lanes are PER-CONNECTION
+    /// (session_hub keys `input_revisions` by connection id), so revisions
+    /// compare only within one owner — never against our own publish counter
+    /// (rev934 P1-1).
+    foreign_floors: HashMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -1269,6 +1300,12 @@ struct InputMirrorState {
     epoch: u64,
     binding: Option<SessionId>,
     publish_revision: u64,
+    /// Learned own daemon connection identity. The daemon mints connection
+    /// ids and never sends ours (Welcome carries none), so the only honest
+    /// self-discriminator is our own publish echoed back: a frame matching
+    /// our last accepted publish — revision AND text — names us. Re-learned
+    /// on every match; reset with the connection epoch.
+    self_owner: Option<String>,
     sessions: HashMap<SessionId, InputMirrorSession>,
 }
 
