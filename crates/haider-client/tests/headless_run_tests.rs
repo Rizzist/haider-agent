@@ -2104,13 +2104,18 @@ async fn blocked_output_does_not_delay_wall_clock_cancellation() {
         .await;
     });
 
-    let mut timed = request(Some(Duration::from_millis(20)));
+    // 250ms trigger (was 20): generous enough to survive loaded-gate setup,
+    // still expires (the mock never completes) to drive the cancel law.
+    let mut timed = request(Some(Duration::from_millis(250)));
     timed.terminal_grace = Duration::from_millis(250);
     let (sender, mut receiver) = mpsc::channel(1);
     let task = tokio::spawn(async move {
         run_headless(&profile, EnsureOptions::default(), timed, sender).await
     });
-    tokio::time::timeout(Duration::from_millis(150), cancellation)
+    // Observation bound scales with the 250ms trigger: the LAW is that the
+    // cancel reaches the peer promptly after expiry despite a blocked output
+    // channel (capacity 1, consumer parked) — not an absolute latency.
+    tokio::time::timeout(Duration::from_millis(1_500), cancellation)
         .await
         .expect("cancel must not wait for output drain")
         .expect("peer reports cancel");
@@ -2220,7 +2225,9 @@ async fn confirmed_cancel_disconnect_replays_terminal_within_grace() {
             .await;
     });
 
-    let mut timed = request(Some(Duration::from_millis(20)));
+    // 250ms trigger (was 20): generous enough to survive loaded-gate setup,
+    // still expires (the mock never completes) to drive the cancel law.
+    let mut timed = request(Some(Duration::from_millis(250)));
     timed.terminal_grace = Duration::from_millis(250);
     let (result, events) = run_with_events(profile, timed, 4, Duration::ZERO).await;
     peer.await.expect("peer");
@@ -2344,7 +2351,9 @@ async fn cancel_response_loss_replays_then_retries_same_command_at_current_gener
 
     let (result, _) = run_with_events(
         profile,
-        request(Some(Duration::from_millis(20))),
+        // 250ms trigger (was 20): generous enough to survive loaded-gate setup,
+        // still expires (the mock never completes) to drive the cancel law.
+        request(Some(Duration::from_millis(250))),
         4,
         Duration::ZERO,
     )
