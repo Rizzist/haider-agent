@@ -122,6 +122,10 @@ struct OpenMenu {
 pub(crate) struct StartupTurnRecovery {
     pub(crate) work: Vec<RecoveredWork>,
     pub(crate) touched_sessions: Vec<SessionId>,
+    /// The sealed boot journals already consumed by turn recovery. Hook
+    /// hydration reuses these prefixes and reads only recovery-appended
+    /// suffixes, avoiding a second cold scan.
+    pub(crate) journals: HashMap<SessionId, Vec<RawEnvelope>>,
 }
 
 pub(crate) async fn recover_interrupted_turns_report(
@@ -130,6 +134,7 @@ pub(crate) async fn recover_interrupted_turns_report(
 ) -> Result<StartupTurnRecovery, HaiderError> {
     let mut recovered = Vec::new();
     let mut touched_sessions = Vec::new();
+    let mut journals = HashMap::new();
     for session_id in store.session_ids().await? {
         let mut touched = false;
         let runnable_metadata = store.session_metadata(&session_id).await?.is_some();
@@ -141,9 +146,13 @@ pub(crate) async fn recover_interrupted_turns_report(
                 break;
             }
             cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-            for envelope in page {
-                reduce(&mut reductions, envelope);
+            for envelope in &page {
+                reduce(&mut reductions, envelope.clone());
             }
+            journals
+                .entry(session_id.clone())
+                .or_insert_with(Vec::new)
+                .extend(page);
         }
         let mut runs = reductions.into_iter().collect::<Vec<_>>();
         runs.sort_by_key(|(_, reduction)| {
@@ -348,6 +357,7 @@ pub(crate) async fn recover_interrupted_turns_report(
     Ok(StartupTurnRecovery {
         work: recovered,
         touched_sessions,
+        journals,
     })
 }
 

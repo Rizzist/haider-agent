@@ -615,6 +615,22 @@ pub fn decide_child_workflow(
     trigger: Option<ChildWorkflowTrigger>,
     workflow_author_requested: bool,
 ) -> ChildWorkflowDecision {
+    decide_child_workflow_with_registry(requested, trigger, workflow_author_requested, false)
+}
+
+/// Applies the child-workflow gate with an optional positive registry
+/// resolution for a [`ChildWorkflowSelector::WorkflowRef`]. The registry is
+/// deliberately consulted by the daemon before this pure decision: unknown
+/// names retain the historical bare-attempt fallback, while a registered Loom
+/// workflow follows the same explicit-trigger and workflow-author laws as the
+/// built-in child templates.
+#[must_use]
+pub fn decide_child_workflow_with_registry(
+    requested: Option<&ChildWorkflowSelector>,
+    trigger: Option<ChildWorkflowTrigger>,
+    workflow_author_requested: bool,
+    registered_workflow_ref: bool,
+) -> ChildWorkflowDecision {
     let requested = requested.cloned().unwrap_or(ChildWorkflowSelector::Plain);
     let (template, reason) = match (&requested, trigger) {
         (ChildWorkflowSelector::Plain, _) => (None, "default_bare_attempt"),
@@ -667,6 +683,9 @@ pub fn decide_child_workflow(
             ) =>
         {
             (None, "workflow_ref_trigger_mismatch")
+        }
+        (ChildWorkflowSelector::WorkflowRef(name), Some(_)) if registered_workflow_ref => {
+            (Some(name.clone()), "registered_loom_workflow_ref")
         }
         (ChildWorkflowSelector::WorkflowRef(_), Some(_)) => {
             (None, "workflow_ref_not_registered_child_template")
@@ -1037,7 +1056,7 @@ impl GraphRunSetStatus {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphReduction {
     pub status: Option<GraphStatus>,
     pub evidence: Vec<EvidenceRecorded>,
@@ -1063,7 +1082,7 @@ impl GraphReduction {
 
 /// Full session graph forest. Superseded instances remain queryable while the
 /// active-root pointer selects the instance used by legacy status callers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphReductions {
     pub active_root: Option<GraphId>,
     pub by_graph: HashMap<GraphId, GraphReduction>,
@@ -1072,7 +1091,7 @@ pub struct GraphReductions {
 }
 
 /// Coordinates retained from a durable `GraphAbandonConfirm` menu.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphFinalizationMenu {
     pub menu_id: MenuId,
     pub run_id: RunId,
@@ -1313,8 +1332,16 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
 pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
     let mut reductions = GraphReductions::default();
     for envelope in envelopes {
+        reductions.apply_envelope(envelope);
+    }
+    refresh_run_set_projections(&mut reductions);
+    reductions
+}
+
+impl GraphReductions {
+    fn apply_envelope(&mut self, envelope: &RawEnvelope) {
         let Some(payload) = graph_reduction_payload(&envelope.payload) else {
-            continue;
+            return;
         };
         match payload {
             EventPayload::GraphPinned(pinned) => {
@@ -1367,7 +1394,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     pending_menus: Vec::new(),
                     run_set: None,
                 };
-                reductions.by_graph.insert(
+                self.by_graph.insert(
                     graph_id.clone(),
                     GraphReduction {
                         status: Some(status),
@@ -1377,24 +1404,24 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                         template_nodes,
                     },
                 );
-                let attached_child = reductions.run_sets.values().any(|run_set| {
+                let attached_child = self.run_sets.values().any(|run_set| {
                     run_set
                         .children
                         .iter()
                         .any(|child| child.graph_id == graph_id)
                 });
                 if !attached_child {
-                    reductions.active_root = Some(graph_id);
+                    self.active_root = Some(graph_id);
                 }
             }
             EventPayload::GraphRunSetOpened(opened) => {
-                if reductions.run_sets.contains_key(&opened.run_set_id)
-                    || reductions.graph(&opened.root_graph_id).is_none()
+                if self.run_sets.contains_key(&opened.run_set_id)
+                    || self.graph(&opened.root_graph_id).is_none()
                 {
-                    continue;
+                    return;
                 }
-                reductions.active_run_set = Some(opened.run_set_id.clone());
-                reductions.run_sets.insert(
+                self.active_run_set = Some(opened.run_set_id.clone());
+                self.run_sets.insert(
                     opened.run_set_id.clone(),
                     GraphRunSetStatus {
                         run_set_id: opened.run_set_id,
@@ -1408,14 +1435,14 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 );
             }
             EventPayload::TodoGraphAttached(attached) => {
-                let child_graph_already_attached = reductions.run_sets.values().any(|candidate| {
+                let child_graph_already_attached = self.run_sets.values().any(|candidate| {
                     candidate
                         .children
                         .iter()
                         .any(|child| child.graph_id == attached.child_graph_id)
                 });
-                let Some(run_set) = reductions.run_sets.get_mut(&attached.run_set_id) else {
-                    continue;
+                let Some(run_set) = self.run_sets.get_mut(&attached.run_set_id) else {
+                    return;
                 };
                 if run_set.plan_item_id != attached.plan_item_id
                     || run_set.children.len()
@@ -1426,7 +1453,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                         .any(|child| child.todo_id == attached.todo_id)
                     || child_graph_already_attached
                 {
-                    continue;
+                    return;
                 }
                 run_set.children.push(TodoGraphStatus {
                     todo_id: attached.todo_id,
@@ -1442,15 +1469,15 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     .sort_by_key(|child| (child.ordinal, child.todo_id));
             }
             EventPayload::GraphAttemptOpened(opened) => {
-                let Some(reduction) = reductions.by_graph.get_mut(&opened.graph_id) else {
-                    continue;
+                let Some(reduction) = self.by_graph.get_mut(&opened.graph_id) else {
+                    return;
                 };
                 let template_nodes = reduction.template_nodes.clone();
                 let Some(status) = reduction.status_for_graph_mut(&opened.graph_id) else {
-                    continue;
+                    return;
                 };
                 if status.phase != GraphPhase::Active {
-                    continue;
+                    return;
                 }
                 status.attempt = opened.attempt;
                 let start_node = status.start_node.clone().unwrap_or_else(build_node);
@@ -1478,17 +1505,17 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 }
             }
             EventPayload::EvidenceRecorded(recorded) => {
-                let Some(reduction) = reductions.by_graph.get_mut(&recorded.graph_id) else {
-                    continue;
+                let Some(reduction) = self.by_graph.get_mut(&recorded.graph_id) else {
+                    return;
                 };
                 let Some(status) = reduction.status.as_mut() else {
-                    continue;
+                    return;
                 };
                 if status.phase != GraphPhase::Active
                     || !status.node_is_ready(&recorded.node)
                     || status.attempt != recorded.attempt
                 {
-                    continue;
+                    return;
                 }
                 // Computer observations are durable provenance attached to
                 // the active node, not gate testimony. A screenshot must
@@ -1551,12 +1578,12 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 reduction.evidence.push(recorded);
             }
             EventPayload::GraphGateSatisfied(satisfied) => {
-                let Some(reduction) = reductions.by_graph.get_mut(&satisfied.graph_id) else {
-                    continue;
+                let Some(reduction) = self.by_graph.get_mut(&satisfied.graph_id) else {
+                    return;
                 };
                 let template_nodes = reduction.template_nodes.clone();
                 let Some(status) = reduction.status_for_graph_mut(&satisfied.graph_id) else {
-                    continue;
+                    return;
                 };
                 if let Some(node) = status.node_mut(&satisfied.node) {
                     node.satisfied = true;
@@ -1567,7 +1594,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 }
             }
             EventPayload::GraphAdvanced(advanced) => {
-                if let Some(status) = reductions
+                if let Some(status) = self
                     .by_graph
                     .get_mut(&advanced.graph_id)
                     .and_then(|reduction| reduction.status_for_graph_mut(&advanced.graph_id))
@@ -1577,19 +1604,19 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 }
             }
             EventPayload::GraphNodeReadied(readied) => {
-                let Some(reduction) = reductions.by_graph.get_mut(&readied.graph_id) else {
-                    continue;
+                let Some(reduction) = self.by_graph.get_mut(&readied.graph_id) else {
+                    return;
                 };
                 let template_nodes = reduction.template_nodes.clone();
                 let Some(status) = reduction.status_for_graph_mut(&readied.graph_id) else {
-                    continue;
+                    return;
                 };
                 if status.phase == GraphPhase::Active && status.attempt == readied.attempt {
                     push_ready_in_template_order(status, &template_nodes, readied.node);
                 }
             }
             EventPayload::GraphBlocked(blocked) => {
-                if let Some(status) = reductions
+                if let Some(status) = self
                     .by_graph
                     .get_mut(&blocked.graph_id)
                     .and_then(|reduction| reduction.status_for_graph_mut(&blocked.graph_id))
@@ -1603,7 +1630,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 }
             }
             EventPayload::GraphCompleted(completed) => {
-                if let Some(status) = reductions
+                if let Some(status) = self
                     .by_graph
                     .get_mut(&completed.graph_id)
                     .and_then(|reduction| reduction.status_for_graph_mut(&completed.graph_id))
@@ -1618,7 +1645,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 }
             }
             EventPayload::GraphAbandoned(abandoned) => {
-                if let Some(status) = reductions
+                if let Some(status) = self
                     .by_graph
                     .get_mut(&abandoned.graph_id)
                     .and_then(|reduction| reduction.status_for_graph_mut(&abandoned.graph_id))
@@ -1630,7 +1657,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 }
             }
             EventPayload::GraphFinalizationDeferred(deferred) => {
-                if let Some(reduction) = reductions.by_graph.get_mut(&deferred.graph_id)
+                if let Some(reduction) = self.by_graph.get_mut(&deferred.graph_id)
                     && !reduction.finalization_deferrals.iter().any(|prior| {
                         prior.run_id == deferred.run_id
                             && prior.state_digest == deferred.state_digest
@@ -1640,7 +1667,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                 }
             }
             EventPayload::GraphSuperseded(superseded) => {
-                if let Some(status) = reductions
+                if let Some(status) = self
                     .by_graph
                     .get_mut(&superseded.old)
                     .and_then(|reduction| reduction.status_for_graph_mut(&superseded.old))
@@ -1651,14 +1678,14 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     status.pending_menu = None;
                     status.pending_menus.clear();
                 }
-                let child_supersession = reductions.run_sets.values().any(|run_set| {
+                let child_supersession = self.run_sets.values().any(|run_set| {
                     run_set
                         .children
                         .iter()
                         .any(|child| child.graph_id == superseded.old)
                 });
                 if !child_supersession {
-                    reductions.active_root = Some(superseded.new);
+                    self.active_root = Some(superseded.new);
                 }
             }
             EventPayload::MenuOpened(menu) => {
@@ -1672,7 +1699,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     _ => None,
                 };
                 if let Some(graph_id) = graph_id
-                    && let Some(status) = reductions
+                    && let Some(status) = self
                         .by_graph
                         .get_mut(graph_id)
                         .and_then(|reduction| reduction.status_for_graph_mut(graph_id))
@@ -1689,7 +1716,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
                     run_id,
                     state_digest,
                 } = menu.kind
-                    && let Some(reduction) = reductions.by_graph.get_mut(&graph_id)
+                    && let Some(reduction) = self.by_graph.get_mut(&graph_id)
                 {
                     reduction.finalization_menus.push(GraphFinalizationMenu {
                         menu_id: menu.id,
@@ -1700,7 +1727,7 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
             }
             EventPayload::MenuAnswered(crate::menu::MenuAnswer { menu, .. })
             | EventPayload::MenuClosed { menu, .. } => {
-                for reduction in reductions.by_graph.values_mut() {
+                for reduction in self.by_graph.values_mut() {
                     if let Some(status) = reduction.status.as_mut() {
                         status.pending_menus.retain(|pending| pending != &menu);
                         if status.pending_menu.as_ref() == Some(&menu) {
@@ -1712,8 +1739,6 @@ pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
             _ => {}
         }
     }
-    refresh_run_set_projections(&mut reductions);
-    reductions
 }
 
 fn refresh_run_set_projections(reductions: &mut GraphReductions) {
@@ -1798,7 +1823,7 @@ fn refresh_current_node(status: &mut GraphStatus, template_nodes: &[GraphNodeSpe
     status.current_node = status.ready_nodes.first().cloned();
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelemetryAttempt {
     node: GraphNodeName,
     attempt: u32,
@@ -1807,7 +1832,7 @@ struct TelemetryAttempt {
     outcome: GraphNodeAttemptOutcome,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelemetryRun {
     session_id: SessionId,
     graph_id: GraphId,
@@ -1825,7 +1850,7 @@ struct TelemetryRun {
     override_count: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelemetryRunSet {
     session_id: SessionId,
     run_set_id: GraphRunSetId,
@@ -1863,24 +1888,35 @@ impl TelemetryRun {
     }
 }
 
-/// Rebuilds graph adoption telemetry solely from committed journal facts.
-/// The same function is used for incremental cache refresh and store reopen.
-#[must_use]
-pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjection {
-    let mut runs = HashMap::<(SessionId, GraphId), TelemetryRun>::new();
-    let mut guard_menus = HashMap::<(SessionId, MenuId), (GraphId, RunId)>::new();
-    let mut run_sets = HashMap::<(SessionId, GraphRunSetId), TelemetryRunSet>::new();
-    let mut todo_attachments = HashMap::<(SessionId, GraphId), TodoGraphAttached>::new();
+/// Durable continuation of the exact from-scratch telemetry fold. Persisted
+/// instances are an optimization only: replaying the indexed journal through
+/// [`Self::apply`] reconstructs byte-identical state and projection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphTelemetryAccumulator {
+    runs: HashMap<(SessionId, GraphId), TelemetryRun>,
+    guard_menus: HashMap<(SessionId, MenuId), (GraphId, RunId)>,
+    run_sets: HashMap<(SessionId, GraphRunSetId), TelemetryRunSet>,
+    todo_attachments: HashMap<(SessionId, GraphId), TodoGraphAttached>,
+    reductions_by_session: HashMap<SessionId, GraphReductions>,
+    tool_selection: ToolSelectionAccumulator,
+}
 
-    for envelope in envelopes {
+impl GraphTelemetryAccumulator {
+    /// Folds one committed envelope in journal order.
+    pub fn apply(&mut self, envelope: &RawEnvelope) {
+        self.reductions_by_session
+            .entry(envelope.session_id.clone())
+            .or_default()
+            .apply_envelope(envelope);
+        self.tool_selection.apply(envelope);
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
-            continue;
+            return;
         };
         let session_id = envelope.session_id.clone();
         let at_ms = envelope.committed_at_ms;
         match payload {
             EventPayload::GraphRunSetOpened(opened) => {
-                run_sets
+                self.run_sets
                     .entry((session_id.clone(), opened.run_set_id.clone()))
                     .or_insert(TelemetryRunSet {
                         session_id,
@@ -1892,13 +1928,13 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
                     });
             }
             EventPayload::TodoGraphAttached(attached) => {
-                todo_attachments
+                self.todo_attachments
                     .entry((session_id, attached.child_graph_id.clone()))
                     .or_insert(attached);
             }
             EventPayload::GraphPinned(pinned) => {
                 let key = (session_id.clone(), pinned.graph_id.clone());
-                runs.entry(key).or_insert_with(|| TelemetryRun {
+                self.runs.entry(key).or_insert_with(|| TelemetryRun {
                     session_id,
                     graph_id: pinned.graph_id,
                     template: pinned.template,
@@ -1916,7 +1952,7 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
                 });
             }
             EventPayload::GraphAttemptOpened(opened) => {
-                if let Some(run) = runs.get_mut(&(session_id, opened.graph_id.clone())) {
+                if let Some(run) = self.runs.get_mut(&(session_id, opened.graph_id.clone())) {
                     let is_new_epoch = run
                         .start_node
                         .as_ref()
@@ -1940,7 +1976,7 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
                 }
             }
             EventPayload::GraphGateSatisfied(satisfied) => {
-                if let Some(run) = runs.get_mut(&(session_id, satisfied.graph_id.clone())) {
+                if let Some(run) = self.runs.get_mut(&(session_id, satisfied.graph_id.clone())) {
                     run.close_attempt(
                         &satisfied.node,
                         satisfied.attempt,
@@ -1950,34 +1986,34 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
                 }
             }
             EventPayload::GraphBlocked(blocked) => {
-                if let Some(run) = runs.get_mut(&(session_id, blocked.graph_id.clone())) {
+                if let Some(run) = self.runs.get_mut(&(session_id, blocked.graph_id.clone())) {
                     run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Blocked);
                     run.phase = GraphPhase::Blocked;
                 }
             }
             EventPayload::GraphCompleted(completed) => {
-                if let Some(run) = runs.get_mut(&(session_id, completed.graph_id.clone())) {
+                if let Some(run) = self.runs.get_mut(&(session_id, completed.graph_id.clone())) {
                     run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Completed);
                     run.phase = GraphPhase::Completed;
                     run.terminal_at_ms = Some(at_ms);
                 }
             }
             EventPayload::GraphAbandoned(abandoned) => {
-                if let Some(run) = runs.get_mut(&(session_id, abandoned.graph_id.clone())) {
+                if let Some(run) = self.runs.get_mut(&(session_id, abandoned.graph_id.clone())) {
                     run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Abandoned);
                     run.phase = GraphPhase::Abandoned;
                     run.terminal_at_ms = Some(at_ms);
                 }
             }
             EventPayload::GraphSuperseded(superseded) => {
-                if let Some(run) = runs.get_mut(&(session_id, superseded.old.clone())) {
+                if let Some(run) = self.runs.get_mut(&(session_id, superseded.old.clone())) {
                     run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Superseded);
                     run.phase = GraphPhase::Superseded;
                     run.terminal_at_ms = Some(at_ms);
                 }
             }
             EventPayload::GraphFinalizationDeferred(deferred) => {
-                if let Some(run) = runs.get_mut(&(session_id, deferred.graph_id.clone())) {
+                if let Some(run) = self.runs.get_mut(&(session_id, deferred.graph_id.clone())) {
                     run.last_observed_at_ms = run.last_observed_at_ms.max(at_ms);
                     run.mis_gate_count = run.mis_gate_count.saturating_add(1);
                 }
@@ -1987,15 +2023,18 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
                     graph_id, run_id, ..
                 } = menu.kind
                 {
-                    guard_menus.insert((session_id, menu.id), (graph_id, run_id));
+                    self.guard_menus
+                        .insert((session_id, menu.id), (graph_id, run_id));
                 }
             }
             EventPayload::MenuAnswered(answer)
                 if answer.option_key.as_deref() == Some("abandon-and-finish") =>
             {
-                if let Some((graph_id, _)) =
-                    guard_menus.get(&(session_id.clone(), answer.menu)).cloned()
-                    && let Some(run) = runs.get_mut(&(session_id, graph_id))
+                if let Some((graph_id, _)) = self
+                    .guard_menus
+                    .get(&(session_id.clone(), answer.menu))
+                    .cloned()
+                    && let Some(run) = self.runs.get_mut(&(session_id, graph_id))
                 {
                     run.override_count = run.override_count.saturating_add(1);
                     run.last_observed_at_ms = run.last_observed_at_ms.max(at_ms);
@@ -2004,6 +2043,29 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
             _ => {}
         }
     }
+
+    /// Materializes the public rows from the continuation state.
+    #[must_use]
+    pub fn projection(&self) -> GraphTelemetryProjection {
+        graph_telemetry_projection(self)
+    }
+}
+
+/// Rebuilds graph adoption telemetry solely from committed journal facts.
+/// The same fold drives incremental cache refresh and store reopen.
+#[must_use]
+pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjection {
+    let mut accumulator = GraphTelemetryAccumulator::default();
+    for envelope in envelopes {
+        accumulator.apply(envelope);
+    }
+    accumulator.projection()
+}
+
+fn graph_telemetry_projection(accumulator: &GraphTelemetryAccumulator) -> GraphTelemetryProjection {
+    let runs = &accumulator.runs;
+    let run_sets = &accumulator.run_sets;
+    let todo_attachments = &accumulator.todo_attachments;
 
     let mut graph_runs = Vec::with_capacity(runs.len());
     let mut graph_node_attempts = Vec::new();
@@ -2060,20 +2122,14 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
         });
     }
 
-    let reductions_by_session = envelopes
+    let reductions_by_session = accumulator
+        .reductions_by_session
         .iter()
-        .fold(
-            HashMap::<SessionId, Vec<RawEnvelope>>::new(),
-            |mut by_session, envelope| {
-                by_session
-                    .entry(envelope.session_id.clone())
-                    .or_default()
-                    .push(envelope.clone());
-                by_session
-            },
-        )
-        .into_iter()
-        .map(|(session_id, session_envelopes)| (session_id, reduce_graphs(&session_envelopes)))
+        .map(|(session_id, reductions)| {
+            let mut reductions = reductions.clone();
+            refresh_run_set_projections(&mut reductions);
+            (session_id.clone(), reductions)
+        })
         .collect::<HashMap<_, _>>();
     for run_set in run_sets.values() {
         let child_rows = graph_runs
@@ -2184,7 +2240,7 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
             .then_with(|| left.node.cmp(&right.node))
     });
     let graph_template_rollups = graph_template_rollups(&graph_runs, &graph_node_attempts);
-    let tool_selection = reduce_tool_selection(envelopes);
+    let tool_selection = accumulator.tool_selection.projection();
     GraphTelemetryProjection {
         graph_runs,
         graph_node_attempts,
@@ -2193,14 +2249,14 @@ pub fn reduce_graph_telemetry(envelopes: &[RawEnvelope]) -> GraphTelemetryProjec
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct ToolCallLane {
     branch_id: Option<BranchId>,
     run_id: Option<RunId>,
     agent_id: Option<AgentId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolCallTelemetry {
     lane: ToolCallLane,
     call_id: String,
@@ -2209,26 +2265,36 @@ struct ToolCallTelemetry {
     started_seq: u64,
     completed_seq: Option<u64>,
     result_status: Option<crate::tool::ToolResultStatus>,
+    candidate_assigned: bool,
+    #[serde(default)]
+    waiting_for_candidate: bool,
+    redundant: bool,
 }
 
-/// Rebuilds the session-local tool-selection rollup from durable call/result
-/// facts. A call is conservatively classified as redundant only when it ends
-/// in a typed `Rejected`/`Conflict`, then the first call started after its
-/// completed item in the same lane retries the same tool with different final
-/// arguments. The rejected original is counted, never the repair.
-#[must_use]
-pub fn reduce_tool_selection(envelopes: &[RawEnvelope]) -> Vec<ToolSelectionRow> {
-    let mut calls = Vec::<ToolCallTelemetry>::new();
-    let mut positions = HashMap::<(ToolCallLane, String), usize>::new();
+/// Durable continuation state for the tool-selection projection. The
+/// from-scratch reducer below drives this same fold, so serialized hot-state
+/// continuation and journal replay cannot acquire separate semantics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolSelectionAccumulator {
+    calls: Vec<ToolCallTelemetry>,
+    positions: HashMap<(ToolCallLane, String), usize>,
+    #[serde(default)]
+    lane_calls: HashMap<ToolCallLane, Vec<usize>>,
+    #[serde(default)]
+    pending_repairs: HashMap<ToolCallLane, Vec<usize>>,
+    repair_for: HashMap<usize, Vec<usize>>,
+    rollups: BTreeMap<String, (u64, u64, u64)>,
+}
 
-    for envelope in envelopes {
+impl ToolSelectionAccumulator {
+    pub fn apply(&mut self, envelope: &RawEnvelope) {
         let lane = ToolCallLane {
             branch_id: envelope.branch_id.clone(),
             run_id: envelope.run_id.clone(),
             agent_id: envelope.agent_id.clone(),
         };
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
-            continue;
+            return;
         };
         match payload {
             EventPayload::Item(crate::item::ItemEvent::Started {
@@ -2241,20 +2307,7 @@ pub fn reduce_tool_selection(envelopes: &[RawEnvelope]) -> Vec<ToolSelectionRow>
                     },
                 ..
             }) => {
-                let key = (lane.clone(), call_id.clone());
-                if positions.contains_key(&key) {
-                    continue;
-                }
-                positions.insert(key, calls.len());
-                calls.push(ToolCallTelemetry {
-                    lane,
-                    call_id,
-                    tool_name: name,
-                    args,
-                    started_seq: envelope.seq,
-                    completed_seq: None,
-                    result_status: None,
-                });
+                self.insert_call(lane, call_id, name, args, envelope.seq, None);
             }
             EventPayload::Item(crate::item::ItemEvent::Completed {
                 item:
@@ -2267,98 +2320,220 @@ pub fn reduce_tool_selection(envelopes: &[RawEnvelope]) -> Vec<ToolSelectionRow>
                 ..
             }) => {
                 let key = (lane.clone(), call_id.clone());
-                if let Some(index) = positions.get(&key).copied() {
-                    let call = &mut calls[index];
-                    call.tool_name = name;
-                    call.args = args;
-                    call.completed_seq = Some(envelope.seq);
-                } else {
-                    positions.insert(key, calls.len());
-                    calls.push(ToolCallTelemetry {
+                let index = self.positions.get(&key).copied().unwrap_or_else(|| {
+                    self.insert_call(
                         lane,
                         call_id,
-                        tool_name: name,
-                        args,
-                        started_seq: envelope.seq,
-                        completed_seq: Some(envelope.seq),
-                        result_status: None,
-                    });
-                }
+                        name.clone(),
+                        args.clone(),
+                        envelope.seq,
+                        Some(envelope.seq),
+                    )
+                });
+                self.complete_call(index, name, args, envelope.seq);
             }
             EventPayload::ToolResult { call_id, result } => {
-                if let Some(index) = positions.get(&(lane, call_id)).copied()
-                    && calls[index].result_status.is_none()
+                if let Some(index) = self.positions.get(&(lane, call_id)).copied()
+                    && self.calls[index].result_status.is_none()
                 {
-                    calls[index].result_status = Some(result.status);
+                    self.calls[index].result_status = Some(result.status);
+                    if !result.status.is_completed() {
+                        let row = self
+                            .rollups
+                            .entry(self.calls[index].tool_name.clone())
+                            .or_default();
+                        row.1 = row.1.saturating_add(1);
+                    }
+                    self.assign_repair_candidate(index);
                 }
             }
             _ => {}
         }
     }
 
-    calls.sort_by_key(|call| call.started_seq);
-    let mut redundant = HashSet::<(ToolCallLane, String)>::new();
-    for (index, call) in calls.iter().enumerate() {
-        if !matches!(
-            call.result_status,
-            Some(crate::tool::ToolResultStatus::Rejected | crate::tool::ToolResultStatus::Conflict)
-        ) {
-            continue;
+    fn insert_call(
+        &mut self,
+        lane: ToolCallLane,
+        call_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        started_seq: u64,
+        completed_seq: Option<u64>,
+    ) -> usize {
+        let key = (lane.clone(), call_id.clone());
+        if let Some(index) = self.positions.get(&key).copied() {
+            return index;
         }
-        let Some(completed_seq) = call.completed_seq else {
-            continue;
-        };
-        let repair = calls[index + 1..]
-            .iter()
-            .find(|candidate| candidate.lane == call.lane && candidate.started_seq > completed_seq);
-        if repair.is_some_and(|candidate| {
-            candidate.tool_name == call.tool_name
-                && candidate.completed_seq.is_some()
-                && candidate.args != call.args
-        }) {
-            redundant.insert((call.lane.clone(), call.call_id.clone()));
+        let index = self.calls.len();
+        self.positions.insert(key, index);
+        self.lane_calls.entry(lane.clone()).or_default().push(index);
+        self.calls.push(ToolCallTelemetry {
+            lane,
+            call_id,
+            tool_name: tool_name.clone(),
+            args,
+            started_seq,
+            completed_seq,
+            result_status: None,
+            candidate_assigned: false,
+            waiting_for_candidate: false,
+            redundant: false,
+        });
+        let row = self.rollups.entry(tool_name).or_default();
+        row.0 = row.0.saturating_add(1);
+        self.attach_as_first_repair(index);
+        index
+    }
+
+    fn complete_call(
+        &mut self,
+        index: usize,
+        tool_name: String,
+        args: serde_json::Value,
+        completed_seq: u64,
+    ) {
+        let previous_name = self.calls[index].tool_name.clone();
+        if previous_name != tool_name {
+            let error = self.calls[index]
+                .result_status
+                .is_some_and(|status| !status.is_completed());
+            let redundant = self.calls[index].redundant;
+            if let Some(row) = self.rollups.get_mut(&previous_name) {
+                row.0 = row.0.saturating_sub(1);
+                row.1 = row.1.saturating_sub(u64::from(error));
+                row.2 = row.2.saturating_sub(u64::from(redundant));
+            }
+            let row = self.rollups.entry(tool_name.clone()).or_default();
+            row.0 = row.0.saturating_add(1);
+            row.1 = row.1.saturating_add(u64::from(error));
+            row.2 = row.2.saturating_add(u64::from(redundant));
+        }
+        self.calls[index].tool_name = tool_name;
+        self.calls[index].args = args;
+        self.calls[index].completed_seq = Some(completed_seq);
+        self.evaluate_repair(index);
+        self.assign_repair_candidate(index);
+    }
+
+    fn rejected(&self, index: usize) -> bool {
+        matches!(
+            self.calls[index].result_status,
+            Some(crate::tool::ToolResultStatus::Rejected | crate::tool::ToolResultStatus::Conflict)
+        ) && self.calls[index].completed_seq.is_some()
+    }
+
+    fn assign_repair_candidate(&mut self, original: usize) {
+        if !self.rejected(original) || self.calls[original].candidate_assigned {
+            return;
+        }
+        let completed_seq = self.calls[original].completed_seq.unwrap_or(u64::MAX);
+        let lane = self.calls[original].lane.clone();
+        let candidate = self.lane_calls.get(&lane).and_then(|calls| {
+            let position =
+                calls.partition_point(|index| self.calls[*index].started_seq <= completed_seq);
+            calls.get(position).copied()
+        });
+        if let Some(candidate) = candidate {
+            self.calls[original].candidate_assigned = true;
+            self.calls[original].waiting_for_candidate = false;
+            self.repair_for.entry(candidate).or_default().push(original);
+            self.evaluate_repair(candidate);
+        } else if !self.calls[original].waiting_for_candidate {
+            self.calls[original].waiting_for_candidate = true;
+            self.pending_repairs.entry(lane).or_default().push(original);
         }
     }
 
-    let mut rollups = BTreeMap::<String, (u64, u64, u64)>::new();
-    for call in calls {
-        let row = rollups.entry(call.tool_name).or_default();
-        row.0 = row.0.saturating_add(1);
-        if call
-            .result_status
-            .is_some_and(|status| !status.is_completed())
-        {
-            row.1 = row.1.saturating_add(1);
+    fn attach_as_first_repair(&mut self, candidate: usize) {
+        let lane = self.calls[candidate].lane.clone();
+        let started_seq = self.calls[candidate].started_seq;
+        let Some(originals) = self.pending_repairs.remove(&lane) else {
+            return;
+        };
+        let mut waiting = Vec::new();
+        for original in originals {
+            if self.calls[original]
+                .completed_seq
+                .is_some_and(|seq| started_seq > seq)
+            {
+                self.calls[original].candidate_assigned = true;
+                self.calls[original].waiting_for_candidate = false;
+                self.repair_for.entry(candidate).or_default().push(original);
+            } else {
+                waiting.push(original);
+            }
         }
-        if redundant.contains(&(call.lane, call.call_id)) {
-            row.2 = row.2.saturating_add(1);
+        if !waiting.is_empty() {
+            self.pending_repairs.insert(lane, waiting);
         }
     }
-    let mut rows = rollups
-        .into_iter()
-        .map(
-            |(tool_name, (total_calls, error_count, redundant_call_count))| {
-                let rate = error_count
-                    .saturating_mul(10_000)
-                    .checked_div(total_calls)
-                    .unwrap_or(0);
-                ToolSelectionRow {
-                    tool_name,
-                    total_calls,
-                    error_count,
-                    error_rate_basis_points: u32::try_from(rate).unwrap_or(u32::MAX),
-                    redundant_call_count,
-                }
-            },
-        )
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .total_calls
-            .cmp(&left.total_calls)
-            .then_with(|| left.tool_name.cmp(&right.tool_name))
-    });
-    rows
+
+    fn evaluate_repair(&mut self, candidate: usize) {
+        let Some(originals) = self.repair_for.get(&candidate).cloned() else {
+            return;
+        };
+        if self.calls[candidate].completed_seq.is_none() {
+            return;
+        }
+        for original in originals {
+            if !self.calls[original].redundant
+                && self.calls[candidate].tool_name == self.calls[original].tool_name
+                && self.calls[candidate].args != self.calls[original].args
+            {
+                self.calls[original].redundant = true;
+                let row = self
+                    .rollups
+                    .entry(self.calls[original].tool_name.clone())
+                    .or_default();
+                row.2 = row.2.saturating_add(1);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> Vec<ToolSelectionRow> {
+        let mut rows = self
+            .rollups
+            .iter()
+            .filter(|(_, (total, _, _))| *total > 0)
+            .map(
+                |(tool_name, (total_calls, error_count, redundant_call_count))| {
+                    let rate = error_count
+                        .saturating_mul(10_000)
+                        .checked_div(*total_calls)
+                        .unwrap_or(0);
+                    ToolSelectionRow {
+                        tool_name: tool_name.clone(),
+                        total_calls: *total_calls,
+                        error_count: *error_count,
+                        error_rate_basis_points: u32::try_from(rate).unwrap_or(u32::MAX),
+                        redundant_call_count: *redundant_call_count,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .total_calls
+                .cmp(&left.total_calls)
+                .then_with(|| left.tool_name.cmp(&right.tool_name))
+        });
+        rows
+    }
+}
+
+/// Rebuilds the session-local tool-selection rollup from durable call/result
+/// facts. A call is conservatively classified as redundant only when it ends
+/// in a typed `Rejected`/`Conflict`, then the first call started after its
+/// completed item in the same lane retries the same tool with different final
+/// arguments. The rejected original is counted, never the repair.
+#[must_use]
+pub fn reduce_tool_selection(envelopes: &[RawEnvelope]) -> Vec<ToolSelectionRow> {
+    let mut accumulator = ToolSelectionAccumulator::default();
+    for envelope in envelopes {
+        accumulator.apply(envelope);
+    }
+    accumulator.projection()
 }
 
 fn graph_critical_path_ms(specs: &[GraphNodeSpec], attempts: &[GraphNodeAttemptRow]) -> u64 {
@@ -4056,5 +4231,40 @@ mod tests {
         let reduced = reduce_graphs(&facts);
         assert!(reduced.graph(&parent).is_some());
         assert!(reduced.graph(&child).is_none());
+    }
+
+    /// Loom child-workflow gap (935): a registered loom workflow id resolves
+    /// as a child template ONLY when a trigger is present AND the registry
+    /// confirms it (`registered_workflow_ref`); otherwise it stays an honest
+    /// bare attempt with a named reason — never a silent unauthorized run.
+    ///
+    /// MUTATION CHECK: resolve a WorkflowRef without the registry gate (drop
+    /// the `registered_workflow_ref` guard). Expected failure: an
+    /// unregistered ref resolves to a template instead of bare-attempt.
+    #[test]
+    fn registered_loom_workflow_ref_resolves_only_with_registry_and_trigger() {
+        let sel = ChildWorkflowSelector::WorkflowRef("my-loom-flow".into());
+        // Registered + trigger present → resolves to the named template.
+        let d = decide_child_workflow_with_registry(
+            Some(&sel),
+            Some(ChildWorkflowTrigger::DependentPhases),
+            false,
+            true,
+        );
+        assert_eq!(d.template.as_deref(), Some("my-loom-flow"));
+        assert_eq!(d.reason, "registered_loom_workflow_ref");
+        // NOT registered → honest bare attempt, never a silent run.
+        let d = decide_child_workflow_with_registry(
+            Some(&sel),
+            Some(ChildWorkflowTrigger::DependentPhases),
+            false,
+            false,
+        );
+        assert_eq!(d.template, None);
+        assert_eq!(d.reason, "workflow_ref_not_registered_child_template");
+        // No trigger → refused regardless of registration.
+        let d = decide_child_workflow_with_registry(Some(&sel), None, false, true);
+        assert_eq!(d.template, None);
+        assert_eq!(d.reason, "missing_workflow_trigger");
     }
 }

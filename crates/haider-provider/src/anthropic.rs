@@ -164,6 +164,8 @@ fn build_anthropic_client(
         .retry(match transport.retry_policy {
             AnthropicRetryPolicy::Never => reqwest::retry::never(),
         })
+        .pool_idle_timeout(crate::PROVIDER_POOL_IDLE_TIMEOUT)
+        .http2_adaptive_window(true)
         .connect_timeout(transport.connect_timeout);
     if let Some(guard) = fixed_origin_guard {
         client = client.dns_resolver(guard);
@@ -754,7 +756,10 @@ impl AnthropicProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let payload = self.request_payload(request)?;
+        let payload = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared.payload,
+            None => self.request_payload(request)?,
+        };
         let request = self.request(&payload).await?;
         let opening = self.client.execute(request);
         tokio::time::timeout(Self::transport_config().response_open_timeout, opening)
@@ -794,23 +799,33 @@ impl Provider for AnthropicProvider {
         &self,
         request: &TurnRequest,
     ) -> Option<haider_protocol::provider::PrefixDigests> {
+        self.prepare_turn(request)
+            .map(|prepared| prepared.prefix_digests)
+    }
+
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.stable_history_end;
         let full_payload = self.request_payload(request).ok()?;
-        let mut stable_request = request.clone();
-        stable_request.messages.truncate(boundary);
-        if let Some(metadata) = &mut stable_request.cache_metadata {
-            metadata.stable_history_end = boundary;
-            metadata.current_user_start = boundary;
-        }
-        let stable_payload = self.request_payload(&stable_request).ok()?;
-        crate::rendered_prefix_digests(
+        let immutable_history =
+            crate::rendered_array_prefix_digest(&full_payload, "messages", boundary)?;
+        let prefix_digests = crate::rendered_prefix_digests(
             request,
             &full_payload,
-            &stable_payload,
+            immutable_history,
             "system",
             "tools",
-            "messages",
-        )
+        )?;
+        Some(crate::PreparedTurn {
+            prefix_digests,
+            wire: Some(crate::PreparedWire {
+                payload: full_payload,
+                history_boundary: None,
+            }),
+        })
+    }
+
+    async fn prewarm(&self) {
+        crate::optional_http_prewarm(&self.client, &self.api_url).await;
     }
 
     async fn capabilities(&self) -> CapabilityDoc {

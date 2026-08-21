@@ -41,7 +41,7 @@ use hooks_server::{HookServerRegistry, ServerReply};
 use rustix::fd::OwnedFd;
 #[cfg(unix)]
 use rustix::fs::{FileType, Mode, OFlags};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -242,11 +242,20 @@ impl HookDefinition {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Discovery {
     hooks: BTreeMap<String, HookDefinition>,
     notices: Vec<HookNotice>,
     policy: HookTrustPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveryStamp(Vec<(PathBuf, Option<(u64, u128)>)>);
+
+#[derive(Debug, Clone)]
+struct CachedDiscovery {
+    stamp: DiscoveryStamp,
+    discovery: Discovery,
 }
 
 #[derive(Clone)]
@@ -272,6 +281,9 @@ struct HookServiceInner {
     /// This is the authority for revoked-by-edit classification; clients do
     /// not infer it by comparing snapshots.
     observed_trusted: Mutex<HashMap<String, String>>,
+    /// Canonical workspace → mtime-keyed discovery result. Decision hooks
+    /// deliberately bypass this cache again immediately before execution.
+    discovery_cache: Mutex<HashMap<PathBuf, CachedDiscovery>>,
     next_event: AtomicU64,
 }
 
@@ -302,12 +314,19 @@ impl HookService {
         }
     }
 
+    pub(crate) fn session_deleted(&self, session_id: SessionId) {
+        let _ = self
+            .inner
+            .committed
+            .send(EngineMessage::SessionDeleted(session_id));
+    }
+
     pub(crate) async fn list(
         &self,
         cwd: PathBuf,
     ) -> Result<(HookTrustPolicy, u64, Vec<HookSummaryWire>), String> {
         let workspace_cwd = cwd.clone();
-        let discovery = discover_async(cwd, self.inner.profile_root.clone()).await?;
+        let discovery = discover_cached_async(self, cwd).await?;
         self.prepare_workspace_trust(&discovery).await;
         let current_servers = discovery
             .hooks
@@ -641,10 +660,20 @@ pub(crate) struct HookEngine {
 }
 
 impl HookEngine {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn start(
         profile_root: PathBuf,
         store: haider_core::SqliteStoreHandle,
         hub: SessionHub,
+    ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
+        Self::start_with_boot_journals(profile_root, store, hub, None).await
+    }
+
+    pub(crate) async fn start_with_boot_journals(
+        profile_root: PathBuf,
+        store: haider_core::SqliteStoreHandle,
+        hub: SessionHub,
+        boot_journals: Option<&HashMap<SessionId, Vec<RawEnvelope>>>,
     ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
         let changes = store.hook_trust_changes().await?;
         let mut pins = HashSet::new();
@@ -673,10 +702,14 @@ impl HookEngine {
                 pins: RwLock::new(pins),
                 workspace_baselines: Mutex::new(workspace_baselines),
                 observed_trusted: Mutex::new(observed_trusted),
+                discovery_cache: Mutex::new(HashMap::new()),
                 next_event: AtomicU64::new(0),
             }),
         };
-        let state = hydrate_engine_state(&service.inner.store).await?;
+        let state = hydrate_engine_state(&service.inner.store, boot_journals).await?;
+        if let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await {
+            tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed; journal rebuild remains authoritative");
+        }
         let manager_service = service.clone();
         let task = tokio::spawn(run_engine(receiver, manager_service, state));
         Ok((
@@ -720,6 +753,7 @@ impl Drop for HookEngine {
 
 enum EngineMessage {
     Committed(Vec<RawEnvelope>),
+    SessionDeleted(SessionId),
     TrustChanged(HookTrustChange),
     Shutdown(oneshot::Sender<()>),
 }
@@ -727,6 +761,8 @@ enum EngineMessage {
 struct EngineState {
     sessions: HashMap<SessionId, DecisionState>,
     run_trust: HashSet<(SessionId, RunId)>,
+    through_seq: HashMap<SessionId, u64>,
+    through_digest: HashMap<SessionId, String>,
     notice_dedup: HashSet<String>,
     subscribers: HashMap<String, SubscriberHandle>,
 }
@@ -832,14 +868,14 @@ impl PendingServerFire {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct DecisionState {
     intents: HashMap<EffectId, EffectIntent>,
     bindings: HashMap<MenuId, EffectIntent>,
     menus: HashMap<MenuId, OpenPermission>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OpenPermission {
     menu: Menu,
     opening: RawEnvelope,
@@ -851,17 +887,96 @@ struct DecisionContext {
     permission: OpenPermission,
 }
 
+const HOOK_ENGINE_SNAPSHOT_VERSION: u32 = 2;
+const HOOK_ENGINE_SNAPSHOT_FILE: &str = "hook-engine.snapshot.msgpack";
+
+#[derive(Serialize, Deserialize)]
+struct HookEngineSnapshot {
+    version: u32,
+    sessions: HashMap<SessionId, DecisionState>,
+    run_trust: HashSet<(SessionId, RunId)>,
+    through_seq: HashMap<SessionId, u64>,
+    through_digest: HashMap<SessionId, String>,
+}
+
 async fn hydrate_engine_state(
     store: &haider_core::SqliteStoreHandle,
+    boot_journals: Option<&HashMap<SessionId, Vec<RawEnvelope>>>,
 ) -> Result<EngineState, haider_protocol::error::HaiderError> {
+    let snapshot = load_engine_snapshot(store).await;
     let mut state = EngineState {
-        sessions: HashMap::new(),
-        run_trust: HashSet::new(),
+        sessions: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.sessions.clone())
+            .unwrap_or_default(),
+        run_trust: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.run_trust.clone())
+            .unwrap_or_default(),
+        through_seq: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.through_seq.clone())
+            .unwrap_or_default(),
+        through_digest: snapshot
+            .map(|snapshot| snapshot.through_digest)
+            .unwrap_or_default(),
         notice_dedup: HashSet::new(),
         subscribers: HashMap::new(),
     };
-    for session_id in store.session_ids().await? {
-        let mut since_seq = 0;
+    let session_ids = store.session_ids().await?;
+    let current_sessions = session_ids.iter().cloned().collect::<HashSet<_>>();
+    state
+        .sessions
+        .retain(|session_id, _| current_sessions.contains(session_id));
+    state
+        .through_seq
+        .retain(|session_id, _| current_sessions.contains(session_id));
+    state
+        .through_digest
+        .retain(|session_id, _| current_sessions.contains(session_id));
+    state
+        .run_trust
+        .retain(|(session_id, _)| current_sessions.contains(session_id));
+    for session_id in session_ids {
+        let mut since_seq = state.through_seq.get(&session_id).copied().unwrap_or(0);
+        if since_seq > 0 {
+            let cursor = if let Some(journal) =
+                boot_journals.and_then(|journals| journals.get(&session_id))
+            {
+                journal
+                    .iter()
+                    .find(|envelope| envelope.seq == since_seq)
+                    .cloned()
+            } else {
+                store
+                    .read(&session_id, since_seq.saturating_sub(1), 1)
+                    .await?
+                    .into_iter()
+                    .find(|envelope| envelope.seq == since_seq)
+            };
+            let valid = cursor.as_ref().is_some_and(|envelope| {
+                state.through_digest.get(&session_id) == Some(&hook_envelope_digest(envelope))
+            });
+            if !valid {
+                state.sessions.remove(&session_id);
+                state
+                    .run_trust
+                    .retain(|(candidate, _)| candidate != &session_id);
+                state.through_seq.remove(&session_id);
+                state.through_digest.remove(&session_id);
+                since_seq = 0;
+            }
+        }
+        if let Some(journal) = boot_journals.and_then(|journals| journals.get(&session_id)) {
+            for envelope in journal.iter().filter(|envelope| envelope.seq > since_seq) {
+                reduce_durable_state(&mut state, envelope);
+            }
+            since_seq = state
+                .through_seq
+                .get(&session_id)
+                .copied()
+                .unwrap_or(since_seq);
+        }
         loop {
             let page = store.read(&session_id, since_seq, 1_024).await?;
             if page.is_empty() {
@@ -876,10 +991,44 @@ async fn hydrate_engine_state(
     Ok(state)
 }
 
+async fn load_engine_snapshot(
+    store: &haider_core::SqliteStoreHandle,
+) -> Option<HookEngineSnapshot> {
+    let bytes = tokio::fs::read(store.root().join(HOOK_ENGINE_SNAPSHOT_FILE))
+        .await
+        .ok()?;
+    let snapshot = rmp_serde::from_slice::<HookEngineSnapshot>(&bytes).ok()?;
+    (snapshot.version == HOOK_ENGINE_SNAPSHOT_VERSION).then_some(snapshot)
+}
+
+async fn persist_engine_snapshot(
+    store: &haider_core::SqliteStoreHandle,
+    state: &EngineState,
+) -> Result<(), String> {
+    let snapshot = HookEngineSnapshot {
+        version: HOOK_ENGINE_SNAPSHOT_VERSION,
+        sessions: state.sessions.clone(),
+        run_trust: state.run_trust.clone(),
+        through_seq: state.through_seq.clone(),
+        through_digest: state.through_digest.clone(),
+    };
+    let bytes = rmp_serde::to_vec_named(&snapshot)
+        .map_err(|error| format!("hook snapshot encode failed: {error}"))?;
+    let path = store.root().join(HOOK_ENGINE_SNAPSHOT_FILE);
+    let temporary = store.root().join("hook-engine.snapshot.tmp");
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(|error| format!("hook snapshot write failed: {error}"))?;
+    tokio::fs::rename(&temporary, &path)
+        .await
+        .map_err(|error| format!("hook snapshot install failed: {error}"))
+}
+
 fn reduce_durable_state(
     state: &mut EngineState,
     envelope: &RawEnvelope,
 ) -> Option<DecisionContext> {
+    advance_durable_cursor(state, envelope);
     if let Ok(HookEventPayload::HookRunTrust { enabled }) =
         HookEventPayload::from_payload_value(envelope.payload.clone())
         && let Some(run_id) = envelope.run_id.clone()
@@ -893,6 +1042,29 @@ fn reduce_durable_state(
         return None;
     }
     absorb_decision_fact(state, envelope)
+}
+
+fn advance_durable_cursor(state: &mut EngineState, envelope: &RawEnvelope) {
+    let through = state
+        .through_seq
+        .entry(envelope.session_id.clone())
+        .or_default();
+    if envelope.seq >= *through {
+        *through = envelope.seq;
+        state
+            .through_digest
+            .insert(envelope.session_id.clone(), hook_envelope_digest(envelope));
+    }
+}
+
+fn hook_envelope_digest(envelope: &RawEnvelope) -> String {
+    serde_json::to_vec(envelope)
+        .map_or_else(
+            |_| blake3::hash(b"haider-hook-snapshot-envelope-encode-error"),
+            |bytes| blake3::hash(&bytes),
+        )
+        .to_hex()
+        .to_string()
 }
 
 async fn run_engine(
@@ -921,9 +1093,11 @@ async fn run_engine(
                 // never grows unbounded under sustained commit load.
                 let mut next = Some(message);
                 let mut acks: Vec<(SessionId, u64)> = Vec::new();
+                let mut snapshot_dirty = false;
                 let control = loop {
                     match next.take() {
                         Some(EngineMessage::Committed(envelopes)) => {
+                            snapshot_dirty = true;
                             let mut aborted = false;
                             for envelope in envelopes {
                                 if !handle_and_complete(
@@ -947,11 +1121,35 @@ async fn run_engine(
                     }
                 };
                 let _ = flush_hook_dispatch_acks(&service, acks).await;
+                if snapshot_dirty
+                    && let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await
+                {
+                    tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed; journal rebuild remains authoritative");
+                }
                 match control {
                     Some(EngineMessage::TrustChanged(change)) => {
                         if !change.trusted {
                             service.inner.servers.kill_digest(&change.digest);
                             state.subscribers.retain(|_, handle| handle.digest != change.digest);
+                        }
+                    }
+                    Some(EngineMessage::SessionDeleted(session_id)) => {
+                        state.sessions.remove(&session_id);
+                        state.through_seq.remove(&session_id);
+                        state.through_digest.remove(&session_id);
+                        state
+                            .run_trust
+                            .retain(|(candidate, _)| candidate != &session_id);
+                        state.subscribers.retain(|_, handle| {
+                            handle
+                                .run_scope
+                                .as_ref()
+                                .is_none_or(|(candidate, _)| candidate != &session_id)
+                        });
+                        if let Err(error) =
+                            persist_engine_snapshot(&service.inner.store, &state).await
+                        {
+                            tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed after session deletion");
                         }
                     }
                     Some(EngineMessage::Shutdown(done)) => {
@@ -1031,6 +1229,7 @@ async fn handle_and_complete(
     defer_servers: bool,
     acks: &mut Vec<(SessionId, u64)>,
 ) -> bool {
+    advance_durable_cursor(state, &envelope);
     let mut pending = Vec::new();
     let mut terminal_scope = None;
     if !handle_committed(
@@ -1125,12 +1324,7 @@ async fn handle_committed(
             return false;
         }
     };
-    let discovery = match discover_async(
-        PathBuf::from(&metadata.cwd),
-        service.inner.profile_root.clone(),
-    )
-    .await
-    {
+    let discovery = match discover_cached_async(service, PathBuf::from(&metadata.cwd)).await {
         Ok(discovery) => discovery,
         Err(reason) => {
             return journal_notice_once(
@@ -1147,6 +1341,23 @@ async fn handle_committed(
             .await;
         }
     };
+    let terminal_scope = if facts.event == MatchEvent::RunFinished {
+        envelope
+            .run_id
+            .clone()
+            .map(|run_id| (envelope.session_id.clone(), run_id))
+    } else {
+        None
+    };
+    // Evaluate the complete matcher once before any hook input rendering or
+    // process work. Discovery notices and live subscriber/server
+    // reconciliation still run below: configuration removal and malformed
+    // definitions are observable even when this event matches no hook.
+    let any_match = discovery.hooks.values().any(|definition| {
+        definition
+            .matcher
+            .matches(&envelope, &metadata.provider, &facts)
+    });
     service.prepare_workspace_trust(&discovery).await;
     let current_servers = discovery
         .hooks
@@ -1200,14 +1411,16 @@ async fn handle_committed(
                 .is_some_and(|scope| state.run_trust.contains(scope))
     });
 
-    let terminal_scope = if facts.event == MatchEvent::RunFinished {
-        envelope
-            .run_id
-            .clone()
-            .map(|run_id| (envelope.session_id.clone(), run_id))
-    } else {
-        None
-    };
+    if !any_match {
+        if let Some(terminal_scope) = terminal_scope {
+            state
+                .subscribers
+                .retain(|_, handle| handle.run_scope.as_ref() != Some(&terminal_scope));
+            service.inner.servers.kill_scope(&terminal_scope);
+        }
+        return true;
+    }
+
     let mut prepared_input = None::<Result<Arc<[u8]>, String>>;
     for definition in discovery.hooks.into_values() {
         if !definition
@@ -1976,12 +2189,18 @@ async fn definition_current(
     definition: &HookDefinition,
     run_override: bool,
 ) -> bool {
-    let Ok(discovery) = discover_async(
-        definition.workspace_cwd.clone(),
-        service.inner.profile_root.clone(),
-    )
-    .await
-    else {
+    let discovery = if definition.decision {
+        // Security-relevant gates never accept cached discovery: the exact
+        // current bytes and trust pin are revalidated at fire time.
+        discover_async(
+            definition.workspace_cwd.clone(),
+            service.inner.profile_root.clone(),
+        )
+        .await
+    } else {
+        discover_cached_async(service, definition.workspace_cwd.clone()).await
+    };
+    let Ok(discovery) = discovery else {
         return false;
     };
     service.prepare_workspace_trust(&discovery).await;
@@ -2514,6 +2733,71 @@ async fn discover_async(cwd: PathBuf, profile_root: PathBuf) -> Result<Discovery
     tokio::task::spawn_blocking(move || discover(&cwd, &profile_root))
         .await
         .map_err(|error| format!("hook discovery task stopped: {error}"))?
+}
+
+async fn discover_cached_async(service: &HookService, cwd: PathBuf) -> Result<Discovery, String> {
+    let profile_root = service.inner.profile_root.clone();
+    let stamp_cwd = cwd.clone();
+    let stamp_profile = profile_root.clone();
+    let before = tokio::task::spawn_blocking(move || discovery_stamp(&stamp_cwd, &stamp_profile))
+        .await
+        .map_err(|error| format!("hook discovery stamp task stopped: {error}"))??;
+    if let Ok(cache) = service.inner.discovery_cache.lock()
+        && let Some(cached) = cache.get(&cwd)
+        && cached.stamp == before
+    {
+        return Ok(cached.discovery.clone());
+    }
+    let discovery = discover_async(cwd.clone(), profile_root.clone()).await?;
+    let after_cwd = cwd.clone();
+    let after = tokio::task::spawn_blocking(move || discovery_stamp(&after_cwd, &profile_root))
+        .await
+        .map_err(|error| format!("hook discovery stamp task stopped: {error}"))??;
+    if before == after
+        && let Ok(mut cache) = service.inner.discovery_cache.lock()
+    {
+        cache.insert(
+            cwd,
+            CachedDiscovery {
+                stamp: after,
+                discovery: discovery.clone(),
+            },
+        );
+    }
+    Ok(discovery)
+}
+
+fn discovery_stamp(cwd: &Path, profile_root: &Path) -> Result<DiscoveryStamp, String> {
+    let canonical_cwd = fs::canonicalize(cwd)
+        .map_err(|error| format!("workspace could not be canonicalized: {error}"))?;
+    if canonical_cwd != cwd || !cwd.is_absolute() {
+        return Err("workspace is not an absolute canonical path".into());
+    }
+    let mut paths = Vec::new();
+    let mut directory = cwd.to_path_buf();
+    for _ in 0..MAX_HOOK_ANCESTORS {
+        paths.push(directory.clone());
+        paths.push(directory.join(HOOKS_FILE));
+        if !directory.pop() {
+            break;
+        }
+    }
+    paths.push(profile_root.to_path_buf());
+    paths.push(profile_root.join(HOOKS_FILE));
+    let mut stamped = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = fs::symlink_metadata(&path).ok();
+        let value = metadata.map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos());
+            (metadata.len(), modified)
+        });
+        stamped.push((path, value));
+    }
+    Ok(DiscoveryStamp(stamped))
 }
 
 fn discover(cwd: &Path, profile_root: &Path) -> Result<Discovery, String> {

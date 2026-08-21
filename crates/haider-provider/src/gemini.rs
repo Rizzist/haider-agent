@@ -14,6 +14,8 @@ use haider_protocol::provider::{
 };
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
@@ -66,6 +68,8 @@ fn build_gemini_transport(
         .retry(match transport.retry_policy {
             GeminiRetryPolicy::Never => reqwest::retry::never(),
         })
+        .pool_idle_timeout(crate::PROVIDER_POOL_IDLE_TIMEOUT)
+        .http2_adaptive_window(true)
         .connect_timeout(transport.connect_timeout)
         .dns_resolver(Arc::clone(&fixed_origin_guard))
         .build()
@@ -385,14 +389,32 @@ impl GeminiProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let full_payload = self.request_payload(request)?;
+        let (full_payload, history_boundary) = match crate::take_prepared_wire_payload() {
+            Some(prepared) => (prepared.payload, prepared.history_boundary),
+            None => {
+                self.validate_model(request)?;
+                let boundary = request
+                    .cache_metadata
+                    .as_ref()
+                    .map_or(request.messages.len(), |metadata| {
+                        metadata.stable_history_end
+                    });
+                let (payload, boundary) = gemini_request_json_with_boundary(
+                    request,
+                    self.effort.as_deref(),
+                    self.web_builtins,
+                    boundary,
+                )?;
+                (payload, Some(boundary))
+            }
+        };
         let payload = if let Some(registry) = &self.cache_registry {
             registry
-                .prepare_generate_payload(
+                .prepare_generate_payload_with_boundary(
                     request,
                     full_payload,
+                    history_boundary,
                     Arc::clone(&self.cache_backend),
-                    self.effort.as_deref(),
                     self.web_builtins
                         && crate::effort::gemini_web_builtins_supported(&request.model),
                 )
@@ -421,23 +443,39 @@ impl Provider for GeminiProvider {
         &self,
         request: &TurnRequest,
     ) -> Option<haider_protocol::provider::PrefixDigests> {
+        self.prepare_turn(request)
+            .map(|prepared| prepared.prefix_digests)
+    }
+
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.stable_history_end;
-        let full_payload = self.request_payload(request).ok()?;
-        let mut stable_request = request.clone();
-        stable_request.messages.truncate(boundary);
-        if let Some(metadata) = &mut stable_request.cache_metadata {
-            metadata.stable_history_end = boundary;
-            metadata.current_user_start = boundary;
-        }
-        let stable_payload = self.request_payload(&stable_request).ok()?;
-        crate::rendered_prefix_digests(
+        self.validate_model(request).ok()?;
+        let (full_payload, history_boundary) = gemini_request_json_with_boundary(
+            request,
+            self.effort.as_deref(),
+            self.web_builtins,
+            boundary,
+        )
+        .ok()?;
+        let immutable_history = gemini_history_digest(&full_payload, history_boundary)?;
+        let prefix_digests = crate::rendered_prefix_digests(
             request,
             &full_payload,
-            &stable_payload,
+            immutable_history,
             "system_instruction",
             "tools",
-            "contents",
-        )
+        )?;
+        Some(crate::PreparedTurn {
+            prefix_digests,
+            wire: Some(crate::PreparedWire {
+                payload: full_payload,
+                history_boundary: Some(history_boundary),
+            }),
+        })
+    }
+
+    async fn prewarm(&self) {
+        crate::optional_http_prewarm(&self.client, &self.api_url).await;
     }
 
     async fn capabilities(&self) -> CapabilityDoc {
@@ -633,12 +671,44 @@ impl GeminiCacheRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_generate_payload(
         &self,
         request: &TurnRequest,
         full_payload: serde_json::Value,
         backend: Arc<dyn GeminiCacheBackend>,
         effort: Option<&str>,
+        web_builtins: bool,
+    ) -> serde_json::Value {
+        let history_boundary = gemini_request_json_with_boundary(
+            request,
+            effort,
+            web_builtins,
+            request
+                .cache_metadata
+                .as_ref()
+                .map_or(request.messages.len(), |metadata| {
+                    metadata.stable_history_end
+                }),
+        )
+        .ok()
+        .map(|(_, boundary)| boundary);
+        self.prepare_generate_payload_with_boundary(
+            request,
+            full_payload,
+            history_boundary,
+            backend,
+            web_builtins,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_generate_payload_with_boundary(
+        &self,
+        request: &TurnRequest,
+        full_payload: serde_json::Value,
+        history_boundary: Option<crate::PreparedHistoryBoundary>,
+        backend: Arc<dyn GeminiCacheBackend>,
         web_builtins: bool,
     ) -> serde_json::Value {
         let Some(metadata) = request.cache_metadata.as_ref().filter(|metadata| {
@@ -696,26 +766,20 @@ impl GeminiCacheRegistry {
             return full_payload;
         }
 
-        let mut stable_request = request.clone();
-        stable_request
-            .messages
-            .truncate(metadata.stable_history_end);
-        stable_request.cache_metadata = None;
-        let Ok(stable_payload) = gemini_request_json(&stable_request, effort, web_builtins) else {
+        let Some(history_boundary) = history_boundary else {
             return full_payload;
         };
-        let Some(stable_contents) = payload_contents(&stable_payload).map(<[_]>::to_vec) else {
+        let Some(stable_contents) = gemini_cacheable_contents(&full_payload, history_boundary)
+        else {
             return full_payload;
         };
-        if stable_contents.is_empty()
-            || !payload_contents(&full_payload)
-                .is_some_and(|contents| contents.starts_with(&stable_contents))
-        {
+        if stable_contents.is_empty() {
             // Adjacent equal Gemini roles can coalesce across a split. Such a
             // boundary is not byte-stable and stays on implicit caching.
             return full_payload;
         }
-        let create_payload = gemini_cached_content_create_payload(request, &stable_payload);
+        let create_payload =
+            gemini_cached_content_create_payload(request, &full_payload, &stable_contents);
         let Ok(name) = backend.create_cached_content(&create_payload).await else {
             return full_payload;
         };
@@ -750,20 +814,21 @@ fn payload_contents(payload: &serde_json::Value) -> Option<&[serde_json::Value]>
 
 fn gemini_cached_content_create_payload(
     request: &TurnRequest,
-    stable_payload: &serde_json::Value,
+    full_payload: &serde_json::Value,
+    stable_contents: &[serde_json::Value],
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "model": format!("models/{}", request.model),
-        "contents": stable_payload.get("contents").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "contents": stable_contents,
         "ttl": "3600s",
     });
     // The literal above is always an object; a non-object would simply skip
     // the optional inserts rather than panic.
     if let Some(object) = payload.as_object_mut() {
-        if let Some(system) = stable_payload.get("system_instruction") {
+        if let Some(system) = full_payload.get("system_instruction") {
             object.insert("systemInstruction".into(), system.clone());
         }
-        if let Some(tools) = stable_payload.get("tools") {
+        if let Some(tools) = full_payload.get("tools") {
             object.insert("tools".into(), tools.clone());
         }
     }
@@ -877,12 +942,28 @@ pub(crate) fn gemini_request_json(
     effort: Option<&str>,
     web_builtins: bool,
 ) -> Result<serde_json::Value, ProviderError> {
+    gemini_request_json_with_boundary(request, effort, web_builtins, request.messages.len())
+        .map(|(payload, _)| payload)
+}
+
+fn gemini_request_json_with_boundary(
+    request: &TurnRequest,
+    effort: Option<&str>,
+    web_builtins: bool,
+    stable_history_end: usize,
+) -> Result<(serde_json::Value, crate::PreparedHistoryBoundary), ProviderError> {
     let attachments = attachment_index(request)?;
     let (tool_names, opaque_calls) = tool_call_index(request)?;
     let mut contents = Vec::<serde_json::Value>::new();
     let mut pending_signed_text = VecDeque::<String>::new();
+    let stable_history_end = stable_history_end.min(request.messages.len());
+    let mut history_boundary =
+        (stable_history_end == 0).then_some(crate::PreparedHistoryBoundary {
+            items: 0,
+            last_parts: 0,
+        });
 
-    for message in &request.messages {
+    for (message_index, message) in request.messages.iter().enumerate() {
         let role = match message.role {
             MessageRole::Assistant => "model",
             MessageRole::User | MessageRole::Tool => "user",
@@ -1043,6 +1124,16 @@ pub(crate) fn gemini_request_json(
             }
         }
         append_content(&mut contents, role, parts)?;
+        if message_index.saturating_add(1) == stable_history_end {
+            history_boundary = Some(crate::PreparedHistoryBoundary {
+                items: contents.len(),
+                last_parts: contents
+                    .last()
+                    .and_then(|content| content.get("parts"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+            });
+        }
     }
     if !pending_signed_text.is_empty() {
         return Err(invalid_request(
@@ -1076,6 +1167,14 @@ pub(crate) fn gemini_request_json(
         }),
         None => serde_json::json!({"maxOutputTokens": request.max_tokens}),
     };
+    let history_boundary = history_boundary.unwrap_or_else(|| crate::PreparedHistoryBoundary {
+        items: contents.len(),
+        last_parts: contents
+            .last()
+            .and_then(|content| content.get("parts"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+    });
     let mut payload = serde_json::json!({
         "contents": contents,
         "generationConfig": generation_config,
@@ -1104,7 +1203,88 @@ pub(crate) fn gemini_request_json(
     if !tool_entries.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tool_entries));
     }
-    Ok(payload)
+    Ok((payload, history_boundary))
+}
+
+struct GeminiContentsPrefix<'a> {
+    contents: &'a [serde_json::Value],
+    boundary: crate::PreparedHistoryBoundary,
+}
+
+impl Serialize for GeminiContentsPrefix<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let end = self.boundary.items.min(self.contents.len());
+        let mut sequence = serializer.serialize_seq(Some(end))?;
+        for (index, content) in self.contents[..end].iter().enumerate() {
+            if index.saturating_add(1) == end {
+                sequence.serialize_element(&GeminiContentPrefix {
+                    content,
+                    parts_end: self.boundary.last_parts,
+                })?;
+            } else {
+                sequence.serialize_element(content)?;
+            }
+        }
+        sequence.end()
+    }
+}
+
+struct GeminiContentPrefix<'a> {
+    content: &'a serde_json::Value,
+    parts_end: usize,
+}
+
+impl Serialize for GeminiContentPrefix<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let Some(object) = self.content.as_object() else {
+            return self.content.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(object.len()))?;
+        for (key, value) in object {
+            if key == "parts" {
+                if let Some(parts) = value.as_array() {
+                    map.serialize_entry(key, &parts[..self.parts_end.min(parts.len())])?;
+                } else {
+                    map.serialize_entry(key, value)?;
+                }
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+fn gemini_history_digest(
+    full_payload: &serde_json::Value,
+    boundary: crate::PreparedHistoryBoundary,
+) -> Option<String> {
+    let contents = payload_contents(full_payload)?;
+    Some(crate::exact_optional_wire_digest(Some(
+        &GeminiContentsPrefix { contents, boundary },
+    )))
+}
+
+fn gemini_cacheable_contents(
+    full_payload: &serde_json::Value,
+    boundary: crate::PreparedHistoryBoundary,
+) -> Option<Vec<serde_json::Value>> {
+    let contents = payload_contents(full_payload)?;
+    let end = boundary.items.min(contents.len());
+    if end == 0 {
+        return Some(Vec::new());
+    }
+    let final_parts = contents[end - 1].get("parts")?.as_array()?.len();
+    if final_parts != boundary.last_parts {
+        return None;
+    }
+    Some(contents[..end].to_vec())
 }
 
 fn append_content(

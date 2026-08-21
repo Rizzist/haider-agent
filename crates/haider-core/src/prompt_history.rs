@@ -54,6 +54,7 @@ struct CachedPromptSession {
     compaction_epoch: u64,
     envelopes: Vec<RawEnvelope>,
     projections: HashMap<PromptProjectionKey, CompiledPromptProjection>,
+    append_prefixes: HashMap<PromptProjectionScope, CachedCompiledPrefix>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,6 +64,20 @@ struct PromptProjectionKey {
     branch_id: Option<BranchId>,
     agent_id: Option<AgentId>,
     current_run: RunId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PromptProjectionScope {
+    compaction_epoch: u64,
+    branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
+}
+
+#[derive(Clone)]
+struct CachedCompiledPrefix {
+    head_seq: u64,
+    current_run: RunId,
+    projection: CompiledPromptProjection,
 }
 
 /// Provider-facing prompt projection plus ephemeral cache boundaries.
@@ -425,6 +440,7 @@ impl PromptHistoryCache {
         if cached.head_seq > head_seq {
             cached = CachedPromptSession::default();
         }
+        let previous_compaction_epoch = cached.compaction_epoch;
         let mut cursor = cached.head_seq;
         while cursor < head_seq {
             let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
@@ -458,6 +474,9 @@ impl PromptHistoryCache {
         if cached.head_seq < head_seq {
             cached.head_seq = head_seq;
             cached.projections.clear();
+            if cached.compaction_epoch != previous_compaction_epoch {
+                cached.append_prefixes.clear();
+            }
         }
 
         let key = PromptProjectionKey {
@@ -472,16 +491,52 @@ impl PromptHistoryCache {
             return Ok(projection);
         }
 
-        let projection = compile_projection_from_envelopes(
-            store,
-            Some(artifacts),
-            session_id,
-            branch_id,
-            agent_id,
-            current_run,
-            &cached.envelopes,
-        )
-        .await?;
+        let scope = PromptProjectionScope {
+            compaction_epoch: cached.compaction_epoch,
+            branch_id: branch_id.cloned(),
+            agent_id: agent_id.cloned(),
+        };
+        let projection = match cached.append_prefixes.get(&scope) {
+            Some(prefix) if prefix.head_seq < head_seq && prefix.current_run != *current_run => {
+                extend_compiled_projection(
+                    prefix,
+                    &cached.envelopes,
+                    branch_id,
+                    agent_id,
+                    current_run,
+                )?
+            }
+            _ => {
+                compile_projection_from_envelopes(
+                    store,
+                    Some(artifacts),
+                    session_id,
+                    branch_id,
+                    agent_id,
+                    current_run,
+                    &cached.envelopes,
+                )
+                .await?
+            }
+        };
+        // Keep the earliest request boundary for a live run. Later tool-round
+        // recompiles intentionally suppress that run's assistant/tool output;
+        // replacing this prefix at their later head would make those facts
+        // fall before the next run's suffix and disappear permanently.
+        if cached
+            .append_prefixes
+            .get(&scope)
+            .is_none_or(|prefix| prefix.current_run != *current_run)
+        {
+            cached.append_prefixes.insert(
+                scope,
+                CachedCompiledPrefix {
+                    head_seq,
+                    current_run: current_run.clone(),
+                    projection: projection.clone(),
+                },
+            );
+        }
         cached.projections.insert(key, projection.clone());
         self.install(session_id.clone(), cached).await;
         Ok(projection)
@@ -496,6 +551,51 @@ impl PromptHistoryCache {
             sessions.insert(session_id, cached);
         }
     }
+}
+
+/// Extends a completed request projection with only the journal suffix that
+/// accumulated before the next accepted run. The old request (including its
+/// user message) is now immutable history; rendering the suffix produces the
+/// preceding assistant/tool results followed by the new current user. A
+/// compaction epoch change never reaches this function and recompiles through
+/// the full oracle instead.
+fn extend_compiled_projection(
+    prefix: &CachedCompiledPrefix,
+    envelopes: &[RawEnvelope],
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    current_run: &RunId,
+) -> Result<CompiledPromptProjection, HaiderError> {
+    let suffix = envelopes
+        .iter()
+        .filter(|envelope| envelope.seq > prefix.head_seq)
+        .cloned()
+        .collect::<Vec<_>>();
+    let rendered = render_journal(
+        &suffix,
+        envelopes,
+        branch_id,
+        agent_id,
+        Some(current_run),
+        true,
+    )?;
+    let mut messages = prefix.projection.messages.clone();
+    let offset = messages.len();
+    let current_user_start = rendered
+        .current_user_start
+        .map(|index| offset.saturating_add(index))
+        .ok_or_else(|| {
+            corrupt(format!(
+                "accepted run {current_run} has no append-only committed user message"
+            ))
+        })?;
+    messages.extend(rendered.messages);
+    Ok(CompiledPromptProjection {
+        stable_history_end: current_user_start,
+        current_user_start,
+        latest_compaction_summary_end: prefix.projection.latest_compaction_summary_end,
+        messages,
+    })
 }
 
 async fn compile_projection_from_envelopes(

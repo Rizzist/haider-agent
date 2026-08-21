@@ -13,9 +13,9 @@ use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, ERROR_CODE_NOT_FOUND,
-    FEATURE_EFFECT_RECOVERY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_V1,
-    LifecyclePhase, RequestBody, ResponseBody, SessionFleetSnapshot, SessionObserveDigest,
-    SessionSummary, Welcome, WireFrame,
+    FEATURE_EFFECT_RECOVERY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
+    FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody, ResponseBody, SessionFleetSnapshot,
+    SessionObserveDigest, SessionSummary, Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -313,6 +313,46 @@ impl ObserveClient {
         last_event_limit: u32,
     ) -> Result<Vec<SessionObserveDigest>, ObserveError> {
         let ids = self.session_ids().await?;
+        if self
+            .welcome
+            .features
+            .contains(FEATURE_SESSION_OBSERVE_BATCH_V1)
+        {
+            let mut digests = Vec::with_capacity(ids.len());
+            for session_ids in ids.chunks(64) {
+                match self
+                    .client
+                    .request(RequestBody::SessionObserveBatch {
+                        session_ids: session_ids.to_vec(),
+                        last_event_limit,
+                        metadata_only: false,
+                    })
+                    .await?
+                {
+                    ResponseBody::SessionObserveBatch {
+                        digests: batch_digests,
+                    } => digests.extend(batch_digests),
+                    ResponseBody::Error {
+                        code,
+                        message,
+                        retryable,
+                        ..
+                    } => {
+                        return Err(ObserveError::Rpc {
+                            code,
+                            message,
+                            retryable,
+                        });
+                    }
+                    _ => {
+                        return Err(ObserveError::Protocol(
+                            "session.observe_batch response method mismatch",
+                        ));
+                    }
+                }
+            }
+            return Ok(digests);
+        }
         let mut digests = Vec::with_capacity(ids.len());
         for session_id in ids {
             digests.push(self.session(session_id, last_event_limit).await?);

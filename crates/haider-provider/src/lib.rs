@@ -42,14 +42,19 @@ use haider_protocol::tool::{
     ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::error::Error as _;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
+/// Provider connections survive normal think/tool gaps and can be reused by
+/// concurrently-started child turns. Reqwest negotiates HTTP/2 through ALPN;
+/// this only changes transport reuse, never request bodies or headers.
+pub(crate) const PROVIDER_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Digests Haider-owned tool definitions after recursively sorting object
 /// keys in their schemas.
@@ -85,7 +90,10 @@ pub fn canonical_tool_definitions_digest(tools: &[ToolDefinition]) -> String {
         .to_string()
 }
 
-fn exact_optional_wire_digest(value: Option<&serde_json::Value>) -> String {
+pub(crate) fn exact_optional_wire_digest<T>(value: Option<&T>) -> String
+where
+    T: Serialize + ?Sized,
+{
     serde_json::to_vec(&value)
         .map_or_else(
             |_| blake3::hash(b"haider-final-wire-serialization-error"),
@@ -102,16 +110,26 @@ fn exact_optional_wire_digest(value: Option<&serde_json::Value>) -> String {
 pub(crate) fn rendered_prefix_digests(
     request: &TurnRequest,
     full_payload: &serde_json::Value,
-    stable_payload: &serde_json::Value,
+    immutable_history: String,
     system_key: &str,
     tools_key: &str,
-    history_key: &str,
 ) -> Option<PrefixDigests> {
     let mut digests = request.cache_metadata.as_ref()?.prefix_digests.clone();
     digests.system = exact_optional_wire_digest(full_payload.get(system_key));
     digests.tools = exact_optional_wire_digest(full_payload.get(tools_key));
-    digests.immutable_history = exact_optional_wire_digest(stable_payload.get(history_key));
+    digests.immutable_history = immutable_history;
     Some(digests)
+}
+
+pub(crate) fn rendered_array_prefix_digest(
+    full_payload: &serde_json::Value,
+    history_key: &str,
+    end: usize,
+) -> Option<String> {
+    let history = full_payload.get(history_key)?.as_array()?;
+    Some(exact_optional_wire_digest(Some(
+        &history[..end.min(history.len())],
+    )))
 }
 
 pub use anthropic::{
@@ -579,6 +597,43 @@ pub struct TurnRequest {
     pub cache_metadata: Option<PromptCacheMetadata>,
 }
 
+/// Adapter-rendered request retained across cache-digest finalization. The
+/// full wire object is built once; only a provider cache-key scalar may be
+/// refreshed from finalized metadata before transmission.
+pub struct PreparedTurn {
+    pub(crate) prefix_digests: PrefixDigests,
+    pub(crate) wire: Option<PreparedWire>,
+}
+
+pub(crate) struct PreparedWire {
+    pub(crate) payload: serde_json::Value,
+    pub(crate) history_boundary: Option<PreparedHistoryBoundary>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedHistoryBoundary {
+    pub(crate) items: usize,
+    pub(crate) last_parts: usize,
+}
+
+impl PreparedTurn {
+    #[must_use]
+    pub fn prefix_digests(&self) -> &PrefixDigests {
+        &self.prefix_digests
+    }
+}
+
+tokio::task_local! {
+    static PREPARED_WIRE_PAYLOAD: RefCell<Option<PreparedWire>>;
+}
+
+pub(crate) fn take_prepared_wire_payload() -> Option<PreparedWire> {
+    PREPARED_WIRE_PAYLOAD
+        .try_with(|payload| payload.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
@@ -964,8 +1019,49 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<PreparedTurn> {
+        self.rendered_cache_prefix_digests(request)
+            .map(|prefix_digests| PreparedTurn {
+                prefix_digests,
+                wire: None,
+            })
+    }
+
+    /// Optionally establishes the provider origin's pooled TLS/ALPN
+    /// connection. Disabled unless `HAIDER_PROVIDER_PREWARM=1`; failures are
+    /// deliberately advisory and cannot change turn admission or request
+    /// bytes.
+    async fn prewarm(&self) {}
+
     async fn capabilities(&self) -> CapabilityDoc;
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError>;
+
+    async fn stream_prepared_turn(
+        &self,
+        request: TurnRequest,
+        prepared: Option<PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        let payload = prepared.and_then(|prepared| prepared.wire);
+        PREPARED_WIRE_PAYLOAD
+            .scope(RefCell::new(payload), self.stream_turn(request))
+            .await
+    }
+}
+
+pub(crate) async fn optional_http_prewarm(client: &reqwest::Client, endpoint: &str) {
+    static PREWARMED_ENDPOINTS: OnceLock<Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    if std::env::var_os("HAIDER_PROVIDER_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let first = PREWARMED_ENDPOINTS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .is_ok_and(|mut endpoints| endpoints.insert(endpoint.to_owned()));
+    if !first {
+        return;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.head(endpoint).send()).await;
 }
 
 /// One deterministic operation in a [`FakeProvider`] fixture.

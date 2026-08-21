@@ -298,7 +298,7 @@ pub(super) async fn run_session_actor(
     pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
-    hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
+    hooks: Arc<CommitProjection>,
     force_stop: Arc<AtomicBool>,
     mut commands: mpsc::Receiver<ActorCommand>,
 ) {
@@ -468,8 +468,19 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
-            ActorCommand::PinGraph { command, completed } => {
-                let result = store.pin_graph(command).await;
+            ActorCommand::PinGraph {
+                command,
+                expected_digest,
+                completed,
+            } => {
+                let result = match expected_digest {
+                    Some(expected_digest) => {
+                        store
+                            .pin_graph_matching_digest(command, expected_digest)
+                            .await
+                    }
+                    None => store.pin_graph(command).await,
+                };
                 let envelopes = match &result {
                     Ok(GraphPinOutcome::Committed { envelopes, .. }) => Some(envelopes.as_slice()),
                     _ => None,
@@ -1270,7 +1281,7 @@ fn publish_graph_commit(
     catch_up_byte_budget: usize,
     observer: &Arc<dyn SessionHubObserver>,
     metrics: &HubMetrics,
-    hooks: &Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
+    hooks: &Arc<CommitProjection>,
 ) {
     let Some(envelopes) = envelopes else {
         return;
@@ -1353,15 +1364,9 @@ fn publish(
     envelopes: &[RawEnvelope],
     byte_budget: usize,
     metrics: &HubMetrics,
-    hooks: &Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
+    hooks: &Arc<CommitProjection>,
 ) {
-    if let Ok(installed) = hooks.lock()
-        && let Some(hooks) = installed
-            .as_ref()
-            .and_then(crate::hooks::WeakHookService::upgrade)
-    {
-        hooks.observe_committed(envelopes);
-    }
+    hooks.observe_committed(envelopes);
     if !attachments.values().any(|attachment| attachment.active) {
         return;
     }

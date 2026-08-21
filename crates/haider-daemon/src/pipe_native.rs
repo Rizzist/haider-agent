@@ -133,6 +133,150 @@ impl PipeNativeWriter {
         result
     }
 
+    /// Cold-boot reconciliation using the journal page already read by turn
+    /// recovery. Only a suffix committed after that sealed boot page is read
+    /// from SQLite; missing/corrupt sidecars rebuild from the shared bytes.
+    pub(crate) async fn maintain_from_boot_journal(
+        &self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+        journal: &[RawEnvelope],
+    ) -> Result<(), PipeNativeError> {
+        let path = self.sidecar_path(session_id)?;
+        let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
+        let boot_head = journal.last().map_or(0, |envelope| envelope.seq);
+        let latest_seq = store.latest_seq(session_id).await.map_err(|error| {
+            PipeNativeError(format!("journal head inspection failed: {error:?}"))
+        })?;
+        let reconciled = match state {
+            SidecarState::Ready(cursor) if cursor.seq <= boot_head && cursor.seq <= latest_seq => {
+                self.reconcile_from_boot(store, session_id, path, cursor, journal)
+                    .await?
+            }
+            SidecarState::Ready(cursor) => {
+                self.rebuild_from_boot(store, session_id, path, cursor.generation, journal)
+                    .await?
+            }
+            SidecarState::Missing => {
+                self.rebuild_from_boot(store, session_id, path, 0, journal)
+                    .await?
+            }
+            SidecarState::Corrupt { generation } => {
+                self.rebuild_from_boot(store, session_id, path, generation, journal)
+                    .await?
+            }
+        };
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), reconciled);
+        self.dirty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        Ok(())
+    }
+
+    async fn reconcile_from_boot(
+        &self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+        path: PathBuf,
+        cursor: SidecarCursor,
+        journal: &[RawEnvelope],
+    ) -> Result<ReconciledSidecar, PipeNativeError> {
+        let mut projector = TranscriptProjector::default();
+        let prewarm_start = cursor.seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
+        for envelope in ordered_after(journal, prewarm_start) {
+            if envelope.seq > cursor.seq {
+                break;
+            }
+            projector.prewarm(envelope);
+        }
+        let mut file = open_append(path.clone()).await?;
+        let boot_tail = render_rows_after(journal, cursor.seq, &mut projector);
+        if !boot_tail.is_empty() {
+            file = write_open(file, boot_tail).await?;
+        }
+        let mut read_cursor = journal
+            .last()
+            .map_or(cursor.seq, |envelope| envelope.seq.max(cursor.seq));
+        file =
+            append_store_suffix(store, session_id, file, &mut projector, &mut read_cursor).await?;
+        let trailing = render_projected_rows(projector.finish());
+        if !trailing.is_empty() {
+            file = write_open(file, trailing).await?;
+        }
+        file = write_open(file, coverage_line(read_cursor, cursor.generation)?).await?;
+        let file = sync_open(file).await?;
+        Ok(ReconciledSidecar {
+            cursor: SidecarCursor {
+                seq: read_cursor,
+                pending_seq: read_cursor,
+                generation: cursor.generation,
+            },
+            projector,
+            file,
+        })
+    }
+
+    async fn rebuild_from_boot(
+        &self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+        path: PathBuf,
+        generation: u64,
+        journal: &[RawEnvelope],
+    ) -> Result<ReconciledSidecar, PipeNativeError> {
+        let (mut file, temp_path) = create_temp(path.clone()).await?;
+        let generation = generation
+            .checked_add(1)
+            .ok_or_else(|| PipeNativeError("sidecar generation exhausted".into()))?;
+        let mut header = serde_json::to_string(&SidecarHeader {
+            pipe: SIDECAR_MAGIC.to_owned(),
+            version: SIDECAR_VERSION,
+            session_id: session_id.as_str().to_owned(),
+            generation,
+        })
+        .map_err(|error| {
+            PipeNativeError(format!("sidecar header serialization failed: {error}"))
+        })?;
+        header.push('\n');
+        file = write_temp(file, header).await?;
+        let mut projector = TranscriptProjector::default();
+        file = write_temp(file, render_rows_after(journal, 0, &mut projector)).await?;
+        let mut read_cursor = journal.last().map_or(0, |envelope| envelope.seq);
+        loop {
+            let page = store
+                .read_page(
+                    session_id,
+                    read_cursor,
+                    RECONCILE_PAGE_ENVELOPES,
+                    RECONCILE_PAGE_BYTES,
+                )
+                .await
+                .map_err(|error| PipeNativeError(format!("journal rebuild failed: {error:?}")))?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            read_cursor = last.seq;
+            file = write_temp(file, render_rows_after(&page, 0, &mut projector)).await?;
+        }
+        file = write_temp(file, render_projected_rows(projector.finish())).await?;
+        file = write_temp(file, coverage_line(read_cursor, generation)?).await?;
+        finish_temp(file, temp_path, path.clone()).await?;
+        let file = open_append(path).await?;
+        Ok(ReconciledSidecar {
+            cursor: SidecarCursor {
+                seq: read_cursor,
+                pending_seq: read_cursor,
+                generation,
+            },
+            projector,
+            file,
+        })
+    }
+
     async fn maintain_inner(
         &self,
         store: &SqliteStoreHandle,
@@ -382,6 +526,36 @@ async fn prewarm_projector(
         }
     }
     Ok(projector)
+}
+
+async fn append_store_suffix(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    mut file: File,
+    projector: &mut TranscriptProjector,
+    read_cursor: &mut u64,
+) -> Result<File, PipeNativeError> {
+    loop {
+        let page = store
+            .read_page(
+                session_id,
+                *read_cursor,
+                RECONCILE_PAGE_ENVELOPES,
+                RECONCILE_PAGE_BYTES,
+            )
+            .await
+            .map_err(|error| {
+                PipeNativeError(format!("journal reconciliation failed: {error:?}"))
+            })?;
+        let Some(last) = page.last() else {
+            return Ok(file);
+        };
+        *read_cursor = last.seq;
+        let chunk = render_rows_after(&page, 0, projector);
+        if !chunk.is_empty() {
+            file = write_open(file, chunk).await?;
+        }
+    }
 }
 
 fn ordered_after(envelopes: &[RawEnvelope], cursor: u64) -> Vec<&RawEnvelope> {

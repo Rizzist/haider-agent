@@ -152,7 +152,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -678,6 +678,12 @@ struct HubInner {
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
+    /// One post-commit fan-out shared by every session actor. The journal is
+    /// still authoritative: the observe fold rebuilds on miss/gap, while the
+    /// roster channel is only a coalescing wake carrying the dirty session.
+    commit_projection: Arc<CommitProjection>,
+    observe_digests: Arc<rpc::ObserveDigestCache>,
+    roster_publications: broadcast::Sender<SessionId>,
     usage_report: Mutex<Option<Arc<crate::usage_report::UsageReportService>>>,
     /// W-A: the ONE in-memory projection of every session's background
     /// tasks. Hub-owned so every facade clone shares it; the journal's
@@ -691,6 +697,28 @@ struct HubInner {
     /// Ephemeral compiled-prompt acceleration. Journal bytes remain the
     /// authority; the cache is discarded with this daemon generation.
     prompt_history: PromptHistoryCache,
+}
+
+pub(super) struct CommitProjection {
+    hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
+    observe_digests: Arc<rpc::ObserveDigestCache>,
+    roster_publications: broadcast::Sender<SessionId>,
+}
+
+impl CommitProjection {
+    pub(super) fn observe_committed(&self, envelopes: &[RawEnvelope]) {
+        self.observe_digests.observe_committed(envelopes);
+        if let Ok(installed) = self.hooks.lock()
+            && let Some(hooks) = installed
+                .as_ref()
+                .and_then(crate::hooks::WeakHookService::upgrade)
+        {
+            hooks.observe_committed(envelopes);
+        }
+        if let Some(envelope) = envelopes.last() {
+            let _ = self.roster_publications.send(envelope.session_id.clone());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1041,6 +1069,7 @@ enum ActorCommand {
     },
     PinGraph {
         command: GraphPinCommand,
+        expected_digest: Option<String>,
         completed: oneshot::Sender<Result<GraphPinOutcome, HaiderError>>,
     },
     AttachChildGraph {
@@ -1267,13 +1296,21 @@ impl SessionHub {
     /// durable retry obligation; the full sweep is the obligation. Cost is
     /// one tail read per current session (catch-up work only where a file
     /// is actually behind), before the endpoint binds.
-    pub(crate) async fn reconcile_all_pipe_sidecars(&self) {
-        match self.inner.store.session_ids().await {
-            Ok(session_ids) => self.reconcile_pipe_sidecars(&session_ids).await,
-            Err(error) => {
+    pub(crate) async fn reconcile_all_pipe_sidecars(
+        &self,
+        boot_journals: &HashMap<SessionId, Vec<RawEnvelope>>,
+    ) {
+        for (session_id, journal) in boot_journals {
+            if let Err(error) = self
+                .inner
+                .pipe_native
+                .maintain_from_boot_journal(&self.inner.store, session_id, journal)
+                .await
+            {
                 tracing::warn!(
-                    error = %error.message,
-                    "boot sidecar sweep could not list sessions; journal remains authoritative"
+                    session_id = %session_id,
+                    %error,
+                    "boot native pipe sidecar reconciliation failed; journal remains authoritative"
                 );
             }
         }
@@ -1283,6 +1320,7 @@ impl SessionHub {
     /// existed. Sidecar projection is best-effort, just like post-commit actor
     /// maintenance: journal recovery remains authoritative if filesystem I/O
     /// fails.
+    #[cfg(test)]
     pub(crate) async fn reconcile_pipe_sidecars(&self, session_ids: &[SessionId]) {
         for session_id in session_ids {
             if let Err(error) = self
@@ -1315,6 +1353,14 @@ impl SessionHub {
         };
         let append_commit_task = tokio::spawn(run_append_committer(store.clone(), append_receiver));
         let (surface_publications, _) = watch::channel(0_u64);
+        let (roster_publications, _) = broadcast::channel(1_024);
+        let hooks = Arc::new(Mutex::new(None));
+        let observe_digests = Arc::new(rpc::ObserveDigestCache::default());
+        let commit_projection = Arc::new(CommitProjection {
+            hooks: Arc::clone(&hooks),
+            observe_digests: Arc::clone(&observe_digests),
+            roster_publications: roster_publications.clone(),
+        });
         let inner = Arc::new(HubInner {
             store,
             append_committer,
@@ -1338,7 +1384,10 @@ impl SessionHub {
             worker_manager: Mutex::new(None),
             accounts: Mutex::new(None),
             creatable_providers: Mutex::new(None),
-            hooks: Arc::new(Mutex::new(None)),
+            hooks,
+            commit_projection,
+            observe_digests,
+            roster_publications,
             usage_report: Mutex::new(None),
             tasks: crate::tasks::TaskRegistry::default(),
             web_degrade: Mutex::new(HashMap::new()),
@@ -1780,6 +1829,10 @@ impl SessionHub {
         self.inner.store.create_delegation(record).await
     }
 
+    pub(crate) fn notify_roster_session(&self, session_id: SessionId) {
+        let _ = self.inner.roster_publications.send(session_id);
+    }
+
     pub(crate) async fn delegation(
         &self,
         agent: haider_protocol::ids::AgentId,
@@ -2154,7 +2207,33 @@ impl SessionHub {
         let (completed, result) = oneshot::channel();
         actor
             .commands
-            .send(ActorCommand::PinGraph { command, completed })
+            .send(ActorCommand::PinGraph {
+                command,
+                expected_digest: None,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn pin_graph_matching_digest(
+        &self,
+        command: GraphPinCommand,
+        expected_digest: String,
+    ) -> Result<GraphPinOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::PinGraph {
+                command,
+                expected_digest: Some(expected_digest),
+                completed,
+            })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result
@@ -2774,6 +2853,11 @@ impl SessionHub {
         // after the actor is provably stopped and before the durable delete.
         self.fence_background_tasks(session_id).await;
         self.inner.store.delete_session(session_id.clone()).await?;
+        self.inner.observe_digests.remove(session_id);
+        if let Ok(Some(hooks)) = self.hooks() {
+            hooks.session_deleted(session_id.clone());
+        }
+        let _ = self.inner.roster_publications.send(session_id.clone());
         self.clear_session_surface(session_id);
         crate::delegation::DelegationHandle::new(self.clone())
             .cleanup_handoff_for_deleted_parent(&metadata.cwd, session_id)
@@ -2911,7 +2995,7 @@ impl SessionHub {
             Arc::clone(&self.inner.pipe_native),
             Arc::clone(&self.inner.observer),
             Arc::clone(&self.inner.metrics),
-            Arc::clone(&self.inner.hooks),
+            Arc::clone(&self.inner.commit_projection),
             Arc::clone(&self.inner.force_stop),
             receiver,
         ));

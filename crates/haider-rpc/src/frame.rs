@@ -276,6 +276,10 @@ pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
 /// Daemon implements the read-only, journal-derived session observation digest.
 pub const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
+/// Daemon accepts up to 64 observation coordinates in one read-only RPC.
+pub const FEATURE_SESSION_OBSERVE_BATCH_V1: &str = "session_observe_batch_v1";
+/// Daemon exposes the receipt-identical resident CLI submission alias.
+pub const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
 /// Daemon exposes typed crash-window state plus answerable recovery-card
 /// coordinates through the existing observation/menu-answer surfaces.
 pub const FEATURE_EFFECT_RECOVERY_V1: &str = "effect_recovery_v1";
@@ -1451,6 +1455,15 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "is_false")]
         metadata_only: bool,
     },
+    /// Batched form of `session.observe`; order is preserved exactly.
+    #[serde(rename = "session.observe_batch")]
+    SessionObserveBatch {
+        session_ids: Vec<SessionId>,
+        #[serde(default)]
+        last_event_limit: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        metadata_only: bool,
+    },
     /// Returns the bounded full descendant tree and daemon-side rollup from
     /// durable delegation and child-journal truth. Read-only and receipt-free.
     #[serde(rename = "session.fleet")]
@@ -1591,6 +1604,20 @@ pub enum RequestBody {
         command_id: CommandId,
         session_id: SessionId,
         worker_generation: u64,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<AttachmentBlock>,
+        mode: DeliveryMode,
+    },
+    /// Feature-gated resident CLI door. It enters the identical receipted
+    /// turn admission path without requiring a new process or daemon socket.
+    #[serde(rename = "turn.submit_from_cli")]
+    TurnSubmitFromCli {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
         text: String,
         #[serde(default)]
         attachments: Vec<AttachmentBlock>,
@@ -2002,6 +2029,8 @@ pub enum ResponseBody {
     SessionRead { result: SessionReadResult },
     #[serde(rename = "session.observe")]
     SessionObserve { digest: SessionObserveDigest },
+    #[serde(rename = "session.observe_batch")]
+    SessionObserveBatch { digests: Vec<SessionObserveDigest> },
     #[serde(rename = "session.fleet")]
     SessionFleet { snapshot: SessionFleetSnapshot },
     #[serde(rename = "graph.pin")]

@@ -180,6 +180,8 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_V1.to_owned(),
             haider_rpc::FEATURE_STORE_HEALTH_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),
+            haider_rpc::FEATURE_RESIDENT_TURN_SUBMIT_V1.to_owned(),
             haider_rpc::FEATURE_TUI_ATTACH_ANNOUNCE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_AGENT_TYPE_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LINEAGE_V1.to_owned(),

@@ -54,100 +54,13 @@ struct AttachmentValidationFailure {
     data: Option<ErrorData>,
 }
 
-async fn latest_context_footprint(
-    store: &dyn StoreHandle,
-    session_id: &SessionId,
-    through_seq: u64,
-) -> Result<Option<ContextFootprint>, HaiderError> {
-    Ok(session_summary_truth(store, session_id, through_seq)
-        .await?
-        .1)
-}
-
-/// One sealed-journal replay computing the roster truth a `session.list`
-/// summary carries for an UNATTACHED session: the committed main-timeline
-/// user-turn count (durable `UserMessage` envelopes not scoped to a
-/// subagent) and the latest durable [`ContextFootprint`] snapshot. These
-/// are the SAME durable sources the observe surface replays, so a summary
-/// never disagrees with observation after attach.
-async fn session_summary_truth(
-    store: &dyn StoreHandle,
-    session_id: &SessionId,
-    through_seq: u64,
-) -> Result<
-    (
-        u64,
-        Option<ContextFootprint>,
-        haider_rpc::ObserveRunStateWire,
-    ),
-    HaiderError,
-> {
-    let mut since_seq = 0;
-    let mut turns = 0_u64;
-    let mut latest = None;
-    let mut runs = HashMap::<RunId, ObservedRun>::new();
-    while since_seq < through_seq {
-        let page = store.read(session_id, since_seq, REPLAY_PAGE_SIZE).await?;
-        if page.is_empty() {
-            break;
-        }
-        let mut advanced = false;
-        for envelope in page {
-            if envelope.seq > through_seq {
-                return Ok((turns, latest, summary_run_state(&runs)));
-            }
-            since_seq = envelope.seq;
-            advanced = true;
-            let agent_scoped = envelope.agent_id.is_some();
-            let run_id = envelope.run_id.clone();
-            let branch_id = envelope.branch_id.clone();
-            let seq = envelope.seq;
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
-                continue;
-            };
-            match payload {
-                EventPayload::UserMessage { .. } if !agent_scoped => {
-                    turns = turns.saturating_add(1);
-                }
-                EventPayload::Item(ItemEvent::Completed { item, .. }) => {
-                    if let Some(footprint) = ContextFootprint::from_extension_item(&item) {
-                        latest = Some(footprint);
-                    }
-                }
-                EventPayload::RunState(state) => {
-                    if let Some(run_id) = run_id {
-                        runs.insert(
-                            run_id,
-                            ObservedRun {
-                                state,
-                                seq,
-                                branch_id,
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !advanced {
-            break;
-        }
-    }
-    Ok((turns, latest, summary_run_state(&runs)))
-}
-
-fn summary_run_state(runs: &HashMap<RunId, ObservedRun>) -> haider_rpc::ObserveRunStateWire {
-    select_observed_run(runs).map_or(haider_rpc::ObserveRunStateWire::Idle, |run| {
-        observe_run_state(&run.state)
-    })
-}
-
 /// Compact direct-agent metrics from the same sealed journal head carried by
 /// `SessionSummary`. The live child path publishes the identical shape into
 /// the parent journal; this summary copy is the cold/reconnect and `/usage`
 /// main-agent fallback. The same fold also returns the model active at that
 /// head: its seed is the metadata model and each durable `model_selected`
 /// fact replaces it in sequence order.
+#[allow(dead_code)]
 async fn session_agent_metrics_truth(
     store: &dyn StoreHandle,
     session_id: &SessionId,
@@ -529,6 +442,459 @@ struct ObserveProjection {
     main_head_seq: u64,
     branches: HashMap<haider_protocol::ids::BranchId, haider_protocol::branch::BranchDescriptor>,
     updated_at_ms: u64,
+}
+
+/// Daemon-lifetime observe/roster fold. Missing sessions rebuild from the
+/// journal oracle; once installed, the session actor extends the fold with
+/// every committed envelope before waking roster consumers.
+pub(super) struct ObserveDigestCache {
+    sessions: Mutex<HashMap<SessionId, ObserveCacheEntry>>,
+    next_build: AtomicU64,
+}
+
+impl Default for ObserveDigestCache {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            next_build: AtomicU64::new(1),
+        }
+    }
+}
+
+enum ObserveCacheEntry {
+    Building {
+        token: u64,
+        pending: Vec<RawEnvelope>,
+    },
+    Ready(ObserveFold),
+}
+
+struct ObserveFold {
+    head_seq: u64,
+    projection: ObserveProjection,
+    turns: u64,
+    metrics: crate::usage_report::SessionFolder,
+}
+
+#[derive(Clone)]
+struct ObserveFoldSnapshot {
+    head_seq: u64,
+    title: Option<String>,
+    run_state: haider_rpc::ObserveRunStateWire,
+    active_branch_id: Option<BranchId>,
+    branches: Vec<haider_protocol::branch::BranchDescriptor>,
+    main_head_node_id: Option<haider_protocol::ids::NodeId>,
+    main_head_seq: u64,
+    footprint: Option<ContextFootprint>,
+    pending_menus: Vec<haider_rpc::ObserveMenuWire>,
+    subagents: Vec<haider_rpc::ObserveSubagentWire>,
+    updated_at_ms: u64,
+    event_kinds: Vec<String>,
+    turns: u64,
+    agent_metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+    last_model: Option<String>,
+}
+
+enum CacheStart {
+    Ready(ObserveFoldSnapshot),
+    BuildAndInstall(u64),
+    BuildOnly,
+}
+
+struct ObserveBuildGuard {
+    cache: Arc<ObserveDigestCache>,
+    session_id: SessionId,
+    token: u64,
+    armed: bool,
+}
+
+impl ObserveBuildGuard {
+    fn new(cache: Arc<ObserveDigestCache>, session_id: SessionId, token: u64) -> Self {
+        Self {
+            cache,
+            session_id,
+            token,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ObserveBuildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cache.abandon(&self.session_id, self.token);
+        }
+    }
+}
+
+impl ObserveFold {
+    fn new(initial_model: &str) -> Self {
+        Self {
+            head_seq: 0,
+            projection: ObserveProjection::new(100),
+            turns: 0,
+            metrics: crate::usage_report::SessionFolder::new(initial_model),
+        }
+    }
+
+    fn apply(&mut self, envelope: RawEnvelope) {
+        self.head_seq = self.head_seq.max(envelope.seq);
+        if envelope.agent_id.is_none()
+            && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
+        {
+            self.turns = self.turns.saturating_add(1);
+        }
+        self.metrics.push(&envelope);
+        self.projection.apply(envelope);
+    }
+
+    fn snapshot(&self, session_id: &SessionId) -> ObserveFoldSnapshot {
+        let selected = select_observed_run(&self.projection.runs);
+        let run_state = selected.map_or(haider_rpc::ObserveRunStateWire::Idle, |run| {
+            observe_run_state(&run.state)
+        });
+        let active_branch_id = selected.and_then(|run| run.branch_id.clone());
+        let mut branches = self
+            .projection
+            .branches
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        branches.sort_by_key(|branch| branch.created_seq);
+        ObserveFoldSnapshot {
+            head_seq: self.head_seq,
+            title: self.projection.title.clone(),
+            run_state,
+            active_branch_id,
+            branches,
+            main_head_node_id: self.projection.main_head_node_id.clone(),
+            main_head_seq: self.projection.main_head_seq,
+            footprint: self.projection.footprint.clone(),
+            pending_menus: self.projection.menus.values().cloned().collect(),
+            subagents: self.projection.subagents.values().cloned().collect(),
+            updated_at_ms: self.projection.updated_at_ms,
+            event_kinds: self.projection.event_kinds.iter().cloned().collect(),
+            turns: self.turns,
+            agent_metrics: self
+                .metrics
+                .primary_agent_snapshot(session_id, self.head_seq),
+            last_model: self.metrics.active_model().map(str::to_owned),
+        }
+    }
+}
+
+impl ObserveFoldSnapshot {
+    fn digest(
+        &self,
+        session_id: SessionId,
+        worker_generation: u64,
+        metadata: Option<haider_protocol::session::SessionMetadataV1>,
+        event_limit: usize,
+        include_summary: bool,
+    ) -> haider_rpc::SessionObserveDigest {
+        let title = self.title.clone().unwrap_or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| {
+                    std::path::Path::new(&metadata.cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(ToOwned::to_owned)
+                })
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| session_id.as_str().to_owned())
+        });
+        let event_start = self.event_kinds.len().saturating_sub(event_limit);
+        haider_rpc::SessionObserveDigest {
+            session_id,
+            head_seq: self.head_seq,
+            worker_generation,
+            metadata,
+            title,
+            run_state: self.run_state,
+            active_branch_id: self.active_branch_id.clone(),
+            branches: self.branches.clone(),
+            main_head_node_id: self.main_head_node_id.clone(),
+            main_head_seq: self.main_head_seq,
+            latest_context_footprint: self.footprint.clone(),
+            pending_menus: self.pending_menus.clone(),
+            subagents: self.subagents.clone(),
+            updated_at_ms: self.updated_at_ms,
+            last_event_kinds: self.event_kinds[event_start..].to_vec(),
+            turn_count: include_summary.then_some(self.turns),
+            agent_metrics: include_summary
+                .then(|| self.agent_metrics.clone())
+                .flatten(),
+        }
+    }
+}
+
+impl ObserveDigestCache {
+    fn start(&self, session_id: &SessionId) -> CacheStart {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match sessions.get(session_id) {
+            Some(ObserveCacheEntry::Ready(fold)) => CacheStart::Ready(fold.snapshot(session_id)),
+            Some(ObserveCacheEntry::Building { .. }) => CacheStart::BuildOnly,
+            None => {
+                let token = self.next_build.fetch_add(1, Ordering::Relaxed);
+                sessions.insert(
+                    session_id.clone(),
+                    ObserveCacheEntry::Building {
+                        token,
+                        pending: Vec::new(),
+                    },
+                );
+                CacheStart::BuildAndInstall(token)
+            }
+        }
+    }
+
+    fn install(
+        &self,
+        session_id: SessionId,
+        mut fold: ObserveFold,
+        build_token: Option<u64>,
+    ) -> ObserveFoldSnapshot {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = match sessions.remove(&session_id) {
+            Some(ObserveCacheEntry::Building { token, pending }) if build_token == Some(token) => {
+                pending
+            }
+            Some(entry @ ObserveCacheEntry::Building { .. }) => {
+                sessions.insert(session_id.clone(), entry);
+                return fold.snapshot(&session_id);
+            }
+            Some(ObserveCacheEntry::Ready(current)) => {
+                if current.head_seq >= fold.head_seq {
+                    let snapshot = current.snapshot(&session_id);
+                    sessions.insert(session_id, ObserveCacheEntry::Ready(current));
+                    return snapshot;
+                }
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        for envelope in pending {
+            if envelope.seq > fold.head_seq {
+                if envelope.seq != fold.head_seq.saturating_add(1) {
+                    // A gap means a writer bypassed the live commit seam.
+                    // Leave the cache absent so the next read replays the
+                    // deterministic journal oracle instead of guessing.
+                    return fold.snapshot(&session_id);
+                }
+                fold.apply(envelope);
+            }
+        }
+        let snapshot = fold.snapshot(&session_id);
+        sessions.insert(session_id, ObserveCacheEntry::Ready(fold));
+        snapshot
+    }
+
+    fn abandon(&self, session_id: &SessionId, token: u64) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            sessions.get(session_id),
+            Some(ObserveCacheEntry::Building {
+                token: current,
+                ..
+            }) if *current == token
+        ) {
+            sessions.remove(session_id);
+        }
+    }
+
+    pub(super) fn observe_committed(&self, envelopes: &[RawEnvelope]) {
+        let Some(first) = envelopes.first() else {
+            return;
+        };
+        let session_id = &first.session_id;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return;
+        };
+        let mut invalidate = false;
+        match entry {
+            ObserveCacheEntry::Building { pending, .. } => pending.extend_from_slice(envelopes),
+            ObserveCacheEntry::Ready(fold) => {
+                for envelope in envelopes {
+                    if envelope.seq <= fold.head_seq {
+                        continue;
+                    }
+                    if envelope.seq != fold.head_seq.saturating_add(1) {
+                        invalidate = true;
+                        break;
+                    }
+                    fold.apply(envelope.clone());
+                }
+            }
+        }
+        if invalidate {
+            sessions.remove(session_id);
+        }
+    }
+
+    pub(super) fn remove(&self, session_id: &SessionId) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+}
+
+/// Deterministic cache-miss/cold-start oracle. It consumes a sealed journal
+/// prefix in sequence order and is intentionally retained independently of
+/// the incremental commit path so parity can be asserted directly.
+async fn rebuild_observe_fold(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    through_seq: u64,
+    initial_model: &str,
+) -> Result<ObserveFold, HaiderError> {
+    let mut fold = ObserveFold::new(initial_model);
+    let mut cursor = 0;
+    while cursor < through_seq {
+        let page = store.read(session_id, cursor, REPLAY_PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        let mut advanced = false;
+        for envelope in page {
+            if envelope.seq > through_seq {
+                break;
+            }
+            cursor = envelope.seq;
+            advanced = true;
+            fold.apply(envelope);
+        }
+        if !advanced {
+            break;
+        }
+    }
+    if fold.head_seq != through_seq {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!(
+                "observe digest rebuild stopped at sequence {} before sealed head {through_seq}",
+                fold.head_seq
+            ),
+            false,
+        ));
+    }
+    Ok(fold)
+}
+
+async fn cached_observe_snapshot(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    initial_model: &str,
+) -> Result<ObserveFoldSnapshot, SessionHubError> {
+    loop {
+        match hub.inner.observe_digests.start(session_id) {
+            CacheStart::Ready(snapshot) => {
+                let head_seq = hub.inner.store.latest_seq(session_id).await?;
+                if snapshot.head_seq == head_seq {
+                    return Ok(snapshot);
+                }
+                let fold =
+                    rebuild_observe_fold(&hub.inner.store, session_id, head_seq, initial_model)
+                        .await?;
+                let snapshot = hub
+                    .inner
+                    .observe_digests
+                    .install(session_id.clone(), fold, None);
+                if snapshot.head_seq == hub.inner.store.latest_seq(session_id).await? {
+                    return Ok(snapshot);
+                }
+            }
+            CacheStart::BuildAndInstall(token) => {
+                let mut guard = ObserveBuildGuard::new(
+                    Arc::clone(&hub.inner.observe_digests),
+                    session_id.clone(),
+                    token,
+                );
+                let head_seq = hub.inner.store.latest_seq(session_id).await?;
+                let fold =
+                    rebuild_observe_fold(&hub.inner.store, session_id, head_seq, initial_model)
+                        .await?;
+                let snapshot =
+                    hub.inner
+                        .observe_digests
+                        .install(session_id.clone(), fold, Some(token));
+                guard.disarm();
+                if snapshot.head_seq == hub.inner.store.latest_seq(session_id).await? {
+                    return Ok(snapshot);
+                }
+            }
+            CacheStart::BuildOnly => {
+                let head_seq = hub.inner.store.latest_seq(session_id).await?;
+                let fold =
+                    rebuild_observe_fold(&hub.inner.store, session_id, head_seq, initial_model)
+                        .await?;
+                let snapshot = fold.snapshot(session_id);
+                if snapshot.head_seq == hub.inner.store.latest_seq(session_id).await? {
+                    return Ok(snapshot);
+                }
+            }
+        }
+    }
+}
+
+const MAX_OBSERVE_EVENT_KINDS: usize = 100;
+const MAX_OBSERVE_BATCH: usize = 64;
+
+async fn session_observe_digest(
+    hub: &SessionHub,
+    session_id: SessionId,
+    last_event_limit: u32,
+    metadata_only: bool,
+) -> Result<Option<haider_rpc::SessionObserveDigest>, SessionHubError> {
+    let metadata = hub.inner.store.session_metadata(&session_id).await?;
+    let initial_model = metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.model.as_str());
+    let snapshot = cached_observe_snapshot(hub, &session_id, initial_model).await?;
+    if snapshot.head_seq == 0 {
+        return Ok(None);
+    }
+    let event_limit = usize::try_from(last_event_limit)
+        .unwrap_or(usize::MAX)
+        .min(MAX_OBSERVE_EVENT_KINDS);
+    let digest = if metadata_only {
+        let mut projection = ObserveProjection::new(event_limit);
+        projection.title = snapshot.title;
+        projection.finish(
+            session_id,
+            snapshot.head_seq,
+            hub.inner.store.worker_generation(),
+            metadata,
+        )
+    } else {
+        snapshot.digest(
+            session_id,
+            hub.inner.store.worker_generation(),
+            metadata,
+            event_limit,
+            true,
+        )
+    };
+    Ok(Some(digest))
 }
 
 impl ObserveProjection {
@@ -1363,6 +1729,23 @@ impl HubConnection {
                 self.session_observe(request_id, session_id, last_event_limit, metadata_only)
                     .await
             }
+            RequestBody::SessionObserveBatch {
+                session_ids,
+                last_event_limit,
+                metadata_only,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_observe_batch(request_id, session_ids, last_event_limit, metadata_only)
+                    .await
+            }
             RequestBody::SessionFleet { session_id } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -1698,6 +2081,49 @@ impl HubConnection {
                     session_id,
                     worker_generation,
                     None,
+                    text,
+                    attachments,
+                    mode,
+                    false,
+                )
+                .await
+            }
+            RequestBody::TurnSubmitFromCli {
+                command_id,
+                session_id,
+                worker_generation,
+                branch_id,
+                text,
+                attachments,
+                mode,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "turn submission requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.turn_submit(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    branch_id,
                     text,
                     attachments,
                     mode,
@@ -6146,6 +6572,9 @@ impl HubConnection {
     fn session_list_watch(&self, request_id: RequestId) -> Result<(), SessionHubError> {
         let mut watch = lock(&self.roster_watch)?;
         let accepted = watch.as_ref().is_none_or(JoinHandle::is_finished);
+        // Subscribe before acknowledging so a commit racing registration is
+        // either present in the baseline or queued as a dirty-session wake.
+        let mut publications = self.hub.inner.roster_publications.subscribe();
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionListWatch { accepted },
@@ -6157,45 +6586,84 @@ impl HubConnection {
         let hub = self.hub.clone();
         let sink = Arc::clone(&self.sink);
         *watch = Some(tokio::spawn(async move {
-            let period = std::time::Duration::from_millis(1_000);
+            let period = std::time::Duration::from_secs(30);
             let mut ticker = interval_at(tokio::time::Instant::now() + period, period);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut pushed_heads = BTreeMap::<String, u64>::new();
+            let mut reconcile_all = true;
             loop {
-                ticker.tick().await;
-                let Ok(ids) = hub.inner.store.session_ids().await else {
-                    continue;
-                };
-                let mut current_heads = Vec::with_capacity(ids.len());
-                let mut head_read_failed = false;
-                for session_id in &ids {
-                    match hub.inner.store.latest_seq(session_id).await {
-                        Ok(head_seq) => current_heads.push((session_id.clone(), head_seq)),
-                        Err(_) => {
-                            head_read_failed = true;
-                            break;
+                if reconcile_all {
+                    let Ok(ids) = hub.inner.store.session_ids().await else {
+                        ticker.tick().await;
+                        continue;
+                    };
+                    let mut current_heads = Vec::with_capacity(ids.len());
+                    let mut head_read_failed = false;
+                    for session_id in &ids {
+                        match hub.inner.store.latest_seq(session_id).await {
+                            Ok(head_seq) => current_heads.push((session_id.clone(), head_seq)),
+                            Err(_) => {
+                                head_read_failed = true;
+                                break;
+                            }
                         }
                     }
-                }
-                if head_read_failed {
-                    continue;
+                    if head_read_failed {
+                        ticker.tick().await;
+                        continue;
+                    }
+                    // Removed sessions are deliberately silent in v1.
+                    let current_ids = current_heads
+                        .iter()
+                        .map(|(session_id, _)| session_id.as_str())
+                        .collect::<BTreeSet<_>>();
+                    pushed_heads.retain(|session_id, _| current_ids.contains(session_id.as_str()));
+                    let changed_ids = roster_fold_candidates(&pushed_heads, &current_heads);
+                    if !changed_ids.is_empty()
+                        && let Ok(changed) = session_summaries(&hub, &changed_ids).await
+                    {
+                        push_roster_chunks(sink.as_ref(), changed, &mut pushed_heads);
+                    }
+                    reconcile_all = false;
                 }
 
-                // Removed sessions are deliberately silent in v1. Forgetting
-                // their head makes a later recreation appear new.
-                let current_ids = current_heads
-                    .iter()
-                    .map(|(session_id, _)| session_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                pushed_heads.retain(|session_id, _| current_ids.contains(session_id.as_str()));
-                let changed_ids = roster_fold_candidates(&pushed_heads, &current_heads);
-                if changed_ids.is_empty() {
-                    continue;
-                }
-                let Ok(changed) = session_summaries(&hub, &changed_ids).await else {
-                    continue;
+                let first = tokio::select! {
+                    received = publications.recv() => received,
+                    _ = ticker.tick() => {
+                        reconcile_all = true;
+                        continue;
+                    }
                 };
-                push_roster_chunks(sink.as_ref(), changed, &mut pushed_heads);
+                let mut dirty = BTreeMap::<String, SessionId>::new();
+                match first {
+                    Ok(session_id) => {
+                        dirty.insert(session_id.as_str().to_owned(), session_id);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        reconcile_all = true;
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                while let Ok(session_id) = publications.try_recv() {
+                    dirty.insert(session_id.as_str().to_owned(), session_id);
+                }
+                for session_id in dirty.into_values() {
+                    let Ok(head_seq) = hub.inner.store.latest_seq(&session_id).await else {
+                        continue;
+                    };
+                    if head_seq == 0 {
+                        pushed_heads.remove(session_id.as_str());
+                        continue;
+                    }
+                    if pushed_heads.get(session_id.as_str()) == Some(&head_seq) {
+                        continue;
+                    }
+                    let Ok(changed) = session_summaries(&hub, &[session_id]).await else {
+                        continue;
+                    };
+                    push_roster_chunks(sink.as_ref(), changed, &mut pushed_heads);
+                }
             }
         }));
         Ok(())
@@ -6563,13 +7031,19 @@ impl HubConnection {
             .into_iter()
             .take_while(|envelope| envelope.seq <= range.end_seq)
             .collect::<Vec<_>>();
+        let metadata = self.hub.inner.store.session_metadata(&session_id).await?;
+        let initial_model = metadata
+            .as_ref()
+            .map_or("", |metadata| metadata.model.as_str());
         let latest_context_footprint =
-            latest_context_footprint(&self.hub.inner.store, &session_id, head).await?;
+            cached_observe_snapshot(&self.hub, &session_id, initial_model)
+                .await?
+                .footprint;
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionRead {
                 result: SessionReadResult {
-                    metadata: self.hub.inner.store.session_metadata(&session_id).await?,
+                    metadata,
                     session_id,
                     range,
                     head_seq: head,
@@ -6587,10 +7061,9 @@ impl HubConnection {
         last_event_limit: u32,
         metadata_only: bool,
     ) -> Result<(), SessionHubError> {
-        const MAX_EVENT_KINDS: usize = 100;
-
-        let head = self.hub.inner.store.latest_seq(&session_id).await?;
-        if head == 0 {
+        let Some(digest) =
+            session_observe_digest(&self.hub, session_id, last_event_limit, metadata_only).await?
+        else {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_NOT_FOUND,
@@ -6598,87 +7071,48 @@ impl HubConnection {
                 false,
                 None,
             );
-        }
-        let event_limit = usize::try_from(last_event_limit)
-            .unwrap_or(usize::MAX)
-            .min(MAX_EVENT_KINDS);
-        let metadata = self.hub.inner.store.session_metadata(&session_id).await?;
-        let mut projection = ObserveProjection::new(event_limit);
-        let mut cursor = 0;
-        'replay: while cursor < head {
-            let page = self
-                .hub
-                .inner
-                .store
-                .read(&session_id, cursor, REPLAY_PAGE_SIZE)
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            let mut advanced = false;
-            for envelope in page {
-                if envelope.seq > head {
-                    break;
-                }
-                cursor = envelope.seq;
-                advanced = true;
-                if metadata_only {
-                    // #7 export fast path: only the title projection is
-                    // requested, and only a `user_message` can set it. The
-                    // type-tag peek preserves "first user message in seq
-                    // order" exactly (any payload decoding to UserMessage
-                    // carries that tag), so the fast path's title is
-                    // byte-identical to the full replay's.
-                    if envelope
-                        .payload
-                        .get("type")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("user_message")
-                    {
-                        projection.apply(envelope);
-                        if projection.title.is_some() {
-                            break 'replay;
-                        }
-                    }
-                } else {
-                    projection.apply(envelope);
-                }
-            }
-            if !advanced {
-                break;
-            }
-        }
-        // #13: the config door reads roster truth from this digest instead of
-        // scanning session.list pages; both fields come from the SAME truth
-        // functions the listing uses, at this observe's sealed head.
-        let (turn_count, agent_metrics) = if metadata_only {
-            (None, None)
-        } else {
-            let (turns, _footprint, _run_state) =
-                session_summary_truth(&self.hub.inner.store, &session_id, head).await?;
-            let initial_model = metadata
-                .as_ref()
-                .map_or("", |metadata| metadata.model.as_str());
-            let (agent_metrics, _last_model) = session_agent_metrics_truth(
-                &self.hub.inner.store,
-                &session_id,
-                head,
-                initial_model,
-            )
-            .await?;
-            (Some(turns), agent_metrics)
         };
-        let mut digest = projection.finish(
-            session_id,
-            head,
-            self.hub.inner.store.worker_generation(),
-            metadata,
-        );
-        digest.turn_count = turn_count;
-        digest.agent_metrics = agent_metrics;
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionObserve { digest },
+        })
+    }
+
+    async fn session_observe_batch(
+        &self,
+        request_id: RequestId,
+        session_ids: Vec<SessionId>,
+        last_event_limit: u32,
+        metadata_only: bool,
+    ) -> Result<(), SessionHubError> {
+        if session_ids.is_empty() || session_ids.len() > MAX_OBSERVE_BATCH {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session.observe_batch requires between 1 and 64 session ids",
+                false,
+                None,
+            );
+        }
+        let mut digests = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let Some(digest) =
+                session_observe_digest(&self.hub, session_id, last_event_limit, metadata_only)
+                    .await?
+            else {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_NOT_FOUND,
+                    "session was not found",
+                    false,
+                    None,
+                );
+            };
+            digests.push(digest);
+        }
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionObserveBatch { digests },
         })
     }
 
@@ -7349,28 +7783,29 @@ pub(crate) async fn session_summaries(
 ) -> Result<Vec<SessionSummary>, SessionHubError> {
     let mut sessions = Vec::with_capacity(session_ids.len());
     for session_id in session_ids {
-        // Ship-gate round: the HEAD seals FIRST. The two reads are not a
-        // snapshot — a rename/model commit between them updates metadata and
-        // appends its fact atomically, so metadata-then-head could pair OLD
-        // metadata with the NEW head, and a head-gated watcher recording
-        // that head would suppress the refold forever. Head-first inverts
-        // the race into a self-healing one: a commit after this head read
-        // moves the TRUE head past the recorded value, so the next tick
-        // refolds and converges. Staleness is transient, never sticky.
-        let head_seq = hub.inner.store.latest_seq(session_id).await?;
-        let metadata = hub.inner.store.session_metadata(session_id).await?;
-        // Roster truth for unattached sessions replays the same sealed journal
-        // as observation, so watches and explicit lists cannot disagree.
-        let (turns, footprint, run_state) =
-            session_summary_truth(&hub.inner.store, session_id, head_seq).await?;
+        // Seal the head before metadata and accept the pair only when the
+        // cached fold lands on that exact seal. A commit during either read
+        // forces a retry, preventing OLD metadata from being published with
+        // a NEW head that the watcher would then consider fully delivered.
+        let (metadata, snapshot) = loop {
+            let sealed_head = hub.inner.store.latest_seq(session_id).await?;
+            let metadata = hub.inner.store.session_metadata(session_id).await?;
+            let initial_model = metadata
+                .as_ref()
+                .map_or("", |metadata| metadata.model.as_str());
+            let snapshot = cached_observe_snapshot(hub, session_id, initial_model).await?;
+            if snapshot.head_seq == sealed_head {
+                break (metadata, snapshot);
+            }
+        };
+        let head_seq = snapshot.head_seq;
+        let turns = snapshot.turns;
+        let footprint = snapshot.footprint;
+        let run_state = snapshot.run_state;
         let (footprint_tokens, footprint_truth) =
             summary_footprint_fields(turns, footprint.as_ref());
-        let initial_model = metadata
-            .as_ref()
-            .map_or("", |metadata| metadata.model.as_str());
-        let (agent_metrics, last_model) =
-            session_agent_metrics_truth(&hub.inner.store, session_id, head_seq, initial_model)
-                .await?;
+        let agent_metrics = snapshot.agent_metrics;
+        let last_model = snapshot.last_model;
         let title = metadata
             .as_ref()
             .and_then(|metadata| metadata.title.clone());

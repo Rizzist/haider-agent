@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 16;
 
 struct Migration {
     version: u32,
@@ -299,6 +299,34 @@ const MIGRATIONS: &[Migration] = &[
         version: 14,
         sql: "
             ALTER TABLE events ADD COLUMN payload_kind TEXT;
+        ",
+    },
+    Migration {
+        version: 15,
+        sql: "
+            CREATE INDEX events_payload_kind_session_seq
+            ON events(payload_kind, session_id, seq);
+
+            CREATE TABLE graph_telemetry_projection (
+                session_id       TEXT PRIMARY KEY,
+                through_seq      INTEGER NOT NULL CHECK (through_seq > 0),
+                reducer_version  INTEGER NOT NULL,
+                tool_state       BLOB NOT NULL,
+                projection       BLOB NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+        ",
+    },
+    Migration {
+        version: 16,
+        sql: "
+            CREATE TABLE graph_telemetry_dirty (
+                session_id TEXT PRIMARY KEY,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
+            UPDATE events SET payload_kind = 'item_legacy'
+            WHERE payload_kind = 'item';
         ",
     },
 ];

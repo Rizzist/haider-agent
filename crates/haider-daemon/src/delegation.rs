@@ -37,7 +37,7 @@ use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildWorkflowDecision,
     ChildWorkflowTrigger, EvidenceAuthority, EvidenceVerdict, GraphGateKind, GraphPhase,
     GraphStatus, ParentGraphAttempt, child_contract_subject_digest, child_gate_structure,
-    decide_child_workflow, graph_template, graph_template_digest, reduce_graphs,
+    decide_child_workflow_with_registry, graph_template, graph_template_digest, reduce_graphs,
     validate_graph_template,
 };
 use haider_protocol::ids::{
@@ -195,10 +195,19 @@ impl DelegationHandle {
         let child_session_id = SessionId::new(format!("session-child-{identity}"));
         let child_run_id = RunId::new(format!("run-child-{identity}"));
         let lease = LeaseId::new(format!("lease-child-{identity}"));
-        let decision = decide_child_workflow(
+        let registered_workflow = match request.workflow.as_ref() {
+            Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
+                if graph_template(name).is_none() =>
+            {
+                self.hub.loom_workflow(name).await?
+            }
+            _ => None,
+        };
+        let decision = decide_child_workflow_with_registry(
             request.workflow.as_ref(),
             request.workflow_trigger,
             request.workflow_author,
+            registered_workflow.is_some(),
         );
         let mut requested_grant = crate::worker::default_child_grant();
         // B3 — a typed child starts from its TYPE's grant, intersected with
@@ -218,6 +227,7 @@ impl DelegationHandle {
                 &child_run_id,
                 &identity,
                 &requested_grant,
+                registered_workflow.as_ref(),
             )
             .await?;
         if workflow.is_some() {
@@ -377,6 +387,44 @@ impl DelegationHandle {
             })
             .await?;
 
+        if let Some(attached) = workflow.as_ref() {
+            let pin_request = serde_json::to_string(&serde_json::json!({
+                "session_id": attached.child_session_id,
+                "graph_id": attached.child_graph_id,
+                "template": attached.template,
+                "expected_digest": attached.digest,
+            }))
+            .map_err(internal_serialization)?;
+            let pinned = match self
+                .hub
+                .pin_graph_matching_digest(
+                    GraphPinCommand {
+                        command_id: format!("delegation-graph-pin-{identity}"),
+                        request_digest: digest_bytes(pin_request.as_bytes()),
+                        request_json: pin_request,
+                        session_id: attached.child_session_id.clone(),
+                        worker_generation: self.hub.worker_generation(),
+                        graph_id: attached.child_graph_id.clone(),
+                        template: attached.template.clone(),
+                        device_id: self.hub.device_id(),
+                    },
+                    attached.digest.clone(),
+                )
+                .await
+                .map_err(hub_graph_error)?
+            {
+                GraphPinOutcome::Committed { pinned, .. }
+                | GraphPinOutcome::IdempotentReplay { pinned } => pinned,
+            };
+            if pinned.digest != attached.digest {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "exact child workflow pin returned a different digest",
+                    false,
+                ));
+            }
+        }
+
         let record = DelegationRecord {
             agent_id: agent_id.clone(),
             child_session_id: child_session_id.clone(),
@@ -399,30 +447,9 @@ impl DelegationHandle {
             DelegationCreateOutcome::Committed(record)
             | DelegationCreateOutcome::IdempotentReplay(record) => record,
         };
+        self.hub
+            .notify_roster_session(record.child_session_id.clone());
         if let Some(attached) = workflow {
-            let pin_request = serde_json::to_string(&serde_json::json!({
-                "session_id": attached.child_session_id,
-                "graph_id": attached.child_graph_id,
-                "template": attached.template,
-            }))
-            .map_err(internal_serialization)?;
-            match self
-                .hub
-                .pin_graph(GraphPinCommand {
-                    command_id: format!("delegation-graph-pin-{identity}"),
-                    request_digest: digest_bytes(pin_request.as_bytes()),
-                    request_json: pin_request,
-                    session_id: attached.child_session_id.clone(),
-                    worker_generation: self.hub.worker_generation(),
-                    graph_id: attached.child_graph_id.clone(),
-                    template: attached.template.clone(),
-                    device_id: self.hub.device_id(),
-                })
-                .await
-                .map_err(hub_graph_error)?
-            {
-                GraphPinOutcome::Committed { .. } | GraphPinOutcome::IdempotentReplay { .. } => {}
-            }
             let attach_request =
                 serde_json::to_string(&attached).map_err(internal_serialization)?;
             self.hub
@@ -501,6 +528,7 @@ impl DelegationHandle {
         child_run_id: &RunId,
         identity: &str,
         requested_grant: &Grant,
+        registered_workflow: Option<&LoomWorkflow>,
     ) -> Result<Option<ChildGraphAttached>, HaiderError> {
         let Some(template_name) = decision.template.as_deref() else {
             return Ok(None);
@@ -551,12 +579,18 @@ impl DelegationHandle {
                     "workflow child named no declared slot on the parent obligation",
                 )
             })?;
-        let template = graph_template(template_name).ok_or_else(|| {
-            workflow_rejection(
-                "unknown_child_workflow",
-                format!("unknown child workflow template `{template_name}`"),
-            )
-        })?;
+        let template = graph_template(template_name)
+            .or_else(|| {
+                registered_workflow
+                    .filter(|workflow| workflow.id == template_name)
+                    .map(|workflow| workflow.template.clone())
+            })
+            .ok_or_else(|| {
+                workflow_rejection(
+                    "unknown_child_workflow",
+                    format!("unknown child workflow template `{template_name}`"),
+                )
+            })?;
         validate_graph_template(&template)
             .map_err(|error| workflow_rejection("malformed_child_workflow", error.to_string()))?;
         if template.nodes.iter().any(|node| {

@@ -302,6 +302,18 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.pin_graph(&command))).await
     }
 
+    pub async fn pin_graph_matching_digest(
+        &self,
+        command: GraphPinCommand,
+        expected_digest: String,
+    ) -> Result<GraphPinOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.pin_graph_matching_digest(&command, &expected_digest))
+        })
+        .await
+    }
+
     pub async fn attach_child_graph(
         &self,
         command: ChildGraphAttachCommand,

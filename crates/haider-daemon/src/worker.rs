@@ -492,8 +492,9 @@ impl ContextCompactor for DaemonContextCompactor {
             attachments,
             cache_metadata: Some(cache_metadata.clone()),
         };
-        if let Some(rendered) = self.provider.rendered_cache_prefix_digests(&request) {
-            prefix_digests = rendered;
+        let prepared = self.provider.prepare_turn(&request);
+        if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
+            prefix_digests = rendered.clone();
             cache_metadata = self.compaction_cache_metadata(
                 &request.messages,
                 covered_history_end,
@@ -505,7 +506,7 @@ impl ContextCompactor for DaemonContextCompactor {
         let replay_request_messages = request.messages.clone();
         let (mut stream, request_messages, request_prefix_digests) = match self
             .provider
-            .stream_turn(request)
+            .stream_prepared_turn(request, prepared)
             .await
         {
             Ok(stream) => (stream, replay_request_messages, prefix_digests),
@@ -4757,6 +4758,14 @@ async fn start_turn(
         instructions.as_ref(),
     )
     .await?;
+    let prewarm = (std::env::var_os("HAIDER_PROVIDER_PREWARM").as_deref()
+        == Some(std::ffi::OsStr::new("1")))
+    .then(|| {
+        let provider = Arc::clone(&resolved.provider);
+        tokio::spawn(async move {
+            provider.prewarm().await;
+        })
+    });
     let prompt_compile_started = Instant::now();
     let prompt_run_id = prompt_run_id.as_ref().unwrap_or(&accepted.run_id);
     let mut compiled = lease
@@ -4778,6 +4787,9 @@ async fn start_turn(
     let compiled_compaction_summary_end = compiled.latest_compaction_summary_end;
     let mut messages = compiled.messages;
     let provider_capabilities = resolved.provider.capabilities().await;
+    if let Some(prewarm) = prewarm {
+        let _ = prewarm.await;
+    }
     if messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(

@@ -2004,8 +2004,9 @@ impl HarnessActor {
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
-            if let Some(rendered) = provider.rendered_cache_prefix_digests(&provider_request) {
-                prefix_digests = rendered;
+            let prepared = provider.prepare_turn(&provider_request);
+            if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
+                prefix_digests = rendered.clone();
                 cache_metadata = prompt_cache_metadata(
                     &self.config,
                     &messages,
@@ -2019,7 +2020,8 @@ impl HarnessActor {
             }
             let mut request_usage: Option<Usage> = None;
             let attempt_provider = Arc::clone(&provider);
-            let mut opening = Box::pin(attempt_provider.stream_turn(provider_request));
+            let mut opening =
+                Box::pin(attempt_provider.stream_prepared_turn(provider_request, prepared));
             let mut stream = loop {
                 let opened = tokio::select! {
                     biased;

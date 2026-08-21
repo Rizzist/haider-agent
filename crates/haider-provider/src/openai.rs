@@ -162,6 +162,8 @@ fn build_openai_client(
         .retry(match transport.retry_policy {
             OpenAiRetryPolicy::Never => reqwest::retry::never(),
         })
+        .pool_idle_timeout(crate::PROVIDER_POOL_IDLE_TIMEOUT)
+        .http2_adaptive_window(true)
         .connect_timeout(transport.connect_timeout);
     if let Some(guard) = origin_guard {
         client = client.dns_resolver(guard);
@@ -730,7 +732,17 @@ impl OpenAiProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let payload = self.request_payload(request)?;
+        let mut payload = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared.payload,
+            None => self.request_payload(request)?,
+        };
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(key) = openai_prompt_cache_key(request, self.http.codex_responses_lite) {
+                object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
+            } else {
+                object.remove("prompt_cache_key");
+            }
+        }
         self.http.post_json(&self.api_url, &payload).await
     }
 }
@@ -749,23 +761,41 @@ impl Provider for OpenAiProvider {
         &self,
         request: &TurnRequest,
     ) -> Option<haider_protocol::provider::PrefixDigests> {
+        self.prepare_turn(request)
+            .map(|prepared| prepared.prefix_digests)
+    }
+
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.stable_history_end;
-        let full_payload = self.request_payload(request).ok()?;
-        let mut stable_request = request.clone();
-        stable_request.messages.truncate(boundary);
-        if let Some(metadata) = &mut stable_request.cache_metadata {
-            metadata.stable_history_end = boundary;
-            metadata.current_user_start = boundary;
-        }
-        let stable_payload = self.request_payload(&stable_request).ok()?;
-        crate::rendered_prefix_digests(
+        self.http.validate_model(request).ok()?;
+        let (full_payload, stable_wire_end) = responses_request_json_with_boundary(
+            request,
+            self.http.codex_responses_lite,
+            self.effort.as_deref(),
+            self.web_search,
+            boundary,
+        )
+        .ok()?;
+        let immutable_history =
+            crate::rendered_array_prefix_digest(&full_payload, "input", stable_wire_end)?;
+        let prefix_digests = crate::rendered_prefix_digests(
             request,
             &full_payload,
-            &stable_payload,
+            immutable_history,
             "instructions",
             "tools",
-            "input",
-        )
+        )?;
+        Some(crate::PreparedTurn {
+            prefix_digests,
+            wire: Some(crate::PreparedWire {
+                payload: full_payload,
+                history_boundary: None,
+            }),
+        })
+    }
+
+    async fn prewarm(&self) {
+        crate::optional_http_prewarm(&self.http.client, &self.api_url).await;
     }
 
     async fn capabilities(&self) -> CapabilityDoc {
@@ -1320,7 +1350,29 @@ impl OpenAiCompatibleProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let payload = self.request_payload(request)?;
+        let mut payload = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared.payload,
+            None => self.request_payload(request)?,
+        };
+        if self.dialect == CompatibleDialect::KimiOAuth
+            && let Some(object) = payload.as_object_mut()
+        {
+            let key = request.cache_metadata.as_ref().filter(|metadata| {
+                metadata.boundaries_valid(request.messages.len())
+                    && metadata.provider == KIMI_OAUTH_PROVIDER_NAME
+                    && metadata.account_scope.is_some()
+            });
+            if let Some(metadata) = key {
+                object.insert(
+                    "prompt_cache_key".into(),
+                    serde_json::Value::String(derive_kimi_session_prompt_cache_key(
+                        request, metadata,
+                    )),
+                );
+            } else {
+                object.remove("prompt_cache_key");
+            }
+        }
         self.http.post_json(&self.chat_url, &payload).await
     }
 }
@@ -1342,23 +1394,41 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: &TurnRequest,
     ) -> Option<haider_protocol::provider::PrefixDigests> {
+        self.prepare_turn(request)
+            .map(|prepared| prepared.prefix_digests)
+    }
+
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.stable_history_end;
-        let full_payload = self.request_payload(request).ok()?;
-        let mut stable_request = request.clone();
-        stable_request.messages.truncate(boundary);
-        if let Some(metadata) = &mut stable_request.cache_metadata {
-            metadata.stable_history_end = boundary;
-            metadata.current_user_start = boundary;
-        }
-        let stable_payload = self.request_payload(&stable_request).ok()?;
-        crate::rendered_prefix_digests(
+        self.http.validate_model(request).ok()?;
+        let (full_payload, stable_wire_end) = chat_request_json_with_boundary(
+            request,
+            self.dialect,
+            self.kimi_thinking.as_ref(),
+            self.kimi_reasoning_effort.as_deref(),
+            boundary,
+        )
+        .ok()?;
+        let immutable_history =
+            crate::rendered_array_prefix_digest(&full_payload, "messages", stable_wire_end)?;
+        let prefix_digests = crate::rendered_prefix_digests(
             request,
             &full_payload,
-            &stable_payload,
+            immutable_history,
             "system",
             "tools",
-            "messages",
-        )
+        )?;
+        Some(crate::PreparedTurn {
+            prefix_digests,
+            wire: Some(crate::PreparedWire {
+                payload: full_payload,
+                history_boundary: None,
+            }),
+        })
+    }
+
+    async fn prewarm(&self) {
+        crate::optional_http_prewarm(&self.http.client, &self.chat_url).await;
     }
 
     async fn capabilities(&self) -> CapabilityDoc {
@@ -3178,6 +3248,23 @@ fn responses_request_json(
     effort: Option<&str>,
     hosted_web_search: bool,
 ) -> Result<serde_json::Value, ProviderError> {
+    responses_request_json_with_boundary(
+        request,
+        codex_responses_lite,
+        effort,
+        hosted_web_search,
+        request.messages.len(),
+    )
+    .map(|(payload, _)| payload)
+}
+
+fn responses_request_json_with_boundary(
+    request: &TurnRequest,
+    codex_responses_lite: bool,
+    effort: Option<&str>,
+    hosted_web_search: bool,
+    stable_history_end: usize,
+) -> Result<(serde_json::Value, usize), ProviderError> {
     let computer_kind = openai_computer_tool_kind(&request.model, codex_responses_lite);
     let computer_display = latest_computer_display_dimensions(request).unwrap_or((
         OPENAI_COMPUTER_BOOTSTRAP_WIDTH,
@@ -3195,6 +3282,8 @@ fn responses_request_json(
         })
         .collect::<HashSet<_>>();
     let mut input = Vec::new();
+    let stable_history_end = stable_history_end.min(request.messages.len());
+    let mut stable_wire_end = (stable_history_end == 0).then_some(0);
     for (message_index, message) in request.messages.iter().enumerate() {
         let mut content = Vec::new();
         for block in &message.blocks {
@@ -3449,6 +3538,9 @@ fn responses_request_json(
         {
             mark_latest_openai_cacheable_block(&mut input);
         }
+        if message_index.saturating_add(1) == stable_history_end {
+            stable_wire_end = Some(input.len());
+        }
     }
     let mut tools = request
         .tools
@@ -3496,6 +3588,7 @@ fn responses_request_json(
     //   - `reasoning.context` MUST be `all_turns` (even for non-reasoning
     //     models).
     // The API-key Responses path keeps its original shape.
+    let stable_wire_end = stable_wire_end.unwrap_or(input.len());
     let mut payload = serde_json::json!({
         "model": request.model,
         "input": input,
@@ -3560,7 +3653,7 @@ fn responses_request_json(
             );
         }
     }
-    Ok(payload)
+    Ok((payload, stable_wire_end))
 }
 
 #[derive(Debug, Clone)]
@@ -3837,12 +3930,31 @@ fn chat_request_json(
     kimi_thinking: Option<&KimiThinkingConfig>,
     kimi_reasoning_effort: Option<&str>,
 ) -> Result<serde_json::Value, ProviderError> {
+    chat_request_json_with_boundary(
+        request,
+        dialect,
+        kimi_thinking,
+        kimi_reasoning_effort,
+        request.messages.len(),
+    )
+    .map(|(payload, _)| payload)
+}
+
+fn chat_request_json_with_boundary(
+    request: &TurnRequest,
+    dialect: CompatibleDialect,
+    kimi_thinking: Option<&KimiThinkingConfig>,
+    kimi_reasoning_effort: Option<&str>,
+    stable_history_end: usize,
+) -> Result<(serde_json::Value, usize), ProviderError> {
     let attachments = attachment_index(request)?;
     let mut messages = Vec::new();
     if let Some(system) = &request.system_prompt {
         messages.push(serde_json::json!({"role": "system", "content": system}));
     }
-    for message in &request.messages {
+    let stable_history_end = stable_history_end.min(request.messages.len());
+    let mut stable_wire_end = (stable_history_end == 0).then_some(messages.len());
+    for (message_index, message) in request.messages.iter().enumerate() {
         match message.role {
             MessageRole::Assistant => {
                 let mut text = String::new();
@@ -3977,6 +4089,9 @@ fn chat_request_json(
                 }
             }
         }
+        if message_index.saturating_add(1) == stable_history_end {
+            stable_wire_end = Some(messages.len());
+        }
     }
     let tools = request
         .tools
@@ -3993,6 +4108,7 @@ fn chat_request_json(
             })
         })
         .collect::<Vec<_>>();
+    let stable_wire_end = stable_wire_end.unwrap_or(messages.len());
     let mut payload = serde_json::json!({
         "model": request.model,
         "messages": messages,
@@ -4042,7 +4158,7 @@ fn chat_request_json(
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
-    Ok(payload)
+    Ok((payload, stable_wire_end))
 }
 
 /// OpenAI-compatible ordering law: the tool-role result is immediately

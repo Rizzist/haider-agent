@@ -39,14 +39,14 @@ use haider_protocol::graph::{
     GraphEvidenceSource, GraphFinalizationDeferred, GraphGateKind, GraphGateSatisfied,
     GraphInspectSnapshot, GraphNodeAttemptRow, GraphNodeName, GraphNodeReadied, GraphPhase,
     GraphPinned, GraphReduction, GraphReductions, GraphRunRow, GraphRunScope, GraphRunSetOpened,
-    GraphSignalProvenance, GraphStatus, GraphSuperseded, GraphTelemetryProjection,
-    GraphTemplateRejection, GraphTemplateRollup, GraphTemplateSpec,
+    GraphSignalProvenance, GraphStatus, GraphSuperseded, GraphTelemetryAccumulator,
+    GraphTelemetryProjection, GraphTemplateRejection, GraphTemplateRollup, GraphTemplateSpec,
     GraphWorkspaceMutationProvenance, ProcessSignalRecorded, ProcessSignalRef, SubjectSelector,
     TodoGraphAttached, WorkspaceMutationRef, build_node, child_contract_subject_digest,
     child_gate_structure, computer_observation_subject_digest, evidence_fingerprint,
     graph_template, graph_template_digest, graph_template_rollups, normalize_evidence_detail,
-    process_signal_subject_digest, reduce_graph_telemetry, reduce_graphs, todo_child_graph_id,
-    todo_run_set_id, validate_graph_template, workspace_mutation_subject_digest,
+    process_signal_subject_digest, reduce_graphs, todo_child_graph_id, todo_run_set_id,
+    validate_graph_template, workspace_mutation_subject_digest,
 };
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
@@ -1362,9 +1362,12 @@ struct GraphTelemetryCache {
 }
 
 struct CachedSessionGraphTelemetry {
-    envelopes: Vec<RawEnvelope>,
+    through_seq: u64,
+    accumulator: GraphTelemetryAccumulator,
     projection: GraphTelemetryProjection,
 }
+
+const GRAPH_TELEMETRY_REDUCER_VERSION: u32 = 3;
 
 fn trim_to_latest<T>(rows: &mut Vec<T>, limit: usize) {
     if rows.len() > limit {
@@ -1396,6 +1399,7 @@ impl Store {
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection(&database_path)?;
         migrations::migrate(&mut connection)?;
+        backfill_payload_kinds(&mut connection)?;
         connection.set_prepared_statement_cache_capacity(16);
         let cas = FileCas::open(&root)?;
         let worker_generation = next_worker_generation(&mut connection)?;
@@ -1942,6 +1946,8 @@ impl Store {
             .map_err(map_sqlite_error)?;
         require_session(&transaction, session_id)?;
         for statement in [
+            "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
+            "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
             "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
             "DELETE FROM menu_resolutions WHERE session_id = ?1",
             "DELETE FROM branches WHERE session_id = ?1",
@@ -2321,7 +2327,7 @@ impl Store {
                 &mut envelopes,
             )?;
             transaction.commit().map_err(map_sqlite_error)?;
-            self.extend_graph_reduction(&command.session_id, &envelopes);
+            self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
             return Ok(GraphFinalizationOutcome::Deferred {
                 graph_id: status.graph_id,
                 emit_reminder,
@@ -2374,7 +2380,7 @@ impl Store {
         )?];
         append_transaction_envelopes(&transaction, &command.session_id, now_ms()?, &mut envelopes)?;
         transaction.commit().map_err(map_sqlite_error)?;
-        self.extend_graph_reduction(&command.session_id, &envelopes);
+        self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
         Ok(GraphFinalizationOutcome::ConfirmRequired { menu, envelopes })
     }
 
@@ -2772,13 +2778,31 @@ impl Store {
             "graph-run-set-open",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
-        self.extend_graph_reduction(&command.session_id, &envelopes);
+        self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
         Ok(GraphRunSetOpenOutcome::Committed { opened, envelopes })
     }
 
     /// Atomically pins ship-loop and opens BUILD attempt/epoch 1. A blocked
     /// graph may be exited by re-pin; that transaction first abandons it.
     pub fn pin_graph(&self, command: &GraphPinCommand) -> StoreResult<GraphPinOutcome> {
+        self.pin_graph_with_expected_digest(command, None)
+    }
+
+    /// Pins a graph only when the registry bytes resolved inside the same
+    /// transaction still have the caller-authorized digest.
+    pub fn pin_graph_matching_digest(
+        &self,
+        command: &GraphPinCommand,
+        expected_digest: &str,
+    ) -> StoreResult<GraphPinOutcome> {
+        self.pin_graph_with_expected_digest(command, Some(expected_digest))
+    }
+
+    fn pin_graph_with_expected_digest(
+        &self,
+        command: &GraphPinCommand,
+        expected_digest: Option<&str>,
+    ) -> StoreResult<GraphPinOutcome> {
         validate_command_identity(
             &command.command_id,
             &command.request_digest,
@@ -2815,6 +2839,14 @@ impl Store {
                 )
             })?;
         validate_pinned_graph_template(&template)?;
+        let digest = graph_template_digest(&template);
+        if expected_digest.is_some_and(|expected| expected != digest) {
+            return Err(graph_evidence_error(
+                ErrorCode::RevisionConflict,
+                "child_workflow_registry_race",
+                "registered child workflow changed before its instance could be pinned",
+            ));
+        }
         let current = self
             .graph_reductions(&transaction, &command.session_id)?
             .active()
@@ -2847,7 +2879,6 @@ impl Store {
             }));
         }
         let pinned_index = payloads.len();
-        let digest = graph_template_digest(&template);
         let start_node = template.start_node.clone().ok_or_else(|| {
             store_error(
                 ErrorCode::StoreCorrupt,
@@ -2890,7 +2921,7 @@ impl Store {
             "graph-pin",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
-        self.extend_graph_reduction(&command.session_id, &envelopes);
+        self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
         Ok(GraphPinOutcome::Committed { pinned, envelopes })
     }
 
@@ -3498,7 +3529,7 @@ impl Store {
             "graph-switch",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
-        self.extend_graph_reduction(&command.session_id, &envelopes);
+        self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
         Ok(GraphSwitchOutcome::Committed {
             switched,
             envelopes,
@@ -3606,7 +3637,7 @@ impl Store {
             "graph-abandon",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
-        self.extend_graph_reduction(&command.session_id, &envelopes);
+        self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
         Ok(GraphAbandonOutcome::Committed {
             abandoned,
             envelopes,
@@ -3778,7 +3809,7 @@ impl Store {
             "computer-evidence",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
-        self.extend_graph_reduction(&command.session_id, &envelopes);
+        self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
         Ok(ComputerEvidenceOutcome::Committed {
             recorded,
             envelopes,
@@ -4182,7 +4213,7 @@ impl Store {
             "graph-evidence",
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
-        self.extend_graph_reduction(&command.session_id, &envelopes);
+        self.extend_graph_reduction(&connection, &command.session_id, &envelopes);
         Ok(GraphEvidenceOutcome::Committed {
             recorded,
             envelopes,
@@ -4587,6 +4618,7 @@ impl Store {
                     batch.envelopes = outcome.stamped;
                     update_append_caches(
                         self,
+                        &connection,
                         &outcome.range.session_id,
                         &batch.envelopes,
                         outcome.changes_graph_reduction,
@@ -7774,7 +7806,7 @@ impl Store {
             let mut graph_events = Vec::with_capacity(1 + follow_up.len());
             graph_events.push(envelope.as_ref().clone());
             graph_events.extend(follow_up.iter().cloned());
-            self.extend_graph_reduction(&command.session_id, &graph_events);
+            self.extend_graph_reduction(&connection, &command.session_id, &graph_events);
         }
         Ok(outcome)
     }
@@ -7906,7 +7938,12 @@ impl Store {
         Ok(reductions)
     }
 
-    fn extend_graph_reduction(&self, session_id: &SessionId, envelopes: &[RawEnvelope]) {
+    fn extend_graph_reduction(
+        &self,
+        connection: &Connection,
+        session_id: &SessionId,
+        envelopes: &[RawEnvelope],
+    ) {
         let mut graph_reductions = self
             .graph_reductions
             .lock()
@@ -7921,10 +7958,15 @@ impl Store {
             cached.reductions = reduce_graphs(&cached.envelopes);
         }
         drop(graph_reductions);
-        self.extend_graph_telemetry(session_id, envelopes);
+        self.extend_graph_telemetry(connection, session_id, envelopes);
     }
 
-    fn extend_graph_telemetry(&self, session_id: &SessionId, envelopes: &[RawEnvelope]) {
+    fn extend_graph_telemetry(
+        &self,
+        connection: &Connection,
+        session_id: &SessionId,
+        envelopes: &[RawEnvelope],
+    ) {
         let telemetry_envelopes = envelopes
             .iter()
             .filter(|envelope| graph_telemetry_event(&envelope.payload))
@@ -7941,11 +7983,30 @@ impl Store {
             .by_session
             .entry(session_id.clone())
             .or_insert_with(|| CachedSessionGraphTelemetry {
-                envelopes: Vec::new(),
+                through_seq: 0,
+                accumulator: GraphTelemetryAccumulator::default(),
                 projection: GraphTelemetryProjection::default(),
             });
-        cached.envelopes.extend(telemetry_envelopes);
-        cached.projection = reduce_graph_telemetry(&cached.envelopes);
+        for envelope in &telemetry_envelopes {
+            cached.accumulator.apply(envelope);
+        }
+        cached.projection = cached.accumulator.projection();
+        cached.through_seq = cached.through_seq.max(
+            telemetry_envelopes
+                .last()
+                .map_or(0, |envelope| envelope.seq),
+        );
+        let through_seq = cached.through_seq;
+        let accumulator = cached.accumulator.clone();
+        let projection = cached.projection.clone();
+        drop(telemetry);
+        let _ = persist_graph_telemetry_projection(
+            connection,
+            session_id,
+            through_seq,
+            &accumulator,
+            &projection,
+        );
     }
 
     fn invalidate_graph_reduction(&self, session_id: &SessionId) {
@@ -8636,19 +8697,10 @@ fn load_graph_reduction_envelopes(
             "SELECT envelope_json FROM events
              WHERE session_id = ?1
                AND (
-                   payload_kind LIKE 'graph\\_%' ESCAPE '\\'
+                   (payload_kind >= 'graph_' AND payload_kind < 'graph`')
                    OR payload_kind = 'todo_graph_attached'
                    OR payload_kind = 'evidence_recorded'
-                   OR payload_kind LIKE 'menu\\_%' ESCAPE '\\'
-                   OR (
-                       payload_kind IS NULL
-                       AND (
-                           instr(envelope_json, '\"type\":\"graph_') > 0
-                           OR instr(envelope_json, '\"type\":\"todo_graph_attached\"') > 0
-                           OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
-                           OR instr(envelope_json, '\"type\":\"menu_') > 0
-                       )
-                   )
+                   OR (payload_kind >= 'menu_' AND payload_kind < 'menu`')
                )
              ORDER BY seq ASC",
         )
@@ -8667,58 +8719,227 @@ fn load_graph_reduction_envelopes(
     Ok(envelopes)
 }
 
+fn backfill_payload_kinds(connection: &mut Connection) -> StoreResult<()> {
+    let decoded = {
+        let mut statement = connection
+            .prepare(
+                "SELECT rowid, envelope_json FROM events
+                 WHERE payload_kind IS NULL OR payload_kind = 'item_legacy'",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+        let mut decoded = Vec::new();
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let rowid: i64 = row.get(0).map_err(map_sqlite_error)?;
+            let envelope = decode_envelope_column(row, 1).map_err(|error| {
+                corrupt(format!(
+                    "invalid legacy envelope during payload-kind backfill: {error}"
+                ))
+            })?;
+            let telemetry_session = graph_telemetry_event(&envelope.payload)
+                .then(|| envelope.session_id.as_str().to_owned());
+            decoded.push((rowid, payload_kind(&envelope).to_owned(), telemetry_session));
+        }
+        decoded
+    };
+    if decoded.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    {
+        let mut update = transaction
+            .prepare("UPDATE events SET payload_kind = ?2 WHERE rowid = ?1")
+            .map_err(map_sqlite_error)?;
+        let mut dirty_sessions = HashSet::new();
+        for (rowid, kind, telemetry_session) in decoded {
+            update
+                .execute(params![rowid, kind])
+                .map_err(map_sqlite_error)?;
+            if let Some(session_id) = telemetry_session {
+                dirty_sessions.insert(session_id);
+            }
+        }
+        drop(update);
+        for session_id in dirty_sessions {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO graph_telemetry_dirty(session_id) VALUES (?1)",
+                    [session_id],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+    }
+    transaction.commit().map_err(map_sqlite_error)
+}
+
+fn telemetry_payload_predicate() -> &'static str {
+    "((payload_kind >= 'graph_' AND payload_kind < 'graph`')
+       OR (payload_kind >= 'menu_' AND payload_kind < 'menu`')
+       OR payload_kind IN ('todo_graph_attached', 'evidence_recorded', 'item_tool_call', 'tool_result'))"
+}
+
+fn load_graph_telemetry_envelopes(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Vec<RawEnvelope>> {
+    let sql = format!(
+        "SELECT envelope_json FROM events WHERE session_id = ?1 AND {} ORDER BY seq ASC",
+        telemetry_payload_predicate()
+    );
+    let mut statement = connection.prepare(&sql).map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        envelopes.push(decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!(
+                "invalid graph telemetry envelope in session {session_id}: {error}"
+            ))
+        })?);
+    }
+    Ok(envelopes)
+}
+
+fn persist_graph_telemetry_projection(
+    connection: &Connection,
+    session_id: &SessionId,
+    through_seq: u64,
+    accumulator: &GraphTelemetryAccumulator,
+    projection: &GraphTelemetryProjection,
+) -> StoreResult<()> {
+    if through_seq == 0 {
+        return Ok(());
+    }
+    let accumulator = rmp_serde::to_vec_named(accumulator).map_err(|error| {
+        store_error(
+            ErrorCode::Internal,
+            format!("cannot encode graph telemetry continuation state: {error}"),
+            false,
+        )
+    })?;
+    let projection = rmp_serde::to_vec_named(projection).map_err(|error| {
+        store_error(
+            ErrorCode::Internal,
+            format!("cannot encode graph telemetry projection: {error}"),
+            false,
+        )
+    })?;
+    connection
+        .execute(
+            "INSERT INTO graph_telemetry_projection(
+                session_id, through_seq, reducer_version, tool_state, projection
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id) DO UPDATE SET
+                through_seq = excluded.through_seq,
+                reducer_version = excluded.reducer_version,
+                tool_state = excluded.tool_state,
+                projection = excluded.projection",
+            params![
+                session_id.as_str(),
+                to_sqlite_integer(through_seq)?,
+                GRAPH_TELEMETRY_REDUCER_VERSION,
+                accumulator,
+                projection,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    connection
+        .execute(
+            "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
+            [session_id.as_str()],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
 fn rebuild_graph_telemetry_cache(connection: &Connection) -> StoreResult<GraphTelemetryCache> {
+    let mut persisted = HashMap::<SessionId, CachedSessionGraphTelemetry>::new();
+    let mut rebuild_sessions = HashSet::<SessionId>::new();
     let mut statement = connection
         .prepare(
-            "SELECT envelope_json FROM events
-             WHERE payload_kind LIKE 'graph\\_%' ESCAPE '\\'
-                OR payload_kind = 'todo_graph_attached'
-                OR payload_kind = 'evidence_recorded'
-                OR payload_kind LIKE 'menu\\_%' ESCAPE '\\'
-                OR payload_kind = 'item'
-                OR payload_kind = 'tool_result'
-                OR (
-                    payload_kind IS NULL
-                    AND (
-                        instr(envelope_json, '\"type\":\"graph_') > 0
-                        OR instr(envelope_json, '\"type\":\"todo_graph_attached\"') > 0
-                        OR instr(envelope_json, '\"type\":\"evidence_recorded\"') > 0
-                        OR instr(envelope_json, '\"type\":\"menu_') > 0
-                        OR instr(envelope_json, '\"item\":\"tool_call\"') > 0
-                        OR instr(envelope_json, '\"type\":\"tool_result\"') > 0
-                    )
-                )
-             ORDER BY session_id ASC, seq ASC",
+            "SELECT session_id, through_seq, reducer_version, tool_state, projection
+             FROM graph_telemetry_projection ORDER BY session_id ASC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement.query([]).map_err(map_sqlite_error)?;
-    let mut grouped = HashMap::<SessionId, Vec<RawEnvelope>>::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
-            corrupt(format!(
-                "invalid graph telemetry envelope during store open: {error}"
-            ))
-        })?;
-        grouped
-            .entry(envelope.session_id.clone())
-            .or_default()
-            .push(envelope);
+        let session_id = SessionId::new(row.get::<_, String>(0).map_err(map_sqlite_error)?);
+        let through_seq = u64::try_from(row.get::<_, i64>(1).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("negative telemetry projection head"))?;
+        let version: u32 = row.get(2).map_err(map_sqlite_error)?;
+        if version != GRAPH_TELEMETRY_REDUCER_VERSION {
+            rebuild_sessions.insert(session_id);
+            continue;
+        }
+        let tool_bytes: Vec<u8> = row.get(3).map_err(map_sqlite_error)?;
+        let projection_bytes: Vec<u8> = row.get(4).map_err(map_sqlite_error)?;
+        let (Ok(accumulator), Ok(projection)) = (
+            rmp_serde::from_slice::<GraphTelemetryAccumulator>(&tool_bytes),
+            rmp_serde::from_slice::<GraphTelemetryProjection>(&projection_bytes),
+        ) else {
+            rebuild_sessions.insert(session_id);
+            continue;
+        };
+        persisted.insert(
+            session_id,
+            CachedSessionGraphTelemetry {
+                through_seq,
+                accumulator,
+                projection,
+            },
+        );
     }
-    Ok(GraphTelemetryCache {
-        by_session: grouped
-            .into_iter()
-            .map(|(session_id, envelopes)| {
-                let projection = reduce_graph_telemetry(&envelopes);
-                (
-                    session_id,
-                    CachedSessionGraphTelemetry {
-                        envelopes,
-                        projection,
-                    },
+    drop(rows);
+    drop(statement);
+
+    let mut statement = connection
+        .prepare("SELECT session_id FROM graph_telemetry_dirty ORDER BY session_id ASC")
+        .map_err(map_sqlite_error)?;
+    let dirty = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    rebuild_sessions.extend(dirty.into_iter().map(SessionId::new));
+    let mut by_session = persisted;
+    for session_id in rebuild_sessions {
+        by_session.remove(&session_id);
+        let envelopes = load_graph_telemetry_envelopes(connection, &session_id)?;
+        let Some(last) = envelopes.last() else {
+            connection
+                .execute(
+                    "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
+                    [session_id.as_str()],
                 )
-            })
-            .collect(),
-    })
+                .map_err(map_sqlite_error)?;
+            continue;
+        };
+        let through_seq = last.seq;
+        let mut accumulator = GraphTelemetryAccumulator::default();
+        for envelope in &envelopes {
+            accumulator.apply(envelope);
+        }
+        let projection = accumulator.projection();
+        persist_graph_telemetry_projection(
+            connection,
+            &session_id,
+            through_seq,
+            &accumulator,
+            &projection,
+        )?;
+        by_session.insert(
+            session_id,
+            CachedSessionGraphTelemetry {
+                through_seq,
+                accumulator,
+                projection,
+            },
+        );
+    }
+    Ok(GraphTelemetryCache { by_session })
 }
 
 trait GraphCommandCoordinates {
@@ -11129,6 +11350,17 @@ fn append_transaction_envelopes(
         enqueue_hook_dispatch(transaction, envelope)?;
     }
     drop(insert);
+    if envelopes
+        .iter()
+        .any(|envelope| graph_telemetry_event(&envelope.payload))
+    {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO graph_telemetry_dirty(session_id) VALUES (?1)",
+                [session_id.as_str()],
+            )
+            .map_err(map_sqlite_error)?;
+    }
     update_branch_heads(transaction, envelopes)?;
     Ok(())
 }
@@ -12138,6 +12370,7 @@ fn append_envelopes(
     envelopes.clone_from_slice(&outcome.stamped);
     update_append_caches(
         store,
+        &connection,
         &outcome.range.session_id,
         envelopes,
         outcome.changes_graph_reduction,
@@ -12232,15 +12465,16 @@ fn append_envelopes_in_transaction(
 
 fn update_append_caches(
     store: &Store,
+    connection: &Connection,
     session: &SessionId,
     envelopes: &[RawEnvelope],
     changes_graph_reduction: bool,
     changes_graph_telemetry: bool,
 ) {
     if changes_graph_reduction {
-        store.extend_graph_reduction(session, envelopes);
+        store.extend_graph_reduction(connection, session, envelopes);
     } else if changes_graph_telemetry {
-        store.extend_graph_telemetry(session, envelopes);
+        store.extend_graph_telemetry(connection, session, envelopes);
     }
 }
 
@@ -13207,11 +13441,23 @@ fn encode_envelope(envelope: &RawEnvelope) -> Result<Vec<u8>, rmp_serde::encode:
 }
 
 fn payload_kind(envelope: &RawEnvelope) -> &str {
-    envelope
+    let kind = envelope
         .payload
         .get("type")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
+        .unwrap_or("");
+    if kind == "item"
+        && envelope
+            .payload
+            .get("item")
+            .and_then(|item| item.get("item"))
+            .and_then(serde_json::Value::as_str)
+            == Some("tool_call")
+    {
+        "item_tool_call"
+    } else {
+        kind
+    }
 }
 
 /// Decodes the authoritative event record according to its SQLite storage
