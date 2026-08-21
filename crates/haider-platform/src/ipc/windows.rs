@@ -179,6 +179,13 @@ fn pipe_name(endpoint: &Endpoint) -> io::Result<&str> {
     })
 }
 
+/// Windows named pipes leave no filesystem node behind when their owner
+/// exits, so there is nothing to sweep: the kernel reclaims the instance with
+/// the process. Present so callers stay platform-agnostic.
+pub async fn sweep_stale_endpoints(_runtime_dir: &Path, _keep: Option<&Path>) -> usize {
+    0
+}
+
 pub async fn connect(endpoint: impl AsRef<Path>) -> io::Result<IpcStream> {
     let name = endpoint.as_ref().to_str().ok_or_else(|| {
         io::Error::new(

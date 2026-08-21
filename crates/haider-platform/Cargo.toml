@@ -11,6 +11,10 @@ blake3.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["system"] }
 

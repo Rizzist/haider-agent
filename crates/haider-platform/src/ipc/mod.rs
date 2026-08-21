@@ -8,12 +8,12 @@ mod windows;
 #[cfg(unix)]
 pub use unix::{
     BoundEndpoint, EndpointAddress, IpcReadHalf, IpcStream, IpcWriteHalf, connect,
-    peer_credentials, peer_is_owner, split, write_immediate,
+    peer_credentials, peer_is_owner, split, sweep_stale_endpoints, write_immediate,
 };
 #[cfg(windows)]
 pub use windows::{
     BoundEndpoint, EndpointAddress, IpcReadHalf, IpcStream, IpcWriteHalf, connect,
-    peer_credentials, peer_is_owner, split, write_immediate,
+    peer_credentials, peer_is_owner, split, sweep_stale_endpoints, write_immediate,
 };
 
 /// One deterministic per-profile rendezvous name.

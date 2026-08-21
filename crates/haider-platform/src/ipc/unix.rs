@@ -461,6 +461,79 @@ fn probe_failure(operation: &'static str, path: &Path, error: std::io::Error) ->
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Endpoint names this module owns: `haider-<32 hex>.sock` (see
+/// [`super::Endpoint::new`]). The sweep only ever considers these.
+const ENDPOINT_PREFIX: &str = "haider-";
+const ENDPOINT_SUFFIX: &str = ".sock";
+/// Upper bound on endpoints examined per sweep, so a runtime directory that
+/// has accumulated thousands of nodes cannot stall daemon startup. The sweep
+/// is opportunistic hygiene, never a correctness requirement.
+const SWEEP_BUDGET: usize = 256;
+
+/// Remove endpoint nodes left behind by daemons that died without running
+/// their cleanup (SIGKILL, panic, power loss). Each candidate is proven dead
+/// exactly the way [`remove_verified_stale`] proves it — connect refused,
+/// then claim-verify-reprobe — so a LIVE endpoint is never removed and a
+/// name whose ownership cannot be verified is left alone.
+///
+/// `keep` is this daemon's own address, which is skipped even though it is
+/// live: never depend on ordering between binding and sweeping.
+///
+/// Returns how many nodes were removed. Errors on individual candidates are
+/// deliberately swallowed: hygiene must never fail a daemon start.
+pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> usize {
+    let runtime_dir_owned = runtime_dir.to_path_buf();
+    let Ok(Ok((directory, owner_uid))) =
+        tokio::task::spawn_blocking(move || prepare_runtime_dir(&runtime_dir_owned)).await
+    else {
+        return 0;
+    };
+    let keep_name = keep
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    let listing_dir = runtime_dir.to_path_buf();
+    let Ok(Ok(names)) = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&listing_dir)? {
+            let Ok(entry) = entry else { continue };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with(ENDPOINT_PREFIX) && name.ends_with(ENDPOINT_SUFFIX) {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    })
+    .await
+    else {
+        return 0;
+    };
+
+    let mut removed = 0;
+    for name in names.into_iter().take(SWEEP_BUDGET) {
+        if keep_name.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        let socket_path = runtime_dir.join(&name);
+        // Only a refused connect proves death. A live endpoint, a timeout, or
+        // any other error leaves the node exactly as it is.
+        match probe(&socket_path).await {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && remove_verified_stale(&directory, &socket_path, &name, owner_uid)
+                        .await
+                        .is_ok() =>
+            {
+                removed += 1;
+            }
+            _ => {}
+        }
+    }
+    removed
+}
+
 async fn probe(path: &Path) -> std::io::Result<UnixStream> {
     match tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await {
         Ok(result) => result,

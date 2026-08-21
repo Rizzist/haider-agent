@@ -32,7 +32,7 @@ pub use fs::{
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcStream, IpcWriteHalf,
     PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner, split,
-    write_immediate,
+    sweep_stale_endpoints, write_immediate,
 };
 pub use process::{
     ProcessGroup, ProcessId, ProcessSignal, configure_background_process,

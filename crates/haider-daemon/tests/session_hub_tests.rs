@@ -7131,7 +7131,7 @@ async fn every_input_kind_is_answerable_headlessly_over_rpc() {
     ];
     for (label, kind, input) in legs {
         let (menu_id, mut opened) = park(kind, &format!("parity-{label}-menu"), label);
-        hub.append(&mut std::slice::from_mut(&mut opened))
+        hub.append(std::slice::from_mut(&mut opened))
             .await
             .expect("park commits");
         let request_seq = opened.seq;
