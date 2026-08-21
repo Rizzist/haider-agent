@@ -1578,17 +1578,52 @@ fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
     );
 }
 
-/// CM2f — Codex subscription/lite caching is unverified and therefore keeps
-/// its exact CM1 full-history request even when compiler metadata is present.
+/// CM2f — DELIBERATE re-pin 2026-08-21: subscription/lite caching is now
+/// VERIFIED (codex 0.145 sends a stable per-thread `prompt_cache_key` +
+/// `prompt_cache_retention: "24h"` and reads 13M+ cached tokens; without a
+/// key, live sessions measured ~0%-cached agentic rounds). Lite therefore
+/// carries the derived stable key + the captured retention — and stripping
+/// exactly those two fields restores the CM1 byte-exact request, so cache
+/// annotation never changes model-visible content.
+///
+/// MUTATION CHECK (executed): restore the lite refusal in
+/// `openai_prompt_cache_key` (key absent on lite) and the presence pins
+/// fail; vary the derived key across identical requests and the stability
+/// pin fails.
 #[test]
-fn cm2f_openai_lite_is_byte_exact_without_cache_annotations() {
+fn cm2f_openai_lite_carries_stable_cache_key_and_retention() {
     let mut request = probe_request("gpt-5.6-sol");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
-    let with_metadata = responses_request_json(&request, true, None, false).expect("fallback");
+    let with_metadata = responses_request_json(&request, true, None, false).expect("lite wire");
+    let again = responses_request_json(&request, true, None, false).expect("lite wire again");
+    let key = with_metadata
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .expect("lite request carries prompt_cache_key");
+    assert!(!key.is_empty());
+    assert_eq!(
+        again
+            .get("prompt_cache_key")
+            .and_then(serde_json::Value::as_str),
+        Some(key),
+        "the cache key must be stable across identical requests"
+    );
+    assert_eq!(
+        with_metadata
+            .get("prompt_cache_retention")
+            .and_then(serde_json::Value::as_str),
+        Some("24h"),
+    );
+    // Content invariance: strip exactly the cache annotations and the CM1
+    // unannotated request comes back byte-exact.
+    let mut stripped = with_metadata.clone();
+    let object = stripped.as_object_mut().expect("request object");
+    object.remove("prompt_cache_key");
+    object.remove("prompt_cache_retention");
     request.cache_metadata = None;
     let baseline = responses_request_json(&request, true, None, false).expect("CM1 wire");
-    assert_eq!(with_metadata, baseline);
-    assert!(!with_metadata.to_string().contains("prompt_cache"));
+    assert_eq!(stripped, baseline);
+    assert!(!stripped.to_string().contains("prompt_cache"));
 }
 
 /// CM2g — strip only the new cache keys and the GPT-5.6 request becomes the
@@ -2582,11 +2617,13 @@ fn azure_origin_predicate_and_constructor_agree_both_directions() {
     }
 }
 
-/// LAW (LW4, alpha/search request-body golden): the client `web_search`
-/// SearchRequest body pins exactly the locked shape — session id, model, an
-/// empty input, ONE search command carrying the query, and the locked
-/// settings (`medium` context, `direct` caller, external access on) — and
-/// never `max_output_tokens` (the same backend bans it on lite).
+/// LAW (LW4, alpha/search request-body golden — DELIBERATE re-pin
+/// 2026-08-21): the backend drifted to a `commands` OBJECT keyed by command
+/// family (the 935-era array form 400s "Invalid type for 'commands':
+/// expected an object"). The body pins the codex-0.145-captured shape:
+/// session id, model, empty input, one `search_query` entry carrying the
+/// query, `response_length: long`, the captured settings, and the captured
+/// `max_output_tokens` bound.
 #[test]
 fn alpha_search_request_body_is_golden() {
     let body = codex_alpha_search_request_body("session-9", "gpt-5.6-sol", "rust sse decoding");
@@ -2596,12 +2633,15 @@ fn alpha_search_request_body_is_golden() {
             "id": "session-9",
             "model": "gpt-5.6-sol",
             "input": [],
-            "commands": [{"type": "search", "query": "rust sse decoding"}],
-            "settings": {
-                "search_context_size": "medium",
-                "allowed_callers": ["direct"],
-                "external_web_access": true,
+            "commands": {
+                "search_query": [{"q": "rust sse decoding"}],
+                "response_length": "long",
             },
+            "settings": {
+                "allowed_callers": ["direct"],
+                "external_web_access": false,
+            },
+            "max_output_tokens": 10000,
         })
     );
     assert_eq!(

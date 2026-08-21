@@ -2554,6 +2554,11 @@ fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Ve
 /// own `base_url` wins when it carries one (an imported codex credential may
 /// point at a proxy); otherwise the sanctioned subscription base. Always
 /// `{base}/alpha/search` — the same `{provider_base}` join codex performs.
+/// Prompt-cache retention codex 0.145 requests on the subscription lite
+/// dialect (echoed accepted in `response.created`; capture 2026-08-21 —
+/// /Users/rizzist/haider-run/contract-capture-2026-08-21.md).
+const CODEX_LITE_PROMPT_CACHE_RETENTION: &str = "24h";
+
 #[must_use]
 pub fn codex_alpha_search_url(base_url: Option<&str>) -> String {
     let base = base_url
@@ -2564,13 +2569,23 @@ pub fn codex_alpha_search_url(base_url: Option<&str>) -> String {
     format!("{base}/alpha/search")
 }
 
+/// Output bound codex 0.145 sends on every alpha/search call (capture
+/// 2026-08-21); the endpoint accepts it even though /responses-lite bans
+/// the same field.
+const ALPHA_SEARCH_MAX_OUTPUT_TOKENS: u32 = 10_000;
+
 /// The exact SearchRequest body the daemon POSTs to
 /// [`OPENAI_ALPHA_SEARCH_URL`] for the client `web_search` tool (W-B
-/// decision 3, LW4 golden). Locked settings: `search_context_size: medium`,
-/// `allowed_callers: ["direct"]`, `external_web_access: true`. `input` stays
-/// empty (recent-history seeding is a codex nicety, not part of the locked
-/// contract) and `max_output_tokens` is omitted — the same backend bans it
-/// on lite.
+/// decision 3, LW4 golden — re-pinned 2026-08-21 from a live codex 0.145
+/// trace after the backend drifted: `commands` became an OBJECT keyed by
+/// command family and the array form 400s "expected an object";
+/// /Users/rizzist/haider-run/contract-capture-2026-08-21.md holds the
+/// bodies). `search_query` accepts several `{q}` entries; haider sends the
+/// tool's one query. `response_length` is short|long in captures (codex
+/// lets the model pick); the harness fixes `long` — this tool feeds a
+/// model, not a status line. `input` stays empty (codex seeds its user
+/// message there as a nicety, not a requirement) and the settings mirror
+/// codex: `external_web_access: false`, no `search_context_size`.
 #[must_use]
 pub fn codex_alpha_search_request_body(
     session_id: &str,
@@ -2581,12 +2596,15 @@ pub fn codex_alpha_search_request_body(
         "id": session_id,
         "model": model,
         "input": [],
-        "commands": [{"type": "search", "query": query}],
-        "settings": {
-            "search_context_size": "medium",
-            "allowed_callers": ["direct"],
-            "external_web_access": true,
+        "commands": {
+            "search_query": [{"q": query}],
+            "response_length": "long",
         },
+        "settings": {
+            "allowed_callers": ["direct"],
+            "external_web_access": false,
+        },
+        "max_output_tokens": ALPHA_SEARCH_MAX_OUTPUT_TOKENS,
     })
 }
 
@@ -3626,6 +3644,12 @@ fn responses_request_json_with_boundary(
                 serde_json::json!({"mode": "explicit", "ttl": "30m"}),
             );
         }
+        if codex_responses_lite {
+            object.insert(
+                "prompt_cache_retention".into(),
+                serde_json::json!(CODEX_LITE_PROMPT_CACHE_RETENTION),
+            );
+        }
     }
     // Reasoning object: `summary: auto` + encrypted-content include for
     // reasoning models; lite ADDS the required `context: all_turns` and
@@ -3848,8 +3872,16 @@ fn openai_automatic_cache_key_supported(model: &str) -> bool {
         || model_or_variant("o4")
 }
 
+/// On the subscription lite dialect the key is REQUIRED for reliable cache
+/// hits: without it OpenAI's implicit prefix cache is best-effort and
+/// shard-routed, and fast agentic rounds always outran its async warm-up
+/// (observed 0%-cached rounds on live sessions, 2026-08-21). codex 0.145
+/// sends a stable per-thread key; the derived key below is stable per
+/// session prefix basis (system/tool digests + compaction epoch), which is
+/// the same contract.
 fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) -> Option<String> {
-    if codex_responses_lite || !openai_automatic_cache_key_supported(&request.model) {
+    let _ = codex_responses_lite;
+    if !openai_automatic_cache_key_supported(&request.model) {
         return None;
     }
     let metadata = request.cache_metadata.as_ref()?;
