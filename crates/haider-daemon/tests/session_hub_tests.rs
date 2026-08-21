@@ -46,10 +46,10 @@ use haider_rpc::{
     ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachmentId, Capability, CapabilitySet, CommandId,
     ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
-    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
-    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, FleetAgentStateWire,
-    MenuInput, ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary,
-    SurfaceInputPublishWire, WireFrame,
+    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_PDF_MALFORMED,
+    ERROR_CODE_PDF_TOO_LARGE, ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS,
+    ErrorData, FleetAgentStateWire, MenuInput, ObserveRunStateWire, RequestBody, RequestId,
+    ResponseBody, SeqRange, SessionSummary, SurfaceInputPublishWire, WireFrame,
 };
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -7155,6 +7155,118 @@ async fn every_input_kind_is_answerable_headlessly_over_rpc() {
             "{label} park must resolve over RPC, got {body:?}"
         );
     }
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// PRE-RECEIPT REJECTION LAW (v0.0.938, ADE-reported): every check that runs
+/// BEFORE the durable receipt is claimed — draining, capability, control
+/// attachment, argument validation — leaves NO durable trace, so the SAME
+/// command id may be retried safely once the condition clears. Clients derive
+/// their command id from the answer coordinates and retain replay context
+/// across these errors precisely because of this ordering; reordering a check
+/// to after the receipt claim would silently break that retry.
+///
+/// MUTATION CHECK (executed): move the control-attachment check to AFTER the
+/// actor's receipt claim (or claim a receipt before rejecting) and the retry
+/// below stops resolving the menu — the second attempt replays a receipt for
+/// an answer that never committed.
+#[tokio::test]
+async fn a_pre_receipt_rejection_leaves_the_command_id_retryable() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let session = SessionId::new("pre-receipt-retry");
+    append_one(&hub, &session, generation, "pre-receipt-seed").await;
+
+    let menu_id = MenuId::new("pre-receipt-menu");
+    let mut opened = menu_opening(&session, &menu_id, generation);
+    opened.event_id = EventId::new("pre-receipt-menu-opened");
+    opened.run_id = Some(RunId::new("pre-receipt-run"));
+    hub.append(&mut [opened.clone()])
+        .await
+        .expect("menu commits");
+    let request_seq = 2;
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    macro_rules! next_response {
+        () => {{
+            loop {
+                match sink.next().await {
+                    WireFrame::Response { body, .. } => break body,
+                    WireFrame::Event { .. } | WireFrame::AttachCaughtUp { .. } => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }};
+    }
+
+    // Answer WITHOUT a control attachment: rejected pre-receipt.
+    let command_id = CommandId::new("pre-receipt-command");
+    connection
+        .menu_answer(
+            Some(RequestId::new("denied")),
+            command_id.clone(),
+            session.clone(),
+            menu_id.clone(),
+            request_seq,
+            generation,
+            "allow".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("routes");
+    let body = next_response!();
+    let ResponseBody::Error { code, .. } = &body else {
+        panic!("expected a pre-receipt rejection, got {body:?}");
+    };
+    assert_eq!(code, ERROR_CODE_CAPABILITY_DENIED);
+
+    // Clear the condition, then retry the SAME command id: it must resolve
+    // the menu for real, not replay a receipt that was never committed.
+    connection
+        .request(
+            RequestId::new("pre-receipt-attach"),
+            RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let ResponseBody::SessionAttach { .. } = next_response!() else {
+        panic!("expected attach response");
+    };
+    connection
+        .menu_answer(
+            Some(RequestId::new("retry")),
+            command_id,
+            session.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            "allow".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("routes");
+    let body = next_response!();
+    assert!(
+        matches!(body, ResponseBody::MenuAnswer { .. }),
+        "the same command id resolves after the condition clears, got {body:?}"
+    );
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
