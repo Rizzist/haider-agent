@@ -29,11 +29,11 @@ use haider_protocol::envelope::{
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
 use haider_protocol::history::{NodeKind, TreeNode};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, ItemId, LeaseId, MenuId,
-    NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EffectId, EventId, ItemId, LeaseId,
+    MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{ErrorRecoveryCardKind, Menu, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{EffectRecoveryAction, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{FinishReason, Usage, UsageRequestKind, UsageScope, UsageSource};
 use haider_protocol::session::ModelSelected;
 use haider_protocol::state::{RunState, WaitReason};
@@ -2795,20 +2795,16 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     recovery_menu.run_id = Some(RunId::new("recovery-run"));
     recovery_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
         id: recovery_menu_id.clone(),
-        kind: MenuKind::ErrorRecovery {
-            card: ErrorRecoveryCardKind::StoreUnwritable,
-            presentation: ErrorPresentation::new(
+        kind: MenuKind::Recovery {
+            effect: EffectId::new("effect-observe-recovery"),
+            presentation: Some(ErrorPresentation::new(
                 "effect-outcome-unknown",
                 "Effect outcome unknown",
                 "reconcile before continuing",
                 ErrorScope::Turn,
                 [ErrorAction::Retry],
-            ),
-            option_actions: Vec::new(),
-            provider: None,
-            account: None,
-            source_run: None,
-            source_item: None,
+            )),
+            option_actions: vec![EffectRecoveryAction::Probe],
         },
         title: "Effect outcome unknown".into(),
         body: vec!["probe: process dead \u{b7} no result committed".into()],
@@ -2933,14 +2929,18 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
         .find(|digest| digest.session_id.as_str() == "observe-recovery")
         .expect("recovery digest");
     assert_eq!(recovery.run_state, ObserveRunStateWire::EffectUnknown);
+    // v0.0.935 shipped defect lock: the crash-window park is
+    // `MenuKind::Recovery` — wire kind "recovery", the string the headless
+    // recover door filters on — NOT the provider/account "error_recovery"
+    // card this fixture used to (wrongly) model it with.
     let recovery_menu = recovery
         .pending_menus
         .iter()
-        .find(|menu| menu.kind == "error_recovery")
-        .expect("recovery menu present");
+        .find(|menu| menu.kind == "recovery")
+        .expect("crash-window recovery menu present under wire kind 'recovery'");
     assert!(
         !recovery_menu.body.is_empty() && !recovery_menu.options.is_empty(),
-        "the recovery card's probe evidence and options DO reach the digest"
+        "the crash-window card's probe evidence and options DO reach the digest"
     );
     assert_eq!(recovery_menu.options[0].key, "probe");
 

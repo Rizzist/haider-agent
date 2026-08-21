@@ -6,7 +6,7 @@ use haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
-use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
 use std::fs::{OpenOptions, TryLockError};
 use std::io::Read;
@@ -845,16 +845,32 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
             .windows(2)
             .all(|pair| pair[1].seq == pair[0].seq + 1)
     );
-    let delta_count = envelopes
+    // Delta coalescing (v0.0.936 #25) makes the delta-envelope COUNT
+    // provider-timing dependent, so the count is no longer a law. The law
+    // this test owns is LOSSLESS replay under consumer lag: every journaled
+    // envelope arrives (seq contiguity above) and no streamed byte is
+    // dropped — the concatenated delta text and the completed item must
+    // both carry all 500 fragments.
+    let expected_text: String = (0..500).map(|index| index.to_string()).collect();
+    let delta_text: String = envelopes
         .iter()
-        .filter(|envelope| {
-            matches!(
-                typed(envelope),
-                Some(EventPayload::Item(ItemEvent::Delta { .. }))
-            )
+        .filter_map(|envelope| match typed(envelope) {
+            Some(EventPayload::Item(ItemEvent::Delta {
+                delta: ItemDelta::Text { text },
+                ..
+            })) => Some(text),
+            _ => None,
         })
-        .count();
-    assert_eq!(delta_count, 500);
+        .collect();
+    assert!(!delta_text.is_empty(), "streamed deltas must journal");
+    assert_eq!(delta_text, expected_text);
+    assert!(envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        Some(EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::AgentMessage { ref text },
+            ..
+        })) if *text == expected_text
+    )));
     assert_eq!(
         envelopes.last().map(typed),
         Some(Some(EventPayload::RunState(RunState::Done)))

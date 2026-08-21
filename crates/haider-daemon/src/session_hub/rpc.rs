@@ -961,10 +961,16 @@ impl ObserveProjection {
                 // Secret/permission/other menu bodies and options may carry
                 // vaulted credentials or untrusted payloads; the observe
                 // digest exposes body+options ONLY for the daemon-authored
-                // effect-recovery card (its body is probe evidence, its
-                // options the fixed Probe/Mark done/Retry/Abandon), which is
-                // the sole menu the headless recover door needs to render.
-                let is_effect_recovery = matches!(menu.kind, MenuKind::ErrorRecovery { .. });
+                // recovery cards: the crash-window `Recovery` menu (body is
+                // reconciliation evidence, options the fixed Probe/Mark
+                // done/Retry/Abandon the headless recover door renders — the
+                // v0.0.935 gate matched `ErrorRecovery` alone and starved
+                // that door) and the provider/account `ErrorRecovery` card
+                // (safe presentation copy + typed actions).
+                let is_effect_recovery = matches!(
+                    menu.kind,
+                    MenuKind::ErrorRecovery { .. } | MenuKind::Recovery { .. }
+                );
                 let (permission_description, presentation) = match menu.kind {
                     MenuKind::Permission { effect_summary } => (Some(effect_summary), None),
                     MenuKind::ErrorRecovery { presentation, .. } => (None, Some(presentation)),

@@ -298,11 +298,18 @@ async fn execute(
     }))
 }
 
+/// The crash-window reconciliation menu is `MenuKind::Recovery` — wire kind
+/// `"recovery"` ("effect_outcome_unknown reconciliation" in protocol
+/// menu.rs). `"error_recovery"` is the SEPARATE provider/account/stream card
+/// and never carries the probe/retry/mark-done/abandon options this door
+/// answers; the daemon pins its side of this string in observe_menu tests.
+const RECOVERY_MENU_WIRE_KIND: &str = "recovery";
+
 fn recovery_menu(digest: &SessionObserveDigest) -> Result<&ObserveMenuWire, RecoverError> {
     digest
         .pending_menus
         .iter()
-        .filter(|menu| menu.kind == "error_recovery")
+        .filter(|menu| menu.kind == RECOVERY_MENU_WIRE_KIND)
         .min_by_key(|menu| menu.request_seq.unwrap_or(u64::MAX))
         .ok_or(RecoverError::NoRecovery {
             state: run_state_name(digest.run_state),
@@ -538,5 +545,63 @@ mod tests {
 
         // --help/-h short-circuits to "no options" (show help).
         assert!(parse_options(&["--help".into()]).expect("ok").is_none());
+    }
+
+    fn digest_with_menus(menus: Vec<ObserveMenuWire>) -> SessionObserveDigest {
+        SessionObserveDigest {
+            session_id: SessionId::new("session-recover-test"),
+            head_seq: 9,
+            worker_generation: 1,
+            metadata: None,
+            title: "parked".into(),
+            run_state: ObserveRunStateWire::EffectUnknown,
+            active_branch_id: None,
+            branches: Vec::new(),
+            main_head_node_id: None,
+            main_head_seq: 9,
+            latest_context_footprint: None,
+            pending_menus: menus,
+            subagents: Vec::new(),
+            updated_at_ms: 0,
+            last_event_kinds: Vec::new(),
+            turn_count: None,
+            agent_metrics: None,
+        }
+    }
+
+    fn wire_menu(kind: &str, seq: u64) -> ObserveMenuWire {
+        ObserveMenuWire {
+            kind: kind.into(),
+            title: format!("{kind} menu"),
+            menu_id: Some(MenuId::new(format!("menu-{kind}-{seq}"))),
+            request_seq: Some(seq),
+            worker_generation: Some(1),
+            opened_at_ms: Some(1),
+            body: vec!["evidence".into()],
+            options: Vec::new(),
+            permission_description: None,
+            presentation: None,
+        }
+    }
+
+    /// MUTATION CHECK: flipping `RECOVERY_MENU_WIRE_KIND` back to
+    /// `"error_recovery"` (the v0.0.935 shipped defect) must fail both
+    /// halves: the door must select the crash-window `"recovery"` menu and
+    /// must NOT treat the provider/account `"error_recovery"` card as one.
+    #[test]
+    fn recovery_menu_selects_the_crash_window_kind_only() {
+        let digest = digest_with_menus(vec![
+            wire_menu("error_recovery", 3),
+            wire_menu("recovery", 7),
+        ]);
+        let menu = recovery_menu(&digest).expect("crash-window menu");
+        assert_eq!(menu.kind, "recovery");
+        assert_eq!(menu.request_seq, Some(7));
+
+        let digest = digest_with_menus(vec![wire_menu("error_recovery", 3)]);
+        assert!(matches!(
+            recovery_menu(&digest),
+            Err(RecoverError::NoRecovery { .. })
+        ));
     }
 }
