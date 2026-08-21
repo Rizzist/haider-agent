@@ -9983,3 +9983,113 @@ async fn management_publications_notify_watchers_with_the_new_revision() {
     // The snapshot read agrees with the announced revision.
     assert_eq!(snapshot.read().expect("view").revision, 11);
 }
+
+/// PER-TURN CREDENTIAL RESOLUTION (R6/R8, pinned v0.0.938): every logical
+/// turn resolves its provider's CURRENTLY-ACTIVE credential from live account
+/// state. Making a different account active takes effect on the very next
+/// turn — no daemon restart, no session restart, for OAuth and API keys
+/// alike. The invariant was documented on `ProviderFactory` and relied on by
+/// clients, but nothing pinned the ACCOUNT half of it (model selection is
+/// pinned separately), so a cached resolution could have regressed silently.
+///
+/// MUTATION CHECK (executed): resolve once and reuse that result for later
+/// turns (any caching of the resolved account in the factory) and the second
+/// assertion fails — the turn would keep spending the old credential after
+/// the operator switched.
+#[tokio::test]
+async fn each_turn_resolves_the_currently_active_account() {
+    let provider = "switch-fixture";
+    let first = CredentialAlias::new("switch-first");
+    let second = CredentialAlias::new("switch-second");
+    let descriptor = |alias: &CredentialAlias, active: bool| CredentialDescriptor {
+        alias: alias.clone(),
+        provider: provider.to_owned(),
+        base_url: Some("http://127.0.0.1:11434/v1".to_owned()),
+        auth_method: AuthMethod::ApiKey,
+        identity: format!("{alias} fixture"),
+        status: CredentialStatus::Ok,
+        active,
+    };
+
+    let vault = Arc::new(MemoryVault::default());
+    vault.put(&first, b"first-secret").expect("seed first");
+    vault.put(&second, b"second-secret").expect("seed second");
+
+    // Both accounts exist on the same provider; the FIRST is active.
+    let snapshot = Arc::new(StdMutex::new(vec![
+        descriptor(&first, true),
+        descriptor(&second, false),
+    ]));
+    // The provider must be a registered profile for an adapter to exist; the
+    // account choice is what this pin is about, not the adapter.
+    let summary = ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
+        models: vec!["llama-fixture".to_owned()],
+        model_details: vec![ModelDetailWire {
+            name: "llama-fixture".to_owned(),
+            context_window: Some(131_072),
+            supported_efforts: Vec::new(),
+            default_effort: None,
+            supported_speeds: Vec::new(),
+            supports_thinking_type: None,
+        }],
+        auth_methods: vec![AuthMethod::ApiKey],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("llama-fixture".to_owned()),
+        enabled: true,
+    };
+    let management =
+        ManagementSnapshot::new(0, snapshot.lock().expect("snapshot").clone(), vec![summary]);
+    let factory = AccountsProviderFactory::new_with_management(
+        Arc::clone(&snapshot),
+        management,
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    );
+    let metadata = haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/switch-fixture".to_owned(),
+        provider: provider.to_owned(),
+        model: "llama-fixture".to_owned(),
+        max_tokens: 64,
+        permission_overrides: None,
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        created_at_ms: 1,
+        agent_type: None,
+    };
+
+    let turn_one = factory
+        .resolve_for_turn(&metadata)
+        .await
+        .expect("first turn resolves");
+    assert_eq!(
+        turn_one.account_alias.as_deref(),
+        Some(first.as_str()),
+        "the first turn uses the active account"
+    );
+
+    // The operator switches the active account (what account.set_active
+    // publishes). Nothing else changes — no restart, same session.
+    {
+        let mut accounts = snapshot.lock().expect("snapshot");
+        for entry in accounts.iter_mut() {
+            entry.active = entry.alias == second;
+        }
+    }
+
+    let turn_two = factory
+        .resolve_for_turn(&metadata)
+        .await
+        .expect("second turn resolves");
+    assert_eq!(
+        turn_two.account_alias.as_deref(),
+        Some(second.as_str()),
+        "the NEXT turn already uses the newly active account — no restart"
+    );
+}
