@@ -497,6 +497,7 @@ fn trust_revision_event_refreshes_the_summary_workspace() {
                 seen_at_ms: None,
                 last_activity_ms: None,
                 waiting_why: None,
+                needs_input: None,
                 metadata: None,
                 workspace_cwd: Some("/work/original".into()),
                 turn_count: None,

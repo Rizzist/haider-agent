@@ -44,6 +44,7 @@ fn summary(
         seen_at_ms: None,
         last_activity_ms: None,
         waiting_why: None,
+        needs_input: None,
         metadata: None,
         workspace_cwd: None,
         turn_count: Some(2),

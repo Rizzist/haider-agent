@@ -660,6 +660,7 @@ impl ObserveFoldSnapshot {
             agent_metrics: include_summary
                 .then(|| self.agent_metrics.clone())
                 .flatten(),
+            needs_input: needs_input(self.run_state, &self.pending_menus),
         }
     }
 }
@@ -988,25 +989,24 @@ impl ObserveProjection {
             }
             EventPayload::MenuOpened(menu) => {
                 let kind = observe_menu_kind(&menu.kind);
-                // Secret/permission/other menu bodies and options may carry
-                // vaulted credentials or untrusted payloads; the observe
-                // digest exposes body+options ONLY for the daemon-authored
-                // recovery cards: the crash-window `Recovery` menu (body is
-                // reconciliation evidence, options the fixed Probe/Mark
-                // done/Retry/Abandon the headless recover door renders — the
-                // v0.0.935 gate matched `ErrorRecovery` alone and starved
-                // that door) and the provider/account `ErrorRecovery` card
-                // (safe presentation copy + typed actions).
-                let is_effect_recovery = matches!(
-                    menu.kind,
-                    MenuKind::ErrorRecovery { .. } | MenuKind::Recovery { .. }
-                );
-                let (permission_description, presentation) = match menu.kind {
-                    MenuKind::Permission { effect_summary } => (Some(effect_summary), None),
-                    MenuKind::ErrorRecovery { presentation, .. } => (None, Some(presentation)),
+                // v0.0.937 unified input-required contract: every parked
+                // menu is answerable from any surface, so the digest carries
+                // display copy + options for EVERY kind EXCEPT Secret —
+                // durable Secret menus are the one kind whose body/options
+                // can carry vaulted material (the v0.0.935 leak class), so
+                // they expose title + kind only and their answers travel as
+                // secret references. All other bodies are daemon-authored
+                // display copy by construction (effect summaries, recovery
+                // evidence, update/trust prompts) and never vault material.
+                let exposes_card = !matches!(menu.kind, MenuKind::Secret);
+                let (permission_description, presentation) = match &menu.kind {
+                    MenuKind::Permission { effect_summary } => (Some(effect_summary.clone()), None),
+                    MenuKind::ErrorRecovery { presentation, .. } => {
+                        (None, Some(presentation.clone()))
+                    }
                     _ => (None, None),
                 };
-                let (body, options) = if is_effect_recovery {
+                let (body, options) = if exposes_card {
                     (
                         menu.body,
                         menu.options
@@ -1015,6 +1015,23 @@ impl ObserveProjection {
                                 key: option.key,
                                 label: option.label,
                                 detail: option.detail,
+                                decision: option.decision.map(|decision| {
+                                    match decision {
+                                        haider_protocol::menu::DecisionKind::AllowOnce => {
+                                            "allow_once"
+                                        }
+                                        haider_protocol::menu::DecisionKind::AllowAlways => {
+                                            "allow_always"
+                                        }
+                                        haider_protocol::menu::DecisionKind::RejectOnce => {
+                                            "reject_once"
+                                        }
+                                        haider_protocol::menu::DecisionKind::RejectAlways => {
+                                            "reject_always"
+                                        }
+                                    }
+                                    .to_owned()
+                                }),
                             })
                             .collect(),
                     )
@@ -1124,6 +1141,8 @@ impl ObserveProjection {
         // mutable registry read that could race ahead of `head_seq`.
         let mut branches = self.branches.into_values().collect::<Vec<_>>();
         branches.sort_by_key(|branch| branch.created_seq);
+        let pending_menus: Vec<haider_rpc::ObserveMenuWire> = self.menus.into_values().collect();
+        let needs_input = needs_input(run_state, &pending_menus);
         haider_rpc::SessionObserveDigest {
             session_id,
             head_seq,
@@ -1136,7 +1155,7 @@ impl ObserveProjection {
             main_head_node_id: self.main_head_node_id,
             main_head_seq: self.main_head_seq,
             latest_context_footprint: self.footprint,
-            pending_menus: self.menus.into_values().collect(),
+            pending_menus,
             subagents: self.subagents.into_values().collect(),
             updated_at_ms: self.updated_at_ms,
             last_event_kinds: self.event_kinds.into_iter().collect(),
@@ -1145,6 +1164,7 @@ impl ObserveProjection {
             // metadata-only responses).
             turn_count: None,
             agent_metrics: None,
+            needs_input,
         }
     }
 }
@@ -7949,6 +7969,7 @@ pub(crate) async fn session_summaries(
         let run_state = snapshot.run_state;
         let last_activity_ms = snapshot.last_activity_ms;
         let waiting_why = waiting_why(run_state, &snapshot.pending_menus);
+        let needs_input = needs_input(run_state, &snapshot.pending_menus);
         let (footprint_tokens, footprint_truth) =
             summary_footprint_fields(turns, footprint.as_ref());
         let agent_metrics = snapshot.agent_metrics;
@@ -7986,6 +8007,7 @@ pub(crate) async fn session_summaries(
             seen_at_ms,
             last_activity_ms,
             waiting_why,
+            needs_input,
             workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
             metadata,
             last_model,
@@ -8003,6 +8025,68 @@ pub(crate) async fn session_summaries(
         });
     }
     Ok(sessions)
+}
+
+/// v0.0.937 unified input-required contract: whenever the run state is
+/// parked on a human, project the oldest answerable pending menu into ONE
+/// typed, secret-free card carrying its exact `menu.answer` coordinates.
+/// A parked state with no menu still reports a kind (from the state) so a
+/// surface can badge it, just without an answerable card.
+fn needs_input(
+    run_state: haider_rpc::ObserveRunStateWire,
+    pending_menus: &[haider_rpc::ObserveMenuWire],
+) -> Option<haider_rpc::NeedsInputWire> {
+    use haider_rpc::{NeedsInputKindWire, NeedsInputWire, ObserveRunStateWire};
+
+    let parked = matches!(
+        run_state,
+        ObserveRunStateWire::ParkedPermission
+            | ObserveRunStateWire::ParkedInput
+            | ObserveRunStateWire::EffectUnknown
+    );
+    if !parked {
+        return None;
+    }
+    let menu = pending_menus
+        .iter()
+        .min_by_key(|menu| menu.request_seq.unwrap_or(u64::MAX));
+    let kind = match menu.map(|menu| menu.kind.as_str()) {
+        Some("permission") => NeedsInputKindWire::Permission,
+        Some("question") => NeedsInputKindWire::Question,
+        Some("recovery" | "error_recovery") => NeedsInputKindWire::Recovery,
+        Some("secret") => NeedsInputKindWire::Secret,
+        Some("update") => NeedsInputKindWire::Update,
+        Some("trust_hook") => NeedsInputKindWire::TrustHook,
+        Some("choice") => NeedsInputKindWire::Choice,
+        Some("conflict") => NeedsInputKindWire::Conflict,
+        Some("file") => NeedsInputKindWire::File,
+        Some("exhausted") => NeedsInputKindWire::Exhausted,
+        Some("graph_human_confirm" | "graph_abandon_confirm") => NeedsInputKindWire::Approval,
+        Some(_) => NeedsInputKindWire::Unknown,
+        // Parked with no visible menu: badgeable, not answerable.
+        None => match run_state {
+            ObserveRunStateWire::ParkedPermission => NeedsInputKindWire::Permission,
+            ObserveRunStateWire::EffectUnknown => NeedsInputKindWire::Recovery,
+            _ => NeedsInputKindWire::Question,
+        },
+    };
+    let secret_answer = matches!(kind, NeedsInputKindWire::Secret);
+    Some(NeedsInputWire {
+        kind,
+        title: menu
+            .map(|menu| menu.title.clone())
+            .unwrap_or_else(|| match run_state {
+                ObserveRunStateWire::EffectUnknown => "Effect outcome unknown".to_owned(),
+                _ => "Input required".to_owned(),
+            }),
+        safe_body: menu.map(|menu| menu.body.clone()).unwrap_or_default(),
+        menu_id: menu.and_then(|menu| menu.menu_id.clone()),
+        request_seq: menu.and_then(|menu| menu.request_seq),
+        worker_generation: menu.and_then(|menu| menu.worker_generation),
+        since_ms: menu.and_then(|menu| menu.opened_at_ms),
+        options: menu.map(|menu| menu.options.clone()).unwrap_or_default(),
+        secret_answer,
+    })
 }
 
 fn waiting_why(
@@ -8180,6 +8264,7 @@ mod roster_wave_tests {
             seen_at_ms: None,
             last_activity_ms: None,
             waiting_why: None,
+            needs_input: None,
             effort: None,
             fast: None,
             account_alias: None,

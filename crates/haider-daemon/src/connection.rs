@@ -1746,6 +1746,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_SESSION_MUTATION_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_NEEDS_INPUT_V1.to_owned(),
         FEATURE_SESSION_FLEET_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),

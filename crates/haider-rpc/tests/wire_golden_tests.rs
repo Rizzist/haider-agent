@@ -632,6 +632,7 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         seen_at_ms: None,
         last_activity_ms: None,
         waiting_why: None,
+        needs_input: None,
         metadata: None,
         last_model: None,
         workspace_cwd: Some("/work/original".into()),
@@ -2044,6 +2045,7 @@ fn session_rename_frames_are_additive_and_golden() {
         seen_at_ms: None,
         last_activity_ms: None,
         waiting_why: None,
+        needs_input: None,
         metadata: None,
         last_model: None,
         workspace_cwd: None,
@@ -2616,6 +2618,7 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
         seen_at_ms: None,
         last_activity_ms: None,
         waiting_why: None,
+        needs_input: None,
         metadata: None,
         last_model: None,
         workspace_cwd: None,
@@ -3023,4 +3026,91 @@ fn attention_fields_and_waiting_why_are_additive() {
         .expect("encodes"),
         serde_json::json!({"kind": "question", "pending_menu_id": "menu-3"})
     );
+}
+
+/// v0.0.937 unified input contract: `needs_input` is additive on BOTH the
+/// summary and the observe digest, `NeedsInputKindWire` tolerates kinds a
+/// newer daemon may add (`#[serde(other)] Unknown` — the arm the frozen
+/// 936 `waiting_why` enum lacked), the full card shape is pinned, and the
+/// option `decision` rider is additive.
+///
+/// MUTATION CHECK (executed): remove the `#[serde(other)]` tolerance arm
+/// and the future-kind decode fails; drop a `skip_serializing_if` on
+/// `needs_input`/`secret_answer` and the byte-stability halves fail.
+#[test]
+fn needs_input_is_additive_tolerant_and_shape_pinned() {
+    use haider_rpc::{NeedsInputKindWire, NeedsInputWire, SessionSummary};
+
+    // Tolerance: an unknown kind decodes to Unknown, never an error.
+    let future: NeedsInputKindWire =
+        serde_json::from_value(serde_json::json!("holographic_consent_v9")).expect("tolerant");
+    assert!(matches!(future, NeedsInputKindWire::Unknown));
+
+    // Older daemon: absent field decodes None and re-encodes with no key.
+    let older: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "s1", "head_seq": 3, "worker_generation": 1,
+    }))
+    .expect("older summary decodes");
+    assert_eq!(older.needs_input, None);
+    let encoded = serde_json::to_value(&older).expect("encodes");
+    assert!(encoded.get("needs_input").is_none());
+
+    // The full card round-trips with its exact wire shape.
+    let card = NeedsInputWire {
+        kind: NeedsInputKindWire::Permission,
+        title: "Allow write?".into(),
+        safe_body: vec!["write src/lib.rs".into()],
+        menu_id: Some(haider_protocol::ids::MenuId::new("menu-9")),
+        request_seq: Some(41),
+        worker_generation: Some(2),
+        since_ms: Some(1_000),
+        options: vec![haider_rpc::ObserveMenuOptionWire {
+            key: "approve_once".into(),
+            label: "Approve once".into(),
+            detail: None,
+            decision: Some("allow_once".into()),
+        }],
+        secret_answer: false,
+    };
+    assert_eq!(
+        serde_json::to_value(&card).expect("encodes"),
+        serde_json::json!({
+            "kind": "permission",
+            "title": "Allow write?",
+            "safe_body": ["write src/lib.rs"],
+            "menu_id": "menu-9",
+            "request_seq": 41,
+            "worker_generation": 2,
+            "since_ms": 1000,
+            "options": [{
+                "key": "approve_once",
+                "label": "Approve once",
+                "decision": "allow_once",
+            }],
+        }),
+        "secret_answer=false and empty optionals never serialize"
+    );
+
+    // The minimal badge-only card (parked, no menu) stays tiny.
+    let badge = NeedsInputWire {
+        kind: NeedsInputKindWire::Recovery,
+        title: "Effect outcome unknown".into(),
+        safe_body: Vec::new(),
+        menu_id: None,
+        request_seq: None,
+        worker_generation: None,
+        since_ms: None,
+        options: Vec::new(),
+        secret_answer: false,
+    };
+    assert_eq!(
+        serde_json::to_value(&badge).expect("encodes"),
+        serde_json::json!({"kind": "recovery", "title": "Effect outcome unknown"})
+    );
+
+    // Option decision rider is additive: absent decodes None.
+    let old_option: haider_rpc::ObserveMenuOptionWire =
+        serde_json::from_value(serde_json::json!({"key": "k", "label": "L"}))
+            .expect("older option decodes");
+    assert_eq!(old_option.decision, None);
 }

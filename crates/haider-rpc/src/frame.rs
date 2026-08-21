@@ -308,6 +308,11 @@ pub const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
 /// Daemon implements the durable, shared per-session attention acknowledgement
 /// (`session.seen`) and attention fields on session summaries.
 pub const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
+/// Daemon publishes the unified needs-input structure on session summaries:
+/// EVERY parked-on-a-human menu (permission, recovery, update, secret, …)
+/// presents one typed, secret-free, answerable card, so any surface can
+/// resolve it through `menu.answer` without a terminal.
+pub const FEATURE_SESSION_NEEDS_INPUT_V1: &str = "session_needs_input_v1";
 /// Daemon implements receipted live-session effort selection
 /// (`session.select_effort`), validated against the CURRENT pair's declared
 /// effort ladder; `effort: null` reverts to the provider default (G3).
@@ -978,8 +983,19 @@ pub struct SessionSummary {
     /// Why the session currently needs a human. This is absent unless its
     /// daemon-owned run state is parked for permission, a question, or an
     /// approval.
+    ///
+    /// FROZEN at three kinds (v0.0.936 shipped the enum without a tolerance
+    /// arm, so it must never grow) — superseded by [`Self::needs_input`],
+    /// kept for 936 clients until they migrate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_why: Option<WaitingWhyWire>,
+    /// v0.0.937 unified input-required contract: whenever this session is
+    /// parked on ANY human input, the one typed, secret-free, answerable
+    /// card — enough for a client to render it and resolve it through
+    /// `menu.answer` (or the secret-reference input path) without ever
+    /// reaching a terminal. Absent when the session needs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_input: Option<NeedsInputWire>,
     /// Additive R2 field: typed configuration for live-created sessions.
     /// `None` for legacy `{}` rows and when an old daemon omits the field —
     /// readers must not infer anything from its absence.
@@ -1194,6 +1210,53 @@ pub struct WaitingWhyWire {
     pub pending_menu_id: Option<MenuId>,
 }
 
+/// The typed reason a session is parked on a human (v0.0.937 unified
+/// contract). Kinds mirror the daemon's menu vocabulary; `Unknown` absorbs
+/// kinds a newer daemon may add, so this enum CAN grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedsInputKindWire {
+    Permission,
+    Question,
+    Approval,
+    Recovery,
+    Secret,
+    Update,
+    TrustHook,
+    Choice,
+    Conflict,
+    File,
+    Exhausted,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One unified, secret-free, ANSWERABLE input-required card. Everything a
+/// client needs to render the park and resolve it: typed kind, display copy,
+/// the exact `menu.answer` coordinates (menu id + request_seq +
+/// worker_generation), and the option roster. `secret_answer` marks the one
+/// kind whose answer must travel as a secret reference, never a plain value.
+/// `since_ms` + the menu id give notification surfaces a stable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeedsInputWire {
+    pub kind: NeedsInputKindWire,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_body: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_id: Option<MenuId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ObserveMenuOptionWire>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub secret_answer: bool,
+}
+
 /// Secret-free projection of one currently answerable menu.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserveMenuWire {
@@ -1230,6 +1293,12 @@ pub struct ObserveMenuOptionWire {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Additive (v0.0.937): the typed decision this choice commits for
+    /// permission-style menus (`allow_once` / `allow_always` / `reject_once`
+    /// / `reject_always`), so a client can style buttons without parsing
+    /// labels. Absent for options with no permission semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
 }
 
 /// Daemon-persisted subagent identity and chip state.
@@ -1283,6 +1352,10 @@ pub struct SessionObserveDigest {
     /// daemons and in metadata-only responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_metrics: Option<AgentMetricsSnapshot>,
+    /// v0.0.937 unified input-required card (same producer as the session
+    /// listing's field): present whenever this session is parked on a human.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_input: Option<NeedsInputWire>,
 }
 
 /// Stable display state for one descendant in a fleet snapshot.

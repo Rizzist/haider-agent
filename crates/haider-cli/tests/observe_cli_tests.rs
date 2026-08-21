@@ -132,6 +132,7 @@ fn digest(
         last_event_kinds: vec!["run_state".into(), "future_observe_kind_v9".into()],
         turn_count: None,
         agent_metrics: None,
+        needs_input: None,
     }
 }
 

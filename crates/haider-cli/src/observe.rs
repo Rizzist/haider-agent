@@ -129,6 +129,7 @@ pub(crate) struct SessionSummaryView {
     pub seen_at_ms: Option<u64>,
     pub last_activity_ms: Option<u64>,
     pub waiting_why: Option<haider_rpc::WaitingWhyWire>,
+    pub needs_input: Option<haider_rpc::NeedsInputWire>,
 }
 
 pub(crate) struct SessionDepthView {
@@ -250,6 +251,9 @@ impl ObserveJson for SessionSummaryView {
         }
         if let Some(waiting_why) = &self.waiting_why {
             object["waiting_why"] = serde_json::to_value(waiting_why).unwrap_or(Value::Null);
+        }
+        if let Some(needs_input) = &self.needs_input {
+            object["needs_input"] = serde_json::to_value(needs_input).unwrap_or(Value::Null);
         }
         object
     }
@@ -566,6 +570,7 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
                 view.seen_at_ms = summary.seen_at_ms;
                 view.last_activity_ms = summary.last_activity_ms;
                 view.waiting_why = summary.waiting_why.clone();
+                view.needs_input = summary.needs_input.clone();
             }
             view
         })
@@ -814,6 +819,7 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         seen_at_ms: None,
         last_activity_ms: None,
         waiting_why: None,
+        needs_input: None,
         title: digest.title,
         run_state: run_state_name(digest.run_state),
         active_branch: digest
@@ -1227,6 +1233,7 @@ mod roster_scalar_tests {
             seen_at_ms: None,
             last_activity_ms: None,
             waiting_why: None,
+            needs_input: None,
         }
     }
 
@@ -1246,6 +1253,7 @@ mod roster_scalar_tests {
             "seen_at_ms",
             "last_activity_ms",
             "waiting_why",
+            "needs_input",
         ] {
             assert!(bare.get(key).is_none(), "absent `{key}` must not serialize");
         }
@@ -1260,8 +1268,20 @@ mod roster_scalar_tests {
             kind: haider_rpc::WaitingWhyKindWire::Permission,
             pending_menu_id: None,
         });
+        populated.needs_input = Some(haider_rpc::NeedsInputWire {
+            kind: haider_rpc::NeedsInputKindWire::Recovery,
+            title: "Effect outcome unknown".into(),
+            safe_body: Vec::new(),
+            menu_id: None,
+            request_seq: None,
+            worker_generation: None,
+            since_ms: None,
+            options: Vec::new(),
+            secret_answer: false,
+        });
         let json = populated.json();
         assert_eq!(json["effort"], "high");
+        assert_eq!(json["needs_input"]["kind"], "recovery");
         assert_eq!(json["fast"], false);
         assert_eq!(json["agent_type"], "@scout");
         assert_eq!(json["seen_at_ms"], 1_000);

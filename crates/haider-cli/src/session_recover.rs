@@ -566,6 +566,7 @@ mod tests {
             last_event_kinds: Vec::new(),
             turn_count: None,
             agent_metrics: None,
+            needs_input: None,
         }
     }
 

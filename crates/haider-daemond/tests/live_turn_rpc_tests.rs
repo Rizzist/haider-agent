@@ -4845,6 +4845,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             seen_at_ms: None,
             last_activity_ms: None,
             waiting_why: None,
+            needs_input: None,
             metadata: Some(metadata.clone()),
             workspace_cwd: Some(metadata.cwd.clone()),
             // A just-created session is truly empty: zero committed user

@@ -33,7 +33,9 @@ use haider_protocol::ids::{
     MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{EffectRecoveryAction, Menu, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{
+    DecisionKind, EffectRecoveryAction, Menu, MenuKind, MenuOption, MenuScope,
+};
 use haider_protocol::provider::{FinishReason, Usage, UsageRequestKind, UsageScope, UsageSource};
 use haider_protocol::session::ModelSelected;
 use haider_protocol::state::{RunState, WaitReason};
@@ -2682,12 +2684,15 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
             effect_summary: "write src/lib.rs".into(),
         },
         title: "Allow write?".into(),
-        body: vec![VAULT_SENTINEL.into()],
+        // v0.0.937 policy: permission bodies are broker-authored display
+        // copy by construction and are EXPOSED on the digest so any surface
+        // can render the card; only Secret menus may carry vault material.
+        body: vec!["write src/lib.rs".into(), "Effect class: Write".into()],
         options: vec![MenuOption {
-            key: VAULT_SENTINEL.into(),
-            label: VAULT_SENTINEL.into(),
-            detail: Some(VAULT_SENTINEL.into()),
-            decision: None,
+            key: "approve_once".into(),
+            label: "Approve once".into(),
+            detail: None,
+            decision: Some(DecisionKind::AllowOnce),
         }],
         blocking: true,
         scope: MenuScope::Session,
@@ -2915,14 +2920,51 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     // effect_recovery_v1 boundary: non-recovery menus expose title +
     // permission_description ONLY; their durable body/options (which can
     // carry vaulted credentials) are stripped from the observe digest.
-    assert!(
-        permission.pending_menus[0].body.is_empty()
-            && permission.pending_menus[0].options.is_empty(),
-        "a permission menu's body/options never reach the observe digest"
+    // v0.0.937 unified input contract: the permission card IS exposed —
+    // body (display copy), options, and the typed decision rider — so the
+    // ADE can render and answer it without a terminal.
+    assert_eq!(
+        permission.pending_menus[0].body,
+        vec![
+            "write src/lib.rs".to_owned(),
+            "Effect class: Write".to_owned()
+        ],
     );
+    assert_eq!(
+        permission.pending_menus[0].options[0].decision.as_deref(),
+        Some("allow_once"),
+        "the typed decision rides the exposed option"
+    );
+    let permission_card = permission
+        .needs_input
+        .as_ref()
+        .expect("permission park publishes needs_input");
+    assert_eq!(
+        permission_card.kind,
+        haider_rpc::NeedsInputKindWire::Permission
+    );
+    assert_eq!(permission_card.menu_id, permission.pending_menus[0].menu_id);
+    assert_eq!(
+        permission_card.request_seq,
+        permission.pending_menus[0].request_seq
+    );
+    assert!(!permission_card.secret_answer);
     assert!(
         input.pending_menus[0].body.is_empty() && input.pending_menus[0].options.is_empty(),
         "a secret menu's body/options never reach the observe digest"
+    );
+    let secret_card = input
+        .needs_input
+        .as_ref()
+        .expect("secret park still publishes a typed badge");
+    assert_eq!(secret_card.kind, haider_rpc::NeedsInputKindWire::Secret);
+    assert!(
+        secret_card.secret_answer,
+        "secret answers must travel as references"
+    );
+    assert!(
+        secret_card.safe_body.is_empty() && secret_card.options.is_empty(),
+        "the secret card is badge-only — never material"
     );
     let recovery = digests
         .iter()
@@ -6935,6 +6977,41 @@ async fn waiting_why_types_parked_states_with_menu_identity() {
     let approval_why = why(&approval_session).expect("approval park types");
     assert_eq!(approval_why.kind, haider_rpc::WaitingWhyKindWire::Approval);
     assert_eq!(why(&idle_session), None, "idle session has no waiting_why");
+
+    // v0.0.937 unified contract beside the frozen waiting_why: needs_input
+    // gives the PRECISE kind (trust_hook stays trust_hook, not approval)
+    // plus the answerable card coordinates.
+    let card = |session: &SessionId| {
+        sessions
+            .iter()
+            .find(|summary| &summary.session_id == session)
+            .expect("session listed")
+            .needs_input
+            .clone()
+    };
+    let permission_card = card(&permission_session).expect("permission card");
+    assert_eq!(
+        permission_card.kind,
+        haider_rpc::NeedsInputKindWire::Permission
+    );
+    assert_eq!(
+        permission_card.menu_id,
+        Some(MenuId::new("attention-perm-menu"))
+    );
+    assert!(
+        !permission_card.options.is_empty(),
+        "the card carries answerable options"
+    );
+    assert!(permission_card.request_seq.is_some() && permission_card.since_ms.is_some());
+    let question_card = card(&question_session).expect("question card");
+    assert_eq!(question_card.kind, haider_rpc::NeedsInputKindWire::Question);
+    let approval_card = card(&approval_session).expect("trust-hook card");
+    assert_eq!(
+        approval_card.kind,
+        haider_rpc::NeedsInputKindWire::TrustHook,
+        "needs_input keeps the precise kind"
+    );
+    assert_eq!(card(&idle_session), None, "idle session needs no input");
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

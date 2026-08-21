@@ -254,6 +254,7 @@ fn sustained_unknown_payloads_emit_one_durable_compatibility_diagnostic() {
                 seen_at_ms: None,
                 last_activity_ms: None,
                 waiting_why: None,
+                needs_input: None,
                 metadata: None,
                 workspace_cwd: None,
                 turn_count: None,
