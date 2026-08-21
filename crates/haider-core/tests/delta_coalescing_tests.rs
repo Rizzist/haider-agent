@@ -171,6 +171,50 @@ async fn window_elapse_flushes_a_buffered_delta_without_a_semantic_boundary() {
     assert_eq!(completed_message(&events), "earlylate");
 }
 
+/// MUTATION CHECK: neutering `delta_flush_timer` (never firing) must fail
+/// this pin. The journal-shape pins cannot catch that mutation — the
+/// buffer-entry deadline check flushes once a NEXT delta arrives — so this
+/// pin observes the timer's distinct job: publishing during provider
+/// silence, long before the next semantic boundary. The 500ms bound is 10x
+/// the 50ms window (gate-load doctrine: wall-clock pins need wide margins).
+#[tokio::test]
+async fn timed_flush_publishes_the_delta_during_provider_silence() {
+    let (handle, _store) = runtime_with_window(
+        vec![
+            FakeStep::EmitText {
+                text: "early".into(),
+            },
+            FakeStep::Delay { ms: 700 },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+        STREAM_DELTA_COALESCE_WINDOW,
+    );
+    let mut subscriber = handle.subscribe();
+    let started = tokio::time::Instant::now();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("coalesce me"))
+        .await
+        .expect("turn accepted");
+    let waited = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let event = subscriber.recv().await.expect("event stream open");
+            if matches!(typed(&event), EventPayload::Item(ItemEvent::Delta { .. })) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "the timed flush must publish the buffered delta during the provider's \
+         700ms silence, not at the next semantic boundary (waited {}ms)",
+        started.elapsed().as_millis()
+    );
+    turn.wait().await.expect("turn outcome");
+}
+
 /// MUTATION CHECK: replacing the buffer on an interleave without flushing
 /// (dropping the buffered delta) must fail the ordered three-envelope pin.
 #[tokio::test]
