@@ -3978,10 +3978,16 @@ fn render_session(
         } else {
             (theme.dim_style(), theme.dim_style())
         };
+        // Fixed-width readout, left-anchored above the composer (owner
+        // 2026-08-21): 24 bar columns then a 5-char rate field, so the row
+        // never shifts as digits (or the ~ marker) come and go.
         let mut spans = vec![
             Span::raw(" "),
             Span::styled(readout.spark.clone(), spark_ink),
-            Span::styled(format!(" {tilde}{} tps", readout.tps), rate_ink),
+            Span::styled(
+                format!(" {:>5} tps", format!("{tilde}{}", readout.tps)),
+                rate_ink,
+            ),
         ];
         if let Some(mean) = readout.mean {
             spans.push(Span::styled(format!(" · μ{mean}"), theme.dim_style()));

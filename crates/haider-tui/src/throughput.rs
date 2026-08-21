@@ -24,10 +24,11 @@ pub const SPARK_RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '�
 /// Per-turn tps samples kept for the sparkline + aggregate stats (decision 3,
 /// N in the 16–24 band).
 const SAMPLE_CAP: usize = 24;
-/// The sparkline's FIXED rendered width (owner 2026-08-15): the readout box
-/// never grows — samples enter at the right edge and roll off the left, and
-/// until the ring fills the missing columns are blank (never a fabricated
-/// floor glyph).
+/// The sparkline's FIXED rendered width (owner 2026-08-15, roll direction
+/// owner 2026-08-21): the readout box never grows — bars fill left-to-right
+/// as 5s buckets close and roll off the LEFT once the ring caps, and until
+/// the ring fills the trailing columns are blank (never a fabricated floor
+/// glyph).
 pub const SPARK_WIDTH: usize = SAMPLE_CAP;
 /// Raw `(t_ms, cumulative_tokens)` observations retained for the windowed rate.
 /// Bounded well above one window's worth at the anim cadence.
@@ -35,10 +36,13 @@ const RAW_CAP: usize = 96;
 /// The sliding window (ms) the instantaneous rate is measured over
 /// (decision 1: "last ~1s of deltas").
 const WINDOW_MS: u64 = 1_000;
-/// A new tps sample joins the ring at most this often, so the 24-slot
-/// sparkline spans ~6s of history rather than a fraction of a second at the
-/// 30fps clock. Raw observations are still recorded every tick.
-const SAMPLE_INTERVAL_MS: u64 = 250;
+/// One sparkline column is one closed BUCKET of this many milliseconds
+/// (owner 2026-08-21: "1 bar represents 5s avg") — the bar is the turn's
+/// AVERAGE rate across its bucket, computed from cumulative-token deltas at
+/// bucket boundaries, so the 24-slot track spans two minutes of streaming
+/// history. Raw observations still land every tick; only bucket closes
+/// append columns. The live `N tps` number stays the 1s instantaneous rate.
+const BUCKET_MS: u64 = 5_000;
 /// Samples required before μ/p95 are shown (decision 5: show the current rate
 /// alone until enough exist, never fake the aggregates).
 const STATS_MIN: usize = 4;
@@ -105,8 +109,10 @@ pub struct ThroughputTracker {
     /// The most recent windowed rate (the live number), independent of the
     /// ring cadence.
     last_tps: Option<u32>,
-    /// When the last ring sample was appended (cadence gate).
-    last_sample_ms: Option<u64>,
+    /// The open bucket's start: `(start_ms, cumulative_tokens_at_start)`.
+    /// Closed by observations that land past the boundary; a multi-bucket
+    /// silence closes each elapsed bucket at the span's uniform average.
+    bucket_start: Option<(u64, u64)>,
     /// Sticky for the turn: once ANY exact-usage observation lands, the readout
     /// stops flagging itself approximate — we have real numbers now.
     exact_seen: bool,
@@ -127,7 +133,7 @@ impl ThroughputTracker {
             && self.samples.is_empty()
             && self.last_tokens.is_none()
             && self.last_tps.is_none()
-            && self.last_sample_ms.is_none()
+            && self.bucket_start.is_none()
             && !self.exact_seen
     }
 
@@ -137,7 +143,7 @@ impl ThroughputTracker {
         self.samples.clear();
         self.last_tokens = None;
         self.last_tps = None;
-        self.last_sample_ms = None;
+        self.bucket_start = None;
         self.exact_seen = false;
     }
 
@@ -170,15 +176,33 @@ impl ThroughputTracker {
 
         if let Some(tps) = windowed_tps(&self.raw) {
             self.last_tps = Some(tps);
-            let due = self
-                .last_sample_ms
-                .is_none_or(|last| now_ms.saturating_sub(last) >= SAMPLE_INTERVAL_MS);
-            if due {
-                self.samples.push_back(tps);
-                while self.samples.len() > SAMPLE_CAP {
-                    self.samples.pop_front();
+        }
+
+        // Bucket accounting: the FIRST observation opens the bucket; any
+        // later observation past a boundary closes every fully elapsed
+        // bucket at the span's uniform average (tokens/second across the
+        // whole gap — a silence closes honest zero-rate bars), then rolls
+        // the open bucket forward by exactly the consumed span.
+        match self.bucket_start {
+            None => self.bucket_start = Some((now_ms, tokens)),
+            Some((start_ms, start_tokens)) => {
+                let elapsed = now_ms.saturating_sub(start_ms);
+                if elapsed >= BUCKET_MS {
+                    let delta = tokens.saturating_sub(start_tokens);
+                    let average =
+                        u32::try_from(delta.saturating_mul(1_000) / elapsed).unwrap_or(u32::MAX);
+                    let full = elapsed / BUCKET_MS;
+                    for _ in 0..full {
+                        self.samples.push_back(average);
+                        while self.samples.len() > SAMPLE_CAP {
+                            self.samples.pop_front();
+                        }
+                    }
+                    let consumed_ms = full * BUCKET_MS;
+                    let consumed_tokens = delta.saturating_mul(consumed_ms) / elapsed;
+                    self.bucket_start =
+                        Some((start_ms + consumed_ms, start_tokens + consumed_tokens));
                 }
-                self.last_sample_ms = Some(now_ms);
             }
         }
     }
@@ -191,12 +215,13 @@ impl ThroughputTracker {
         let tps = self.last_tps?;
         let ring: Vec<u32> = self.samples.iter().copied().collect();
         let enough = ring.len() >= STATS_MIN;
-        // Fixed-width roll: left-pad the young ring with blanks so the box
-        // is SPARK_WIDTH columns from the first frame and samples march
-        // right-to-left as the ring fills and caps.
+        // Fixed-width roll, LEFT-anchored (owner 2026-08-21): the box is
+        // SPARK_WIDTH columns from the first frame, bars fill left-to-right
+        // as buckets close, and once the ring caps the oldest bar falls off
+        // the left. Unfilled columns stay blank — never a fabricated floor.
         let drawn = spark(&ring, SPARK_WIDTH);
         let pad = SPARK_WIDTH.saturating_sub(drawn.chars().count());
-        let spark = format!("{}{drawn}", " ".repeat(pad));
+        let spark = format!("{drawn}{}", " ".repeat(pad));
         Some(ThroughputReadout {
             spark,
             tps,
@@ -382,12 +407,13 @@ mod tests {
     #[test]
     fn wg4_scripted_stream_rises_and_populates_the_sparkline() {
         let mut tracker = ThroughputTracker::new();
-        // A steadily accelerating token stream over mock time.
+        // A steadily accelerating token stream over two minutes of mock
+        // time at a 1s tick — enough to close 23 five-second buckets.
         let mut script = Vec::new();
         let mut tok = 0u64;
-        for i in 0..24u64 {
-            tok += 50 + i * 4; // rising per-step delta → rising tps
-            script.push((250 * (i + 1), tok, true));
+        for i in 0..120u64 {
+            tok += 50 + i * 4; // rising per-tick delta → rising bucket rates
+            script.push((1_000 * (i + 1), tok, true));
         }
         feed(&mut tracker, &script);
         let readout = tracker.readout().expect("a rate is established");
@@ -395,21 +421,48 @@ mod tests {
         assert!(!readout.approx, "exact usage → no tilde");
         assert!(readout.mean.is_some());
         assert!(readout.p95.is_some());
-        // Fixed-width law (owner 2026-08-15): the box is ALWAYS SPARK_WIDTH
-        // columns — a young ring is left-padded with blanks, so samples
-        // enter at the right and roll off the left.
+        // Bucket law (owner 2026-08-21): one column per closed 5s bucket.
+        assert_eq!(tracker.samples().len(), (119_000 / 5_000) as usize);
+        // Fixed-width law: the box is ALWAYS SPARK_WIDTH columns.
         assert_eq!(readout.spark.chars().count(), SPARK_WIDTH);
-        // The drawn portion is populated and its later columns out-rank its
-        // first drawn column (padding blanks are not samples).
-        let first = SPARK_RAMP
-            .iter()
-            .position(|&r| Some(r) == readout.spark.chars().find(|c| *c != ' '))
-            .unwrap();
+        // LEFT-anchored fill: the first column is a drawn bar, and the last
+        // DRAWN column out-ranks it (rising rates ramp left→right).
+        let drawn: Vec<char> = readout.spark.chars().filter(|c| *c != ' ').collect();
+        let first = SPARK_RAMP.iter().position(|&r| r == drawn[0]).unwrap();
         let last = SPARK_RAMP
             .iter()
-            .position(|&r| r == readout.spark.chars().last().unwrap())
+            .position(|&r| r == *drawn.last().unwrap())
             .unwrap();
         assert!(last >= first, "the rate ramps up: {}", readout.spark);
+        assert_ne!(
+            readout.spark.chars().next(),
+            Some(' '),
+            "bars anchor at the LEFT edge"
+        );
+    }
+
+    /// MUTATION CHECK (executed): drift `BUCKET_MS` (e.g. back to 250ms
+    /// cadence) and the boundary/count assertions fail; attribute a silence
+    /// to the live bucket instead of closing zero-rate bars and the silence
+    /// half fails.
+    #[test]
+    fn one_bar_is_one_five_second_average_bucket() {
+        let mut tracker = ThroughputTracker::new();
+        // Open the bucket at t=0, stream 500 tokens by t=4999 — still no
+        // closed bucket one millisecond before the boundary.
+        tracker.observe(0, 0, true);
+        tracker.observe(4_999, 500, true);
+        assert_eq!(tracker.samples().len(), 0, "no bar before the boundary");
+        // The observation AT the boundary closes bucket one at its average.
+        tracker.observe(5_000, 500, true);
+        assert_eq!(tracker.samples(), vec![100], "500 tokens / 5s = 100 tps");
+        // A 10s silence with no new tokens closes two honest zero bars.
+        tracker.observe(15_000, 500, true);
+        assert_eq!(tracker.samples(), vec![100, 0, 0]);
+        // The young track renders left-anchored with trailing blanks.
+        let readout = tracker.readout().expect("readout");
+        assert!(readout.spark.starts_with(|c: char| c != ' '));
+        assert!(readout.spark.ends_with(' '));
     }
 
     #[test]
@@ -417,20 +470,25 @@ mod tests {
         let mut tracker = ThroughputTracker::new();
         feed(
             &mut tracker,
-            &[(250, 100, true), (500, 260, true), (750, 450, true)],
+            &[
+                (1_000, 100, true),
+                (6_000, 600, true),
+                (11_000, 1_200, true),
+                (16_000, 1_900, true),
+            ],
         );
         assert!(tracker.readout().is_some());
         let before = tracker.samples().len();
         assert!(before >= 2);
         // A new turn: cumulative output restarts small → buffers clear.
-        tracker.observe(1_000, 5, true);
+        tracker.observe(17_000, 5, true);
         assert_eq!(
             tracker.samples().len(),
             0,
             "the regression cleared the ring"
         );
         // And it rebuilds cleanly from the new baseline.
-        tracker.observe(1_250, 130, true);
+        tracker.observe(17_500, 130, true);
         assert!(tracker.readout().is_some());
     }
 
