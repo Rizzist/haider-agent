@@ -60,6 +60,12 @@ pub struct TranscriptJoiner {
 pub struct TranscriptProjector {
     joiner: TranscriptJoiner,
     buffered: VecDeque<BufferedRow>,
+    /// Runs that committed item events. An `assistant_commit` node in such a
+    /// run repeats content the item stream already carries, so its text row
+    /// is marked `compat` and an item-canonical client may drop it
+    /// unconditionally. Pre-item journals never populate this, so their rows
+    /// stay unmarked and fold normally.
+    item_runs: std::collections::HashSet<String>,
 }
 
 struct BufferedRow {
@@ -73,7 +79,22 @@ impl TranscriptProjector {
     /// already durable. Rows after that cursor still enter through [`Self::push`]
     /// and may wait for a later result as usual.
     pub fn prewarm(&mut self, envelope: &RawEnvelope) {
+        self.note_item_run(envelope);
         let _ = self.joiner.observe(envelope);
+    }
+
+    /// Cheap type-tag peek: remembers which runs speak item events, without
+    /// decoding the payload.
+    fn note_item_run(&mut self, envelope: &RawEnvelope) {
+        if envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("item")
+            && let Some(run_id) = envelope.run_id.as_ref()
+        {
+            self.item_runs.insert(run_id.as_str().to_owned());
+        }
     }
 
     /// Project one ordered envelope. Rows following an unresolved tool stay
@@ -90,8 +111,14 @@ impl TranscriptProjector {
             }
         }
 
+        self.note_item_run(envelope);
+        let run_repeats_items = envelope
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| self.item_runs.contains(run_id.as_str()));
         let result = matching_result(envelope);
-        if let Some(projection) = sidecar_projection(&mut self.joiner, envelope) {
+        if let Some(projection) = sidecar_projection(&mut self.joiner, envelope, run_repeats_items)
+        {
             self.buffered.push_back(BufferedRow {
                 row: projection.row,
                 unresolved_tool: projection.unresolved_tool,
@@ -340,6 +367,15 @@ struct TextRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     branch_id: Option<String>,
     ordinal: u32,
+    /// Marks a row whose content the item stream ALSO carries (or an empty
+    /// turn-start row, which is always safe to drop). Serialized only when
+    /// true, so pre-item journals and exports keep their exact bytes.
+    #[serde(skip_serializing_if = "is_false")]
+    compat: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize)]
@@ -515,12 +551,16 @@ pub fn sidecar_row_with(
     joiner: &mut TranscriptJoiner,
     envelope: &RawEnvelope,
 ) -> Option<SidecarRow> {
-    sidecar_projection(joiner, envelope).map(|projection| projection.row)
+    // The stateless form has no run history, so only the always-safe empty
+    // assistant rows are marked here; the pipe projector carries the run
+    // tracking that marks item-repeating content.
+    sidecar_projection(joiner, envelope, false).map(|projection| projection.row)
 }
 
 fn sidecar_projection(
     joiner: &mut TranscriptJoiner,
     envelope: &RawEnvelope,
+    run_repeats_items: bool,
 ) -> Option<SidecarProjection> {
     let tool_join = joiner.observe(envelope);
     // Ship-gate round 2: the peek goes DEEP enough that the common case —
@@ -574,11 +614,16 @@ fn sidecar_projection(
                     seq,
                     branch_id,
                     ordinal: 0,
+                    compat: false,
                 })),
                 unresolved_tool: None,
             }),
             NodeKind::AssistantCommit { text, .. } => Some(SidecarProjection {
                 row: SidecarRow(SidecarRowKind::Text(TextRow {
+                    // Empty turn-start commits precede their run's items, so
+                    // they are marked unconditionally: dropping an empty row
+                    // loses nothing on any journal.
+                    compat: run_repeats_items || text.is_empty(),
                     role: "assistant",
                     text,
                     at_ms,
