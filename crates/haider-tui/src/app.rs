@@ -3387,7 +3387,6 @@ pub struct AppModel {
     /// `Some(buffer)` while open. The PANE decides what ⏎ asks the model to
     /// draft (agent type vs workflow); the input itself registers nothing —
     /// the plan gate + `loom_register` machinery does.
-    pub loom_input: Option<String>,
     /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
@@ -3746,7 +3745,6 @@ impl Default for AppModel {
             loom_scroll_max: std::cell::Cell::new(0),
             loom_return: None,
             loom_pane: LoomPane::default(),
-            loom_input: None,
             graph_inspect: None,
             retry_inflight: false,
             graph_unsupported: false,
@@ -4831,17 +4829,6 @@ impl AppModel {
                     }
                     return;
                 }
-                // W-flow: the loom authoring input is a one-line field —
-                // paste lands there (newlines flattened) and nowhere else,
-                // never in the hidden composer draft beneath the screen.
-                if self.screen == Screen::Loom
-                    && let Some(buffer) = self.loom_input.as_mut()
-                {
-                    for c in text.chars() {
-                        buffer.push(if c == '\n' || c == '\r' { ' ' } else { c });
-                    }
-                    return;
-                }
                 // T2: pasting while a talk session is engaged COMMITS the
                 // partial transcript first (the typing-commits law), then
                 // the paste itself flows the normal path below.
@@ -5690,33 +5677,17 @@ impl AppModel {
         // D3 — /loom browser: ↑↓ move over types+workflows, ⏎ opens the
         // detail pane, esc backs out (detail → list → where you came from).
         if self.screen == Screen::Loom {
-            // W-flow authoring: an open `n` input owns every key. ⌥m hops
-            // to the model picker and must be matched BEFORE the Char arm —
-            // a plain `m` stays typeable inside a description; other
-            // modified chars are excluded like the login card's.
-            if self.loom_input.is_some() {
-                match key.code {
-                    KeyCode::Esc => self.loom_input = None,
-                    KeyCode::Enter => self.loom_submit_authoring(),
-                    KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
-                        self.open_model_picker(String::new());
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(buffer) = self.loom_input.as_mut() {
-                            buffer.pop();
-                        }
-                    }
-                    KeyCode::Char(c)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        if let Some(buffer) = self.loom_input.as_mut() {
-                            buffer.push(c);
-                        }
-                    }
-                    _ => {}
-                }
+            // W-flow authoring: ⌥m picks the model that will DRAFT the
+            // workflow or agent type. It must be matched before the bare
+            // Char arm below, which hands every printable key to the
+            // composer — otherwise the `m` would simply be typed.
+            //
+            // The choice routes to the bound session (see the live_session
+            // gate in `pick_model`), because authoring here IS an ordinary
+            // turn on that session: the model you pick is the one that
+            // drafts the plan the loom registry gate then accepts.
+            if key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::ALT) {
+                self.open_model_picker(String::new());
                 self.dirty = true;
                 return;
             }
@@ -9614,7 +9585,6 @@ impl AppModel {
         self.loom_selection = 0;
         self.loom_detail = false;
         self.loom_scroll = 0;
-        self.loom_input = None;
         // W-flow: EVERY pane entry re-reads the registry, so a
         // `loom_register` landed by an authoring turn is visible on return.
         // The Listed-driven fetch stays the once-per-connection hydration
@@ -9788,59 +9758,6 @@ impl AppModel {
         if self.composer.text().trim().is_empty() {
             self.composer.set_text(opener);
         }
-    }
-
-    /// W-flow authoring — ⏎ on the `n` input: leave for the bound session
-    /// and submit ONE ordinary turn whose text instructs the model to draft
-    /// the described agent type / workflow and propose it as a plan; the
-    /// plan-gate + `loom_register` machinery does the rest (root sessions
-    /// only — the daemon enforces that, not this client).
-    fn loom_submit_authoring(&mut self) {
-        let description = self
-            .loom_input
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        if description.is_empty() {
-            self.flash = Some("· describe it first".to_owned());
-            return;
-        }
-        if self.mode.fabricates_locally() {
-            self.flash =
-                Some("· authoring runs live — the daemon's plan gate registers".to_owned());
-            return;
-        }
-        if self.active_session.is_none() {
-            self.flash = Some("· no bound session — open a session, then n".to_owned());
-            return;
-        }
-        let text = match self.loom_pane {
-            LoomPane::Types => format!(
-                "Draft a Loom agent type for: {description}. Propose it as a plan \
-                 (id, name, job, In -> Out types, color #rrggbb, glyph) and after \
-                 I accept the plan register it with loom_register."
-            ),
-            LoomPane::Workflows => format!(
-                "Draft a Loom workflow for: {description}. Propose it as a plan \
-                 carrying the pipe DSL source (header `name: In -> Out`, one node \
-                 per line — the registered agent types are listed in your loom \
-                 inventory) and after I accept the plan register it with \
-                 loom_register."
-            ),
-        };
-        self.loom_input = None;
-        self.loom_return = None;
-        self.screen = Screen::Session;
-        self.turn_active = true;
-        self.scroll_back.set(0);
-        self.requests.push(AppRequest::SubmitText {
-            text,
-            voice: false,
-            title: self.session_title.is_none(),
-            branch: self.branch_state.active().cloned(),
-            attachments: Vec::new(),
-        });
     }
 
     fn enter_graph(&mut self, arg: Option<&str>) {
@@ -13295,10 +13212,9 @@ impl AppModel {
         // loom authoring input's ⌥m hop selects for the BOUND session too —
         // the receipted select is the authoring model choice.
         let live_session = (!self.mode.fabricates_locally()
-            && (self.screen == Screen::Session
-                || (self.screen == Screen::Loom && self.loom_input.is_some())))
-        .then(|| self.active_session.clone())
-        .flatten();
+            && (self.screen == Screen::Session || self.screen == Screen::Loom))
+            .then(|| self.active_session.clone())
+            .flatten();
         let Some(session) = live_session else {
             self.identity.provider = row.provider.clone();
             self.identity.model_short = row.model.clone();

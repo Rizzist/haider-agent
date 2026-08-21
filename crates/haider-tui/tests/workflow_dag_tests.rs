@@ -36,7 +36,7 @@ fn template(nodes: Vec<GraphNodeSpec>) -> GraphTemplateSpec {
 
 fn rendered(spec: &GraphTemplateSpec) -> String {
     let theme = ThemeKey::Dark.theme();
-    workflow_dag_lines(spec, &theme)
+    workflow_dag_lines(spec, theme)
         .iter()
         .map(|line| {
             line.spans

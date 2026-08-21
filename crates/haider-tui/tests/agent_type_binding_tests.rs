@@ -20,7 +20,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::KeyCode;
 
 mod common;
-use common::{ctrl, key, launcher_model, submit};
+use common::{ctrl, launcher_model, submit};
 
 fn sid() -> SessionId {
     SessionId::new("s-agent-type")
@@ -152,10 +152,12 @@ fn types_pane_leads_with_none_and_none_is_synthetic() {
         "the synthetic default leads the registered types:\n{}",
         rows.join("\n")
     );
+    // The verbs sit on ⌃: the pane carries a live composer that owns every
+    // bare letter (owner 2026-08-22).
     assert!(
         rows.iter()
-            .any(|row| row.contains("p bind to session") && row.contains("n new")),
-        "types footer missing p/n:\n{}",
+            .any(|row| row.contains("⌃P bind") && row.contains("⌃N new")),
+        "types footer missing ⌃P/⌃N:\n{}",
         rows.join("\n")
     );
 

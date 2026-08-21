@@ -5727,29 +5727,6 @@ fn render_loom(
         lines.push(new_row);
         lines.push(Line::raw(""));
     }
-    // W-flow authoring: the open `n` input band — house card grammar
-    // (`❯ value▏`); its hint line IS the footer while it is open, so the
-    // pane footers below gate on the input being closed.
-    if let Some(buffer) = &model.loom_input {
-        lines.push(Line::styled(
-            if on_types {
-                "new agent type — describe the job"
-            } else {
-                "new workflow — describe the flow"
-            },
-            theme.bright_style().add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::from(vec![
-            Span::styled(" ❯ ", theme.gold_style()),
-            Span::styled(buffer.clone(), theme.input_style()),
-            Span::styled("▏", theme.gold_style()),
-        ]));
-        lines.push(Line::styled(
-            "⏎ send to model · ⌥m model · esc cancel",
-            theme.dim_style(),
-        ));
-        lines.push(Line::raw(""));
-    }
     // Round 3: an unhydrated live connection is LOADING, not empty — the
     // once-per-connection loom.list may still be in flight (or the socket
     // just died and the next connection re-hydrates).
@@ -6042,12 +6019,10 @@ fn render_loom(
             ]));
         }
         lines.push(Line::raw(""));
-        if model.loom_input.is_none() {
-            lines.push(Line::styled(
-                "↑↓ select · ⏎ detail · p bind to session · n new · tab ⇄ workflows · esc back",
-                theme.dim_style(),
-            ));
-        }
+        lines.push(Line::styled(
+            "↑↓ select · ⏎ detail · ⌃P bind · ⌃N new · ⌥m model · tab ⇄ workflows · esc back",
+            theme.dim_style(),
+        ));
     } else {
         lines.push(Line::styled(
             "WORKFLOWS — run with @name <brief>",
@@ -6139,12 +6114,10 @@ fn render_loom(
             lines.push(Line::from(spans));
         }
         lines.push(Line::raw(""));
-        if model.loom_input.is_none() {
-            lines.push(Line::styled(
-                "↑↓ select · ⏎ detail · p pin to session · n new · tab ⇄ loom · esc back",
-                theme.dim_style(),
-            ));
-        }
+        lines.push(Line::styled(
+            "↑↓ select · ⏎ detail · ⌃P pin · ⌃N new · ⌥m model · tab ⇄ loom · esc back",
+            theme.dim_style(),
+        ));
     }
     // Round 3: both views SCROLL — a large registry or a long detail pane
     // must stay reachable. Detail rides loom_scroll against a published

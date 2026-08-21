@@ -1,9 +1,14 @@
 //! W-flow — the Loom/Workflows QOL wave: the /workflows pane's fixed-head
 //! row space (`∅ none` first and undeletable, then the built-in catalog
-//! pair, then the REGISTERED section), `p` pin-by-name to the bound
-//! session, the `n` describe-it authoring input (⏎ submits the instruction
-//! turn, ⌥m picks the authoring model), the fleet's typed-agent accent, and
+//! pair, then the REGISTERED section), ⌃P pin-by-name to the bound
+//! session, the ⌃N composer seed (authoring is a conversation held IN the
+//! tab, ⌥m picks the drafting model), the fleet's typed-agent accent, and
 //! the pane-entry snapshot re-request.
+//!
+//! The registry actions sit on ⌃ rather than on bare letters because the
+//! owner's ruling (2026-08-22) keeps a LIVE COMPOSER on both loom panes:
+//! every printable key belongs to it, exactly as on the session screen.
+//! That is pinned below — a bare `p` must TYPE, never pin.
 #![allow(clippy::expect_used)]
 
 use haider_protocol::graph::{GraphPhase, GraphStatus};
@@ -23,7 +28,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod common;
-use common::{key, launcher_model, run_slash, submit};
+use common::{ctrl, key, launcher_model, run_slash, submit};
 
 fn sid() -> SessionId {
     SessionId::new("s-loomflow")
@@ -170,11 +175,12 @@ fn workflows_pane_leads_with_none_then_builtins_then_registered() {
         "built-ins must be marked:\n{}",
         rows.join("\n")
     );
-    // The footer carries the new verbs.
+    // The footer carries the new verbs — on ⌃, because the composer below
+    // owns every bare letter.
     assert!(
         rows.iter()
-            .any(|row| row.contains("p pin to session") && row.contains("n new")),
-        "workflows footer missing p/n:\n{}",
+            .any(|row| row.contains("⌃P pin") && row.contains("⌃N new")),
+        "workflows footer missing ⌃P/⌃N:\n{}",
         rows.join("\n")
     );
 
@@ -270,7 +276,7 @@ fn p_pin_carries_the_selected_template_name_on_the_wire() {
     model.loom_selection = 2; // super-ship-loop
     model.requests.clear();
 
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         model.requests.iter().any(|request| matches!(
             request,
@@ -302,7 +308,7 @@ fn p_pin_carries_the_selected_template_name_on_the_wire() {
     model.loom_workflows = vec![clip_workflow()];
     model.loom_selection = 3;
     model.requests.clear();
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         model.requests.iter().any(|request| matches!(
             request,
@@ -341,7 +347,7 @@ fn p_on_none_abandons_the_active_graph() {
     model.graph = Some(active_graph());
     model.requests.clear();
 
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         model
             .requests
@@ -361,7 +367,7 @@ fn p_on_none_abandons_the_active_graph() {
     // Without a graph the row is already truth — honest flash, no wire.
     model.graph = None;
     model.requests.clear();
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(model.requests.is_empty(), "already-none issues nothing");
     assert_eq!(
         model.flash.as_deref(),
@@ -387,7 +393,7 @@ fn p_without_a_bound_session_flashes_honestly() {
     model.loom_selection = 1;
     model.requests.clear();
 
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         !model.requests.iter().any(|request| matches!(
             request,
@@ -471,101 +477,105 @@ fn graph_receipts_flash_and_refusals_carry_the_daemon_message() {
     assert_eq!(model.flash.as_deref(), Some("· workflow cleared — none"));
 }
 
-// ---- item 3: `n` authoring input ----------------------------------------
-
-/// MUTATION CHECK: break the input lifecycle — `n` no longer opens it, ⏎
-/// no longer leaves for the session with the instruction turn, or esc no
-/// longer cancels. Expected RUNTIME failure: the assertions at each step.
+/// The composer owns every bare printable key on BOTH loom panes (owner
+/// 2026-08-22) — which is precisely why pin and new-workflow moved onto ⌃.
+/// A bare `p` that pinned would make the composer untypable.
+///
+/// MUTATION CHECK: drop the ⌃ guard from either registry arm (make them
+/// bare `p`/`n`). Expected RUNTIME failure: the composer-text assertion —
+/// the letters would fire the actions instead of reaching the buffer.
 #[test]
-fn n_authoring_input_submits_the_instruction_turn() {
+fn bare_letters_type_into_the_composer_and_never_fire_registry_actions() {
+    for pane in [LoomPane::Workflows, LoomPane::Types] {
+        let mut model = live_bound_model();
+        model.screen = Screen::Loom;
+        model.loom_pane = pane;
+        model.loom_selection = 2;
+        model.requests.clear();
+
+        // The two hotkey letters, typed bare, plus a neighbour.
+        for c in "pin now".chars() {
+            model.handle(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            model.composer.text(),
+            "pin now",
+            "bare letters reach the composer verbatim on {pane:?}"
+        );
+        assert!(
+            model.screen == Screen::Loom,
+            "a bare `n` must not navigate away from {pane:?}"
+        );
+        assert!(
+            model.requests.is_empty(),
+            "a bare `p` must not reach the wire on {pane:?}: {:?}",
+            model.requests
+        );
+    }
+}
+
+// ---- item 3: ⌃N composer-seeded authoring -------------------------------
+
+/// ⌃N seeds the tab's COMPOSER with the authoring opener and leaves you in
+/// the tab, so the draft, your refinements and the registry stay in view at
+/// once (owner 2026-08-22). It deliberately does NOT open a modal field or
+/// hop to the session screen — authoring a workflow is a conversation, and
+/// the registry you are describing has to remain readable while you have it.
+///
+/// MUTATION CHECK: make the seed overwrite a non-empty composer, or drop
+/// the pane split. Expected RUNTIME failure: the preserved-draft assertion,
+/// or the Types-pane opener assertion.
+#[test]
+fn ctrl_n_seeds_the_composer_per_pane_and_stays_in_the_tab() {
     let mut model = live_bound_model();
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Workflows;
     model.requests.clear();
 
-    model.handle(key(KeyCode::Char('n')));
-    assert_eq!(model.loom_input.as_deref(), Some(""), "n opens the input");
-    let (rows, _) = draw(&model);
-    let all = rows.join("\n");
-    assert!(
-        all.contains("new workflow — describe the flow"),
-        "input title missing:\n{all}"
+    model.handle(ctrl(KeyCode::Char('n')));
+    assert_eq!(
+        model.composer.text(),
+        "New workflow: ",
+        "⌃N seeds the workflows opener"
     );
+    assert_eq!(model.screen, Screen::Loom, "authoring stays in the tab");
     assert!(
-        all.contains("⏎ send to model · ⌥m model · esc cancel"),
-        "input footer missing:\n{all}"
+        model.requests.is_empty(),
+        "seeding is local — nothing reaches the wire until ⏎"
     );
 
-    // The description is typed VERBATIM — `p` and `n` are letters here,
-    // never hotkeys.
+    // Finishing the sentence is ordinary typing, and ⏎ sends it as one turn
+    // WITHOUT leaving the tab.
     for c in "spin and pin".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    assert_eq!(model.loom_input.as_deref(), Some("spin and pin"));
+    assert_eq!(model.composer.text(), "New workflow: spin and pin");
 
-    model.handle(key(KeyCode::Enter));
-    assert_eq!(model.screen, Screen::Session, "⏎ leaves for the session");
-    assert!(model.loom_input.is_none(), "the input closed");
-    let turn = model
-        .requests
-        .iter()
-        .find_map(|request| match request {
-            AppRequest::SubmitText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .expect("⏎ submits one ordinary turn");
-    assert!(
-        turn.contains("Draft a Loom workflow for: spin and pin"),
-        "instruction must carry the description: {turn}"
-    );
-    assert!(
-        turn.contains("loom_register") && turn.contains("pipe DSL"),
-        "instruction must route through plan + loom_register: {turn}"
-    );
-
-    // The TYPES pane asks for an agent type instead.
-    model.requests.clear();
+    // The TYPES pane seeds its own opener.
+    let mut model = live_bound_model();
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Types;
-    model.handle(key(KeyCode::Char('n')));
-    for c in "sec auditor".chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
-    let turn = model
-        .requests
-        .iter()
-        .find_map(|request| match request {
-            AppRequest::SubmitText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .expect("⏎ submits the type instruction");
-    assert!(
-        turn.contains("Draft a Loom agent type for: sec auditor") && turn.contains("color #rrggbb"),
-        "type instruction wrong: {turn}"
-    );
+    model.handle(ctrl(KeyCode::Char('n')));
+    assert_eq!(model.composer.text(), "New agent type: ");
 
-    // Esc cancels without leaving the loom screen or submitting.
-    model.requests.clear();
+    // A draft already in progress is NEVER clobbered — the seed is an
+    // affordance, not a reset.
+    let mut model = live_bound_model();
     model.screen = Screen::Loom;
-    model.handle(key(KeyCode::Char('n')));
-    model.handle(key(KeyCode::Char('x')));
-    model.handle(key(KeyCode::Esc));
-    assert!(model.loom_input.is_none(), "esc cancels the input");
-    assert_eq!(model.screen, Screen::Loom, "esc stays on the loom screen");
-    assert!(
-        !model
-            .requests
-            .iter()
-            .any(|request| matches!(request, AppRequest::SubmitText { .. })),
-        "esc submits nothing"
+    model.loom_pane = LoomPane::Workflows;
+    model.composer.set_text("half a thought");
+    model.handle(ctrl(KeyCode::Char('n')));
+    assert_eq!(
+        model.composer.text(),
+        "half a thought",
+        "⌃N must not overwrite work in progress"
     );
 }
 
-/// MUTATION CHECK: let an unbound ⏎ submit anyway. Expected RUNTIME
-/// failure: the no-submit assertion or the honest flash naming the fix.
+/// MUTATION CHECK: let an unbound ⌃N seed anyway. Expected RUNTIME failure:
+/// the untouched-composer assertion or the honest flash naming the fix.
 #[test]
-fn n_submit_without_a_bound_session_flashes_honestly() {
+fn ctrl_n_without_a_bound_session_flashes_honestly() {
     let mut model = launcher_model();
     model.mode = RuntimeMode::Live;
     model.daemon_features = [haider_rpc::FEATURE_LOOM_V1.to_owned()]
@@ -576,38 +586,37 @@ fn n_submit_without_a_bound_session_flashes_honestly() {
     model.loom_pane = LoomPane::Types;
     model.requests.clear();
 
-    model.handle(key(KeyCode::Char('n')));
-    for c in "anything".chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
+    model.handle(ctrl(KeyCode::Char('n')));
     assert!(
-        !model
-            .requests
-            .iter()
-            .any(|request| matches!(request, AppRequest::SubmitText { .. })),
-        "no bound session — nothing may submit"
+        model.composer.text().is_empty(),
+        "no bound session — nothing to author into"
     );
     assert_eq!(
         model.flash.as_deref(),
-        Some("· no bound session — open a session, then n"),
+        Some("· no bound session — open a session first"),
         "the flash names the fix"
     );
-    assert_eq!(model.screen, Screen::Loom, "the input surface stays put");
+    assert_eq!(model.screen, Screen::Loom, "the tab stays put");
 }
 
-/// MUTATION CHECK: drop the ⌥m hop (or route it into the buffer). Expected
-/// RUNTIME failure: the picker-open assertion, the buffer-untouched
-/// assertion, or the return-to-input assertion after esc.
+/// ⌥m picks the model that will DRAFT the workflow — the owner's "we can
+/// choose model type in the workflow we want". It must beat the composer's
+/// bare-Char arm, or it would simply type an `m`.
+///
+/// MUTATION CHECK: drop the ⌥m arm from the loom dispatch (or move it after
+/// the Char arm). Expected RUNTIME failure: the picker-open assertion, or
+/// the composer-untouched assertion — the `m` would land in the draft.
 #[test]
-fn alt_m_from_the_input_opens_the_model_picker_and_returns() {
+fn alt_m_opens_the_model_picker_over_the_loom_tab_and_returns() {
     let mut model = live_bound_model();
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Workflows;
-    model.handle(key(KeyCode::Char('n')));
+    model.handle(ctrl(KeyCode::Char('n')));
     for c in "flow".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
+    let draft = model.composer.text().to_owned();
+    assert_eq!(draft, "New workflow: flow");
 
     model.handle(haider_tui::app::AppEvent::Key(KeyEvent::new(
         KeyCode::Char('m'),
@@ -615,22 +624,18 @@ fn alt_m_from_the_input_opens_the_model_picker_and_returns() {
     )));
     assert!(
         model.model_picker.is_some(),
-        "⌥m opens the model picker over the loom screen"
+        "⌥m opens the model picker over the loom tab"
     );
-    assert_eq!(
-        model.loom_input.as_deref(),
-        Some("flow"),
-        "⌥m never lands in the description"
-    );
+    assert_eq!(model.composer.text(), draft, "⌥m never lands in the draft");
 
-    // Esc closes the picker and the authoring input is still there.
+    // Esc closes the picker and the draft is still there.
     model.handle(key(KeyCode::Esc));
     assert!(model.model_picker.is_none(), "esc closes the picker");
-    assert_eq!(model.screen, Screen::Loom, "back on the loom screen");
+    assert_eq!(model.screen, Screen::Loom, "back on the loom tab");
     assert_eq!(
-        model.loom_input.as_deref(),
-        Some("flow"),
-        "the input survives the picker round trip"
+        model.composer.text(),
+        draft,
+        "the draft survives the picker round trip"
     );
 }
 
