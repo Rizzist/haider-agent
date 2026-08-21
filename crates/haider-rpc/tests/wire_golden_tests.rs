@@ -3113,4 +3113,33 @@ fn needs_input_is_additive_tolerant_and_shape_pinned() {
         serde_json::from_value(serde_json::json!({"key": "k", "label": "L"}))
             .expect("older option decodes");
     assert_eq!(old_option.decision, None);
+
+    // DECODE side of the same law (the encode golden above pins only what
+    // we WRITE): every omitted field must decode to its default, so the
+    // minimal badge card — the exact bytes a parked-without-menu session
+    // publishes — round-trips, and `secret_answer` absent reads as FALSE.
+    // A client is entitled to treat absence as default; without
+    // `serde(default)` on these fields this decode would ERROR instead.
+    //
+    // MUTATION CHECK (executed): drop `default` from `secret_answer` (or
+    // any other omitted field) and this decode fails.
+    let minimal: NeedsInputWire = serde_json::from_value(serde_json::json!({
+        "kind": "recovery",
+        "title": "Effect outcome unknown",
+    }))
+    .expect("the minimal badge card decodes");
+    assert!(!minimal.secret_answer, "absent secret_answer reads false");
+    assert!(minimal.safe_body.is_empty() && minimal.options.is_empty());
+    assert_eq!(minimal.menu_id, None);
+    assert_eq!(minimal.request_seq, None);
+    assert_eq!(minimal.worker_generation, None);
+    assert_eq!(minimal.since_ms, None);
+    // And a card carrying a field a NEWER daemon adds still decodes.
+    let forward: NeedsInputWire = serde_json::from_value(serde_json::json!({
+        "kind": "permission",
+        "title": "Allow?",
+        "some_field_from_v999": {"nested": true},
+    }))
+    .expect("unknown fields are tolerated");
+    assert_eq!(forward.kind, NeedsInputKindWire::Permission);
 }
