@@ -2454,6 +2454,14 @@ pub enum ResponseBody {
         loopback_port: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_at_ms: Option<u64>,
+        /// v0.0.938, additive: the RFC 8628 user code for a DEVICE flow, so a
+        /// surface can display it beside the verification URL instead of
+        /// parsing it back out of that URL's query string. Absent for
+        /// loopback/PKCE flows and from older daemons. The code is a
+        /// short-lived public pairing string, not a credential — it is
+        /// useless without the device_code the daemon keeps.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_code: Option<String>,
     },
     #[serde(rename = "account.oauth_status")]
     AccountOAuthStatus {

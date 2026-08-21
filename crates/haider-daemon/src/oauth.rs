@@ -2557,6 +2557,7 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
                 provider_origin: None,
                 loopback_port: None,
                 expires_at_ms: None,
+                user_code: None,
             },
         );
         return;
@@ -2750,6 +2751,9 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
             provider_origin: Some(safe_url(&registration.authorization_endpoint)),
             loopback_port: Some(bound.port()),
             expires_at_ms: Some(expires_at_ms),
+            // Loopback/PKCE has no user code: the browser callback carries
+            // the grant, there is nothing for a human to type.
+            user_code: None,
         },
     );
     let task_inner = Arc::clone(&inner);
@@ -2872,6 +2876,13 @@ async fn begin_device_flow(
             return;
         }
     };
+    // Publish the user code alongside the URL (v0.0.938). It comes from the
+    // same authorization response the URL is built from, so the two can never
+    // disagree; a client that shows the code no longer parses it back out of
+    // the URL's query string.
+    let device_user_code = std::str::from_utf8(&authorization.user_code.0)
+        .ok()
+        .map(str::to_owned);
     let authorization_url =
         OAuthAuthorizationWire::from_zeroizing(Zeroizing::new(verification.as_str().to_owned()));
     let flow_id = match random_id(
@@ -2942,6 +2953,7 @@ async fn begin_device_flow(
             provider_origin: Some(safe_url(&registration.authorization_endpoint)),
             loopback_port: None,
             expires_at_ms: Some(expires_at_ms),
+            user_code: device_user_code,
         },
     );
     let Some(tasks) = inner.tasks.upgrade() else {

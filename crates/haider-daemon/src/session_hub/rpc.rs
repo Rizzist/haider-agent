@@ -3530,6 +3530,7 @@ impl HubConnection {
                     provider_origin: None,
                     loopback_port: None,
                     expires_at_ms: None,
+                    user_code: None,
                 },
             });
         }

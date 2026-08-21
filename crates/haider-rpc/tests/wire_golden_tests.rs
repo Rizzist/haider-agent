@@ -1247,6 +1247,7 @@ fn oauth_authorization_and_ready_ref_codec_round_trip_but_debug_redacts() {
             provider_origin: Some("https://auth.example.invalid".into()),
             loopback_port: Some(49_152),
             expires_at_ms: Some(99),
+            user_code: None,
         },
     };
     let encoded = uds_codec::encode_zeroizing(&frame, DEFAULT_FRAME_LIMIT).expect("encode");
@@ -3142,4 +3143,66 @@ fn needs_input_is_additive_tolerant_and_shape_pinned() {
     }))
     .expect("unknown fields are tolerated");
     assert_eq!(forward.kind, NeedsInputKindWire::Permission);
+}
+
+/// v0.0.938: the RFC 8628 `user_code` rides `account.oauth_start` ADDITIVELY,
+/// so a surface can display the pairing code beside the verification URL
+/// instead of parsing it back out of that URL's query string (which is what
+/// the ADE had to do). Absent for loopback/PKCE flows — a browser callback
+/// carries the grant, there is nothing to type — and absent from older
+/// daemons.
+///
+/// MUTATION CHECK (executed): drop the `skip_serializing_if` and a PKCE start
+/// response starts emitting `"user_code": null`, failing the byte-stability
+/// half below.
+#[test]
+fn oauth_start_carries_the_device_user_code_additively() {
+    use haider_rpc::{OAuthAvailabilityWire, OAuthFlowId, ResponseBody};
+
+    // A loopback/PKCE start: no user code, and the key must not appear at all.
+    let pkce = ResponseBody::AccountOAuthStart {
+        availability: OAuthAvailabilityWire {
+            available: true,
+            reason: None,
+        },
+        flow_id: Some(OAuthFlowId::new("flow-pkce")),
+        authorization_url: None,
+        provider_origin: None,
+        loopback_port: Some(49_152),
+        expires_at_ms: Some(99),
+        user_code: None,
+    };
+    let encoded = serde_json::to_value(&pkce).expect("encodes");
+    assert!(
+        encoded.get("user_code").is_none(),
+        "an absent user code must not serialize: {encoded}"
+    );
+
+    // A device start: the code travels beside the URL.
+    let device = ResponseBody::AccountOAuthStart {
+        availability: OAuthAvailabilityWire {
+            available: true,
+            reason: None,
+        },
+        flow_id: Some(OAuthFlowId::new("flow-device")),
+        authorization_url: None,
+        provider_origin: None,
+        loopback_port: None,
+        expires_at_ms: Some(99),
+        user_code: Some("WDJB-MJHT".into()),
+    };
+    let encoded = serde_json::to_value(&device).expect("encodes");
+    assert_eq!(encoded["user_code"], "WDJB-MJHT");
+
+    // Older daemon: the field is absent and decodes to None, never an error.
+    let older: ResponseBody = serde_json::from_value(serde_json::json!({
+        "method": "account.oauth_start",
+        "availability": {"available": true},
+        "flow_id": "flow-old",
+    }))
+    .expect("older start decodes");
+    let ResponseBody::AccountOAuthStart { user_code, .. } = older else {
+        panic!("expected an oauth start body");
+    };
+    assert_eq!(user_code, None);
 }

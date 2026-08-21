@@ -507,6 +507,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 provider_origin: Some("https://auth.example.invalid".into()),
                 loopback_port: Some(49_152),
                 expires_at_ms: Some(1_753_500_060_000),
+                user_code: None,
             },
         },
         WireFrame::Request {
@@ -1063,6 +1064,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 provider_origin: Some("https://auth.kimi.com".into()),
                 loopback_port: None,
                 expires_at_ms: Some(1_753_500_060_000),
+                user_code: None,
             },
         },
         WireFrame::Response {
