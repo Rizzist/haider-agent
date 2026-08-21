@@ -256,7 +256,9 @@ fn the_mark_maps_and_their_half_block_rendering_agree() {
             let top: Vec<char> = format!("{:<width$}", map[index * 2]).chars().collect();
             let bottom: Vec<char> = format!("{:<width$}", map[index * 2 + 1]).chars().collect();
             for (x, cell) in row.chars().enumerate() {
-                let expected = match (top[x] == '#', bottom[x] == '#') {
+                // Ink vocabulary: '#' stroke, 'o' gold dot — BOTH are ink
+                // to the plain renderer (the two-tone split is color-only).
+                let expected = match (top[x] != '.', bottom[x] != '.') {
                     (true, true) => '█',
                     (true, false) => '▀',
                     (false, true) => '▄',
@@ -278,6 +280,35 @@ fn the_mark_maps_and_their_half_block_rendering_agree() {
     for row in haider_tui::mark::banner_rows() {
         assert!(row.chars().all(|c| "█▀▄ ".contains(c)), "half blocks only");
     }
+    // Two-tone parity: the cell map's glyphs differ from the plain render
+    // ONLY at mixed stroke-over-dot cells (which flatten `█` → `▀` so the
+    // dot half can wear gold via background); every other cell agrees, and
+    // the maps carry gold dots at all (the port's reason to exist).
+    let mut dots = 0;
+    for (map, rows) in [
+        (
+            haider_tui::mark::BANNER.as_slice(),
+            haider_tui::mark::banner_rows(),
+        ),
+        (
+            haider_tui::mark::HEADER.as_slice(),
+            haider_tui::mark::header_rows(),
+        ),
+    ] {
+        let cells = haider_tui::mark::half_block_cells(map);
+        for (row_cells, row_plain) in cells.iter().zip(rows.iter()) {
+            for (&(glyph, top, bottom), plain) in row_cells.iter().zip(row_plain.chars()) {
+                use haider_tui::mark::HalfInk;
+                if top != HalfInk::None && bottom != HalfInk::None && top != bottom {
+                    assert_eq!(glyph, '▀', "mixed cells flatten to ▀");
+                } else {
+                    assert_eq!(glyph, plain, "single-tone cells agree");
+                }
+                dots += usize::from(top == HalfInk::Dot) + usize::from(bottom == HalfInk::Dot);
+            }
+        }
+    }
+    assert!(dots > 0, "the ya dots exist in gold");
 }
 
 #[test]
@@ -321,7 +352,10 @@ fn the_session_header_mark_spans_both_lines_or_yields() {
     let mut model = launcher_model();
     submit(&mut model, "walk me through the harness");
     let frame = draw(&model, 118, 34);
-    let rows = haider_tui::mark::header_rows();
+    let rows: Vec<String> = haider_tui::mark::half_block_cells(&haider_tui::mark::HEADER)
+        .iter()
+        .map(|row| row.iter().map(|&(glyph, _, _)| glyph).collect::<String>())
+        .collect();
     assert!(
         frame.rows[0].contains(rows[0].trim_end()),
         "line 1 of the mark"

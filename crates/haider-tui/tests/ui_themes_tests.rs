@@ -52,7 +52,10 @@ fn launcher_renders_header_band_not_centered_art() {
     let (rows, _, _) = draw(&model, 100, 30);
     // The header band sits AT THE TOP: the compact 24×2 mark art spans
     // band lines 0-1, the product mark + version + device beside it.
-    let art = haider_tui::mark::header_rows();
+    let art: Vec<String> = haider_tui::mark::half_block_cells(&haider_tui::mark::HEADER)
+        .iter()
+        .map(|row| row.iter().map(|&(glyph, _, _)| glyph).collect::<String>())
+        .collect();
     assert!(
         rows[0].contains(art[0].trim_end()),
         "compact mark, band line 1:\n{}",

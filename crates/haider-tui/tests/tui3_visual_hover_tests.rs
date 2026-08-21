@@ -229,8 +229,13 @@ fn launcher_typography_uses_exact_theme_inks() {
     let theme = model.theme.theme();
     let (rows, _, terminal) = draw(&model, 118, 34);
     let buffer = terminal.backend().buffer();
-    // The compact mark: BOLD maroon header art spanning both band lines.
-    let header_art = haider_tui::mark::header_rows();
+    // The compact mark: BOLD maroon strokes + gold ya dots spanning both
+    // band lines (two-tone glyph shapes from the cell map — a baseline-
+    // over-dot cell is `▀`, not `█`, since the haidercode.ai port).
+    let header_art: Vec<String> = haider_tui::mark::half_block_cells(&haider_tui::mark::HEADER)
+        .iter()
+        .map(|row| row.iter().map(|&(glyph, _, _)| glyph).collect::<String>())
+        .collect();
     assert!(rows[0].contains(header_art[0].trim_end()), "mark line 1");
     assert!(rows[1].contains(header_art[1].trim_end()), "mark line 2");
     let mark_x = col_of(&rows[0], "█");

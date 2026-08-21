@@ -50,8 +50,8 @@ pub const BANNER: [&str; 8] = [
     ".....##...##....##.......###",
     "....##..####################",
     "....##..####################",
-    ".####.........##..##........",
-    ".####.........##..##........",
+    ".####.........oo..oo........",
+    ".####.........oo..oo........",
 ];
 
 /// The session-header mark: 24 × 4 pixels → 24 cols × 2 terminal rows, so it
@@ -86,7 +86,7 @@ pub const HEADER: [&str; 4] = [
     ".......##.......#######.",
     "...##..##...##.......###",
     "..##..##################",
-    "###.......##..##........",
+    "###.......oo..oo........",
 ];
 
 /// Cells the banner needs (its map width).
@@ -123,11 +123,67 @@ pub fn half_blocks(map: &[&str]) -> Vec<String> {
         rows.push(
             top.chars()
                 .zip(bottom.chars())
-                .map(|(t, b)| match (t == '#', b == '#') {
+                .map(|(t, b)| match (t != '.', b != '.') {
                     (true, true) => '█',
                     (true, false) => '▀',
                     (false, true) => '▄',
                     (false, false) => ' ',
+                })
+                .collect(),
+        );
+        index += 2;
+    }
+    rows
+}
+
+/// One half-cell's ink on the two-tone mark (haidercode.ai port, owner
+/// 2026-08-21): the strokes wear the primary mark ink and the ya's two
+/// dots wear GOLD — the same square-Kufic mark the website renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalfInk {
+    None,
+    Ink,
+    Dot,
+}
+
+fn half_ink(pixel: char) -> HalfInk {
+    match pixel {
+        '#' => HalfInk::Ink,
+        'o' => HalfInk::Dot,
+        _ => HalfInk::None,
+    }
+}
+
+/// Render a pixel map as per-cell `(glyph, top, bottom)` triples, two pixel
+/// rows per terminal row — the two-tone companion to [`half_blocks`]. A
+/// mixed cell (stroke over dot) renders as `▀` whose lower half the caller
+/// paints via background, so the dot bumps off the baseline in gold exactly
+/// as the website's blocklogo does.
+#[must_use]
+pub fn half_block_cells(map: &[&str]) -> Vec<Vec<(char, HalfInk, HalfInk)>> {
+    let width = map.iter().map(|row| row.len()).max().unwrap_or(0);
+    let padded: Vec<String> = map
+        .iter()
+        .map(|row| format!("{row:<width$}").replace(' ', "."))
+        .collect();
+    let blank = ".".repeat(width);
+    let mut rows = Vec::with_capacity(padded.len().div_ceil(2));
+    let mut index = 0;
+    while index < padded.len() {
+        let top = &padded[index];
+        let bottom = padded.get(index + 1).unwrap_or(&blank);
+        rows.push(
+            top.chars()
+                .zip(bottom.chars())
+                .map(|(t, b)| {
+                    let (t, b) = (half_ink(t), half_ink(b));
+                    let glyph = match (t != HalfInk::None, b != HalfInk::None) {
+                        (true, true) if t == b => '█',
+                        (true, true) | (true, false) => '▀',
+                        (false, true) => '▄',
+                        (false, false) => ' ',
+                    };
+                    (glyph, t, b)
                 })
                 .collect(),
         );

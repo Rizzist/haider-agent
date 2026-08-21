@@ -47,10 +47,12 @@ fn draw(model: &AppModel, width: u16, height: u16) -> Vec<String> {
 /// Feed a scripted, rising token stream (exact usage) so the tracker holds a
 /// full readout — enough samples for μ/p95, a populated sparkline.
 fn seed_stream(model: &mut AppModel) {
+    // One-second ticks across 40s of mock stream: enough closed 5s BUCKETS
+    // (v0.0.937 bucket law) for a populated sparkline and μ/p95.
     let mut tok = 0u64;
-    for i in 0..10u64 {
+    for i in 0..40u64 {
         tok += 100 + i * 6;
-        model.throughput.observe(250 * (i + 1), tok, true);
+        model.throughput.observe(1_000 * (i + 1), tok, true);
     }
 }
 

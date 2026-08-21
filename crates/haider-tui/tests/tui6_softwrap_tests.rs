@@ -2113,7 +2113,10 @@ fn header_mark_dignity_gate_holds_at_the_new_threshold() {
     assert_eq!(model.screen, Screen::Session);
     // At the threshold the art spans BOTH header lines…
     let (rows, _, _) = draw(&model, threshold, 30);
-    let art = mark::header_rows();
+    let art: Vec<String> = mark::half_block_cells(&mark::HEADER)
+        .iter()
+        .map(|row| row.iter().map(|&(glyph, _, _)| glyph).collect::<String>())
+        .collect();
     assert!(rows[0].contains(art[0].trim_end()), "art line 1");
     assert!(rows[1].contains(art[1].trim_end()), "art line 2");
     // …one cell under it, the text mark returns and no art row leaks.

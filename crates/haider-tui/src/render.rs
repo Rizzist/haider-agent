@@ -16,7 +16,7 @@ use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::item::TurnItem;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
@@ -675,6 +675,41 @@ fn mark_lines(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'static>>
 /// when the surrounding block would not fit the frame. The art is the FIRST
 /// thing to yield — it must never push the sanctum, the wordmark or the
 /// recent list off the screen (TUI4 item 6: the banner joins the ledger).
+/// One two-tone mark row as styled spans (haidercode.ai port, owner
+/// 2026-08-21): strokes in the maroon identity ink, the ya's two dots in
+/// GOLD. A mixed cell (baseline stroke over a dot) is `▀` with a gold
+/// background so the dot bumps off the rule exactly as the website's
+/// blocklogo renders it. Adjacent same-style cells merge into one span.
+fn mark_tone_spans(
+    cells: &[(char, crate::mark::HalfInk, crate::mark::HalfInk)],
+    theme: &Theme,
+    ink: Style,
+) -> Vec<Span<'static>> {
+    use crate::mark::HalfInk;
+    let gold = theme.gold_style().add_modifier(Modifier::BOLD);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = Style::default();
+    for &(glyph, top, bottom) in cells {
+        let style = match (top, bottom) {
+            (HalfInk::None, HalfInk::None) => Style::default(),
+            (HalfInk::Dot | HalfInk::None, HalfInk::Dot) | (HalfInk::Dot, HalfInk::None) => gold,
+            (HalfInk::Ink, HalfInk::Dot) => ink.bg(theme.gold.into()),
+            (HalfInk::Dot, HalfInk::Ink) => gold.bg(theme.maroon.into()),
+            _ => ink,
+        };
+        if style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = style;
+        run.push(glyph);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
+    }
+    spans
+}
+
 fn mark_lines_within(
     model: &AppModel,
     theme: &Theme,
@@ -683,9 +718,9 @@ fn mark_lines_within(
 ) -> Vec<Line<'static>> {
     let ink = theme.maroon_style().add_modifier(Modifier::BOLD);
     if crate::mark::banner_fits(width) && banner_budget >= crate::mark::BANNER_ROWS {
-        return crate::mark::banner_rows()
-            .into_iter()
-            .map(|row| Line::styled(row, ink))
+        return crate::mark::half_block_cells(&crate::mark::BANNER)
+            .iter()
+            .map(|row| Line::from(mark_tone_spans(row, theme, ink)))
             .collect();
     }
     vec![Line::styled(
@@ -941,10 +976,10 @@ fn render_launcher(
         // letterforms at header scale (24×2 — `mark::HEADER`, the S2
         // half-res-banner rebuild), spanning
         // both band lines exactly as it does beside a session's info block.
-        let rows = crate::mark::header_rows();
-        header_top.push(Span::styled(rows[0].clone(), mark_ink));
+        let rows = crate::mark::half_block_cells(&crate::mark::HEADER);
+        header_top.extend(mark_tone_spans(&rows[0], theme, mark_ink));
         header_top.push(Span::raw("  "));
-        header_bottom.push(Span::styled(rows[1].clone(), mark_ink));
+        header_bottom.extend(mark_tone_spans(&rows[1], theme, mark_ink));
         header_bottom.push(Span::raw("  "));
     } else {
         header_top.push(Span::styled(format!("{}  ", sanctum.mark()), mark_ink));
@@ -3552,12 +3587,12 @@ fn render_session(
     // header too tight for the art keeps the one-line text mark inline.
     let mark_ink = theme.maroon_style().add_modifier(Modifier::BOLD);
     if crate::mark::header_fits(area.width, HEADER_MARK_RESERVED) {
-        let rows = crate::mark::header_rows();
+        let rows = crate::mark::half_block_cells(&crate::mark::HEADER);
         header_top.push(Span::raw("  "));
-        header_top.push(Span::styled(rows[0].clone(), mark_ink));
+        header_top.extend(mark_tone_spans(&rows[0], theme, mark_ink));
         header_top.push(Span::raw("  "));
         header_bottom.push(Span::raw("  "));
-        header_bottom.push(Span::styled(rows[1].clone(), mark_ink));
+        header_bottom.extend(mark_tone_spans(&rows[1], theme, mark_ink));
         header_bottom.push(Span::raw("  "));
     } else {
         header_top.push(Span::styled(format!("  {}  ", sanctum.mark()), mark_ink));

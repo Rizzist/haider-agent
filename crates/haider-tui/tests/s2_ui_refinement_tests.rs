@@ -124,11 +124,20 @@ fn header_mark_uses_halfblock_glyphs() {
 }
 
 /// The mark must look intentional in BOTH redesigned palettes (owner
-/// item 3): the session header renders the full art in bold identity ink
-/// on light and dark alike.
+/// item 3), and since the haidercode.ai port (owner 2026-08-21) it is
+/// TWO-TONE: strokes in bold identity ink, the ya's two dots in GOLD —
+/// a baseline-over-dot cell renders `▀` with a gold background so the
+/// dot bumps off the rule.
+///
+/// MUTATION CHECK (executed): repaint the dot cells with the stroke ink
+/// (drop the HalfInk::Dot arms) and the gold assertions fail.
 #[test]
 fn header_mark_renders_in_both_new_palettes() {
-    let art = haider_tui::mark::header_rows();
+    let cells = haider_tui::mark::half_block_cells(&haider_tui::mark::HEADER);
+    let expected: Vec<String> = cells
+        .iter()
+        .map(|row| row.iter().map(|&(glyph, _, _)| glyph).collect::<String>())
+        .collect();
     for key in [ThemeKey::Light, ThemeKey::Dark] {
         let mut model = session_model();
         model.theme = key;
@@ -136,17 +145,23 @@ fn header_mark_renders_in_both_new_palettes() {
         let (rows, _, terminal) = draw(&model, 118, 34);
         let buffer = terminal.backend().buffer();
         assert!(
-            rows[0].contains(art[0].trim_end()),
+            rows[0].contains(expected[0].trim_end()),
             "{}: mark line 1",
             theme.label
         );
         assert!(
-            rows[1].contains(art[1].trim_end()),
+            rows[1].contains(expected[1].trim_end()),
             "{}: mark line 2",
             theme.label
         );
         // Cell coordinates are CHAR columns, never byte offsets (the art
         // is multi-byte ink).
+        let row0_start = rows[0]
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(expected[0].trim_end().chars().count())
+            .position(|window| window.iter().collect::<String>() == expected[0].trim_end())
+            .expect("mark row present");
         let char_x = u16::try_from(
             rows[0]
                 .chars()
@@ -162,6 +177,23 @@ fn header_mark_renders_in_both_new_palettes() {
             theme.label
         );
         assert!(cell.modifier.contains(Modifier::BOLD));
+        // The ya dots: find a dot-bearing cell on row 2 (baseline over dot
+        // → `▀` with gold BACKGROUND) and assert the gold half.
+        let dot_col = cells[1]
+            .iter()
+            .position(|&(_, top, bottom)| {
+                top == haider_tui::mark::HalfInk::Ink && bottom == haider_tui::mark::HalfInk::Dot
+            })
+            .expect("the header packs a baseline-over-dot cell");
+        let dot_x = u16::try_from(row0_start + dot_col).expect("x fits");
+        let dot_cell = &buffer[(dot_x, 1)];
+        assert_eq!(
+            dot_cell.bg,
+            Color::from(theme.gold),
+            "{}: the ya dot's lower half is GOLD",
+            theme.label
+        );
+        assert_eq!(dot_cell.symbol(), "▀", "{}: mixed cell shape", theme.label);
     }
 }
 
