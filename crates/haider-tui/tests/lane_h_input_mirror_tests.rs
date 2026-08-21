@@ -24,6 +24,7 @@ fn input(text: &str, revision: u64) -> SurfaceInputWire {
 fn owned(owner: &str, text: &str, revision: u64) -> SurfaceInputWire {
     SurfaceInputWire {
         text: text.to_owned(),
+        attachments: Vec::new(),
         revision,
         owner: owner.to_owned(),
     }
@@ -54,7 +55,7 @@ fn mirror_model(session: &str) -> AppModel {
 fn only_publish(commands: Vec<LiveCommand>) -> (String, u64) {
     let [
         LiveCommand::SurfacePublish {
-            input: Some((text, revision)),
+            input: Some((text, _attachments, revision)),
             status: None,
             ..
         },

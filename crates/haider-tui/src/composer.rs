@@ -82,6 +82,9 @@ pub struct PendingAttachment {
     /// Chip label ("photo.png · 41 KB", "[Pasted 12 lines]").
     pub label: String,
     pub kind: PendingKind,
+    /// Original byte length, retained as metadata after the upload payload
+    /// leaves the process so a volatile input mirror can publish a safe ref.
+    pub bytes: u64,
     /// The daemon's verified CAS address, once the upload answers.
     pub artifact: Option<ArtifactRef>,
 }
@@ -143,6 +146,24 @@ fn max_placeholder_token(text: &str) -> u32 {
 }
 
 impl PendingAttachment {
+    /// Safe coordinates for the volatile input mirror, once the daemon has
+    /// verified the attachment's CAS address. This exactly reuses the
+    /// hooks payload's metadata-only attachment shape.
+    #[must_use]
+    pub fn surface_ref(&self) -> Option<haider_protocol::hook::HookAttachmentMetadata> {
+        let artifact = self.artifact.clone()?;
+        let mime = match &self.kind {
+            PendingKind::Image { mime } => mime.clone(),
+            PendingKind::PastedText { .. } | PendingKind::File { .. } => "text/plain".to_owned(),
+            PendingKind::Pdf { .. } => "application/pdf".to_owned(),
+        };
+        Some(haider_protocol::hook::HookAttachmentMetadata {
+            mime,
+            bytes: self.bytes,
+            artifact,
+        })
+    }
+
     /// The wire block, once (and only once) the upload completed.
     #[must_use]
     pub fn ready_block(&self) -> Option<AttachmentBlock> {

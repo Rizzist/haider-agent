@@ -3318,6 +3318,7 @@ impl SessionHub {
             accepted_input_revision = Some(input.revision);
             state.input = Some(SurfaceInputWire {
                 text: input.text,
+                attachments: input.attachments,
                 revision: input.revision,
                 owner: connection_id.to_owned(),
             });
@@ -3334,6 +3335,8 @@ impl SessionHub {
             accepted_status_revision = Some(status.revision);
             state.status = Some(SurfaceStatusWire {
                 line: status.line,
+                state: status.state,
+                detail: status.detail,
                 revision: status.revision,
                 owner: connection_id.to_owned(),
             });

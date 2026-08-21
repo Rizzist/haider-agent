@@ -8261,7 +8261,9 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // B4b: pending attachment chips claim ONE row above the text rows —
     // height and paint (`render_composer`) share this same predicate, so
     // the band's geometry can never disagree with what lands in it.
-    let chips = u16::from(model.composer.has_attachments());
+    let chips = u16::from(
+        model.composer.has_attachments() || !model.mirrored_input_attachments().is_empty(),
+    );
     // T2: the partial-transcript ghost row claims ONE row above the text
     // rows too — same shared-predicate discipline
     // (`AppModel::talk_ghost_visible`), and CHROME by law: nothing here
@@ -8396,7 +8398,10 @@ fn render_composer(
         row_area.y += 1;
         row_area.height -= 1;
     }
-    if model.login.is_none() && model.composer.has_attachments() && row_area.height > 1 {
+    if model.login.is_none()
+        && (model.composer.has_attachments() || !model.mirrored_input_attachments().is_empty())
+        && row_area.height > 1
+    {
         frame.render_widget(
             Paragraph::new(attachment_chip_line(model, theme)).style(theme.input_style()),
             Rect {
@@ -8465,10 +8470,21 @@ fn attachment_chip_line(model: &AppModel, theme: &Theme) -> Line<'static> {
         ));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled(
-        "· ⌫ at the start removes".to_owned(),
-        theme.dim_style(),
-    ));
+    let mirrored = model.mirrored_input_attachments();
+    if !mirrored.is_empty() {
+        let suffix = if mirrored.len() == 1 { "" } else { "s" };
+        spans.push(Span::styled(
+            format!("[+{} attachment{suffix}]", mirrored.len()),
+            theme.gold_style(),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    if model.composer.has_attachments() {
+        spans.push(Span::styled(
+            "· ⌫ at the start removes".to_owned(),
+            theme.dim_style(),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -9283,6 +9299,10 @@ fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
 pub struct StatusSegment {
     pub text: String,
     pub tone: StatusSegmentTone,
+    /// Structured semantics carried by the state badge, when this run is
+    /// the one clients should render instead of parsing display text.
+    pub state: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// The strip's style vocabulary — resolved to real styles only inside
@@ -9311,6 +9331,7 @@ pub enum StatusSegmentTone {
 pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> {
     // The derived WAITING-on-subagents badge overlays plain IDLE (§2.6).
     let (badge, _) = model.status_badge();
+    let (state, detail) = model.status_badge_state_detail();
     let identity = &model.identity;
     // W7b meter truth: the durable occupancy snapshot beats the
     // cumulative usage sum, and an ESTIMATED snapshot wears `~` so the
@@ -9357,18 +9378,26 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
         StatusSegment {
             text: " ".to_owned(),
             tone: StatusSegmentTone::Text,
+            state: None,
+            detail: None,
         },
         StatusSegment {
             text: "[ ".to_owned(),
             tone: StatusSegmentTone::BadgeChrome,
+            state: None,
+            detail: None,
         },
         StatusSegment {
             text: badge.clone(),
             tone: StatusSegmentTone::Badge,
+            state: Some(state),
+            detail,
         },
         StatusSegment {
             text: " ]".to_owned(),
             tone: StatusSegmentTone::BadgeChrome,
+            state: None,
+            detail: None,
         },
     ];
     let meter_shown = badge_cells + 2 + meter.chars().count() <= width as usize;
@@ -9376,6 +9405,8 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
         segments.push(StatusSegment {
             text: format!("  {meter}  "),
             tone: StatusSegmentTone::Dim,
+            state: None,
+            detail: None,
         });
     }
     if meter_shown && !model.cache_usage.is_empty() {
@@ -9393,11 +9424,15 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             segments.push(StatusSegment {
                 text: format!("{wide}  "),
                 tone: StatusSegmentTone::Dim,
+                state: None,
+                detail: None,
             });
         } else if medium.chars().count() + 2 <= available {
             segments.push(StatusSegment {
                 text: format!("{medium}  "),
                 tone: StatusSegmentTone::Dim,
+                state: None,
+                detail: None,
             });
         }
     }
@@ -9415,6 +9450,8 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
         segments.push(StatusSegment {
             text: format!("· {}{queue_tag}  ", model.active_branch_name()),
             tone: StatusSegmentTone::Text,
+            state: None,
+            detail: None,
         });
     }
     // The voice/dictation chip moved to the TOP-RIGHT header (see
@@ -9432,14 +9469,20 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
         segments.push(StatusSegment {
             text: "[ ".to_owned(),
             tone: StatusSegmentTone::HookChrome,
+            state: None,
+            detail: None,
         });
         segments.push(StatusSegment {
             text: "⚙ hook·decided".to_owned(),
             tone: StatusSegmentTone::Hook,
+            state: None,
+            detail: None,
         });
         segments.push(StatusSegment {
             text: " ]".to_owned(),
             tone: StatusSegmentTone::HookChrome,
+            state: None,
+            detail: None,
         });
     }
     segments
@@ -9449,10 +9492,39 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
 /// the value the W-INP status mirror publishes (`status_segment_v1`).
 #[must_use]
 pub fn status_left_string(model: &AppModel, width: u16) -> String {
-    status_left_segments(model, width)
-        .into_iter()
-        .map(|segment| segment.text)
-        .collect()
+    status_left_surface(model, width).line
+}
+
+/// The status mirror's render-compatible display line plus the state badge's
+/// structured semantics. `state` and `detail` are read directly from the
+/// typed badge segment — never recovered by parsing `line`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusLeftSurface {
+    pub line: String,
+    pub state: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Compose the bottom-left strip once for both its byte-exact display line
+/// and its additive structured state fields.
+#[must_use]
+pub fn status_left_surface(model: &AppModel, width: u16) -> StatusLeftSurface {
+    let segments = status_left_segments(model, width);
+    let (state, detail) = segments
+        .iter()
+        .find_map(|segment| {
+            segment
+                .state
+                .as_ref()
+                .map(|state| (Some(state.clone()), segment.detail.clone()))
+        })
+        .unwrap_or((None, None));
+    let line = segments.into_iter().map(|segment| segment.text).collect();
+    StatusLeftSurface {
+        line,
+        state,
+        detail,
+    }
 }
 
 /// The status bar (sim StatusBar, tui.js:5492): boxed state chip · model ·

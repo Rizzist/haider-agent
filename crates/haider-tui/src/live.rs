@@ -112,13 +112,17 @@ pub enum LiveCommand {
         /// create WITHOUT the model having fabricated anything.
         first_text: String,
     },
-    /// W-INP: publish this client's composer text (and later its status
-    /// strip) as the session's volatile input surface. Fire-and-forget —
-    /// the ack carries no client-visible state.
+    /// W-INP: publish this client's composer text and ready attachment refs
+    /// (and later its status strip) as the session's volatile input surface.
+    /// Fire-and-forget — the ack carries no client-visible state.
     SurfacePublish {
         session: SessionId,
-        input: Option<(String, u64)>,
-        status: Option<(String, u64)>,
+        input: Option<(
+            String,
+            Vec<haider_protocol::hook::HookAttachmentMetadata>,
+            u64,
+        )>,
+        status: Option<(String, Option<String>, Option<String>, u64)>,
     },
     /// W-INP: watch the latest volatile composer for one session.
     SurfaceWatch {
@@ -582,21 +586,35 @@ impl LiveDriver {
         }
 
         let text = model.composer.text();
+        let attachments = if model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1) {
+            model
+                .composer
+                .attachments()
+                .iter()
+                .filter_map(crate::composer::PendingAttachment::surface_ref)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let current = PublishedSurfaceInput {
+            text: text.to_owned(),
+            attachments,
+        };
         let state = self
             .input_mirror
             .sessions
             .entry(session.clone())
             .or_default();
-        if state.adopting || state.published_text.as_deref() == Some(text) {
+        if state.adopting || state.published.as_ref() == Some(&current) {
             return Vec::new();
         }
         self.input_mirror.publish_revision = self.input_mirror.publish_revision.saturating_add(1);
         let revision = self.input_mirror.publish_revision;
-        state.published_text = Some(text.to_owned());
+        state.published = Some(current.clone());
         state.last_published_revision = Some(revision);
         vec![LiveCommand::SurfacePublish {
             session,
-            input: Some((text.to_owned(), revision)),
+            input: Some((current.text, current.attachments, revision)),
             status: None,
         }]
     }
@@ -623,8 +641,11 @@ impl LiveDriver {
                 // baseline so a fresh binding never publishes "" (P1-2); a
                 // non-empty local stash genuinely differs post-adoption and
                 // may publish on the next pass.
-                if model.composer.text().is_empty() && state.published_text.is_none() {
-                    state.published_text = Some(String::new());
+                if model.composer.text().is_empty()
+                    && model.composer.attachments().is_empty()
+                    && state.published.is_none()
+                {
+                    state.published = Some(PublishedSurfaceInput::default());
                 }
             }
         }
@@ -646,14 +667,25 @@ impl LiveDriver {
         {
             return;
         }
-        let state = self.input_mirror.sessions.entry(session).or_default();
+        let state = self
+            .input_mirror
+            .sessions
+            .entry(session.clone())
+            .or_default();
         // Self-echo (P1-1): the daemon broadcasts every accepted publish to
         // ALL watchers, publisher included, stamping the publisher's
         // connection id as `owner`. Our own accepted publish arriving back —
         // revision AND text both matching — names us; that learned identity
         // is the discriminator, never cross-lane revision comparison.
+        let attachments = if model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1) {
+            input.attachments.clone()
+        } else {
+            Vec::new()
+        };
         if state.last_published_revision == Some(input.revision)
-            && state.published_text.as_deref() == Some(input.text.as_str())
+            && state.published.as_ref().is_some_and(|published| {
+                published.text == input.text && published.attachments == attachments
+            })
         {
             self.input_mirror.self_owner = Some(input.owner);
             return;
@@ -670,12 +702,16 @@ impl LiveDriver {
         }
         state.foreign_floors.insert(input.owner, input.revision);
         // The mirror now equals the surface: block an immediate republish.
-        state.published_text = Some(input.text.clone());
+        state.published = Some(PublishedSurfaceInput {
+            text: input.text.clone(),
+            attachments: attachments.clone(),
+        });
         // rev934 P3-5: the same predicate that gates injected ops gates a
         // remote replace — an in-progress modal answer is never overwritten.
         if !model.accepts_injected_input() {
             return;
         }
+        model.set_mirrored_input_attachments(session, attachments);
         model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
     }
 }
@@ -1282,7 +1318,7 @@ impl Cold {
 
 #[derive(Debug, Default)]
 struct InputMirrorSession {
-    published_text: Option<String>,
+    published: Option<PublishedSurfaceInput>,
     last_published_revision: Option<u64>,
     /// Watch sent, ack pending: publishes hold until the surface snapshot is
     /// adopted, so a fresh binding can never wipe a foreign draft with an
@@ -1293,6 +1329,12 @@ struct InputMirrorSession {
     /// compare only within one owner — never against our own publish counter
     /// (rev934 P1-1).
     foreign_floors: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PublishedSurfaceInput {
+    text: String,
+    attachments: Vec<haider_protocol::hook::HookAttachmentMetadata>,
 }
 
 #[derive(Debug, Default)]

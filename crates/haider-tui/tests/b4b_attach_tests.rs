@@ -528,6 +528,7 @@ fn oversized_and_non_image_attach_are_honest_notices_with_no_upload() {
                 upload: u64::from(lines) + 100,
                 label: format!("[Pasted {} lines]", lines + 4),
                 kind: haider_tui::composer::PendingKind::PastedText { lines: lines + 4 },
+                bytes: 0,
                 artifact: Some(ArtifactRef::new(format!("blake3:{lines:0>64}"))),
             });
     }

@@ -6688,6 +6688,7 @@ impl HubConnection {
                 }
                 Some(SurfaceInputPublishWire {
                     text: strip_input_controls(input.text),
+                    attachments: input.attachments,
                     revision: input.revision,
                 })
             }
@@ -6705,6 +6706,8 @@ impl HubConnection {
                 }
                 Some(SurfaceStatusPublishWire {
                     line: strip_status_controls(status.line),
+                    state: status.state,
+                    detail: status.detail,
                     revision: status.revision,
                 })
             }

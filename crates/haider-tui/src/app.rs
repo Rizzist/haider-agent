@@ -3190,6 +3190,13 @@ pub struct AppModel {
     /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
     /// selection + input ring. Nothing in it persists (item 8).
     pub composer: crate::composer::Composer,
+    /// Metadata-only refs from a foreign input mirror. They are keyed to the
+    /// active session at render time and remain display-only: remote CAS refs
+    /// never become local pending attachments or submit input.
+    mirrored_input_attachments: Option<(
+        SessionId,
+        Vec<haider_protocol::hook::HookAttachmentMetadata>,
+    )>,
     /// Parked composers for the surfaces NOT on screen (TUI5 item 9):
     /// every surface — launcher, each session, aura — keeps its own draft
     /// (text AND cursor/selection/ring travel together, Claude Code's
@@ -3641,6 +3648,7 @@ impl Default for AppModel {
             identity: IdentityLine::default(),
             identity_pinned: false,
             composer: crate::composer::Composer::new(),
+            mirrored_input_attachments: None,
             drafts: std::collections::HashMap::new(),
             upload_seq: 0,
             session_title: None,
@@ -3816,6 +3824,28 @@ impl AppModel {
         }
     }
 
+    /// Install the metadata-only attachment refs carried by an applied
+    /// foreign input surface. The session key makes a prior session's chips
+    /// invisible immediately on a surface switch.
+    pub fn set_mirrored_input_attachments(
+        &mut self,
+        session: SessionId,
+        attachments: Vec<haider_protocol::hook::HookAttachmentMetadata>,
+    ) {
+        self.mirrored_input_attachments = Some((session, attachments));
+        self.dirty = true;
+    }
+
+    /// The active session's foreign input refs, if the current composer
+    /// mirror applied them. They are render-only and never submit.
+    #[must_use]
+    pub fn mirrored_input_attachments(&self) -> &[haider_protocol::hook::HookAttachmentMetadata] {
+        self.mirrored_input_attachments
+            .as_ref()
+            .filter(|(session, _)| self.active_session.as_ref() == Some(session))
+            .map_or(&[], |(_, attachments)| attachments)
+    }
+
     /// The draft key of the attached session (the launcher's when nothing
     /// is attached) — the ONE place a generation becomes a surface key.
     fn session_draft_key(&self) -> DraftKey {
@@ -3858,6 +3888,7 @@ impl AppModel {
                 upload,
                 label,
                 kind,
+                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 artifact: None,
             });
         self.requests.push(AppRequest::AttachUpload {
@@ -4205,6 +4236,26 @@ impl AppModel {
             }
         }
         (badge, self.projection.badge_tone())
+    }
+
+    /// Structured status fields for the input/status mirror. The same typed
+    /// status source builds the visible badge; this never parses its rendered
+    /// text back into semantics.
+    #[must_use]
+    pub fn status_badge_state_detail(&self) -> (String, Option<String>) {
+        let (state, detail) = self.projection.status_state_detail();
+        let live = tree_live_count(&self.chips);
+        if live > 0
+            && ((state == "idle" && detail.is_none())
+                || self.projection.waiting_on_local_subagent())
+        {
+            let plural = if live > 1 { "s" } else { "" };
+            return (
+                "waiting".to_owned(),
+                Some(format!("{live} subagent{plural}")),
+            );
+        }
+        (state, detail)
     }
 
     /// TUI4d item 14 — TRUE while ANY pulsing element is on screen: the

@@ -56,7 +56,7 @@ fn draw_rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
 fn published(command: &LiveCommand) -> (&str, u64) {
     let LiveCommand::SurfacePublish {
         input: None,
-        status: Some((line, revision)),
+        status: Some((line, _state, _detail, revision)),
         ..
     } = command
     else {

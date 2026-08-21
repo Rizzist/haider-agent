@@ -1382,6 +1382,71 @@ impl SessionProjection {
         }
     }
 
+    /// The status badge's machine-readable state and human detail. This is
+    /// derived directly from typed run state, never by parsing [`Self::badge`]
+    /// after it has become display text.
+    #[must_use]
+    pub fn status_state_detail(&self) -> (String, Option<String>) {
+        if matches!(self.harness, Some(HarnessStatus::Starting { .. })) {
+            return ("starting".to_owned(), None);
+        }
+        match &self.run {
+            None | Some(RunState::Done | RunState::Cancelled) => (
+                "idle".to_owned(),
+                self.interrupted.then(|| "interrupted".to_owned()),
+            ),
+            Some(RunState::Queued) => ("waiting".to_owned(), Some("queued".to_owned())),
+            Some(RunState::Thinking) => ("running".to_owned(), Some("thinking".to_owned())),
+            Some(RunState::Streaming) => ("running".to_owned(), Some("streaming".to_owned())),
+            Some(RunState::RunningTool) => ("running".to_owned(), Some("running tool".to_owned())),
+            Some(RunState::Waiting { reason }) => {
+                ("waiting".to_owned(), Some(wait_reason_label(reason)))
+            }
+            Some(RunState::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                ..
+            }) => (
+                "waiting".to_owned(),
+                Some(format!(
+                    "retrying in {}s · attempt {attempt}/{max}",
+                    delay_ms.div_ceil(1_000)
+                )),
+            ),
+            Some(RunState::InputRequired { .. }) => {
+                ("waiting".to_owned(), Some("input required".to_owned()))
+            }
+            Some(RunState::PermissionRequired { .. }) => {
+                ("waiting".to_owned(), Some("permission required".to_owned()))
+            }
+            Some(RunState::Compacting) => ("running".to_owned(), Some("compacting".to_owned())),
+            Some(RunState::Verifying { step }) => (
+                "running".to_owned(),
+                Some(format!("verifying {}", verify_step_label(*step))),
+            ),
+            Some(RunState::Concluding) => ("running".to_owned(), Some("concluding".to_owned())),
+            Some(RunState::EffectOutcomeUnknown) => (
+                "errored".to_owned(),
+                Some("effect outcome unknown".to_owned()),
+            ),
+            Some(RunState::Cancelling) => ("running".to_owned(), Some("cancelling".to_owned())),
+            Some(RunState::Errored) => ("errored".to_owned(), None),
+        }
+    }
+
+    /// Whether the typed run state is the durable local-subagent wait that
+    /// the application augments with its live child count.
+    #[must_use]
+    pub fn waiting_on_local_subagent(&self) -> bool {
+        matches!(
+            self.run,
+            Some(RunState::Waiting {
+                reason: WaitReason::LocalChild
+            })
+        )
+    }
+
     /// Terminal rest, idle(i) INCLUDED: no run, or the last run reached
     /// Done/Cancelled/Errored. The interrupt marker is HISTORY, not
     /// activity (owner report: a visited-then-left session wore

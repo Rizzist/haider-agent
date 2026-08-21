@@ -589,6 +589,17 @@ pub const IDLE_DECAY: Duration = Duration::from_secs(30);
 /// (two phases) and, via `% 3`, the shimmer's 1.8 s exactly.
 pub const ANIM_PHASE_MS: u64 = 600;
 
+/// One status-surface snapshot held by the W-INP publisher's dedup cache.
+/// The connection epoch, session id, display line, and additive structured
+/// fields all move under one cache/revision fence.
+type PublishedStatus = (
+    u64,
+    haider_protocol::ids::SessionId,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 /// Wall clock in epoch ms — the S4 chip clocks' runtime time base: the
 /// anim tick advances [`AppModel::clock_ms`] with it, and the demo driver
 /// stamps chip events with it (the demo fabricates locally, so its journal
@@ -614,7 +625,7 @@ pub fn now_epoch_ms() -> u64 {
 pub fn status_publish_pass(
     model: &AppModel,
     connection_epoch: u64,
-    published: &mut Option<(u64, haider_protocol::ids::SessionId, String)>,
+    published: &mut Option<PublishedStatus>,
     revision: &mut u64,
 ) -> Option<crate::live::LiveCommand> {
     if !model.daemon_serves(haider_rpc::FEATURE_STATUS_SEGMENT_V1)
@@ -630,8 +641,19 @@ pub fn status_publish_pass(
     if width == 0 {
         return None;
     }
-    let line = crate::render::status_left_string(model, width);
-    let current = (connection_epoch, session.clone(), line.clone());
+    let status = crate::render::status_left_surface(model, width);
+    let (state, detail) = if model.daemon_serves(haider_rpc::FEATURE_STATUS_SEGMENT_STRUCTURED_V1) {
+        (status.state, status.detail)
+    } else {
+        (None, None)
+    };
+    let current = (
+        connection_epoch,
+        session.clone(),
+        status.line.clone(),
+        state.clone(),
+        detail.clone(),
+    );
     if published.as_ref() == Some(&current) {
         return None;
     }
@@ -640,7 +662,7 @@ pub fn status_publish_pass(
     Some(crate::live::LiveCommand::SurfacePublish {
         session,
         input: None,
-        status: Some((line, *revision)),
+        status: Some((status.line, state, detail, *revision)),
     })
 }
 
@@ -3013,7 +3035,7 @@ pub async fn run_live(
     let mut announced_session: Option<Option<String>> = None;
     // The status half (status_segment_v1) — same cache shape, own
     // revision counter (`status_publish_pass`).
-    let mut published_status: Option<(u64, haider_protocol::ids::SessionId, String)> = None;
+    let mut published_status: Option<PublishedStatus> = None;
     let mut status_revision: u64 = 0;
 
     while !model.should_quit {

@@ -3087,6 +3087,7 @@ async fn surface_watch_delivers_on_change_and_stays_silent_when_idle() {
                 session_id: session_id.clone(),
                 input: Some(SurfaceInputPublishWire {
                     text: "draft in flight".into(),
+                    attachments: Vec::new(),
                     revision: 1,
                 }),
                 status: None,

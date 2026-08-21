@@ -348,8 +348,12 @@ pub const FEATURE_LOOM_V1: &str = "loom_v1";
 pub const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
 /// Daemon-owned volatile composer mirroring, watching, and input injection.
 pub const FEATURE_INPUT_MIRROR_V1: &str = "input_mirror_v1";
+/// Input mirrors carry metadata-only refs for ready composer attachments.
+pub const FEATURE_INPUT_MIRROR_ATTACHMENTS_V1: &str = "input_mirror_attachments_v1";
 /// Daemon-owned volatile status-segment publication and watching.
 pub const FEATURE_STATUS_SEGMENT_V1: &str = "status_segment_v1";
+/// Status mirrors carry structured state and detail beside their display line.
+pub const FEATURE_STATUS_SEGMENT_STRUCTURED_V1: &str = "status_segment_structured_v1";
 /// Daemon latches durable-store write health and pushes the transition —
 /// degraded and recovered alike — to every connection as an out-of-band
 /// `ProtocolError` (`store_full`/`store_read_only`/`store_unavailable`,
@@ -1053,6 +1057,10 @@ pub enum SessionKindWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceInputPublishWire {
     pub text: String,
+    /// Ready CAS attachment coordinates. Bytes never ride the volatile
+    /// surface; the shape is the metadata-only hooks attachment payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<haider_protocol::hook::HookAttachmentMetadata>,
     pub revision: u64,
 }
 
@@ -1061,6 +1069,12 @@ pub struct SurfaceInputPublishWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceStatusPublishWire {
     pub line: String,
+    /// Short lowercased status state for clients that do not render `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Human-readable state detail, when the typed TUI status carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub revision: u64,
 }
 
@@ -1068,6 +1082,9 @@ pub struct SurfaceStatusPublishWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceInputWire {
     pub text: String,
+    /// Ready CAS attachment coordinates carried beside the authoritative text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<haider_protocol::hook::HookAttachmentMetadata>,
     pub revision: u64,
     pub owner: String,
 }
@@ -1076,6 +1093,12 @@ pub struct SurfaceInputWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceStatusWire {
     pub line: String,
+    /// Short lowercased status state carried beside the display line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Human-readable state detail carried beside the display line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub revision: u64,
     pub owner: String,
 }

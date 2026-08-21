@@ -732,10 +732,21 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             status,
         } => RequestBody::SessionSurfacePublish {
             session_id: session,
-            input: input
-                .map(|(text, revision)| haider_rpc::SurfaceInputPublishWire { text, revision }),
-            status: status
-                .map(|(line, revision)| haider_rpc::SurfaceStatusPublishWire { line, revision }),
+            input: input.map(
+                |(text, attachments, revision)| haider_rpc::SurfaceInputPublishWire {
+                    text,
+                    attachments,
+                    revision,
+                },
+            ),
+            status: status.map(|(line, state, detail, revision)| {
+                haider_rpc::SurfaceStatusPublishWire {
+                    line,
+                    state,
+                    detail,
+                    revision,
+                }
+            }),
         },
         LiveCommand::SurfaceWatch { session } => RequestBody::SessionSurfaceWatch {
             session_id: session,

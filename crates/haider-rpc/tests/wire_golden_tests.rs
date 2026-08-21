@@ -2892,3 +2892,65 @@ fn borrowed_event_encode_is_byte_identical_to_owned() {
         );
     }
 }
+
+/// Lane S (935): surface attachment refs (input_mirror_attachments_v1) and
+/// structured status (status_segment_structured_v1) are additive both ways
+/// — an older publisher omitting them decodes with empty/none, and text /
+/// line stay the mirror's authoritative value.
+///
+/// MUTATION CHECK: drop the skip_serializing_if on either field. Expected
+/// failure: an empty/none field appears on the wire (breaking byte-identity
+/// for existing consumers) or the older-decoder default reads change.
+#[test]
+fn surface_attachment_refs_and_structured_status_are_additive() {
+    use haider_rpc::{SurfaceInputPublishWire, SurfaceStatusPublishWire};
+
+    // Older publisher: text/line only — no attachment or structured keys.
+    let older_input = serde_json::to_value(&SurfaceInputPublishWire {
+        text: "hi".into(),
+        attachments: Vec::new(),
+        revision: 3,
+    })
+    .expect("input encodes");
+    assert_eq!(
+        older_input.get("attachments"),
+        None,
+        "empty attachments never ride the wire"
+    );
+    let older_status = serde_json::to_value(&SurfaceStatusPublishWire {
+        line: "[ IDLE ] 0 tok".into(),
+        state: None,
+        detail: None,
+        revision: 3,
+    })
+    .expect("status encodes");
+    assert_eq!(older_status.get("state"), None);
+    assert_eq!(older_status.get("detail"), None);
+    assert_eq!(older_status["line"], "[ IDLE ] 0 tok");
+
+    // A newer publisher's extra fields decode, and a client that ignores
+    // them still reads text/line.
+    let newer_input: SurfaceInputPublishWire = serde_json::from_value(serde_json::json!({
+        "text": "look",
+        "attachments": [{"mime": "image/png", "bytes": 1024, "artifact": "blake3:abc"}],
+        "revision": 4,
+    }))
+    .expect("newer input decodes");
+    assert_eq!(newer_input.text, "look", "text stays the mirror truth");
+    assert_eq!(newer_input.attachments.len(), 1);
+    assert_eq!(newer_input.attachments[0].mime, "image/png");
+
+    let newer_status: SurfaceStatusPublishWire = serde_json::from_value(serde_json::json!({
+        "line": "[ RUNNING ] 3k tok",
+        "state": "running",
+        "detail": "applying patch 3/5",
+        "revision": 4,
+    }))
+    .expect("newer status decodes");
+    assert_eq!(
+        newer_status.line, "[ RUNNING ] 3k tok",
+        "line stays authoritative"
+    );
+    assert_eq!(newer_status.state.as_deref(), Some("running"));
+    assert_eq!(newer_status.detail.as_deref(), Some("applying patch 3/5"));
+}
