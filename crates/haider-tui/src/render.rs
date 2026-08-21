@@ -1107,6 +1107,22 @@ fn render_launcher(
                 theme.dim_style(),
             ),
         ];
+        if let Some(attention) = model.session_attention.get(&entry.id) {
+            if attention.unseen() {
+                spans.push(Span::styled(" •", theme.gold_style()));
+            }
+            if let Some(waiting) = &attention.waiting_why {
+                let reason = match waiting.kind {
+                    haider_rpc::WaitingWhyKindWire::Permission => "permission",
+                    haider_rpc::WaitingWhyKindWire::Question => "question",
+                    haider_rpc::WaitingWhyKindWire::Approval => "approval",
+                };
+                let chip = format!(" needs {reason}");
+                if Line::from(spans.clone()).width() + chip.chars().count() + 12 <= area_cap {
+                    spans.push(Span::styled(chip, theme.warn_style()));
+                }
+            }
+        }
         // W-flow inline identity: a row whose summary carries a bound agent
         // type wears a small `{glyph} @{id}` chip in the type's registry
         // accent — the SessionSummary.agent_type ↔ loom-snapshot join. The

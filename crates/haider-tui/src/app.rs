@@ -2386,6 +2386,9 @@ pub enum AppRequest {
     /// moves only on the correlated NORMALIZED reply (optimism forbidden,
     /// same law as [`Self::SelectModel`]).
     Rename { session: SessionId, title: String },
+    /// Durable shared attention acknowledgement. The daemon owns the seen
+    /// timestamp; this surface merely says that the user viewed a session.
+    Seen { session: SessionId },
     /// G3: receipted live-session effort selection
     /// (`session.select_effort`). `None` reverts to the provider default;
     /// the identity's reasoning segment moves only on the correlated reply.
@@ -2470,6 +2473,24 @@ pub enum AppRequest {
     TalkShell(crate::talk::TalkShellCommand),
     /// Quit the app.
     Quit,
+}
+
+/// Daemon-summarized attention state for one roster row. The TUI never
+/// derives this from its transcript: a mark seen here must clear the dot for
+/// ADE and every other connected surface too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAttention {
+    pub seen_at_ms: Option<u64>,
+    pub last_activity_ms: Option<u64>,
+    pub waiting_why: Option<haider_rpc::WaitingWhyWire>,
+}
+
+impl SessionAttention {
+    #[must_use]
+    pub fn unseen(&self) -> bool {
+        self.last_activity_ms
+            .is_some_and(|activity| self.seen_at_ms.is_none_or(|seen| activity > seen))
+    }
 }
 
 /// Side effects only the DEMO runtime can perform (W3c3, report R11 cut 3).
@@ -3367,6 +3388,9 @@ pub struct AppModel {
     /// swap this registry, so `/usage` can refresh it in place.
     pub session_metrics:
         std::collections::HashMap<SessionId, haider_protocol::agent::AgentMetricsSnapshot>,
+    /// Attention state is roster-only daemon truth. It is kept outside the
+    /// checked-in session slots so a summary can update an active session.
+    pub session_attention: std::collections::HashMap<SessionId, SessionAttention>,
     /// Which runtime drives this model (W3c3 M2). Demo by default.
     pub mode: RuntimeMode,
     /// The masked `/login … api` card, while it is open (W3c3 M3).
@@ -3703,6 +3727,7 @@ impl Default for AppModel {
             // `next_ui_generation` continues at 4.
             sessions: seed_session_states(UiGeneration::FIRST.get()),
             session_metrics: std::collections::HashMap::new(),
+            session_attention: std::collections::HashMap::new(),
             active_session: None,
             custom_commands: Vec::new(),
             custom_command_warnings: Vec::new(),
@@ -11698,6 +11723,7 @@ impl AppModel {
     pub fn open_session(&mut self, id: &SessionId) {
         if self.active_session.as_ref() == Some(id) {
             self.switch_surface(Screen::Session);
+            self.note_session_view();
             return;
         }
         // TUI5 item 9: park the departing surface's draft BEFORE identity
@@ -11777,6 +11803,22 @@ impl AppModel {
         // TUI5 item 9: the attached session's own draft comes live —
         // text, cursor, selection and input ring exactly as it left.
         self.restore_draft();
+        self.note_session_view();
+    }
+
+    /// A view/read acknowledgement is deliberately a request, not local
+    /// unseen bookkeeping. The live driver debounces it and holds it until
+    /// the control attachment is established; another surface then receives
+    /// the same durable truth through ordinary roster summaries.
+    fn note_session_view(&mut self) {
+        if self.mode.fabricates_locally()
+            || !self.daemon_serves(haider_rpc::FEATURE_SESSION_SEEN_V1)
+        {
+            return;
+        }
+        if let Some(session) = self.active_session.clone() {
+            self.requests.push(AppRequest::Seen { session });
+        }
     }
 
     /// Detach: write the live fields back into the session's slot (sim
@@ -11935,6 +11977,18 @@ impl AppModel {
     ///   ([`crate::session::SessionState::turns`] / `row_tokens`), so a
     ///   checkin AFTER this call still beats a stale summary.
     pub fn note_summary_counts(&mut self, summary: &haider_rpc::SessionSummary) {
+        if self.daemon_serves(haider_rpc::FEATURE_SESSION_SEEN_V1) {
+            let attention = SessionAttention {
+                seen_at_ms: summary.seen_at_ms,
+                last_activity_ms: summary.last_activity_ms,
+                waiting_why: summary.waiting_why.clone(),
+            };
+            if self.session_attention.get(&summary.session_id) != Some(&attention) {
+                self.session_attention
+                    .insert(summary.session_id.clone(), attention);
+                self.dirty = true;
+            }
+        }
         if let Some(workspace) = &summary.workspace_cwd {
             if self.active_session.as_ref() == Some(&summary.session_id) {
                 if self.session_workspace_cwd.as_ref() != Some(workspace) {
@@ -12549,6 +12603,7 @@ impl AppModel {
                 // other hit arm (Fable review D3-12).
                 self.scroll_back.set(scroll_back.min(self.scroll_max.get()));
                 self.sticky_suppressed.set(true);
+                self.note_session_view();
             }
             // A hit whose owning surface is gone: dropped, never acted on.
             _ => {}
@@ -12618,6 +12673,7 @@ impl AppModel {
             current.saturating_sub(3)
         };
         self.scroll_back.set(next);
+        self.note_session_view();
     }
 
     /// One drag-autoscroll step (QoL wave): a held transcript selection
@@ -12643,6 +12699,7 @@ impl AppModel {
             current.saturating_sub(1)
         };
         self.scroll_back.set(next);
+        self.note_session_view();
     }
 
     /// Terminal resize: force a redraw. The frame itself reconciles the

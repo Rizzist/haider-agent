@@ -41,6 +41,9 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         head_seq,
         worker_generation: 7,
         run_state: None,
+        seen_at_ms: None,
+        last_activity_ms: None,
+        waiting_why: None,
         metadata: None,
         workspace_cwd: None,
         turn_count: None,
@@ -1264,4 +1267,68 @@ fn initial_session_opens_from_the_list_or_flashes_unknown() {
         },
     );
     assert_eq!(model.active_session.as_ref(), Some(&sid(2)));
+}
+
+/// v0.0.936 attention state: viewing a session queues EXACTLY ONE
+/// `session.seen` acknowledgement per read window — a second view while one
+/// is pending is absorbed, a view shortly after the receipt is debounced
+/// (750ms), and a genuinely later read re-acknowledges so cross-surface
+/// truth stays fresh.
+///
+/// MUTATION CHECK (executed): drop the `last_seen_mark` debounce guard and
+/// the 200ms re-view emits a second command — the debounce assertion fails;
+/// drop the `pending_seen` dedup and the immediate second view duplicates.
+#[test]
+fn session_seen_acknowledgement_debounces_per_view_window() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let base = std::time::Instant::now();
+    driver.set_now(base);
+    attach_all(&mut driver, &mut model, 1);
+    model.open_session(&sid(0));
+
+    let issued = driver.handle_request(&mut model, AppRequest::Seen { session: sid(0) });
+    let Some(LiveCommand::Seen {
+        command_id,
+        session,
+        ..
+    }) = issued.first()
+    else {
+        panic!("expected a seen command, got {issued:?}");
+    };
+    assert_eq!(session, &sid(0));
+    let first_command = command_id.clone();
+
+    // A second view while the acknowledgement is in flight is absorbed.
+    assert!(
+        driver
+            .handle_request(&mut model, AppRequest::Seen { session: sid(0) })
+            .is_empty(),
+        "a pending acknowledgement absorbs repeat views"
+    );
+
+    // The receipt lands; a re-view 200ms after the mark stays debounced.
+    driver.apply(
+        &mut model,
+        LiveReply::Seen {
+            command_id: first_command,
+            session: sid(0),
+            worker_generation: 7,
+        },
+    );
+    driver.set_now(base + std::time::Duration::from_millis(200));
+    assert!(
+        driver
+            .handle_request(&mut model, AppRequest::Seen { session: sid(0) })
+            .is_empty(),
+        "a 200ms re-view is inside the 750ms debounce"
+    );
+
+    // A genuinely later read acknowledges again.
+    driver.set_now(base + std::time::Duration::from_millis(1_000));
+    let renewed = driver.handle_request(&mut model, AppRequest::Seen { session: sid(0) });
+    assert!(
+        matches!(renewed.first(), Some(LiveCommand::Seen { .. })),
+        "a later read re-acknowledges, got {renewed:?}"
+    );
 }

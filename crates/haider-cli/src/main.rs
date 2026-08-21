@@ -25,6 +25,7 @@ pub(crate) mod run;
 pub(crate) mod session_config;
 pub(crate) mod session_item;
 pub(crate) mod session_recover;
+pub(crate) mod session_seen;
 pub(crate) mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -118,6 +119,11 @@ async fn dispatch() -> ExitCode {
         {
             session_recover::session_recover_command(session_id, rest).await
         }
+        [command, session_id, subcommand, rest @ ..]
+            if command == "session" && subcommand == "seen" =>
+        {
+            session_seen::session_seen_command(session_id, rest).await
+        }
         [command, session_id, subcommand, seq, rest @ ..]
             if command == "session" && subcommand == "item" =>
         {
@@ -143,7 +149,7 @@ async fn dispatch() -> ExitCode {
                  status [--json] [--no-spawn], sessions [--recovery] [--json] [--no-spawn], \
                  session <id> [--json|--watch] [--no-spawn], \
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
-                 session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
+                 session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  models [--json], \
                  fleet [<session-id>] [--json] [--no-spawn], \

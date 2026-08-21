@@ -797,6 +797,43 @@ pub enum SessionRenameOutcome {
     Skipped,
 }
 
+/// Secret-free coordinates for one atomic durable attention acknowledgement.
+///
+/// `session.seen` is ordered through the same actor as every session write.
+/// The store stamps `seen_at_ms` and preserves the greater already-durable
+/// value, so a wall-clock regression can never make a session unseen again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSeenCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.seen` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SeenSession {
+    pub session_id: SessionId,
+    pub seen_at_ms: u64,
+    pub seen_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic attention acknowledgement transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionSeenOutcome {
+    Committed {
+        seen: SeenSession,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        seen: SeenSession,
+    },
+}
+
 /// Secret-free coordinates for one atomic live-session effort selection (G3).
 ///
 /// `effort` is the RESOLVED, ladder-validated value — the daemon validates
@@ -5313,6 +5350,153 @@ impl Store {
             request_json,
             "session-rename",
         )
+    }
+
+    /// Returns the durable attention acknowledgement for a session. `None`
+    /// is a real never-seen value, distinct from an absent legacy summary.
+    pub fn session_seen_at(&self, session_id: &SessionId) -> StoreResult<Option<u64>> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        let seen_at_ms: Option<i64> = connection
+            .query_row(
+                "SELECT seen_at_ms FROM sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        seen_at_ms
+            .map(|value| {
+                u64::try_from(value).map_err(|_| corrupt("session attention timestamp is negative"))
+            })
+            .transpose()
+    }
+
+    /// Looks up a committed `session.seen` response before session or
+    /// generation validation, preserving the same response-loss recovery law
+    /// as `session.rename`.
+    pub fn session_seen_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SeenSession>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.seen",
+            request_digest,
+            request_json,
+            "session-seen",
+        )
+    }
+
+    /// Atomically advances one session's shared attention acknowledgement,
+    /// appends a non-meaningful `session_seen` config fact, and finalizes the
+    /// command receipt. The SQL comparison is the durable monotonicity proof:
+    /// `seen_at_ms` is never replaced by a smaller candidate.
+    pub fn mark_session_seen(
+        &self,
+        command: &SessionSeenCommand,
+    ) -> StoreResult<SessionSeenOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(seen) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "session.seen",
+            &command.request_digest,
+            &command.request_json,
+            "session-seen",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionSeenOutcome::IdempotentReplay { seen });
+        }
+        require_session(&transaction, &command.session_id)?;
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "session.seen",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        transaction
+            .execute(
+                "UPDATE sessions
+                 SET seen_at_ms = CASE
+                     WHEN seen_at_ms IS NULL OR seen_at_ms < ?2 THEN ?2
+                     ELSE seen_at_ms
+                 END
+                 WHERE id = ?1",
+                params![command.session_id.as_str(), to_sqlite_integer(now)?],
+            )
+            .map_err(map_sqlite_error)?;
+        let seen_at_ms: i64 = transaction
+            .query_row(
+                "SELECT seen_at_ms FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let seen_at_ms = u64::try_from(seen_at_ms)
+            .map_err(|_| corrupt("session attention timestamp is negative"))?;
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            command.event_id.clone(),
+            &command.session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            self.worker_generation,
+            haider_protocol::session::SessionConfigEventPayload::session_seen_value(seen_at_ms)
+                .map_err(|error| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        format!("cannot serialize session-seen payload: {error}"),
+                        false,
+                    )
+                })?,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let seen = SeenSession {
+            session_id: command.session_id.clone(),
+            seen_at_ms,
+            seen_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(seen.seen_seq),
+            &seen,
+            now,
+            "session-seen",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionSeenOutcome::Committed {
+            seen,
+            envelope: Box::new(envelopes.remove(0)),
+        })
     }
 
     /// Atomically applies one NORMALIZED rename (G2): updates the session's

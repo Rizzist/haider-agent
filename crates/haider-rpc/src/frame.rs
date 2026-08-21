@@ -305,6 +305,9 @@ pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 /// `session_renamed` config fact is journaled atomically with the receipt,
 /// and `session.list` summaries carry the title.
 pub const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
+/// Daemon implements the durable, shared per-session attention acknowledgement
+/// (`session.seen`) and attention fields on session summaries.
+pub const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
 /// Daemon implements receipted live-session effort selection
 /// (`session.select_effort`), validated against the CURRENT pair's declared
 /// effort ladder; `effort: null` reverts to the provider default (G3).
@@ -963,6 +966,20 @@ pub struct SessionSummary {
     /// older daemon; current list/watch producers always populate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_state: Option<ObserveRunStateWire>,
+    /// Durable time at which any surface last acknowledged this session's
+    /// activity. `None` means no acknowledgement has ever committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_at_ms: Option<u64>,
+    /// Latest meaningful committed activity, reduced by the daemon. It is
+    /// absent for a session with no user-relevant activity, never a client
+    /// replay obligation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<u64>,
+    /// Why the session currently needs a human. This is absent unless its
+    /// daemon-owned run state is parked for permission, a question, or an
+    /// approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_why: Option<WaitingWhyWire>,
     /// Additive R2 field: typed configuration for live-created sessions.
     /// `None` for legacy `{}` rows and when an old daemon omits the field —
     /// readers must not infer anything from its absence.
@@ -1156,6 +1173,25 @@ pub enum ObserveRunStateWire {
     Cancelled,
     #[serde(other)]
     Unknown,
+}
+
+/// Typed reason a session is currently parked for a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingWhyKindWire {
+    Permission,
+    Question,
+    Approval,
+}
+
+/// Additive summary-level human-attention coordinate. The pending menu id is
+/// intentionally optional so a parked run remains representable while a
+/// legacy/recovery projection has no current menu identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingWhyWire {
+    pub kind: WaitingWhyKindWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_menu_id: Option<MenuId>,
 }
 
 /// Secret-free projection of one currently answerable menu.
@@ -1725,6 +1761,15 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// Receipted durable acknowledgement that one surface has viewed this
+    /// session. The daemon advances the timestamp monotonically and replays
+    /// the original receipt for a repeated command id.
+    #[serde(rename = "session.seen")]
+    SessionSeen {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    },
     /// Receipted live-session effort selection (G3), mirroring
     /// `session.select_model` exactly: receipt replay precedes validation,
     /// the store fences the worker generation, and the next logical turn
@@ -2246,6 +2291,15 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         renamed_seq: u64,
+        worker_generation: u64,
+    },
+    /// Durable coordinates of a committed attention acknowledgement. A
+    /// repeated command id receives this exact receipt.
+    #[serde(rename = "session.seen")]
+    SessionSeen {
+        session_id: SessionId,
+        seen_at_ms: u64,
+        seen_seq: u64,
         worker_generation: u64,
     },
     /// Durable coordinates of a committed effort selection (G3/R2): the

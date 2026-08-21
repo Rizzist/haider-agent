@@ -468,6 +468,32 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::Seen { command, completed } => {
+                // Attention state is durable session truth, not a surface
+                // flag. Its non-meaningful config fact must still move this
+                // actor's head so attachments and roster watchers converge.
+                let result = store.mark_session_seen(command).await;
+                if let Ok(haider_core::SessionSeenOutcome::Committed { envelope, .. }) = &result {
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::PinGraph {
                 command,
                 expected_digest,

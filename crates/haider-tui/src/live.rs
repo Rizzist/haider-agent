@@ -460,6 +460,14 @@ pub enum LiveCommand {
         worker_generation: u64,
         title: String,
     },
+    /// `session.seen`: a receipted durable acknowledgement shared with every
+    /// client surface. The command is held until its control attachment is
+    /// established, then reconnects replay the same receipt identity.
+    Seen {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+    },
     /// `session.select_effort` (G3): receipted per-pair effort selection.
     /// DURABLE — a reconnect resends under the same command id and the
     /// daemon replays the committed receipt. `None` reverts to the
@@ -744,6 +752,7 @@ impl LiveCommand {
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
             Self::SelectModel { command_id, .. } => Some(command_id),
             Self::Rename { command_id, .. } => Some(command_id),
+            Self::Seen { command_id, .. } => Some(command_id),
             Self::SelectEffort { command_id, .. } => Some(command_id),
             Self::SelectFast { command_id, .. } => Some(command_id),
             Self::SelectAgentType { command_id, .. } => Some(command_id),
@@ -1137,6 +1146,13 @@ pub enum LiveReply {
         title: Option<String>,
         worker_generation: u64,
     },
+    /// `session.seen` committed. The receipt retires the outbox only;
+    /// attention display remains a session-summary projection.
+    Seen {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+    },
     /// `session.select_effort` committed (G3): the RESOLVED value — never
     /// an echo of the request.
     EffortSelected {
@@ -1279,6 +1295,7 @@ struct OAuthFlight {
 
 /// `account.oauth_status` poll cadence while the browser owns the flow.
 const OAUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+const SESSION_SEEN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// The committed coordinates of one open menu (report R11 cut 4): a live
 /// answer is built from the OPENING envelope, never from local state.
@@ -1426,6 +1443,11 @@ pub struct LiveDriver {
     /// In-flight `session.rename` (G2): (command, session), so a typed
     /// refusal lands on the exact session that asked.
     pending_rename: Option<(CommandId, SessionId)>,
+    /// One pending attention acknowledgement per session plus its throttle.
+    /// A read later in a long-lived transcript view may send another ack,
+    /// but wheel/drag bursts never mint one command per tick.
+    pending_seen: HashMap<SessionId, CommandId>,
+    last_seen_mark: HashMap<SessionId, std::time::Instant>,
     /// In-flight `session.select_effort` (G3): failure correlation.
     pending_effort_select: Option<(CommandId, SessionId, Option<String>)>,
     /// In-flight `session.select_fast` (G3): failure correlation.
@@ -1563,6 +1585,8 @@ impl LiveDriver {
             pending_model_select: None,
             pending_retry: None,
             pending_rename: None,
+            pending_seen: HashMap::new(),
+            last_seen_mark: HashMap::new(),
             pending_effort_select: None,
             pending_fast_select: None,
             pending_agent_type: None,
@@ -1706,6 +1730,36 @@ impl LiveDriver {
             });
         }
         command
+    }
+
+    /// Queue a shared attention acknowledgement once per short read window.
+    /// An acknowledgement requested before `session.attach` is intentionally
+    /// only outboxed: the Attached arm releases it after the control lease is
+    /// installed, avoiding an attach/seen capability race.
+    fn request_session_seen(&mut self, session: SessionId) -> Vec<LiveCommand> {
+        if self.pending_seen.contains_key(&session)
+            || self.last_seen_mark.get(&session).is_some_and(|last| {
+                self.now
+                    .checked_duration_since(*last)
+                    .is_some_and(|elapsed| elapsed < SESSION_SEEN_DEBOUNCE)
+            })
+        {
+            return Vec::new();
+        }
+        let command_id = self.mint();
+        let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+        self.pending_seen
+            .insert(session.clone(), command_id.clone());
+        self.last_seen_mark.insert(session.clone(), self.now);
+        let command = self.enqueue(LiveCommand::Seen {
+            command_id,
+            session: session.clone(),
+            worker_generation,
+        });
+        self.is_attached(&session)
+            .then_some(command)
+            .into_iter()
+            .collect()
     }
 
     fn retire(&mut self, command_id: &CommandId) {
@@ -2551,6 +2605,18 @@ impl LiveDriver {
                 model.apply_renamed(&session, title);
                 Vec::new()
             }
+            LiveReply::Seen {
+                command_id,
+                session,
+                worker_generation,
+            } => {
+                self.retire(&command_id);
+                if self.pending_seen.get(&session) == Some(&command_id) {
+                    self.pending_seen.remove(&session);
+                }
+                self.generations.insert(session, worker_generation);
+                Vec::new()
+            }
             LiveReply::EffortSelected {
                 command_id,
                 session,
@@ -3087,6 +3153,22 @@ impl LiveDriver {
                         self.retire(id);
                     }
                     model.run_retry_failed(&message);
+                    return Vec::new();
+                }
+                // A failed attention acknowledgement remains retryable under
+                // its durable id; a permanent refusal retires silently
+                // because attention display is always daemon summary truth.
+                if let Some(id) = &command_id
+                    && let Some((session, _)) = self
+                        .pending_seen
+                        .iter()
+                        .find(|(_, pending)| *pending == id)
+                        .map(|(session, pending)| (session.clone(), pending.clone()))
+                {
+                    if !retryable {
+                        self.retire(id);
+                        self.pending_seen.remove(&session);
+                    }
                     return Vec::new();
                 }
                 // A failed `session.rename` (G2): the typed public reason
@@ -3901,7 +3983,10 @@ impl LiveDriver {
             }
             // G2 renames land through the correlated `session.rename` reply
             // and `session.list` summaries, never this raw-fact lane.
-            haider_protocol::session::SessionConfigEventPayload::SessionRenamed { .. } => {}
+            haider_protocol::session::SessionConfigEventPayload::SessionRenamed { .. }
+            // `session_seen` is acknowledged through its receipt; the
+            // roster summary remains the sole local attention display truth.
+            | haider_protocol::session::SessionConfigEventPayload::SessionSeen { .. } => {}
         }
     }
 
@@ -4286,6 +4371,7 @@ impl LiveDriver {
                     title,
                 })]
             }
+            AppRequest::Seen { session } => self.request_session_seen(session),
             AppRequest::SelectEffort {
                 session,
                 effort,
@@ -4790,6 +4876,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::ToolsInventory { session }
         | LiveCommand::SelectModel { session, .. }
         | LiveCommand::Rename { session, .. }
+        | LiveCommand::Seen { session, .. }
         | LiveCommand::SelectEffort { session, .. }
         | LiveCommand::SelectFast { session, .. }
         | LiveCommand::Answer { session, .. } => Some(session),

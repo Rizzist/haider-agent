@@ -24,9 +24,10 @@ use haider_store::{
     HookTrustChange, HookTrustCommand, JournalAppendBatch, MenuResolutionCommand,
     MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
     RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
-    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -532,6 +533,41 @@ impl SqliteStoreHandle {
     ) -> Result<SessionRenameOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.rename_session(&command))).await
+    }
+
+    /// Reads the durable shared attention acknowledgement for one session.
+    pub async fn session_seen_at(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<u64>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || owner.with_store(|store| store.session_seen_at(&session_id))).await
+    }
+
+    /// Preflights a durable `session.seen` receipt (attention replay).
+    pub async fn session_seen_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::SeenSession>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_seen_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically advances one session's durable attention acknowledgement.
+    pub async fn mark_session_seen(
+        &self,
+        command: SessionSeenCommand,
+    ) -> Result<SessionSeenOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.mark_session_seen(&command))).await
     }
 
     /// Preflights a durable `session.select_effort` receipt (R2 replay).

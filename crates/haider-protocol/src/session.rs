@@ -173,6 +173,12 @@ pub enum SessionConfigEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// Durable attention acknowledgement. This config fact deliberately does
+    /// not count as session activity: it only records that a surface has
+    /// observed activity which was already committed.
+    SessionSeen {
+        seen_at_ms: u64,
+    },
     EffortSelected(EffortSelected),
     FastModeSelected(FastModeSelected),
     AgentTypeSelected(AgentTypeSelected),
@@ -194,6 +200,11 @@ impl SessionConfigEventPayload {
             Self::SessionRenamed { title } => Some(title),
             _ => None,
         }
+    }
+
+    /// Encodes one committed attention acknowledgement.
+    pub fn session_seen_value(seen_at_ms: u64) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::SessionSeen { seen_at_ms })
     }
 }
 

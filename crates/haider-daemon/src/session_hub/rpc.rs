@@ -472,6 +472,7 @@ enum ObserveCacheEntry {
 struct ObserveFold {
     head_seq: u64,
     projection: ObserveProjection,
+    last_activity_ms: Option<u64>,
     turns: u64,
     metrics: crate::usage_report::SessionFolder,
 }
@@ -489,6 +490,7 @@ struct ObserveFoldSnapshot {
     pending_menus: Vec<haider_rpc::ObserveMenuWire>,
     subagents: Vec<haider_rpc::ObserveSubagentWire>,
     updated_at_ms: u64,
+    last_activity_ms: Option<u64>,
     event_kinds: Vec<String>,
     turns: u64,
     agent_metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
@@ -536,6 +538,7 @@ impl ObserveFold {
         Self {
             head_seq: 0,
             projection: ObserveProjection::new(100),
+            last_activity_ms: None,
             turns: 0,
             metrics: crate::usage_report::SessionFolder::new(initial_model),
         }
@@ -543,6 +546,13 @@ impl ObserveFold {
 
     fn apply(&mut self, envelope: RawEnvelope) {
         self.head_seq = self.head_seq.max(envelope.seq);
+        if is_meaningful_activity(&envelope) {
+            self.last_activity_ms = Some(
+                self.last_activity_ms
+                    .unwrap_or(0)
+                    .max(envelope.committed_at_ms),
+            );
+        }
         if envelope.agent_id.is_none()
             && serde_json::from_value::<EventPayload>(envelope.payload.clone())
                 .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
@@ -578,6 +588,7 @@ impl ObserveFold {
             pending_menus: self.projection.menus.values().cloned().collect(),
             subagents: self.projection.subagents.values().cloned().collect(),
             updated_at_ms: self.projection.updated_at_ms,
+            last_activity_ms: self.last_activity_ms,
             event_kinds: self.projection.event_kinds.iter().cloned().collect(),
             turns: self.turns,
             agent_metrics: self
@@ -586,6 +597,25 @@ impl ObserveFold {
             last_model: self.metrics.active_model().map(str::to_owned),
         }
     }
+}
+
+/// Attention is derived only from committed facts a human would reasonably
+/// return to: any visible assistant/item lifecycle, a menu/parked-for-human
+/// transition, or a completed turn. UserMessage input echoes, config facts
+/// (including `session_seen` itself), usage, graph telemetry, and all other
+/// bookkeeping are deliberately excluded so telemetry cannot create an
+/// unseen dot.
+fn is_meaningful_activity(envelope: &RawEnvelope) -> bool {
+    matches!(
+        serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+        Ok(EventPayload::Item(_))
+            | Ok(EventPayload::MenuOpened(_))
+            | Ok(EventPayload::RunState(
+                RunState::PermissionRequired { .. }
+                    | RunState::InputRequired { .. }
+                    | RunState::Done,
+            ))
+    )
 }
 
 impl ObserveFoldSnapshot {
@@ -2378,6 +2408,35 @@ impl HubConnection {
                     );
                 }
                 self.session_rename(request_id, command_id, session_id, worker_generation, title)
+                    .await
+            }
+            RequestBody::SessionSeen {
+                command_id,
+                session_id,
+                worker_generation,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "session seen requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_seen(request_id, command_id, session_id, worker_generation)
                     .await
             }
             RequestBody::GraphPin {
@@ -4553,6 +4612,82 @@ impl HubConnection {
                 title: renamed.title,
                 renamed_seq: renamed.renamed_seq,
                 worker_generation: renamed.worker_generation,
+            },
+        })
+    }
+
+    /// `session.seen` uses rename's receipt-first mutation shape. The store
+    /// serializes the acknowledgement with every session write and chooses
+    /// the maximum durable timestamp, so this handler never trusts wall
+    /// clock order for monotonicity.
+    async fn session_seen(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session seen needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode session-seen coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .session_seen_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(seen)) => return self.respond_session_seen(request_id, seen),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        let command = SessionSeenCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            event_id: EventId::new(random_id("session-seen")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let seen = match self.hub.mark_session_seen(command).await {
+            Ok(SessionSeenOutcome::Committed { seen, .. })
+            | Ok(SessionSeenOutcome::IdempotentReplay { seen }) => seen,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_session_seen(request_id, seen)
+    }
+
+    fn respond_session_seen(
+        &self,
+        request_id: RequestId,
+        seen: SeenSession,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionSeen {
+                session_id: seen.session_id,
+                seen_at_ms: seen.seen_at_ms,
+                seen_seq: seen.seen_seq,
+                worker_generation: seen.worker_generation,
             },
         })
     }
@@ -7796,21 +7931,24 @@ pub(crate) async fn session_summaries(
         // cached fold lands on that exact seal. A commit during either read
         // forces a retry, preventing OLD metadata from being published with
         // a NEW head that the watcher would then consider fully delivered.
-        let (metadata, snapshot) = loop {
+        let (metadata, seen_at_ms, snapshot) = loop {
             let sealed_head = hub.inner.store.latest_seq(session_id).await?;
             let metadata = hub.inner.store.session_metadata(session_id).await?;
+            let seen_at_ms = hub.inner.store.session_seen_at(session_id).await?;
             let initial_model = metadata
                 .as_ref()
                 .map_or("", |metadata| metadata.model.as_str());
             let snapshot = cached_observe_snapshot(hub, session_id, initial_model).await?;
             if snapshot.head_seq == sealed_head {
-                break (metadata, snapshot);
+                break (metadata, seen_at_ms, snapshot);
             }
         };
         let head_seq = snapshot.head_seq;
         let turns = snapshot.turns;
         let footprint = snapshot.footprint;
         let run_state = snapshot.run_state;
+        let last_activity_ms = snapshot.last_activity_ms;
+        let waiting_why = waiting_why(run_state, &snapshot.pending_menus);
         let (footprint_tokens, footprint_truth) =
             summary_footprint_fields(turns, footprint.as_ref());
         let agent_metrics = snapshot.agent_metrics;
@@ -7845,6 +7983,9 @@ pub(crate) async fn session_summaries(
             head_seq,
             worker_generation: hub.inner.store.worker_generation(),
             run_state: Some(run_state),
+            seen_at_ms,
+            last_activity_ms,
+            waiting_why,
             workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
             metadata,
             last_model,
@@ -7862,6 +8003,45 @@ pub(crate) async fn session_summaries(
         });
     }
     Ok(sessions)
+}
+
+fn waiting_why(
+    run_state: haider_rpc::ObserveRunStateWire,
+    pending_menus: &[haider_rpc::ObserveMenuWire],
+) -> Option<haider_rpc::WaitingWhyWire> {
+    use haider_rpc::{WaitingWhyKindWire, WaitingWhyWire};
+
+    let menu_for = |predicate: fn(&str) -> bool| {
+        pending_menus
+            .iter()
+            .find(|menu| predicate(&menu.kind))
+            .or_else(|| pending_menus.first())
+    };
+    match run_state {
+        haider_rpc::ObserveRunStateWire::ParkedPermission => {
+            let menu = menu_for(|kind| kind == "permission");
+            Some(WaitingWhyWire {
+                kind: WaitingWhyKindWire::Permission,
+                pending_menu_id: menu.and_then(|menu| menu.menu_id.clone()),
+            })
+        }
+        haider_rpc::ObserveRunStateWire::ParkedInput => {
+            let menu = menu_for(|_| true);
+            let kind = menu.map_or(WaitingWhyKindWire::Question, |menu| {
+                matches!(
+                    menu.kind.as_str(),
+                    "graph_human_confirm" | "graph_abandon_confirm" | "trust_hook" | "update"
+                )
+                .then_some(WaitingWhyKindWire::Approval)
+                .unwrap_or(WaitingWhyKindWire::Question)
+            });
+            Some(WaitingWhyWire {
+                kind,
+                pending_menu_id: menu.and_then(|menu| menu.menu_id.clone()),
+            })
+        }
+        _ => None,
+    }
 }
 
 const ROSTER_DELTA_CHUNK_SIZE: usize = 64;
@@ -7997,6 +8177,9 @@ mod roster_wave_tests {
             kind: None,
             agent_type: None,
             run_state: None,
+            seen_at_ms: None,
+            last_activity_ms: None,
+            waiting_why: None,
             effort: None,
             fast: None,
             account_alias: None,

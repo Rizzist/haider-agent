@@ -465,12 +465,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 16);
+        assert_eq!(must(store.schema_version()), 17);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 16);
+    assert_eq!(must(reopened.schema_version()), 17);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -635,5 +635,73 @@ fn read_page_ends_early_on_byte_budget_and_always_makes_progress() {
             .collect::<Vec<_>>(),
         [1],
         "a single envelope larger than the budget is still returned"
+    );
+}
+
+/// v0.0.936 attention state: `seen_at_ms` is monotone under ANY candidate —
+/// the SQL CASE keeps the greater durable value, so a wall-clock regression
+/// can never resurrect an unseen dot — and a replayed command id returns the
+/// exact original receipt without moving the timestamp.
+///
+/// MUTATION CHECK (executed): replace the CASE with a plain overwrite
+/// (`SET seen_at_ms = ?2`) and the future-poked value regresses — the
+/// monotone assertion fails.
+#[test]
+fn session_seen_is_monotone_and_replays_the_original_receipt() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("session-seen-law");
+    let mut batch = [envelope(
+        &session,
+        "seen-law-seed",
+        json!({"type": "user_message", "text": "seed"}),
+    )];
+    must(store.append(&mut batch));
+
+    let command = haider_store::SessionSeenCommand {
+        command_id: "seen-cmd-1".into(),
+        request_digest: "seen-digest-1".into(),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: store.worker_generation(),
+        event_id: EventId::new("seen-evt-1"),
+        device_id: DeviceId::new("device-test"),
+    };
+    let first = match must(store.mark_session_seen(&command)) {
+        haider_store::SessionSeenOutcome::Committed { seen, .. } => seen,
+        other => panic!("expected committed, got {other:?}"),
+    };
+    assert!(first.seen_at_ms > 0);
+
+    let replay = match must(store.mark_session_seen(&command)) {
+        haider_store::SessionSeenOutcome::IdempotentReplay { seen } => seen,
+        other => panic!("expected idempotent replay, got {other:?}"),
+    };
+    assert_eq!(
+        replay, first,
+        "replay must return the exact original receipt"
+    );
+
+    // Poke the durable value into the future; a later mark must PRESERVE the
+    // greater timestamp (the SQL CASE is the monotonicity proof).
+    let future = first.seen_at_ms + 3_600_000;
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute(
+        "UPDATE sessions SET seen_at_ms = ?2 WHERE id = ?1",
+        params![session.as_str(), i64::try_from(future).expect("fits i64")],
+    ));
+    let second_command = haider_store::SessionSeenCommand {
+        command_id: "seen-cmd-2".into(),
+        request_digest: "seen-digest-2".into(),
+        event_id: EventId::new("seen-evt-2"),
+        ..command.clone()
+    };
+    let second = match must(store.mark_session_seen(&second_command)) {
+        haider_store::SessionSeenOutcome::Committed { seen, .. } => seen,
+        other => panic!("expected committed, got {other:?}"),
+    };
+    assert_eq!(
+        second.seen_at_ms, future,
+        "monotone: the greater durable value is preserved over a smaller now"
     );
 }

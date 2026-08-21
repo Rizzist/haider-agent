@@ -39,14 +39,15 @@ pub use event_store::{
     MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, OpenedTodoGraph,
     PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, PinnedGraph, ProcessSignalCommand,
     ProcessSignalOutcome, ProfileLease, RecordedGraphEvidence, RecordedProcessSignal,
-    RenamedSession, RunRetryCommand, RunRetryOutcome, SUBAGENT_LIVE_LIMIT, SelectedAgentType,
-    SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
-    SessionRenameCommand, SessionRenameOutcome, SessionSelectAgentTypeCommand,
-    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    RenamedSession, RunRetryCommand, RunRetryOutcome, SUBAGENT_LIVE_LIMIT, SeenSession,
+    SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
+    SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
+    SessionSeenOutcome, SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 

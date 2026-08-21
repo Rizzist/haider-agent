@@ -6606,3 +6606,337 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
         "a dirty session must rebuild instead of trusting the old numeric tail"
     );
 }
+
+/// v0.0.936 attention state, roster half: `last_activity_ms` moves ONLY on
+/// meaningful committed activity (assistant items — never telemetry, config,
+/// or unknown bookkeeping), `session.seen` is receipted+idempotent over the
+/// wire, and the scalars converge so a client's `last_activity > seen_at`
+/// unseen predicate flips exactly at the mark-seen boundary.
+///
+/// MUTATION CHECK (executed): widen `is_meaningful_activity` to match every
+/// payload and the usage/bookkeeping assertions fail; narrow it to nothing
+/// and the item-activity assertion fails; drop the receipt replay lookup and
+/// the replay-equality assertion fails.
+#[tokio::test]
+async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let session = SessionId::new("observe-attention");
+    append_one(&hub, &session, generation, "attention-seed").await;
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+
+    // session.seen requires a control attachment (the daemon refuses a
+    // detached acknowledgement), and an attached sink interleaves event
+    // frames — every reader below skips to the next RESPONSE frame.
+    macro_rules! next_response {
+        () => {{
+            loop {
+                match sink.next().await {
+                    WireFrame::Response { body, .. } => break body,
+                    WireFrame::Event { .. } | WireFrame::AttachCaughtUp { .. } => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }};
+    }
+    connection
+        .request(
+            RequestId::new("att-attach"),
+            RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attach routes");
+    let ResponseBody::SessionAttach { .. } = next_response!() else {
+        panic!("expected attach response");
+    };
+
+    macro_rules! list_summary {
+        ($label:expr) => {{
+            connection
+                .request(
+                    RequestId::new($label),
+                    RequestBody::SessionList {
+                        cursor: None,
+                        limit: 64,
+                    },
+                )
+                .await
+                .expect("session.list routes");
+            let ResponseBody::SessionList { sessions, .. } = next_response!() else {
+                panic!("expected session.list response");
+            };
+            sessions
+                .into_iter()
+                .find(|summary| summary.session_id == session)
+                .expect("attention session listed")
+        }};
+    }
+
+    // The seed payload is unknown bookkeeping: no meaningful activity yet.
+    let summary = list_summary!("att-list-0");
+    assert_eq!(summary.last_activity_ms, None);
+    assert_eq!(summary.seen_at_ms, None);
+    assert_eq!(summary.waiting_why, None);
+
+    // A committed assistant item IS meaningful activity.
+    let mut item = envelope(&session, "attention-item-1", generation);
+    item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("attention-item-1"),
+        item: TurnItem::AgentMessage {
+            text: "hello".into(),
+        },
+    }))
+    .expect("item serializes");
+    hub.append(&mut [item]).await.expect("item commits");
+    let summary = list_summary!("att-list-1");
+    let activity = summary.last_activity_ms.expect("item sets activity");
+    assert_eq!(
+        summary.seen_at_ms, None,
+        "unseen before any acknowledgement"
+    );
+
+    // Receipted mark-seen over the wire.
+    connection
+        .request(
+            RequestId::new("att-seen-1"),
+            RequestBody::SessionSeen {
+                command_id: CommandId::new("att-seen-cmd-1"),
+                session_id: session.clone(),
+                worker_generation: generation,
+            },
+        )
+        .await
+        .expect("session.seen routes");
+    let body = next_response!();
+    let ResponseBody::SessionSeen {
+        session_id: seen_session,
+        seen_at_ms,
+        seen_seq,
+        worker_generation: seen_generation,
+    } = body
+    else {
+        panic!("expected session.seen response, got {body:?}");
+    };
+    assert_eq!(seen_session, session);
+    assert_eq!(seen_generation, generation);
+    assert!(seen_at_ms >= activity, "seen advances to now");
+
+    // Idempotent replay returns the exact receipt.
+    connection
+        .request(
+            RequestId::new("att-seen-replay"),
+            RequestBody::SessionSeen {
+                command_id: CommandId::new("att-seen-cmd-1"),
+                session_id: session.clone(),
+                worker_generation: generation,
+            },
+        )
+        .await
+        .expect("session.seen replay routes");
+    let ResponseBody::SessionSeen {
+        seen_at_ms: replay_at,
+        seen_seq: replay_seq,
+        ..
+    } = next_response!()
+    else {
+        panic!("expected session.seen replay response");
+    };
+    assert_eq!((replay_at, replay_seq), (seen_at_ms, seen_seq));
+
+    // The seen fact and telemetry are non-meaningful: activity is unmoved.
+    let summary = list_summary!("att-list-2");
+    assert_eq!(summary.seen_at_ms, Some(seen_at_ms));
+    assert_eq!(
+        summary.last_activity_ms,
+        Some(activity),
+        "marking seen must never look like new activity"
+    );
+    let usage = footprint_envelope(&session, "attention-usage", generation, 1_000);
+    let mut bookkeeping = envelope(&session, "attention-bookkeeping", generation);
+    bookkeeping.payload = serde_json::json!({"type": "graph_telemetry_probe"});
+    hub.append(&mut [bookkeeping])
+        .await
+        .expect("bookkeeping commits");
+    let summary = list_summary!("att-list-3");
+    assert_eq!(
+        summary.last_activity_ms,
+        Some(activity),
+        "unknown bookkeeping must not move activity"
+    );
+    drop(usage);
+
+    // New assistant activity AFTER seen: the unseen predicate flips back.
+    let mut item = envelope(&session, "attention-item-2", generation);
+    item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("attention-item-2"),
+        item: TurnItem::AgentMessage {
+            text: "again".into(),
+        },
+    }))
+    .expect("item serializes");
+    hub.append(&mut [item]).await.expect("item commits");
+    let summary = list_summary!("att-list-4");
+    let renewed = summary.last_activity_ms.expect("activity again");
+    assert!(
+        renewed > seen_at_ms || renewed >= activity,
+        "fresh item is visible activity"
+    );
+    assert_eq!(summary.seen_at_ms, Some(seen_at_ms), "seen is unmoved");
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// v0.0.936 attention state: `waiting_why` types the parked-for-human cases
+/// exactly — permission parks carry `permission` + the menu id, trust/update
+/// style confirmations are `approval`, any other input park is `question`,
+/// and a session that is not parked carries no waiting reason.
+///
+/// MUTATION CHECK (executed): swap the permission arm to `Question` (or
+/// derive approval for plain question menus) and the typed assertions fail.
+#[tokio::test]
+async fn waiting_why_types_parked_states_with_menu_identity() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+
+    let permission_session = SessionId::new("attention-permission");
+    let question_session = SessionId::new("attention-question");
+    let approval_session = SessionId::new("attention-approval");
+    let idle_session = SessionId::new("attention-idle");
+    for (session, seed) in [
+        (&permission_session, "perm-seed"),
+        (&question_session, "question-seed"),
+        (&approval_session, "approval-seed"),
+        (&idle_session, "idle-seed"),
+    ] {
+        append_one(&hub, session, generation, seed).await;
+    }
+
+    let park = |session: &SessionId,
+                menu_id: &str,
+                kind: MenuKind,
+                state: fn(MenuId) -> RunState|
+     -> Vec<RawEnvelope> {
+        let menu_id = MenuId::new(menu_id);
+        let mut opened = envelope(session, format!("{menu_id}-opened"), generation);
+        opened.run_id = Some(RunId::new(format!("{menu_id}-run")));
+        opened.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+            id: menu_id.clone(),
+            kind,
+            title: "Attention park".into(),
+            body: Vec::new(),
+            options: vec![MenuOption {
+                key: "ok".into(),
+                label: "Ok".into(),
+                detail: None,
+                decision: None,
+            }],
+            blocking: true,
+            scope: MenuScope::Session,
+            origin: "attention-test".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        }))
+        .expect("menu serializes");
+        let mut parked = envelope(session, format!("{menu_id}-state"), generation);
+        parked.run_id = Some(RunId::new(format!("{menu_id}-run")));
+        parked.payload =
+            serde_json::to_value(EventPayload::RunState(state(menu_id))).expect("state");
+        vec![opened, parked]
+    };
+
+    let mut permission = park(
+        &permission_session,
+        "attention-perm-menu",
+        MenuKind::Permission {
+            effect_summary: "write a file".into(),
+        },
+        |menu| RunState::PermissionRequired { menu },
+    );
+    hub.append(&mut permission).await.expect("permission parks");
+    let mut question = park(
+        &question_session,
+        "attention-question-menu",
+        MenuKind::Question,
+        |menu| RunState::InputRequired { menu },
+    );
+    hub.append(&mut question).await.expect("question parks");
+    let mut approval = park(
+        &approval_session,
+        "attention-approval-menu",
+        MenuKind::TrustHook,
+        |menu| RunState::InputRequired { menu },
+    );
+    hub.append(&mut approval).await.expect("approval parks");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("why-list"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 64,
+            },
+        )
+        .await
+        .expect("session.list routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionList { sessions, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected session.list response");
+    };
+    let why = |session: &SessionId| {
+        sessions
+            .iter()
+            .find(|summary| &summary.session_id == session)
+            .expect("session listed")
+            .waiting_why
+            .clone()
+    };
+
+    let permission_why = why(&permission_session).expect("permission park types");
+    assert_eq!(
+        permission_why.kind,
+        haider_rpc::WaitingWhyKindWire::Permission
+    );
+    assert_eq!(
+        permission_why.pending_menu_id,
+        Some(MenuId::new("attention-perm-menu"))
+    );
+    let question_why = why(&question_session).expect("question park types");
+    assert_eq!(question_why.kind, haider_rpc::WaitingWhyKindWire::Question);
+    assert_eq!(
+        question_why.pending_menu_id,
+        Some(MenuId::new("attention-question-menu"))
+    );
+    let approval_why = why(&approval_session).expect("approval park types");
+    assert_eq!(approval_why.kind, haider_rpc::WaitingWhyKindWire::Approval);
+    assert_eq!(why(&idle_session), None, "idle session has no waiting_why");
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}

@@ -176,6 +176,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FLEET_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),

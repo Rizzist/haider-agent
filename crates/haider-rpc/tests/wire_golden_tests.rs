@@ -629,6 +629,9 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         head_seq: 17,
         worker_generation: 15,
         run_state: None,
+        seen_at_ms: None,
+        last_activity_ms: None,
+        waiting_why: None,
         metadata: None,
         last_model: None,
         workspace_cwd: Some("/work/original".into()),
@@ -2038,6 +2041,9 @@ fn session_rename_frames_are_additive_and_golden() {
         head_seq: 9,
         worker_generation: 7,
         run_state: None,
+        seen_at_ms: None,
+        last_activity_ms: None,
+        waiting_why: None,
         metadata: None,
         last_model: None,
         workspace_cwd: None,
@@ -2607,6 +2613,9 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
         head_seq: 4,
         worker_generation: 2,
         run_state: None,
+        seen_at_ms: None,
+        last_activity_ms: None,
+        waiting_why: None,
         metadata: None,
         last_model: None,
         workspace_cwd: None,
@@ -2953,4 +2962,65 @@ fn surface_attachment_refs_and_structured_status_are_additive() {
     );
     assert_eq!(newer_status.state.as_deref(), Some("running"));
     assert_eq!(newer_status.detail.as_deref(), Some("applying patch 3/5"));
+}
+
+/// v0.0.936 attention state: the summary's `seen_at_ms`/`last_activity_ms`/
+/// `waiting_why` are ADDITIVE — absent from older daemons (None, and never
+/// serialized when None so pre-936 wire bytes are unchanged) — and
+/// `WaitingWhyWire` pins its exact serialized shape.
+///
+/// MUTATION CHECK (executed): drop a `skip_serializing_if` on the new
+/// summary fields and the absent-summary byte pin fails; rename a
+/// `WaitingWhyKindWire` variant and the shape golden fails.
+#[test]
+fn attention_fields_and_waiting_why_are_additive() {
+    use haider_rpc::{SessionSummary, WaitingWhyKindWire, WaitingWhyWire};
+
+    // Older daemon: absent fields decode to None.
+    let older: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "s1", "head_seq": 3, "worker_generation": 1,
+    }))
+    .expect("older summary decodes");
+    assert_eq!(older.seen_at_ms, None);
+    assert_eq!(older.last_activity_ms, None);
+    assert_eq!(older.waiting_why, None);
+
+    // None fields never serialize: pre-936 wire bytes are unchanged.
+    let encoded = serde_json::to_value(&older).expect("summary encodes");
+    for key in ["seen_at_ms", "last_activity_ms", "waiting_why"] {
+        assert!(
+            encoded.get(key).is_none(),
+            "absent attention field `{key}` must not serialize"
+        );
+    }
+
+    // Newer daemon: populated fields decode, exact wire shape pinned.
+    let newer: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "s1", "head_seq": 9, "worker_generation": 1,
+        "seen_at_ms": 1000, "last_activity_ms": 2000,
+        "waiting_why": {"kind": "permission", "pending_menu_id": "menu-7"},
+    }))
+    .expect("newer summary decodes");
+    assert_eq!(newer.seen_at_ms, Some(1000));
+    assert_eq!(newer.last_activity_ms, Some(2000));
+    let why = newer.waiting_why.expect("waiting_why decodes");
+    assert_eq!(why.kind, WaitingWhyKindWire::Permission);
+
+    // The typed shape golden: snake_case kind, optional menu id skipped.
+    assert_eq!(
+        serde_json::to_value(WaitingWhyWire {
+            kind: WaitingWhyKindWire::Approval,
+            pending_menu_id: None,
+        })
+        .expect("encodes"),
+        serde_json::json!({"kind": "approval"})
+    );
+    assert_eq!(
+        serde_json::to_value(WaitingWhyWire {
+            kind: WaitingWhyKindWire::Question,
+            pending_menu_id: Some(haider_protocol::ids::MenuId::new("menu-3")),
+        })
+        .expect("encodes"),
+        serde_json::json!({"kind": "question", "pending_menu_id": "menu-3"})
+    );
 }

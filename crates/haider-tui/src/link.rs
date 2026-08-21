@@ -1044,6 +1044,15 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             worker_generation,
             title: Some(title),
         },
+        LiveCommand::Seen {
+            command_id,
+            session,
+            worker_generation,
+        } => RequestBody::SessionSeen {
+            command_id,
+            session_id: session,
+            worker_generation,
+        },
         // G3: the receipted per-pair tuning selections.
         LiveCommand::SelectEffort {
             command_id,
@@ -1498,6 +1507,17 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 command_id: id,
                 session: session_id,
                 title,
+                worker_generation,
+            }]
+        }),
+        ResponseBody::SessionSeen {
+            session_id,
+            worker_generation,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::Seen {
+                command_id: id,
+                session: session_id,
                 worker_generation,
             }]
         }),

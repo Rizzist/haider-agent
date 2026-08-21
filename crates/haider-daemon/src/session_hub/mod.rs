@@ -110,14 +110,14 @@ use haider_core::{
     GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand,
     MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand,
     ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, RunRetryCommand,
-    RunRetryOutcome, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
+    RunRetryOutcome, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
     SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
-    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
+    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -1066,6 +1066,10 @@ enum ActorCommand {
     Rename {
         command: SessionRenameCommand,
         completed: oneshot::Sender<Result<SessionRenameOutcome, HaiderError>>,
+    },
+    Seen {
+        command: SessionSeenCommand,
+        completed: oneshot::Sender<Result<SessionSeenOutcome, HaiderError>>,
     },
     PinGraph {
         command: GraphPinCommand,
@@ -2133,6 +2137,43 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::Rename { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_seen_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SeenSession>, SessionHubError> {
+        self.inner
+            .store
+            .session_seen_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// An attention acknowledgement shares the serialized actor with every
+    /// session write: the `session_seen` fact advances the actor head and
+    /// wakes the common roster projection after its durable transaction.
+    pub(crate) async fn mark_session_seen(
+        &self,
+        command: SessionSeenCommand,
+    ) -> Result<SessionSeenOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::Seen { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

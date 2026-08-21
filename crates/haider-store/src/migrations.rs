@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 16;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 17;
 
 struct Migration {
     version: u32,
@@ -327,6 +327,13 @@ const MIGRATIONS: &[Migration] = &[
 
             UPDATE events SET payload_kind = 'item_legacy'
             WHERE payload_kind = 'item';
+        ",
+    },
+    Migration {
+        version: 17,
+        sql: "
+            ALTER TABLE sessions ADD COLUMN seen_at_ms INTEGER
+                CHECK (seen_at_ms IS NULL OR seen_at_ms >= 0);
         ",
     },
 ];
