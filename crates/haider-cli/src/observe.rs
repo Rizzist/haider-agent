@@ -120,6 +120,15 @@ pub(crate) struct SessionSummaryView {
     pub subagent_count: usize,
     pub updated_at: u64,
     pub parked_since: Option<u64>,
+    /// Additive roster scalars merged from `session.list` (v0.0.936): the
+    /// digest path predates them, so they are optional and omitted when the
+    /// daemon or the merge has nothing to say.
+    pub effort: Option<String>,
+    pub fast: Option<bool>,
+    pub agent_type: Option<String>,
+    pub seen_at_ms: Option<u64>,
+    pub last_activity_ms: Option<u64>,
+    pub waiting_why: Option<haider_rpc::WaitingWhyWire>,
 }
 
 pub(crate) struct SessionDepthView {
@@ -223,6 +232,24 @@ impl ObserveJson for SessionSummaryView {
         });
         if let Some(parked_since) = self.parked_since {
             object["parked_since"] = json!(parked_since);
+        }
+        if let Some(effort) = &self.effort {
+            object["effort"] = json!(effort);
+        }
+        if let Some(fast) = self.fast {
+            object["fast"] = json!(fast);
+        }
+        if let Some(agent_type) = &self.agent_type {
+            object["agent_type"] = json!(agent_type);
+        }
+        if let Some(seen_at_ms) = self.seen_at_ms {
+            object["seen_at_ms"] = json!(seen_at_ms);
+        }
+        if let Some(last_activity_ms) = self.last_activity_ms {
+            object["last_activity_ms"] = json!(last_activity_ms);
+        }
+        if let Some(waiting_why) = &self.waiting_why {
+            object["waiting_why"] = serde_json::to_value(waiting_why).unwrap_or(Value::Null);
         }
         object
     }
@@ -506,17 +533,42 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
     } else {
         observer.sessions(0).await
     };
+    // Roster scalars are additive garnish: an error here must not fail the
+    // listing (an older daemon simply has none).
+    let observer_summaries = observer.session_summaries().await.ok();
     observer.close();
     let digests = match digests {
         Ok(digests) => digests,
         Err(error) => return observe_failure("sessions", &error),
+    };
+    // The digest path predates the roster scalars; one session.list call
+    // fetches them for every row (tolerating an older daemon by leaving the
+    // fields absent, exactly like the wire).
+    let roster: std::collections::HashMap<_, _> = match observer_summaries {
+        Some(summaries) => summaries
+            .into_iter()
+            .map(|summary| (summary.session_id.clone(), summary))
+            .collect(),
+        None => std::collections::HashMap::new(),
     };
     let sessions = digests
         .into_iter()
         .filter(|digest| {
             !options.recovery || digest.run_state == ObserveRunStateWire::EffectUnknown
         })
-        .map(summary_view)
+        .map(|digest| {
+            let scalars = roster.get(&digest.session_id);
+            let mut view = summary_view(digest);
+            if let Some(summary) = scalars {
+                view.effort = summary.effort.clone();
+                view.fast = summary.fast;
+                view.agent_type = summary.agent_type.clone();
+                view.seen_at_ms = summary.seen_at_ms;
+                view.last_activity_ms = summary.last_activity_ms;
+                view.waiting_why = summary.waiting_why.clone();
+            }
+            view
+        })
         .collect();
     let document = SessionsDocument {
         schema: OBSERVE_SCHEMA,
@@ -756,6 +808,12 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         .collect();
     SessionSummaryView {
         id: digest.session_id.as_str().to_owned(),
+        effort: None,
+        fast: None,
+        agent_type: None,
+        seen_at_ms: None,
+        last_activity_ms: None,
+        waiting_why: None,
         title: digest.title,
         run_state: run_state_name(digest.run_state),
         active_branch: digest
@@ -1142,5 +1200,75 @@ pub(crate) fn exit_code_for_observe_error(error: &ObserveError) -> u8 {
             EX_PROTOCOL
         }
         ObserveError::Rpc { .. } => EX_SOFTWARE,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod roster_scalar_tests {
+    use super::*;
+
+    fn view() -> SessionSummaryView {
+        SessionSummaryView {
+            id: "session-view".into(),
+            title: "t".into(),
+            run_state: "idle",
+            active_branch: "main".into(),
+            branches: vec!["main".into()],
+            provider: None,
+            model: None,
+            footprint: None,
+            subagent_count: 0,
+            updated_at: 7,
+            parked_since: None,
+            effort: None,
+            fast: None,
+            agent_type: None,
+            seen_at_ms: None,
+            last_activity_ms: None,
+            waiting_why: None,
+        }
+    }
+
+    /// v0.0.936 CLI riders: the roster scalars and attention fields ride
+    /// `sessions --json` rows ADDITIVELY — absent when the daemon (or the
+    /// merge) has nothing, present with their wire shapes when populated.
+    ///
+    /// MUTATION CHECK (executed): serialize a field unconditionally (or drop
+    /// one of the merge assignments) and the absent/present halves fail.
+    #[test]
+    fn roster_scalars_ride_sessions_json_rows_additively() {
+        let bare = view().json();
+        for key in [
+            "effort",
+            "fast",
+            "agent_type",
+            "seen_at_ms",
+            "last_activity_ms",
+            "waiting_why",
+        ] {
+            assert!(bare.get(key).is_none(), "absent `{key}` must not serialize");
+        }
+
+        let mut populated = view();
+        populated.effort = Some("high".into());
+        populated.fast = Some(false);
+        populated.agent_type = Some("@scout".into());
+        populated.seen_at_ms = Some(1_000);
+        populated.last_activity_ms = Some(2_000);
+        populated.waiting_why = Some(haider_rpc::WaitingWhyWire {
+            kind: haider_rpc::WaitingWhyKindWire::Permission,
+            pending_menu_id: None,
+        });
+        let json = populated.json();
+        assert_eq!(json["effort"], "high");
+        assert_eq!(json["fast"], false);
+        assert_eq!(json["agent_type"], "@scout");
+        assert_eq!(json["seen_at_ms"], 1_000);
+        assert_eq!(json["last_activity_ms"], 2_000);
+        assert_eq!(
+            json["waiting_why"],
+            serde_json::json!({"kind": "permission"})
+        );
     }
 }
