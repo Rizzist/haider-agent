@@ -3206,3 +3206,42 @@ fn oauth_start_carries_the_device_user_code_additively() {
     };
     assert_eq!(user_code, None);
 }
+
+/// v0.0.938 `account.list_watch` wire shapes: the request takes no fields,
+/// the response is a bare acceptance, and the `AccountsChanged` event carries
+/// ONLY the new revision — no descriptors, so the signal can never disagree
+/// with the `account.list` snapshot it announces.
+///
+/// MUTATION CHECK (executed): add descriptors to the event and this shape
+/// golden fails — the frame would then be a delta stream that can drift from
+/// the snapshot, which is the design this deliberately rejects.
+#[test]
+fn account_list_watch_is_a_signal_not_a_delta() {
+    use haider_rpc::{RequestBody, ResponseBody, WireFrame};
+
+    let request = RequestBody::AccountListWatch {};
+    assert_eq!(
+        serde_json::to_value(&request).expect("encodes"),
+        serde_json::json!({"method": "account.list_watch"}),
+        "the watch request carries no parameters"
+    );
+
+    let accepted = ResponseBody::AccountListWatch { accepted: true };
+    assert_eq!(
+        serde_json::to_value(&accepted).expect("encodes"),
+        serde_json::json!({"method": "account.list_watch", "accepted": true})
+    );
+
+    let event = WireFrame::AccountsChanged { revision: 42 };
+    let encoded = serde_json::to_value(&event).expect("encodes");
+    assert_eq!(encoded["revision"], 42);
+    assert!(
+        encoded.get("descriptors").is_none(),
+        "the signal carries no registry payload: {encoded}"
+    );
+
+    // No round-trip assertion here on purpose: `WireFrame` derives only
+    // Debug/Clone/PartialEq and its canonical wire encoding goes through the
+    // borrowed `WireFrameRef`, so decoding the owned enum is not the real
+    // path and asserting on it would pin a fiction.
+}

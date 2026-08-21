@@ -250,6 +250,10 @@ pub const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 pub const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
+/// Daemon serves `account.list_watch` and pushes `AccountsChanged` on every
+/// published registry revision, so a client mirrors the account list without
+/// polling.
+pub const FEATURE_ACCOUNT_LIST_WATCH_V1: &str = "account_list_watch_v1";
 /// Daemon implements provider management reads.
 pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 /// Daemon implements durable `provider.configure`.
@@ -2022,6 +2026,12 @@ pub enum RequestBody {
         model: String,
         expected_revision: u64,
     },
+    /// Watch for account-registry changes (View). The daemon answers
+    /// `accepted`, then pushes an `AccountsChanged` event carrying the new
+    /// revision whenever the management snapshot publishes — a change SIGNAL,
+    /// not a delta stream: re-read `account.list` on notice.
+    #[serde(rename = "account.list_watch")]
+    AccountListWatch {},
     /// Lists credential descriptors (View); never secrets.
     #[serde(rename = "account.list")]
     AccountList {
@@ -2513,6 +2523,8 @@ pub enum ResponseBody {
         provider: ProviderSummaryWire,
         revision: u64,
     },
+    #[serde(rename = "account.list_watch")]
+    AccountListWatch { accepted: bool },
     /// Credential descriptors (never secrets).
     #[serde(rename = "account.list")]
     AccountList {
@@ -2886,6 +2898,10 @@ pub enum WireFrame {
     /// v1 deliberately does not report removed sessions. Clients that need
     /// deletion reconciliation must occasionally issue `session.list`.
     SessionRosterDelta { summaries: Vec<SessionSummary> },
+    /// The account registry changed; `revision` is the newly published one.
+    /// Carries no descriptors on purpose — a watcher re-reads `account.list`,
+    /// so this frame can never disagree with the snapshot it announces.
+    AccountsChanged { revision: u64 },
     /// Complete latest volatile surface snapshot after one or more accepted
     /// changes. `None` means the corresponding surface is cleared.
     SessionSurfaceDelta {
@@ -2989,6 +3005,9 @@ enum WireFrameRef<'a> {
     },
     SessionRosterDelta {
         summaries: &'a [SessionSummary],
+    },
+    AccountsChanged {
+        revision: u64,
     },
     SessionSurfaceDelta {
         session_id: &'a SessionId,
@@ -3171,6 +3190,9 @@ impl Serialize for WireFrame {
             Self::SessionRosterDelta { summaries } => {
                 WireFrameRef::SessionRosterDelta { summaries }
             }
+            Self::AccountsChanged { revision } => WireFrameRef::AccountsChanged {
+                revision: *revision,
+            },
             Self::SessionSurfaceDelta {
                 session_id,
                 input,

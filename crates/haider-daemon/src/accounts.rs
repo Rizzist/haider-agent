@@ -758,6 +758,13 @@ pub(crate) type AccountsSnapshot = Arc<StdMutex<Vec<CredentialDescriptor>>>;
 #[derive(Clone)]
 pub(crate) struct ManagementSnapshot {
     inner: Arc<StdMutex<ManagementView>>,
+    /// Latest published revision, for watchers. A change SIGNAL rather than a
+    /// delta stream: the management view is small and already revision
+    /// stamped, so a watcher re-reads `account.list` on notice instead of the
+    /// daemon duplicating the snapshot onto the wire — which also sidesteps
+    /// the removal-reconciliation problem that forces roster watchers to
+    /// occasionally re-list.
+    changes: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
@@ -779,7 +786,15 @@ impl ManagementSnapshot {
                 descriptors,
                 providers,
             })),
+            changes: watch::Sender::new(revision),
         }
+    }
+
+    /// Observe published revisions. The current value is the revision at
+    /// subscription time, so a watcher that races a mutation sees it as a
+    /// change rather than missing it.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     pub(crate) fn read(&self) -> Option<ManagementView> {
@@ -791,6 +806,7 @@ impl ManagementSnapshot {
             view.revision = revision;
             view.descriptors = descriptors;
         }
+        self.changes.send_replace(revision);
     }
 
     fn publish(
@@ -806,6 +822,7 @@ impl ManagementSnapshot {
                 providers,
             };
         }
+        self.changes.send_replace(revision);
     }
 }
 

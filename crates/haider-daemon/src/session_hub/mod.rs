@@ -1212,6 +1212,9 @@ pub struct HubConnection {
     /// connection clone, so aborting this handle tears the watch down
     /// immediately on close or drop.
     roster_watch: Mutex<Option<JoinHandle<()>>>,
+    /// Account-registry change watcher (v0.0.938), torn down with the
+    /// connection exactly like the roster watch.
+    accounts_watch: Mutex<Option<JoinHandle<()>>>,
     /// One ticker serves a bounded set of per-session volatile watches.
     surface_watch: Mutex<Option<SurfaceWatchState>>,
     closed: AtomicBool,
@@ -1220,6 +1223,11 @@ pub struct HubConnection {
 impl Drop for HubConnection {
     fn drop(&mut self) {
         if let Ok(watch) = self.roster_watch.get_mut()
+            && let Some(task) = watch.take()
+        {
+            task.abort();
+        }
+        if let Ok(watch) = self.accounts_watch.get_mut()
             && let Some(task) = watch.take()
         {
             task.abort();
@@ -1938,6 +1946,7 @@ impl SessionHub {
             transport,
             stages: Mutex::new(crate::accounts::StagedSecrets::default()),
             roster_watch: Mutex::new(None),
+            accounts_watch: Mutex::new(None),
             surface_watch: Mutex::new(None),
             closed: AtomicBool::new(false),
         })

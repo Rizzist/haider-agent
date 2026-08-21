@@ -1691,6 +1691,18 @@ impl HubConnection {
                 }
                 self.session_list(request_id, cursor, limit).await
             }
+            RequestBody::AccountListWatch {} => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_list_watch(request_id)
+            }
             RequestBody::SessionListWatch {} => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -6729,6 +6741,48 @@ impl HubConnection {
                 next_cursor,
             },
         })
+    }
+
+    /// `account.list_watch`: a change SIGNAL, not a delta stream. The
+    /// management view is small and already revision-stamped, so a watcher
+    /// re-reads `account.list` on notice — which also means this frame can
+    /// never disagree with the snapshot it announces, and removals need no
+    /// special reconciliation.
+    fn account_list_watch(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let mut watch = lock(&self.accounts_watch)?;
+        let accepted = watch.as_ref().is_none_or(JoinHandle::is_finished);
+        // Subscribe BEFORE acknowledging so a publication racing registration
+        // is observed as a change rather than missed.
+        let receiver = match self.hub.accounts()? {
+            Some(facade) => Some(facade.management.subscribe()),
+            None => None,
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::AccountListWatch {
+                accepted: accepted && receiver.is_some(),
+            },
+        })?;
+        let (Some(mut receiver), true) = (receiver, accepted) else {
+            return Ok(());
+        };
+
+        let sink = Arc::clone(&self.sink);
+        *watch = Some(tokio::spawn(async move {
+            // `changed()` resolves once per publication; the revision read
+            // afterwards is the latest, so a burst collapses into one frame
+            // carrying the newest revision rather than a queue of stale ones.
+            while receiver.changed().await.is_ok() {
+                let revision = *receiver.borrow_and_update();
+                if sink
+                    .try_send(WireFrame::AccountsChanged { revision })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+        Ok(())
     }
 
     fn session_list_watch(&self, request_id: RequestId) -> Result<(), SessionHubError> {

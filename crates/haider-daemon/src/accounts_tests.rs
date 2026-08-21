@@ -9936,3 +9936,50 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         "the latch is anthropic-scoped: another pair keeps its own native search"
     );
 }
+
+/// v0.0.938 `account.list_watch` is backed by a change SIGNAL on the
+/// management snapshot: every published revision notifies watchers, who then
+/// re-read `account.list`. Carrying no descriptors is the point — the signal
+/// can never disagree with the snapshot it announces, and removals need no
+/// special reconciliation the way a delta stream does.
+///
+/// MUTATION CHECK (executed): drop the `send_replace` from `publish_accounts`
+/// (or from `publish`) and the corresponding half below stops observing a
+/// change — a watcher would sit silent through a real mutation, which is
+/// exactly the polling-forever bug this replaces.
+#[tokio::test]
+async fn management_publications_notify_watchers_with_the_new_revision() {
+    let snapshot = ManagementSnapshot::new(7, Vec::new(), Vec::new());
+    let mut watcher = snapshot.subscribe();
+
+    // Subscribing sees the CURRENT revision, so a watcher that races a
+    // mutation observes it rather than missing it.
+    assert_eq!(*watcher.borrow_and_update(), 7);
+
+    // An accounts-only publication notifies with the new revision.
+    snapshot.publish_accounts(8, Vec::new());
+    watcher
+        .changed()
+        .await
+        .expect("accounts publication notifies");
+    assert_eq!(*watcher.borrow_and_update(), 8);
+
+    // A full publication (descriptors + providers) notifies too.
+    snapshot.publish(9, Vec::new(), Vec::new());
+    watcher.changed().await.expect("full publication notifies");
+    assert_eq!(*watcher.borrow_and_update(), 9);
+
+    // A burst collapses to the NEWEST revision rather than queueing stale
+    // frames: the watcher reads latest-wins after one wake.
+    snapshot.publish_accounts(10, Vec::new());
+    snapshot.publish_accounts(11, Vec::new());
+    watcher.changed().await.expect("burst notifies");
+    assert_eq!(
+        *watcher.borrow_and_update(),
+        11,
+        "a burst collapses to the newest revision"
+    );
+
+    // The snapshot read agrees with the announced revision.
+    assert_eq!(snapshot.read().expect("view").revision, 11);
+}
