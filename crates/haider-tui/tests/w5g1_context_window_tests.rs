@@ -26,6 +26,7 @@ fn oauth_descriptor(provider: &str, alias: &str) -> CredentialDescriptor {
         identity: "owner@example.test".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }
 

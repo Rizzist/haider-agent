@@ -1700,6 +1700,7 @@ impl DemoDriver {
                     identity: row.identity,
                     status: row.status,
                     active: true,
+                    label: None,
                 };
                 let revision = model.accounts.revision.map_or(1, |current| current + 1);
                 model.apply_account_selected(&descriptor, revision);

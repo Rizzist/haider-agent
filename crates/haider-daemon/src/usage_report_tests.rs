@@ -40,6 +40,7 @@ fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> Credentia
         identity: format!("{alias}@example.invalid"),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }
 

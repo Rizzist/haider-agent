@@ -347,6 +347,7 @@ fn active_account(provider: &str) -> CredentialDescriptor {
         identity: "active@example.com".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }
 

@@ -1660,6 +1660,7 @@ pub fn golden_descriptor() -> CredentialDescriptor {
         identity: "work".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }
 
@@ -1672,5 +1673,6 @@ pub fn golden_oauth_descriptor() -> CredentialDescriptor {
         identity: "person@example.invalid".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }

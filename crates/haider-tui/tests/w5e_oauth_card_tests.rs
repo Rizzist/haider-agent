@@ -188,6 +188,7 @@ fn cancel_closes_and_late_replies_are_ghosts() {
         identity: "person@example.invalid".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let message_before = model.accounts.message.clone();
     model.oauth_add_completed(attempt, &descriptor);

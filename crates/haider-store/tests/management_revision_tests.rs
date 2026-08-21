@@ -14,6 +14,7 @@ fn descriptor(alias: &str, auth_method: AuthMethod) -> CredentialDescriptor {
         identity: "revision fixture".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }
 

@@ -69,6 +69,7 @@ fn descriptor(alias: &str, provider: &str, method: AuthMethod) -> CredentialDesc
         identity: "you@work.com · ChatGPT".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }
 

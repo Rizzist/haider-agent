@@ -1458,6 +1458,7 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
         identity: bundle.identity.display_identity.clone(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let vault = Arc::new(MemoryVault::new());
     vault
@@ -1547,6 +1548,7 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
         identity: "fake-pkce-person@example.invalid".to_owned(),
         status: CredentialStatus::Ok,
         active: false,
+        label: None,
     };
     let now = now_ms().expect("clock");
     let pkce_bundle = OAuthTokenBundleV1::new(
@@ -3089,6 +3091,7 @@ fn oauth_descriptor_for_test() -> CredentialDescriptor {
         identity: "person@example.invalid".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     }
 }
 
@@ -5235,6 +5238,7 @@ async fn auth_aware_broker_keeps_api_keys_raw_and_never_treats_bundle_as_bearer(
         identity: "api fixture".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     vault
         .put(&descriptor.alias, b"API_KEY_BROKER_SENTINEL_20ac")
@@ -5408,6 +5412,7 @@ async fn late_refresh_failure_after_remove_readd_cannot_expire_the_replacement()
         identity: "replacement identity".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     *snapshot.lock().expect("snapshot") = vec![replacement.clone()];
     vault

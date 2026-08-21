@@ -374,6 +374,7 @@ fn a_selected_api_key_account_triggers_model_discovery() {
         identity: "sk-… probe".to_owned(),
         status: haider_protocol::credential::CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let pass = live_pass(
         &mut driver,

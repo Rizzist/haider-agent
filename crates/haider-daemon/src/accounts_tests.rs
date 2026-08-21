@@ -216,6 +216,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             identity: "anthropic fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
         CredentialDescriptor {
             alias: openai_alias.clone(),
@@ -225,6 +226,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             identity: "openai fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
         CredentialDescriptor {
             alias: gemini_alias.clone(),
@@ -234,6 +236,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             identity: "gemini fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
         CredentialDescriptor {
             alias: compatible_alias.clone(),
@@ -243,6 +246,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             identity: "compatible fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
     ]));
     let factory = AccountsProviderFactory::new(
@@ -404,6 +408,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         identity: "custom fixture".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let summary = ProviderSummaryWire {
         provider: provider.to_owned(),
@@ -576,6 +581,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         identity: "promotion fixture".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let vault = Arc::new(MemoryVault::default());
     vault.put(&alias, b"promotion-secret").expect("seed key");
@@ -718,6 +724,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         identity: "stored ollama key".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
     let management = ManagementSnapshot::new(0, vec![descriptor], vec![summary]);
@@ -936,6 +943,7 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         identity: "person@example.invalid".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
@@ -1182,6 +1190,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         identity: "wedged fixture".into(),
         status: CredentialStatus::Ok,
         active,
+        label: None,
     };
     let descriptors = vec![
         descriptor(primary_alias.clone(), true),
@@ -1274,6 +1283,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             identity: "fallback current".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
         CredentialDescriptor {
             alias: target.clone(),
@@ -1283,6 +1293,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             identity: "fallback target".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
     ];
     let snapshot = Arc::new(StdMutex::new(descriptors));
@@ -1421,6 +1432,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             identity: "limited fixture".into(),
             status: CredentialStatus::Limited { until_ms: u64::MAX },
             active: true,
+            label: None,
         })
         .expect("limited descriptor");
     accounts
@@ -1432,6 +1444,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             identity: "backup fixture".into(),
             status: CredentialStatus::Ok,
             active: false,
+            label: None,
         })
         .expect("alternate descriptor");
     accounts
@@ -1443,6 +1456,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             identity: "refresh failed fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         })
         .expect("refresh-failed descriptor");
     accounts
@@ -1454,6 +1468,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             identity: "refresh backup fixture".into(),
             status: CredentialStatus::Ok,
             active: false,
+            label: None,
         })
         .expect("refresh backup descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
@@ -1584,6 +1599,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         identity: format!("{provider} fixture"),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let openai_descriptor = descriptor(openai_alias.clone(), OPENAI_OAUTH_PROVIDER_NAME);
     let anthropic_descriptor = descriptor(anthropic_alias.clone(), ANTHROPIC_OAUTH_PROVIDER_NAME);
@@ -2774,6 +2790,7 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
         identity: "work".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     store
         .finalize_login_receipt(
@@ -2970,6 +2987,7 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         identity: "healed".into(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     store
         .finalize_login_receipt(
@@ -3487,6 +3505,7 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
             identity: "other@example.invalid".into(),
             status: CredentialStatus::Ok,
             active: false,
+            label: None,
         })
         .expect("add other descriptor");
     accounts
@@ -3875,6 +3894,7 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         identity: bundle.identity.display_identity.clone(),
         status: CredentialStatus::Ok,
         active,
+        label: None,
     };
     let mut accounts = memory_accounts();
     accounts
@@ -4614,6 +4634,7 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
             identity: "custom endpoint key".to_owned(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         })
         .expect("custom descriptor");
     let vault = Arc::new(MemoryVault::new());
@@ -5064,6 +5085,7 @@ async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() 
             identity: "orphan fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         })
         .expect("descriptor");
     let vault = Arc::new(DeleteGateVault {
@@ -5533,6 +5555,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         identity: "custom refresh key".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let gemini_alias = CredentialAlias::new("gemini-refresh-key");
     let gemini_descriptor = CredentialDescriptor {
@@ -5543,6 +5566,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         identity: "Gemini refresh key".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let mut accounts = memory_accounts();
     accounts.add(descriptor).expect("custom descriptor");
@@ -5801,6 +5825,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         identity: "model refresh fixture".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
@@ -6748,6 +6773,7 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
         identity: "Claude Max subscription · independently imported".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let bundle = haider_accounts::OAuthTokenBundleV1::new(
         ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
@@ -7251,6 +7277,7 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         identity: "expired Claude subscription".to_owned(),
         status: CredentialStatus::Expired,
         active: true,
+        label: None,
     };
     accounts.add(expired.clone()).expect("seed expired account");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![expired]));
@@ -7329,6 +7356,7 @@ async fn oauth_import_repairs_an_expired_default_alias_in_place() {
         identity: "expired Claude subscription".to_owned(),
         status: CredentialStatus::Expired,
         active: true,
+        label: None,
     };
     accounts
         .add(descriptor)
@@ -8295,6 +8323,7 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
                 identity: "fixture".to_owned(),
                 status: CredentialStatus::Ok,
                 active,
+                label: None,
             })
             .expect("blocking descriptor");
     }
@@ -9208,6 +9237,7 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
             identity: format!("{provider} bearer"),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         };
         let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
         let management = ManagementSnapshot::new(0, vec![descriptor], vec![summary]);
@@ -9342,6 +9372,7 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         identity: "gcloud access token (auto-refresh)".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let refreshed = broker
         .refresh_after_auth_failure(&descriptor, None)
@@ -9383,6 +9414,7 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         identity: "pasted access token".to_owned(),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     let refused = broker
         .refresh_after_auth_failure(&plain, None)
@@ -9863,6 +9895,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             identity: "anthropic fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
         CredentialDescriptor {
             alias: openai_alias,
@@ -9872,6 +9905,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             identity: "openai fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
     ]));
     let builder = TuningRecordingBuilder::new();
@@ -10009,6 +10043,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         identity: format!("{alias} fixture"),
         status: CredentialStatus::Ok,
         active,
+        label: None,
     };
 
     let vault = Arc::new(MemoryVault::default());

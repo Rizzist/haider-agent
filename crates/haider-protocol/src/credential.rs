@@ -19,6 +19,13 @@ pub struct CredentialDescriptor {
     pub status: CredentialStatus,
     /// Exactly one credential is active per provider.
     pub active: bool,
+    /// Operator-chosen display name (v0.0.938). Purely cosmetic: the `alias`
+    /// remains the identity every door addresses, so renaming for display can
+    /// never break a reference, a receipt, or a removal-in-flight. Absent
+    /// until someone sets one — surfaces fall back to `identity`, then
+    /// `alias`. Free-form text, bounded and control-stripped by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

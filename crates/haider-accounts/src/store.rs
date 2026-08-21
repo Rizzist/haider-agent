@@ -252,6 +252,15 @@ impl<S: StoreLike> AccountStore<S> {
             ));
         }
         descriptor.active = previous.active;
+        // The operator's display label survives replacement (v0.0.938): OAuth
+        // rotation and re-login rebuild a descriptor from provider truth and
+        // carry no label, and silently discarding the chosen name on every
+        // re-authentication would be its own small betrayal. An incoming
+        // label wins when one is supplied — that is how the label door sets
+        // and clears it.
+        if descriptor.label.is_none() {
+            descriptor.label = previous.label.clone();
+        }
         let mut next = self.descriptors.clone();
         next[index] = descriptor;
         self.commit(next)

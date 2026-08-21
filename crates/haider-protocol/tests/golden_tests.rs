@@ -1200,6 +1200,7 @@ fn golden_credentials() {
             identity: "user@example.com".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
     );
     golden(
@@ -1214,6 +1215,7 @@ fn golden_credentials() {
                 reason: CredentialAttentionReason::KeychainLocked,
             },
             active: true,
+            label: None,
         },
     );
     golden(

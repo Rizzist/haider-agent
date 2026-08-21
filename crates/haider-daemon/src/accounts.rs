@@ -4677,6 +4677,7 @@ async fn handle_gcloud_import(
             identity: "gcloud access token (auto-refresh)".to_owned(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         })
     };
     if let Err(error) = result {
@@ -5670,6 +5671,7 @@ fn oauth_descriptor_for(
         identity: bundle.identity.display_identity.clone(),
         status: CredentialStatus::Ok,
         active,
+        label: None,
     }
 }
 
@@ -5771,6 +5773,7 @@ fn descriptor_for(
         // A committed login becomes the provider's active credential; the
         // store deselects the previous active in the same snapshot.
         active: true,
+        label: None,
     }
 }
 
@@ -6798,6 +6801,7 @@ impl AccountsProviderFactory {
             identity: "keyless local endpoint".to_owned(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         };
         let credential = keyless_placeholder_credential().ok()?;
         Some((
@@ -7985,6 +7989,7 @@ fn import_bedrock_env_bearer(
         identity: format!("{BEDROCK_ENV_BEARER_VAR} (env import)"),
         status: CredentialStatus::Ok,
         active: true,
+        label: None,
     };
     if accounts.add(descriptor).is_err() {
         // The descriptor store refused (never a duplicate — checked above);

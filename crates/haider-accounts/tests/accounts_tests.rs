@@ -39,6 +39,7 @@ fn descriptor(
         identity: format!("{alias}@example.test"),
         status,
         active,
+        label: None,
     }
 }
 

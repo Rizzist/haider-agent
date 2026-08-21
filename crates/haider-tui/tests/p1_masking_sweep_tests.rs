@@ -157,6 +157,7 @@ fn oauth_receipts_mask_the_identity_always() {
             identity: "person@example.invalid".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
     );
     let message = model.accounts.message.as_deref().expect("receipt named");
@@ -192,6 +193,7 @@ fn launcher_header_carries_the_alias_never_the_identity() {
             identity: "you@work.com · ChatGPT".into(),
             status: CredentialStatus::Ok,
             active: true,
+            label: None,
         },
         1,
     );
