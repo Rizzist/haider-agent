@@ -48,7 +48,7 @@ use haider_rpc::{
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
     ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
     ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, FleetAgentStateWire,
-    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary,
+    MenuInput, ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary,
     SurfaceInputPublishWire, WireFrame,
 };
 use std::collections::VecDeque;
@@ -7012,6 +7012,126 @@ async fn waiting_why_types_parked_states_with_menu_identity() {
         "needs_input keeps the precise kind"
     );
     assert_eq!(card(&idle_session), None, "idle session needs no input");
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// v0.0.937 answer-door parity: EVERY input-required kind is resolvable
+/// headlessly through `menu.answer` — update, trust-hook, and choice parks
+/// answer by option, and a secret park answers by VAULT REFERENCE (the raw
+/// secret never transits the wire). This is the law behind "full control
+/// from any surface, never a terminal".
+///
+/// MUTATION CHECK (executed): refuse non-recovery kinds in the answer path
+/// (kind-gate the resolution) and every leg fails; drop the secret-reference
+/// arm and the secret leg fails.
+#[tokio::test]
+async fn every_input_kind_is_answerable_headlessly_over_rpc() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let session = SessionId::new("answer-parity");
+    append_one(&hub, &session, generation, "parity-seed").await;
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("parity-attach"),
+            RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attach routes");
+    macro_rules! next_response {
+        () => {{
+            loop {
+                match sink.next().await {
+                    WireFrame::Response { body, .. } => break body,
+                    WireFrame::Event { .. } | WireFrame::AttachCaughtUp { .. } => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }};
+    }
+    let ResponseBody::SessionAttach { .. } = next_response!() else {
+        panic!("expected attach response");
+    };
+
+    let park = |kind: MenuKind, menu_id: &str, seq_hint: &str| {
+        let menu_id = MenuId::new(menu_id);
+        let mut opened = envelope(&session, format!("parity-{seq_hint}-opened"), generation);
+        opened.run_id = Some(RunId::new(format!("parity-{seq_hint}-run")));
+        opened.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+            id: menu_id.clone(),
+            kind,
+            title: format!("parity {seq_hint}"),
+            body: Vec::new(),
+            options: vec![MenuOption {
+                key: "ok".into(),
+                label: "Ok".into(),
+                detail: None,
+                decision: None,
+            }],
+            blocking: true,
+            scope: MenuScope::Session,
+            origin: "parity-test".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        }))
+        .expect("menu serializes");
+        (menu_id, opened)
+    };
+
+    let legs: Vec<(&str, MenuKind, Option<MenuInput>)> = vec![
+        ("update", MenuKind::Update, None),
+        ("trust-hook", MenuKind::TrustHook, None),
+        ("choice", MenuKind::Choice, None),
+        (
+            "secret",
+            MenuKind::Secret,
+            Some(MenuInput::SecretVaultReference {
+                vault_reference: "vault-ref-parity-1".into(),
+            }),
+        ),
+    ];
+    for (label, kind, input) in legs {
+        let (menu_id, mut opened) = park(kind, &format!("parity-{label}-menu"), label);
+        hub.append(&mut std::slice::from_mut(&mut opened))
+            .await
+            .expect("park commits");
+        let request_seq = opened.seq;
+        connection
+            .menu_answer(
+                Some(RequestId::new(format!("parity-{label}"))),
+                CommandId::new(format!("parity-{label}-command")),
+                session.clone(),
+                menu_id.clone(),
+                request_seq,
+                generation,
+                "ok".into(),
+                0,
+                input,
+            )
+            .await
+            .expect("answer routes");
+        let body = next_response!();
+        assert!(
+            matches!(body, ResponseBody::MenuAnswer { .. }),
+            "{label} park must resolve over RPC, got {body:?}"
+        );
+    }
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
