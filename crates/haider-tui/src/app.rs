@@ -5753,9 +5753,8 @@ impl AppModel {
                 }
                 KeyCode::Backspace => {
                     self.composer.backspace();
-                },
+                }
                 // W-flow authoring: describe it, the model makes it.
-
                 KeyCode::Up if self.loom_detail => {
                     self.loom_scroll = self.loom_scroll.min(ceiling).saturating_sub(1);
                 }

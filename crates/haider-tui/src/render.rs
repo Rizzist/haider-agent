@@ -4590,6 +4590,132 @@ fn needs_input_label(card: &haider_rpc::NeedsInputWire) -> &'static str {
     }
 }
 
+/// Lay a workflow's node graph out in dependency LAYERS and draw it, so the
+/// shape of a flow is visible at a glance instead of reconstructed from a
+/// flat list of `← after` clauses (owner 2026-08-22).
+///
+/// Layer(n) = 0 when a node has no dependencies, else 1 + max(layer(deps)).
+/// Nodes that share a layer run concurrently — which is exactly the fact a
+/// flat list hides. The walk is iteration-capped: template validation already
+/// rejects cycles, but a renderer must not hang on a malformed one.
+pub fn workflow_dag_lines(
+    template: &haider_protocol::graph::GraphTemplateSpec,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    use haider_protocol::graph::GraphNodeName;
+    use std::collections::HashMap;
+
+    let mut layer: HashMap<&str, usize> = HashMap::new();
+    let known: std::collections::HashSet<&str> = template
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect();
+    // Fixed-point relaxation, capped by node count: every pass can only
+    // raise a layer, and a valid DAG settles within `nodes.len()` passes.
+    for _ in 0..=template.nodes.len() {
+        let mut changed = false;
+        for node in &template.nodes {
+            let depth = node
+                .depends_on
+                .iter()
+                .map(GraphNodeName::as_str)
+                .filter(|dep| known.contains(dep))
+                .map(|dep| layer.get(dep).map_or(0, |value| value + 1))
+                .max()
+                .unwrap_or(0);
+            let entry = layer.entry(node.name.as_str()).or_insert(0);
+            if depth > *entry {
+                *entry = depth;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let depth = layer.values().copied().max().unwrap_or(0);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  DAG", theme.bright_style().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(
+                "  {} node{} · {} layer{}",
+                template.nodes.len(),
+                if template.nodes.len() == 1 { "" } else { "s" },
+                depth + 1,
+                if depth == 0 { "" } else { "s" },
+            ),
+            theme.dim_style(),
+        ),
+    ])];
+
+    for level in 0..=depth {
+        let mut here: Vec<&haider_protocol::graph::GraphNodeSpec> = template
+            .nodes
+            .iter()
+            .filter(|node| layer.get(node.name.as_str()).copied().unwrap_or(0) == level)
+            .collect();
+        here.sort_by_key(|node| node.name.as_str());
+        if here.is_empty() {
+            continue;
+        }
+        if level > 0 {
+            lines.push(Line::styled("      │", theme.faint_style()));
+        }
+        let concurrent = here.len() > 1;
+        for (index, node) in here.iter().enumerate() {
+            let stem = if level == 0 {
+                "   "
+            } else if concurrent && index + 1 < here.len() {
+                "  ├"
+            } else if concurrent {
+                "  └"
+            } else {
+                "  ▼"
+            };
+            let mut spans = vec![
+                Span::styled(format!("{stem} "), theme.faint_style()),
+                Span::styled("◆ ", theme.gold_style()),
+                Span::styled(
+                    node.name.as_str().to_owned(),
+                    theme.bright_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} · {}",
+                        crate::graph::gate_kind_label(&node.gate),
+                        crate::graph::executor_label(node.executor),
+                    ),
+                    theme.dim_style(),
+                ),
+            ];
+            if !node.depends_on.is_empty() {
+                spans.push(Span::styled(
+                    format!(
+                        "  ← {}",
+                        node.depends_on
+                            .iter()
+                            .map(GraphNodeName::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    ),
+                    theme.faint_style(),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        if concurrent {
+            lines.push(Line::styled(
+                "        concurrent — these run together",
+                theme.faint_style(),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
 fn render_tools(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![
         Line::styled("TOOLS — daemon inventory", theme.bright_style()),
@@ -5596,10 +5722,7 @@ fn render_loom(
         ]);
         let row_y = area.y.saturating_add(lines.len() as u16);
         if row_y < area.y.saturating_add(area.height) {
-            hits.push((
-                Rect::new(area.x, row_y, area.width, 1),
-                Hit::LoomNew,
-            ));
+            hits.push((Rect::new(area.x, row_y, area.width, 1), Hit::LoomNew));
         }
         lines.push(new_row);
         lines.push(Line::raw(""));
@@ -5755,6 +5878,7 @@ fn render_loom(
                 ),
             ]));
             lines.push(Line::raw(""));
+            lines.extend(workflow_dag_lines(&template, theme));
             lines.push(Line::styled("NODES", theme.gold_style()));
             for node in &template.nodes {
                 let mut spans = vec![
@@ -5818,6 +5942,7 @@ fn render_loom(
                 ),
             ]));
             lines.push(Line::raw(""));
+            lines.extend(workflow_dag_lines(&workflow.template, theme));
             lines.push(Line::styled("NODES", theme.gold_style()));
             for meta in &workflow.meta {
                 let mut spans = vec![Span::styled(
