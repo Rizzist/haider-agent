@@ -268,3 +268,66 @@ fn key_r_answers_the_paired_permission_menu() {
         Some("retry")
     );
 }
+
+/// v0.0.938: the grant card is TURN-SCOPED. It exists to enrich a blocking
+/// menu that parks the CURRENT turn ("grant it, then Retry — it resumes
+/// automatically"), so when that turn reaches a terminal state the card must
+/// go with it. Its only other exit is a matching `permission_grant_resolved`,
+/// which a CANCELLED turn never produces — so before this the card outlived
+/// its turn and sat over an idle session offering a Retry with nothing left
+/// to resume (owner-reported: cancelled the turn, card stayed).
+///
+/// MUTATION CHECK (executed): drop the terminal-state clear in
+/// `SessionProjection::apply`'s `RunState` arm and the cancelled assertion
+/// fails — the card survives into idle exactly as reported.
+#[test]
+fn a_cancelled_turn_takes_the_permission_card_with_it() {
+    use haider_protocol::state::RunState;
+
+    for terminal in [RunState::Cancelled, RunState::Done] {
+        let mut projection = SessionProjection::new();
+        let session = SessionId::new("perm-cancel");
+
+        // The turn parks on the OS-permission menu and the card enriches it.
+        let needed = PermissionEventPayload::PermissionGrantNeeded(card(
+            SystemPermission::ScreenRecording,
+            false,
+        ));
+        let env = raw(&session, 1, needed.to_payload_value().expect("serialize"));
+        assert!(route_permission_event(&mut projection, &env));
+        assert!(
+            projection.permission_card().is_some(),
+            "the card is present while the turn is parked"
+        );
+
+        // The turn ends without the grant ever being resolved.
+        projection.apply(&EventPayload::RunState(terminal.clone()));
+        assert!(
+            projection.permission_card().is_none(),
+            "{terminal:?} must take the card with it — no Retry over an idle session"
+        );
+    }
+}
+
+/// The card SURVIVES a non-terminal state change: parking, streaming and
+/// tool-running are all still the same turn, and clearing there would erase
+/// the card the moment anything else happened mid-park.
+#[test]
+fn a_live_turn_keeps_its_permission_card() {
+    use haider_protocol::state::RunState;
+
+    let mut projection = SessionProjection::new();
+    let session = SessionId::new("perm-live");
+    let needed = PermissionEventPayload::PermissionGrantNeeded(card(
+        SystemPermission::ScreenRecording,
+        false,
+    ));
+    let env = raw(&session, 1, needed.to_payload_value().expect("serialize"));
+    assert!(route_permission_event(&mut projection, &env));
+
+    projection.apply(&EventPayload::RunState(RunState::Streaming));
+    assert!(
+        projection.permission_card().is_some(),
+        "a live turn keeps its card"
+    );
+}

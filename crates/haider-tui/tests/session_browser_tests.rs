@@ -164,3 +164,61 @@ fn the_browser_is_live_only() {
         "the demo says so honestly instead of fabricating a roster"
     );
 }
+
+/// v0.0.938: the browser lists EVERY session on the machine, so it is long by
+/// construction and must be navigable beyond one keypress at a time —
+/// PageUp/PageDown, Home/End, and the wheel all move the selection, clamped
+/// at both ends.
+///
+/// MUTATION CHECK (executed): drop the `.min(last)` clamp on PageDown/End and
+/// the selection runs past the final row, leaving the browser rendering an
+/// empty window with nothing selected.
+#[test]
+fn the_browser_pages_scrolls_and_clamps() {
+    let mut model = live_model();
+    for index in 0..40_u64 {
+        seed(
+            &mut model,
+            summary(&format!("session-{index:02}"), Some(1), Some(index)),
+        );
+    }
+    model.enter_sessions();
+    let last = model.session_browser_rows().len() - 1;
+    assert_eq!(last, 39);
+
+    // PageDown moves a page and PageUp comes back.
+    model.handle(common::key(KeyCode::PageDown));
+    let paged = model.session_browser_sel;
+    assert!(paged > 1, "PageDown moves more than one row: {paged}");
+    model.handle(common::key(KeyCode::PageUp));
+    assert_eq!(model.session_browser_sel, 0, "PageUp returns to the top");
+
+    // End/Home reach both ends exactly.
+    model.handle(common::key(KeyCode::End));
+    assert_eq!(model.session_browser_sel, last, "End selects the final row");
+    model.handle(common::key(KeyCode::Home));
+    assert_eq!(model.session_browser_sel, 0);
+
+    // The wheel scrolls the selection too, and clamps at both ends.
+    model.handle_wheel(false);
+    assert!(
+        model.session_browser_sel > 0,
+        "wheel down moves the selection"
+    );
+    for _ in 0..100 {
+        model.handle_wheel(false);
+    }
+    assert_eq!(
+        model.session_browser_sel, last,
+        "wheel down clamps at the last row, never past it"
+    );
+    for _ in 0..100 {
+        model.handle_wheel(true);
+    }
+    assert_eq!(model.session_browser_sel, 0, "wheel up clamps at the top");
+
+    // PageDown from the last row stays put rather than overrunning.
+    model.handle(common::key(KeyCode::End));
+    model.handle(common::key(KeyCode::PageDown));
+    assert_eq!(model.session_browser_sel, last);
+}

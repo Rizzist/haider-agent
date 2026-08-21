@@ -9512,14 +9512,33 @@ impl AppModel {
 
     fn handle_sessions_key(&mut self, code: KeyCode) {
         let rows = self.session_browser_rows();
+        let last = rows.len().saturating_sub(1);
+        // One keypress-page. The render window is height-derived, so this is
+        // a fixed, predictable jump rather than a guess at the frame.
+        const PAGE: usize = 10;
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.session_browser_sel = self.session_browser_sel.saturating_sub(1);
                 self.dirty = true;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.session_browser_sel =
-                    (self.session_browser_sel + 1).min(rows.len().saturating_sub(1));
+                self.session_browser_sel = (self.session_browser_sel + 1).min(last);
+                self.dirty = true;
+            }
+            KeyCode::PageUp => {
+                self.session_browser_sel = self.session_browser_sel.saturating_sub(PAGE);
+                self.dirty = true;
+            }
+            KeyCode::PageDown => {
+                self.session_browser_sel = (self.session_browser_sel + PAGE).min(last);
+                self.dirty = true;
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.session_browser_sel = 0;
+                self.dirty = true;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.session_browser_sel = last;
                 self.dirty = true;
             }
             KeyCode::Enter => {
@@ -12757,6 +12776,19 @@ impl AppModel {
         // The login gate joins the help gate (TUI6.2c finding 7 —
         // consistency: nothing scrolls beneath a modal).
         if self.help_open || self.login.is_some() {
+            return;
+        }
+        // The all-sessions browser scrolls under the wheel: it is a long
+        // list by construction (every session on the machine), so the wheel
+        // is the expected gesture and paging by keyboard alone is not enough.
+        if self.screen == Screen::Sessions {
+            let last = self.session_browser_rows().len().saturating_sub(1);
+            self.session_browser_sel = if up {
+                self.session_browser_sel.saturating_sub(3)
+            } else {
+                (self.session_browser_sel + 3).min(last)
+            };
+            self.dirty = true;
             return;
         }
         // F2b: the providers roster scrolls under the wheel too.

@@ -419,6 +419,15 @@ impl SessionProjection {
                 if run.is_terminal() {
                     self.flush_pending_effect_failures();
                     self.effect_tool_owners.clear();
+                    // The OS-permission grant card is TURN-SCOPED: it exists
+                    // to enrich a blocking menu that parks the current turn
+                    // ("grant it, then Retry — it resumes automatically").
+                    // Its only other exit is a matching
+                    // `permission_grant_resolved`, which a CANCELLED turn
+                    // never produces — so without this the card outlived its
+                    // turn and sat over an idle session offering a Retry that
+                    // had nothing left to resume.
+                    self.permission_card = None;
                 }
                 // W-G: a genuine turn OPENING (idle/none → non-terminal) resets
                 // the streamed-output char tally so the throughput fallback
