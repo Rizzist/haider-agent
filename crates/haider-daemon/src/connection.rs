@@ -1748,6 +1748,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_NEEDS_INPUT_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
+        haider_rpc::FEATURE_ACCOUNT_LABEL_V1.to_owned(),
         FEATURE_SESSION_FLEET_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),

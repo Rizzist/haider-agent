@@ -254,6 +254,10 @@ pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 /// published registry revision, so a client mirrors the account list without
 /// polling.
 pub const FEATURE_ACCOUNT_LIST_WATCH_V1: &str = "account_list_watch_v1";
+/// Daemon serves `account.set_label` and carries `label` on credential
+/// descriptors, so a surface can show an operator-chosen name instead of an
+/// alias or a provider identity string.
+pub const FEATURE_ACCOUNT_LABEL_V1: &str = "account_label_v1";
 /// Daemon implements provider management reads.
 pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 /// Daemon implements durable `provider.configure`.
@@ -2026,6 +2030,16 @@ pub enum RequestBody {
         model: String,
         expected_revision: u64,
     },
+    /// Set or clear one account's operator-chosen display label (Control).
+    /// `label: null` clears it. Cosmetic only — the alias remains the
+    /// identity every other door addresses, so a rename can never break a
+    /// reference.
+    #[serde(rename = "account.set_label")]
+    AccountSetLabel {
+        alias: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Watch for account-registry changes (View). The daemon answers
     /// `accepted`, then pushes an `AccountsChanged` event carrying the new
     /// revision whenever the management snapshot publishes — a change SIGNAL,
@@ -2521,6 +2535,12 @@ pub enum ResponseBody {
     #[serde(rename = "account.set_default_model")]
     AccountSetDefaultModel {
         provider: ProviderSummaryWire,
+        revision: u64,
+    },
+    /// The credential after its label changed, plus the new revision.
+    #[serde(rename = "account.set_label")]
+    AccountSetLabel {
+        descriptor: haider_protocol::credential::CredentialDescriptor,
         revision: u64,
     },
     #[serde(rename = "account.list_watch")]

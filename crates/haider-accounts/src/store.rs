@@ -216,6 +216,31 @@ impl<S: StoreLike> AccountStore<S> {
         self.commit(next)
     }
 
+    /// Sets or clears one credential's operator-chosen display label.
+    ///
+    /// Distinct from [`Self::replace`] on purpose: `replace` rebuilds a
+    /// descriptor from provider truth (OAuth rotation, re-login) and
+    /// therefore PRESERVES an existing label when the incoming one is absent.
+    /// This door is the one place absence means "clear it", so the two
+    /// intents can never be confused.
+    pub fn set_label(
+        &mut self,
+        alias: &CredentialAlias,
+        label: Option<String>,
+    ) -> AccountsResult<CredentialDescriptor> {
+        let index = self
+            .descriptors
+            .iter()
+            .position(|existing| &existing.alias == alias)
+            .ok_or_else(|| missing_alias(alias))?;
+        let mut next = self.descriptors.clone();
+        next[index].label = label;
+        let updated = next[index].clone();
+        self.store.save(&next)?;
+        self.descriptors = next;
+        Ok(updated)
+    }
+
     /// Atomically replaces one descriptor without changing its active slot.
     ///
     /// OAuth token rotation uses this after its new bundle is durable. The

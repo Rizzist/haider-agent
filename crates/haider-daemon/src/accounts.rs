@@ -907,6 +907,18 @@ pub(crate) struct SetActiveJob {
     pub route: LoginRoute,
 }
 
+/// Set or clear one account's operator-chosen display label (v0.0.938).
+/// Display labels are bounded: long enough to be useful, short enough that
+/// no surface has to decide how to truncate someone's chosen name.
+pub(crate) const ACCOUNT_LABEL_MAX_CHARS: usize = 64;
+
+pub(crate) struct SetLabelJob {
+    pub alias: String,
+    /// `None` clears the label back to the provider identity.
+    pub label: Option<String>,
+    pub route: LoginRoute,
+}
+
 pub(crate) struct RemoveAccountJob {
     pub command_id: String,
     pub alias: String,
@@ -976,6 +988,7 @@ pub(crate) enum AccountCommand {
     },
     ImportDevice(Box<DeviceImportJob>),
     SetActive(Box<SetActiveJob>),
+    SetLabel(Box<SetLabelJob>),
     Remove(Box<RemoveAccountJob>),
     SetDefaultModel(Box<SetDefaultModelJob>),
     ConfigureProvider(Box<ProviderConfigureJob>),
@@ -1404,6 +1417,9 @@ async fn run_account_actor(
                     *job,
                 )
                 .await;
+            }
+            AccountCommand::SetLabel(job) => {
+                handle_set_label(&store, &mut accounts, &snapshot, management.as_ref(), *job).await;
             }
             AccountCommand::SetActive(job) => {
                 handle_set_active(
@@ -2467,6 +2483,91 @@ fn try_refresh_resolver_snapshot(
     })?;
     *view = accounts.list().to_vec();
     Ok(())
+}
+
+/// The display-label mutation. Deliberately NOT receipted, unlike its
+/// sibling account doors: a label carries no credential authority and is
+/// idempotent BY VALUE — replaying the same request produces the same
+/// descriptor — so a command receipt would add machinery without adding
+/// safety. Everything that changes what a turn spends (set_active, login,
+/// remove) stays receipted.
+///
+/// The write goes through `AccountStore::replace`, which holds the alias,
+/// provider, auth method and base URL immutable, so a rename can only ever
+/// change the cosmetic field. Publishing bumps the management revision,
+/// which is what notifies `account.list_watch` subscribers.
+async fn handle_set_label(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    job: SetLabelJob,
+) {
+    let alias = CredentialAlias::new(job.alias.trim());
+    let Some(existing) = accounts
+        .list()
+        .iter()
+        .find(|descriptor| descriptor.alias == alias)
+        .cloned()
+    else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!("no credential named `{alias}`"),
+                false,
+            ),
+        );
+        return;
+    };
+    // Bounded, control-stripped, and empty-means-clear: a label is display
+    // text and must never smuggle escapes into a terminal surface.
+    let label = job.label.and_then(|label| {
+        let cleaned: String = label
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(ACCOUNT_LABEL_MAX_CHARS)
+            .collect();
+        let trimmed = cleaned.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    });
+
+    drop(existing);
+    if let Err(error) = accounts.set_label(&alias, label) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let revision =
+        match publish_next_management_revision(store, snapshot, management, accounts).await {
+            Ok(revision) => revision,
+            Err(error) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
+        };
+    let Some(descriptor) = accounts
+        .list()
+        .iter()
+        .find(|descriptor| descriptor.alias == alias)
+        .cloned()
+    else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "credential disappeared while setting its label",
+                false,
+            ),
+        );
+        return;
+    };
+    respond(
+        &job.route,
+        ResponseBody::AccountSetLabel {
+            descriptor,
+            revision,
+        },
+    );
 }
 
 fn publish_management_snapshot(

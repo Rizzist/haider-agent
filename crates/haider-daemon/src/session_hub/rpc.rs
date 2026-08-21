@@ -2950,6 +2950,18 @@ impl HubConnection {
                     oauth_reference,
                 )
             }
+            RequestBody::AccountSetLabel { alias, label } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_set_label(request_id, alias, label)
+            }
             RequestBody::AccountSetActive {
                 command_id,
                 alias,
@@ -3950,6 +3962,38 @@ impl HubConnection {
             crate::accounts::AccountCommand::SetActive(Box::new(crate::accounts::SetActiveJob {
                 command_id: command_id.0,
                 alias,
+                route: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            })),
+        )
+    }
+
+    /// `account.set_label` — cosmetic rename. No command id and no receipt:
+    /// the mutation is idempotent by value and carries no credential
+    /// authority, so replaying it produces the same descriptor. Everything
+    /// that changes what a turn spends stays receipted.
+    fn account_set_label(
+        &self,
+        request_id: RequestId,
+        alias: String,
+        label: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        if alias.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "account.set_label requires an alias",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SetLabel(Box::new(crate::accounts::SetLabelJob {
+                alias,
+                label,
                 route: crate::accounts::LoginRoute {
                     request_id,
                     sink: Arc::clone(&self.sink),

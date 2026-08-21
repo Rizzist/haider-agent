@@ -577,3 +577,62 @@ impl RotationCallback for FixedRotation {
         self.decision.clone()
     }
 }
+
+/// v0.0.938 account labels: `set_label` sets and CLEARS the operator's
+/// display name, while `replace` — the rotation/re-login path — preserves an
+/// existing label when the rebuilt descriptor carries none. The two intents
+/// are separate methods precisely so absence can mean "keep it" in one and
+/// "clear it" in the other without ambiguity.
+///
+/// MUTATION CHECK (executed): make `replace` overwrite the label
+/// unconditionally (drop the is_none guard) and the survives-rotation half
+/// fails — every re-authentication would silently discard the chosen name.
+#[test]
+fn labels_are_set_cleared_and_survive_rotation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let alias = CredentialAlias::new("label-acct");
+    store
+        .add(descriptor("label-acct", "acme", CredentialStatus::Ok, true))
+        .unwrap();
+
+    // Absent by default — a surface falls back to identity, then alias.
+    assert_eq!(store.list()[0].label, None);
+
+    let updated = store
+        .set_label(&alias, Some("work openai".to_owned()))
+        .unwrap();
+    assert_eq!(updated.label.as_deref(), Some("work openai"));
+    assert_eq!(store.list()[0].label.as_deref(), Some("work openai"));
+
+    // Rotation/re-login rebuilds the descriptor from provider truth with no
+    // label; the operator's name must survive.
+    let mut rebuilt = descriptor("label-acct", "acme", CredentialStatus::Ok, true);
+    rebuilt.identity = "rotated@example.test".to_owned();
+    rebuilt.label = None;
+    store.replace(rebuilt).unwrap();
+    assert_eq!(
+        store.list()[0].label.as_deref(),
+        Some("work openai"),
+        "re-authentication must not discard the chosen name"
+    );
+    assert_eq!(store.list()[0].identity, "rotated@example.test");
+
+    // An incoming label still wins on replace.
+    let mut renamed = descriptor("label-acct", "acme", CredentialStatus::Ok, true);
+    renamed.label = Some("renamed by rebuild".to_owned());
+    store.replace(renamed).unwrap();
+    assert_eq!(store.list()[0].label.as_deref(), Some("renamed by rebuild"));
+
+    // And the label door clears it — absence means clear HERE.
+    let cleared = store.set_label(&alias, None).unwrap();
+    assert_eq!(cleared.label, None);
+    assert_eq!(store.list()[0].label, None);
+
+    // An unknown alias is an honest miss, never a silent no-op.
+    assert!(
+        store
+            .set_label(&CredentialAlias::new("nope"), Some("x".into()))
+            .is_err()
+    );
+}
