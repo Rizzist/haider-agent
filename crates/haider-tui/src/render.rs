@@ -382,7 +382,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Usage => render_usage(model, theme, frame, body, &mut hits),
             Screen::Fleet => render_fleet(model, theme, frame, body, &mut hits),
             Screen::Graph => render_graph(model, theme, frame, body, &mut hits),
-            Screen::Loom => render_loom(model, theme, frame, body),
+            Screen::Loom => render_loom(model, theme, frame, body, &mut hits),
             Screen::Sessions => render_sessions(model, theme, frame, body, &mut hits),
         }
     }
@@ -5528,7 +5528,35 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
 /// W-flow: the workflows pane leads with the synthetic `∅ none` row and the
 /// built-in catalog pair — `p` pins the selected row to the bound session,
 /// `n` opens the describe-it authoring input on both panes.
-fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+/// The Loom/Workflows tab keeps the session COMPOSER live at its foot
+/// (owner 2026-08-22): authoring is a conversation, not a one-shot prompt,
+/// so the operator describes, sees the proposal, and refines WITHOUT leaving
+/// the registry they are editing. The list takes navigation keys; every
+/// printable character goes to the composer, which is why "new" is a
+/// clickable row rather than a bare `n`.
+fn render_loom(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    // The composer band owns the foot of the tab; the registry gets the rest.
+    let composer_rows = composer_height(model, area.width);
+    let band = composer_rows.saturating_add(1);
+    let list_height = area.height.saturating_sub(band);
+    let list_area = Rect::new(area.x, area.y, area.width, list_height);
+    let rule_area = Rect::new(area.x, area.y.saturating_add(list_height), area.width, 1);
+    let composer_area = Rect::new(
+        area.x,
+        area.y.saturating_add(list_height).saturating_add(1),
+        area.width,
+        composer_rows,
+    );
+    // Painted BEFORE the registry so every early-return path below still
+    // leaves the operator a live composer to type into.
+    render_composer(model, theme, frame, rule_area, composer_area, hits);
+    let area = list_area;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let on_types = model.loom_pane == LoomPane::Types;
     let (title, own, own_noun, sibling) = if on_types {
@@ -5547,6 +5575,35 @@ fn render_loom(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         ),
     ]));
     lines.push(Line::raw(""));
+    // Owner 2026-08-22: a visible, CLICKABLE create affordance. Bare `n`
+    // stopped being available the moment printable keys started reaching the
+    // composer, and a button is what the operator was looking for anyway.
+    {
+        let new_row = Line::from(vec![
+            Span::styled("  ＋ ", theme.gold_style()),
+            Span::styled(
+                if on_types {
+                    "New agent type"
+                } else {
+                    "New workflow"
+                },
+                theme.gold_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   describe it below, or click here to start",
+                theme.dim_style(),
+            ),
+        ]);
+        let row_y = area.y.saturating_add(lines.len() as u16);
+        if row_y < area.y.saturating_add(area.height) {
+            hits.push((
+                Rect::new(area.x, row_y, area.width, 1),
+                Hit::LoomNew,
+            ));
+        }
+        lines.push(new_row);
+        lines.push(Line::raw(""));
+    }
     // W-flow authoring: the open `n` input band — house card grammar
     // (`❯ value▏`); its hint line IS the footer while it is open, so the
     // pane footers below gate on the input being closed.

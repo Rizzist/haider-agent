@@ -2604,6 +2604,9 @@ pub enum Hit {
     PermissionRetry,
     /// Aura / Accounts / Peers launcher rows, by identity not ordinal.
     ExtraRow(LauncherRow),
+    /// The Loom/Workflows tab's create row — seeds the composer with the
+    /// authoring prompt for whichever pane is showing.
+    LoomNew,
     /// The palette row's actual content at render time.
     PaletteRow(PaletteItem),
     /// A menu option, bound to the menu it was rendered for.
@@ -5507,6 +5510,17 @@ impl AppModel {
                     Screen::Launcher | Screen::Boot => self.should_quit = true,
                     _ => self.back_to_launcher(),
                 },
+                // The Loom/Workflows tab's registry actions live on ⌃ since
+                // the tab grew a live composer (owner 2026-08-22) — and the
+                // global ⌃ block runs before the screen dispatch, so they
+                // have to be answered here or they never arrive.
+                KeyCode::Char('p') if self.screen == Screen::Loom => match self.loom_pane {
+                    LoomPane::Workflows => self.pin_selected_workflow(),
+                    LoomPane::Types => self.bind_selected_type(),
+                },
+                KeyCode::Char('n') if self.screen == Screen::Loom => {
+                    self.seed_loom_authoring();
+                }
                 // Ctrl+T cycles the theme (demo stand-in for /theme).
                 KeyCode::Char('t') => self.cycle_theme(),
                 // ⌃G = the token panel (sim tui.js binding).
@@ -5723,14 +5737,25 @@ impl AppModel {
                 // W-flow: `p` binds the SELECTED row to the bound session —
                 // workflows pin by name (`none` abandons); types bind the
                 // receipted agent type (`none` clears to plain).
-                KeyCode::Char('p') => match self.loom_pane {
-                    LoomPane::Workflows => self.pin_selected_workflow(),
-                    LoomPane::Types => self.bind_selected_type(),
+                // Owner 2026-08-22: the tab carries a LIVE composer, so every
+                // printable key belongs to it — authoring here is a
+                // conversation. Registry actions moved onto modifiers and
+                // navigation keys; `p` (pin/bind) is now ⌃P, and the create
+                // affordance is the clickable ＋ row or ⌃N.
+                // Printable input goes to the composer, exactly as it does on
+                // the session screen.
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.composer.insert_str(&c.to_string());
+                }
+                KeyCode::Backspace => {
+                    self.composer.backspace();
                 },
                 // W-flow authoring: describe it, the model makes it.
-                KeyCode::Char('n') => {
-                    self.loom_input = Some(String::new());
-                }
+
                 KeyCode::Up if self.loom_detail => {
                     self.loom_scroll = self.loom_scroll.min(ceiling).saturating_sub(1);
                 }
@@ -5742,6 +5767,12 @@ impl AppModel {
                 }
                 KeyCode::Down if total > 0 => {
                     self.loom_selection = (self.loom_selection + 1).min(total - 1);
+                }
+                // A composer with text owns ⏎ — that is the authoring turn.
+                // An EMPTY composer means the operator is browsing, so ⏎
+                // opens the selected row's detail. Unambiguous either way.
+                KeyCode::Enter if !self.composer.text().trim().is_empty() => {
+                    self.submit_loom_turn();
                 }
                 KeyCode::Enter if total > 0 => {
                     self.loom_detail = !self.loom_detail;
@@ -9688,6 +9719,78 @@ impl AppModel {
         }
     }
 
+    /// Submit the tab's composer as one ordinary turn WITHOUT leaving the
+    /// tab. The model's proposal, the operator's refinements, and the
+    /// registry being edited all stay on one screen — which is what makes
+    /// authoring iterative instead of one-shot (owner 2026-08-22).
+    fn submit_loom_turn(&mut self) {
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· authoring runs live — the daemon's plan gate registers".to_owned());
+            return;
+        }
+        if self.active_session.is_none() {
+            self.flash = Some("· no bound session — open a session first".to_owned());
+            return;
+        }
+        let described = self.composer.take_for_submit();
+        if described.trim().is_empty() {
+            return;
+        }
+        // The pane decides what KIND of thing is being authored; the daemon's
+        // plan gate and `loom_register` still do the registering, so this
+        // stays an ordinary turn with no privileged path.
+        let text = match self.loom_pane {
+            LoomPane::Types => format!(
+                "{described}\n\nDraft this as a Loom AGENT TYPE. Propose it as a plan \
+                 (id, name, job, In -> Out types, color #rrggbb, glyph, and any \
+                 command-line tools it expects to have installed). After I accept \
+                 the plan, register it with loom_register."
+            ),
+            LoomPane::Workflows => format!(
+                "{described}\n\nDraft this as a Loom WORKFLOW. Propose it as a plan \
+                 carrying the pipe DSL source (header `name: In -> Out`, one node per \
+                 line, using the registered agent types in your loom inventory) and \
+                 name the model each node should run on. After I accept the plan, \
+                 register it with loom_register."
+            ),
+        };
+        let attachments = self.composer.take_ready_attachments();
+        self.turn_active = true;
+        self.requests.push(AppRequest::SubmitText {
+            text,
+            voice: false,
+            title: self.session_title.is_none(),
+            branch: self.branch_state.active().cloned(),
+            attachments,
+        });
+        self.flash = Some("· drafting — the plan gate will ask before it registers".to_owned());
+    }
+
+    /// Seed the tab's composer with the authoring opener for the current
+    /// pane. The operator finishes the sentence and presses ⏎ — and STAYS in
+    /// the tab, so the proposal, their refinements and the registry are all
+    /// in view at once (owner 2026-08-22).
+    pub fn seed_loom_authoring(&mut self) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· authoring runs live — the daemon's plan gate registers".to_owned());
+            return;
+        }
+        if self.active_session.is_none() {
+            self.flash = Some("· no bound session — open a session first".to_owned());
+            return;
+        }
+        let opener = match self.loom_pane {
+            LoomPane::Types => "New agent type: ",
+            LoomPane::Workflows => "New workflow: ",
+        };
+        if self.composer.text().trim().is_empty() {
+            self.composer.set_text(opener);
+        }
+    }
+
     /// W-flow authoring — ⏎ on the `n` input: leave for the bound session
     /// and submit ONE ordinary turn whose text instructs the model to draft
     /// the described agent type / workflow and propose it as a plan; the
@@ -12382,6 +12485,7 @@ impl AppModel {
             {
                 self.attach_session_id(&id);
             }
+            Hit::LoomNew if self.screen == Screen::Loom => self.seed_loom_authoring(),
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
                 LauncherRow::Aura => self.enter_aura(),
                 LauncherRow::Accounts => self.enter_accounts(),

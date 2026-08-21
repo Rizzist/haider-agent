@@ -16,6 +16,13 @@ pub fn key(code: KeyCode) -> AppEvent {
     AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
+/// A control-modified key. The Loom/Workflows tab moved its registry actions
+/// onto ⌃ once the tab grew a live composer (owner 2026-08-22): every bare
+/// printable key belongs to the composer now.
+pub fn ctrl(code: KeyCode) -> AppEvent {
+    AppEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
+}
+
 pub fn launcher_model() -> AppModel {
     let mut model = AppModel::new();
     // Deterministic device: header-band pins ellipsize at narrow widths,

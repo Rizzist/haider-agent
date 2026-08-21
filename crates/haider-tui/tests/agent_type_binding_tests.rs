@@ -20,7 +20,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::KeyCode;
 
 mod common;
-use common::{key, launcher_model, submit};
+use common::{ctrl, key, launcher_model, submit};
 
 fn sid() -> SessionId {
     SessionId::new("s-agent-type")
@@ -215,7 +215,7 @@ fn p_bind_carries_the_exact_id_on_the_wire() {
     model.loom_selection = 1; // @scout
     model.requests.clear();
 
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         model.requests.iter().any(|request| matches!(
             request,
@@ -252,7 +252,7 @@ fn p_bind_carries_the_exact_id_on_the_wire() {
     model.identity.agent_type = Some("scout".to_owned());
     model.loom_selection = 0;
     model.requests.clear();
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         model
             .requests
@@ -277,7 +277,7 @@ fn p_bind_carries_the_exact_id_on_the_wire() {
     // Already plain: honest flash, nothing on the wire.
     model.identity.agent_type = None;
     model.requests.clear();
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(model.requests.is_empty(), "already-plain issues nothing");
     assert_eq!(
         model.flash.as_deref(),
@@ -305,7 +305,7 @@ fn p_bind_unbound_or_ungated_flashes_honestly() {
     model.loom_pane = LoomPane::Types;
     model.loom_selection = 1;
     model.requests.clear();
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         !model
             .requests
@@ -329,7 +329,7 @@ fn p_bind_unbound_or_ungated_flashes_honestly() {
     model.loom_pane = LoomPane::Types;
     model.loom_selection = 1;
     model.requests.clear();
-    model.handle(key(KeyCode::Char('p')));
+    model.handle(ctrl(KeyCode::Char('p')));
     assert!(
         !model
             .requests
