@@ -1383,8 +1383,9 @@ impl SqliteStoreHandle {
     /// Checkpoints committed WAL pages before orderly close.
     ///
     /// W3b1 daemon seam: the R17 drain barrier flushes before removing the
-    /// socket and closing the store. Committed data is durable without this;
-    /// flushing just shrinks the successor's WAL replay.
+    /// socket and closing the store. Under the default `NORMAL` policy an OS
+    /// crash can lose the most recent checkpoint window; this orderly flush
+    /// persists committed WAL pages and shrinks the successor's replay.
     pub async fn flush(&self) -> Result<(), HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(Store::flush)).await

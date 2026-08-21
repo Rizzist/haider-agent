@@ -70,26 +70,34 @@ durable events, five repetitions, and 10,000 events per repetition.
 | batches of 100 | repeated 100-event calls | 83,102 events/s |
 | one 10k-event batch | repeated whole batch | 126,800 events/s |
 
-SQLite is configured for WAL with `synchronous=FULL`. Each `EventStore::append`
-call opens one transaction, inserts all envelopes supplied by that call, and
-commits once. It does not fsync once per envelope in an already-batched call.
+SQLite is configured for WAL with `synchronous=NORMAL` by default; deployments
+that need SQLite's `FULL` mode can set `HAIDER_STORE_SYNCHRONOUS=full`. `NORMAL`
+can lose the most recent checkpoint window after an OS crash or power loss,
+without corrupting the WAL; orderly close/checkpoint persists committed data.
+Each `EventStore::append` call opens one transaction, inserts all envelopes
+supplied by that call, and commits once. It does not fsync once per envelope in
+an already-batched call.
 Turn acceptance is especially important: its receipt and accepted envelopes
 are inserted in the same transaction, and the session actor publishes or
 acknowledges only after the awaited append completes. `flush` is a WAL
 checkpoint, not the original durability boundary.
 
-Additional batching is therefore deferred. The measured 17k acknowledged
-append calls/s is not the current end-to-end bottleneck, while changing the
-boundary would require a crash-shaped law proving both of the following:
+Provider-stream text, reasoning, and tool-argument deltas are coalesced for at
+most 50 ms (or less at every semantic boundary) before they enter this path.
+Their completed items remain authoritative; process-output byte chunks are not
+coalesced because prompt reconstruction consumes those bytes directly. The
+actor config can set `stream_delta_coalesce_window` to `Duration::ZERO` to
+restore the historical envelope-per-delta cadence. Broader batching remains
+deferred: it would require a crash-shaped law proving both of the following:
 
 - every acknowledged receipt/event is present after kill and reopen;
 - an unacknowledged suffix is either wholly absent or wholly present, never a
   partial receipt/event group.
 
 Any future batching design must group only callers that have not yet received
-an acknowledgement, commit the whole group with `FULL` durability, and release
-their waiters only after that commit. That invasive scheduler and crash harness
-are not justified by the current measurement.
+an acknowledgement, commit the whole group under the configured synchronous
+policy, and release their waiters only after that commit. That invasive
+scheduler and crash harness are not justified by the current measurement.
 
 ### Prompt compilation
 

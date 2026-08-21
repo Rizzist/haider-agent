@@ -84,6 +84,11 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
 const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
+/// Maximum time a provider-stream text, reasoning, or tool-argument delta may
+/// remain in memory before it is journaled. Contiguous deltas for one item and
+/// one variant coalesce during this window; every semantic boundary flushes
+/// earlier, so `Completed` remains the authoritative durable item.
+pub const STREAM_DELTA_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 /// Bounded web-sources list journaled under one finished turn (W-B).
 const WEB_SOURCES_CAP: usize = 8;
 const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
@@ -207,6 +212,10 @@ pub struct HarnessConfig {
     /// Daemon supervisors close/reconcile their effect broker before writing
     /// `Cancelled`. Standalone actors retain the direct terminal commit.
     pub supervisor_commits_cancelled: bool,
+    /// Maximum time a provider-stream delta may remain non-durable. Set this
+    /// to `Duration::ZERO` to disable coalescing and restore one durable
+    /// envelope per provider delta for a deployment that needs that cadence.
+    pub stream_delta_coalesce_window: std::time::Duration,
     /// Optional supervisor-owned event namespace shared by every turn actor
     /// and effect journal in one worker generation.
     event_ids: Option<Arc<EventIdGenerator>>,
@@ -265,6 +274,7 @@ impl HarnessConfig {
             max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
+            stream_delta_coalesce_window: STREAM_DELTA_COALESCE_WINDOW,
             event_ids: None,
             started_at_ms: None,
         }
@@ -284,6 +294,14 @@ impl HarnessConfig {
     /// collisions when two actors receive the same value here.
     pub fn with_started_at_ms(mut self, started_at_ms: u64) -> Self {
         self.started_at_ms = Some(started_at_ms);
+        self
+    }
+
+    /// Overrides the provider-delta coalescing cadence for this actor.
+    /// `Duration::ZERO` restores the historical envelope-per-delta cadence.
+    #[must_use]
+    pub fn with_stream_delta_coalesce_window(mut self, window: std::time::Duration) -> Self {
+        self.stream_delta_coalesce_window = window;
         self
     }
 
@@ -1230,6 +1248,11 @@ pub struct HarnessActor {
     /// projection closes finished item ids forever). Keyed by run so a stale
     /// lifecycle from an earlier run never leaks into the next one.
     plan: Option<PlanLifecycle>,
+    /// One contiguous provider-stream delta held before its timed or semantic
+    /// flush. Keeping one entry, rather than a map, preserves event ordering
+    /// when providers interleave item kinds.
+    pending_item_delta: Option<PendingItemDelta>,
+    pending_item_delta_deadline: Option<tokio::time::Instant>,
 }
 
 /// See [`HarnessActor::plan`].
@@ -1310,6 +1333,8 @@ impl HarnessActor {
                 pending_nudges: Vec::new(),
                 pending_subturns: Vec::new(),
                 plan: None,
+                pending_item_delta: None,
+                pending_item_delta_deadline: None,
             },
             handle,
         )
@@ -1559,6 +1584,15 @@ impl HarnessActor {
                     break;
                 }
             }
+        }
+        // A normal stop arrives only after an active turn's terminal path has
+        // flushed its delta, but retain this drain barrier for channel-close
+        // and future control paths.
+        if let Err(error) = self.flush_pending_item_delta().await {
+            tracing::error!(
+                ?error,
+                "session actor shutdown could not flush a buffered delta"
+            );
         }
     }
 
@@ -2164,6 +2198,7 @@ impl HarnessActor {
             let mut provider_content_seen = false;
             let mut refusal_reason = String::new();
             loop {
+                let pending_delta_deadline = self.pending_item_delta_deadline;
                 let next = tokio::select! {
                     // Cancellation owns ties. Provider progress is polled
                     // before command service on every round so an unbounded
@@ -2178,6 +2213,20 @@ impl HarnessActor {
                                 &mut tools,
                             )
                             .await;
+                    }
+                    () = delta_flush_timer(pending_delta_deadline) => {
+                        if let Err(error) = self.flush_pending_item_delta().await {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
+                        continue;
                     }
                     item = stream.recv() => item,
                     command = self.commands.recv() => {
@@ -2673,6 +2722,17 @@ impl HarnessActor {
                         name,
                         args,
                     } => {
+                        if let Err(error) = self.flush_pending_item_delta().await {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
                         server_calls.insert(call_id, (name, args));
                         Ok(None)
                     }
@@ -3983,6 +4043,9 @@ impl HarnessActor {
             .map_err(DriveError::Store)?];
         let retrying_event_id = envelopes[0].event_id.clone();
         let retry_wake = Arc::clone(&self.provider_retry_wake);
+        self.flush_pending_item_delta()
+            .await
+            .map_err(DriveError::Store)?;
         retry_wake.arm(retrying_event_id.clone());
         if let Err(error) = self.store.append(&mut envelopes).await {
             retry_wake.disarm(&retrying_event_id);
@@ -5473,6 +5536,9 @@ impl HarnessActor {
             )
             .map_err(DriveError::Store)?,
         ];
+        self.flush_pending_item_delta()
+            .await
+            .map_err(DriveError::Store)?;
         self.store
             .append(&mut envelopes)
             .await
@@ -5508,6 +5574,9 @@ impl HarnessActor {
             )
             .map_err(DriveError::Store)?,
         ];
+        self.flush_pending_item_delta()
+            .await
+            .map_err(DriveError::Store)?;
         self.store
             .append(&mut envelopes)
             .await
@@ -5817,6 +5886,7 @@ impl HarnessActor {
                 prompt_omit_render(),
             )?,
         ];
+        self.flush_pending_item_delta().await?;
         self.store.append(&mut envelopes).await?;
         for committed in envelopes {
             // No live subscribers is fine — the store already has the
@@ -5839,11 +5909,15 @@ impl HarnessActor {
         Ok(())
     }
 
-    async fn commit_item(
-        &mut self,
-        run_id: &RunId,
-        item: ItemEvent,
-    ) -> Result<RawEnvelope, HaiderError> {
+    async fn commit_item(&mut self, run_id: &RunId, item: ItemEvent) -> Result<(), HaiderError> {
+        let item = match item {
+            ItemEvent::Delta { item_id, delta } => {
+                return self
+                    .buffer_provider_item_delta(run_id, item_id, delta)
+                    .await;
+            }
+            item => item,
+        };
         let node_kind = match &item {
             ItemEvent::Completed {
                 item: TurnItem::AgentMessage { text },
@@ -5882,11 +5956,12 @@ impl HarnessActor {
                 prompt_verbatim_render(),
                 node_kind,
             )
-            .await
+            .await?;
         } else {
             self.commit_payload(run_id, EventPayload::Item(item), prompt_verbatim_render())
-                .await
+                .await?;
         }
+        Ok(())
     }
 
     /// Atomically journals a hidden provider-native block as one closed item.
@@ -5944,6 +6019,9 @@ impl HarnessActor {
             )
             .map_err(DriveError::Store)?,
         ];
+        self.flush_pending_item_delta()
+            .await
+            .map_err(DriveError::Store)?;
         self.store
             .append(&mut envelopes)
             .await
@@ -6004,6 +6082,9 @@ impl HarnessActor {
             )
             .map_err(DriveError::Store)?,
         ];
+        self.flush_pending_item_delta()
+            .await
+            .map_err(DriveError::Store)?;
         self.store
             .append(&mut envelopes)
             .await
@@ -6079,6 +6160,7 @@ impl HarnessActor {
                 render,
             )?,
         ];
+        self.flush_pending_item_delta().await?;
         self.store.append(&mut envelopes).await?;
         for committed in envelopes {
             let _ = self.events.send(committed);
@@ -6095,6 +6177,7 @@ impl HarnessActor {
         render: RenderTargets,
         kind: NodeKind,
     ) -> Result<RawEnvelope, HaiderError> {
+        self.flush_pending_item_delta().await?;
         let node = TreeNode {
             node: self.next_node_id(),
             parent: self.tree_parent().await?,
@@ -6138,12 +6221,92 @@ impl HarnessActor {
         payload: EventPayload,
         render: RenderTargets,
     ) -> Result<RawEnvelope, HaiderError> {
+        self.flush_pending_item_delta().await?;
         let mut envelopes = [self.uncommitted_envelope(run_id, payload, render)?];
         self.store.append(&mut envelopes).await?;
         let [committed] = envelopes;
         // No live subscribers is fine — the store already has the envelope.
         let _ = self.events.send(committed.clone());
         Ok(committed)
+    }
+
+    /// Holds only provider-stream deltas. A buffered value has not crossed the
+    /// store append boundary, so cancellation or a process crash may lose it;
+    /// every `Completed` or other semantic event flushes it first.
+    async fn buffer_provider_item_delta(
+        &mut self,
+        run_id: &RunId,
+        item_id: ItemId,
+        delta: ItemDelta,
+    ) -> Result<(), HaiderError> {
+        if self
+            .pending_item_delta_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.flush_pending_item_delta().await?;
+        }
+
+        if let Some(pending) = self.pending_item_delta.as_mut()
+            && pending.run_id == *run_id
+            && pending.item_id == item_id
+            && merge_contiguous_item_delta(&mut pending.delta, &delta)
+        {
+            return Ok(());
+        }
+
+        // An interleaved item or delta kind is a semantic ordering boundary:
+        // commit the prior delta before accepting the next one.
+        self.flush_pending_item_delta().await?;
+        self.pending_item_delta = Some(PendingItemDelta {
+            run_id: run_id.clone(),
+            item_id,
+            delta,
+        });
+        self.pending_item_delta_deadline =
+            Some(tokio::time::Instant::now() + self.config.stream_delta_coalesce_window);
+        Ok(())
+    }
+
+    /// Durably commits and publishes the one pending provider delta. Every
+    /// durable non-delta emitter calls this barrier before its own append, and
+    /// the stream select calls it at the configured deadline.
+    async fn flush_pending_item_delta(&mut self) -> Result<(), HaiderError> {
+        let Some(pending) = self.pending_item_delta.take() else {
+            self.pending_item_delta_deadline = None;
+            return Ok(());
+        };
+        self.pending_item_delta_deadline = None;
+
+        let envelope = self.uncommitted_envelope(
+            &pending.run_id,
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: pending.item_id.clone(),
+                delta: pending.delta.clone(),
+            }),
+            prompt_verbatim_render(),
+        );
+        let envelope = match envelope {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.restore_pending_item_delta(pending);
+                return Err(error);
+            }
+        };
+        let mut envelopes = [envelope];
+        if let Err(error) = self.store.append(&mut envelopes).await {
+            self.restore_pending_item_delta(pending);
+            return Err(error);
+        }
+        let [committed] = envelopes;
+        let _ = self.events.send(committed);
+        Ok(())
+    }
+
+    fn restore_pending_item_delta(&mut self, pending: PendingItemDelta) {
+        debug_assert!(self.pending_item_delta.is_none());
+        self.pending_item_delta = Some(pending);
+        // A failed append must be retried before any later boundary can pass.
+        self.pending_item_delta_deadline = Some(tokio::time::Instant::now());
     }
 
     fn uncommitted_envelope(
@@ -6280,6 +6443,35 @@ impl HarnessActor {
     }
 }
 
+async fn delta_flush_timer(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn merge_contiguous_item_delta(existing: &mut ItemDelta, incoming: &ItemDelta) -> bool {
+    match (existing, incoming) {
+        (ItemDelta::Text { text: accumulated }, ItemDelta::Text { text })
+        | (ItemDelta::Reasoning { text: accumulated }, ItemDelta::Reasoning { text }) => {
+            accumulated.push_str(text);
+            true
+        }
+        (
+            ItemDelta::ToolArgs {
+                fragment: accumulated,
+            },
+            ItemDelta::ToolArgs { fragment },
+        ) => {
+            accumulated.push_str(fragment);
+            true
+        }
+        // Command output is raw base64 bytes, emitted by the daemon tool
+        // sink rather than this actor; it deliberately remains uncoalesced.
+        _ => false,
+    }
+}
+
 /// Turn-loop failure, tagged by which port failed (drives the error surface).
 #[derive(Debug)]
 enum DriveError {
@@ -6300,6 +6492,17 @@ struct ProviderRetryContext<'a> {
 struct TextAccumulator {
     item_id: ItemId,
     text: String,
+}
+
+/// One as-yet-uncommitted provider-stream delta. It is intentionally limited
+/// to the actor's text/reasoning/tool-argument stream; process output carries
+/// raw bytes and is read directly by prompt reconstruction, so it stays
+/// independently journaled at its daemon source.
+#[derive(Debug)]
+struct PendingItemDelta {
+    run_id: RunId,
+    item_id: ItemId,
+    delta: ItemDelta,
 }
 
 /// One in-flight tool call; `args` collects the streamed JSON fragments.

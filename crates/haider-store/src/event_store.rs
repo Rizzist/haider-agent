@@ -83,6 +83,34 @@ use std::time::Duration;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_PAGE_SIZE: usize = 1_024;
 
+/// Deployment escape hatch for the journal connection's SQLite `synchronous`
+/// pragma. Accepted values are the lower-case strings `normal` and `full`.
+const STORE_SYNCHRONOUS_ENV: &str = "HAIDER_STORE_SYNCHRONOUS";
+
+/// The default WAL commit policy. `NORMAL` can lose commits from the most
+/// recent checkpoint window after an OS crash or power loss; the WAL itself is
+/// not corrupted. This is deliberate: on macOS, `FULL` without `F_FULLFSYNC`
+/// already does not promise power-cut survival, so `NORMAL` states that
+/// boundary honestly while making the commit path roughly 3–10× faster.
+/// Deployments that require SQLite's `FULL` mode can set
+/// `HAIDER_STORE_SYNCHRONOUS=full`; both modes are applied on every open.
+const DEFAULT_STORE_SYNCHRONOUS: StoreSynchronous = StoreSynchronous::Normal;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreSynchronous {
+    Normal,
+    Full,
+}
+
+impl StoreSynchronous {
+    const fn pragma_value(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+        }
+    }
+}
+
 /// Device-profile-wide hard admission bound for durable live delegations.
 ///
 /// Admission is serialized by the same SQLite `IMMEDIATE` transaction that
@@ -7726,9 +7754,11 @@ impl Store {
 
     /// Checkpoints committed WAL pages before orderly profile close.
     ///
-    /// W3b1 seam (additive), used by the daemon drain barrier. Committed data
-    /// is durable without this; checkpointing shrinks the WAL a successor
-    /// must replay. A busy checkpoint surfaces as retryable `StoreLocked`.
+    /// W3b1 seam (additive), used by the daemon drain barrier. Under the
+    /// default `NORMAL` policy an OS crash can lose the most recent checkpoint
+    /// window; this orderly checkpoint persists all committed WAL pages and
+    /// shrinks the WAL a successor must replay. A busy checkpoint surfaces as
+    /// retryable `StoreLocked`.
     pub fn flush(&self) -> StoreResult<()> {
         let connection = self.connection()?;
         let (busy, _, _): (u32, u32, u32) = connection
@@ -13418,8 +13448,12 @@ fn same_session_batch(envelopes: &[RawEnvelope]) -> StoreResult<(SessionId, u64)
 }
 
 /// Opens the profile's long-lived journal connection with the required pragmas
-/// (WAL, FULL synchronous, foreign keys, busy timeout).
+/// (WAL, configured synchronous policy, foreign keys, busy timeout).
 fn open_connection(path: &Path) -> StoreResult<Connection> {
+    open_connection_with(path, configured_store_synchronous()?)
+}
+
+fn open_connection_with(path: &Path, synchronous: StoreSynchronous) -> StoreResult<Connection> {
     let connection = Connection::open(path).map_err(map_sqlite_error)?;
     connection
         .busy_timeout(BUSY_TIMEOUT)
@@ -13431,9 +13465,35 @@ fn open_connection(path: &Path) -> StoreResult<Connection> {
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(map_sqlite_error)?;
     connection
-        .pragma_update(None, "synchronous", "FULL")
+        .pragma_update(None, "synchronous", synchronous.pragma_value())
         .map_err(map_sqlite_error)?;
     Ok(connection)
+}
+
+fn configured_store_synchronous() -> StoreResult<StoreSynchronous> {
+    let Some(value) = std::env::var_os(STORE_SYNCHRONOUS_ENV) else {
+        return Ok(DEFAULT_STORE_SYNCHRONOUS);
+    };
+    let value = value.into_string().map_err(|_| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("{STORE_SYNCHRONOUS_ENV} must be UTF-8 and one of: normal, full"),
+            false,
+        )
+    })?;
+    parse_store_synchronous(&value)
+}
+
+fn parse_store_synchronous(value: &str) -> StoreResult<StoreSynchronous> {
+    match value {
+        "normal" => Ok(StoreSynchronous::Normal),
+        "full" => Ok(StoreSynchronous::Full),
+        _ => Err(store_error(
+            ErrorCode::InvalidArgument,
+            format!("{STORE_SYNCHRONOUS_ENV} must be one of: normal, full (got `{value}`)"),
+            false,
+        )),
+    }
 }
 
 fn encode_envelope(envelope: &RawEnvelope) -> Result<Vec<u8>, rmp_serde::encode::Error> {
@@ -13888,5 +13948,63 @@ mod m2d_law_tests {
             .collect::<Vec<_>>();
         assert_eq!(opened, vec![earlier_ordinal, later_ordinal]);
         assert!(!opened.contains(&wrong_dependency));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod store_synchronous_tests {
+    use super::*;
+
+    fn queried_synchronous(connection: &Connection) -> i64 {
+        connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .expect("query synchronous pragma")
+    }
+
+    /// MUTATION CHECK: deleting the `synchronous` `pragma_update` in
+    /// `open_connection_with` (SQLite's own per-connection default is FULL),
+    /// or swapping `pragma_value`'s arms, must fail the NORMAL=1 assertion.
+    #[test]
+    fn open_connection_applies_the_requested_synchronous_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let normal =
+            open_connection_with(&dir.path().join("normal.sqlite"), StoreSynchronous::Normal)
+                .expect("open NORMAL");
+        assert_eq!(queried_synchronous(&normal), 1, "NORMAL applies as 1");
+        let full = open_connection_with(&dir.path().join("full.sqlite"), StoreSynchronous::Full)
+            .expect("open FULL");
+        assert_eq!(queried_synchronous(&full), 2, "FULL applies as 2");
+    }
+
+    /// MUTATION CHECK: flipping `DEFAULT_STORE_SYNCHRONOUS` to `Full` must
+    /// fail this pin (the gate never exports the escape env; the guard below
+    /// keeps the pin honest if a shell ever does).
+    #[test]
+    fn default_open_is_normal_unless_the_env_escape_is_set() {
+        let expected = match std::env::var(STORE_SYNCHRONOUS_ENV).as_deref() {
+            Ok("full") => 2,
+            _ => 1,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let connection = open_connection(&dir.path().join("default.sqlite")).expect("open default");
+        assert_eq!(queried_synchronous(&connection), expected);
+    }
+
+    /// MUTATION CHECK: mapping `full` to `Normal`, or accepting arbitrary
+    /// values, must fail these parse pins.
+    #[test]
+    fn synchronous_env_values_parse_exactly() {
+        assert_eq!(
+            parse_store_synchronous("normal").expect("normal"),
+            StoreSynchronous::Normal
+        );
+        assert_eq!(
+            parse_store_synchronous("full").expect("full"),
+            StoreSynchronous::Full
+        );
+        let error = parse_store_synchronous("extra").expect_err("unknown value refuses");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains(STORE_SYNCHRONOUS_ENV));
     }
 }
