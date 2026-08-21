@@ -7013,6 +7013,29 @@ async fn waiting_why_types_parked_states_with_menu_identity() {
     );
     assert_eq!(card(&idle_session), None, "idle session needs no input");
 
+    // ANSWERABLE-SET LAW (v0.0.937, ADE-reported): the answer coordinates
+    // travel as a SET. A card carrying options MUST also carry menu_id,
+    // request_seq and worker_generation — a client answers with those
+    // three verbatim, so options without the fence would invite an answer
+    // built from nulls or, worse, re-derived coordinates racing a menu
+    // that just closed. The types cannot enforce this (each field is
+    // independently optional on the menu wire), so it is pinned here.
+    //
+    // MUTATION CHECK (executed): drop `menu_id` (or request_seq /
+    // worker_generation) from the needs_input derivation while leaving
+    // options populated, and every parked card below fails this law.
+    for session in [&permission_session, &question_session, &approval_session] {
+        let card = card(session).expect("parked session publishes a card");
+        if !card.options.is_empty() {
+            assert!(
+                card.menu_id.is_some()
+                    && card.request_seq.is_some()
+                    && card.worker_generation.is_some(),
+                "an answerable card carries the FULL answer fence: {card:?}"
+            );
+        }
+    }
+
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
