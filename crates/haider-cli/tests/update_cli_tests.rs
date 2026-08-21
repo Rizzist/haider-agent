@@ -180,6 +180,7 @@ fn bare_tui_update_opt_out_flag_preserves_session_arguments() {
     let expected = BareTuiOptions {
         session: Some("session-42".to_owned()),
         no_update_check: true,
+        browse_sessions: false,
     };
     for args in [
         vec!["--no-update-check", "--session", "session-42"],
@@ -231,5 +232,49 @@ fn bare_session_flag_refuses_a_flag_shaped_value() {
     assert_eq!(
         parse_bare_tui_options(&args),
         Err("--session requires a session id".to_owned())
+    );
+}
+
+/// v0.0.937 `--resume`: bare opens the all-sessions PICKER, with an id it is
+/// the `--session` door (attach that one), and it never doubles.
+///
+/// MUTATION CHECK (executed): treat a following id as a separate flag (drop
+/// the peek) and the id form falls back to the picker; drop the
+/// supplied-twice arm and the refusal half fails.
+#[test]
+fn resume_opens_the_picker_or_attaches_the_named_session() {
+    let parse = |args: Vec<&str>| {
+        parse_bare_tui_options(&args.into_iter().map(String::from).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        parse(vec!["--resume"]).expect("bare resume parses"),
+        Some(BareTuiOptions {
+            session: None,
+            no_update_check: false,
+            browse_sessions: true,
+        }),
+        "no id → the picker"
+    );
+    assert_eq!(
+        parse(vec!["--resume", "session-9"]).expect("resume with an id parses"),
+        Some(BareTuiOptions {
+            session: Some("session-9".to_owned()),
+            no_update_check: false,
+            browse_sessions: false,
+        }),
+        "an id → attach it directly, never the picker"
+    );
+    assert_eq!(
+        parse(vec!["--resume", "--no-update-check"]).expect("flag after resume parses"),
+        Some(BareTuiOptions {
+            session: None,
+            no_update_check: true,
+            browse_sessions: true,
+        }),
+        "a FLAG after --resume is not an id"
+    );
+    assert_eq!(
+        parse(vec!["--resume", "--resume"]),
+        Err("--resume was supplied twice".to_owned())
     );
 }

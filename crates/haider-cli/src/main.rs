@@ -138,6 +138,34 @@ async fn dispatch() -> ExitCode {
         [command, rest @ ..] if command == "hooks" => hooks::hooks_command(rest).await,
         [command, rest @ ..] if command == "update" => update::update_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
+        // Owner 2026-08-21: `haider resume` opens the all-sessions picker;
+        // `haider resume <id>` attaches that session directly.
+        [command, rest @ ..] if command == "resume" => match rest {
+            [] => {
+                front_door_with_options(
+                    FrontDoor::Tui,
+                    BareTuiOptions {
+                        browse_sessions: true,
+                        ..BareTuiOptions::default()
+                    },
+                )
+                .await
+            }
+            [id] if !id.is_empty() && !id.starts_with('-') => {
+                front_door_with_options(
+                    FrontDoor::Tui,
+                    BareTuiOptions {
+                        session: Some(id.clone()),
+                        ..BareTuiOptions::default()
+                    },
+                )
+                .await
+            }
+            _ => {
+                eprintln!("usage: haider resume [<session-id>]");
+                ExitCode::from(2)
+            }
+        },
         [command, rest @ ..] if command == "import" => import_command(rest).await,
         [other, ..] => {
             eprintln!(
@@ -147,6 +175,7 @@ async fn dispatch() -> ExitCode {
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--allow-writes] [--allow-exec] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], sessions [--recovery] [--json] [--no-spawn], \
+                 resume [<session-id>], \
                  session <id> [--json|--watch] [--no-spawn], \
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
@@ -174,6 +203,9 @@ async fn dispatch() -> ExitCode {
 pub(crate) struct BareTuiOptions {
     pub session: Option<String>,
     pub no_update_check: bool,
+    /// `haider resume` / `--resume` with no id: boot straight into the
+    /// all-sessions browser so the user PICKS a session (owner 2026-08-21).
+    pub browse_sessions: bool,
 }
 
 /// Parse only the bare-TUI argument vocabulary. `Ok(None)` leaves ordinary
@@ -182,7 +214,10 @@ pub(crate) fn parse_bare_tui_options(args: &[String]) -> Result<Option<BareTuiOp
     if args.is_empty() {
         return Ok(Some(BareTuiOptions::default()));
     }
-    if !matches!(args[0].as_str(), "--session" | "--no-update-check") {
+    if !matches!(
+        args[0].as_str(),
+        "--session" | "--no-update-check" | "--resume"
+    ) {
         return Ok(None);
     }
     let mut options = BareTuiOptions::default();
@@ -199,6 +234,18 @@ pub(crate) fn parse_bare_tui_options(args: &[String]) -> Result<Option<BareTuiOp
                 options.session = Some(id.clone());
             }
             "--session" => return Err("--session was supplied twice".into()),
+            // `--resume` alone opens the picker; `--resume <id>` is the
+            // same door as `--session <id>` (attach that one directly).
+            "--resume" if !options.browse_sessions && options.session.is_none() => {
+                match iter.clone().next() {
+                    Some(id) if !id.is_empty() && !id.starts_with('-') => {
+                        options.session = Some(id.clone());
+                        iter.next();
+                    }
+                    _ => options.browse_sessions = true,
+                }
+            }
+            "--resume" => return Err("--resume was supplied twice".into()),
             other => return Err(format!("unknown bare-TUI flag `{other}`")),
         }
     }
@@ -361,6 +408,7 @@ async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> Ex
     let BareTuiOptions {
         session: initial_session,
         no_update_check,
+        browse_sessions,
     } = options;
     let env = haider_client::ProfileEnv::capture();
     let profile = match haider_client::resolve_profile(&env) {
@@ -399,6 +447,9 @@ async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> Ex
             }
             let mut model = live_model(&profile);
             model.initial_session = initial_session.map(haider_protocol::ids::SessionId::new);
+            if browse_sessions {
+                model.enter_sessions();
+            }
             let updates =
                 update::tui::live_update_bridge(profile.store_dir.clone(), no_update_check);
             match run_live(
@@ -517,6 +568,7 @@ async fn tui_command(rest: &[String]) -> ExitCode {
             BareTuiOptions {
                 session,
                 no_update_check,
+                browse_sessions: false,
             },
         )
         .await;

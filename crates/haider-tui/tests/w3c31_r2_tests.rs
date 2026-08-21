@@ -718,14 +718,23 @@ fn demo_sessions_is_a_known_stub_not_a_typo() {
     // and let demo `/sessions` fall into the typo catch-all — "unknown
     // command /sessions" while `/help` lists it.
     //
+    // v0.0.937: the sessions screen the stub called "unbuilt" IS built (the
+    // all-sessions browser), so `/sessions` now routes to the real door
+    // alongside `/resume`. In DEMO the door still answers honestly rather
+    // than fabricating a roster — the law this pin actually owns.
+    //
     // MUTATION CHECK: delete the demo `"sessions"` arm from
     // `execute_slash` and the assertion below reads "unknown command".
     let mut model = launcher_model();
     run_slash(&mut model, "/sessions");
-    let flash = model.flash.as_deref().expect("the stub answers");
+    let flash = model.flash.as_deref().expect("the door answers");
     assert!(
-        flash.contains("demo stub"),
-        "the stub names itself honestly: {flash}"
+        flash.contains("live only"),
+        "demo says the roster is daemon truth: {flash}"
+    );
+    assert!(
+        !flash.contains("unknown command"),
+        "a KNOWN command, never the typo catch-all: {flash}"
     );
     assert!(
         !flash.contains("unknown command"),

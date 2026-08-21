@@ -200,6 +200,10 @@ pub fn run_shell(
 pub enum Screen {
     Boot,
     Launcher,
+    /// `/resume` — every session on this machine in one browsable list,
+    /// rendered from roster truth alone (unseen dot + needs-you chip), so a
+    /// parked or unread session is impossible to miss (owner 2026-08-21).
+    Sessions,
     Session,
     Subagent,
     Aura,
@@ -2483,6 +2487,25 @@ pub struct SessionAttention {
     pub seen_at_ms: Option<u64>,
     pub last_activity_ms: Option<u64>,
     pub waiting_why: Option<haider_rpc::WaitingWhyWire>,
+    /// v0.0.937 unified card: the typed reason this session needs a human,
+    /// whatever the kind (permission, recovery, update, secret, …).
+    pub needs_input: Option<haider_rpc::NeedsInputWire>,
+}
+
+/// One rendered row of the `/resume` browser — roster truth only, no
+/// journal replay (the 936 attention fields are exactly what this needs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBrowserRow {
+    pub id: SessionId,
+    pub title: String,
+    pub dir: String,
+    pub model_short: String,
+    pub agent_type: Option<String>,
+    pub ago: String,
+    pub busy: bool,
+    pub unseen: bool,
+    pub needs_input: Option<haider_rpc::NeedsInputWire>,
+    pub last_activity_ms: Option<u64>,
 }
 
 impl SessionAttention {
@@ -2816,6 +2839,8 @@ pub enum LauncherRow {
     Aura,
     Accounts,
     Peers,
+    /// The all-sessions browser (`/resume`).
+    Sessions,
     /// The Workflows registry browser (`/workflows`) — typed pipe DAGs.
     Workflows,
     /// The Loom agent-type browser (`/loom`) — capability-scoped specialists.
@@ -3631,6 +3656,11 @@ pub struct AppModel {
     /// projection). Session-scoped by runtime law — checked in/out whole
     /// with the session, never split per branch.
     pub tasks: crate::taskrows::TaskPanel,
+    /// `/resume` browser: the selected row index into
+    /// [`AppModel::session_browser_rows`], and the screen to return to on
+    /// esc (the browser is reachable from the launcher AND a session).
+    pub session_browser_sel: usize,
+    pub session_browser_return: Option<Screen>,
     /// W-G: the live token-throughput sampler for the ACTIVE session. Fed on
     /// the existing frame clock (`note_throughput`) while a turn streams,
     /// reset to empty when idle — a pure ring buffer, so idle frames cost
@@ -3797,6 +3827,8 @@ impl Default for AppModel {
             hooks: crate::hooks::HooksScreenState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
             tasks: crate::taskrows::TaskPanel::default(),
+            session_browser_sel: 0,
+            session_browser_return: None,
             throughput: crate::throughput::ThroughputTracker::new(),
             usage: UsageState::default(),
         }
@@ -4204,6 +4236,7 @@ impl AppModel {
         match self.screen {
             Screen::Boot => "haider — starting".to_owned(),
             Screen::Launcher => "haider — launcher".to_owned(),
+            Screen::Sessions => "haider — sessions".to_owned(),
             Screen::Accounts => "haider — accounts".to_owned(),
             Screen::Tree => "haider — session tree".to_owned(),
             Screen::Tools => "haider — tools".to_owned(),
@@ -4316,6 +4349,9 @@ impl AppModel {
             Screen::Launcher => self.sessions.iter().any(crate::session::SessionState::busy),
             // Loom: a static registry browse — nothing pulses.
             Screen::Loom => false,
+            // Sessions browser: a busy row's dot pulses, exactly as the
+            // launcher's does (the same roster truth, more of it).
+            Screen::Sessions => self.sessions.iter().any(crate::session::SessionState::busy),
             // Accounts: a static list — only an in-flight select animates
             // (the pending row's `…` beat).
             Screen::Accounts => self.accounts.pending_select.is_some(),
@@ -5412,6 +5448,10 @@ impl AppModel {
         }
         if self.screen == Screen::Hooks {
             self.handle_hooks_key(key.code);
+            return;
+        }
+        if self.screen == Screen::Sessions {
+            self.handle_sessions_key(key.code);
             return;
         }
         if self.screen == Screen::Tree {
@@ -9407,6 +9447,100 @@ impl AppModel {
     /// only; live only (graph state is daemon truth, never fabricated).
     /// D3 — open the Loom registry browser. Registry truth is daemon-owned:
     /// live-only, feature-gated; the browse list reads the D1 snapshot.
+    /// Open the all-sessions browser (`/resume`, the launcher's sessions
+    /// row, or `haider resume` at boot). Live-only: the rows ARE daemon
+    /// roster truth, and the demo fabricates nothing.
+    pub fn enter_sessions(&mut self) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /resume — live only; the session list is daemon truth".to_owned());
+            return;
+        }
+        if self.screen != Screen::Sessions {
+            self.session_browser_return = Some(self.screen);
+        }
+        self.session_browser_sel = 0;
+        self.screen = Screen::Sessions;
+    }
+
+    /// Every known session, ordered by ATTENTION (owner 2026-08-21): the
+    /// sessions needing a human first, then unseen activity, then the rest
+    /// by recency. Within a tier the most recent activity leads, so the row
+    /// a user most likely wants is always at the top of the list.
+    #[must_use]
+    pub fn session_browser_rows(&self) -> Vec<SessionBrowserRow> {
+        let mut rows: Vec<SessionBrowserRow> = self
+            .sessions
+            .iter()
+            .map(|entry| {
+                let attention = self.session_attention.get(&entry.id);
+                SessionBrowserRow {
+                    id: entry.id.clone(),
+                    title: entry
+                        .title
+                        .clone()
+                        .or_else(|| entry.name.clone())
+                        .unwrap_or_else(|| entry.id.as_str().to_owned()),
+                    dir: entry.dir.clone(),
+                    model_short: entry.model_short.clone(),
+                    agent_type: entry.agent_type.clone(),
+                    ago: entry.ago.clone(),
+                    busy: entry.busy(),
+                    unseen: attention.is_some_and(SessionAttention::unseen),
+                    needs_input: attention.and_then(|a| a.needs_input.clone()),
+                    last_activity_ms: attention.and_then(|a| a.last_activity_ms),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let tier = |row: &SessionBrowserRow| {
+                if row.needs_input.is_some() {
+                    0
+                } else if row.unseen {
+                    1
+                } else {
+                    2
+                }
+            };
+            tier(a)
+                .cmp(&tier(b))
+                .then(b.last_activity_ms.cmp(&a.last_activity_ms))
+                .then(a.title.cmp(&b.title))
+        });
+        rows
+    }
+
+    fn handle_sessions_key(&mut self, code: KeyCode) {
+        let rows = self.session_browser_rows();
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.session_browser_sel = self.session_browser_sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.session_browser_sel =
+                    (self.session_browser_sel + 1).min(rows.len().saturating_sub(1));
+                self.dirty = true;
+            }
+            KeyCode::Enter => {
+                if let Some(row) = rows.get(self.session_browser_sel) {
+                    let id = row.id.clone();
+                    // Opening a session is a VIEW: the 936 attention hook
+                    // marks it seen for every surface (debounced driver-side).
+                    self.open_session(&id);
+                }
+            }
+            KeyCode::Esc => {
+                self.screen = self
+                    .session_browser_return
+                    .take()
+                    .unwrap_or(Screen::Launcher);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
     fn enter_loom(&mut self) {
         self.enter_loom_pane(LoomPane::Types, "loom");
     }
@@ -10325,18 +10459,11 @@ impl AppModel {
                     self.open_listed_session(&remainder);
                 }
             }
-            "sessions" => {
-                // The demo stub must stay a KNOWN command: without this arm
-                // it fell to the typo catch-all, which called a command
-                // `/help` itself lists "unknown" (W3c3.1 r2 completion —
-                // the first cut of P3-H removed the listing arm without
-                // re-homing the stub).
-                self.flash = Some(
-                    "· /sessions — demo stub; the sim's sessions screen is unbuilt \
-                     (live mode lists and opens)"
-                        .to_owned(),
-                );
-            }
+            // Owner 2026-08-21: the sessions screen the demo stub once
+            // called unbuilt IS built — the all-sessions browser. Both
+            // names open it; the demo says so honestly instead of
+            // fabricating a roster.
+            "sessions" => self.enter_sessions(),
             "accounts" => self.enter_accounts(),
             "peers" => self.reject_remote_placement(),
             "providers" => self.enter_providers(),
@@ -10344,6 +10471,9 @@ impl AppModel {
             // CG-M1: `/graph [pin|abandon|status]`.
             "graph" => self.enter_graph(arg.as_deref()),
             "loom" => self.enter_loom(),
+            // Owner 2026-08-21: every session on the machine, with the
+            // shared attention state visible (unseen dot, needs-you chip).
+            "resume" => self.enter_sessions(),
             "workflows" => self.enter_workflows(),
             // Owner 2026-08-16: manual retry of the failed turn — the
             // keyboard path to the ambient retry row's click.
@@ -11982,6 +12112,7 @@ impl AppModel {
                 seen_at_ms: summary.seen_at_ms,
                 last_activity_ms: summary.last_activity_ms,
                 waiting_why: summary.waiting_why.clone(),
+                needs_input: summary.needs_input.clone(),
             };
             if self.session_attention.get(&summary.session_id) != Some(&attention) {
                 self.session_attention
@@ -12227,7 +12358,9 @@ impl AppModel {
             // one frame stale, so a rect from a screen we have since left
             // must never act (review P1-5 — the law documented above was
             // only honored by the palette/menu hits).
-            Hit::AttachSession(id) if self.screen == Screen::Launcher => {
+            Hit::AttachSession(id)
+                if matches!(self.screen, Screen::Launcher | Screen::Sessions) =>
+            {
                 self.attach_session_id(&id);
             }
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
@@ -12236,6 +12369,7 @@ impl AppModel {
                 LauncherRow::Peers => self.reject_remote_placement(),
                 LauncherRow::Workflows => self.enter_workflows(),
                 LauncherRow::Loom => self.enter_loom(),
+                LauncherRow::Sessions => self.enter_sessions(),
             },
             // `/accounts` rows: click = make active for its provider (sim
             // tui.js:3604 onClick useAccount). Value-carrying alias, and

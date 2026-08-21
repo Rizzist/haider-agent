@@ -358,7 +358,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Usage
         | Screen::Fleet
         | Screen::Graph
-        | Screen::Loom => 1,
+        | Screen::Loom
+        | Screen::Sessions => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -382,6 +383,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Fleet => render_fleet(model, theme, frame, body, &mut hits),
             Screen::Graph => render_graph(model, theme, frame, body, &mut hits),
             Screen::Loom => render_loom(model, theme, frame, body),
+            Screen::Sessions => render_sessions(model, theme, frame, body, &mut hits),
         }
     }
     if model.help_open {
@@ -1254,6 +1256,15 @@ fn render_launcher(
             "⇄",
             "Peers",
             "remote placement — not supported · Haider runs local-only".to_owned(),
+        ),
+        // Owner 2026-08-21: the all-sessions browser — the launcher lists
+        // only the most recent handful, this row reaches every one of them
+        // with their attention marks.
+        (
+            LauncherRow::Sessions,
+            "≡",
+            "All sessions",
+            "every session on this machine — unseen + needs-you · /resume".to_owned(),
         ),
         // Sim rows 4+5 (tui.js:6302-6315): the Loom split surfaces.
         (
@@ -4451,6 +4462,134 @@ fn render_tree(
 /// registry + remembered session grants (research §W8b-4). Committed
 /// snapshot only; while the read is in flight the screen says so —
 /// nothing is fabricated.
+/// `/resume` — every session on the machine, ordered by attention (owner
+/// 2026-08-21). Rows render from ROSTER truth alone: the unseen dot and
+/// the typed needs-you chip come from the daemon's own attention fields
+/// (v0.0.936/937), so this list agrees with the ADE's rail by construction
+/// and needs no journal replay to draw.
+fn render_sessions(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let rows = model.session_browser_rows();
+    let needs = rows.iter().filter(|row| row.needs_input.is_some()).count();
+    let unseen = rows.iter().filter(|row| row.unseen).count();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("SESSIONS", theme.bright_style()),
+            Span::styled(
+                format!("  {} on this machine", rows.len()),
+                theme.dim_style(),
+            ),
+            Span::styled(
+                if needs > 0 {
+                    format!("  ·  {needs} need you")
+                } else {
+                    String::new()
+                },
+                theme.gold_style(),
+            ),
+            Span::styled(
+                if unseen > 0 {
+                    format!("  ·  {unseen} unseen")
+                } else {
+                    String::new()
+                },
+                theme.maroon_style(),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            "  no sessions yet — start one from the launcher",
+            theme.dim_style(),
+        ));
+    }
+    // The list body: one row per session, the selected row banded.
+    let list_top = area.y.saturating_add(2);
+    let visible = area.height.saturating_sub(3) as usize;
+    let first = model
+        .session_browser_sel
+        .saturating_sub(visible.saturating_sub(1));
+    for (offset, row) in rows.iter().skip(first).take(visible).enumerate() {
+        let index = first + offset;
+        let selected = index == model.session_browser_sel;
+        // The attention marks lead the row: gold needs-you chip, then the
+        // accent unseen dot (matching the ADE's accent-family dot so the
+        // two surfaces read identically).
+        let mark = if row.needs_input.is_some() {
+            Span::styled("  ◆ ", theme.gold_style())
+        } else if row.unseen {
+            Span::styled("  ● ", theme.maroon_style())
+        } else {
+            Span::styled("    ", theme.dim_style())
+        };
+        let mut spans = vec![
+            mark,
+            Span::styled(
+                ellipsize(&row.title, 44),
+                if selected {
+                    theme.bright_style()
+                } else {
+                    theme.text_style()
+                },
+            ),
+        ];
+        if let Some(card) = &row.needs_input {
+            spans.push(Span::styled(
+                format!("  [{}]", needs_input_label(card)),
+                theme.gold_style(),
+            ));
+        }
+        if let Some(agent_type) = &row.agent_type {
+            spans.push(Span::styled(
+                format!("  {agent_type}"),
+                theme.maroon_style(),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("  {}  ·  {}  ·  {}", row.model_short, row.dir, row.ago),
+            theme.dim_style(),
+        ));
+        let mut line = Line::from(spans);
+        if selected {
+            line = line.style(theme.hover_style());
+        }
+        lines.push(line);
+        let row_y = list_top.saturating_add(offset as u16);
+        if row_y < area.y.saturating_add(area.height) {
+            hits.push((
+                Rect::new(area.x, row_y, area.width, 1),
+                Hit::AttachSession(row.id.clone()),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The needs-you chip's copy for one unified card.
+fn needs_input_label(card: &haider_rpc::NeedsInputWire) -> &'static str {
+    use haider_rpc::NeedsInputKindWire;
+    match card.kind {
+        NeedsInputKindWire::Permission => "permission",
+        NeedsInputKindWire::Question => "question",
+        NeedsInputKindWire::Approval => "approval",
+        NeedsInputKindWire::Recovery => "recover",
+        NeedsInputKindWire::Secret => "secret",
+        NeedsInputKindWire::Update => "update",
+        NeedsInputKindWire::TrustHook => "trust",
+        NeedsInputKindWire::Choice => "choice",
+        NeedsInputKindWire::Conflict => "conflict",
+        NeedsInputKindWire::File => "file",
+        NeedsInputKindWire::Exhausted => "exhausted",
+        NeedsInputKindWire::Unknown => "input",
+    }
+}
+
 fn render_tools(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![
         Line::styled("TOOLS — daemon inventory", theme.bright_style()),
