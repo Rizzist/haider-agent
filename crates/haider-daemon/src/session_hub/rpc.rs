@@ -4813,11 +4813,26 @@ impl HubConnection {
                 );
             }
         };
+        // W-flow — probe each DISTINCT declared CLI once and report device
+        // presence alongside the registry, so a missing program is visible
+        // before the bind instead of at the first failing turn.
+        let cli_present: std::collections::BTreeMap<String, bool> = agent_types
+            .iter()
+            .flat_map(|record| record.clis.iter())
+            .map(|cli| cli.to_owned())
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
+            .map(|cli| {
+                let present = haider_platform::program_on_path(&cli);
+                (cli, present)
+            })
+            .collect();
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::LoomList {
                 agent_types,
                 workflows,
+                cli_present,
             },
         })
     }

@@ -3367,6 +3367,10 @@ pub struct AppModel {
     /// that the TUI opens as soon as the live list proves it exists. Cleared
     /// after one attempt — found or honestly flashed as unknown.
     pub initial_session: Option<SessionId>,
+    /// W-flow — device PATH presence per declared CLI, from `loom.list`.
+    /// A name ABSENT from this map was never probed (older daemon) and must
+    /// render as unknown, never as missing.
+    pub loom_cli_present: std::collections::BTreeMap<String, bool>,
     pub loom_loaded: bool,
     /// Round 4: the per-connection loom.list dedup latch — separate from
     /// `loom_loaded` (truth) so an in-flight read renders as LOADING.
@@ -3737,6 +3741,7 @@ impl Default for AppModel {
             loom_types: Vec::new(),
             loom_workflows: Vec::new(),
             initial_session: None,
+            loom_cli_present: std::collections::BTreeMap::new(),
             loom_loaded: false,
             loom_requested: false,
             loom_selection: 0,
@@ -5507,6 +5512,9 @@ impl AppModel {
                 },
                 KeyCode::Char('n') if self.screen == Screen::Loom => {
                     self.seed_loom_authoring();
+                }
+                KeyCode::Char('i') if self.screen == Screen::Loom => {
+                    self.seed_cli_provisioning();
                 }
                 // Ctrl+T cycles the theme (demo stand-in for /theme).
                 KeyCode::Char('t') => self.cycle_theme(),
@@ -9653,6 +9661,63 @@ impl AppModel {
     /// sessions only; the daemon validates the id against the registry (a
     /// miss is a typed refusal the flash carries) and identity moves only
     /// on the `agent_type_selected` fact — nothing installs here.
+    /// W-flow (owner 2026-08-22) — "after confirmation, install the required
+    /// clis on the device".
+    ///
+    /// The confirmation is the one we ALREADY audit: this seeds an ordinary
+    /// turn, and the install runs as a `process_exec` effect behind the
+    /// normal permission card. It deliberately does NOT add a privileged
+    /// installer door — a door that takes a program name and runs a package
+    /// manager is arbitrary code execution with a friendly label, and it
+    /// would bypass the very card that makes the install reviewable.
+    ///
+    /// The names are not model-authored: they are the type's DECLARED CLIs,
+    /// already validated at registration (concrete programs, never a shell
+    /// dispatcher), narrowed to the ones this device was PROBED and found to
+    /// lack. The operator still sees, and approves, the actual command.
+    pub fn seed_cli_provisioning(&mut self) {
+        self.dirty = true;
+        if self.loom_pane != LoomPane::Types {
+            self.flash = Some("· install — agent types carry the CLI grants".to_owned());
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· install runs live — the permission card confirms".to_owned());
+            return;
+        }
+        if self.active_session.is_none() {
+            self.flash = Some("· no bound session — open a session first".to_owned());
+            return;
+        }
+        let Some(TypeRow::Registered(index)) = self.type_row(self.loom_selection) else {
+            self.flash = Some("· install — select a registered agent type".to_owned());
+            return;
+        };
+        let Some(record) = self.loom_types.get(index) else {
+            return;
+        };
+        let missing = crate::render::missing_clis(self, record);
+        if missing.is_empty() {
+            // Never-probed names land here too, and that is correct: we do
+            // not offer to install what we did not check.
+            self.flash = Some(format!("· @{} — nothing missing to install", record.id));
+            return;
+        }
+        let id = record.id.clone();
+        let list = missing.join(", ");
+        let text = format!(
+            "The @{id} agent type declares CLIs this device does not have: {list}. \
+             Install exactly those programs using this machine's usual package \
+             manager, one program per command, and nothing else. Show me each \
+             command before you run it, then verify each one is on PATH."
+        );
+        self.composer.set_text(&text);
+        self.flash = Some(format!(
+            "· install {} — review the command, the permission card confirms",
+            list
+        ));
+    }
+
     fn bind_selected_type(&mut self) {
         self.dirty = true;
         if self.mode.fabricates_locally() {

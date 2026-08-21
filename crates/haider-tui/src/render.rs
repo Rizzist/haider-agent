@@ -4590,6 +4590,22 @@ fn needs_input_label(card: &haider_rpc::NeedsInputWire) -> &'static str {
     }
 }
 
+/// W-flow — the declared CLIs this device does NOT have, in declaration
+/// order. A name the daemon never probed is OMITTED: unknown is not
+/// missing, and offering to install something we never checked would be a
+/// guess dressed as a fact.
+pub fn missing_clis(
+    model: &AppModel,
+    record: &haider_protocol::loom::LoomAgentType,
+) -> Vec<String> {
+    record
+        .clis
+        .iter()
+        .filter(|cli| model.loom_cli_present.get(*cli) == Some(&false))
+        .cloned()
+        .collect()
+}
+
 /// Lay a workflow's node graph out in dependency LAYERS and draw it, so the
 /// shape of a flow is visible at a glance instead of reconstructed from a
 /// flat list of `← after` clauses (owner 2026-08-22).
@@ -5801,11 +5817,41 @@ fn render_loom(
             ));
             for (label, list) in [("cli", &record.clis), ("api", &record.apis)] {
                 for item in list {
-                    lines.push(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(format!("  {label} "), theme.dim_style()),
                         Span::styled(item.clone(), accent),
-                    ]));
+                    ];
+                    // W-flow: a declared CLI is a capability grant, not a
+                    // promise the program EXISTS. Three states, and the
+                    // third is not the second: present, missing, and NOT
+                    // PROBED (an older daemon sent no map) — an unprobed
+                    // name must never be drawn as missing.
+                    if label == "cli" {
+                        match model.loom_cli_present.get(item) {
+                            Some(true) => {
+                                spans.push(Span::styled("  ✓ installed", theme.faint_style()))
+                            }
+                            Some(false) => spans
+                                .push(Span::styled("  ✗ not on this device", theme.warn_style())),
+                            None => {}
+                        }
+                    }
+                    lines.push(Line::from(spans));
                 }
+            }
+            let missing = missing_clis(model, record);
+            if !missing.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ⌃I ", theme.gold_style()),
+                    Span::styled(
+                        format!(
+                            "install the {} missing program{}",
+                            missing.len(),
+                            if missing.len() == 1 { "" } else { "s" }
+                        ),
+                        theme.dim_style(),
+                    ),
+                ]));
             }
             if record.clis.is_empty() && record.apis.is_empty() {
                 lines.push(Line::styled(

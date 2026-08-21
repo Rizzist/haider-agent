@@ -1331,9 +1331,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::LoomList {
             agent_types,
             workflows,
+            cli_present,
         } => vec![LiveReply::LoomRegistry {
             agent_types,
             workflows,
+            cli_present,
             epoch: context.loom_epoch.unwrap_or(0),
         }],
         ResponseBody::GraphStatus { status } => match context.graph.clone() {

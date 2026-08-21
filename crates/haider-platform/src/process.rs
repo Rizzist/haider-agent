@@ -725,3 +725,68 @@ pub fn exit_signal(status: &ExitStatus) -> Option<i32> {
 pub fn exit_signal(_status: &ExitStatus) -> Option<i32> {
     None
 }
+
+/// W-flow (owner 2026-08-22) — is `program` runnable on this device?
+///
+/// A Loom agent type DECLARES the CLIs it may touch, and that declaration is
+/// a capability grant enforced at spawn. It is not a promise the program is
+/// installed: a type can register naming `yt-dlp` and only discover the gap
+/// at its first failing turn. This answers the question before the bind.
+///
+/// Resolution mirrors what an exec would actually do, deliberately WITHOUT
+/// running a shell — no `which`, no subprocess, nothing the probe itself
+/// could execute. A name containing a separator is a path and is checked
+/// where it points; a bare name is searched along `PATH`.
+///
+/// A directory never counts, and on unix neither does a non-executable
+/// file — `PATH` hits that cannot be run are not presence.
+pub fn program_on_path(program: &str) -> bool {
+    if program.is_empty() {
+        return false;
+    }
+    let looks_like_path = program.contains('/') || (cfg!(windows) && program.contains('\\'));
+    if looks_like_path {
+        return is_executable_file(std::path::Path::new(program));
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        let candidate = dir.join(program);
+        if is_executable_file(&candidate) {
+            return true;
+        }
+        // Windows runs `tool` as `tool.exe`/`tool.cmd`/...; PATHEXT is the
+        // authority, with the documented default when it is unset.
+        if cfg!(windows) {
+            let extensions =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+            return extensions
+                .split(';')
+                .filter(|ext| !ext.is_empty())
+                .any(|ext| is_executable_file(&dir.join(format!("{program}{ext}"))));
+        }
+        false
+    })
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}

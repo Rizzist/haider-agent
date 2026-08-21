@@ -127,6 +127,11 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_MODELS_LIST_V1`. Expected RUNTIME failure: the ADE cannot sniff
 /// the headless session-config door / model-library enumeration (W-CFG).
 ///
+/// MUTATION CHECK: remove `FEATURE_LOOM_CLI_PRESENCE_V1`. Expected RUNTIME
+/// failure: clients cannot discover that `loom.list` reports device PATH
+/// presence, so a missing declared CLI stays invisible until the agent
+/// type's first failing turn (W-flow).
+///
 /// MUTATION CHECK: remove `FEATURE_TUI_ATTACH_ANNOUNCE_V1` or
 /// `FEATURE_SESSION_LINEAGE_V1`. Expected RUNTIME failure: the ADE cannot
 /// sniff the OSC 7791 attach announce stream / typed subagent lineage and
@@ -157,6 +162,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_HOOKS_SERVER_V1.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
+            haider_rpc::FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
             haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),
             haider_rpc::FEATURE_PIPE_NATIVE_V2.to_owned(),

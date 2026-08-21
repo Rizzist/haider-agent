@@ -818,6 +818,9 @@ pub enum LiveReply {
     LoomRegistry {
         agent_types: Vec<haider_protocol::loom::LoomAgentType>,
         workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+        /// W-flow — device PATH presence per DECLARED cli name. Absent key
+        /// means NOT PROBED (older daemon), never "missing".
+        cli_present: std::collections::BTreeMap<String, bool>,
         /// Echoed from the LoomList command — round 4's stale-reply fence.
         epoch: u64,
     },
@@ -1924,6 +1927,7 @@ impl LiveDriver {
             LiveReply::LoomRegistry {
                 agent_types,
                 workflows,
+                cli_present,
                 epoch,
             } => {
                 // Round 3/4: a reply that outlived its socket is stale. The
@@ -1937,6 +1941,7 @@ impl LiveDriver {
                         model.loom_types != agent_types || model.loom_workflows != workflows;
                     model.loom_types = agent_types;
                     model.loom_workflows = workflows;
+                    model.loom_cli_present = cli_present;
                     model.loom_loaded = true;
                     // rev933b finding 9: the clamp is PANE-LOCAL — the
                     // browser shows one list at a time, so a stale index

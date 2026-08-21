@@ -34,6 +34,7 @@ pub use ipc::{
     PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner, split,
     sweep_stale_endpoints, write_immediate,
 };
+pub use process::program_on_path;
 pub use process::{
     ProcessGroup, ProcessId, ProcessSignal, configure_background_process,
     configure_process_environment, configure_process_group, exit_signal, kill_process_tree,

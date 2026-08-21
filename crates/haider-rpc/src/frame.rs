@@ -359,6 +359,8 @@ pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 /// Daemon implements the Loom registry: agent types + pipe-source workflows
 /// (`loom.list`, `loom.register_agent_type`, `loom.register_workflow`).
 pub const FEATURE_LOOM_V1: &str = "loom_v1";
+/// W-flow — `loom.list` carries the declared-CLI device presence map.
+pub const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
 /// Daemon can push changed/new session summaries after a read-only roster
 /// watch is accepted.
 pub const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
@@ -2254,6 +2256,18 @@ pub enum ResponseBody {
         agent_types: Vec<haider_protocol::loom::LoomAgentType>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+        /// W-flow (owner 2026-08-22) — device PATH presence for every CLI
+        /// any registered type DECLARES, probed at list time. A type may
+        /// register naming `yt-dlp` and only discover at spawn that the
+        /// device has never had it; this makes the gap visible before the
+        /// bind rather than at the first failing turn.
+        ///
+        /// Keyed by the declared name verbatim. Absent from the map means
+        /// NOT PROBED (an older daemon, or a name that reached the client
+        /// some other way) — which is not the same as absent from the
+        /// device, and clients must not render it as missing.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        cli_present: std::collections::BTreeMap<String, bool>,
     },
     /// B1 — a committed (or no-op) registration.
     #[serde(rename = "loom.registered")]
