@@ -3251,6 +3251,10 @@ pub async fn run_live(
             sync_session_announce(attached.as_deref());
             announced_session = Some(attached);
         }
+        // Typed replacement channel for clients migrating away from OSC
+        // scraping. The driver's connection/generation-aware dedup emits on
+        // bind, rebind, unbind, and once again after every reconnect.
+        pending.extend(driver.sync_resident_binding(&model));
         // W-INP: watch and publish the active per-surface composer through
         // the driver's shared revision fence. Nothing is journaled.
         pending.extend(driver.sync_input_mirror(&model));

@@ -3243,8 +3243,55 @@ fn account_list_watch_is_a_signal_not_a_delta() {
         "the signal carries no registry payload: {encoded}"
     );
 
-    // No round-trip assertion here on purpose: `WireFrame` derives only
-    // Debug/Clone/PartialEq and its canonical wire encoding goes through the
-    // borrowed `WireFrameRef`, so decoding the owned enum is not the real
-    // path and asserting on it would pin a fiction.
+    assert_eq!(
+        serde_json::from_value::<WireFrame>(encoded).expect("decodes"),
+        event,
+        "a listed signal must not fall through the owned decoder's Unknown arm"
+    );
+}
+
+/// The resident binding signal represents unbind by omitting `session_id`,
+/// keeps the generation fence required, and ignores additive future fields.
+///
+/// MUTATION CHECK: delete `skip_serializing_if = "Option::is_none"` from the
+/// borrowed `session_id` field. Expected runtime failure: the exact unbind
+/// golden contains `"session_id":null` instead of the additive absent-field
+/// shape older clients decode.
+#[test]
+fn resident_session_binding_decodes_without_optional_fields() {
+    use haider_protocol::ids::SessionId;
+    use haider_rpc::WireFrame;
+
+    let unbound_json = serde_json::json!({
+        "v": 1,
+        "kind": "resident_session_binding",
+        "worker_generation": 17,
+        "future_field": {"safe": true}
+    });
+    let unbound: WireFrame = serde_json::from_value(unbound_json).expect("unbind decodes");
+    assert_eq!(
+        unbound,
+        WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: 17,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&unbound).expect("unbind encodes"),
+        serde_json::json!({
+            "v": 1,
+            "kind": "resident_session_binding",
+            "worker_generation": 17
+        })
+    );
+
+    let bound = WireFrame::ResidentSessionBinding {
+        session_id: Some(SessionId::new("session-bound")),
+        worker_generation: 17,
+    };
+    assert_eq!(
+        serde_json::from_value::<WireFrame>(serde_json::to_value(&bound).expect("bound encodes"))
+            .expect("bound decodes"),
+        bound
+    );
 }

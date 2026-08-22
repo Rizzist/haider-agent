@@ -471,6 +471,445 @@ impl FrameSink for CapturingFrameSink {
     }
 }
 
+#[derive(Default)]
+struct RefusingRequiredFrameSink(AtomicBool);
+
+impl FrameSink for RefusingRequiredFrameSink {
+    fn try_send(&self, _frame: WireFrame) -> Result<(), FrameSendError> {
+        Err(FrameSendError)
+    }
+
+    fn close_after_required_delivery_failure(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// MUTATION CHECK: replace the retained baseline read in `open_connection`
+/// with `None`. Expected runtime failure: after the pressured observer is
+/// closed, its replacement receives no current binding and remains stale.
+#[tokio::test]
+async fn resident_session_binding_recovers_refusal_with_late_subscriber_baseline() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session = SessionId::new("resident-binding-baseline");
+    hub.create_internal_session(create_command(&session, "resident-binding-baseline"))
+        .await
+        .expect("session created");
+    let capabilities = std::collections::BTreeSet::from([
+        haider_rpc::Capability::Control,
+        haider_rpc::Capability::View,
+    ]);
+    let publisher = hub
+        .open_connection(
+            capabilities.clone(),
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("publisher connection");
+    let refusing_sink = Arc::new(RefusingRequiredFrameSink::default());
+    let refused_observer = hub
+        .open_connection(
+            capabilities.clone(),
+            refusing_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("observer opens before a baseline exists");
+    let generation = store.worker_generation();
+
+    publisher
+        .resident_session_binding(Some(session.clone()), generation)
+        .await
+        .expect("binding is retained despite observer refusal");
+    assert!(
+        refusing_sink.0.load(Ordering::Acquire),
+        "required-state refusal closes the stale transport"
+    );
+    refused_observer
+        .close()
+        .await
+        .expect("refused observer closes");
+
+    let replacement_sink = Arc::new(CapturingFrameSink::default());
+    let replacement = hub
+        .open_connection(
+            capabilities,
+            replacement_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("replacement observer receives retained baseline");
+    assert_eq!(
+        replacement_sink
+            .0
+            .lock()
+            .expect("replacement frames")
+            .as_slice(),
+        &[WireFrame::ResidentSessionBinding {
+            session_id: Some(session),
+            worker_generation: generation,
+        }]
+    );
+
+    publisher.close().await.expect("publisher closes");
+    replacement.close().await.expect("replacement closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: delete the one-line owner comparison in
+/// `clear_resident_binding`. Expected runtime failure: closing the overlapped
+/// old publisher emits a same-generation unbind that clears the replacement.
+#[tokio::test]
+async fn resident_session_binding_old_owner_cannot_clear_replacement() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session = SessionId::new("resident-binding-owner");
+    hub.create_internal_session(create_command(&session, "resident-binding-owner"))
+        .await
+        .expect("session created");
+    let capabilities = std::collections::BTreeSet::from([
+        haider_rpc::Capability::Control,
+        haider_rpc::Capability::View,
+    ]);
+    let first = hub
+        .open_connection(
+            capabilities.clone(),
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("first publisher");
+    let observer_sink = Arc::new(CapturingFrameSink::default());
+    let observer = hub
+        .open_connection(
+            capabilities.clone(),
+            observer_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("observer");
+    let generation = store.worker_generation();
+    first
+        .resident_session_binding(Some(session.clone()), generation)
+        .await
+        .expect("first bind");
+
+    let replacement = hub
+        .open_connection(
+            capabilities,
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("replacement publisher");
+    replacement
+        .resident_session_binding(Some(session.clone()), generation)
+        .await
+        .expect("same-state reannounce transfers ownership");
+    first.close().await.expect("old publisher closes");
+    assert_eq!(
+        observer_sink.0.lock().expect("observer frames").as_slice(),
+        &[WireFrame::ResidentSessionBinding {
+            session_id: Some(session),
+            worker_generation: generation,
+        }],
+        "old-owner close cannot append an unbind"
+    );
+
+    replacement.close().await.expect("current publisher closes");
+    assert!(matches!(
+        observer_sink.0.lock().expect("observer frames").last(),
+        Some(WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: observed_generation,
+        }) if *observed_generation == generation
+    ));
+    observer.close().await.expect("observer closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: replace the registry's `max_by_key` selection with the
+/// closing publisher. Expected runtime failure: closing the newest resident
+/// emits `None` instead of restoring the still-live predecessor's session.
+#[tokio::test]
+async fn resident_session_binding_restores_live_predecessor() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let first_session = SessionId::new("resident-binding-predecessor");
+    let second_session = SessionId::new("resident-binding-newest");
+    hub.create_internal_session(create_command(
+        &first_session,
+        "resident-binding-predecessor",
+    ))
+    .await
+    .expect("predecessor session created");
+    hub.create_internal_session(create_command(&second_session, "resident-binding-newest"))
+        .await
+        .expect("newest session created");
+    let capabilities = std::collections::BTreeSet::from([
+        haider_rpc::Capability::Control,
+        haider_rpc::Capability::View,
+    ]);
+    let first = hub
+        .open_connection(
+            capabilities.clone(),
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("first publisher");
+    let second = hub
+        .open_connection(
+            capabilities.clone(),
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("second publisher");
+    let observer_sink = Arc::new(CapturingFrameSink::default());
+    let observer = hub
+        .open_connection(
+            capabilities,
+            observer_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("observer");
+    let generation = store.worker_generation();
+
+    first
+        .resident_session_binding(Some(first_session.clone()), generation)
+        .await
+        .expect("predecessor binds");
+    second
+        .resident_session_binding(Some(second_session.clone()), generation)
+        .await
+        .expect("newest binds");
+    second.close().await.expect("newest publisher closes");
+
+    assert_eq!(
+        observer_sink.0.lock().expect("observer frames").as_slice(),
+        &[
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(first_session.clone()),
+                worker_generation: generation,
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(second_session),
+                worker_generation: generation,
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(first_session),
+                worker_generation: generation,
+            },
+        ]
+    );
+
+    first.close().await.expect("predecessor closes");
+    observer.close().await.expect("observer closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: replace the one-line `may_view_binding` capability
+/// expression with `true`. Expected runtime failure: a capability-empty
+/// client receives the retained session id and explicit unbind transition.
+#[tokio::test]
+async fn resident_session_binding_requires_view_for_baseline_and_push() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session = SessionId::new("resident-binding-view-gate");
+    hub.create_internal_session(create_command(&session, "resident-binding-view-gate"))
+        .await
+        .expect("session created");
+    let publisher = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("publisher");
+    let generation = store.worker_generation();
+    publisher
+        .resident_session_binding(Some(session), generation)
+        .await
+        .expect("bind publishes");
+
+    let denied_sink = Arc::new(CapturingFrameSink::default());
+    let denied = hub
+        .open_connection(
+            std::collections::BTreeSet::new(),
+            denied_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("capability-empty connection remains valid");
+    publisher
+        .resident_session_binding(None, generation)
+        .await
+        .expect("unbind publishes");
+    assert!(
+        denied_sink.0.lock().expect("denied frames").is_empty(),
+        "session identity is not visible without View or Control"
+    );
+
+    publisher.close().await.expect("publisher closes");
+    denied.close().await.expect("denied connection closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: delete the one-line `publish_resident_binding` call in
+/// `HubConnection::resident_session_binding`. Expected runtime failure: the
+/// observer misses the bind, rebind, and explicit unbind transition frames.
+#[tokio::test]
+async fn resident_session_binding_fans_out_bind_rebind_and_unbind() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let first = SessionId::new("resident-binding-first");
+    let second = SessionId::new("resident-binding-second");
+    hub.create_internal_session(create_command(&first, "resident-binding-first"))
+        .await
+        .expect("first session created");
+    hub.create_internal_session(create_command(&second, "resident-binding-second"))
+        .await
+        .expect("second session created");
+
+    let publisher_sink = Arc::new(CapturingFrameSink::default());
+    let observer_sink = Arc::new(CapturingFrameSink::default());
+    let capabilities = std::collections::BTreeSet::from([
+        haider_rpc::Capability::Control,
+        haider_rpc::Capability::View,
+    ]);
+    let publisher = hub
+        .open_connection(
+            capabilities.clone(),
+            publisher_sink,
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("publisher connection");
+    let observer = hub
+        .open_connection(
+            capabilities,
+            observer_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("observer connection");
+    let generation = store.worker_generation();
+
+    publisher
+        .resident_session_binding(Some(first.clone()), generation)
+        .await
+        .expect("bind publishes");
+    publisher
+        .resident_session_binding(Some(second.clone()), generation)
+        .await
+        .expect("rebind publishes");
+    publisher
+        .resident_session_binding(None, generation)
+        .await
+        .expect("unbind publishes");
+
+    assert_eq!(
+        observer_sink.0.lock().expect("observer frames").as_slice(),
+        &[
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(first),
+                worker_generation: generation,
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(second),
+                worker_generation: generation,
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: generation,
+            },
+        ]
+    );
+
+    publisher.close().await.expect("publisher closes");
+    observer.close().await.expect("observer closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: change the generation comparison in
+/// `resident_session_binding` from `!=` to `==`. Expected runtime failure: a
+/// stale post-rebind unbind reaches the observer and clears its fresh state.
+#[tokio::test]
+async fn resident_session_binding_discards_stale_generation_after_rebind() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let current = SessionId::new("resident-binding-current");
+    hub.create_internal_session(create_command(&current, "resident-binding-current"))
+        .await
+        .expect("current session created");
+
+    let publisher_sink = Arc::new(CapturingFrameSink::default());
+    let observer_sink = Arc::new(CapturingFrameSink::default());
+    let capabilities = std::collections::BTreeSet::from([
+        haider_rpc::Capability::Control,
+        haider_rpc::Capability::View,
+    ]);
+    let publisher = hub
+        .open_connection(
+            capabilities.clone(),
+            publisher_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("publisher connection");
+    let observer = hub
+        .open_connection(
+            capabilities,
+            observer_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("observer connection");
+    let generation = store.worker_generation();
+    assert!(generation > 0, "worker generations are positive fences");
+
+    publisher
+        .resident_session_binding(Some(current.clone()), generation)
+        .await
+        .expect("fresh rebind publishes");
+    publisher
+        .resident_session_binding(None, generation - 1)
+        .await
+        .expect("stale publish is rejected without closing the connection");
+
+    assert_eq!(
+        observer_sink.0.lock().expect("observer frames").as_slice(),
+        &[WireFrame::ResidentSessionBinding {
+            session_id: Some(current),
+            worker_generation: generation,
+        }]
+    );
+    assert!(
+        publisher_sink
+            .0
+            .lock()
+            .expect("publisher frames")
+            .iter()
+            .any(|frame| matches!(
+                frame,
+                WireFrame::ProtocolError(error)
+                    if error.code == haider_rpc::ERROR_CODE_STALE_GENERATION && !error.fatal
+            )),
+        "publisher receives the standard non-fatal stale-generation rejection"
+    );
+
+    publisher.close().await.expect("publisher closes");
+    observer.close().await.expect("observer closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
 /// The pipe location is daemon-owned: the view RPC returns the exact absolute
 /// resolver output for a durable session and applies the standard session
 /// not-found response before exposing any synthesized filename.

@@ -1531,6 +1531,55 @@ async fn effect_probe_observation(
 }
 
 impl HubConnection {
+    /// Publishes the resident TUI's foreground session after applying the same
+    /// exact worker-generation fence used by control mutations. This is an
+    /// uncorrelated top-level signal: a stale publisher receives a non-fatal
+    /// `ProtocolError`, while accepted state is fanned out to other clients.
+    pub(crate) async fn resident_session_binding(
+        &self,
+        session_id: Option<SessionId>,
+        worker_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+            return self.send(WireFrame::ProtocolError(ProtocolError {
+                code: ERROR_CODE_CAPABILITY_DENIED.into(),
+                message: message.into(),
+                fatal: false,
+                presentation: None,
+                failed_write_ids: Vec::new(),
+            }));
+        }
+        if worker_generation != self.hub.worker_generation() {
+            return self.send(WireFrame::ProtocolError(ProtocolError {
+                code: ERROR_CODE_STALE_GENERATION.into(),
+                message: "resident session binding worker generation is stale".into(),
+                fatal: false,
+                presentation: None,
+                failed_write_ids: Vec::new(),
+            }));
+        }
+        if let Some(session_id) = session_id.as_ref()
+            && self.hub.inner.store.latest_seq(session_id).await? == 0
+        {
+            return self.send(WireFrame::ProtocolError(ProtocolError {
+                code: ERROR_CODE_NOT_FOUND.into(),
+                message: "resident session binding names an unknown session".into(),
+                fatal: false,
+                presentation: None,
+                failed_write_ids: Vec::new(),
+            }));
+        }
+        self.hub
+            .publish_resident_binding(&self.connection_id, session_id, worker_generation)
+    }
+
+    pub(super) fn clear_resident_binding(&self) {
+        self.hub.clear_resident_binding(&self.connection_id);
+    }
+
     async fn artifact_put(
         &self,
         request_id: RequestId,
@@ -8016,6 +8065,7 @@ impl HubConnection {
         {
             oauth.cancel_connection(&self.connection_id);
         }
+        self.clear_resident_binding();
         self.hub.detach_connection(&self.connection_id).await
     }
 }

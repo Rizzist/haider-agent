@@ -449,6 +449,19 @@ async fn issue(
     replies: &mpsc::Sender<LiveReply>,
     attaches: &mpsc::Sender<Vec<LiveReply>>,
 ) -> bool {
+    if let LiveCommand::ResidentSessionBinding {
+        session,
+        worker_generation,
+    } = command
+    {
+        let _ = client
+            .send_frame(WireFrame::ResidentSessionBinding {
+                session_id: session,
+                worker_generation,
+            })
+            .await;
+        return false;
+    }
     // A menu answer is an UNCORRELATED frame by wire design (the durable
     // identity is its `command_id`). Its outcome arrives as the committed
     // `MenuAnswered` envelope, which is also what retires it from the
@@ -1179,6 +1192,9 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             haider_client::transcription::secret_set_request(secret, clear)
         }
         LiveCommand::Answer { .. } => unreachable!("answers ride send_frame, not request"),
+        LiveCommand::ResidentSessionBinding { .. } => {
+            unreachable!("resident bindings ride send_frame, not request")
+        }
     }
 }
 
@@ -1787,6 +1803,10 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             session: session_id,
             op,
         }],
+        // This TUI is a publisher, not a consumer, of profile-level resident
+        // binding signals. Name the known frame explicitly so it can never be
+        // confused with the forward-compat fallback below.
+        WireFrame::ResidentSessionBinding { .. } => Vec::new(),
         WireFrame::ProtocolError(error)
             if matches!(
                 error.code.as_str(),
@@ -1809,8 +1829,30 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             retryable: !error.fatal,
             presentation: error.presentation,
         }],
-        // Handshake, correlated, and heartbeat frames never reach here; an
-        // unknown frame from a newer daemon is tolerated, never fatal.
-        _ => Vec::new(),
+        // Known traffic that is irrelevant to this TUI is named rather than
+        // hidden under the fallback. `Unknown` is the deliberate
+        // forward-compatibility drop: Serde maps a newer daemon's unknown
+        // discriminant here without failing the connection.
+        WireFrame::Hello(_)
+        | WireFrame::Welcome(_)
+        | WireFrame::Request { .. }
+        | WireFrame::Response { .. }
+        | WireFrame::SessionRosterDelta { .. }
+        | WireFrame::AccountsChanged { .. }
+        | WireFrame::SessionSurfaceDelta { input: None, .. }
+        | WireFrame::MenuAnswer { .. }
+        | WireFrame::Ping { .. }
+        | WireFrame::Pong { .. }
+        | WireFrame::Unknown => Vec::new(),
+        // `WireFrame` is non-exhaustive, so Rust requires a fallback. It must
+        // not be silent: after an RPC crate upgrade, a newly known stateful
+        // frame has to surface until this match gives it an explicit policy.
+        _ => vec![LiveReply::Failed {
+            command_id: None,
+            code: "unsupported_frame".into(),
+            message: "the TUI received a newly known RPC frame without a routing policy".into(),
+            retryable: true,
+            presentation: None,
+        }],
     }
 }

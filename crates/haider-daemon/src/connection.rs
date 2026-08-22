@@ -53,13 +53,13 @@ use haider_rpc::{
     FEATURE_EXPORT_SEQ_V1, FEATURE_FALLBACK_CHAIN_V1, FEATURE_HOOKS_SERVER_V1, FEATURE_HOOKS_V1,
     FEATURE_LOOM_CLI_PRESENCE_V1, FEATURE_LOOM_V1, FEATURE_MODELS_LIST_V1, FEATURE_PIPE_NATIVE_V2,
     FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
-    FEATURE_PROVIDER_REMOVE_V1, FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_RETRY_V1,
-    FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
-    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RUN_ID_V1, FEATURE_SHELL_EXEC_V1,
-    FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_USER_COMMAND_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome,
-    WireEncoding, WireFrame, negotiate, uds_codec,
+    FEATURE_PROVIDER_REMOVE_V1, FEATURE_RESIDENT_SESSION_BINDING_V1,
+    FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_RETRY_V1, FEATURE_SESSION_CONFIG_V1,
+    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
+    FEATURE_SESSION_OBSERVE_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RUN_ID_V1,
+    FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError,
+    RequestId, ServerRange, Welcome, WireEncoding, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::IoSlice;
@@ -862,6 +862,10 @@ impl FrameSink for ConnectionFrameSink {
         Some(self.outbound_limit)
     }
 
+    fn close_after_required_delivery_failure(&self) {
+        self.lane.close();
+    }
+
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
         let bytes = encode_outbound_parts(&frame, self.outbound_limit, self.encoding)
@@ -1612,6 +1616,37 @@ async fn handle_frame(
                 .map_err(DaemonError::from)?;
             Ok(false)
         }
+        WireFrame::ResidentSessionBinding {
+            session_id,
+            worker_generation,
+        } => {
+            if !grant
+                .as_ref()
+                .is_some_and(|grant| grant.capabilities.contains(&Capability::Control))
+            {
+                enqueue(
+                    lane,
+                    &WireFrame::ProtocolError(ProtocolError {
+                        code: haider_rpc::ERROR_CODE_CAPABILITY_DENIED.into(),
+                        message: "resident session binding requires control capability".into(),
+                        fatal: false,
+                        presentation: None,
+                        failed_write_ids: Vec::new(),
+                    }),
+                    *outbound_limit,
+                    *encoding,
+                )?;
+                return Ok(false);
+            }
+            let connection = hub_connection.as_ref().ok_or_else(|| DaemonError::Task {
+                message: "negotiated connection has no session-hub registration".into(),
+            })?;
+            connection
+                .resident_session_binding(session_id, worker_generation)
+                .await
+                .map_err(DaemonError::from)?;
+            Ok(false)
+        }
         WireFrame::Unknown => {
             enqueue(
                 lane,
@@ -1741,6 +1776,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_PROVIDER_MODELS_V1.to_owned(),
         FEATURE_MODELS_LIST_V1.to_owned(),
         FEATURE_PROVIDER_REMOVE_V1.to_owned(),
+        FEATURE_RESIDENT_SESSION_BINDING_V1.to_owned(),
         FEATURE_RUN_RETRY_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),

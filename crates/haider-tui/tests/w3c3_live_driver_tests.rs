@@ -126,6 +126,83 @@ fn attach_all(driver: &mut LiveDriver, model: &mut AppModel, count: usize) {
     }
 }
 
+fn resident_binding_fixture() -> (LiveDriver, AppModel) {
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_V1.to_owned());
+    let mut driver = LiveDriver::new("resident-binding-test");
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(0, 1), summary(1, 1)],
+            next_cursor: None,
+        },
+    );
+    (driver, model)
+}
+
+/// MUTATION CHECK: replace the one-line `vec![LiveCommand::ResidentSessionBinding
+/// { .. }]` return with `Vec::new()`. Expected runtime failure: entering a
+/// session still emits OSC bytes but no typed bind command reaches the link.
+#[test]
+fn resident_binding_announce_fires_on_bind() {
+    let (mut driver, mut model) = resident_binding_fixture();
+    model.open_session(&sid(0));
+
+    assert_eq!(
+        driver.sync_resident_binding(&model),
+        vec![LiveCommand::ResidentSessionBinding {
+            session: Some(sid(0)),
+            worker_generation: 7,
+        }]
+    );
+    assert!(
+        driver.sync_resident_binding(&model).is_empty(),
+        "an unchanged binding is not re-announced every render pass"
+    );
+}
+
+/// MUTATION CHECK: change `session.clone()` to the previously announced
+/// session in `sync_resident_binding`. Expected runtime failure: hopping from
+/// one warm session to another emits no rebind and this exact `s-1` assertion
+/// receives `s-0` (or no command).
+#[test]
+fn resident_binding_announce_fires_on_rebind() {
+    let (mut driver, mut model) = resident_binding_fixture();
+    model.open_session(&sid(0));
+    let _ = driver.sync_resident_binding(&model);
+
+    model.open_session(&sid(1));
+    assert_eq!(
+        driver.sync_resident_binding(&model),
+        vec![LiveCommand::ResidentSessionBinding {
+            session: Some(sid(1)),
+            worker_generation: 7,
+        }]
+    );
+}
+
+/// MUTATION CHECK: change the `Screen::Launcher => None` arm in
+/// `sync_resident_binding` to retain `active_session`. Expected runtime
+/// failure: returning to the launcher emits another bound signal instead of
+/// the explicit `session: None` unbind pinned here.
+#[test]
+fn resident_binding_announce_fires_on_unbind() {
+    let (mut driver, mut model) = resident_binding_fixture();
+    model.open_session(&sid(0));
+    let _ = driver.sync_resident_binding(&model);
+
+    model.back_to_launcher();
+    assert_eq!(
+        driver.sync_resident_binding(&model),
+        vec![LiveCommand::ResidentSessionBinding {
+            session: None,
+            worker_generation: 7,
+        }]
+    );
+}
+
 // ---- the bounded priority working set --------------------------------
 
 #[test]

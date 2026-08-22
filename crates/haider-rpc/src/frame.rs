@@ -388,6 +388,12 @@ pub const FEATURE_STORE_HEALTH_V1: &str = "store_health_v1";
 /// embedding ADE that sees it may trust the announce stream for PTY↔session
 /// correlation instead of guessing.
 pub const FEATURE_TUI_ATTACH_ANNOUNCE_V1: &str = "tui_attach_announce_v1";
+/// Resident TUIs publish their foreground session as a typed RPC signal, and
+/// the daemon fans that signal out to other connected clients. `None` is an
+/// explicit unbind, while `worker_generation` fences announcements from a
+/// superseded daemon worker generation. The OSC 7791 compatibility channel is
+/// separate and remains advertised by [`FEATURE_TUI_ATTACH_ANNOUNCE_V1`].
+pub const FEATURE_RESIDENT_SESSION_BINDING_V1: &str = "resident_session_binding_v1";
 /// Receipted per-session Loom agent-type binding (`session.select_agent_type`)
 /// — the inline identity switch: a session takes a registered type's job
 /// (volatile prompt tail, cache-epoch free) and accent until reverted.
@@ -2956,6 +2962,18 @@ pub enum WireFrame {
     /// Carries no descriptors on purpose — a watcher re-reads `account.list`,
     /// so this frame can never disagree with the snapshot it announces.
     AccountsChanged { revision: u64 },
+    /// The foreground session of the resident TUI on this daemon profile.
+    ///
+    /// A resident TUI publishes this uncorrelated signal whenever its binding
+    /// changes; the daemon validates the generation and fans it out to other
+    /// clients. `None` is the explicit unbound/launcher state. Consumers must
+    /// apply the signal only when `worker_generation` equals their current
+    /// authoritative generation, exactly as `turn.cancel` and `menu.answer`
+    /// fence stale coordinates.
+    ResidentSessionBinding {
+        session_id: Option<SessionId>,
+        worker_generation: u64,
+    },
     /// Complete latest volatile surface snapshot after one or more accepted
     /// changes. `None` means the corresponding surface is cleared.
     SessionSurfaceDelta {
@@ -3063,6 +3081,11 @@ enum WireFrameRef<'a> {
     AccountsChanged {
         revision: u64,
     },
+    ResidentSessionBinding {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: &'a Option<SessionId>,
+        worker_generation: u64,
+    },
     SessionSurfaceDelta {
         session_id: &'a SessionId,
         input: &'a Option<SurfaceInputWire>,
@@ -3130,6 +3153,14 @@ enum WireFrameOwned {
     SessionRosterDelta {
         #[serde(default)]
         summaries: Vec<SessionSummary>,
+    },
+    AccountsChanged {
+        revision: u64,
+    },
+    ResidentSessionBinding {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+        worker_generation: u64,
     },
     SessionSurfaceDelta {
         session_id: SessionId,
@@ -3247,6 +3278,13 @@ impl Serialize for WireFrame {
             Self::AccountsChanged { revision } => WireFrameRef::AccountsChanged {
                 revision: *revision,
             },
+            Self::ResidentSessionBinding {
+                session_id,
+                worker_generation,
+            } => WireFrameRef::ResidentSessionBinding {
+                session_id,
+                worker_generation: *worker_generation,
+            },
             Self::SessionSurfaceDelta {
                 session_id,
                 input,
@@ -3347,6 +3385,14 @@ impl<'de> Deserialize<'de> for WireFrame {
             WireFrameOwned::SessionRosterDelta { summaries } => {
                 Self::SessionRosterDelta { summaries }
             }
+            WireFrameOwned::AccountsChanged { revision } => Self::AccountsChanged { revision },
+            WireFrameOwned::ResidentSessionBinding {
+                session_id,
+                worker_generation,
+            } => Self::ResidentSessionBinding {
+                session_id,
+                worker_generation,
+            },
             WireFrameOwned::SessionSurfaceDelta {
                 session_id,
                 input,

@@ -128,6 +128,13 @@ pub enum LiveCommand {
     SurfaceWatch {
         session: SessionId,
     },
+    /// Foreground resident-TUI binding. This is the typed replacement channel
+    /// for clients that currently scrape OSC 7791; the OSC emission remains
+    /// in place until those clients migrate.
+    ResidentSessionBinding {
+        session: Option<SessionId>,
+        worker_generation: u64,
+    },
     Submit {
         command_id: CommandId,
         session: SessionId,
@@ -554,6 +561,33 @@ impl LiveDriver {
         self.connection_epoch
     }
 
+    /// Synchronize the resident TUI's foreground binding over the typed RPC
+    /// signal. The screen/session predicate deliberately matches the retained
+    /// OSC 7791 seam exactly: Boot and Launcher are unbound; every other
+    /// session-backed surface reports `active_session`.
+    #[must_use]
+    pub fn sync_resident_binding(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        if !model.daemon_serves(haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_V1) {
+            return Vec::new();
+        }
+        let Some(worker_generation) = self.binding_worker_generation else {
+            return Vec::new();
+        };
+        let session = match model.screen {
+            crate::app::Screen::Boot | crate::app::Screen::Launcher => None,
+            _ => model.active_session.clone(),
+        };
+        let next = (self.connection_epoch, session.clone(), worker_generation);
+        if self.announced_resident_binding.as_ref() == Some(&next) {
+            return Vec::new();
+        }
+        self.announced_resident_binding = Some(next);
+        vec![LiveCommand::ResidentSessionBinding {
+            session,
+            worker_generation,
+        }]
+    }
+
     /// Synchronize the active composer's bidirectional volatile mirror.
     #[must_use]
     pub fn sync_input_mirror(&mut self, model: &AppModel) -> Vec<LiveCommand> {
@@ -745,7 +779,9 @@ impl LiveCommand {
             Self::GraphPin { command_id, .. } | Self::GraphAbandon { command_id, .. } => {
                 Some(command_id)
             }
-            Self::SurfacePublish { .. } | Self::SurfaceWatch { .. } => None,
+            Self::SurfacePublish { .. }
+            | Self::SurfaceWatch { .. }
+            | Self::ResidentSessionBinding { .. } => None,
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::DeviceImport { command_id, .. } => Some(command_id),
@@ -1492,6 +1528,14 @@ pub struct LiveDriver {
     menus: HashMap<MenuId, MenuCoordinates>,
     /// Latest worker generation per session (create/attach/submit report it).
     generations: HashMap<SessionId, u64>,
+    /// Current connection's worker generation for resident-binding signals.
+    /// Cleared on disconnect so an old generation is never re-announced on a
+    /// fresh socket before list/attach grounds the new daemon truth.
+    binding_worker_generation: Option<u64>,
+    /// Last typed binding sent, including connection epoch and generation.
+    /// The epoch forces a resend after reconnect even when the foreground
+    /// session itself did not change.
+    announced_resident_binding: Option<(u64, Option<SessionId>, u64)>,
     /// The run a session is CURRENTLY executing, learned from the committed
     /// envelopes' `run_id` and dropped the moment the run terminalizes.
     /// `turn.cancel` needs it: cancelling by guess would either name a run
@@ -1604,6 +1648,8 @@ impl LiveDriver {
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
+            binding_worker_generation: None,
+            announced_resident_binding: None,
             active_run: HashMap::new(),
             instance: instance.into(),
             next_command: 0,
@@ -1978,6 +2024,7 @@ impl LiveDriver {
                 next_cursor,
             } => {
                 for summary in sessions {
+                    self.binding_worker_generation = Some(summary.worker_generation);
                     model.upsert_live_session(&summary.session_id);
                     // Launcher fix 2: the additive turn/footprint fields
                     // hydrate the row's counts at list time — tolerantly
@@ -2033,6 +2080,7 @@ impl LiveDriver {
                 worker_generation,
                 ..
             } => {
+                self.binding_worker_generation = Some(worker_generation);
                 self.cold.remove(&session);
                 // THE STRICT GAP LAW COVERS THE FIRST ENVELOPE (review
                 // W3c3 P1-1). Continuity used to be checked only once
@@ -2078,6 +2126,7 @@ impl LiveDriver {
                 cwd,
                 model: model_name,
             } => {
+                self.binding_worker_generation = Some(worker_generation);
                 self.retire(&command_id);
                 self.generations.insert(session.clone(), worker_generation);
                 // THE LAUNCHER ORDER (R11 cut 4). Only now — with the
@@ -2110,6 +2159,7 @@ impl LiveDriver {
                 worker_generation,
                 ..
             } => {
+                self.binding_worker_generation = Some(worker_generation);
                 self.retire(&command_id);
                 self.generations.insert(session, worker_generation);
                 Vec::new()
@@ -3419,6 +3469,7 @@ impl LiveDriver {
             }
             LiveReply::Disconnected { reason } => {
                 self.connected = false;
+                self.binding_worker_generation = None;
                 self.attaching.clear();
                 // Review round 2: the Loom registry snapshot is CONNECTION
                 // truth — the next daemon may hold a different registry (or

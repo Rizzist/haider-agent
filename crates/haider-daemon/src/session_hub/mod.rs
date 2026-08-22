@@ -328,6 +328,12 @@ pub trait FrameSink: Send + Sync {
     /// Admits one complete frame without waiting on a socket.
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError>;
 
+    /// Closes a production transport after it refuses authoritative state.
+    /// Reconnection then receives the retained baseline instead of silently
+    /// continuing with stale state. Deterministic test sinks may leave this a
+    /// no-op unless the close behavior itself is under test.
+    fn close_after_required_delivery_failure(&self) {}
+
     /// The largest encodable outbound frame, when the sink knows one.
     /// Handlers whose replies have a KNOWN maximum size (surface snapshots)
     /// refuse registration upfront instead of letting a later oversized
@@ -645,6 +651,15 @@ struct HubInner {
     /// Connection-level unsolicited sinks. Store failures fan out here, and
     /// volatile input injection uses the current publisher's indexed route.
     diagnostic_sinks: Mutex<HashMap<String, Arc<dyn FrameSink>>>,
+    /// Latest profile-level resident-TUI binding and its current publisher.
+    /// The retained value is the late-subscriber/reconnect baseline; owner
+    /// identity prevents an overlapped old connection from clearing its
+    /// replacement's same-generation announcement.
+    resident_binding: Mutex<ResidentBindingRegistry>,
+    /// Connections authorized to observe session identity. Kept separate
+    /// from the general diagnostic sink index because profile-health signals
+    /// intentionally reach capability-empty peers too.
+    resident_binding_viewers: Mutex<HashSet<String>>,
     /// Daemon-generation-only composer/status truth. This state is never
     /// journaled or projected into prompts; clients republish after restart.
     surfaces: Mutex<HashMap<SessionId, SessionSurfaceState>>,
@@ -697,6 +712,37 @@ struct HubInner {
     /// Ephemeral compiled-prompt acceleration. Journal bytes remain the
     /// authority; the cache is discarded with this daemon generation.
     prompt_history: PromptHistoryCache,
+}
+
+#[derive(Default)]
+struct ResidentBindingRegistry {
+    next_revision: u64,
+    publishers: HashMap<String, ResidentBindingState>,
+    /// Retained explicit unbind after the last publisher exits, so a client
+    /// reconnecting after required-delivery refusal receives the clearing
+    /// baseline rather than relying on local reset behavior.
+    vacant_generation: Option<u64>,
+}
+
+impl ResidentBindingRegistry {
+    fn current(&self) -> Option<(&str, &ResidentBindingState)> {
+        self.publishers
+            .iter()
+            .max_by_key(|(_, binding)| binding.revision)
+            .map(|(owner, binding)| (owner.as_str(), binding))
+    }
+
+    fn visible(&self) -> Option<(Option<SessionId>, u64)> {
+        self.current()
+            .map(|(_, binding)| (binding.session_id.clone(), binding.worker_generation))
+            .or_else(|| self.vacant_generation.map(|generation| (None, generation)))
+    }
+}
+
+struct ResidentBindingState {
+    session_id: Option<SessionId>,
+    worker_generation: u64,
+    revision: u64,
 }
 
 pub(super) struct CommitProjection {
@@ -1237,6 +1283,7 @@ impl Drop for HubConnection {
         {
             watch.task.abort();
         }
+        self.clear_resident_binding();
         self.hub.clear_surface_owner(&self.connection_id);
     }
 }
@@ -1383,6 +1430,8 @@ impl SessionHub {
             metrics: Arc::new(HubMetrics::default()),
             actors: Mutex::new(HashMap::new()),
             diagnostic_sinks: Mutex::new(HashMap::new()),
+            resident_binding: Mutex::new(ResidentBindingRegistry::default()),
+            resident_binding_viewers: Mutex::new(HashSet::new()),
             surfaces: Mutex::new(HashMap::new()),
             surface_publications,
             deleting_sessions: Mutex::new(HashSet::new()),
@@ -1934,7 +1983,36 @@ impl SessionHub {
             return Err(SessionHubError::Closed);
         }
         let connection_id = random_id("connection")?;
-        lock(&self.inner.diagnostic_sinks)?.insert(connection_id.clone(), Arc::clone(&sink));
+        let may_view_binding =
+            capabilities.contains(&Capability::View) || capabilities.contains(&Capability::Control);
+        // The state lock spans registration and baseline admission. A
+        // concurrent publisher therefore queues either before this baseline
+        // is sampled or after it is admitted, never between the two and in
+        // reverse order.
+        let resident_binding = lock(&self.inner.resident_binding)?;
+        let mut resident_binding_viewers = lock(&self.inner.resident_binding_viewers)?;
+        let mut diagnostic_sinks = lock(&self.inner.diagnostic_sinks)?;
+        diagnostic_sinks.insert(connection_id.clone(), Arc::clone(&sink));
+        if may_view_binding {
+            resident_binding_viewers.insert(connection_id.clone());
+        }
+        if may_view_binding
+            && let Some((session_id, worker_generation)) = resident_binding.visible()
+            && sink
+                .try_send(WireFrame::ResidentSessionBinding {
+                    session_id,
+                    worker_generation,
+                })
+                .is_err()
+        {
+            diagnostic_sinks.remove(&connection_id);
+            resident_binding_viewers.remove(&connection_id);
+            sink.close_after_required_delivery_failure();
+            return Err(SessionHubError::Delivery);
+        }
+        drop(diagnostic_sinks);
+        drop(resident_binding_viewers);
+        drop(resident_binding);
         if let Some(fault) = self.inner.store.profile_fault() {
             let _ = sink.try_send(profile_store_fault_frame(&fault));
         }
@@ -3470,6 +3548,95 @@ impl SessionHub {
         }
     }
 
+    /// Atomically installs and publishes one resident TUI's binding. The most
+    /// recently announced live publisher is the visible profile state; if it
+    /// exits, the previous live publisher is restored. Holding this registry
+    /// lock through sink admission establishes a total order with
+    /// late-subscriber baselines. This signal must never use the droppable
+    /// lane.
+    fn publish_resident_binding(
+        &self,
+        source_connection_id: &str,
+        session_id: Option<SessionId>,
+        worker_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        let mut registry = lock(&self.inner.resident_binding)?;
+        let previous = registry.visible();
+        registry.next_revision = registry.next_revision.saturating_add(1);
+        let revision = registry.next_revision;
+        registry.publishers.insert(
+            source_connection_id.to_owned(),
+            ResidentBindingState {
+                session_id: session_id.clone(),
+                worker_generation,
+                revision,
+            },
+        );
+        registry.vacant_generation = None;
+        let next = registry.visible();
+        if previous == next {
+            return Ok(());
+        }
+        let frame = WireFrame::ResidentSessionBinding {
+            session_id,
+            worker_generation,
+        };
+        let viewers = lock(&self.inner.resident_binding_viewers)?;
+        let sinks = lock(&self.inner.diagnostic_sinks)?;
+        for (connection_id, sink) in sinks.iter() {
+            if connection_id == source_connection_id || !viewers.contains(connection_id) {
+                continue;
+            }
+            if sink.try_send(frame.clone()).is_err() {
+                sink.close_after_required_delivery_failure();
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes one publisher. Closing an overlapped old connection is a
+    /// no-op at the visible layer; closing the current publisher either
+    /// restores the most recent live predecessor or emits explicit unbind.
+    fn clear_resident_binding(&self, source_connection_id: &str) {
+        let Ok(mut registry) = self.inner.resident_binding.lock() else {
+            return;
+        };
+        let previous_owner = registry.current().map(|(owner, _)| owner.to_owned());
+        let previous = registry.visible();
+        let Some(removed) = registry.publishers.remove(source_connection_id) else {
+            return;
+        };
+        if previous_owner.as_deref() != Some(source_connection_id) {
+            return;
+        }
+        if registry.publishers.is_empty() {
+            registry.vacant_generation = Some(removed.worker_generation);
+        }
+        let next = registry.visible();
+        if previous == next {
+            return;
+        }
+        let (session_id, worker_generation) = next.unwrap_or((None, removed.worker_generation));
+        let frame = WireFrame::ResidentSessionBinding {
+            session_id,
+            worker_generation,
+        };
+        let Ok(viewers) = self.inner.resident_binding_viewers.lock() else {
+            return;
+        };
+        let Ok(sinks) = self.inner.diagnostic_sinks.lock() else {
+            return;
+        };
+        for (connection_id, sink) in sinks.iter() {
+            if connection_id == source_connection_id || !viewers.contains(connection_id) {
+                continue;
+            }
+            if sink.try_send(frame.clone()).is_err() {
+                sink.close_after_required_delivery_failure();
+            }
+        }
+    }
+
     fn clear_session_surface(&self, session_id: &SessionId) {
         let mut surfaces = self
             .inner
@@ -3489,6 +3656,7 @@ impl SessionHub {
     }
 
     async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
+        lock(&self.inner.resident_binding_viewers)?.remove(connection_id);
         lock(&self.inner.diagnostic_sinks)?.remove(connection_id);
         self.clear_surface_owner(connection_id);
         let attachments = {

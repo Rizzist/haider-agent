@@ -353,8 +353,10 @@ struct Shared {
     next_request: AtomicU64,
     /// Highest ping nonce a `Pong` has acknowledged.
     acked_pong: AtomicU64,
-    /// Events dropped because the event channel was full (the consumer's
-    /// reattach-by-cursor discipline recovers; see R9's cursor law).
+    /// Events dropped because the event channel was full. Cursor-bearing
+    /// traffic recovers by reattach (R9); an authoritative snapshot without
+    /// a cursor instead fails the connection and recovers from its retained
+    /// daemon baseline after reconnect.
     lost_events: AtomicU64,
     state: watch::Sender<ConnectionState>,
     /// A writer death observed while the reader may still be draining
@@ -773,6 +775,15 @@ async fn route_frame(
                 shared.fail(DisconnectReason::Fatal(error));
             }
         }
+        binding @ WireFrame::ResidentSessionBinding { .. } => {
+            if events.try_send(binding).is_err() {
+                shared.lost_events.fetch_add(1, Ordering::Relaxed);
+                shared.fail(DisconnectReason::Protocol(
+                    "resident session binding could not reach the authoritative event channel"
+                        .into(),
+                ));
+            }
+        }
         other => {
             // Uncorrelated traffic must never block response correlation:
             // a full event channel drops the frame and the consumer's
@@ -881,6 +892,47 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    /// MUTATION CHECK: move `ResidentSessionBinding` into the generic
+    /// `other` arm. Expected runtime failure: a full event channel leaves the
+    /// connection live after silently dropping the authoritative unbind.
+    #[tokio::test]
+    async fn resident_binding_event_overflow_disconnects_for_baseline_recovery() {
+        let (state, _) = watch::channel(ConnectionState::Connected);
+        let shared = Arc::new(Shared {
+            pending: StdMutex::new(HashMap::new()),
+            next_request: AtomicU64::new(1),
+            acked_pong: AtomicU64::new(0),
+            lost_events: AtomicU64::new(0),
+            writer_failure: StdMutex::new(None),
+            state,
+        });
+        let (events, _event_rx) = mpsc::channel(1);
+        events
+            .try_send(WireFrame::Unknown)
+            .expect("event channel is prefilled");
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+
+        route_frame(
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: 9,
+            },
+            &shared,
+            &events,
+            &outbound,
+            DEFAULT_FRAME_LIMIT,
+            WireEncoding::Json,
+        )
+        .await;
+
+        assert_eq!(shared.lost_events.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            &*shared.state.borrow(),
+            ConnectionState::Disconnected(DisconnectReason::Protocol(message))
+                if message.contains("resident session binding")
+        ));
+    }
 
     #[tokio::test]
     async fn coalesced_json_welcome_and_msgpack_frame_switches_at_frame_boundary() {

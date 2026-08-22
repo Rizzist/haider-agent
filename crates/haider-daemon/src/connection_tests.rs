@@ -144,6 +144,11 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_SESSION_LINEAGE_V1`. Expected RUNTIME failure: the ADE cannot
 /// sniff the OSC 7791 attach announce stream / typed subagent lineage and
 /// falls back to guessing PTY bindings and grepping id prefixes.
+///
+/// MUTATION CHECK: remove `FEATURE_RESIDENT_SESSION_BINDING_V1` from
+/// `welcome_features`. Expected runtime failure: web clients keep scraping
+/// OSC 7791 because the typed generation-fenced binding signal appears
+/// unavailable even though the daemon serves it.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -185,6 +190,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
+            haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_V1.to_owned(),
             haider_rpc::FEATURE_RUN_RETRY_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
@@ -843,6 +849,14 @@ struct PairedClient {
     encoding: haider_rpc::WireEncoding,
 }
 
+struct BindingChannelSink(mpsc::UnboundedSender<WireFrame>);
+
+impl FrameSink for BindingChannelSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.0.send(frame).map_err(|_| FrameSendError)
+    }
+}
+
 impl PairedClient {
     fn new(stream: UnixStream) -> Self {
         Self {
@@ -928,6 +942,59 @@ impl PairedClient {
         })
         .await;
     }
+}
+
+/// MUTATION CHECK: delete the one-line `resident_session_binding` call from
+/// `handle_frame`. Expected runtime failure: the real framed UDS publish is
+/// read successfully but the observer times out without an RPC push.
+#[tokio::test]
+async fn resident_binding_frame_routes_across_the_paired_connection() {
+    let (_root, hub) = liveness_hub().await;
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    let observer = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View, Capability::Control]),
+            Arc::new(BindingChannelSink(observed_tx)),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("observer connection");
+    let generation = hub.worker_generation();
+
+    let (server, client) = UnixStream::pair().expect("socketless stream pair");
+    let (writers, mut registered_writers) = mpsc::unbounded_channel();
+    let context = connection_context(hub.clone(), writers);
+    let writer_registry = tokio::spawn(async move {
+        while let Some(writer) = registered_writers.recv().await {
+            let _ = writer.await;
+        }
+    });
+    let (_drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+    let serve_task = tokio::spawn(serve(server, context, drain_rx));
+    let mut publisher = PairedClient::new(client);
+    publisher.handshake().await;
+    publisher
+        .send(&WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: generation,
+        })
+        .await;
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), observed_rx.recv())
+            .await
+            .expect("binding push is prompt")
+            .expect("observer stays open"),
+        WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: generation,
+        }
+    );
+
+    drop(publisher);
+    let _ = serve_task.await.expect("serve task joins");
+    writer_registry.await.expect("writer registry joins");
+    observer.close().await.expect("observer closes");
+    hub.shutdown().await.expect("hub shutdown");
 }
 
 #[tokio::test]
