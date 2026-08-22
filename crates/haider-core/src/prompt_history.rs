@@ -28,6 +28,14 @@ use tokio::sync::Mutex;
 const HISTORY_PAGE: usize = 256;
 const PROMPT_CHECKPOINT_PROJECTION: &str = "prompt_history";
 const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
+/// Semantic compatibility of the prompt-history reducer.
+///
+/// Bump this only when projection/folding logic changes such that a prefix
+/// produced by the previous reducer can differ from a full replay under the
+/// new reducer. Ordinary package releases do not invalidate checkpoints;
+/// payload layout changes are governed separately by
+/// `PROMPT_CHECKPOINT_SHAPE_VERSION`.
+const PROMPT_CHECKPOINT_REDUCER_VERSION: &str = "prompt-history-v1";
 pub const USER_COMMAND_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
 
 /// Read-only CAS port used only when a durable compaction node is projected.
@@ -827,7 +835,7 @@ fn prompt_timeline_key(timeline: &PromptTimelineKey) -> String {
 }
 
 fn prompt_checkpoint_reducer_version() -> String {
-    format!("{}/prompt-v1", env!("CARGO_PKG_VERSION"))
+    PROMPT_CHECKPOINT_REDUCER_VERSION.to_owned()
 }
 
 async fn load_prompt_checkpoint(
@@ -844,7 +852,7 @@ async fn load_prompt_checkpoint(
     {
         Ok(stored) => stored?,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 session_id = %session_id,
                 ?error,
                 "prompt projection checkpoint read failed; replaying journal"
@@ -852,7 +860,17 @@ async fn load_prompt_checkpoint(
             return None;
         }
     };
-    let decoded = serde_json::from_slice::<DurablePromptCheckpoint>(&stored.payload).ok()?;
+    let decoded = match serde_json::from_slice::<DurablePromptCheckpoint>(&stored.payload) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                ?error,
+                "prompt projection checkpoint payload is corrupt; replaying journal"
+            );
+            return None;
+        }
+    };
     if decoded.shape_version != PROMPT_CHECKPOINT_SHAPE_VERSION
         || decoded.reducer_version != prompt_checkpoint_reducer_version()
         || decoded.through_seq == 0
@@ -894,12 +912,22 @@ async fn load_prompt_checkpoint(
     {
         return None;
     }
-    let messages = decoded
+    let messages = match decoded
         .messages
         .into_iter()
         .map(serde_json::from_value::<Message>)
         .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                ?error,
+                "prompt projection checkpoint messages are corrupt; replaying journal"
+            );
+            return None;
+        }
+    };
     Some(LoadedPromptCheckpoint {
         compaction_epoch: decoded.compaction_epoch,
         prefix: CachedCompiledPrefix {

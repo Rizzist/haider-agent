@@ -14,7 +14,7 @@ use haider_protocol::session_fork::{
 };
 use haider_protocol::state::RunState;
 use haider_store::{
-    BranchCreateCommand, DelegationRecord, DelegationState, SessionCreateCommand,
+    BranchCreateCommand, DelegationRecord, DelegationState, EventStore, SessionCreateCommand,
     SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit, Store, TurnAcceptCommand,
     TurnAcceptOutcome,
 };
@@ -447,9 +447,10 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
     assert_eq!(source_storage_bytes(root.path(), &source), storage_before);
 }
 
-/// MUTATION CHECK: apply `PromptRender::Omit` to the source envelope before
-/// cloning. Expected RUNTIME failure: the parent byte snapshot changes after
-/// metafork, an unrecoverable transcript mutation.
+/// MUTATION CHECK: persist `PromptRender::Omit` back into the matching source
+/// event row instead of limiting it to the child clone. Expected RUNTIME
+/// failure: the decoded and raw parent byte snapshots change after metafork,
+/// exposing an unrecoverable transcript mutation.
 ///
 /// MUTATION CHECK: remove `description` or `omissions` from `SessionForked`.
 /// Expected RUNTIME failure: the child can no longer explain what was omitted
@@ -874,4 +875,94 @@ fn delegated_source_owner_lane_becomes_child_root_history() {
                 .contains("delegated history becomes a standalone root")
     }));
     assert_eq!(source_storage_bytes(root.path(), &source), source_before);
+}
+
+/// A run id is not a complete activity coordinate: each agent lane reduces
+/// independently. A terminal fact in one lane must neither close nor erase a
+/// different lane's nonterminal fork-boundary obligation.
+#[test]
+fn fork_boundary_closes_each_nonterminal_agent_scope_independently() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("fork-agent-boundary-parent");
+    create_session(&store, &source);
+    let shared_run = RunId::new("fork-agent-boundary-shared-run");
+    let agent_a = AgentId::new("fork-agent-boundary-a");
+    let agent_b = AgentId::new("fork-agent-boundary-b");
+    let agent_c = AgentId::new("fork-agent-boundary-c");
+    let empty_agent = AgentId::new("");
+    let scoped_state = |event_id: &str, agent_id: Option<AgentId>, state: RunState| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: source.clone(),
+        branch_id: None,
+        run_id: Some(shared_run.clone()),
+        agent_id,
+        device_id: DeviceId::new("session-fork-test-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(state)).expect("run state payload"),
+    };
+    let mut scoped_states = [
+        scoped_state("fork-root-thinking", None, RunState::Thinking),
+        scoped_state(
+            "fork-empty-agent-thinking",
+            Some(empty_agent.clone()),
+            RunState::Thinking,
+        ),
+        scoped_state(
+            "fork-agent-a-thinking",
+            Some(agent_a.clone()),
+            RunState::Thinking,
+        ),
+        scoped_state("fork-agent-b-done", Some(agent_b.clone()), RunState::Done),
+        scoped_state(
+            "fork-agent-c-thinking",
+            Some(agent_c.clone()),
+            RunState::Thinking,
+        ),
+    ];
+    EventStore::append(&store, &mut scoped_states).expect("append agent-scoped run states");
+    let (_, fork_node, fork_seq, _) = source_turn(&store, &source, "fork after scoped work");
+    let command = fork_command(
+        &store,
+        "fork-agent-boundary-command",
+        &source,
+        "fork-agent-boundary-child",
+        fork_node,
+        fork_seq,
+        None,
+    );
+    let SessionForkOutcome::Committed { envelopes, .. } = store
+        .fork_session(&command)
+        .expect("fork with agent-scoped boundaries")
+    else {
+        panic!("fresh fork commits");
+    };
+
+    let cancelled_agents = envelopes
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&shared_run))
+        .filter(|envelope| {
+            matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                Ok(EventPayload::RunState(RunState::Cancelled))
+            )
+        })
+        .map(|envelope| envelope.agent_id.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        cancelled_agents,
+        HashSet::from([None, Some(empty_agent), Some(agent_a), Some(agent_c)]),
+        "every independently nonterminal root/agent lane needs its own closure"
+    );
 }

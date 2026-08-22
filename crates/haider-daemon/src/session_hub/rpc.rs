@@ -3801,6 +3801,7 @@ impl HubConnection {
                 accounts_watch: Mutex::new(None),
                 surface_watch: Mutex::new(None),
                 metafork_reviews: Arc::clone(&self.metafork_reviews),
+                identity_lease: Arc::clone(&self.identity_lease),
                 closed: AtomicBool::new(false),
             },
             capture,
@@ -3869,13 +3870,31 @@ impl HubConnection {
                     .await?;
             }
             ParkedCommandContinuation::Provider(provider) => {
-                let Some(model) = self.provider_default_model(&session_id, &provider).await else {
-                    return Ok(ResponseBody::Error {
-                        code: ERROR_CODE_INVALID_ARGUMENT.into(),
-                        message: format!("provider {provider} has no daemon-known model"),
-                        retryable: false,
-                        data: None,
-                    });
+                let model = match self.provider_default_model(&session_id, &provider).await {
+                    Ok(Some(model)) => model,
+                    Ok(None) => {
+                        return Ok(ResponseBody::Error {
+                            code: ERROR_CODE_INVALID_ARGUMENT.into(),
+                            message: format!("provider {provider} has no daemon-known model"),
+                            retryable: false,
+                            data: None,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            provider,
+                            %error,
+                            "could not determine provider model inventory for command"
+                        );
+                        return Ok(ResponseBody::Error {
+                            code: ERROR_CODE_PROVIDER_MODELS_UNKNOWN.into(),
+                            message: format!(
+                                "could not determine the daemon-known model set for provider {provider}"
+                            ),
+                            retryable: true,
+                            data: None,
+                        });
+                    }
                 };
                 connection
                     .session_select_model(
@@ -3921,31 +3940,35 @@ impl HubConnection {
         &self,
         session_id: &SessionId,
         provider: &str,
-    ) -> Option<String> {
-        let summaries = self
-            .hub
-            .accounts()
-            .ok()
-            .flatten()
-            .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
-            .unwrap_or_default();
-        if let Some(summary) = summaries
-            .iter()
-            .find(|summary| summary.provider == provider)
-        {
-            return summary
-                .default_model
-                .clone()
-                .or_else(|| summary.models.first().cloned());
+    ) -> Result<Option<String>, SessionHubError> {
+        let facade = self.hub.accounts()?;
+        if let Some(facade) = facade.as_ref() {
+            let view = facade.management.read().ok_or_else(|| {
+                SessionHubError::Task("account management snapshot is poisoned".into())
+            })?;
+            if let Some(summary) = view
+                .providers
+                .iter()
+                .find(|summary| summary.provider == provider)
+            {
+                return Ok(summary
+                    .default_model
+                    .clone()
+                    .or_else(|| summary.models.first().cloned()));
+            }
         }
-        self.hub
+        let metadata_model = self
+            .hub
             .session_metadata(session_id)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .filter(|metadata| metadata.provider == provider)
-            .map(|metadata| metadata.model)
+            .map(|metadata| metadata.model);
+        if metadata_model.is_some() || facade.is_some() {
+            return Ok(metadata_model);
+        }
+        Err(SessionHubError::Task(
+            "account provider inventory is unavailable".into(),
+        ))
     }
 
     async fn stored_command_menu(
@@ -6054,7 +6077,7 @@ impl HubConnection {
         self.respond_session_metafork_created(request_id, created)
     }
 
-    async fn canonical_metafork_proposal(
+    pub(super) async fn canonical_metafork_proposal(
         &self,
         source_session_id: &SessionId,
         worker_generation: u64,
@@ -6124,6 +6147,33 @@ impl HubConnection {
         let mut canonical = proposal.clone();
         let mut reviewed_event_count = 0_usize;
         for removal in &mut canonical.removals {
+            let expected_span = removal
+                .through_seq
+                .checked_sub(removal.from_seq)
+                .and_then(|span| span.checked_add(1))
+                .ok_or_else(|| {
+                    SessionHubError::Store(HaiderError::new(
+                        ErrorCode::InvalidArgument,
+                        "metafork proposal range is not bounded",
+                        false,
+                    ))
+                })?;
+            let admitted_span = admitted
+                .iter()
+                .filter(|envelope| {
+                    envelope.seq >= removal.from_seq && envelope.seq <= removal.through_seq
+                })
+                .count();
+            if u64::try_from(admitted_span).ok() != Some(expected_span) {
+                // Reject rather than clamp: the exact proposal is hashed and
+                // shown for human authorization, so silently changing its
+                // coordinates would make acceptance authorize different text.
+                return Err(SessionHubError::Store(HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "metafork proposal range must be wholly contained in the copied source lineage",
+                    false,
+                )));
+            }
             let matches = admitted
                 .iter()
                 .filter(|envelope| {

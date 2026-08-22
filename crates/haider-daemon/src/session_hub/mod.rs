@@ -142,13 +142,13 @@ use haider_rpc::{
     ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE, ERROR_CODE_GRAPH_WRONG_NODE,
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
     ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
-    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
-    ERROR_CODE_SURFACE_TEXT_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS,
-    ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput,
-    ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
-    SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
-    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
-    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
+    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PROVIDER_MODELS_UNKNOWN, ERROR_CODE_RUN_NOT_ACTIVE,
+    ERROR_CODE_STALE_GENERATION, ERROR_CODE_SURFACE_TEXT_TOO_LARGE,
+    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
+    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
+    ResponseBody, SURFACE_INPUT_MAX_BYTES, SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult,
+    SessionSummary, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire,
+    SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1284,7 +1284,28 @@ pub struct HubConnection {
     /// Write-free metafork reviews awaiting an explicit acceptance on this
     /// connection. Shared with command-capture facades; dropped on disconnect.
     metafork_reviews: Arc<Mutex<HashMap<String, String>>>,
+    /// The transport-created identity lease. Response-capture facades share
+    /// this lease, so they cannot independently own (and therefore cannot
+    /// independently tear down) the caller's live identity.
+    identity_lease: Arc<ConnectionIdentityLease>,
     closed: AtomicBool,
+}
+
+/// RAII ownership of an identity registered by `open_connection`.
+///
+/// Keeping teardown on the last shared lease, rather than on every
+/// `HubConnection`-shaped view, makes borrowed command facades structurally
+/// incapable of unregistering the identity they only use for authorization.
+struct ConnectionIdentityLease {
+    hub: SessionHub,
+    connection_id: String,
+}
+
+impl Drop for ConnectionIdentityLease {
+    fn drop(&mut self) {
+        self.hub.clear_resident_binding(&self.connection_id);
+        self.hub.clear_surface_owner(&self.connection_id);
+    }
 }
 
 impl Drop for HubConnection {
@@ -1304,8 +1325,6 @@ impl Drop for HubConnection {
         {
             watch.task.abort();
         }
-        self.clear_resident_binding();
-        self.hub.clear_surface_owner(&self.connection_id);
     }
 }
 
@@ -2087,6 +2106,10 @@ impl SessionHub {
         if let Some(fault) = self.inner.store.profile_fault() {
             let _ = sink.try_send(profile_store_fault_frame(&fault));
         }
+        let identity_lease = Arc::new(ConnectionIdentityLease {
+            hub: self.clone(),
+            connection_id: connection_id.clone(),
+        });
         Ok(HubConnection {
             hub: self.clone(),
             connection_id,
@@ -2098,6 +2121,7 @@ impl SessionHub {
             accounts_watch: Mutex::new(None),
             surface_watch: Mutex::new(None),
             metafork_reviews: Arc::new(Mutex::new(HashMap::new())),
+            identity_lease,
             closed: AtomicBool::new(false),
         })
     }

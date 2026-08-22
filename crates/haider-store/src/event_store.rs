@@ -2079,8 +2079,9 @@ impl Store {
         Ok(ids.into_iter().map(SessionId::new).collect())
     }
 
-    /// Reads an opaque projection checkpoint. A malformed row is treated as
-    /// a cache miss so callers can replay the authoritative journal.
+    /// Reads an opaque projection checkpoint. Missing rows are cache misses;
+    /// malformed rows are reported as corruption so callers can replay the
+    /// authoritative journal without silently losing checkpoint capability.
     pub fn session_projection_checkpoint(
         &self,
         session_id: &SessionId,
@@ -2115,24 +2116,37 @@ impl Store {
         let Some((through_seq, boundary_event_id, payload, digest, event_id)) = row else {
             return Ok(None);
         };
-        let Ok(through_seq) = u64::try_from(through_seq) else {
-            return Ok(None);
+        let checkpoint_corrupt = |reason: &str| {
+            corrupt(format!(
+                "projection checkpoint {projection}/{timeline_key} for session {session_id} is corrupt: {reason}"
+            ))
         };
-        if through_seq == 0
-            || payload.is_empty()
-            || event_id.as_deref() != Some(boundary_event_id.as_str())
-            || digest.as_slice()
-                != projection_checkpoint_digest(
-                    session_id,
-                    projection,
-                    timeline_key,
-                    through_seq,
-                    &boundary_event_id,
-                    &payload,
-                )
-                .as_bytes()
+        let Ok(through_seq) = u64::try_from(through_seq) else {
+            return Err(checkpoint_corrupt("through_seq is negative"));
+        };
+        if through_seq == 0 {
+            return Err(checkpoint_corrupt("through_seq is zero"));
+        }
+        if payload.is_empty() {
+            return Err(checkpoint_corrupt("payload is empty"));
+        }
+        if event_id.as_deref() != Some(boundary_event_id.as_str()) {
+            return Err(checkpoint_corrupt(
+                "boundary event does not match the immutable journal",
+            ));
+        }
+        if digest.as_slice()
+            != projection_checkpoint_digest(
+                session_id,
+                projection,
+                timeline_key,
+                through_seq,
+                &boundary_event_id,
+                &payload,
+            )
+            .as_bytes()
         {
-            return Ok(None);
+            return Err(checkpoint_corrupt("payload digest does not match"));
         }
         Ok(Some(SessionProjectionCheckpoint {
             session_id: session_id.clone(),
@@ -13971,6 +13985,34 @@ fn fork_boundary_event_id(session_id: &SessionId, coordinate: &str) -> EventId {
     EventId::new(format!("session-fork-boundary-{}", digest.to_hex()))
 }
 
+fn fork_run_boundary_event_id(
+    session_id: &SessionId,
+    run_id: &RunId,
+    agent_id: Option<&AgentId>,
+) -> EventId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"session-fork-run-boundary-v2\0");
+    for bytes in [session_id.as_str().as_bytes(), run_id.as_str().as_bytes()] {
+        hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bytes);
+    }
+    match agent_id {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(agent_id) => {
+            hasher.update(&[1]);
+            let bytes = agent_id.as_str().as_bytes();
+            hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(bytes);
+        }
+    }
+    EventId::new(format!(
+        "session-fork-boundary-{}",
+        hasher.finalize().to_hex()
+    ))
+}
+
 fn insert_forked_envelope(connection: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
     let bytes = encode_envelope(envelope).map_err(|error| {
         store_error(
@@ -14003,16 +14045,18 @@ fn append_fork_boundary_closures(
     now: u64,
     envelopes: &mut Vec<RawEnvelope>,
 ) -> StoreResult<()> {
-    let mut run_states = HashMap::<RunId, RunState>::new();
+    // Run activity is reduced per agent lane. A terminal observation in one
+    // lane says nothing about another lane that happens to share the run id.
+    let mut run_states = HashMap::<(RunId, Option<AgentId>), RunState>::new();
     for envelope in envelopes.iter() {
         if let Some(run_id) = envelope.run_id.clone()
             && let Ok(EventPayload::RunState(state)) =
                 serde_json::from_value::<EventPayload>(envelope.payload.clone())
         {
-            run_states.insert(run_id, state);
+            run_states.insert((run_id, envelope.agent_id.clone()), state);
         }
     }
-    for (run_id, state) in run_states {
+    for ((run_id, agent_id), state) in run_states {
         if state.is_terminal() {
             continue;
         }
@@ -14022,15 +14066,12 @@ fn append_fork_boundary_closures(
             .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
         let envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION,
-            event_id: fork_boundary_event_id(
-                &command.session_id,
-                &format!("run:{}", run_id.as_str()),
-            ),
+            event_id: fork_run_boundary_event_id(&command.session_id, &run_id, agent_id.as_ref()),
             seq,
             session_id: command.session_id.clone(),
             branch_id: None,
             run_id: Some(run_id),
-            agent_id: None,
+            agent_id,
             device_id: command.device_id.clone(),
             authority_epoch: 0,
             worker_generation: command.worker_generation,

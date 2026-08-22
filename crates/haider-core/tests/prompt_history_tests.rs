@@ -1555,7 +1555,7 @@ async fn checkpoint_from_another_branch_is_rejected() {
         boundary_event_id: events[1].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 1,
-            "reducer_version": format!("{}/prompt-v1", env!("CARGO_PKG_VERSION")),
+            "reducer_version": "prompt-history-v1",
             "through_seq": 2,
             "boundary_event_id": events[1].event_id,
             "boundary_run_id": compacting,
@@ -1743,7 +1743,7 @@ async fn compaction_on_another_branch_does_not_invalidate_the_checkpoint() {
         boundary_event_id: events[5].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 1,
-            "reducer_version": format!("{}/prompt-v1", env!("CARGO_PKG_VERSION")),
+            "reducer_version": "prompt-history-v1",
             "through_seq": 6,
             "boundary_event_id": events[5].event_id,
             "boundary_run_id": prior,
@@ -1872,7 +1872,7 @@ async fn unreadable_checkpoint_falls_back_to_full_replay() {
         boundary_event_id: events[0].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 0,
-            "reducer_version": format!("{}/prompt-v1", env!("CARGO_PKG_VERSION")),
+            "reducer_version": "prompt-history-v1",
             "through_seq": 1,
             "boundary_event_id": events[0].event_id,
             "boundary_run_id": prior,

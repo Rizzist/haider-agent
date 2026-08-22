@@ -474,6 +474,350 @@ impl FrameSink for CapturingFrameSink {
     }
 }
 
+/// Regression pin: a command-response capture borrows the live caller's
+/// identity. Dropping that short-lived capture must not unregister the real
+/// connection's resident binding or either volatile surface it owns.
+#[tokio::test]
+async fn command_capture_preserves_callers_binding_and_surface_ownership() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("command-capture-owner");
+    hub.create_internal_session(create_command(&session, "command-capture-owner"))
+        .await
+        .expect("session created");
+    let generation = store.worker_generation();
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("session head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("command-owner-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attachment opens");
+    connection
+        .resident_session_binding(Some(session.clone()), generation)
+        .await
+        .expect("resident binding publishes");
+    connection
+        .request(
+            haider_rpc::RequestId::new("command-owner-surface"),
+            haider_rpc::RequestBody::SessionSurfacePublish {
+                session_id: session.clone(),
+                input: Some(haider_rpc::SurfaceInputPublishWire {
+                    text: "draft survives".into(),
+                    attachments: Vec::new(),
+                    revision: 1,
+                }),
+                status: Some(haider_rpc::SurfaceStatusPublishWire {
+                    line: "working survives".into(),
+                    state: Some("working".into()),
+                    detail: None,
+                    revision: 1,
+                }),
+            },
+        )
+        .await
+        .expect("surface publishes");
+    sink.0.lock().expect("frames").clear();
+
+    connection
+        .request(
+            haider_rpc::RequestId::new("command-owner-rename"),
+            haider_rpc::RequestBody::CommandInvoke {
+                command_id: haider_rpc::CommandId::new("command-owner-rename-id"),
+                command: "/rename Capture survived".into(),
+                session_id: Some(session.clone()),
+            },
+        )
+        .await
+        .expect("command succeeds");
+    let frames = sink.0.lock().expect("frames").clone();
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            WireFrame::Response {
+                request_id,
+                body: haider_rpc::ResponseBody::CommandInvoke {
+                    outcome: haider_rpc::CommandInvokeOutcomeWire::Receipt { receipt },
+                },
+            } if request_id.as_str() == "command-owner-rename"
+                && matches!(receipt.as_ref(), haider_rpc::ResponseBody::SessionRename { .. })
+        )),
+        "command door must return the successful rename receipt, got {frames:?}"
+    );
+
+    assert_eq!(
+        hub.inner
+            .resident_binding
+            .lock()
+            .expect("resident binding")
+            .visible(),
+        Some((Some(session.clone()), generation)),
+        "the real connection must remain resident-bound after capture drops"
+    );
+    // Scoped so the guard cannot outlive the block: clippy denies a
+    // MutexGuard held across an await, and CI runs with -D warnings.
+    {
+        let surfaces = hub.inner.surfaces.lock().expect("surfaces");
+        let surface = surfaces.get(&session).expect("published surface survives");
+        assert_eq!(
+            surface.input.as_ref().map(|input| input.owner.as_str()),
+            Some(connection.connection_id.as_str())
+        );
+        assert_eq!(
+            surface.status.as_ref().map(|status| status.owner.as_str()),
+            Some(connection.connection_id.as_str())
+        );
+    }
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// A healthy, empty provider inventory is a known non-retryable absence;
+/// poisoned account infrastructure is only an unknown, retryable lookup.
+/// The latter must never be collapsed into the former's concrete claim.
+#[tokio::test]
+async fn provider_command_distinguishes_known_absence_from_lookup_failure() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("provider-command-lookup");
+    hub.create_internal_session(create_command(&session, "provider-command-lookup"))
+        .await
+        .expect("session created");
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            Vec::new(),
+            vec![provider_summary("known-empty")],
+        ),
+        vault_supported: false,
+        discovery_disabled: false,
+        vault: None,
+    })
+    .expect("accounts install");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session).await.expect("session head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("provider-command-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attachment opens");
+    sink.0.lock().expect("frames").clear();
+
+    connection
+        .request(
+            haider_rpc::RequestId::new("provider-known-empty"),
+            haider_rpc::RequestBody::CommandInvoke {
+                command_id: haider_rpc::CommandId::new("provider-known-empty-id"),
+                command: "/provider known-empty".into(),
+                session_id: Some(session.clone()),
+            },
+        )
+        .await
+        .expect("known-empty provider routes");
+    assert!(
+        sink.0.lock().expect("frames").iter().any(|frame| matches!(
+            frame,
+            WireFrame::Response {
+                request_id,
+                body: haider_rpc::ResponseBody::Error {
+                    code,
+                    message,
+                    retryable: false,
+                    ..
+                },
+            } if request_id.as_str() == "provider-known-empty"
+                && code == haider_rpc::ERROR_CODE_INVALID_ARGUMENT
+                && message == "provider known-empty has no daemon-known model"
+        )),
+        "healthy empty inventory must remain a known absence"
+    );
+    sink.0.lock().expect("frames").clear();
+
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = hub.inner.accounts.lock().expect("accounts lock");
+        panic!("poison account facade for lookup-failure pin");
+    }));
+    assert!(poisoned.is_err(), "poisoning probe must panic");
+    connection
+        .request(
+            haider_rpc::RequestId::new("provider-lookup-unknown"),
+            haider_rpc::RequestBody::CommandInvoke {
+                command_id: haider_rpc::CommandId::new("provider-lookup-unknown-id"),
+                command: "/provider indeterminate".into(),
+                session_id: Some(session.clone()),
+            },
+        )
+        .await
+        .expect("failed lookup still routes an honest response");
+    let frames = sink.0.lock().expect("frames").clone();
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            WireFrame::Response {
+                request_id,
+                body: haider_rpc::ResponseBody::Error {
+                    code,
+                    message,
+                    retryable: true,
+                    ..
+                },
+            } if request_id.as_str() == "provider-lookup-unknown"
+                && code == "provider_models_unknown"
+                && message.contains("could not determine")
+        )),
+        "infrastructure failure must be retryable unknown state, got {frames:?}"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Metafork review is exact authorization, so a removal must be wholly
+/// contained in copied history. Accepting an intersecting range would make
+/// the reviewed request claim sequence coordinates the child never copied.
+#[tokio::test]
+async fn metafork_rejects_range_beyond_copied_lineage() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let source = SessionId::new("metafork-overrun-parent");
+    hub.create_internal_session(create_command(&source, "metafork-overrun-parent"))
+        .await
+        .expect("create source");
+    let run_id = RunId::new("metafork-overrun-run");
+    hub.accept_internal_turn(TurnAcceptCommand {
+        command_id: "metafork-overrun-turn".into(),
+        request_digest: "metafork-overrun-turn-digest".into(),
+        request_json: r#"{"text":"bounded review event"}"#.into(),
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        branch_id: None,
+        run_id: run_id.clone(),
+        agent_id: None,
+        text: "bounded review event".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new("metafork-overrun-queued"),
+        user_event_id: EventId::new("metafork-overrun-user"),
+        active_event_id: EventId::new("metafork-overrun-active"),
+        device_id: DeviceId::new("metafork-overrun-device"),
+    })
+    .await
+    .expect("accept source turn");
+    let mut done = [run_state_envelope(
+        &source,
+        &run_id,
+        store.worker_generation(),
+        "metafork-overrun-done",
+        RunState::Done,
+    )];
+    hub.append(&mut done)
+        .await
+        .expect("terminalize source turn");
+    let source_events = store.read(&source, 0, 64).await.expect("source events");
+    let user_seq = source_events
+        .iter()
+        .find(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::UserMessage { ref text, .. }) if text == "bounded review event"
+            )
+        })
+        .expect("source user event")
+        .seq;
+    let (fork_node_id, fork_seq) = source_events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            (event.run_id.as_ref() == Some(&run_id)).then_some((node.node, event.seq))
+        })
+        .expect("source fork node");
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let proposal = SessionMetaforkProposal {
+        removals: vec![SessionMetaforkRemoval {
+            from_seq: user_seq,
+            through_seq: fork_seq + 1,
+            reason: "range intentionally overruns copied history".into(),
+            preview: None,
+            reviewed_events: Vec::new(),
+        }],
+    };
+
+    let error = connection
+        .canonical_metafork_proposal(
+            &source,
+            store.worker_generation(),
+            None,
+            &fork_node_id,
+            fork_seq,
+            &proposal,
+        )
+        .await
+        .expect_err("intersecting but uncontained range must be rejected");
+    assert!(matches!(
+        error,
+        SessionHubError::Store(ref error)
+            if error.code == haider_protocol::error::ErrorCode::InvalidArgument
+                && error.message.contains("contained")
+    ));
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// MUTATION CHECK: route a proposal-only `session.metafork` through
 /// `fork_session` or claim its command receipt. Expected RUNTIME failure: the
 /// session roster gains a child, the source journal moves, or a receipt exists

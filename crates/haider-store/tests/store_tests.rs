@@ -212,7 +212,7 @@ fn projection_checkpoint_write_leaves_journal_bytes_unchanged() {
 /// MUTATION CHECK: remove `timeline_key = ?3` from the checkpoint lookup.
 /// Expected runtime failure: the branch-B cache miss returns branch A's row.
 #[test]
-fn projection_checkpoint_lookup_is_timeline_exact_and_corruption_is_a_miss() {
+fn projection_checkpoint_lookup_is_timeline_exact_and_corruption_is_reported() {
     let root = test_root();
     let store = must(Store::open(root.path()));
     let session = SessionId::new("checkpoint-timeline-keying");
@@ -245,10 +245,17 @@ fn projection_checkpoint_lookup_is_timeline_exact_and_corruption_is_a_miss() {
         "UPDATE session_projection_checkpoints SET payload = X'00' WHERE session_id = ?1",
         [session.as_str()],
     ));
-    assert_eq!(
-        must(store.session_projection_checkpoint(&session, "prompt_history", "branch-a")),
-        None,
-        "digest-invalid checkpoint bytes are an ordinary cache miss"
+    let error = match store.session_projection_checkpoint(&session, "prompt_history", "branch-a") {
+        Err(error) => error,
+        Ok(checkpoint) => {
+            panic!("digest-invalid checkpoint must be reported, got {checkpoint:?}")
+        }
+    };
+    assert_eq!(error.code, ErrorCode::StoreCorrupt);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains("prompt_history") && error.message.contains("branch-a"),
+        "corruption evidence must identify the disabled checkpoint: {error:?}"
     );
 }
 

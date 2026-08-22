@@ -143,6 +143,10 @@ pub const ERROR_CODE_BUSY: &str = "busy";
 /// `retryable: true`. Durable turn failures still surface as `RunFailed`
 /// envelopes, not correlated responses (R3).
 pub const ERROR_CODE_PROVIDER_ERROR: &str = "provider_error";
+/// Stable retryable code for daemon infrastructure that prevented a provider
+/// inventory lookup. This asserts no fact about whether the provider or its
+/// models exist; clients may retry after refreshing daemon state.
+pub const ERROR_CODE_PROVIDER_MODELS_UNKNOWN: &str = "provider_models_unknown";
 /// Stable code for a credential that failed authentication (HTTP 401):
 /// the key is invalid. Non-retryable.
 pub const ERROR_CODE_UNAUTHORIZED: &str = "unauthorized";

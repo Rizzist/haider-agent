@@ -8140,8 +8140,10 @@ async fn native_pipe_version_rebuild_sweeps_previous_generation_successor() {
 
 /// MUTATION CHECK: replace the one-line `reachable.contains(&path)` guard
 /// with `false`.
-/// Expected RUNTIME failure: at least one successor named by the live root
-/// chain is unlinked and its post-sweep `exists()` assertion fails.
+/// Expected RUNTIME failure: a reachable successor is quarantined, the live
+/// root rescan can no longer follow its original pathname, and restoration
+/// aborts the sweep before the real orphan is removed; the final orphan
+/// assertion fails.
 #[tokio::test]
 async fn native_pipe_orphan_sweep_preserves_every_reachable_segment() {
     let (root, store, hub) = open_hub(None, 8).await;
