@@ -11,6 +11,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::{MemoryVault, SecretHandle, Vault};
 use haider_protocol::EventPayload;
+use haider_protocol::agent::AgentUsageMetrics;
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::ids::{AgentId, CredentialAlias, DeviceId, EventId, RunId, SessionId};
@@ -757,6 +758,79 @@ fn metrics_usage(logical: u64, output: u64, model: &str, request_kind: UsageRequ
         }),
         cache_cost: None,
     }
+}
+
+fn cache_reread_metrics_usage(run: &str, logical: u64, output: u64, cache_read: u64) -> Usage {
+    let mut usage = metrics_usage(logical, output, "gpt-5.2", UsageRequestKind::MainTurn);
+    usage.cached = cache_read;
+    let normalized = usage.normalized.as_mut().expect("normalized usage");
+    normalized.uncached_input = logical.saturating_sub(cache_read);
+    normalized.cache_read_input = cache_read;
+    usage.scope.as_mut().expect("usage scope").run = Some(RunId::new(run));
+    usage
+}
+
+fn cache_reread_metric_snapshot(calls: &[(&str, u64, u64, u64)]) -> AgentUsageMetrics {
+    let mut folder = SessionFolder::new("gpt-5.2");
+    for (index, &(run, logical, output, cache_read)) in calls.iter().enumerate() {
+        let seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        folder.push(&envelope(
+            seq,
+            Some(run),
+            Some("agent-cache"),
+            seq,
+            usage_payload(cache_reread_metrics_usage(run, logical, output, cache_read)),
+        ));
+    }
+    folder
+        .agent_snapshot(
+            &SessionId::new("s-usage"),
+            Some(&AgentId::new("agent-cache")),
+            u64::try_from(calls.len()).unwrap_or(u64::MAX),
+        )
+        .and_then(|snapshot| snapshot.usage)
+        .expect("cache re-read usage")
+}
+
+/// MUTATION CHECK: replace `logical.min(accumulator.prev_prefix_tokens)` with `logical`; the single call reports `Some(0)` instead of `None`.
+#[test]
+fn cache_reread_metric_single_call_is_none() {
+    let usage = cache_reread_metric_snapshot(&[("run-only", 1_000, 100, 0)]);
+    assert_eq!(usage.cache_reread_hit_basis_points, None);
+}
+
+/// MUTATION CHECK: remove `chronological_chunks.sort_by_key`; key-order folding drops the expected 10_000 to 5_000.
+#[test]
+fn cache_reread_metric_steady_state_excludes_unavoidable_first_input() {
+    let usage = cache_reread_metric_snapshot(&[
+        ("run-z-first", 1_000, 0, 0),
+        ("run-a-second", 1_000, 0, 1_000),
+        ("run-m-third", 1_000, 0, 1_000),
+    ]);
+    assert_eq!(usage.cache_reread_hit_basis_points, Some(10_000));
+    assert_eq!(usage.cache_hit_basis_points, Some(6_666));
+}
+
+/// MUTATION CHECK: replace `logical.min(accumulator.prev_prefix_tokens)` with `accumulator.prev_prefix_tokens`; compaction returns 4_654 instead of 10_000.
+#[test]
+fn cache_reread_metric_compaction_clamps_cacheable_window() {
+    let usage = cache_reread_metric_snapshot(&[
+        ("run-first", 1_000, 100, 0),
+        ("run-compacted", 400, 50, 512),
+    ]);
+    assert_eq!(usage.cache_reread_hit_basis_points, Some(10_000));
+}
+
+/// MUTATION CHECK: replace `read.min(cacheable)` with `cacheable`; real eviction reports 10_000 instead of 6_278.
+#[test]
+fn cache_reread_metric_real_eviction_drives_ratio_down() {
+    let usage = cache_reread_metric_snapshot(&[
+        ("run-first", 10_000, 1_000, 0),
+        ("run-steady", 11_000, 1_000, 11_000),
+        ("run-evicted", 11_819, 1_000, 3_328),
+    ]);
+    assert_eq!(usage.cache_reread_hit_basis_points, Some(6_278));
+    assert!(usage.cache_reread_hit_basis_points < Some(7_000));
 }
 
 /// LAW mv1 — Started+Completed for one durable ToolCall is one attempt;

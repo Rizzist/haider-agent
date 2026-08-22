@@ -807,6 +807,9 @@ struct AgentUsageAccumulator {
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     telemetry_covered_input_tokens: u64,
+    prev_prefix_tokens: u64,
+    cacheable_input_tokens: u64,
+    cache_read_on_cacheable_tokens: u64,
     metered_cost_usd: f64,
     api_equivalent_cost_usd: f64,
     metered_lanes_priced: bool,
@@ -815,6 +818,26 @@ struct AgentUsageAccumulator {
     has_oauth_lanes: bool,
     saw_component: bool,
     breakdowns: HashMap<AgentBreakdownKey, AgentBreakdownAccumulator>,
+}
+
+fn add_agent_cache_reread_component(
+    accumulator: &mut AgentUsageAccumulator,
+    input: u64,
+    output: u64,
+    cached: u64,
+    normalized: Option<&NormalizedUsage>,
+) {
+    let logical = normalized.map_or(input, |usage| usage.logical_input);
+    let billed_output = normalized.map_or(output, |usage| usage.billed_output);
+    let read = normalized.map_or(cached, |usage| usage.cache_read_input);
+    let cacheable = logical.min(accumulator.prev_prefix_tokens);
+    let hit = read.min(cacheable);
+    accumulator.cacheable_input_tokens =
+        accumulator.cacheable_input_tokens.saturating_add(cacheable);
+    accumulator.cache_read_on_cacheable_tokens = accumulator
+        .cache_read_on_cacheable_tokens
+        .saturating_add(hit);
+    accumulator.prev_prefix_tokens = logical.saturating_add(billed_output);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -944,7 +967,9 @@ pub(crate) struct SessionFolder {
     /// and float addition is non-associative — a HashMap's randomized
     /// iteration order could shift the final microusd rounding run-to-run.
     /// Ordered iteration makes every fold deterministic.
-    chunks: BTreeMap<UsageChunkKey, (UsagePayload, String)>,
+    /// The tuple's sequence stamp preserves journal chronology for the
+    /// order-dependent cache re-read fold without changing key deduplication.
+    chunks: BTreeMap<UsageChunkKey, (UsagePayload, String, u64)>,
     tool_attempts: HashMap<String, HashSet<String>>,
     timings: HashMap<String, AgentTiming>,
     run_agents: HashMap<String, Option<String>>,
@@ -1058,7 +1083,7 @@ impl SessionFolder {
                     request_kind: scope
                         .map_or(UsageRequestKind::MainTurn, |scope| scope.request_kind),
                 };
-                self.chunks.insert(key, (usage, model));
+                self.chunks.insert(key, (usage, model, envelope.seq));
             }
             "item" => {
                 let payload = &envelope.payload;
@@ -1144,7 +1169,7 @@ impl SessionFolder {
         let agent_key = agent.map_or("", AgentId::as_str);
         let timing = self.timings.get(agent_key)?;
         let mut accumulator = AgentUsageAccumulator::default();
-        for (key, (usage, fallback_model)) in &self.chunks {
+        for (key, (usage, fallback_model, _)) in &self.chunks {
             if key.agent != agent_key {
                 continue;
             }
@@ -1174,6 +1199,33 @@ impl SessionFolder {
                 }
             }
         }
+        let mut chronological_chunks = self
+            .chunks
+            .iter()
+            .filter(|(key, _)| key.agent == agent_key)
+            .collect::<Vec<_>>();
+        chronological_chunks.sort_by_key(|(_, (_, _, seq))| *seq);
+        for (_, (usage, _, _)) in chronological_chunks {
+            if usage.accounts.is_empty() {
+                add_agent_cache_reread_component(
+                    &mut accumulator,
+                    usage.input,
+                    usage.output,
+                    usage.cached,
+                    usage.normalized.as_ref(),
+                );
+            } else {
+                for subtotal in &usage.accounts {
+                    add_agent_cache_reread_component(
+                        &mut accumulator,
+                        subtotal.input,
+                        subtotal.output,
+                        subtotal.cached,
+                        subtotal.normalized.as_ref(),
+                    );
+                }
+            }
+        }
         let usage = accumulator.saw_component.then(|| {
             let cache_hit_basis_points = (accumulator.logical_input_tokens > 0
                 && accumulator.telemetry_covered_input_tokens == accumulator.logical_input_tokens)
@@ -1185,6 +1237,15 @@ impl SessionFolder {
                         .cache_read_tokens
                         .saturating_mul(10_000)
                         .checked_div(denominator)
+                        .unwrap_or_default();
+                    u32::try_from(points).unwrap_or(10_000).min(10_000)
+                });
+            let cache_reread_hit_basis_points =
+                (accumulator.cacheable_input_tokens > 0).then(|| {
+                    let points = accumulator
+                        .cache_read_on_cacheable_tokens
+                        .saturating_mul(10_000)
+                        .checked_div(accumulator.cacheable_input_tokens)
                         .unwrap_or_default();
                     u32::try_from(points).unwrap_or(10_000).min(10_000)
                 });
@@ -1246,6 +1307,7 @@ impl SessionFolder {
                 cache_read_tokens: accumulator.cache_read_tokens,
                 cache_write_tokens: accumulator.cache_write_tokens,
                 cache_hit_basis_points,
+                cache_reread_hit_basis_points,
                 metered_cost_microusd,
                 api_equivalent_cost_microusd,
                 all_lanes_priced: accumulator.all_lanes_priced,
@@ -1273,7 +1335,7 @@ impl SessionFolder {
 
     pub(crate) fn finish(self) -> SessionLocalStats {
         let mut stats = self.stats;
-        for (usage, model) in self.chunks.into_values() {
+        for (usage, model, _) in self.chunks.into_values() {
             let model = model.as_str();
             if !usage.accounts.is_empty() {
                 for subtotal in usage.accounts {

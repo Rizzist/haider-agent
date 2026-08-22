@@ -1621,6 +1621,7 @@ fn golden_agent_metrics_snapshot_fact() {
             cache_read_tokens: 7_000,
             cache_write_tokens: 1_000,
             cache_hit_basis_points: Some(7_000),
+            cache_reread_hit_basis_points: None,
             metered_cost_microusd: None,
             api_equivalent_cost_microusd: Some(27_000),
             all_lanes_priced: true,

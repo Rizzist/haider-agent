@@ -195,6 +195,11 @@ pub struct AgentUsageMetrics {
     /// cache coverage. 10_000 basis points is 100.00%.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_basis_points: Option<u32>,
+    /// Re-read hit rate over input that could have existed in the preceding
+    /// provider-call prefix, excluding unavoidable first-seen input from the
+    /// lifetime ratio above. 10_000 basis points is 100.00%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_reread_hit_basis_points: Option<u32>,
     /// Real pay-as-you-go spend over API-key lanes only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metered_cost_microusd: Option<u64>,

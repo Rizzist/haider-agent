@@ -91,6 +91,7 @@ fn oauth_usage(cost_microusd: u64) -> AgentUsageMetrics {
         cache_read_tokens: 800,
         cache_write_tokens: 25,
         cache_hit_basis_points: Some(8_000),
+        cache_reread_hit_basis_points: None,
         metered_cost_microusd: None,
         api_equivalent_cost_microusd: Some(cost_microusd),
         all_lanes_priced: true,
