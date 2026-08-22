@@ -10643,10 +10643,8 @@ impl AppModel {
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case(&requested))
                 {
-                    self.identity.provider = name.clone();
-                    self.refresh_context_window();
-                    self.identity_pinned = true;
-                    self.flash = Some(format!("· provider → {name} · {health}"));
+                    let (name, health) = (name.clone(), health.clone());
+                    self.select_provider(name, health);
                 } else {
                     self.flash = Some(format!("· no provider \"{requested}\" in the registry"));
                 }
@@ -13343,6 +13341,67 @@ impl AppModel {
             session,
             model: row.model.clone(),
             provider: row.provider.clone(),
+            confirm_new_epoch,
+        });
+    }
+
+    /// `/provider <name>`. At the LAUNCHER this pins the default pair the
+    /// next session is created with — client-owned view state, and the same
+    /// ownership flip `/model` carries. In an ATTACHED session the provider
+    /// is DAEMON TRUTH, so it has to be committed by the receipted select:
+    /// assigning `identity.provider` locally and flashing success announced a
+    /// switch the daemon never heard, and the next turn still ran on the old
+    /// provider.
+    fn select_provider(&mut self, name: String, health: String) {
+        self.dirty = true;
+        let live_session = (!self.mode.fabricates_locally()
+            && (self.screen == Screen::Session || self.screen == Screen::Loom))
+            .then(|| self.active_session.clone())
+            .flatten();
+        let Some(session) = live_session else {
+            self.identity.provider = name.clone();
+            self.refresh_context_window();
+            self.identity_pinned = true;
+            self.flash = Some(format!("· provider → {name} · {health}"));
+            return;
+        };
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1) {
+            self.flash = Some(self.stale_daemon_note("cross-provider model selection"));
+            return;
+        }
+        // A provider is committed by selecting a MODEL on it. The daemon
+        // publishes each provider's default; when it declares NONE we must
+        // not invent one. Reaching for the first catalog entry would commit a
+        // choice the daemon never sanctioned — the same lie this fix removes,
+        // relocated one line down.
+        let Some(model) = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider.eq_ignore_ascii_case(&name))
+            .and_then(|summary| summary.default_model.clone())
+        else {
+            self.flash = Some(format!(
+                "· {name} declares no default model — /model to choose one"
+            ));
+            return;
+        };
+        let change = PendingCacheChange::Model {
+            session: session.clone(),
+            provider: name.clone(),
+            model: model.clone(),
+        };
+        let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
+        // IN FLIGHT, not done. The resolved pair is rendered by
+        // `apply_model_selected` from daemon truth; claiming the switch here
+        // would be the original defect with a longer message.
+        self.flash = Some(format!(
+            "· provider → {name} · {health} · selecting {model}…"
+        ));
+        self.requests.push(AppRequest::SelectModel {
+            session,
+            model,
+            provider: name,
             confirm_new_epoch,
         });
     }
