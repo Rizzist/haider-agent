@@ -852,7 +852,13 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
         detail.contains("tokens — in 1.2k · out 300 · cached 800 · cache write 25"),
         "{detail}"
     );
-    assert!(detail.contains("cache — 80.00% hit"), "{detail}");
+    // W-flow: cache health is now TWO numbers. This fixture has one usage
+    // row, so nothing could be re-read and the rate is honestly absent —
+    // never rendered as 0%, which would read as total cache failure.
+    assert!(
+        detail.contains("cache — 80.00% of all input · re-read n/a"),
+        "{detail}"
+    );
     assert!(detail.contains("openai/gpt-5.2 · delegated"), "{detail}");
     assert!(
         !detail.contains("subtree —"),

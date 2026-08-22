@@ -106,6 +106,37 @@ fn breakdown_cost(breakdown: &AgentUsageBreakdown) -> String {
 }
 
 #[must_use]
+/// Cache health as TWO numbers, because either alone misleads.
+///
+/// The lifetime ratio counts the first send of new content as a miss — which
+/// it definitionally is, since content never sent cannot be a hit — so it can
+/// never reach 100% and a healthy session reads as broken. That is exactly
+/// what happened: a measured session showed 71.9% and raised the question of
+/// whether append-only prompt construction had failed. It had not; its
+/// steady-state re-read rate was 98.7-99.7%.
+///
+/// The re-read rate is the health signal. The lifetime ratio still reports
+/// real cold-start cost, so both stay. **`None` is not zero** — a session with
+/// nothing to re-read has no rate, and rendering that as 0% would recreate the
+/// same false alarm one layer down.
+pub fn cache_line(usage: &AgentUsageMetrics) -> String {
+    match (
+        usage.cache_hit_basis_points,
+        usage.cache_reread_hit_basis_points,
+    ) {
+        (None, _) => "cache — hit n/a".to_owned(),
+        (Some(lifetime), None) => format!(
+            "cache — {:.2}% of all input · re-read n/a",
+            lifetime as f64 / 100.0
+        ),
+        (Some(lifetime), Some(reread)) => format!(
+            "cache — {:.2}% of all input · {:.2}% of re-reads",
+            lifetime as f64 / 100.0,
+            reread as f64 / 100.0
+        ),
+    }
+}
+
 pub fn detail_lines(snapshot: &AgentMetricsSnapshot) -> Vec<String> {
     let Some(usage) = &snapshot.usage else {
         return vec![
@@ -139,10 +170,7 @@ pub fn detail_lines(snapshot: &AgentMetricsSnapshot) -> Vec<String> {
                 )
             }
         ),
-        usage.cache_hit_basis_points.map_or_else(
-            || "cache — hit n/a".to_owned(),
-            |points| format!("cache — {:.2}% hit", points as f64 / 100.0),
-        ),
+        cache_line(usage),
     ];
     for breakdown in &usage.breakdowns {
         let lane = match breakdown.request_kind {
