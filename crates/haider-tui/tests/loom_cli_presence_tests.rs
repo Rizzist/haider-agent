@@ -140,6 +140,44 @@ fn the_detail_marks_present_missing_and_stays_silent_on_unprobed() {
     );
 }
 
+/// The gap must be visible on the ROW, not only inside the detail — a gap
+/// you have to open a pane to find is a gap you bind over.
+///
+/// MUTATION CHECK (executed): drop the row chip. Expected RUNTIME failure:
+/// the list-row assertion below.
+#[test]
+fn the_list_row_carries_the_missing_count() {
+    let model = model_with(
+        typed("scout", &["yt-dlp", "ffmpeg", "jq"]),
+        &[("yt-dlp", false), ("jq", true)],
+    );
+    let rows = draw(&model);
+    let all = rows.join("\n");
+    let row = rows
+        .iter()
+        .find(|row| row.contains("@scout"))
+        .unwrap_or_else(|| panic!("no @scout row:\n{all}"))
+        .clone();
+    assert!(
+        row.contains("✗ 1 missing"),
+        "the row counts only PROBED-absent programs: {row}"
+    );
+
+    // Nothing probed-absent → no chip at all, including when names went
+    // unprobed entirely.
+    let clean = model_with(typed("scout", &["jq", "ffmpeg"]), &[("jq", true)]);
+    let rows = draw(&clean);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("@scout"))
+        .expect("a @scout row")
+        .clone();
+    assert!(
+        !row.contains("missing"),
+        "unprobed names never produce a missing chip: {row}"
+    );
+}
+
 /// ⌃I seeds a turn naming EXACTLY the missing programs — the install then
 /// runs behind the ordinary process_exec permission card, which is the
 /// confirmation the owner asked for.

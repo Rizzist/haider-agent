@@ -6033,7 +6033,7 @@ fn render_loom(
             if index == selection {
                 selected_line = lines.len();
             }
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(cursor.to_owned(), theme.gold_style()),
                 Span::styled(format!("{} ", record.glyph), accent),
                 Span::styled(
@@ -6062,11 +6062,23 @@ fn render_loom(
                     ),
                     theme.dim_style(),
                 ),
-            ]));
+            ];
+            // W-flow: a type whose declared programs are absent will fail at
+            // its first turn. Say so on the ROW — the detail is one keypress
+            // away, but a gap you have to open a pane to discover is a gap
+            // you bind over.
+            let missing = missing_clis(model, record);
+            if !missing.is_empty() {
+                spans.push(Span::styled(
+                    format!("  ✗ {} missing", missing.len()),
+                    theme.maroon_style(),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "↑↓ select · ⏎ detail · ⌃P bind · ⌃N new · ⌥m model · tab ⇄ workflows · esc back",
+            "↑↓ select · ⏎ detail · ⌃P bind · ⌃N new · ⌃I install · ⌥m model · tab ⇄ workflows · esc back",
             theme.dim_style(),
         ));
     } else {
