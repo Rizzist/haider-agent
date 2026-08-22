@@ -425,6 +425,55 @@ async fn cm2e_gemini_cached_content_create_reuse_and_delete_superseded() {
     );
 }
 
+#[tokio::test]
+async fn cm2e_gemini_refreshes_when_cached_coverage_falls_below_eighty_percent() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let mut request = gemini_cache_request("gemini-2.5-flash");
+    let initial = gemini_request_json(&request, None, false).expect("initial full payload");
+    let first = registry
+        .prepare_generate_payload(&request, initial, backend.clone(), None, false)
+        .await;
+    assert_eq!(first["cachedContent"], "cachedContents/mock-1");
+
+    request.messages.push(Message::assistant(vec![Block::Text {
+        text: "now-stable answer".into(),
+    }]));
+    request
+        .messages
+        .push(Message::user_text("new volatile question"));
+    let metadata = request.cache_metadata.as_mut().expect("metadata");
+    metadata.stable_history_end = 4;
+    metadata.current_user_start = 4;
+    metadata.stable_prefix_tokens = 2_500;
+    let grown = gemini_request_json(&request, None, false).expect("grown full payload");
+    let still_reused = registry
+        .prepare_generate_payload(&request, grown.clone(), backend.clone(), None, false)
+        .await;
+    assert_eq!(still_reused["cachedContent"], "cachedContents/mock-1");
+
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("metadata")
+        .stable_prefix_tokens = 3_000;
+    let refreshed = registry
+        .prepare_generate_payload(&request, grown, backend.clone(), None, false)
+        .await;
+    assert_eq!(refreshed["cachedContent"], "cachedContents/mock-2");
+    assert_eq!(
+        *backend.operations.lock().expect("operations lock"),
+        ["create:1", "delete:cachedContents/mock-1", "create:2"]
+    );
+    assert_eq!(
+        backend.create_payloads.lock().expect("payloads lock")[1]["contents"]
+            .as_array()
+            .expect("refreshed cached contents")
+            .len(),
+        4
+    );
+}
+
 /// Expiry is another supersession boundary: a dead resource name is deleted
 /// and recreated instead of being sent forever after its one-hour TTL.
 #[tokio::test(start_paused = true)]

@@ -1626,6 +1626,35 @@ fn cm2f_openai_lite_carries_stable_cache_key_and_retention() {
     assert!(!stripped.to_string().contains("prompt_cache"));
 }
 
+/// OAuth and API-key sessions both receive stable cache routing, while the
+/// provider name keeps their cache domains separate.
+#[test]
+fn cm2f_openai_oauth_cache_key_has_retention_and_is_separate_from_api_key() {
+    let mut oauth_request = probe_request("gpt-5.6-sol");
+    oauth_request.cache_metadata = Some(cm2_cache_metadata(OPENAI_OAUTH_PROVIDER_NAME, 1));
+    let oauth_payload =
+        responses_request_json(&oauth_request, true, None, false).expect("OAuth wire");
+    let oauth_key = oauth_payload
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .expect("OAuth request carries prompt_cache_key");
+    assert_eq!(
+        oauth_payload
+            .get("prompt_cache_retention")
+            .and_then(serde_json::Value::as_str),
+        Some("24h")
+    );
+
+    let mut api_key_request = probe_request("gpt-5.6-sol");
+    api_key_request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let api_key = openai_prompt_cache_key(&api_key_request, false)
+        .expect("API-key request carries prompt_cache_key");
+    assert_ne!(
+        oauth_key, api_key,
+        "provider identity must separate OAuth and API-key cache domains"
+    );
+}
+
 /// CM2g — strip only the new cache keys and the GPT-5.6 request becomes the
 /// byte-equivalent unannotated request, including provider-opaque reasoning
 /// and provider-produced tool arguments in their original order.

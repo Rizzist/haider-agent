@@ -193,6 +193,7 @@ struct GeminiCachedResource {
     epoch: String,
     name: String,
     contents: Vec<serde_json::Value>,
+    stable_prefix_tokens: u64,
     expires_at: tokio::time::Instant,
     backend: Arc<dyn GeminiCacheBackend>,
 }
@@ -726,6 +727,10 @@ impl GeminiCacheRegistry {
                 && !expired
                 && payload_contents(&full_payload)
                     .is_some_and(|contents| contents.starts_with(&existing.contents))
+                && !gemini_cached_coverage_needs_refresh(
+                    existing.stable_prefix_tokens,
+                    metadata.stable_prefix_tokens,
+                )
             {
                 let payload = gemini_cached_generate_payload(
                     full_payload,
@@ -790,12 +795,19 @@ impl GeminiCacheRegistry {
                 epoch: metadata.cache_epoch.clone(),
                 name,
                 contents: stable_contents,
+                stable_prefix_tokens: metadata.stable_prefix_tokens,
                 expires_at: tokio::time::Instant::now() + Duration::from_secs(3_600),
                 backend,
             },
         );
         payload
     }
+}
+
+fn gemini_cached_coverage_needs_refresh(cached_tokens: u64, current_tokens: u64) -> bool {
+    // Refresh below 80% coverage. The multiplicative threshold makes writes
+    // geometric as a conversation grows instead of recreating on every turn.
+    u128::from(cached_tokens) * 100 < u128::from(current_tokens) * 80
 }
 
 fn gemini_explicit_cache_minimum(model: &str) -> Option<u64> {

@@ -3963,7 +3963,10 @@ fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) ->
     }
     let metadata = request.cache_metadata.as_ref()?;
     (metadata.boundaries_valid(request.messages.len())
-        && metadata.provider == OPENAI_PROVIDER_NAME
+        && matches!(
+            metadata.provider.as_str(),
+            OPENAI_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME
+        )
         && metadata.account_scope.is_some())
     .then(|| derive_prompt_cache_key(request, metadata))
 }
