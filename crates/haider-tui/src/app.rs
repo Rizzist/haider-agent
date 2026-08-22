@@ -2306,7 +2306,8 @@ pub enum AppRequest {
         after_seq: u64,
     },
     /// Fetch/refresh the `/accounts` rows (`account.list`). Pushed on
-    /// entering the screen; the demo driver answers from the seed list.
+    /// screen entry and after a successful add commit; the demo driver
+    /// answers from the seed list.
     AccountsRefresh,
     /// Trigger the daemon's device-credential auto-adoption pass through
     /// the existing discovery RPC. Pushed on accounts/provider entry only;
@@ -6653,7 +6654,15 @@ impl AppModel {
         };
         self.dirty = true;
         match outcome {
-            Ok(identity) => card.stage = LoginStage::Done(identity),
+            Ok(identity) => {
+                card.stage = LoginStage::Done(identity);
+                // The daemon committed the descriptor, but the login
+                // receipt carries only its display identity. Re-read the
+                // authoritative roster instead of fabricating a row from
+                // the submitted provider/alias. This seam is shared by
+                // every API-key account kind.
+                self.requests.push(AppRequest::AccountsRefresh);
+            }
             Err((code, message)) => {
                 card.stage = LoginStage::Failed(login_recovery(&code, &message))
             }
@@ -9167,6 +9176,15 @@ impl AppModel {
                 "✓ provider {} created · keyless — discovering models…",
                 card.name
             ));
+            // Keyless presets finish at provider.configure (there is no
+            // credential/login receipt and intentionally no account row).
+            // Still re-read the daemon-owned roster once after a NEW
+            // provider commits so every Accounts-screen add path observes
+            // authoritative account truth. Editing an existing keyless
+            // provider is not an account add and needs no roster read.
+            if !card.edit {
+                self.requests.push(AppRequest::AccountsRefresh);
+            }
             self.requests.push(AppRequest::ProviderModelsRefresh {
                 provider: card.name,
             });

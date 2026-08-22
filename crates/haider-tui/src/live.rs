@@ -2509,10 +2509,10 @@ impl LiveDriver {
                 if matches!(provider.as_deref(), Some("deepseek" | "xai")) {
                     let provider = provider.unwrap_or_default();
                     self.models_requested.insert(provider.clone());
-                    vec![
-                        LiveCommand::AccountList,
-                        LiveCommand::RefreshProviderModels { provider },
-                    ]
+                    // AccountList is raised by the shared successful-login
+                    // reducer seam; these providers additionally refresh
+                    // their model catalogs after validating the key.
+                    vec![LiveCommand::RefreshProviderModels { provider }]
                 } else {
                     Vec::new()
                 }

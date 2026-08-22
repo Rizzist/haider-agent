@@ -7,9 +7,12 @@
 //! could carry it out of the process is searched for it.
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AppModel, AppRequest, LoginStage, RuntimeMode, login_recovery};
+use haider_tui::app::{
+    AccountAddKind, AppModel, AppRequest, Hit, LoginStage, RuntimeMode, Screen, login_recovery,
+};
 use haider_tui::commands::{PaletteItem, palette_items};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
+use haider_tui::mock::seed_provider_summaries;
 use haider_tui::render::render;
 use haider_tui::runtime::live_pass;
 use ratatui::Terminal;
@@ -477,6 +480,170 @@ fn submit_login(model: &mut AppModel, key_text: &str) -> u64 {
             _ => None,
         })
         .expect("submit queued the attempt-carrying request")
+}
+
+/// Walk the owner's exact `+ Haider Code (API)` route while already on
+/// Accounts, then submit its masked key card.
+fn submit_haider_code_add_on_accounts(model: &mut AppModel, key_text: &str) -> u64 {
+    let mut summary = seed_provider_summaries()
+        .into_iter()
+        .next()
+        .expect("seed has a provider summary");
+    summary.provider = "haider-code".to_owned();
+    model.providers.apply_snapshot(vec![summary], 1);
+    run_slash(model, "/accounts");
+    model.requests.clear();
+    model.handle_hit(Hit::AccountAdd(AccountAddKind::HaiderCodeApi));
+    assert_eq!(model.screen, Screen::Accounts);
+    assert_eq!(
+        model.login.as_ref().map(|card| card.provider.as_str()),
+        Some("haider-code")
+    );
+    for c in key_text.chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    model
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            AppRequest::LoginApi { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .expect("Haider Code add queued the attempt-carrying request")
+}
+
+/// HAIDERACCTREFRESH success pin.
+///
+/// MUTATION CHECK: remove the `AccountsRefresh` push from the `Ok` arm of
+/// `AppModel::login_result`. Expected RUNTIME failure: the committed
+/// Haider Code reply produces no `AccountList` while the model remains on
+/// `Screen::Accounts`.
+#[test]
+fn committed_api_key_add_on_accounts_refreshes_the_roster_once() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let now = std::time::Instant::now();
+
+    let attempt = submit_haider_code_add_on_accounts(&mut model, SENTINEL);
+    let _ = live_pass(&mut driver, &mut model, None, now);
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "haider-code-vault-reference".to_owned(),
+            provider: "haider-code".to_owned(),
+            alias: Some("haider-code-api".to_owned()),
+            attempt,
+        }),
+        now,
+    );
+    let command_id = pass
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::LoginApi { command_id, .. } => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("Haider Code login follows the staged key");
+
+    let committed = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::LoggedIn {
+            command_id,
+            identity: "haider-code key".to_owned(),
+        }),
+        now,
+    );
+
+    assert_eq!(
+        model.screen,
+        Screen::Accounts,
+        "the user never left the tab"
+    );
+    assert!(matches!(
+        model.login.as_ref().map(|card| &card.stage),
+        Some(LoginStage::Done(identity)) if identity == "haider-code key"
+    ));
+    assert_eq!(
+        committed
+            .commands
+            .iter()
+            .filter(|command| matches!(command, LiveCommand::AccountList))
+            .count(),
+        1,
+        "one committed add asks once for the daemon-owned roster"
+    );
+    assert!(
+        !model.accounts.revealed,
+        "refreshing after add must preserve the masked state"
+    );
+}
+
+/// HAIDERACCTREFRESH failure pin.
+///
+/// MUTATION CHECK: move the `AccountsRefresh` push before the outcome match
+/// in `AppModel::login_result`, so failures refresh too. Expected RUNTIME
+/// failure: this reply emits `AccountList`; the recovery text assertion
+/// also proves the error remains readable.
+#[test]
+fn failed_api_key_add_on_accounts_does_not_refresh_or_clear_the_error() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let now = std::time::Instant::now();
+
+    let attempt = submit_haider_code_add_on_accounts(&mut model, SENTINEL);
+    let _ = live_pass(&mut driver, &mut model, None, now);
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "haider-code-vault-reference".to_owned(),
+            provider: "haider-code".to_owned(),
+            alias: Some("haider-code-api".to_owned()),
+            attempt,
+        }),
+        now,
+    );
+    let command_id = pass
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::LoginApi { command_id, .. } => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("Haider Code login follows the staged key");
+
+    let failed = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Failed {
+            command_id: Some(command_id),
+            code: haider_rpc::ERROR_CODE_UNAUTHORIZED.to_owned(),
+            message: "rejected test key".to_owned(),
+            retryable: false,
+            presentation: None,
+        }),
+        now,
+    );
+
+    assert_eq!(
+        model.screen,
+        Screen::Accounts,
+        "the user never left the tab"
+    );
+    assert!(
+        !failed
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountList)),
+        "a rejected add must not refresh the roster"
+    );
+    assert!(matches!(
+        model.login.as_ref().map(|card| &card.stage),
+        Some(LoginStage::Failed(message)) if message.contains("provider rejected this key")
+    ));
 }
 
 #[test]
