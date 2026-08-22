@@ -357,6 +357,7 @@ impl SessionExport {
     /// A! <seq> <at_ms> |partial text| interrupted=|title: detail|
     /// E  <seq> <at_ms> |title: detail|
     /// T  <seq> <at_ms> |tool-name| |summary| [args=|preview|] [result=|preview|]
+    /// C  <seq> <at_ms> |compaction boundary|
     /// ```
     ///
     /// Text and tool names ride between pipes with `\` `|` and newline

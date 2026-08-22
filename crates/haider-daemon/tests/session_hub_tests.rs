@@ -27,7 +27,7 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
-use haider_protocol::history::{NodeKind, TreeNode};
+use haider_protocol::history::{CompactionResume, NodeKind, TreeNode};
 use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EffectId, EventId, ItemId, LeaseId,
     MenuId, NodeId, RunId, SessionId,
@@ -533,6 +533,65 @@ fn user_pipe_event(
     )
 }
 
+fn compaction_pipe_event(
+    session_id: &SessionId,
+    event_id: &str,
+    worker_generation: u64,
+    run_id: &str,
+) -> RawEnvelope {
+    let mut event = pipe_event(
+        session_id,
+        event_id,
+        worker_generation,
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new(format!("node-{event_id}")),
+            parent: None,
+            kind: NodeKind::Compaction {
+                covers_from: NodeId::new(format!("from-{event_id}")),
+                covers_to: NodeId::new(format!("to-{event_id}")),
+                summary_artifact: ArtifactRef::new(format!("artifact-{event_id}")),
+                tokens_before: 100,
+                tokens_after: 10,
+                resume_cause: CompactionResume::AutoMidTurn,
+            },
+        }),
+    );
+    event.run_id = Some(RunId::new(run_id));
+    event
+}
+
+fn run_state_pipe_event(
+    session_id: &SessionId,
+    event_id: &str,
+    worker_generation: u64,
+    run_id: &str,
+    state: RunState,
+) -> RawEnvelope {
+    let mut event = pipe_event(
+        session_id,
+        event_id,
+        worker_generation,
+        EventPayload::RunState(state),
+    );
+    event.run_id = Some(RunId::new(run_id));
+    event
+}
+
+fn successor_path(base: &std::path::Path, sidecar: &str) -> std::path::PathBuf {
+    let tail: serde_json::Value = serde_json::from_str(
+        sidecar
+            .lines()
+            .last()
+            .expect("sealed sidecar has a terminator"),
+    )
+    .expect("terminator is JSON");
+    base.parent().expect("sidecar has parent").join(
+        tail["successor"]
+            .as_str()
+            .expect("terminator names successor"),
+    )
+}
+
 fn expected_sidecar_body(events: &[RawEnvelope]) -> String {
     let mut ordered: Vec<&RawEnvelope> = events.iter().collect();
     ordered.sort_by_key(|event| event.seq);
@@ -553,7 +612,7 @@ fn expected_sidecar_batches(
     batches: &[&[RawEnvelope]],
 ) -> String {
     let mut expected = format!(
-        "{{\"pipe\":\"haider.session.jsonl\",\"version\":3,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
+        "{{\"pipe\":\"haider.session.jsonl\",\"version\":4,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
     );
     for batch in batches {
         expected.push_str(&expected_sidecar_body(batch));
@@ -6340,6 +6399,336 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     hub.shutdown().await.expect("hub stops");
 }
 
+/// MUTATION CHECK: read sealed reasoning from `payload.delta.text` or emit the
+/// assistant row before the matching completed item. Expected RUNTIME failure:
+/// the durable row carries `stream fragment` or omits `sealed summary`.
+#[tokio::test]
+async fn native_pipe_carries_only_sealed_reasoning_on_the_assistant_row() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-sealed-reasoning");
+    let generation = store.worker_generation();
+    let run_id = RunId::new("reasoning-run");
+    let item_id = ItemId::new("reasoning-item");
+
+    let mut started = pipe_event(
+        &session_id,
+        "reasoning-started",
+        generation,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: item_id.clone(),
+            item: TurnItem::Reasoning {
+                summary: String::new(),
+            },
+        }),
+    );
+    started.run_id = Some(run_id.clone());
+    let mut delta = pipe_event(
+        &session_id,
+        "reasoning-delta",
+        generation,
+        EventPayload::Item(ItemEvent::Delta {
+            item_id: item_id.clone(),
+            delta: ItemDelta::Reasoning {
+                text: "stream fragment".into(),
+            },
+        }),
+    );
+    delta.run_id = Some(run_id.clone());
+    let mut assistant = pipe_event(
+        &session_id,
+        "reasoning-assistant",
+        generation,
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("reasoning-assistant-node"),
+            parent: None,
+            kind: NodeKind::AssistantCommit {
+                text: "answer".into(),
+                verdict: VerifyVerdict::Unverified,
+            },
+        }),
+    );
+    assistant.run_id = Some(run_id.clone());
+    let mut sealed = pipe_event(
+        &session_id,
+        "reasoning-sealed",
+        generation,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id,
+            item: TurnItem::Reasoning {
+                summary: "sealed summary".into(),
+            },
+        }),
+    );
+    sealed.run_id = Some(run_id.clone());
+    let done = run_state_pipe_event(
+        &session_id,
+        "reasoning-done",
+        generation,
+        run_id.as_str(),
+        RunState::Done,
+    );
+    let mut events = vec![started, delta, assistant, sealed, done];
+    hub.append(&mut events)
+        .await
+        .expect("reasoning turn commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("reasoning sidecar reads");
+    let assistant: serde_json::Value = sidecar
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row.get("role").and_then(serde_json::Value::as_str) == Some("assistant"))
+        .expect("assistant row");
+    assert_eq!(assistant["text"], "answer");
+    assert_eq!(assistant["reasoning"], "sealed summary");
+    assert!(
+        !sidecar.contains("stream fragment"),
+        "delta leaked: {sidecar}"
+    );
+    let tail: serde_json::Value =
+        serde_json::from_str(sidecar.lines().last().expect("coverage")).expect("coverage JSON");
+    assert_eq!(tail["coverage"], events.last().expect("head").seq);
+}
+
+/// MUTATION CHECK: rotate in the `NodeKind::Compaction` observation arm
+/// instead of the terminal run-state arm. Expected RUNTIME failure: the two
+/// passes below create three physical files instead of one successor.
+#[tokio::test]
+async fn native_pipe_multiple_compaction_passes_create_exactly_one_segment() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-one-turn-segment");
+    let generation = store.worker_generation();
+    let mut seed = vec![user_pipe_event(
+        &session_id,
+        "segment-seed",
+        generation,
+        "before",
+    )];
+    hub.append(&mut seed).await.expect("seed commits");
+
+    let mut compacting = vec![
+        compaction_pipe_event(&session_id, "compact-pass-one", generation, "compact-run"),
+        run_state_pipe_event(
+            &session_id,
+            "compact-thinking",
+            generation,
+            "compact-run",
+            RunState::Thinking,
+        ),
+        compaction_pipe_event(&session_id, "compact-pass-two", generation, "compact-run"),
+        run_state_pipe_event(
+            &session_id,
+            "compact-done",
+            generation,
+            "compact-run",
+            RunState::Done,
+        ),
+        user_pipe_event(&session_id, "segment-after", generation, "after"),
+    ];
+    hub.append(&mut compacting)
+        .await
+        .expect("compacting turn commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let base = sidecar_path(&root, &session_id);
+    let root_segment = std::fs::read_to_string(&base).expect("root segment reads");
+    assert_eq!(
+        root_segment
+            .matches("\"kind\":\"compaction_boundary\"")
+            .count(),
+        1,
+        "one terminal boundary row: {root_segment}"
+    );
+    let successor = successor_path(&base, &root_segment);
+    let next_segment = std::fs::read_to_string(&successor).expect("successor reads");
+    assert!(next_segment.contains("\"starts_after\":"));
+    assert!(next_segment.contains("\"text\":\"after\""));
+    let files = std::fs::read_dir(base.parent().expect("pipe dir"))
+        .expect("pipe dir reads")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(session_id.as_str())
+        })
+        .count();
+    assert_eq!(files, 2, "root plus exactly one successor");
+}
+
+/// MUTATION CHECK: omit the `segment_end` line after writing the boundary.
+/// Expected RUNTIME failure: EOF of the root segment with coverage equal to
+/// `head_seq` is indistinguishable from the final at-head EOF.
+#[tokio::test]
+async fn native_pipe_reader_distinguishes_segment_ended_from_at_head() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-eof-contract");
+    let generation = store.worker_generation();
+    let mut events = vec![
+        compaction_pipe_event(&session_id, "eof-compaction", generation, "eof-run"),
+        run_state_pipe_event(
+            &session_id,
+            "eof-done",
+            generation,
+            "eof-run",
+            RunState::Done,
+        ),
+    ];
+    hub.append(&mut events)
+        .await
+        .expect("compacting turn commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let head_seq = events.last().expect("head event").seq;
+    let base = sidecar_path(&root, &session_id);
+    let root_segment = std::fs::read_to_string(&base).expect("root reads");
+    let terminator: serde_json::Value =
+        serde_json::from_str(root_segment.lines().last().expect("sealed root terminator"))
+            .expect("terminator JSON");
+    assert_eq!(terminator["coverage"], head_seq);
+    assert_eq!(terminator["segment_end"], "sealed");
+    let successor = successor_path(&base, &root_segment);
+    let active = std::fs::read_to_string(&successor).expect("active successor reads");
+    let active_tail: serde_json::Value =
+        serde_json::from_str(active.lines().last().expect("active coverage"))
+            .expect("active tail JSON");
+    assert_eq!(active_tail["coverage"], head_seq);
+    assert!(active_tail.get("segment_end").is_none());
+
+    // Exercise the reader/reconciler, not just the writer's bytes: a fresh
+    // hub must follow the sealed EOF and resume the existing active segment.
+    let reopened = SessionHub::new(store.clone(), SessionHubConfig::default())
+        .expect("fresh hub reopens sidecar state");
+    let mut after = vec![user_pipe_event(
+        &session_id,
+        "eof-after-reopen",
+        generation,
+        "after-reopen",
+    )];
+    reopened
+        .append(&mut after)
+        .await
+        .expect("append after reopen");
+    reopened.shutdown().await.expect("reopened hub stops");
+    let root_after = std::fs::read_to_string(&base).expect("sealed root still reads");
+    assert_eq!(root_after, root_segment, "sealed root stays immutable");
+    let active_after = std::fs::read_to_string(&successor).expect("active successor rereads");
+    assert!(active_after.contains("\"text\":\"after-reopen\""));
+    assert!(active_after.contains("\"generation\":1"));
+}
+
+/// MUTATION CHECK: inspect only the final line and ignore an earlier sealed
+/// terminator. Expected RUNTIME failure: the fresh writer appends to the root
+/// after its terminator, making the new row invisible to chain readers.
+#[tokio::test]
+async fn native_pipe_rebuilds_when_data_follows_a_sealed_terminator() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-data-after-seal");
+    let generation = store.worker_generation();
+    let mut events = vec![
+        compaction_pipe_event(&session_id, "after-seal-compact", generation, "seal-run"),
+        run_state_pipe_event(
+            &session_id,
+            "after-seal-done",
+            generation,
+            "seal-run",
+            RunState::Done,
+        ),
+    ];
+    hub.append(&mut events)
+        .await
+        .expect("segmented turn commits");
+    hub.shutdown().await.expect("first hub stops");
+
+    let base = sidecar_path(&root, &session_id);
+    let mut corrupt = OpenOptions::new()
+        .append(true)
+        .open(&base)
+        .expect("sealed root opens for corruption fixture");
+    use std::io::Write as _;
+    writeln!(
+        corrupt,
+        "{}",
+        serde_json::json!({"coverage": events[1].seq, "generation": 1})
+    )
+    .expect("complete row follows terminator");
+    drop(corrupt);
+
+    let reopened = SessionHub::new(store.clone(), SessionHubConfig::default())
+        .expect("fresh hub reopens sidecar state");
+    let mut after = vec![user_pipe_event(
+        &session_id,
+        "after-corrupt-seal",
+        generation,
+        "visible-after-rebuild",
+    )];
+    reopened
+        .append(&mut after)
+        .await
+        .expect("append triggers rebuild");
+    reopened.shutdown().await.expect("reopened hub stops");
+
+    let rebuilt = std::fs::read_to_string(&base).expect("rebuilt root reads");
+    assert!(rebuilt.contains("\"generation\":2"));
+    assert_eq!(rebuilt.matches("\"segment_end\":\"sealed\"").count(), 1);
+    let successor = successor_path(&base, &rebuilt);
+    let active = std::fs::read_to_string(successor).expect("rebuilt successor reads");
+    assert!(active.contains("\"text\":\"visible-after-rebuild\""));
+}
+
+/// MUTATION CHECK: remove `OFlags::NOFOLLOW` from sidecar inspection.
+/// Expected RUNTIME failure: torn-line repair truncates the symlink target.
+#[cfg(unix)]
+#[tokio::test]
+async fn native_pipe_inspection_never_repairs_through_a_successor_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-successor-symlink");
+    let generation = store.worker_generation();
+    let mut events = vec![
+        compaction_pipe_event(&session_id, "symlink-compact", generation, "symlink-run"),
+        run_state_pipe_event(
+            &session_id,
+            "symlink-done",
+            generation,
+            "symlink-run",
+            RunState::Done,
+        ),
+    ];
+    hub.append(&mut events)
+        .await
+        .expect("segmented turn commits");
+    hub.shutdown().await.expect("first hub stops");
+
+    let base = sidecar_path(&root, &session_id);
+    let sealed = std::fs::read_to_string(&base).expect("sealed root reads");
+    let successor = successor_path(&base, &sealed);
+    std::fs::remove_file(&successor).expect("fixture removes active segment");
+    let victim = root.path().join("must-not-be-truncated.txt");
+    std::fs::write(&victim, b"preserve this unterminated content").expect("fixture victim writes");
+    symlink(&victim, &successor).expect("fixture successor symlink creates");
+
+    let reopened = SessionHub::new(store.clone(), SessionHubConfig::default())
+        .expect("fresh hub reopens sidecar state");
+    let mut after = vec![user_pipe_event(
+        &session_id,
+        "symlink-after",
+        generation,
+        "maintenance remains best effort",
+    )];
+    reopened
+        .append(&mut after)
+        .await
+        .expect("journal append remains authoritative");
+    reopened.shutdown().await.expect("reopened hub stops");
+    assert_eq!(
+        std::fs::read(&victim).expect("victim rereads"),
+        b"preserve this unterminated content"
+    );
+}
+
 /// MUTATION CHECK: removing the zero-row coalescing threshold either writes a
 /// watermark too early or leaves the sidecar cursor stale at the 256th delta.
 #[tokio::test]
@@ -6513,7 +6902,7 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     std::fs::write(
         &path,
         format!(
-            "{{\"pipe\":\"haider.session.jsonl\",\"version\":3,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":4,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
         ),
     )
     .expect("corruption writes");
@@ -6586,10 +6975,9 @@ async fn native_pipe_coverage_tail_ahead_rebuilds_and_increments_generation() {
 
 /// MUTATION CHECK: accepting an old header version would append current
 /// line kinds beneath a stale header instead of performing the
-/// generation-bumped atomic rebuild (v1 and v2 alike rebuild to v3 — the
-/// v3 bump is what backfills tool previews onto existing cold rows).
+/// generation-bumped atomic rebuild (v1 through v3 alike rebuild to v4).
 #[tokio::test]
-async fn native_pipe_v1_header_rebuilds_to_v3_with_generation_bump() {
+async fn native_pipe_v1_header_rebuilds_to_v4_with_generation_bump() {
     let (root, store, hub) = open_hub(None, 8).await;
     let session_id = SessionId::new("native-pipe-v1-rebuild");
     let generation = store.worker_generation();
@@ -6615,6 +7003,119 @@ async fn native_pipe_v1_header_rebuilds_to_v3_with_generation_bump() {
     );
 }
 
+/// MUTATION CHECK: change the header-version comparison to accept v3.
+/// Expected RUNTIME failure: the at-head v3 file remains generation 4 instead
+/// of rebuilding all journal rows into a generation-5 v4 projection.
+#[tokio::test]
+async fn native_pipe_v3_header_rebuilds_to_v4_with_generation_bump() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-v3-rebuild");
+    let generation = store.worker_generation();
+    let reasoning_id = ItemId::new("v3-reasoning");
+    let mut reasoning_started = pipe_event(
+        &session_id,
+        "v3-reasoning-started",
+        generation,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: reasoning_id.clone(),
+            item: TurnItem::Reasoning {
+                summary: String::new(),
+            },
+        }),
+    );
+    reasoning_started.run_id = Some(RunId::new("v3-run"));
+    let mut reasoning_delta = pipe_event(
+        &session_id,
+        "v3-reasoning-delta",
+        generation,
+        EventPayload::Item(ItemEvent::Delta {
+            item_id: reasoning_id.clone(),
+            delta: ItemDelta::Reasoning {
+                text: "v3 partial".into(),
+            },
+        }),
+    );
+    reasoning_delta.run_id = Some(RunId::new("v3-run"));
+    let mut assistant = pipe_event(
+        &session_id,
+        "v3-assistant",
+        generation,
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("v3-assistant-node"),
+            parent: None,
+            kind: NodeKind::AssistantCommit {
+                text: "v3 answer".into(),
+                verdict: VerifyVerdict::Unverified,
+            },
+        }),
+    );
+    assistant.run_id = Some(RunId::new("v3-run"));
+    let mut reasoning_sealed = pipe_event(
+        &session_id,
+        "v3-reasoning-sealed",
+        generation,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: reasoning_id,
+            item: TurnItem::Reasoning {
+                summary: "sealed v3 summary".into(),
+            },
+        }),
+    );
+    reasoning_sealed.run_id = Some(RunId::new("v3-run"));
+    let mut seed = vec![
+        reasoning_started,
+        reasoning_delta,
+        assistant,
+        reasoning_sealed,
+        compaction_pipe_event(&session_id, "v3-compaction", generation, "v3-run"),
+        run_state_pipe_event(&session_id, "v3-done", generation, "v3-run", RunState::Done),
+    ];
+    hub.append(&mut seed).await.expect("compaction commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let path = sidecar_path(&root, &session_id);
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":3,\"session_id\":\"{session_id}\",\"generation\":4}}\n{{\"coverage\":{},\"generation\":4}}\n",
+            seed.last().expect("v3 head").seq,
+        ),
+    )
+    .expect("v3 sidecar writes");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    let mut trigger = vec![user_pipe_event(
+        &session_id,
+        "rebuild-trigger",
+        generation,
+        "after v3",
+    )];
+    hub.append(&mut trigger).await.expect("trigger commits");
+    hub.shutdown().await.expect("second hub stops");
+    let root_segment = std::fs::read_to_string(&path).expect("rebuilt root reads");
+    let header: serde_json::Value =
+        serde_json::from_str(root_segment.lines().next().expect("v4 header")).expect("header JSON");
+    assert_eq!(header["version"], 4);
+    assert_eq!(header["generation"], 5);
+    assert!(root_segment.contains("\"reasoning\":\"sealed v3 summary\""));
+    assert!(!root_segment.contains("v3 partial"));
+    assert!(root_segment.contains("\"kind\":\"compaction_boundary\""));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            root_segment.lines().last().expect("sealed terminator")
+        )
+        .expect("terminator JSON")["segment_end"],
+        "sealed"
+    );
+    let successor = successor_path(&path, &root_segment);
+    let active = std::fs::read_to_string(successor).expect("rebuilt successor reads");
+    assert!(active.contains("\"text\":\"after v3\""));
+    let coverage: serde_json::Value =
+        serde_json::from_str(active.lines().last().expect("active coverage"))
+            .expect("coverage JSON");
+    assert_eq!(coverage["coverage"], trigger[0].seq);
+    assert_eq!(coverage["generation"], 5);
+}
+
 #[tokio::test]
 async fn native_pipe_io_failure_never_fails_the_journal_append() {
     let (root, store, hub) = open_hub(None, 8).await;
@@ -6637,7 +7138,7 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     std::fs::create_dir(root.path().join("pipe")).expect("sidecar directory creates");
     std::fs::write(
         sidecar_path(&root, &session_id),
-        b"{\"pipe\":\"haider.session.jsonl\",\"version\":3,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
+        b"{\"pipe\":\"haider.session.jsonl\",\"version\":4,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
     )
     .expect("stale sidecar writes");
     append_one(&hub, &session_id, generation, "retry-trigger").await;

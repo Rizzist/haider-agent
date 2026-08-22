@@ -3,9 +3,19 @@
 //! The journal remains authoritative. A sidecar failure is reported and the
 //! session is left unreconciled so its next committed append retries from the
 //! last self-describing line (or rebuilds a corrupt file).
-//! Readers compute `covered_through` as the maximum row `seq` or coverage
-//! value encountered while reading forward. EOF proves the reader is at head
-//! only when that value equals the roster/status `head_seq`.
+//! Readers start at `<session>.pipe`, compute `covered_through` as the maximum
+//! row `seq` or coverage value encountered while reading forward, and follow
+//! every `segment_end: "sealed"` terminator's relative `successor` filename.
+//! EOF of a sealed segment never proves anything about journal head, even when
+//! its coverage happens to equal the roster/status `head_seq`; the successor
+//! must be opened. Only EOF of the final, unterminated segment proves at-head,
+//! and only when `covered_through == head_seq`.
+//!
+//! Sealed segments are immutable within one v4 generation. A future sidecar
+//! version bump rebuilds the complete reachable chain from the authoritative
+//! journal and atomically replaces the stable root last; old-generation
+//! successor files are unreachable historical debris, never mixed into the
+//! new chain.
 
 use haider_core::{SqliteStoreHandle, StoreHandle};
 use haider_protocol::envelope::RawEnvelope;
@@ -29,9 +39,11 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const SIDECAR_MAGIC: &str = "haider.session.jsonl";
 // V2 added coverage lines and `(seq, ordinal)` row identity. V3 guarantees
-// cold tool preview projection; the version bump forces existing at-head V2
-// files through journal rebuild rather than leaving their rows preview-less.
-const SIDECAR_VERSION: u64 = 3;
+// cold tool preview projection. V4 adds sealed reasoning, compaction boundary
+// rows, and physical segments. Every bump intentionally forces existing
+// at-head files (including every sealed segment) through a journal rebuild so
+// old projections cannot remain silently "current" at EOF.
+const SIDECAR_VERSION: u64 = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarCursor {
@@ -41,11 +53,13 @@ struct SidecarCursor {
     /// of `seq` while non-projecting hot batches are being coalesced.
     pending_seq: u64,
     generation: u64,
+    segment: u64,
 }
 
 struct ReconciledSidecar {
     cursor: SidecarCursor,
     projector: TranscriptProjector,
+    base_path: PathBuf,
     /// Append handle kept open across hot batches within one reconciled
     /// lifetime, so steady-state appends stop paying open/close per batch.
     /// Any maintenance error evicts the entry, dropping (closing) the handle;
@@ -59,6 +73,10 @@ struct SidecarHeader {
     version: u64,
     session_id: String,
     generation: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    segment: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    starts_after: u64,
 }
 
 /// A durable proof that all journal envelopes through `coverage` were
@@ -67,6 +85,21 @@ struct SidecarHeader {
 struct SidecarCoverage {
     coverage: u64,
     generation: u64,
+}
+
+/// Final row of an immutable segment. It is also a normal coverage value so
+/// the reader's max-seq rule remains uniform while `segment_end` prevents EOF
+/// from being mistaken for the live head.
+#[derive(Serialize, Deserialize)]
+struct SidecarSegmentEnd {
+    segment_end: String,
+    coverage: u64,
+    generation: u64,
+    successor: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug)]
@@ -193,29 +226,66 @@ impl PipeNativeWriter {
             }
             projector.prewarm(envelope);
         }
-        let mut file = open_append(path.clone()).await?;
+        let active_path = segment_path(&path, cursor.generation, cursor.segment)?;
+        let mut file = open_append(active_path).await?;
+        let mut segment = cursor.segment;
+        let mut sealed_root = None;
         let boot_tail = render_rows_after(journal, cursor.seq, &mut projector);
         if !boot_tail.is_empty() {
-            file = write_open(file, boot_tail).await?;
+            (file, segment) = write_segmented_open(
+                file,
+                boot_tail,
+                &path,
+                session_id,
+                cursor.generation,
+                segment,
+                false,
+                &mut sealed_root,
+            )
+            .await?;
         }
         let mut read_cursor = journal
             .last()
             .map_or(cursor.seq, |envelope| envelope.seq.max(cursor.seq));
-        file =
-            append_store_suffix(store, session_id, file, &mut projector, &mut read_cursor).await?;
-        let trailing = render_projected_rows(projector.finish());
+        (file, segment) = append_store_suffix(
+            store,
+            session_id,
+            path.clone(),
+            file,
+            segment,
+            cursor.generation,
+            &mut projector,
+            &mut read_cursor,
+        )
+        .await?;
+        let trailing = render_projected_rows(projector.flush_unresolved_tools());
         if !trailing.is_empty() {
-            file = write_open(file, trailing).await?;
+            (file, segment) = write_segmented_open(
+                file,
+                trailing,
+                &path,
+                session_id,
+                cursor.generation,
+                segment,
+                false,
+                &mut sealed_root,
+            )
+            .await?;
         }
-        file = write_open(file, coverage_line(read_cursor, cursor.generation)?).await?;
+        let covered = projector
+            .blocked_seq()
+            .map_or(read_cursor, |seq| seq.saturating_sub(1));
+        file = write_open(file, coverage_line(covered, cursor.generation)?).await?;
         let file = sync_open(file).await?;
         Ok(ReconciledSidecar {
             cursor: SidecarCursor {
-                seq: read_cursor,
+                seq: covered,
                 pending_seq: read_cursor,
                 generation: cursor.generation,
+                segment,
             },
             projector,
+            base_path: path,
             file,
         })
     }
@@ -232,19 +302,21 @@ impl PipeNativeWriter {
         let generation = generation
             .checked_add(1)
             .ok_or_else(|| PipeNativeError("sidecar generation exhausted".into()))?;
-        let mut header = serde_json::to_string(&SidecarHeader {
-            pipe: SIDECAR_MAGIC.to_owned(),
-            version: SIDECAR_VERSION,
-            session_id: session_id.as_str().to_owned(),
-            generation,
-        })
-        .map_err(|error| {
-            PipeNativeError(format!("sidecar header serialization failed: {error}"))
-        })?;
-        header.push('\n');
-        file = write_temp(file, header).await?;
+        file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
+        let mut segment = 0;
+        let mut sealed_root = None;
         let mut projector = TranscriptProjector::default();
-        file = write_temp(file, render_rows_after(journal, 0, &mut projector)).await?;
+        (file, segment) = write_segmented_open(
+            file,
+            render_rows_after(journal, 0, &mut projector),
+            &path,
+            session_id,
+            generation,
+            segment,
+            true,
+            &mut sealed_root,
+        )
+        .await?;
         let mut read_cursor = journal.last().map_or(0, |envelope| envelope.seq);
         loop {
             let page = store
@@ -260,19 +332,53 @@ impl PipeNativeWriter {
                 break;
             };
             read_cursor = last.seq;
-            file = write_temp(file, render_rows_after(&page, 0, &mut projector)).await?;
+            (file, segment) = write_segmented_open(
+                file,
+                render_rows_after(&page, 0, &mut projector),
+                &path,
+                session_id,
+                generation,
+                segment,
+                true,
+                &mut sealed_root,
+            )
+            .await?;
         }
-        file = write_temp(file, render_projected_rows(projector.finish())).await?;
-        file = write_temp(file, coverage_line(read_cursor, generation)?).await?;
-        finish_temp(file, temp_path, path.clone()).await?;
-        let file = open_append(path).await?;
+        (file, segment) = write_segmented_open(
+            file,
+            render_projected_rows(projector.flush_unresolved_tools()),
+            &path,
+            session_id,
+            generation,
+            segment,
+            true,
+            &mut sealed_root,
+        )
+        .await?;
+        let covered = projector
+            .blocked_seq()
+            .map_or(read_cursor, |seq| seq.saturating_sub(1));
+        file = write_open(file, coverage_line(covered, generation)?).await?;
+        let file = if segment == 0 {
+            finish_temp(file, temp_path, path.clone()).await?;
+            open_append(path.clone()).await?
+        } else {
+            let file = sync_open(file).await?;
+            let root_file = sealed_root.take().ok_or_else(|| {
+                PipeNativeError("segmented rebuild lost its sealed root handle".into())
+            })?;
+            finish_temp(root_file, temp_path, path.clone()).await?;
+            file
+        };
         Ok(ReconciledSidecar {
             cursor: SidecarCursor {
-                seq: read_cursor,
+                seq: covered,
                 pending_seq: read_cursor,
                 generation,
+                segment,
             },
             projector,
+            base_path: path,
             file,
         })
     }
@@ -296,10 +402,23 @@ impl PipeNativeWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(session_id);
         let state = if let Some(mut state) = known {
-            let (data, next_cursor) =
+            let (data, mut next_cursor) =
                 render_hot_batch(committed, state.cursor, &mut state.projector)?;
             if !data.is_empty() {
-                state.file = write_open(state.file, data).await?;
+                let mut sealed_root = None;
+                let (file, segment) = write_segmented_open(
+                    state.file,
+                    data,
+                    &state.base_path,
+                    session_id,
+                    state.cursor.generation,
+                    state.cursor.segment,
+                    false,
+                    &mut sealed_root,
+                )
+                .await?;
+                state.file = file;
+                next_cursor.segment = segment;
             }
             state.cursor = next_cursor;
             state
@@ -352,7 +471,10 @@ impl PipeNativeWriter {
     ) -> Result<ReconciledSidecar, PipeNativeError> {
         let mut projector = prewarm_projector(store, session_id, cursor.seq).await?;
         let mut read_cursor = cursor.seq;
-        let mut append_file = None;
+        let active_path = segment_path(&path, cursor.generation, cursor.segment)?;
+        let mut file = open_append(active_path).await?;
+        let mut segment = cursor.segment;
+        let mut sealed_root = None;
         loop {
             let page = store
                 .read_page(
@@ -371,36 +493,49 @@ impl PipeNativeWriter {
             read_cursor = last.seq;
             let chunk = render_rows_after(&page, cursor.seq, &mut projector);
             if !chunk.is_empty() {
-                let file = match append_file.take() {
-                    Some(file) => file,
-                    None => open_append(path.clone()).await?,
-                };
-                append_file = Some(write_open(file, chunk).await?);
+                (file, segment) = write_segmented_open(
+                    file,
+                    chunk,
+                    &path,
+                    session_id,
+                    cursor.generation,
+                    segment,
+                    false,
+                    &mut sealed_root,
+                )
+                .await?;
             }
         }
-        let trailing = render_projected_rows(projector.finish());
+        let trailing = render_projected_rows(projector.flush_unresolved_tools());
         if !trailing.is_empty() {
-            let file = match append_file.take() {
-                Some(file) => file,
-                None => open_append(path.clone()).await?,
-            };
-            append_file = Some(write_open(file, trailing).await?);
+            (file, segment) = write_segmented_open(
+                file,
+                trailing,
+                &path,
+                session_id,
+                cursor.generation,
+                segment,
+                false,
+                &mut sealed_root,
+            )
+            .await?;
         }
-        let file = match append_file.take() {
-            Some(file) => file,
-            None => open_append(path).await?,
-        };
-        let file = write_open(file, coverage_line(read_cursor, cursor.generation)?).await?;
+        let covered = projector
+            .blocked_seq()
+            .map_or(read_cursor, |seq| seq.saturating_sub(1));
+        let file = write_open(file, coverage_line(covered, cursor.generation)?).await?;
         // Reconciliation is a repair path, so retain an explicit sync here.
         // The synced handle is kept for subsequent hot appends.
         let file = sync_open(file).await?;
         Ok(ReconciledSidecar {
             cursor: SidecarCursor {
-                seq: read_cursor,
+                seq: covered,
                 pending_seq: read_cursor,
+                segment,
                 ..cursor
             },
             projector,
+            base_path: path,
             file,
         })
     }
@@ -416,17 +551,9 @@ impl PipeNativeWriter {
         let generation = generation
             .checked_add(1)
             .ok_or_else(|| PipeNativeError("sidecar generation exhausted".into()))?;
-        let mut header = serde_json::to_string(&SidecarHeader {
-            pipe: SIDECAR_MAGIC.to_owned(),
-            version: SIDECAR_VERSION,
-            session_id: session_id.as_str().to_owned(),
-            generation,
-        })
-        .map_err(|error| {
-            PipeNativeError(format!("sidecar header serialization failed: {error}"))
-        })?;
-        header.push('\n');
-        file = write_temp(file, header).await?;
+        file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
+        let mut segment = 0;
+        let mut sealed_root = None;
         let mut read_cursor = 0;
         let mut projector = TranscriptProjector::default();
         loop {
@@ -444,21 +571,53 @@ impl PipeNativeWriter {
             };
             read_cursor = last.seq;
             let chunk = render_rows_after(&page, 0, &mut projector);
-            file = write_temp(file, chunk).await?;
+            (file, segment) = write_segmented_open(
+                file,
+                chunk,
+                &path,
+                session_id,
+                generation,
+                segment,
+                true,
+                &mut sealed_root,
+            )
+            .await?;
         }
-        file = write_temp(file, render_projected_rows(projector.finish())).await?;
-        file = write_temp(file, coverage_line(read_cursor, generation)?).await?;
-        finish_temp(file, temp_path, path.clone()).await?;
-        // The temp handle was write-positioned, not O_APPEND; reopen the
-        // renamed file in append mode as the retained hot-append handle.
-        let file = open_append(path).await?;
+        (file, segment) = write_segmented_open(
+            file,
+            render_projected_rows(projector.flush_unresolved_tools()),
+            &path,
+            session_id,
+            generation,
+            segment,
+            true,
+            &mut sealed_root,
+        )
+        .await?;
+        let covered = projector
+            .blocked_seq()
+            .map_or(read_cursor, |seq| seq.saturating_sub(1));
+        file = write_open(file, coverage_line(covered, generation)?).await?;
+        let file = if segment == 0 {
+            finish_temp(file, temp_path, path.clone()).await?;
+            open_append(path.clone()).await?
+        } else {
+            let file = sync_open(file).await?;
+            let root_file = sealed_root.take().ok_or_else(|| {
+                PipeNativeError("segmented rebuild lost its sealed root handle".into())
+            })?;
+            finish_temp(root_file, temp_path, path.clone()).await?;
+            file
+        };
         Ok(ReconciledSidecar {
             cursor: SidecarCursor {
-                seq: read_cursor,
+                seq: covered,
                 pending_seq: read_cursor,
                 generation,
+                segment,
             },
             projector,
+            base_path: path,
             file,
         })
     }
@@ -528,13 +687,18 @@ async fn prewarm_projector(
     Ok(projector)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_store_suffix(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
+    base_path: PathBuf,
     mut file: File,
+    mut segment: u64,
+    generation: u64,
     projector: &mut TranscriptProjector,
     read_cursor: &mut u64,
-) -> Result<File, PipeNativeError> {
+) -> Result<(File, u64), PipeNativeError> {
+    let mut sealed_root = None;
     loop {
         let page = store
             .read_page(
@@ -548,12 +712,22 @@ async fn append_store_suffix(
                 PipeNativeError(format!("journal reconciliation failed: {error:?}"))
             })?;
         let Some(last) = page.last() else {
-            return Ok(file);
+            return Ok((file, segment));
         };
         *read_cursor = last.seq;
         let chunk = render_rows_after(&page, 0, projector);
         if !chunk.is_empty() {
-            file = write_open(file, chunk).await?;
+            (file, segment) = write_segmented_open(
+                file,
+                chunk,
+                &base_path,
+                session_id,
+                generation,
+                segment,
+                false,
+                &mut sealed_root,
+            )
+            .await?;
         }
     }
 }
@@ -600,6 +774,143 @@ fn coverage_line(coverage: u64, generation: u64) -> Result<String, PipeNativeErr
     .map_err(|error| PipeNativeError(format!("sidecar coverage serialization failed: {error}")))?;
     line.push('\n');
     Ok(line)
+}
+
+fn header_line(
+    session_id: &SessionId,
+    generation: u64,
+    segment: u64,
+    starts_after: u64,
+) -> Result<String, PipeNativeError> {
+    let mut line = serde_json::to_string(&SidecarHeader {
+        pipe: SIDECAR_MAGIC.to_owned(),
+        version: SIDECAR_VERSION,
+        session_id: session_id.as_str().to_owned(),
+        generation,
+        segment,
+        starts_after,
+    })
+    .map_err(|error| PipeNativeError(format!("sidecar header serialization failed: {error}")))?;
+    line.push('\n');
+    Ok(line)
+}
+
+fn segment_path(
+    base_path: &Path,
+    generation: u64,
+    segment: u64,
+) -> Result<PathBuf, PipeNativeError> {
+    if segment == 0 {
+        return Ok(base_path.to_owned());
+    }
+    let parent = base_path
+        .parent()
+        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+    let stem = base_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| PipeNativeError("sidecar path has no UTF-8 file stem".into()))?;
+    Ok(parent.join(format!("{stem}.g{generation}.s{segment}.pipe")))
+}
+
+fn segment_end_line(
+    coverage: u64,
+    generation: u64,
+    successor: &Path,
+) -> Result<String, PipeNativeError> {
+    let successor = successor
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| PipeNativeError("sidecar successor has no UTF-8 filename".into()))?;
+    let mut line = serde_json::to_string(&SidecarSegmentEnd {
+        segment_end: "sealed".into(),
+        coverage,
+        generation,
+        successor: successor.to_owned(),
+    })
+    .map_err(|error| {
+        PipeNativeError(format!(
+            "sidecar segment terminator serialization failed: {error}"
+        ))
+    })?;
+    line.push('\n');
+    Ok(line)
+}
+
+fn compaction_boundary_seq(line: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(line.trim_end_matches('\n')).ok()?;
+    (value.get("kind").and_then(serde_json::Value::as_str) == Some("compaction_boundary"))
+        .then(|| value.get("seq").and_then(serde_json::Value::as_u64))?
+}
+
+async fn create_successor_segment(
+    base_path: &Path,
+    session_id: &SessionId,
+    generation: u64,
+    segment: u64,
+    starts_after: u64,
+) -> Result<(File, PathBuf), PipeNativeError> {
+    let path = segment_path(base_path, generation, segment)?;
+    let (mut file, temp_path) = create_temp(path.clone()).await?;
+    file = write_temp(
+        file,
+        header_line(session_id, generation, segment, starts_after)?,
+    )
+    .await?;
+    finish_temp(file, temp_path, path.clone()).await?;
+    Ok((open_append(path.clone()).await?, path))
+}
+
+/// Writes projected rows and rotates only after a compacting turn's terminal
+/// boundary row. `hold_root` keeps a rebuild's segment-zero temp handle aside
+/// so the stable root is renamed last, after every successor exists.
+#[allow(clippy::too_many_arguments)]
+async fn write_segmented_open(
+    mut file: File,
+    data: String,
+    base_path: &Path,
+    session_id: &SessionId,
+    generation: u64,
+    mut segment: u64,
+    hold_root: bool,
+    sealed_root: &mut Option<File>,
+) -> Result<(File, u64), PipeNativeError> {
+    let mut pending = String::new();
+    for line in data.split_inclusive('\n') {
+        pending.push_str(line);
+        let Some(boundary_seq) = compaction_boundary_seq(line) else {
+            continue;
+        };
+        let successor_segment = segment
+            .checked_add(1)
+            .ok_or_else(|| PipeNativeError("sidecar segment ordinal exhausted".into()))?;
+        // Create and durably publish the successor before making it reachable
+        // from the sealed predecessor.
+        let (successor_file, successor_path) = create_successor_segment(
+            base_path,
+            session_id,
+            generation,
+            successor_segment,
+            boundary_seq,
+        )
+        .await?;
+        pending.push_str(&segment_end_line(
+            boundary_seq,
+            generation,
+            &successor_path,
+        )?);
+        file = write_open(file, std::mem::take(&mut pending)).await?;
+        file = sync_open(file).await?;
+        if hold_root && segment == 0 {
+            *sealed_root = Some(file);
+        }
+        file = successor_file;
+        segment = successor_segment;
+    }
+    if !pending.is_empty() {
+        file = write_open(file, pending).await?;
+    }
+    Ok((file, segment))
 }
 
 /// Render an ordinary committed batch. A row-producing batch gets exactly
@@ -675,105 +986,228 @@ fn inspect_sidecar_blocking(
     path: &Path,
     session_id: &SessionId,
 ) -> Result<SidecarState, PipeNativeError> {
-    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SidecarState::Missing);
+    let mut current_path = path.to_owned();
+    let mut expected_segment = 0_u64;
+    let mut expected_starts_after = 0_u64;
+    let mut chain_generation = None;
+    loop {
+        let mut file = match open_sidecar_for_inspection(&current_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected_segment == 0 => {
+                return Ok(SidecarState::Missing);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SidecarState::Corrupt {
+                    generation: chain_generation.unwrap_or(0),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(SidecarState::Corrupt {
+                generation: chain_generation.unwrap_or(0),
+            });
         }
-        Err(error) => return Err(error.into()),
-    };
-    let mut len = file.metadata()?.len();
-    if len == 0 {
-        return Ok(SidecarState::Corrupt { generation: 0 });
-    }
-    file.seek(SeekFrom::Start(len - 1))?;
-    let mut final_byte = [0_u8; 1];
-    file.read_exact(&mut final_byte)?;
-    if final_byte[0] != b'\n' {
-        len = find_previous_newline(&mut file, len)?.map_or(0, |position| position + 1);
-        file.set_len(len)?;
-        file.sync_data()?;
-    }
-    if len == 0 {
-        return Ok(SidecarState::Corrupt { generation: 0 });
-    }
+        file.seek(SeekFrom::Start(len - 1))?;
+        let mut final_byte = [0_u8; 1];
+        file.read_exact(&mut final_byte)?;
+        if final_byte[0] != b'\n' {
+            len = find_previous_newline(&mut file, len)?.map_or(0, |position| position + 1);
+            file.set_len(len)?;
+            file.sync_data()?;
+        }
+        if len == 0 {
+            return Ok(SidecarState::Corrupt {
+                generation: chain_generation.unwrap_or(0),
+            });
+        }
 
-    file.seek(SeekFrom::Start(0))?;
-    let mut header_line = String::new();
-    let header_len = BufReader::new(&mut file).read_line(&mut header_line)? as u64;
-    let Ok(header) = serde_json::from_str::<SidecarHeader>(header_line.trim_end_matches('\n'))
-    else {
-        return Ok(SidecarState::Corrupt { generation: 0 });
-    };
-    if header.pipe != SIDECAR_MAGIC
-        || header.version != SIDECAR_VERSION
-        || header.session_id != session_id.as_str()
-        || header.generation == 0
-    {
-        return Ok(SidecarState::Corrupt {
-            generation: header.generation,
-        });
-    }
-    if len == header_len {
+        file.seek(SeekFrom::Start(0))?;
+        let mut header_line = String::new();
+        let header_len = BufReader::new(&mut file).read_line(&mut header_line)? as u64;
+        let Ok(header) = serde_json::from_str::<SidecarHeader>(header_line.trim_end_matches('\n'))
+        else {
+            return Ok(SidecarState::Corrupt {
+                generation: chain_generation.unwrap_or(0),
+            });
+        };
+        let generation = chain_generation.unwrap_or(header.generation);
+        if header.pipe != SIDECAR_MAGIC
+            || header.version != SIDECAR_VERSION
+            || header.session_id != session_id.as_str()
+            || header.generation == 0
+            || header.generation != generation
+            || header.segment != expected_segment
+            || header.starts_after != expected_starts_after
+        {
+            return Ok(SidecarState::Corrupt {
+                generation: header.generation.max(generation),
+            });
+        }
+        chain_generation = Some(generation);
+        if len == header_len {
+            return Ok(SidecarState::Ready(SidecarCursor {
+                seq: header.starts_after,
+                pending_seq: header.starts_after,
+                generation,
+                segment: header.segment,
+            }));
+        }
+
+        let (line_start, line) = read_tail_line(&mut file, len)?;
+        if contains_nonfinal_segment_end(&mut file, header_len, line_start)? {
+            return Ok(SidecarState::Corrupt { generation });
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            return Ok(SidecarState::Corrupt { generation });
+        };
+        if value.get("segment_end").is_some() {
+            let Ok(end) = serde_json::from_value::<SidecarSegmentEnd>(value) else {
+                return Ok(SidecarState::Corrupt { generation });
+            };
+            let successor_segment = expected_segment
+                .checked_add(1)
+                .ok_or_else(|| PipeNativeError("sidecar segment ordinal exhausted".into()))?;
+            let successor_path = segment_path(path, generation, successor_segment)?;
+            let expected_successor = successor_path.file_name().and_then(std::ffi::OsStr::to_str);
+            let previous_is_boundary = read_line_before(&mut file, line_start)?
+                .and_then(|(_, line)| serde_json::from_str::<serde_json::Value>(&line).ok())
+                .is_some_and(|previous| {
+                    previous.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("compaction_boundary")
+                        && previous.get("seq").and_then(serde_json::Value::as_u64)
+                            == Some(end.coverage)
+                });
+            if end.segment_end != "sealed"
+                || end.generation != generation
+                || end.successor != expected_successor.unwrap_or_default()
+                || end.coverage < expected_starts_after
+                || !previous_is_boundary
+            {
+                return Ok(SidecarState::Corrupt { generation });
+            }
+            current_path = successor_path;
+            expected_segment = successor_segment;
+            expected_starts_after = end.coverage;
+            continue;
+        }
+
+        // A boundary without its sealed terminator is a torn rotation. Rebuild
+        // from the journal instead of accepting it as the active EOF.
+        let boundary_shaped = value.get("kind").and_then(serde_json::Value::as_str)
+            == Some("compaction_boundary")
+            && value
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .is_some();
+        let row_shaped = value
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|role| matches!(role, "user" | "assistant" | "error" | "tool"))
+            && value
+                .get("at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some();
+        let coverage_shaped = value
+            .get("coverage")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+            && value.get("generation").and_then(serde_json::Value::as_u64) == Some(generation);
+        if boundary_shaped || (!row_shaped && !coverage_shaped) {
+            return Ok(SidecarState::Corrupt { generation });
+        }
+        let Some(seq) = value
+            .get(if row_shaped { "seq" } else { "coverage" })
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return Ok(SidecarState::Corrupt { generation });
+        };
+        if seq < expected_starts_after {
+            return Ok(SidecarState::Corrupt { generation });
+        }
         return Ok(SidecarState::Ready(SidecarCursor {
-            seq: 0,
-            pending_seq: 0,
-            generation: header.generation,
+            seq,
+            pending_seq: seq,
+            generation,
+            segment: expected_segment,
         }));
     }
+}
 
-    let line_start = find_previous_newline(&mut file, len - 1)?.map_or(0, |position| position + 1);
+#[cfg(unix)]
+fn open_sidecar_for_inspection(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::open(
+        path,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn open_sidecar_for_inspection(path: &Path) -> std::io::Result<File> {
+    // Unix uses O_NOFOLLOW above so repair truncation can never traverse a
+    // symlink. Other platforms retain the existing open behavior until their
+    // equivalent reparse-point-safe handle validation is available.
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
+fn contains_nonfinal_segment_end(
+    file: &mut File,
+    header_len: u64,
+    final_line_start: u64,
+) -> Result<bool, PipeNativeError> {
+    if final_line_start <= header_len {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(header_len))?;
+    let mut earlier = BufReader::new(file.take(final_line_start - header_len));
+    let mut line = String::new();
+    while earlier.read_line(&mut line)? != 0 {
+        if serde_json::from_str::<serde_json::Value>(line.trim_end_matches('\n'))
+            .ok()
+            .is_some_and(|value| value.get("segment_end").is_some())
+        {
+            return Ok(true);
+        }
+        line.clear();
+    }
+    Ok(false)
+}
+
+fn read_tail_line(file: &mut File, len: u64) -> Result<(u64, String), PipeNativeError> {
+    let line_start = find_previous_newline(file, len - 1)?.map_or(0, |position| position + 1);
     let line_len = usize::try_from((len - 1) - line_start)
         .map_err(|_| PipeNativeError("sidecar tail is too large to inspect".into()))?;
     let mut bytes = vec![0_u8; line_len];
     file.seek(SeekFrom::Start(line_start))?;
     file.read_exact(&mut bytes)?;
-    let Ok(line) = std::str::from_utf8(&bytes) else {
-        return Ok(SidecarState::Corrupt {
-            generation: header.generation,
-        });
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Ok(SidecarState::Corrupt {
-            generation: header.generation,
-        });
-    };
-    // The tail must be either a real row or a coverage watermark, not any JSON
-    // object that happens to carry an in-range cursor.
-    let row_shaped = value
-        .get("role")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|role| matches!(role, "user" | "assistant" | "error" | "tool"))
-        && value
-            .get("at_ms")
-            .and_then(serde_json::Value::as_u64)
-            .is_some();
-    let coverage_shaped = value
-        .get("coverage")
-        .and_then(serde_json::Value::as_u64)
-        .is_some()
-        && value
-            .get("generation")
-            .and_then(serde_json::Value::as_u64)
-            .is_some();
-    if !row_shaped && !coverage_shaped {
-        return Ok(SidecarState::Corrupt {
-            generation: header.generation,
-        });
+    let line = String::from_utf8(bytes)
+        .map_err(|_| PipeNativeError("sidecar tail is not UTF-8".into()))?;
+    Ok((line_start, line))
+}
+
+fn read_line_before(
+    file: &mut File,
+    line_start: u64,
+) -> Result<Option<(u64, String)>, PipeNativeError> {
+    if line_start == 0 {
+        return Ok(None);
     }
-    let Some(seq) = value
-        .get(if row_shaped { "seq" } else { "coverage" })
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return Ok(SidecarState::Corrupt {
-            generation: header.generation,
-        });
-    };
-    Ok(SidecarState::Ready(SidecarCursor {
-        seq,
-        pending_seq: seq,
-        generation: header.generation,
-    }))
+    let newline = line_start - 1;
+    let previous_start = find_previous_newline(file, newline)?.map_or(0, |position| position + 1);
+    let line_len = usize::try_from(newline - previous_start)
+        .map_err(|_| PipeNativeError("sidecar prior tail line is too large".into()))?;
+    let mut bytes = vec![0_u8; line_len];
+    file.seek(SeekFrom::Start(previous_start))?;
+    file.read_exact(&mut bytes)?;
+    let line = String::from_utf8(bytes)
+        .map_err(|_| PipeNativeError("sidecar prior tail line is not UTF-8".into()))?;
+    Ok(Some((previous_start, line)))
 }
 
 fn find_previous_newline(file: &mut File, exclusive_end: u64) -> std::io::Result<Option<u64>> {

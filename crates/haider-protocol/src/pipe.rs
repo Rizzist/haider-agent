@@ -3,7 +3,8 @@
 use crate::EventPayload;
 use crate::envelope::RawEnvelope;
 use crate::history::NodeKind;
-use crate::item::{ItemEvent, TurnItem};
+use crate::item::{ItemDelta, ItemEvent, TurnItem};
+use crate::state::RunState;
 use crate::tool::BoundedResult;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -13,6 +14,24 @@ use std::collections::{HashMap, VecDeque};
 pub const TOOL_PREVIEW_CHARS: usize = 160;
 const MAX_PENDING_TOOL_RESULTS: usize = 1_024;
 type ToolJoinKey = (Option<String>, Option<String>, String);
+type ProjectionRunKey = (Option<String>, Option<String>, String);
+
+#[derive(Debug)]
+struct OpenReasoning {
+    item_id: String,
+    first_seq: u64,
+}
+
+#[derive(Debug)]
+struct PendingReasoning {
+    summary: String,
+    seq: u64,
+}
+
+#[derive(Debug)]
+struct PendingCompaction {
+    first_seq: u64,
+}
 
 /// Full journal facts joined to one committed tool-exchange node.
 #[derive(Debug, Clone)]
@@ -60,6 +79,9 @@ pub struct TranscriptJoiner {
 pub struct TranscriptProjector {
     joiner: TranscriptJoiner,
     buffered: VecDeque<BufferedRow>,
+    open_reasoning: HashMap<ProjectionRunKey, OpenReasoning>,
+    pending_reasoning: HashMap<ProjectionRunKey, VecDeque<PendingReasoning>>,
+    compacting_runs: HashMap<ProjectionRunKey, PendingCompaction>,
     /// Runs that committed item events. An `assistant_commit` node in such a
     /// run repeats content the item stream already carries, so its text row
     /// is marked `compat` and an item-canonical client may drop it
@@ -71,7 +93,14 @@ pub struct TranscriptProjector {
 struct BufferedRow {
     row: SidecarRow,
     unresolved_tool: Option<ToolJoinKey>,
+    unresolved_reasoning: Option<ProjectionRunKey>,
     remaining_facts: usize,
+}
+
+enum ReasoningFact {
+    Started { item_id: String },
+    Delta { item_id: String },
+    Sealed { item_id: String, summary: String },
 }
 
 impl TranscriptProjector {
@@ -112,6 +141,19 @@ impl TranscriptProjector {
         }
 
         self.note_item_run(envelope);
+        let run_key = projection_run_key(envelope);
+        if let (Some(run_key), Some(fact)) = (run_key.as_ref(), reasoning_fact(envelope)) {
+            self.observe_reasoning(run_key, envelope.seq, fact);
+        }
+        if is_compaction_node(envelope)
+            && let Some(run_key) = run_key.as_ref()
+        {
+            self.compacting_runs
+                .entry(run_key.clone())
+                .or_insert(PendingCompaction {
+                    first_seq: envelope.seq,
+                });
+        }
         let run_repeats_items = envelope
             .run_id
             .as_ref()
@@ -119,9 +161,38 @@ impl TranscriptProjector {
         let result = matching_result(envelope);
         if let Some(projection) = sidecar_projection(&mut self.joiner, envelope, run_repeats_items)
         {
+            let mut row = projection.row;
+            let unresolved_reasoning = run_key.as_ref().and_then(|run_key| {
+                if !row.is_attachable_assistant() {
+                    self.settle_waiting_assistants(run_key);
+                    self.pending_reasoning.remove(run_key);
+                    return None;
+                }
+                self.settle_waiting_assistants(run_key);
+                if let Some(pending) = self
+                    .pending_reasoning
+                    .get_mut(run_key)
+                    .and_then(VecDeque::pop_front)
+                {
+                    row.set_reasoning_summary(pending.summary);
+                    if self
+                        .pending_reasoning
+                        .get(run_key)
+                        .is_some_and(VecDeque::is_empty)
+                    {
+                        self.pending_reasoning.remove(run_key);
+                    }
+                    None
+                } else {
+                    self.open_reasoning
+                        .contains_key(run_key)
+                        .then(|| run_key.clone())
+                }
+            });
             self.buffered.push_back(BufferedRow {
-                row: projection.row,
+                row,
                 unresolved_tool: projection.unresolved_tool,
+                unresolved_reasoning,
                 remaining_facts: MAX_PENDING_TOOL_RESULTS,
             });
         }
@@ -136,12 +207,121 @@ impl TranscriptProjector {
             self.joiner.remove_result(&key);
         }
 
-        let mut rows = Vec::new();
-        while self
-            .buffered
-            .front()
-            .is_some_and(|buffered| buffered.unresolved_tool.is_none())
+        if is_terminal_run_state(envelope)
+            && let Some(run_key) = run_key.as_ref()
         {
+            self.settle_waiting_assistants(run_key);
+            self.open_reasoning.remove(run_key);
+            self.pending_reasoning.remove(run_key);
+            if self.compacting_runs.remove(run_key).is_some() {
+                self.buffered.push_back(BufferedRow {
+                    row: SidecarRow(SidecarRowKind::CompactionBoundary(CompactionBoundaryRow {
+                        kind: "compaction_boundary",
+                        at_ms: envelope.committed_at_ms,
+                        seq: envelope.seq,
+                        branch_id: envelope
+                            .branch_id
+                            .as_ref()
+                            .map(|branch| branch.as_str().to_owned()),
+                        run_id: run_key.2.clone(),
+                        ordinal: 0,
+                    })),
+                    unresolved_tool: None,
+                    unresolved_reasoning: None,
+                    remaining_facts: MAX_PENDING_TOOL_RESULTS,
+                });
+            }
+        }
+
+        self.take_ready_rows()
+    }
+
+    /// Flush final unresolved rows without fabricating results.
+    pub fn finish(&mut self) -> Vec<SidecarRow> {
+        self.open_reasoning.clear();
+        self.pending_reasoning.clear();
+        self.compacting_runs.clear();
+        self.buffered
+            .drain(..)
+            .map(|buffered| buffered.row)
+            .collect()
+    }
+
+    /// Flush unresolved tool joins at a durable journal EOF while preserving
+    /// turn state whose later seal or terminal event changes the projection.
+    pub fn flush_unresolved_tools(&mut self) -> Vec<SidecarRow> {
+        for buffered in &mut self.buffered {
+            buffered.unresolved_tool = None;
+        }
+        self.take_ready_rows()
+    }
+
+    /// Earliest row withheld from durable sidecar coverage.
+    #[must_use]
+    pub fn blocked_seq(&self) -> Option<u64> {
+        self.buffered
+            .front()
+            .map(|buffered| buffered.row.seq())
+            .into_iter()
+            .chain(self.earliest_lifecycle_blocked_seq())
+            .min()
+    }
+
+    fn observe_reasoning(&mut self, run_key: &ProjectionRunKey, seq: u64, fact: ReasoningFact) {
+        match fact {
+            ReasoningFact::Started { item_id } | ReasoningFact::Delta { item_id } => {
+                self.open_reasoning
+                    .entry(run_key.clone())
+                    .or_insert(OpenReasoning {
+                        item_id,
+                        first_seq: seq,
+                    });
+            }
+            ReasoningFact::Sealed { item_id, summary } => {
+                let matching_open = self
+                    .open_reasoning
+                    .get(run_key)
+                    .is_some_and(|open| open.item_id == item_id);
+                if self.open_reasoning.contains_key(run_key) && !matching_open {
+                    return;
+                }
+                if matching_open {
+                    self.open_reasoning.remove(run_key);
+                }
+                if let Some(buffered) = self
+                    .buffered
+                    .iter_mut()
+                    .rev()
+                    .find(|buffered| buffered.unresolved_reasoning.as_ref() == Some(run_key))
+                {
+                    buffered.row.set_reasoning_summary(summary);
+                    buffered.unresolved_reasoning = None;
+                } else {
+                    self.pending_reasoning
+                        .entry(run_key.clone())
+                        .or_default()
+                        .push_back(PendingReasoning { summary, seq });
+                }
+            }
+        }
+    }
+
+    fn settle_waiting_assistants(&mut self, run_key: &ProjectionRunKey) {
+        for buffered in &mut self.buffered {
+            if buffered.unresolved_reasoning.as_ref() == Some(run_key) {
+                buffered.unresolved_reasoning = None;
+            }
+        }
+    }
+
+    fn take_ready_rows(&mut self) -> Vec<SidecarRow> {
+        let mut rows = Vec::new();
+        let lifecycle_barrier = self.earliest_lifecycle_blocked_seq();
+        while self.buffered.front().is_some_and(|buffered| {
+            buffered.unresolved_tool.is_none()
+                && buffered.unresolved_reasoning.is_none()
+                && lifecycle_barrier.is_none_or(|barrier| buffered.row.seq() < barrier)
+        }) {
             if let Some(buffered) = self.buffered.pop_front() {
                 rows.push(buffered.row);
             }
@@ -149,19 +329,123 @@ impl TranscriptProjector {
         rows
     }
 
-    /// Flush final unresolved rows without fabricating results.
-    pub fn finish(&mut self) -> Vec<SidecarRow> {
-        self.buffered
-            .drain(..)
-            .map(|buffered| buffered.row)
-            .collect()
+    /// An unresolved turn artifact is a global ordering barrier, not merely a
+    /// coverage constraint. Emitting a later ready row would either duplicate
+    /// it when replay starts before the barrier, or make a max-seq reader skip
+    /// the still-unsealed artifact forever.
+    fn earliest_lifecycle_blocked_seq(&self) -> Option<u64> {
+        self.open_reasoning
+            .values()
+            .map(|reasoning| reasoning.first_seq)
+            .chain(
+                self.pending_reasoning
+                    .values()
+                    .filter_map(|pending| pending.front().map(|reasoning| reasoning.seq)),
+            )
+            .chain(
+                self.compacting_runs
+                    .values()
+                    .map(|compaction| compaction.first_seq),
+            )
+            .min()
     }
+}
 
-    /// Earliest row withheld from durable sidecar coverage.
-    #[must_use]
-    pub fn blocked_seq(&self) -> Option<u64> {
-        self.buffered.front().map(|buffered| buffered.row.seq())
+fn projection_run_key(envelope: &RawEnvelope) -> Option<ProjectionRunKey> {
+    Some((
+        envelope
+            .branch_id
+            .as_ref()
+            .map(|branch| branch.as_str().to_owned()),
+        envelope
+            .agent_id
+            .as_ref()
+            .map(|agent| agent.as_str().to_owned()),
+        envelope.run_id.as_ref()?.as_str().to_owned(),
+    ))
+}
+
+fn reasoning_fact(envelope: &RawEnvelope) -> Option<ReasoningFact> {
+    let payload = &envelope.payload;
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("item") {
+        return None;
     }
+    let event = payload.get("event").and_then(serde_json::Value::as_str);
+    let exact_reasoning_shape = match event {
+        Some("started" | "completed") => {
+            payload
+                .get("item")
+                .and_then(|item| item.get("item"))
+                .and_then(serde_json::Value::as_str)
+                == Some("reasoning")
+        }
+        Some("delta") => {
+            payload
+                .get("delta")
+                .and_then(|delta| delta.get("delta"))
+                .and_then(serde_json::Value::as_str)
+                == Some("reasoning")
+        }
+        _ => false,
+    };
+    if !exact_reasoning_shape {
+        return None;
+    }
+    match serde_json::from_value::<EventPayload>(payload.clone()).ok()? {
+        EventPayload::Item(ItemEvent::Started {
+            item_id,
+            item: TurnItem::Reasoning { .. },
+        }) => Some(ReasoningFact::Started {
+            item_id: item_id.as_str().to_owned(),
+        }),
+        EventPayload::Item(ItemEvent::Delta {
+            item_id,
+            delta: ItemDelta::Reasoning { .. },
+        }) => Some(ReasoningFact::Delta {
+            item_id: item_id.as_str().to_owned(),
+        }),
+        EventPayload::Item(ItemEvent::Completed {
+            item_id,
+            item: TurnItem::Reasoning { summary },
+        }) => Some(ReasoningFact::Sealed {
+            item_id: item_id.as_str().to_owned(),
+            summary,
+        }),
+        _ => None,
+    }
+}
+
+fn is_compaction_node(envelope: &RawEnvelope) -> bool {
+    let payload = &envelope.payload;
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("node_committed")
+        || payload
+            .get("kind")
+            .and_then(|kind| kind.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            != Some("compaction")
+    {
+        return false;
+    }
+    matches!(
+        serde_json::from_value::<EventPayload>(payload.clone()),
+        Ok(EventPayload::NodeCommitted(crate::history::TreeNode {
+            kind: NodeKind::Compaction { .. },
+            ..
+        }))
+    )
+}
+
+fn is_terminal_run_state(envelope: &RawEnvelope) -> bool {
+    let payload = &envelope.payload;
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("run_state") {
+        return false;
+    }
+    matches!(
+        serde_json::from_value::<EventPayload>(payload.clone()),
+        Ok(EventPayload::RunState(
+            RunState::Done | RunState::Errored | RunState::Cancelled
+        ))
+    )
 }
 
 fn matching_result(envelope: &RawEnvelope) -> Option<(ToolJoinKey, BoundedResult)> {
@@ -362,6 +646,10 @@ pub fn result_preview(result: &BoundedResult) -> Option<String> {
 struct TextRow {
     role: &'static str,
     text: String,
+    /// Final `TurnItem::Reasoning.summary` for this assistant response. Pipe
+    /// projection never serializes streaming reasoning deltas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
     at_ms: u64,
     seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -382,6 +670,8 @@ fn is_false(value: &bool) -> bool {
 struct IncompleteRow {
     role: &'static str,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
     incomplete: bool,
     interruption: crate::error::ErrorPresentation,
     at_ms: u64,
@@ -418,6 +708,17 @@ struct ToolRow {
     ordinal: u32,
 }
 
+#[derive(Serialize)]
+struct CompactionBoundaryRow {
+    kind: &'static str,
+    at_ms: u64,
+    seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    run_id: String,
+    ordinal: u32,
+}
+
 /// One structured transcript row shared by the sidecar and JSON export.
 #[derive(Serialize)]
 #[serde(transparent)]
@@ -430,6 +731,7 @@ enum SidecarRowKind {
     Incomplete(IncompleteRow),
     Error(ErrorRow),
     Tool(ToolRow),
+    CompactionBoundary(CompactionBoundaryRow),
 }
 
 impl SidecarRow {
@@ -437,6 +739,32 @@ impl SidecarRow {
         if let SidecarRowKind::Tool(row) = &mut self.0 {
             row.result_preview = preview;
         }
+    }
+
+    fn is_attachable_assistant(&self) -> bool {
+        matches!(
+            &self.0,
+            SidecarRowKind::Text(TextRow {
+                role: "assistant",
+                ..
+            }) | SidecarRowKind::Incomplete(_)
+        )
+    }
+
+    fn set_reasoning_summary(&mut self, summary: String) {
+        let summary = (!summary.is_empty()).then_some(summary);
+        match &mut self.0 {
+            SidecarRowKind::Text(row) if row.role == "assistant" => row.reasoning = summary,
+            SidecarRowKind::Incomplete(row) => row.reasoning = summary,
+            _ => {}
+        }
+    }
+
+    /// Whether this row closes a compacting turn and therefore seals the
+    /// current physical JSONL segment.
+    #[must_use]
+    pub fn is_compaction_boundary(&self) -> bool {
+        matches!(&self.0, SidecarRowKind::CompactionBoundary(_))
     }
 
     /// Journal sequence that produced this transcript row.
@@ -447,6 +775,7 @@ impl SidecarRow {
             SidecarRowKind::Incomplete(row) => row.seq,
             SidecarRowKind::Error(row) => row.seq,
             SidecarRowKind::Tool(row) => row.seq,
+            SidecarRowKind::CompactionBoundary(row) => row.seq,
         }
     }
 
@@ -506,6 +835,9 @@ impl SidecarRow {
                     line.push_str(&escape_pipe_field(result));
                 }
                 line
+            }
+            SidecarRowKind::CompactionBoundary(row) => {
+                format!("C  {} {} |compaction boundary|", row.seq, row.at_ms)
             }
         }
     }
@@ -610,6 +942,7 @@ fn sidecar_projection(
                 row: SidecarRow(SidecarRowKind::Text(TextRow {
                     role: "user",
                     text,
+                    reasoning: None,
                     at_ms,
                     seq,
                     branch_id,
@@ -626,6 +959,7 @@ fn sidecar_projection(
                     compat: run_repeats_items || text.is_empty(),
                     role: "assistant",
                     text,
+                    reasoning: None,
                     at_ms,
                     seq,
                     branch_id,
@@ -666,6 +1000,7 @@ fn sidecar_projection(
             row: SidecarRow(SidecarRowKind::Incomplete(IncompleteRow {
                 role: "assistant",
                 text,
+                reasoning: None,
                 incomplete: true,
                 interruption,
                 at_ms,
@@ -737,8 +1072,9 @@ mod tests {
     use super::*;
     use crate::envelope::{EventEnvelope, PromptRender, RenderTargets};
     use crate::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope};
+    use crate::history::CompactionResume;
     use crate::history::TreeNode;
-    use crate::ids::{BranchId, DeviceId, EventId, ItemId, NodeId, SessionId};
+    use crate::ids::{ArtifactRef, BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
     use crate::verify::VerifyVerdict;
 
     fn envelope(seq: u64, payload: EventPayload) -> RawEnvelope {
@@ -773,6 +1109,90 @@ mod tests {
                 parent: None,
                 kind,
             }),
+        )
+    }
+
+    fn in_run(mut envelope: RawEnvelope, run_id: &str) -> RawEnvelope {
+        envelope.run_id = Some(RunId::new(run_id));
+        envelope
+    }
+
+    fn reasoning_started(seq: u64, run_id: &str, item_id: &str) -> RawEnvelope {
+        in_run(
+            envelope(
+                seq,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: ItemId::new(item_id),
+                    item: TurnItem::Reasoning {
+                        summary: String::new(),
+                    },
+                }),
+            ),
+            run_id,
+        )
+    }
+
+    fn reasoning_delta(seq: u64, run_id: &str, item_id: &str, text: &str) -> RawEnvelope {
+        in_run(
+            envelope(
+                seq,
+                EventPayload::Item(ItemEvent::Delta {
+                    item_id: ItemId::new(item_id),
+                    delta: ItemDelta::Reasoning {
+                        text: text.to_owned(),
+                    },
+                }),
+            ),
+            run_id,
+        )
+    }
+
+    fn reasoning_sealed(seq: u64, run_id: &str, item_id: &str, summary: &str) -> RawEnvelope {
+        in_run(
+            envelope(
+                seq,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new(item_id),
+                    item: TurnItem::Reasoning {
+                        summary: summary.to_owned(),
+                    },
+                }),
+            ),
+            run_id,
+        )
+    }
+
+    fn assistant(seq: u64, run_id: &str, text: &str) -> RawEnvelope {
+        in_run(
+            node(
+                seq,
+                NodeKind::AssistantCommit {
+                    text: text.to_owned(),
+                    verdict: VerifyVerdict::Unverified,
+                },
+            ),
+            run_id,
+        )
+    }
+
+    fn run_state(seq: u64, run_id: &str, state: RunState) -> RawEnvelope {
+        in_run(envelope(seq, EventPayload::RunState(state)), run_id)
+    }
+
+    fn compaction(seq: u64, run_id: &str, suffix: &str) -> RawEnvelope {
+        in_run(
+            node(
+                seq,
+                NodeKind::Compaction {
+                    covers_from: NodeId::new(format!("from-{suffix}")),
+                    covers_to: NodeId::new(format!("to-{suffix}")),
+                    summary_artifact: ArtifactRef::new(format!("artifact-{suffix}")),
+                    tokens_before: 100,
+                    tokens_after: 10,
+                    resume_cause: CompactionResume::AutoMidTurn,
+                },
+            ),
+            run_id,
         )
     }
 
@@ -905,5 +1325,191 @@ mod tests {
                 "{\"role\":\"user\",\"text\":\"branched\",\"at_ms\":1700000000007,\"seq\":7,\"branch_id\":\"branch-seven\",\"ordinal\":0}"
             )
         );
+    }
+
+    /// MUTATION CHECK: change the completed-item discriminator path from
+    /// `payload.item.item` to `payload.delta.delta`. Expected RUNTIME failure:
+    /// the assistant row below loses its sealed `reasoning` summary.
+    #[test]
+    fn sealed_reasoning_reaches_the_assistant_row() {
+        let mut projector = TranscriptProjector::default();
+        assert!(
+            projector
+                .push(&reasoning_started(1, "run-a", "reason-a"))
+                .is_empty()
+        );
+        assert!(
+            projector
+                .push(&reasoning_delta(2, "run-a", "reason-a", "stream fragment"))
+                .is_empty()
+        );
+        assert!(projector.push(&assistant(3, "run-a", "answer")).is_empty());
+        let rows = projector.push(&reasoning_sealed(4, "run-a", "reason-a", "sealed summary"));
+        assert_eq!(rows.len(), 1);
+        let row = serde_json::to_value(&rows[0]).expect("row serializes");
+        assert_eq!(row["text"], "answer");
+        assert_eq!(row["reasoning"], "sealed summary");
+    }
+
+    /// MUTATION CHECK: assign `ItemDelta::Reasoning.text` to the row's
+    /// optional reasoning field. Expected RUNTIME failure: the terminally
+    /// released row gains `"reasoning":"stream-only"` instead of omitting it.
+    #[test]
+    fn reasoning_deltas_are_never_carried() {
+        let mut projector = TranscriptProjector::default();
+        assert!(
+            projector
+                .push(&reasoning_started(1, "run-delta", "reason-delta"))
+                .is_empty()
+        );
+        assert!(
+            projector
+                .push(&reasoning_delta(
+                    2,
+                    "run-delta",
+                    "reason-delta",
+                    "stream-only",
+                ))
+                .is_empty()
+        );
+        assert!(
+            projector
+                .push(&assistant(3, "run-delta", "answer"))
+                .is_empty()
+        );
+        let rows = projector.push(&run_state(4, "run-delta", RunState::Done));
+        assert_eq!(rows.len(), 1);
+        let row = serde_json::to_value(&rows[0]).expect("row serializes");
+        assert!(row.get("reasoning").is_none(), "delta leaked: {row}");
+    }
+
+    /// MUTATION CHECK: replace the `(branch, agent, run)` lookup with one
+    /// global pending assistant. Expected RUNTIME failure: `sealed-a` lands on
+    /// run B's row or releases the two rows out of journal order.
+    #[test]
+    fn sealed_reasoning_attaches_to_the_correct_interleaved_turn() {
+        let mut projector = TranscriptProjector::default();
+        projector.push(&reasoning_started(1, "run-a", "reason-a"));
+        projector.push(&assistant(2, "run-a", "answer-a"));
+        projector.push(&reasoning_started(3, "run-b", "reason-b"));
+        assert!(
+            projector
+                .push(&assistant(4, "run-b", "answer-b"))
+                .is_empty()
+        );
+
+        let first = projector.push(&reasoning_sealed(5, "run-a", "reason-a", "sealed-a"));
+        assert_eq!(first.len(), 1);
+        let first = serde_json::to_value(&first[0]).expect("first row serializes");
+        assert_eq!(first["text"], "answer-a");
+        assert_eq!(first["reasoning"], "sealed-a");
+
+        let second = projector.push(&reasoning_sealed(6, "run-b", "reason-b", "sealed-b"));
+        assert_eq!(second.len(), 1);
+        let second = serde_json::to_value(&second[0]).expect("second row serializes");
+        assert_eq!(second["text"], "answer-b");
+        assert_eq!(second["reasoning"], "sealed-b");
+    }
+
+    /// MUTATION CHECK: remove the lifecycle barrier from `take_ready_rows`.
+    /// Expected RUNTIME failure: the unrelated seq-2 user row escapes before
+    /// seq-1 reasoning is sealed, making replay duplicate or skip durable rows.
+    #[test]
+    fn unresolved_reasoning_is_a_global_row_ordering_barrier() {
+        let mut projector = TranscriptProjector::default();
+        assert!(
+            projector
+                .push(&reasoning_started(1, "run-a", "reason-a"))
+                .is_empty()
+        );
+        assert!(
+            projector
+                .push(&node(
+                    2,
+                    NodeKind::UserTurn {
+                        text: "unrelated".into(),
+                        attachments: Vec::new(),
+                    },
+                ))
+                .is_empty()
+        );
+        let released = projector.push(&reasoning_sealed(3, "run-a", "reason-a", "sealed-a"));
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].seq(), 2);
+        let rows = projector.push(&assistant(4, "run-a", "answer-a"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq(), 4);
+        assert_eq!(
+            serde_json::to_value(&rows[0]).expect("assistant serializes")["reasoning"],
+            "sealed-a"
+        );
+    }
+
+    /// MUTATION CHECK: emit a boundary from `NodeKind::Compaction` instead of
+    /// the terminal run-state arm. Expected RUNTIME failure: the intermediate
+    /// `Thinking` observation below already returns a boundary row.
+    #[test]
+    fn compaction_boundary_appears_only_when_the_turn_settles() {
+        let mut projector = TranscriptProjector::default();
+        assert!(
+            projector
+                .push(&compaction(1, "compact-run", "one"))
+                .is_empty()
+        );
+        assert!(
+            projector
+                .push(&run_state(2, "compact-run", RunState::Thinking))
+                .is_empty()
+        );
+        let rows = projector.push(&run_state(3, "compact-run", RunState::Done));
+        assert_eq!(rows.len(), 1);
+        let row = serde_json::to_value(&rows[0]).expect("boundary serializes");
+        assert_eq!(row["kind"], "compaction_boundary");
+        assert_eq!(row["seq"], 3);
+        assert_eq!(
+            rows[0].pipe_body_line(),
+            "C  3 1700000000003 |compaction boundary|"
+        );
+    }
+
+    /// MUTATION CHECK: let a settled compacting run bypass an earlier open
+    /// compacting run. Expected RUNTIME failure: run B's boundary is emitted
+    /// at seq 3 and seals a segment while run A's seq-1 reset is unresolved.
+    #[test]
+    fn unresolved_compaction_is_a_global_row_ordering_barrier() {
+        let mut projector = TranscriptProjector::default();
+        assert!(projector.push(&compaction(1, "run-a", "a")).is_empty());
+        assert!(projector.push(&compaction(2, "run-b", "b")).is_empty());
+        assert!(
+            projector
+                .push(&run_state(3, "run-b", RunState::Done))
+                .is_empty()
+        );
+        let rows = projector.push(&run_state(4, "run-a", RunState::Done));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq(), 3);
+        assert_eq!(rows[1].seq(), 4);
+        assert!(rows.iter().all(SidecarRow::is_compaction_boundary));
+    }
+
+    /// MUTATION CHECK: push one boundary row for every observed compaction
+    /// node. Expected RUNTIME failure: two passes below produce two rows
+    /// instead of exactly one row at the compacting turn's terminal state.
+    #[test]
+    fn multiple_compaction_passes_in_one_turn_emit_one_boundary() {
+        let mut projector = TranscriptProjector::default();
+        assert!(
+            projector
+                .push(&compaction(1, "compact-run", "one"))
+                .is_empty()
+        );
+        assert!(
+            projector
+                .push(&compaction(2, "compact-run", "two"))
+                .is_empty()
+        );
+        let rows = projector.push(&run_state(3, "compact-run", RunState::Done));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_compaction_boundary());
     }
 }
