@@ -45,6 +45,31 @@ fn wire_fields(source: &str, struct_name: &str) -> Vec<String> {
         .collect()
 }
 
+/// A rename between two surfaces of the same field is a tripwire: the wire
+/// calls it `session_id`, the CLI historically called it `id`, and a consumer
+/// reading both silently fails to join the rows. A web-client bridge lost
+/// `run_id` for hours partly to this shape. Both names are emitted, and they
+/// must stay equal — an alias that drifts is worse than no alias.
+///
+/// MUTATION CHECK (executed): emit `session_id` from a different source than
+/// `id`. Expected RUNTIME failure: the equality assertion below.
+#[test]
+fn the_session_id_alias_is_emitted_and_never_drifts_from_id() {
+    let root = workspace_root();
+    let observe = std::fs::read_to_string(root.join("crates/haider-cli/src/observe.rs"))
+        .expect("observe.rs readable");
+    assert!(
+        observe.contains("\"session_id\": self.id"),
+        "the alias must be emitted FROM `self.id`, so the two names cannot \
+         drift apart — an alias sourced separately is a second field wearing \
+         the same name"
+    );
+    assert!(
+        observe.contains("\"id\": self.id"),
+        "the historical `id` key stays for existing readers"
+    );
+}
+
 /// MUTATION CHECK (executed): delete the `"run_id"` emission from
 /// `SessionSummaryView::json`. Expected RUNTIME failure: this guard names
 /// `run_id` as unprojected — which is exactly the v0.0.938 bug it exists to
@@ -62,7 +87,7 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
     // The distinction is the entire point of the list.
     let deliberately_skipped: &[(&str, &str)] = &[
         ("head_seq", "internal cursor, not operator-facing"),
-        ("session_id", "projected as `id`"),
+        ("session_id", "emitted under BOTH `id` and `session_id`"),
         ("metadata", "flattened into provider/model/workspace"),
         ("title", "projected directly"),
         ("run_state", "projected via run_state_name"),

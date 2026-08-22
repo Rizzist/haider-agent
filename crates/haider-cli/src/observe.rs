@@ -223,7 +223,13 @@ impl ObserveJson for SessionDocument {
 impl ObserveJson for SessionSummaryView {
     fn json(&self) -> Value {
         let mut object = json!({
+            // `id` is the historical CLI name; `session_id` is what every RPC
+            // surface calls the same field. A consumer reading both surfaces
+            // would otherwise see two key names for one thing and silently
+            // fail to join the rows — which is exactly how a bridge lost
+            // run_id for hours. Emit both; `id` stays for existing readers.
             "id": self.id,
+            "session_id": self.id,
             "title": self.title,
             "run_state": self.run_state,
             "active_branch": self.active_branch,
