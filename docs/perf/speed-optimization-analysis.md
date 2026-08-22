@@ -229,7 +229,10 @@ epoch in that suffix, and caches projections under the exact
 `(head seq, compaction epoch, branch, agent, current run)` key. The global map
 lock is not held over store or artifact I/O, and a concurrent older compile is
 not allowed to replace a newer cached head. The durable journal and CAS remain
-authoritative; restart simply begins with an empty cache.
+authoritative. After a terminal compaction boundary, the compiler persists the
+exact idle projection for that branch+agent timeline and a restart validates
+that checkpoint before reading only the journal suffix. Missing, corrupt,
+older-shape, or wrong-timeline checkpoints replay from sequence zero.
 
 Ancestry compilation now indexes the fixed agent's envelopes by owning branch
 once and uses two binary searches for each node's sequence slice. This removes
@@ -251,6 +254,12 @@ so the cache-hit and append columns are the production-path result; the 5k
 forced-fresh result independently demonstrates removal of the superlinear
 ancestry scan. The after harness was recreated from the same recorded fixture
 shape rather than retained as production code.
+
+The durable-boundary follow-up retains an ignored, reproducible timing probe
+with five compactions and 3,032 envelopes (1,141,209 serialized journal bytes).
+Nine optimized-build samples measured a 14.839 ms median cold full fold and a
+0.071 ms median cold resume from the latest boundary (about 209x faster). Every
+sample asserts the complete resumed projection equals the full-fold oracle.
 
 Seams:
 

@@ -1150,6 +1150,8 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
 /// the stored terminal boundary. Expected runtime failure: the read-cursor
 /// assertion observes zero. Changing the checkpoint's `boundary_event_id` to
 /// the compaction-node event also fails the terminal-boundary identity pin.
+/// Replacing `prefix.projection.messages.clone()` with `Vec::new()` in the
+/// resumed fold fails `restarted_projection == fresh_projection` at runtime.
 #[tokio::test]
 async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let root = tempfile::tempdir().expect("temp profile");
@@ -1596,26 +1598,225 @@ async fn checkpoint_from_another_branch_is_rejected() {
     );
 }
 
+/// MUTATION CHECK: replace `affects_checkpoint_timeline` with `true` for
+/// suffix compaction nodes. Expected runtime failure: branch A's compaction
+/// makes the valid main-timeline resume read from sequence zero.
+#[tokio::test]
+async fn compaction_on_another_branch_does_not_invalidate_the_checkpoint() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("unrelated-branch-compaction-session");
+    let prior = RunId::new("main-prior-compaction");
+    let other = RunId::new("other-branch-compaction");
+    let current = RunId::new("main-current-after-other-compaction");
+    let other_branch = BranchId::new("unrelated-branch");
+    let summary_artifact = ArtifactRef::new(format!("blake3:{}", "b".repeat(64)));
+    let artifacts = TestArtifacts(HashMap::from([(
+        summary_artifact.clone(),
+        b"main checkpoint summary".to_vec(),
+    )]));
+    let mut other_compaction = node(
+        &session_id,
+        &other,
+        "unrelated-compaction-node",
+        None,
+        NodeKind::Compaction {
+            covers_from: NodeId::new("unrelated-covered-from"),
+            covers_to: NodeId::new("unrelated-covered-to"),
+            summary_artifact: ArtifactRef::new(format!("blake3:{}", "c".repeat(64))),
+            tokens_before: 50,
+            tokens_after: 5,
+            resume_cause: CompactionResume::ManualIdle,
+        },
+    );
+    other_compaction.branch_id = Some(other_branch.clone());
+    let mut other_done = envelope(
+        &session_id,
+        &other,
+        "unrelated-compaction-done",
+        EventPayload::RunState(RunState::Done),
+        PromptRender::Omit,
+    );
+    other_done.branch_id = Some(other_branch);
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "main-prior-user",
+            EventPayload::UserMessage {
+                text: "main old user".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "main-prior-user-node",
+            None,
+            NodeKind::UserTurn {
+                text: "main old user".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "main-prior-assistant",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("main-prior-answer"),
+                item: TurnItem::AgentMessage {
+                    text: "main old answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "main-prior-assistant-node",
+            Some("main-prior-user-node"),
+            NodeKind::AssistantCommit {
+                text: "main old answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        node(
+            &session_id,
+            &prior,
+            "main-prior-compaction-node",
+            Some("main-prior-assistant-node"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("main-prior-user-node"),
+                covers_to: NodeId::new("main-prior-assistant-node"),
+                summary_artifact,
+                tokens_before: 100,
+                tokens_after: 10,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "main-prior-compaction-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        other_compaction,
+        other_done,
+        envelope(
+            &session_id,
+            &current,
+            "main-current-user-after-other",
+            EventPayload::UserMessage {
+                text: "main current".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "main-current-node-after-other",
+            Some("main-prior-compaction-node"),
+            NodeKind::UserTurn {
+                text: "main current".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append interleaved branch compactions");
+    let checkpoint_message = Message {
+        role: MessageRole::User,
+        blocks: vec![Block::Text {
+            text: "main checkpoint summary".into(),
+        }],
+    };
+    let checkpoint = SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: "prompt_history".into(),
+        timeline_key: "main-checkpoint-returned-by-fixture".into(),
+        through_seq: 6,
+        boundary_event_id: events[5].event_id.clone(),
+        payload: serde_json::to_vec(&serde_json::json!({
+            "shape_version": 1,
+            "reducer_version": format!("{}/prompt-v1", env!("CARGO_PKG_VERSION")),
+            "through_seq": 6,
+            "boundary_event_id": events[5].event_id,
+            "boundary_run_id": prior,
+            "compaction_epoch": 5,
+            "messages": [serde_json::to_value(checkpoint_message).expect("message value")],
+            "stable_history_end": 1,
+            "current_user_start": 1,
+            "latest_compaction_summary_end": 1
+        }))
+        .expect("encode main checkpoint"),
+    };
+    let recording = RecordingStore::with_checkpoint(&store, checkpoint);
+    let resumed = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &PromptHistoryCompiler::cache(),
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("unrelated branch leaves checkpoint usable");
+    let full = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("full main-timeline fold");
+
+    assert_eq!(resumed, full);
+    assert!(
+        !recording.read_cursors().contains(&0),
+        "another timeline's compaction must not force a full replay"
+    );
+}
+
 /// MUTATION CHECK: replace `.ok()?` on the checkpoint JSON decode with
 /// `.expect("checkpoint JSON")`. Expected runtime failure: corrupt cache bytes
-/// panic instead of falling back to the authoritative journal.
+/// panic instead of falling back to the authoritative journal. Deleting the
+/// `decoded.shape_version != PROMPT_CHECKPOINT_SHAPE_VERSION` guard makes the
+/// older-shape fixture pollute the prompt and fail resumed/full equality.
 #[tokio::test]
 async fn unreadable_checkpoint_falls_back_to_full_replay() {
     let store = MemoryStore::new();
     let artifacts = TestArtifacts(HashMap::new());
     let session_id = SessionId::new("unreadable-checkpoint-session");
+    let prior = RunId::new("unreadable-checkpoint-prior");
     let current = RunId::new("unreadable-checkpoint-current");
-    let mut events = vec![envelope(
-        &session_id,
-        &current,
-        "unreadable-checkpoint-user",
-        EventPayload::UserMessage {
-            text: "journal remains authoritative".into(),
-            attachments: Vec::new(),
-            mode: DeliveryMode::Queue,
-        },
-        PromptRender::Verbatim,
-    )];
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "unreadable-checkpoint-prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "unreadable-checkpoint-user",
+            EventPayload::UserMessage {
+                text: "journal remains authoritative".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
     StoreHandle::append(&store, &mut events)
         .await
         .expect("append authoritative journal");
@@ -1655,6 +1856,51 @@ async fn unreadable_checkpoint_falls_back_to_full_replay() {
     assert!(
         recording.read_cursors().contains(&0),
         "corrupt checkpoint bytes must trigger replay from sequence zero"
+    );
+
+    let obsolete_message = Message {
+        role: MessageRole::User,
+        blocks: vec![Block::Text {
+            text: "obsolete checkpoint state".into(),
+        }],
+    };
+    let obsolete_checkpoint = SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: "prompt_history".into(),
+        timeline_key: "obsolete-main-key".into(),
+        through_seq: 1,
+        boundary_event_id: events[0].event_id.clone(),
+        payload: serde_json::to_vec(&serde_json::json!({
+            "shape_version": 0,
+            "reducer_version": format!("{}/prompt-v1", env!("CARGO_PKG_VERSION")),
+            "through_seq": 1,
+            "boundary_event_id": events[0].event_id,
+            "boundary_run_id": prior,
+            "compaction_epoch": 1,
+            "messages": [serde_json::to_value(obsolete_message).expect("message value")],
+            "stable_history_end": 1,
+            "current_user_start": 1,
+            "latest_compaction_summary_end": 1
+        }))
+        .expect("encode obsolete checkpoint"),
+    };
+    let obsolete_recording = RecordingStore::with_checkpoint(&store, obsolete_checkpoint);
+    let obsolete_fallback =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &PromptHistoryCompiler::cache(),
+            &obsolete_recording,
+            &artifacts,
+            &session_id,
+            None,
+            None,
+            &current,
+        )
+        .await
+        .expect("older checkpoint shape falls back");
+    assert_eq!(obsolete_fallback, full);
+    assert!(
+        obsolete_recording.read_cursors().contains(&0),
+        "an older checkpoint shape must trigger replay from sequence zero"
     );
 }
 

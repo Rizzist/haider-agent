@@ -540,8 +540,13 @@ impl PromptHistoryCache {
                         )
                     },
                 ) {
-                    cached.compaction_epoch = envelope.seq;
-                    compaction_after_checkpoint |= cached.checkpoint_base.is_some();
+                    let affects_checkpoint_timeline = envelope.branch_id == timeline.branch_id
+                        && envelope.agent_id == timeline.agent_id;
+                    if cached.checkpoint_base.is_none() || affects_checkpoint_timeline {
+                        cached.compaction_epoch = envelope.seq;
+                    }
+                    compaction_after_checkpoint |=
+                        cached.checkpoint_base.is_some() && affects_checkpoint_timeline;
                 }
                 cached.push_envelope(envelope);
             }
@@ -551,6 +556,7 @@ impl PromptHistoryCache {
                 )));
             }
         }
+        cached.flush_boundary_rows();
 
         // A later compaction resets the model context again. The prior
         // checkpoint cannot derive the new overlay without its omitted tree;
@@ -587,6 +593,7 @@ impl PromptHistoryCache {
                     )));
                 }
             }
+            cached.flush_boundary_rows();
         }
         if cached.head_seq < head_seq {
             cached.head_seq = head_seq;
@@ -639,6 +646,7 @@ impl PromptHistoryCache {
                     )));
                 }
             }
+            cached.flush_boundary_rows();
             cached.head_seq = head_seq;
         }
         let scope = PromptProjectionScope {
@@ -757,6 +765,18 @@ impl CachedPromptSession {
     fn push_envelope(&mut self, envelope: RawEnvelope) {
         let rows = self.boundary_projector.push(&envelope);
         self.envelopes.push(envelope);
+        self.note_boundary_rows(rows);
+    }
+
+    fn flush_boundary_rows(&mut self) {
+        let rows = self.boundary_projector.flush_unresolved_tools();
+        self.note_boundary_rows(rows);
+    }
+
+    fn note_boundary_rows(
+        &mut self,
+        rows: impl IntoIterator<Item = haider_protocol::pipe::SidecarRow>,
+    ) {
         for row in rows {
             if !row.is_compaction_boundary() {
                 continue;
