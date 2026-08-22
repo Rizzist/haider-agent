@@ -3,6 +3,9 @@
 //! This module is crate-internal only because `OutboundLane`, `LaneKey`, and
 //! `run_writer` intentionally are not production API.
 
+// Keep this transport-specific suite unavailable off Unix even if its parent
+// module declaration is accidentally broadened in the future.
+#![cfg(unix)]
 #![allow(clippy::expect_used)]
 
 use super::*;

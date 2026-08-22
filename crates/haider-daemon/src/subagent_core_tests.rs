@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used)]
 
+#[cfg(unix)]
 use crate::connection::{ConnectionContext, DrainNotice, serve};
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::session_hub::{SessionHub, SessionHubConfig};
@@ -19,27 +20,39 @@ use haider_protocol::agent::{AgentMessageDelivery, AgentMessageReceipt, AgentMes
 use haider_protocol::effect::{EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::{AgentId, BranchId, DeviceId, EventId, MenuId, RunId, SessionId};
+#[cfg(unix)]
+use haider_protocol::ids::MenuId;
+use haider_protocol::ids::{AgentId, BranchId, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+#[cfg(unix)]
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, WaitReason};
+#[cfg(unix)]
+use haider_provider::FakeInputKind;
 use haider_provider::{
-    FakeInputKind, FakeProvider, FakeStep, Provider, ProviderError, ProviderStream, TurnRequest,
+    FakeProvider, FakeStep, Provider, ProviderError, ProviderStream, TurnRequest,
 };
+#[cfg(unix)]
 use haider_rpc::{
     AttachMode, Capability, CapabilitySet, ClientKind, CommandId, Hello, RequestBody, RequestId,
     ResponseBody, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
 };
 use haider_tools::{MessageSubagent, SpawnSubagent};
+#[cfg(unix)]
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::{Notify, mpsc, watch};
+#[cfg(unix)]
+use tokio::sync::watch;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, timeout};
 
 /// LAW E1d: a child resolves to the intersection of its requested grant and
@@ -79,6 +92,7 @@ fn e1d_child_grant_cannot_exceed_parent_and_within_ceiling_survives() {
     assert!(!names.contains(&"process_exec"));
 }
 
+#[cfg(unix)]
 #[test]
 fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
     use haider_protocol::ids::EffectId;
@@ -519,6 +533,7 @@ impl Provider for GatedSteerProvider {
 /// the child handoff line. Expected RUNTIME failure: the second request is not
 /// the same-round steer, the receipt/fact changes, or the UTF-8/path pins fail.
 #[tokio::test]
+#[cfg(unix)]
 async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact() {
     use haider_protocol::ids::ItemId;
 
@@ -1556,11 +1571,13 @@ fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<Even
         .collect()
 }
 
+#[cfg(unix)]
 enum ParkedChildMode {
     Complete,
     StallAfterApproval,
 }
 
+#[cfg(unix)]
 struct ParkedChildHarness {
     _root: tempfile::TempDir,
     store: SqliteStoreHandle,
@@ -1572,6 +1589,7 @@ struct ParkedChildHarness {
     request_seq: u64,
 }
 
+#[cfg(unix)]
 async fn start_parked_child(
     label: &str,
     mode: ParkedChildMode,
@@ -1701,6 +1719,7 @@ async fn start_parked_child(
     }
 }
 
+#[cfg(unix)]
 struct UdsControlClient {
     stream: UnixStream,
     decoder: uds_codec::Decoder,
@@ -1710,6 +1729,7 @@ struct UdsControlClient {
     writer_owner: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(unix)]
 impl UdsControlClient {
     async fn connect(hub: SessionHub) -> Self {
         let (server, stream) = UnixStream::pair().expect("live UDS pair");
@@ -1940,6 +1960,7 @@ impl UdsControlClient {
     }
 }
 
+#[cfg(unix)]
 async fn wait_for_chip(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
@@ -1974,6 +1995,7 @@ async fn wait_for_chip(
 /// to Thinking. Expected RUNTIME failure: the parent journal never carries
 /// the exact PermissionRequired chip for the delegated agent.
 #[tokio::test]
+#[cfg(unix)]
 async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
     let harness = start_parked_child(
         "permission-chip",
@@ -1999,6 +2021,7 @@ async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
 /// failure: the child is nudged/cancelled before approval, or it never receives
 /// exactly one nudge and cancellation after unpark.
 #[tokio::test]
+#[cfg(unix)]
 async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
     // 300ms: under parallel suite load the child's first round can
     // exceed a 35ms stall deadline BEFORE the park commits — a legal
@@ -2078,6 +2101,7 @@ async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
 /// actor. Expected RUNTIME failure: attach/answer returns a typed error, the
 /// child never reaches Done, or the parent never collects the child's report.
 #[tokio::test]
+#[cfg(unix)]
 async fn control_attach_and_menu_answer_over_uds_complete_a_child_session() {
     let harness = start_parked_child(
         "permission-uds",
@@ -2130,6 +2154,7 @@ async fn control_attach_and_menu_answer_over_uds_complete_a_child_session() {
 /// remove the grace cancellation. Expected runtime failure: the parent never
 /// reaches Done with the stall-reason report.
 #[tokio::test]
+#[cfg(unix)]
 async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -2230,6 +2255,7 @@ async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() 
 /// committed progress. Expected runtime failure: a nudge UserMessage appears
 /// while the slow child is still emitting reasoning deltas.
 #[tokio::test]
+#[cfg(unix)]
 async fn committed_child_progress_resets_the_stall_deadline() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -2324,6 +2350,7 @@ async fn committed_child_progress_resets_the_stall_deadline() {
 /// no-Cancelled assertion (and the child's own report reaching the
 /// parent) dies. A nudge is a question, not a sentence.
 #[tokio::test]
+#[cfg(unix)]
 async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     // Linux CI can defer both Tokio tasks past a 5ms nominal margin. Give the
     // silent child two complete 25ms poll opportunities after its 35ms-style
@@ -2977,6 +3004,7 @@ async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
 /// parent receives a generic restart failure (or waits forever) instead of
 /// the one-nudge stall report.
 #[tokio::test]
+#[cfg(unix)]
 async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress() {
     use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 

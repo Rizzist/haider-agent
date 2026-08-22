@@ -688,7 +688,7 @@ fn session_seen_is_monotone_and_replays_the_original_receipt() {
     let connection = must(Connection::open(store.database_path()));
     must(connection.execute(
         "UPDATE sessions SET seen_at_ms = ?2 WHERE id = ?1",
-        params![session.as_str(), i64::try_from(future).expect("fits i64")],
+        params![session.as_str(), must(i64::try_from(future))],
     ));
     let second_command = haider_store::SessionSeenCommand {
         command_id: "seen-cmd-2".into(),
