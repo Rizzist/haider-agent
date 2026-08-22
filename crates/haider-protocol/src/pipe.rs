@@ -761,10 +761,29 @@ impl SidecarRow {
         )
     }
 
+    /// Attach a turn's sealed reasoning, and CLEAR `compat` when it lands.
+    ///
+    /// `compat` means the row is genuinely redundant — the item stream also
+    /// carries its content, so a client may drop it and lose nothing. Reasoning
+    /// is the one thing the pipe carries that the pipe does not duplicate
+    /// elsewhere, so a row holding it is no longer redundant and must not wear
+    /// the flag.
+    ///
+    /// Found by probing v0.0.939 live rather than by any test: every reasoning
+    /// row was `compat: true` and 57% had empty text, so a pipe-primary client
+    /// following the documented contract would drop 100% of the reasoning that
+    /// release shipped. Making this a PRODUCER guarantee — rather than a caveat
+    /// each client must remember — means it fails loudly instead of silently.
     fn set_reasoning_summary(&mut self, summary: String) {
         let summary = (!summary.is_empty()).then_some(summary);
+        let carries_reasoning = summary.is_some();
         match &mut self.0 {
-            SidecarRowKind::Text(row) if row.role == "assistant" => row.reasoning = summary,
+            SidecarRowKind::Text(row) if row.role == "assistant" => {
+                row.reasoning = summary;
+                if carries_reasoning {
+                    row.compat = false;
+                }
+            }
             SidecarRowKind::Incomplete(row) => row.reasoning = summary,
             _ => {}
         }
@@ -1419,6 +1438,55 @@ mod tests {
         let second = serde_json::to_value(&second[0]).expect("second row serializes");
         assert_eq!(second["text"], "answer-b");
         assert_eq!(second["reasoning"], "sealed-b");
+    }
+
+    /// `compat` promises a row is REDUNDANT — droppable with nothing lost.
+    /// Reasoning is the one thing the pipe carries that it does not duplicate
+    /// elsewhere in the pipe, so a row holding it is not redundant and must not
+    /// claim to be. Probing v0.0.939 found every reasoning row marked compat,
+    /// which would have cost a pipe-primary client 100% of its reasoning.
+    ///
+    /// MUTATION CHECK (executed): drop the `row.compat = false` from
+    /// `set_reasoning_summary`. Expected RUNTIME failure: the assertion below —
+    /// the reasoning-bearing row advertises itself as safe to drop.
+    #[test]
+    fn a_row_carrying_reasoning_is_never_marked_compat() {
+        let mut projector = TranscriptProjector::default();
+        projector.push(&reasoning_started(1, "run-a", "reason-a"));
+        projector.push(&assistant(2, "run-a", "answer-a"));
+        let rows = projector.push(&reasoning_sealed(3, "run-a", "reason-a", "the-thinking"));
+        let row = serde_json::to_value(&rows[0]).expect("row serializes");
+
+        assert_eq!(
+            row["reasoning"], "the-thinking",
+            "the row carries reasoning"
+        );
+        assert!(
+            row.get("compat").is_none(),
+            "a reasoning-bearing row must not advertise itself as droppable: {row}"
+        );
+    }
+
+    /// The guarantee is scoped: a row WITHOUT reasoning keeps whatever compat
+    /// status it earned, so this does not quietly widen what clients must keep.
+    ///
+    /// MUTATION CHECK (executed): clear `compat` unconditionally in
+    /// `set_reasoning_summary`. Expected RUNTIME failure: the assertion below —
+    /// an ordinary item-repeating row would stop being droppable.
+    #[test]
+    fn a_row_without_reasoning_keeps_its_compat_status() {
+        let mut projector = TranscriptProjector::default();
+        // An empty turn-start assistant row is compat by construction.
+        let rows = projector.push(&assistant(1, "run-a", ""));
+        let row = serde_json::to_value(&rows[0]).expect("row serializes");
+        assert!(
+            row.get("reasoning").is_none(),
+            "no reasoning on this row: {row}"
+        );
+        assert_eq!(
+            row["compat"], true,
+            "an empty turn-start row is still redundant: {row}"
+        );
     }
 
     /// Reasoning that never found its assistant row must be DISCARDED when a
