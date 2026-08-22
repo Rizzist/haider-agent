@@ -2263,7 +2263,8 @@ fn xai_cached_prompt_details_map_to_normalized_usage() {
 
 /// MUTATION CHECK: skip the normal OpenAI cached-token normalization for the
 /// Haider Code dialect. Expected runtime failure: uncached input remains 100
-/// or cache-read input becomes zero instead of the exact 60/40 split.
+/// or cache-read input becomes zero instead of the exact 60/40 split, and the
+/// status is no longer Present.
 #[test]
 fn haider_code_openai_usage_is_normalized() {
     let usage = chat_usage(
@@ -2280,7 +2281,175 @@ fn haider_code_openai_usage_is_normalized() {
     assert_eq!(normalized.logical_input, 100);
     assert_eq!(normalized.uncached_input, 60);
     assert_eq!(normalized.cache_read_input, 40);
+    assert_eq!(
+        normalized.cache_status,
+        haider_protocol::provider::CacheStatAvailability::Present
+    );
+    assert_eq!(usage.cached, 40);
     assert_eq!(usage.output, 7);
+}
+
+fn recorded_deepseek_chat_usage() -> serde_json::Value {
+    include_str!("../tests/fixtures/openai/deepseek_reasoning_usage.sse")
+        .lines()
+        .find_map(|line| {
+            let payload = line.strip_prefix("data: ")?;
+            let frame: serde_json::Value = serde_json::from_str(payload).ok()?;
+            frame.get("usage").cloned()
+        })
+        .expect("recorded DeepSeek usage frame")
+}
+
+/// A proxy dialect must decode the DeepSeek wire shape that actually arrived,
+/// regardless of the provider label used to configure the local adapter.
+///
+/// MUTATION CHECK: restrict top-level hit/miss decoding to `DeepSeekApi`.
+/// Expected runtime failure: proxy input/cache stay at 94/0 instead of 23/71.
+#[test]
+fn haider_code_reads_recorded_deepseek_cache_usage() {
+    let items = replay_haider_code_chat_sse(include_bytes!(
+        "../tests/fixtures/openai/deepseek_reasoning_usage.sse"
+    ));
+    let usage = items
+        .iter()
+        .find_map(|item| match item {
+            Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+            _ => None,
+        })
+        .expect("Haider Code usage event");
+    let normalized = usage.normalized.as_ref().expect("normalized proxy usage");
+    assert_eq!(
+        (usage.input, usage.cached),
+        (23, 71),
+        "proxy must preserve DeepSeek miss/hit accounting"
+    );
+    assert_eq!(normalized.logical_input, 94);
+    assert_eq!(normalized.uncached_input, 23);
+    assert_eq!(normalized.cache_read_input, 71);
+    assert_eq!(
+        normalized.cache_status,
+        haider_protocol::provider::CacheStatAvailability::Present
+    );
+}
+
+/// Missing telemetry is unavailable, which is distinct from an observed zero.
+///
+/// MUTATION CHECK: default an absent nested `cached_tokens` field to zero.
+/// Expected runtime failure: cache status changes from Unavailable to Present.
+#[test]
+fn haider_code_without_a_recognized_cache_shape_is_unavailable() {
+    let usage = chat_usage(
+        &serde_json::json!({
+            "prompt_tokens": 94,
+            "completion_tokens": 13
+        }),
+        None,
+        CompatibleDialect::HaiderCodeApi,
+    )
+    .expect("Haider Code usage without cache telemetry");
+    let normalized = usage.normalized.expect("normalized proxy usage");
+    assert_eq!(
+        normalized.cache_status,
+        haider_protocol::provider::CacheStatAvailability::Unavailable
+    );
+    assert_eq!(normalized.cache_telemetry_input, 0);
+    assert_eq!(normalized.cache_read_input, 0);
+    assert_eq!(usage.cached, 0);
+}
+
+/// Both DeepSeek counters must be present and sum exactly to prompt_tokens for
+/// either a direct session or a proxy carrying the DeepSeek wire shape.
+///
+/// MUTATION CHECK: accept a hit/miss pair without the reconciliation guard.
+/// Expected runtime failure: both dialects report Present with a 24/71 split.
+#[test]
+fn non_reconciling_deepseek_cache_usage_is_unavailable_for_direct_and_proxy() {
+    use haider_protocol::provider::CacheStatAvailability;
+
+    let mut value = recorded_deepseek_chat_usage();
+    value["prompt_cache_miss_tokens"] = serde_json::json!(24);
+    let actual = [
+        CompatibleDialect::DeepSeekApi,
+        CompatibleDialect::HaiderCodeApi,
+    ]
+    .map(|dialect| {
+        let usage = chat_usage(&value, None, dialect).expect("malformed DeepSeek usage");
+        let normalized = usage.normalized.expect("normalized malformed usage");
+        (
+            normalized.cache_status,
+            normalized.uncached_input,
+            normalized.cache_read_input,
+        )
+    });
+    assert_eq!(
+        actual,
+        [
+            (CacheStatAvailability::Unavailable, 94, 0),
+            (CacheStatAvailability::Unavailable, 94, 0),
+        ]
+    );
+}
+
+/// A partial DeepSeek pair is evidence of malformed telemetry, not permission
+/// to treat the missing half as zero or to fall through to another shape.
+///
+/// MUTATION CHECK: infer a missing miss counter as prompt_tokens minus hits.
+/// Expected runtime failure: both dialects change from Unavailable to Present.
+#[test]
+fn partial_deepseek_cache_usage_is_unavailable_for_direct_and_proxy() {
+    use haider_protocol::provider::CacheStatAvailability;
+
+    let mut value = recorded_deepseek_chat_usage();
+    value
+        .as_object_mut()
+        .expect("usage object")
+        .remove("prompt_cache_miss_tokens");
+    let statuses = [
+        CompatibleDialect::DeepSeekApi,
+        CompatibleDialect::HaiderCodeApi,
+    ]
+    .map(|dialect| {
+        chat_usage(&value, None, dialect)
+            .expect("partial DeepSeek usage")
+            .normalized
+            .expect("normalized partial usage")
+            .cache_status
+    });
+    assert_eq!(
+        statuses,
+        [
+            CacheStatAvailability::Unavailable,
+            CacheStatAvailability::Unavailable,
+        ]
+    );
+}
+
+/// Direct DeepSeek remains strict: its configured wire contract does not fall
+/// back to OpenAI's nested shape when the required hit/miss pair is absent.
+///
+/// MUTATION CHECK: allow `DeepSeekApi` to fall back to nested cached_tokens.
+/// Expected runtime failure: direct DeepSeek reports Present/71 instead of
+/// Unavailable/0.
+#[test]
+fn direct_deepseek_does_not_fall_back_to_openai_cache_details() {
+    use haider_protocol::provider::CacheStatAvailability;
+
+    let mut value = recorded_deepseek_chat_usage();
+    let object = value.as_object_mut().expect("usage object");
+    object.remove("prompt_cache_hit_tokens");
+    object.remove("prompt_cache_miss_tokens");
+    object.insert(
+        "prompt_tokens_details".to_owned(),
+        serde_json::json!({"cached_tokens": 71}),
+    );
+    let usage = chat_usage(&value, None, CompatibleDialect::DeepSeekApi)
+        .expect("direct DeepSeek nested-only usage");
+    let normalized = usage.normalized.expect("normalized direct usage");
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Unavailable);
+    assert_eq!(normalized.uncached_input, 94);
+    assert_eq!(normalized.cache_read_input, 0);
+    assert_eq!(usage.input, 94);
+    assert_eq!(usage.cached, 0);
 }
 
 /// WH4 — DeepSeek's top-level cache counters are the accounting authority:

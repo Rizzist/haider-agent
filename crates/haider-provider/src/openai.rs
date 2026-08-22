@@ -4926,24 +4926,25 @@ fn chat_usage(
         .get("completion_tokens_details")
         .and_then(|details| details.get("reasoning_tokens"))
         .and_then(serde_json::Value::as_u64);
-    // DeepSeek reports disjoint top-level hit/miss counters. The pair is
-    // authoritative only when BOTH are present and reconcile to the prompt
-    // total; a partial or malformed pair is unavailable, never saturated.
-    let deepseek_miss = (dialect == CompatibleDialect::DeepSeekApi)
-        .then(|| {
-            value
-                .get("prompt_cache_miss_tokens")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .flatten();
-    let deepseek_hit = (dialect == CompatibleDialect::DeepSeekApi)
-        .then(|| {
-            value
-                .get("prompt_cache_hit_tokens")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .flatten();
-    let (input, normalized) = if dialect == CompatibleDialect::DeepSeekApi {
+    // DeepSeek reports disjoint top-level hit/miss counters. Pass-through
+    // proxies retain that upstream shape, so the fields that actually arrived
+    // select this decoder regardless of the locally configured dialect.
+    // Direct DeepSeek remains strict even when both fields are absent.
+    let has_deepseek_cache_shape = value.get("prompt_cache_miss_tokens").is_some()
+        || value.get("prompt_cache_hit_tokens").is_some();
+    let deepseek_miss = value
+        .get("prompt_cache_miss_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let deepseek_hit = value
+        .get("prompt_cache_hit_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let parse_deepseek_cache_shape =
+        dialect == CompatibleDialect::DeepSeekApi || has_deepseek_cache_shape;
+    let (input, normalized) = if parse_deepseek_cache_shape {
+        // Once either DeepSeek field is present, the pair is authoritative
+        // only when BOTH values are valid and reconcile to the prompt total.
+        // Partial or malformed telemetry is unavailable and must not fall back
+        // to another shape, be saturated, or acquire a synthetic zero.
         match (deepseek_miss, deepseek_hit) {
             (Some(miss), Some(hit)) if miss.checked_add(hit) == Some(prompt_tokens) => (
                 miss,
