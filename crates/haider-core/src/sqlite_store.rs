@@ -24,10 +24,10 @@ use haider_store::{
     HookTrustChange, HookTrustCommand, JournalAppendBatch, MenuResolutionCommand,
     MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
     RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
-    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome,
+    SessionForkCommand, SessionForkOutcome, SessionRenameCommand, SessionRenameOutcome,
+    SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -462,6 +462,67 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.create_session(&command))).await
     }
 
+    pub async fn session_fork_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::CreatedSessionFork>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_fork_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn session_metafork_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::CreatedSessionFork>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_metafork_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn validate_session_fork_source(
+        &self,
+        worker_generation: u64,
+        source_session_id: SessionId,
+        source_branch_id: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.validate_session_fork_source(
+                    worker_generation,
+                    &source_session_id,
+                    source_branch_id.as_ref(),
+                    &fork_node_id,
+                    fork_seq,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn fork_session(
+        &self,
+        command: SessionForkCommand,
+    ) -> Result<SessionForkOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.fork_session(&command))).await
+    }
+
     pub async fn branch_create_receipt(
         &self,
         command_id: String,
@@ -483,6 +544,22 @@ impl SqliteStoreHandle {
     ) -> Result<BranchCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.create_branch(&command))).await
+    }
+
+    /// Reads only the generation coordinate of an existing method-fenced
+    /// command receipt.
+    pub async fn command_receipt_worker_generation(
+        &self,
+        command_id: String,
+        expected_method: String,
+    ) -> Result<Option<u64>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.command_receipt_worker_generation(&command_id, &expected_method)
+            })
+        })
+        .await
     }
 
     /// Preflights a durable `session.select_model` receipt (R2 replay).

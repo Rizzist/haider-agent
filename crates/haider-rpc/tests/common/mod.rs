@@ -15,6 +15,9 @@ use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session_fork::{
+    SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
+};
 use haider_protocol::tool::{
     DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
 };
@@ -30,16 +33,16 @@ use haider_rpc::{
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1,
     FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_FLEET_V1,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire, FleetMetricsTotalsWire,
-    FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello, HookSummaryWire,
-    HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire,
-    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire,
-    ObserveRunStateWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
-    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
-    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
-    SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest, SessionReadResult,
-    SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
+    FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_RENAME_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire,
+    FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello,
+    HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire,
+    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
+    OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
+    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
+    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
+    RequestId, ResponseBody, SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest,
+    SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -81,6 +84,40 @@ pub fn transcript() -> Vec<WireFrame> {
     let range = SeqRange {
         start_seq: 5,
         end_seq: 9,
+    };
+    let fork_metadata = SessionMetadataV1 {
+        cwd: "/tmp/workspace".into(),
+        provider: "anthropic".into(),
+        model: "claude-test".into(),
+        max_tokens: 4096,
+        system_prompt_version: Some("fork-policy-v1".into()),
+        permission_overrides: None,
+        title: Some("Chocolate-free child".into()),
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        agent_type: None,
+        created_at_ms: 1_753_500_041_000,
+    };
+    let metafork_proposal = SessionMetaforkProposal {
+        removals: vec![SessionMetaforkRemoval {
+            from_seq: 12,
+            through_seq: 17,
+            reason: "remove the chocolate discussion".into(),
+            preview: Some("Chocolate tempering notes…".into()),
+            reviewed_events: Vec::new(),
+        }],
+    };
+    let metafork_review_manifest = SessionMetaforkReviewManifest {
+        command_id: "command-session-metafork".into(),
+        source_session_id: SessionId::new("session-1"),
+        worker_generation: 7,
+        source_branch_id: None,
+        fork_node_id: NodeId::new("node-fork-3"),
+        fork_seq: 60,
+        name: Some("Chocolate-free child".into()),
+        description: "remove parts about chocolate".into(),
+        model_proposal: metafork_proposal.clone(),
     };
 
     vec![
@@ -953,6 +990,114 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 52,
                 worker_generation: 7,
                 name: "Plan B".into(),
+            },
+        },
+        // Session-level fork/metafork are distinct from branch.create. The
+        // metafork review response has no child coordinates until the human
+        // echoes the exact model-proposal digest.
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-session-fork".into(),
+            daemon_generation: 9,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.942".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([FEATURE_SESSION_FORK_V1.to_owned()]),
+            encoding: None,
+        }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-session-fork"),
+            body: RequestBody::SessionFork {
+                command_id: CommandId::new("command-session-fork"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                source_branch_id: Some(BranchId::new("branch-plan-b")),
+                fork_node_id: NodeId::new("node-fork-2"),
+                fork_seq: 57,
+                name: Some("Independent plan B".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-fork"),
+            body: ResponseBody::SessionFork {
+                session_id: SessionId::new("session-fork-child"),
+                source_session_id: SessionId::new("session-1"),
+                source_branch_id: Some(BranchId::new("branch-plan-b")),
+                fork_node_id: NodeId::new("node-fork-2"),
+                fork_seq: 57,
+                created_seq: 61,
+                worker_generation: 7,
+                metadata: fork_metadata.clone(),
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-session-metafork-review"),
+            body: RequestBody::SessionMetafork {
+                command_id: CommandId::new("command-session-metafork"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                source_branch_id: None,
+                fork_node_id: NodeId::new("node-fork-3"),
+                fork_seq: 60,
+                name: Some("Chocolate-free child".into()),
+                description: "remove parts about chocolate".into(),
+                model_proposal: metafork_proposal.clone(),
+                accepted_proposal_digest: None,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-metafork-review"),
+            body: ResponseBody::SessionMetafork {
+                committed: false,
+                source_session_id: SessionId::new("session-1"),
+                session_id: None,
+                source_branch_id: None,
+                fork_node_id: NodeId::new("node-fork-3"),
+                fork_seq: 60,
+                description: "remove parts about chocolate".into(),
+                model_proposal: metafork_proposal.clone(),
+                review_manifest: Some(metafork_review_manifest),
+                proposal_digest: "reviewed-proposal-digest".into(),
+                created_seq: None,
+                worker_generation: None,
+                metadata: None,
+                omission_count: None,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-session-metafork-commit"),
+            body: RequestBody::SessionMetafork {
+                command_id: CommandId::new("command-session-metafork"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                source_branch_id: None,
+                fork_node_id: NodeId::new("node-fork-3"),
+                fork_seq: 60,
+                name: Some("Chocolate-free child".into()),
+                description: "remove parts about chocolate".into(),
+                model_proposal: metafork_proposal.clone(),
+                accepted_proposal_digest: Some("reviewed-proposal-digest".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-metafork-commit"),
+            body: ResponseBody::SessionMetafork {
+                committed: true,
+                source_session_id: SessionId::new("session-1"),
+                session_id: Some(SessionId::new("session-metafork-child")),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("node-fork-3"),
+                fork_seq: 60,
+                description: "remove parts about chocolate".into(),
+                model_proposal: metafork_proposal,
+                review_manifest: None,
+                proposal_digest: "reviewed-proposal-digest".into(),
+                created_seq: Some(64),
+                worker_generation: Some(7),
+                metadata: Some(fork_metadata),
+                omission_count: Some(6),
             },
         },
         WireFrame::Request {

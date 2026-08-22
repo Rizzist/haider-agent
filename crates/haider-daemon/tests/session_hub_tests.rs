@@ -149,10 +149,11 @@ fn footprint_envelope(
 struct CollectSink {
     frames: Mutex<VecDeque<WireFrame>>,
     changed: Notify,
+    opening_binding_consumed: AtomicBool,
 }
 
 impl CollectSink {
-    async fn next(&self) -> WireFrame {
+    async fn take_next(&self) -> WireFrame {
         tokio::time::timeout(DEADLINE, async {
             loop {
                 let changed = self.changed.notified();
@@ -166,11 +167,47 @@ impl CollectSink {
         .expect("frame deadline")
     }
 
+    async fn next_raw(&self) -> WireFrame {
+        let frame = self.take_next().await;
+        if matches!(frame, WireFrame::ResidentSessionBinding { .. }) {
+            let _ = self.opening_binding_consumed.compare_exchange(
+                false,
+                true,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        frame
+    }
+
+    async fn next(&self) -> WireFrame {
+        loop {
+            let frame = self.take_next().await;
+            if matches!(frame, WireFrame::ResidentSessionBinding { .. })
+                && self
+                    .opening_binding_consumed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                continue;
+            }
+            return frame;
+        }
+    }
+
     fn snapshot(&self) -> Vec<WireFrame> {
+        let skip_opening_binding = !self.opening_binding_consumed.load(Ordering::Acquire);
         self.frames
             .lock()
             .expect("frames lock")
             .iter()
+            .enumerate()
+            .filter(|(index, frame)| {
+                !(skip_opening_binding
+                    && *index == 0
+                    && matches!(frame, WireFrame::ResidentSessionBinding { .. }))
+            })
+            .map(|(_, frame)| frame)
             .cloned()
             .collect()
     }
@@ -227,6 +264,7 @@ struct SlowSink {
     changed: Notify,
     event_budget: usize,
     accepted_events: Mutex<usize>,
+    opening_binding_consumed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -265,21 +303,33 @@ impl SlowSink {
             changed: Notify::new(),
             event_budget,
             accepted_events: Mutex::new(0),
+            opening_binding_consumed: AtomicBool::new(false),
         }
     }
 
     async fn next(&self) -> WireFrame {
-        tokio::time::timeout(DEADLINE, async {
-            loop {
-                let changed = self.changed.notified();
-                if let Some(frame) = self.frames.lock().expect("frames lock").pop_front() {
-                    return frame;
+        loop {
+            let frame = tokio::time::timeout(DEADLINE, async {
+                loop {
+                    let changed = self.changed.notified();
+                    if let Some(frame) = self.frames.lock().expect("frames lock").pop_front() {
+                        return frame;
+                    }
+                    changed.await;
                 }
-                changed.await;
+            })
+            .await
+            .expect("slow-sink frame deadline");
+            if matches!(frame, WireFrame::ResidentSessionBinding { .. })
+                && self
+                    .opening_binding_consumed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                continue;
             }
-        })
-        .await
-        .expect("slow-sink frame deadline")
+            return frame;
+        }
     }
 }
 
@@ -592,6 +642,32 @@ fn successor_path(base: &std::path::Path, sidecar: &str) -> std::path::PathBuf {
     )
 }
 
+fn sidecar_chain_paths(base: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let mut current = base.to_owned();
+    loop {
+        assert!(!paths.contains(&current), "sidecar fixture chain loops");
+        paths.push(current.clone());
+        let segment = std::fs::read_to_string(&current).expect("chain segment reads");
+        let tail: serde_json::Value = serde_json::from_str(
+            segment
+                .lines()
+                .last()
+                .expect("chain segment has a final line"),
+        )
+        .expect("chain tail is JSON");
+        let Some(successor) = tail
+            .get("segment_end")
+            .is_some()
+            .then(|| tail.get("successor").and_then(serde_json::Value::as_str))
+            .flatten()
+        else {
+            return paths;
+        };
+        current = base.parent().expect("sidecar has parent").join(successor);
+    }
+}
+
 fn expected_sidecar_body(events: &[RawEnvelope]) -> String {
     let mut ordered: Vec<&RawEnvelope> = events.iter().collect();
     ordered.sort_by_key(|event| event.seq);
@@ -811,6 +887,926 @@ async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId,
         })
         .await
         .expect("typed session creates");
+}
+
+/// MUTATION CHECK: ignore `in_session` in the `command.list` handler.
+/// Runtime failure: `/compact` is either advertised at the launcher or hidden
+/// from an attached session, forcing clients to mirror session-only names.
+#[tokio::test]
+async fn command_list_serves_the_requested_current_context() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+
+    for (request, in_session) in [("launcher", false), ("session", true)] {
+        connection
+            .request(
+                RequestId::new(request),
+                RequestBody::CommandList {
+                    query: String::new(),
+                    in_session,
+                    slots: haider_rpc::CommandDynamicSlotsWire::default(),
+                },
+            )
+            .await
+            .expect("command.list routes");
+        let WireFrame::Response {
+            body: ResponseBody::CommandList { items },
+            ..
+        } = sink.next().await
+        else {
+            panic!("expected command.list response");
+        };
+        assert_eq!(
+            items
+                .iter()
+                .any(|item| item.name.as_deref() == Some("compact")),
+            in_session
+        );
+        let model = items
+            .iter()
+            .find(|item| item.name.as_deref() == Some("model"))
+            .expect("model is visible in both contexts");
+        assert_eq!(
+            model.ownership,
+            if in_session {
+                haider_rpc::CommandOwnershipWire::DaemonOperation
+            } else {
+                haider_rpc::CommandOwnershipWire::ClientView
+            }
+        );
+    }
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: change `/help` from `ClientView` to `DaemonOperation` in
+/// the shared registry. Runtime failure: this request stops returning the
+/// client-owned outcome and may append daemon state for a help pane the
+/// daemon cannot observe.
+#[tokio::test]
+async fn command_invoke_never_executes_client_owned_view_state() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+
+    connection
+        .request(
+            RequestId::new("command-help"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-help-id"),
+                command: "/help".into(),
+                session_id: None,
+            },
+        )
+        .await
+        .expect("command.invoke routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::CommandInvoke {
+                outcome: haider_rpc::CommandInvokeOutcomeWire::ClientOwned { ref command },
+            },
+        } if request_id.as_str() == "command-help" && command == "help"
+    ));
+    assert!(
+        store.session_ids().await.expect("session ids").is_empty(),
+        "client-owned help invocation must not create daemon truth"
+    );
+
+    connection
+        .request(
+            RequestId::new("command-launcher-model"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-launcher-model-id"),
+                command: "/model future-model".into(),
+                session_id: None,
+            },
+        )
+        .await
+        .expect("launcher model routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::CommandInvoke {
+                outcome: haider_rpc::CommandInvokeOutcomeWire::ClientOwned { ref command },
+            },
+        } if request_id.as_str() == "command-launcher-model" && command == "model"
+    ));
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: replace the unknown-command fallback with `Ok(())` or a
+/// concrete operation. Runtime failure: the caller receives no correlated
+/// refusal, or an unknown slash name mutates daemon state.
+#[tokio::test]
+async fn command_invoke_unknown_name_degrades_honestly() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+
+    connection
+        .request(
+            RequestId::new("command-future"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-future-id"),
+                command: "/future-command".into(),
+                session_id: None,
+            },
+        )
+        .await
+        .expect("command.invoke routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::CommandInvoke {
+                outcome: haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                    ref command,
+                    ref reason,
+                },
+            },
+        } if request_id.as_str() == "command-future"
+            && command == "future-command"
+            && reason.as_deref() == Some("unknown command")
+    ));
+    assert!(store.session_ids().await.expect("session ids").is_empty());
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: change either unknown command-name arm or the reserved
+/// `command-door-` version fallback from `Invalid` to `Ordinary`. Runtime
+/// failure: `menu.answer` commits but executes nothing, silently consuming an
+/// operator choice.
+#[tokio::test]
+async fn unknown_parked_command_origin_is_rejected_before_answer_commit() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("command-door-unknown-origin");
+    let menu_id = MenuId::new("command-door-future-menu");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    create_and_attach_typed_session(&store, &connection, &sink, &session_id, "fake").await;
+
+    let mut opening = menu_opening(&session_id, &menu_id, store.worker_generation());
+    let EventPayload::MenuOpened(mut menu) =
+        serde_json::from_value::<EventPayload>(opening.payload).expect("menu payload")
+    else {
+        panic!("opening helper must create a menu");
+    };
+    menu.origin = "command-door-v1:future-command-kind".into();
+    opening.payload = serde_json::to_value(EventPayload::MenuOpened(menu)).expect("menu encodes");
+    let mut opening = [opening];
+    hub.append(&mut opening).await.expect("future menu opens");
+    let request_seq = opening[0].seq;
+    let generation = opening[0].worker_generation;
+    assert!(matches!(sink.next().await, WireFrame::Event { .. }));
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("future-menu-answer")),
+            CommandId::new("future-menu-answer-id"),
+            session_id.clone(),
+            menu_id,
+            request_seq,
+            generation,
+            "allow".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("unknown origin refusal routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error { ref code, ref message, .. },
+        } if request_id.as_str() == "future-menu-answer"
+            && code == "invalid_argument"
+            && message.contains("no action was taken")
+    ));
+    assert_eq!(
+        store.latest_seq(&session_id).await.expect("head"),
+        request_seq,
+        "unknown command origin must leave its menu unanswered"
+    );
+
+    let v2_menu_id = MenuId::new("command-door-v2-menu");
+    let mut v2_opening = menu_opening(&session_id, &v2_menu_id, store.worker_generation());
+    v2_opening.event_id = EventId::new("command-door-v2-opened");
+    let EventPayload::MenuOpened(mut v2_menu) =
+        serde_json::from_value::<EventPayload>(v2_opening.payload).expect("menu payload")
+    else {
+        panic!("opening helper must create a menu");
+    };
+    v2_menu.origin = "command-door-v2:rename".into();
+    v2_opening.payload =
+        serde_json::to_value(EventPayload::MenuOpened(v2_menu)).expect("menu encodes");
+    let mut v2_opening = [v2_opening];
+    hub.append(&mut v2_opening).await.expect("v2 menu opens");
+    assert!(matches!(sink.next().await, WireFrame::Event { .. }));
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("v2-menu-answer")),
+            CommandId::new("v2-menu-answer-id"),
+            session_id.clone(),
+            v2_menu_id,
+            v2_opening[0].seq,
+            v2_opening[0].worker_generation,
+            "allow".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("future version refusal routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error { ref code, ref message, .. },
+        } if request_id.as_str() == "v2-menu-answer"
+            && code == "invalid_argument"
+            && message.contains("origin version")
+    ));
+    assert_eq!(
+        store.latest_seq(&session_id).await.expect("v2 head"),
+        v2_opening[0].seq,
+        "future command-door version must remain unanswered"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: set `worker_generation` to `None` in the command-card
+/// builder. Runtime failure: the returned park cannot construct the existing
+/// three-coordinate `menu.answer` fence and this test's unwrap fails.
+#[tokio::test]
+async fn parked_command_uses_needs_input_and_executes_once_through_menu_answer() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("command-door-rename");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    create_and_attach_typed_session(&store, &connection, &sink, &session_id, "fake").await;
+
+    connection
+        .request(
+            RequestId::new("command-rename-park"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-rename-park-id"),
+                command: "/rename".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("command.invoke parks");
+    let mut opened_seq = None;
+    let mut parked = None;
+    while opened_seq.is_none() || parked.is_none() {
+        match sink.next().await {
+            WireFrame::Event { envelope, .. }
+                if matches!(
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                    Ok(EventPayload::MenuOpened(_))
+                ) =>
+            {
+                opened_seq = Some(envelope.seq);
+            }
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::CommandInvoke {
+                        outcome: haider_rpc::CommandInvokeOutcomeWire::Parked { needs_input },
+                    },
+            } if request_id.as_str() == "command-rename-park" => parked = Some(needs_input),
+            frame => panic!("unexpected command park frame: {frame:?}"),
+        }
+    }
+    let parked = parked.expect("parked card");
+    let menu_id = parked.menu_id.expect("menu id");
+    let request_seq = parked.request_seq.expect("request seq");
+    let worker_generation = parked.worker_generation.expect("worker generation");
+    assert_eq!(Some(request_seq), opened_seq);
+    assert_eq!(parked.kind, haider_rpc::NeedsInputKindWire::Question);
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("command-rename-answer")),
+            CommandId::new("command-rename-answer-id"),
+            session_id.clone(),
+            menu_id.clone(),
+            request_seq,
+            worker_generation,
+            String::new(),
+            0,
+            Some(MenuInput::Text {
+                text: "Door renamed".into(),
+            }),
+        )
+        .await
+        .expect("menu.answer executes command");
+    loop {
+        if matches!(
+            sink.next().await,
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::MenuAnswer { .. },
+            } if request_id.as_str() == "command-rename-answer"
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        store
+            .session_metadata(&session_id)
+            .await
+            .expect("metadata read")
+            .expect("typed metadata")
+            .title
+            .as_deref(),
+        Some("Door renamed")
+    );
+
+    connection
+        .request(
+            RequestId::new("command-rename-invoke-replay"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-rename-park-id"),
+                command: "/rename".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("resolved invoke replay routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::CommandInvoke {
+                outcome: haider_rpc::CommandInvokeOutcomeWire::Receipt { receipt },
+            },
+        } if request_id.as_str() == "command-rename-invoke-replay"
+            && matches!(*receipt, ResponseBody::SessionRename { .. })
+    ));
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("command-rename-loser")),
+            CommandId::new("command-rename-loser-id"),
+            session_id,
+            menu_id,
+            request_seq,
+            worker_generation,
+            String::new(),
+            0,
+            Some(MenuInput::Text {
+                text: "Different name".into(),
+            }),
+        )
+        .await
+        .expect("second answer routes");
+    loop {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::Error { code, .. },
+            } if request_id.as_str() == "command-rename-loser" => {
+                assert_eq!(code, "already_resolved");
+                break;
+            }
+            WireFrame::Event { .. } => {}
+            frame => panic!("unexpected second-answer frame: {frame:?}"),
+        }
+    }
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: replace the deterministic command-menu identity with
+/// `random_id` or omit the preflight journal lookup. Runtime failure: the
+/// retry appends a second `MenuOpened`, advances the head, and returns a
+/// different full answerable coordinate set.
+#[tokio::test]
+async fn parked_command_invoke_retry_replays_one_durable_menu() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("command-door-park-retry");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    create_and_attach_typed_session(&store, &connection, &sink, &session_id, "fake").await;
+
+    let command_id = CommandId::new("command-park-retry-id");
+    connection
+        .request(
+            RequestId::new("command-park-first"),
+            RequestBody::CommandInvoke {
+                command_id: command_id.clone(),
+                command: "/rename".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("first invoke parks");
+    let first = loop {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::CommandInvoke {
+                        outcome: haider_rpc::CommandInvokeOutcomeWire::Parked { needs_input },
+                    },
+            } if request_id.as_str() == "command-park-first" => break needs_input,
+            WireFrame::Event { .. } => {}
+            frame => panic!("unexpected first park frame: {frame:?}"),
+        }
+    };
+    let first_head = store.latest_seq(&session_id).await.expect("first head");
+
+    connection
+        .request(
+            RequestId::new("command-park-retry"),
+            RequestBody::CommandInvoke {
+                command_id,
+                command: "/rename".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("retry routes");
+    let WireFrame::Response {
+        request_id,
+        body:
+            ResponseBody::CommandInvoke {
+                outcome:
+                    haider_rpc::CommandInvokeOutcomeWire::Parked {
+                        needs_input: replay,
+                    },
+            },
+    } = sink.next().await
+    else {
+        panic!("retry must replay the parked response")
+    };
+    assert_eq!(request_id.as_str(), "command-park-retry");
+    assert_eq!(replay.menu_id, first.menu_id);
+    assert_eq!(replay.request_seq, first.request_seq);
+    assert_eq!(replay.worker_generation, first.worker_generation);
+    assert_eq!(
+        store.latest_seq(&session_id).await.expect("retry head"),
+        first_head,
+        "retry must not append a second answerable card"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: force command menus into `allow_prior_generation: false`
+/// in `menu_answer`. Runtime failure: answering the replayed card after the
+/// store reopens returns `stale_generation` and the rename never commits.
+#[tokio::test]
+async fn parked_command_remains_answerable_after_worker_generation_changes() {
+    let (root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("command-door-restart");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    create_and_attach_typed_session(&store, &connection, &sink, &session_id, "fake").await;
+    connection
+        .request(
+            RequestId::new("command-restart-park"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-restart-park-id"),
+                command: "/rename".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("command parks");
+    let parked = loop {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::CommandInvoke {
+                        outcome: haider_rpc::CommandInvokeOutcomeWire::Parked { needs_input },
+                    },
+            } if request_id.as_str() == "command-restart-park" => break needs_input,
+            WireFrame::Event { .. } => {}
+            frame => panic!("unexpected park frame: {frame:?}"),
+        }
+    };
+    let menu_id = parked.menu_id.expect("menu id");
+    let request_seq = parked.request_seq.expect("request seq");
+    let opening_generation = parked.worker_generation.expect("opening generation");
+    connection.close().await.expect("first connection closes");
+    hub.shutdown().await.expect("first hub stops");
+    store.close().await.expect("first store closes");
+
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store reopens in a new worker generation");
+    assert_ne!(store.worker_generation(), opening_generation);
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("restart connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    connection
+        .request(
+            RequestId::new("command-restart-attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: request_seq,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attach routes");
+    let _ = attachment_from(sink.next().await);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp { .. }
+    ));
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("command-restart-answer")),
+            CommandId::new("command-restart-answer-id"),
+            session_id.clone(),
+            menu_id,
+            request_seq,
+            opening_generation,
+            String::new(),
+            0,
+            Some(MenuInput::Text {
+                text: "Renamed after restart".into(),
+            }),
+        )
+        .await
+        .expect("old opening coordinates recover");
+    loop {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::MenuAnswer { .. },
+            } if request_id.as_str() == "command-restart-answer" => break,
+            WireFrame::Event { .. } => {}
+            frame => panic!("unexpected restart answer frame: {frame:?}"),
+        }
+    }
+    assert_eq!(
+        store
+            .session_metadata(&session_id)
+            .await
+            .expect("metadata reads")
+            .expect("typed metadata")
+            .title
+            .as_deref(),
+        Some("Renamed after restart")
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: return the canonical cache-confirmation error directly
+/// from `command.invoke`. Runtime failure: no typed `needs_input` card is
+/// parked and the operator has no command-door path to confirm the change.
+#[tokio::test]
+async fn command_cache_epoch_confirmation_parks_and_resumes_through_menu_answer() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("command-door-cache-confirm");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    create_and_attach_typed_session(&store, &connection, &sink, &session_id, "fake").await;
+
+    let mut usage = envelope(
+        &session_id,
+        "command-door-cache-scope",
+        store.worker_generation(),
+    );
+    usage.payload = serde_json::to_value(EventPayload::Usage(Usage {
+        input: 10_000,
+        output: 0,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: Some(UsageScope {
+            provider: "fake".into(),
+            model: "test-model".into(),
+            account_scope: None,
+            auth_scope: "api_key".into(),
+            cache_epoch: "warm-command-door".into(),
+            stable_prefix_tokens: 10_000,
+            cache_boundaries: None,
+            request_kind: UsageRequestKind::MainTurn,
+            run: None,
+            agent: None,
+            prefix_digests: None,
+        }),
+        cache_cost: None,
+    }))
+    .expect("usage encodes");
+    hub.append(&mut [usage]).await.expect("warm scope commits");
+    assert!(matches!(sink.next().await, WireFrame::Event { .. }));
+
+    connection
+        .request(
+            RequestId::new("command-model-cache"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-model-cache-id"),
+                command: "/model next-model".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("cache-sensitive command routes");
+    let parked = loop {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::CommandInvoke {
+                        outcome: haider_rpc::CommandInvokeOutcomeWire::Parked { needs_input },
+                    },
+            } if request_id.as_str() == "command-model-cache" => break needs_input,
+            WireFrame::Event { .. } => {}
+            frame => panic!("unexpected cache park frame: {frame:?}"),
+        }
+    };
+    assert_eq!(parked.kind, haider_rpc::NeedsInputKindWire::Choice);
+    assert_eq!(parked.options.len(), 1);
+    assert_eq!(parked.options[0].key, "confirm");
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("command-model-cache-answer")),
+            CommandId::new("command-model-cache-answer-id"),
+            session_id.clone(),
+            parked.menu_id.expect("menu id"),
+            parked.request_seq.expect("request seq"),
+            parked.worker_generation.expect("worker generation"),
+            "confirm".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("confirmation answer routes");
+    loop {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::MenuAnswer { .. },
+            } if request_id.as_str() == "command-model-cache-answer" => break,
+            WireFrame::Event { .. } => {}
+            frame => panic!("unexpected cache answer frame: {frame:?}"),
+        }
+    }
+    assert_eq!(
+        store
+            .session_metadata(&session_id)
+            .await
+            .expect("metadata reads")
+            .expect("typed metadata")
+            .model,
+        "next-model"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: replace receipt-derived generation recovery with the
+/// current worker generation. Runtime failure: the same direct invocation
+/// after reopen conflicts with its canonical receipt instead of replaying it.
+#[tokio::test]
+async fn direct_command_invoke_returns_the_canonical_receipt_nested_in_the_door() {
+    let (root, store, hub) = open_hub(None, 16).await;
+    let session_id = SessionId::new("command-door-direct");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    create_and_attach_typed_session(&store, &connection, &sink, &session_id, "fake").await;
+
+    connection
+        .request(
+            RequestId::new("command-rename-direct"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-rename-direct-id"),
+                command: "/rename Direct door".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("direct command routes");
+    loop {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::CommandInvoke {
+                        outcome: haider_rpc::CommandInvokeOutcomeWire::Receipt { receipt },
+                    },
+            } if request_id.as_str() == "command-rename-direct" => {
+                assert!(matches!(
+                    *receipt,
+                    ResponseBody::SessionRename {
+                        ref session_id,
+                        ref title,
+                        ..
+                    } if session_id.as_str() == "command-door-direct"
+                        && title.as_deref() == Some("Direct door")
+                ));
+                break;
+            }
+            WireFrame::Event { .. } => {}
+            frame => panic!("unexpected direct command frame: {frame:?}"),
+        }
+    }
+
+    let committed_head = store.latest_seq(&session_id).await.expect("committed head");
+    connection.close().await.expect("first connection closes");
+    hub.shutdown().await.expect("first hub stops");
+    store.close().await.expect("first store closes");
+
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store reopens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub reopens");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("replay connection");
+    assert!(matches!(
+        sink.next_raw().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
+    connection
+        .request(
+            RequestId::new("command-direct-replay-attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: committed_head,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("replay control attach routes");
+    let _ = attachment_from(sink.next().await);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp { .. }
+    ));
+    connection
+        .request(
+            RequestId::new("command-rename-direct-replay"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("command-rename-direct-id"),
+                command: "/rename Direct door".into(),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await
+        .expect("direct receipt replays after restart");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::CommandInvoke {
+                outcome: haider_rpc::CommandInvokeOutcomeWire::Receipt { receipt },
+            },
+        } if request_id.as_str() == "command-rename-direct-replay"
+            && matches!(*receipt, ResponseBody::SessionRename { .. })
+    ));
+    assert_eq!(
+        store.latest_seq(&session_id).await.expect("replay head"),
+        committed_head,
+        "receipt replay must not append a second rename"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
 }
 
 /// CG-M1 receipt law: a lost graph.pin response is recoverable without a
@@ -6159,6 +7155,10 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
         )
         .expect("connection"),
     );
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::ResidentSessionBinding { .. }
+    ));
     for (index, session_id) in sessions.iter().enumerate() {
         connection
             .request(
@@ -7077,6 +8077,132 @@ async fn native_pipe_coverage_tail_ahead_rebuilds_and_increments_generation() {
         std::fs::read_to_string(&path).expect("settled sidecar reads"),
         stored_sidecar(&store, &session_id, 2).await
     );
+}
+
+/// MUTATION CHECK: remove the one-line `sweep_orphan_segments_best_effort`
+/// call guarded by `first_touch` in `maintain_inner`. Expected RUNTIME
+/// failure: the generation-1 successor still exists after the generation-2
+/// root and successor have been durably published.
+#[tokio::test]
+async fn native_pipe_version_rebuild_sweeps_previous_generation_successor() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-old-generation-sweep");
+    let generation = store.worker_generation();
+    let mut seed = vec![
+        compaction_pipe_event(
+            &session_id,
+            "old-generation-compaction",
+            generation,
+            "old-generation-run",
+        ),
+        run_state_pipe_event(
+            &session_id,
+            "old-generation-done",
+            generation,
+            "old-generation-run",
+            RunState::Done,
+        ),
+    ];
+    hub.append(&mut seed).await.expect("segmented seed commits");
+    hub.shutdown().await.expect("first hub stops");
+
+    let base = sidecar_path(&root, &session_id);
+    let old_root = std::fs::read_to_string(&base).expect("old root reads");
+    let old_successor = successor_path(&base, &old_root);
+    assert!(old_successor.exists(), "old successor fixture exists");
+    std::fs::write(
+        &base,
+        old_root.replacen("\"version\":5", "\"version\":4", 1),
+    )
+    .expect("old-version root fixture writes");
+
+    let reopened = SessionHub::new(store.clone(), SessionHubConfig::default())
+        .expect("hub reopens old sidecar");
+    append_one(
+        &reopened,
+        &session_id,
+        generation,
+        "old-generation-rebuild-trigger",
+    )
+    .await;
+    reopened.shutdown().await.expect("reopened hub stops");
+
+    assert!(base.exists(), "live root survives");
+    let rebuilt_root = std::fs::read_to_string(&base).expect("rebuilt root reads");
+    let live_successor = successor_path(&base, &rebuilt_root);
+    assert!(live_successor.exists(), "rebuilt successor survives");
+    assert_ne!(old_successor, live_successor, "rebuild changes generation");
+    assert!(
+        !old_successor.exists(),
+        "the unreachable previous-generation successor is swept"
+    );
+}
+
+/// MUTATION CHECK: replace the one-line `reachable.contains(&path)` guard
+/// with `false`.
+/// Expected RUNTIME failure: at least one successor named by the live root
+/// chain is unlinked and its post-sweep `exists()` assertion fails.
+#[tokio::test]
+async fn native_pipe_orphan_sweep_preserves_every_reachable_segment() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-reachable-sweep");
+    let generation = store.worker_generation();
+    for pass in 1..=2 {
+        let run_id = format!("reachable-run-{pass}");
+        let mut compacting = vec![
+            compaction_pipe_event(
+                &session_id,
+                &format!("reachable-compaction-{pass}"),
+                generation,
+                &run_id,
+            ),
+            run_state_pipe_event(
+                &session_id,
+                &format!("reachable-done-{pass}"),
+                generation,
+                &run_id,
+                RunState::Done,
+            ),
+        ];
+        hub.append(&mut compacting)
+            .await
+            .expect("compaction pass commits");
+    }
+    hub.shutdown().await.expect("first hub stops");
+
+    let base = sidecar_path(&root, &session_id);
+    let reachable = sidecar_chain_paths(&base);
+    assert!(
+        reachable.len() >= 3,
+        "fixture has root and two reachable successors: {reachable:?}"
+    );
+    let orphan = base
+        .parent()
+        .expect("pipe directory")
+        .join(format!("{session_id}.g77.s1.pipe"));
+    std::fs::write(
+        &orphan,
+        format!(
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"{session_id}\",\"generation\":77,\"segment\":1}}\n{{\"coverage\":0,\"generation\":77}}\n"
+        ),
+    )
+    .expect("owned orphan fixture writes");
+
+    let reopened = SessionHub::new(store.clone(), SessionHubConfig::default())
+        .expect("hub reopens live chain");
+    append_one(
+        &reopened,
+        &session_id,
+        generation,
+        "reachable-sweep-trigger",
+    )
+    .await;
+    reopened.shutdown().await.expect("reopened hub stops");
+
+    for path in reachable {
+        assert!(path.exists(), "reachable chain member survives: {path:?}");
+    }
+    assert!(!orphan.exists(), "unreferenced owned segment is swept");
 }
 
 /// MUTATION CHECK: accepting an old header version would append current

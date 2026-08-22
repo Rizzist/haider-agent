@@ -20,6 +20,7 @@
 //! semantics on this crate.
 
 mod codec;
+mod command;
 mod frame;
 mod negotiation;
 
@@ -32,6 +33,11 @@ pub mod ws_codec;
 pub use haider_protocol;
 
 pub use codec::{CodecError, WireEncoding, decode_msgpack, encode_msgpack};
+pub use command::{
+    COMMANDS, CommandCatalogItemKindWire, CommandCatalogItemWire, CommandDynamicSlotsWire,
+    CommandInvokeOutcomeWire, CommandOwnershipWire, CommandSpec, PALETTE_MAX_ROWS, PaletteItem,
+    command_catalog_items, command_spec, has_arg_slots, offers_arg_completions, palette_items,
+};
 pub use frame::{
     ARTIFACT_PUT_MAX_BYTES, AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus,
     Capability, CapabilitySet, ClientKind, CommandId, DEFAULT_FRAME_LIMIT,
@@ -54,7 +60,7 @@ pub use frame::{
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
     FEATURE_ACCOUNT_OAUTH_IMPORT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
     FEATURE_AGENT_MESSAGE_V1, FEATURE_ARTIFACT_PUT_V1, FEATURE_BRANCH_CREATE_V1,
-    FEATURE_COMPACTION_GUARD_V1, FEATURE_COMPUTER_PERMISSION_ACTIONS_V1,
+    FEATURE_COMMAND_DOOR_V1, FEATURE_COMPACTION_GUARD_V1, FEATURE_COMPUTER_PERMISSION_ACTIONS_V1,
     FEATURE_CONTEXT_COMPACTION_V1, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2,
     FEATURE_CONVERGENCE_GRAPH_V3, FEATURE_CONVERGENCE_GRAPH_V4, FEATURE_EFFECT_RECOVERY_V1,
     FEATURE_EXPORT_SEQ_V1, FEATURE_FALLBACK_CHAIN_V1, FEATURE_HAIDER_CODE_PLAN_STATUS_V1,
@@ -64,27 +70,28 @@ pub use frame::{
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_RESIDENT_SESSION_BINDING_V1,
     FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_RETRY_V1, FEATURE_SESSION_AGENT_TYPE_SELECT_V1,
     FEATURE_SESSION_ATTACH_SEALED_V1, FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_EFFORT_SELECT_V1,
-    FEATURE_SESSION_FAST_SELECT_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_LINEAGE_V1,
-    FEATURE_SESSION_LIST_WATCH_V1, FEATURE_SESSION_MODEL_SELECT_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_SESSION_NEEDS_INPUT_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
-    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RENAME_V1, FEATURE_SESSION_RUN_ID_V1,
-    FEATURE_SESSION_SEEN_V1, FEATURE_SHELL_EXEC_V1, FEATURE_STATUS_SEGMENT_STRUCTURED_V1,
-    FEATURE_STATUS_SEGMENT_V1, FEATURE_STORE_HEALTH_V1, FEATURE_TOOL_INVENTORY_V1,
-    FEATURE_TRANSCRIPTION_V1, FEATURE_TUI_ATTACH_ANNOUNCE_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_USAGE_REPORT_V1, FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1,
-    FEATURE_WIRE_MSGPACK_V1, FLEET_MAX_DEPTH, FLEET_MAX_NODES, FleetAgentStateWire,
-    FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello,
-    HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire,
-    NeedsInputKindWire, NeedsInputWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveMenuOptionWire, ObserveMenuWire,
-    ObserveRunStateWire, ObserveSubagentWire, ProtocolError, ProviderActiveWire,
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
-    RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES, SURFACE_STATUS_MAX_BYTES, SecretWire,
-    SeqRange, SessionFleetSnapshot, SessionKindWire, SessionObserveDigest, SessionReadResult,
-    SessionSummary, StagePurpose, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire,
-    SurfaceInputWire, SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire,
-    WIRE_PROTOCOL_VERSION, WaitingWhyKindWire, WaitingWhyWire, Welcome, WireFrame,
+    FEATURE_SESSION_FAST_SELECT_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1,
+    FEATURE_SESSION_LINEAGE_V1, FEATURE_SESSION_LIST_WATCH_V1, FEATURE_SESSION_MODEL_SELECT_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_NEEDS_INPUT_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
+    FEATURE_SESSION_OBSERVE_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RENAME_V1,
+    FEATURE_SESSION_RUN_ID_V1, FEATURE_SESSION_SEEN_V1, FEATURE_SHELL_EXEC_V1,
+    FEATURE_STATUS_SEGMENT_STRUCTURED_V1, FEATURE_STATUS_SEGMENT_V1, FEATURE_STORE_HEALTH_V1,
+    FEATURE_TOOL_INVENTORY_V1, FEATURE_TRANSCRIPTION_V1, FEATURE_TUI_ATTACH_ANNOUNCE_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_USER_COMMAND_V1,
+    FEATURE_VAULT_STAGE_V1, FEATURE_WIRE_MSGPACK_V1, FLEET_MAX_DEPTH, FLEET_MAX_NODES,
+    FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
+    FleetStateCountsWire, Hello, HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput,
+    ModelDetailWire, NeedsInputKindWire, NeedsInputWire, OAuthAuthorizationWire,
+    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire,
+    ObserveMenuOptionWire, ObserveMenuWire, ObserveRunStateWire, ObserveSubagentWire,
+    ProtocolError, ProviderActiveWire, ProviderApiFamilyWire, ProviderAuthRequirementWire,
+    ProviderAvailabilityWire, ProviderDefaultWire, ProviderRemoveRefusalReasonWire,
+    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
+    SURFACE_STATUS_MAX_BYTES, SecretWire, SeqRange, SessionFleetSnapshot, SessionKindWire,
+    SessionObserveDigest, SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition,
+    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
+    SurfaceStatusWire, TodoGraphOpenedWire, WIRE_PROTOCOL_VERSION, WaitingWhyKindWire,
+    WaitingWhyWire, Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

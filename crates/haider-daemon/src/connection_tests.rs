@@ -78,6 +78,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// failure: clients cannot discover the served `session.compact` method.
 /// Verified by revert on 2026-07-30.
 ///
+/// MUTATION CHECK: remove `FEATURE_COMMAND_DOOR_V1` from `welcome_features`.
+/// Runtime failure: the exact served-feature assertion reports
+/// `command_door_v1` missing while both command methods remain routable.
+///
 /// MUTATION CHECK: remove `FEATURE_SHELL_EXEC_V1`, `FEATURE_USER_COMMAND_V1`,
 /// or `FEATURE_TOOL_INVENTORY_V1`. Expected runtime failure: the exact feature
 /// set no longer advertises the W8a RPC or its context/cancel semantics.
@@ -91,6 +95,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 ///
 /// MUTATION CHECK: remove `FEATURE_BRANCH_CREATE_V1`. Expected RUNTIME
 /// failure: clients cannot discover the served durable branch-create method.
+///
+/// MUTATION CHECK: remove `FEATURE_SESSION_FORK_V1`. Expected RUNTIME failure:
+/// clients cannot discover the served session-level fork/metafork doors.
 ///
 /// MUTATION CHECK: remove `FEATURE_SESSION_OBSERVE_V1`. Expected RUNTIME
 /// failure: scriptable clients cannot discover the served state digest.
@@ -169,6 +176,8 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_FORK_V1.to_owned(),
+            FEATURE_COMMAND_DOOR_V1.to_owned(),
             haider_rpc::FEATURE_COMPACTION_GUARD_V1.to_owned(),
             FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
             haider_rpc::FEATURE_EFFECT_RECOVERY_V1.to_owned(),
@@ -850,7 +859,7 @@ async fn liveness_hub() -> (tempfile::TempDir, crate::session_hub::SessionHub) {
 struct PairedClient {
     stream: UnixStream,
     decoder: uds_codec::Decoder,
-    pending: VecDeque<WireFrame>,
+    buffered: Vec<u8>,
     encoding: haider_rpc::WireEncoding,
 }
 
@@ -867,7 +876,7 @@ impl PairedClient {
         Self {
             stream,
             decoder: uds_codec::Decoder::new(1024 * 1024),
-            pending: VecDeque::new(),
+            buffered: Vec::new(),
             encoding: haider_rpc::WireEncoding::Json,
         }
     }
@@ -882,21 +891,21 @@ impl PairedClient {
     }
 
     async fn next(&mut self) -> Option<WireFrame> {
-        if let Some(frame) = self.pending.pop_front() {
-            return Some(frame);
-        }
         loop {
+            if !self.buffered.is_empty() {
+                let step = self.decoder.push_one(&self.buffered);
+                self.buffered.drain(..step.consumed);
+                assert!(step.error.is_none(), "server sent an invalid paired frame");
+                if let Some(frame) = step.frame {
+                    return Some(frame);
+                }
+            }
             let mut buffer = [0_u8; 4096];
             let read = self.stream.read(&mut buffer).await.expect("paired read");
             if read == 0 {
                 return None;
             }
-            let batch = self.decoder.push(&buffer[..read]);
-            assert!(batch.error.is_none(), "server sent an invalid paired frame");
-            self.pending.extend(batch.frames);
-            if let Some(frame) = self.pending.pop_front() {
-                return Some(frame);
-            }
+            self.buffered.extend_from_slice(&buffer[..read]);
         }
     }
 
@@ -914,6 +923,13 @@ impl PairedClient {
         }))
         .await;
         assert!(matches!(self.next().await, Some(WireFrame::Welcome(_))));
+        assert!(matches!(
+            self.next().await,
+            Some(WireFrame::ResidentSessionBinding {
+                session_id: None,
+                ..
+            })
+        ));
     }
 
     async fn handshake_msgpack(&mut self) {
@@ -938,6 +954,13 @@ impl PairedClient {
         ));
         self.encoding = haider_rpc::WireEncoding::MessagePack;
         self.decoder.set_encoding(self.encoding);
+        assert!(matches!(
+            self.next().await,
+            Some(WireFrame::ResidentSessionBinding {
+                session_id: None,
+                ..
+            })
+        ));
     }
 
     async fn request(&mut self, request: &str, body: haider_rpc::RequestBody) {
@@ -964,6 +987,13 @@ async fn resident_binding_frame_routes_across_the_paired_connection() {
         )
         .expect("observer connection");
     let generation = hub.worker_generation();
+    assert_eq!(
+        observed_rx.recv().await.expect("observer baseline"),
+        WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: generation,
+        }
+    );
 
     let (server, client) = UnixStream::pair().expect("socketless stream pair");
     let (writers, mut registered_writers) = mpsc::unbounded_channel();

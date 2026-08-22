@@ -104,15 +104,16 @@ use haider_core::{
     BranchCreateCommand, BranchCreateOutcome, CancelledTurn, ChildGraphAttachCommand,
     ChildGraphAttachOutcome, ChildTemplateCacheEntry, ChildTemplateObservation,
     ChildTemplateObservationCommand, ComputerEvidenceCommand, ComputerEvidenceOutcome,
-    CreatedBranch, CreatedSession, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
-    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
-    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
-    GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand,
-    MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand,
-    ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache, RenamedSession, RunRetryCommand,
-    RunRetryOutcome, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
+    CreatedBranch, CreatedSession, CreatedSessionFork, GraphAbandonCommand, GraphAbandonOutcome,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
+    GraphInspectResult, GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand,
+    GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle,
+    MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph,
+    ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache,
+    RenamedSession, RunRetryCommand, RunRetryOutcome, SeenSession, SelectedAgentType,
+    SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
+    SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit, SessionRenameCommand,
+    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
     SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
     SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
@@ -1113,6 +1114,10 @@ enum ActorCommand {
         command: SessionCreateCommand,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
+    ForkSession {
+        command: SessionForkCommand,
+        completed: oneshot::Sender<Result<SessionForkOutcome, HaiderError>>,
+    },
     CreateBranch {
         command: BranchCreateCommand,
         completed: oneshot::Sender<Result<BranchCreateOutcome, HaiderError>>,
@@ -1275,6 +1280,9 @@ pub struct HubConnection {
     accounts_watch: Mutex<Option<JoinHandle<()>>>,
     /// One ticker serves a bounded set of per-session volatile watches.
     surface_watch: Mutex<Option<SurfaceWatchState>>,
+    /// Write-free metafork reviews awaiting an explicit acceptance on this
+    /// connection. Shared with command-capture facades; dropped on disconnect.
+    metafork_reviews: Arc<Mutex<HashMap<String, String>>>,
     closed: AtomicBool,
 }
 
@@ -2049,19 +2057,28 @@ impl SessionHub {
         if may_view_binding {
             resident_binding_viewers.insert(connection_id.clone());
         }
-        if may_view_binding
-            && let Some((session_id, worker_generation)) = resident_binding.visible()
-            && sink
+        if may_view_binding {
+            let (session_id, worker_generation) = resident_binding.visible().unwrap_or_else(|| {
+                // With no publisher and no recorded vacancy, `None` is still
+                // authoritative state for this daemon generation. Using the
+                // current store generation (rather than 0) lets consumers
+                // apply the explicit unbound baseline through the same stale-
+                // generation fence as later binding announcements. This is
+                // synthesized per open, not retained as a publisher event.
+                (None, self.inner.store.worker_generation())
+            });
+            if sink
                 .try_send(WireFrame::ResidentSessionBinding {
                     session_id,
                     worker_generation,
                 })
                 .is_err()
-        {
-            diagnostic_sinks.remove(&connection_id);
-            resident_binding_viewers.remove(&connection_id);
-            sink.close_after_required_delivery_failure();
-            return Err(SessionHubError::Delivery);
+            {
+                diagnostic_sinks.remove(&connection_id);
+                resident_binding_viewers.remove(&connection_id);
+                sink.close_after_required_delivery_failure();
+                return Err(SessionHubError::Delivery);
+            }
         }
         drop(diagnostic_sinks);
         drop(resident_binding_viewers);
@@ -2079,6 +2096,7 @@ impl SessionHub {
             roster_watch: Mutex::new(None),
             accounts_watch: Mutex::new(None),
             surface_watch: Mutex::new(None),
+            metafork_reviews: Arc::new(Mutex::new(HashMap::new())),
             closed: AtomicBool::new(false),
         })
     }
@@ -2174,6 +2192,50 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    async fn session_fork_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+        metafork: bool,
+    ) -> Result<Option<CreatedSessionFork>, SessionHubError> {
+        let command_id = command_id.0.clone();
+        let request_digest = request_digest.to_owned();
+        let request_json = request_json.to_owned();
+        if metafork {
+            self.inner
+                .store
+                .session_metafork_receipt(command_id, request_digest, request_json)
+                .await
+                .map_err(Into::into)
+        } else {
+            self.inner
+                .store
+                .session_fork_receipt(command_id, request_digest, request_json)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    /// Routes creation through the candidate child actor so attachment,
+    /// sidecar, and roster publication are ordered after the atomic clone.
+    async fn fork_session(
+        &self,
+        command: SessionForkCommand,
+    ) -> Result<SessionForkOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::ForkSession { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
     async fn branch_create_receipt(
         &self,
         command_id: &CommandId,
@@ -2205,6 +2267,18 @@ impl SessionHub {
         result
             .await
             .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn command_receipt_worker_generation(
+        &self,
+        command_id: &CommandId,
+        expected_method: &str,
+    ) -> Result<Option<u64>, SessionHubError> {
+        self.inner
+            .store
+            .command_receipt_worker_generation(command_id.0.clone(), expected_method.to_owned())
+            .await
             .map_err(Into::into)
     }
 

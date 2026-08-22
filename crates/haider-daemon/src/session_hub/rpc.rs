@@ -21,7 +21,7 @@ use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
 use haider_protocol::ids::AgentId;
 use haider_protocol::item::ItemEvent;
-use haider_protocol::menu::MenuKind;
+use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
 use haider_tools::MessageSubagent;
@@ -43,6 +43,219 @@ const MAX_SURFACE_WATCHES_PER_CONNECTION: usize = 16;
 pub(crate) const TRANSCRIPTION_SECRET_ALIAS: &str = "transcription.deepgram";
 /// ADE key ceiling (`DEEPGRAM_MAX_API_KEY_LENGTH`).
 const TRANSCRIPTION_SECRET_MAX_LEN: usize = 512;
+
+const COMMAND_MENU_ORIGIN_PREFIX: &str = "command-door-v1:";
+const COMMAND_MENU_ORIGIN_NAMESPACE: &str = "command-door-";
+
+/// Private one-response sink used to reuse canonical operation handlers while
+/// `command.invoke` wraps their exact receipt body in its own correlated
+/// response. It is never registered for event delivery.
+#[derive(Default)]
+struct CommandResponseCapture {
+    frame: Mutex<Option<WireFrame>>,
+}
+
+impl FrameSink for CommandResponseCapture {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        let mut slot = self.frame.lock().map_err(|_| FrameSendError)?;
+        if slot.is_some() {
+            return Err(FrameSendError);
+        }
+        *slot = Some(frame);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+enum ParkedCommandContinuation {
+    Compact,
+    Rename(String),
+    Model(String),
+    Provider(String),
+    Effort(Option<String>),
+    Fast(bool),
+}
+
+impl ParkedCommandContinuation {
+    fn receipt_kind(&self) -> CommandReceiptKind {
+        match self {
+            Self::Compact => CommandReceiptKind::Compact,
+            Self::Rename(_) => CommandReceiptKind::Rename,
+            Self::Model(_) | Self::Provider(_) => CommandReceiptKind::Model,
+            Self::Effort(_) => CommandReceiptKind::Effort,
+            Self::Fast(_) => CommandReceiptKind::Fast,
+        }
+    }
+
+    fn canonical_method(&self) -> &'static str {
+        match self {
+            Self::Compact => "session.compact",
+            Self::Rename(_) => "session.rename",
+            Self::Model(_) | Self::Provider(_) => "session.select_model",
+            Self::Effort(_) => "session.select_effort",
+            Self::Fast(_) => "session.select_fast",
+        }
+    }
+
+    fn slash_name(&self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Rename(_) => "rename",
+            Self::Model(_) => "model",
+            Self::Provider(_) => "provider",
+            Self::Effort(_) => "effort",
+            Self::Fast(_) => "fast",
+        }
+    }
+}
+
+enum CommandMenuLookup {
+    Ordinary,
+    Continuation(ResolvedCommandMenu),
+    Invalid(String),
+}
+
+struct ResolvedCommandMenu {
+    action: ParkedCommandContinuation,
+    opening_generation: u64,
+    confirm_new_epoch: bool,
+}
+
+struct CommandMenuOrigin<'a> {
+    command: &'a str,
+    invocation_key: Option<&'a str>,
+    encoded_continuation: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+enum CommandReceiptKind {
+    Compact,
+    Rename,
+    Model,
+    Effort,
+    Fast,
+}
+
+impl CommandReceiptKind {
+    fn accepts(self, body: &ResponseBody) -> bool {
+        match self {
+            Self::Compact => matches!(
+                body,
+                ResponseBody::SessionCompact { .. } | ResponseBody::SessionCompactOnBranch { .. }
+            ),
+            Self::Rename => matches!(body, ResponseBody::SessionRename { .. }),
+            Self::Model => matches!(body, ResponseBody::SessionSelectModel { .. }),
+            Self::Effort => matches!(body, ResponseBody::SessionSelectEffort { .. }),
+            Self::Fast => matches!(body, ResponseBody::SessionSelectFast { .. }),
+        }
+    }
+}
+
+struct StoredCommandMenu {
+    opening: haider_protocol::envelope::RawEnvelope,
+    menu: Menu,
+    answer: Option<DurableMenuAnswer>,
+    closed: bool,
+}
+
+enum StoredCommandMenuLookup {
+    Missing,
+    Found(StoredCommandMenu),
+    CommandIdConflict,
+}
+
+fn command_menu_options(values: impl IntoIterator<Item = String>) -> Vec<MenuOption> {
+    values
+        .into_iter()
+        .map(|value| MenuOption {
+            key: value.clone(),
+            label: value,
+            detail: None,
+            decision: None,
+        })
+        .filter(|option| !option.key.trim().is_empty())
+        .fold(Vec::new(), |mut options, option| {
+            if !options
+                .iter()
+                .any(|existing: &MenuOption| existing.key == option.key)
+            {
+                options.push(option);
+            }
+            options
+        })
+}
+
+fn command_menu_invocation_key(session_id: &SessionId, command_id: &CommandId) -> String {
+    blake3::hash(format!("{}\0{}", session_id.as_str(), command_id.as_str()).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// `Ok(None)` is an ordinary menu. A reserved but unknown command-door
+/// version is an error, never an ordinary menu that may be consumed silently.
+fn command_menu_origin_parts(origin: &str) -> Result<Option<CommandMenuOrigin<'_>>, ()> {
+    if let Some(rest) = origin.strip_prefix(COMMAND_MENU_ORIGIN_PREFIX) {
+        let mut parts = rest.splitn(3, ':');
+        let command = parts.next().unwrap_or_default();
+        let invocation_key = parts.next();
+        let continuation = parts.next();
+        return if command.is_empty() {
+            Err(())
+        } else {
+            Ok(Some(CommandMenuOrigin {
+                command,
+                invocation_key,
+                encoded_continuation: continuation,
+            }))
+        };
+    }
+    if origin.starts_with(COMMAND_MENU_ORIGIN_NAMESPACE) {
+        return Err(());
+    }
+    Ok(None)
+}
+
+fn encode_cache_confirmation(continuation: &ParkedCommandContinuation) -> Option<String> {
+    let encoded =
+        |value: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
+    match continuation {
+        ParkedCommandContinuation::Model(value) => Some(format!("model.{}", encoded(value))),
+        ParkedCommandContinuation::Provider(value) => Some(format!("provider.{}", encoded(value))),
+        ParkedCommandContinuation::Effort(value) => Some(format!(
+            "effort.{}",
+            encoded(value.as_deref().unwrap_or("default"))
+        )),
+        ParkedCommandContinuation::Fast(enabled) => {
+            Some(format!("fast.{}", if *enabled { "on" } else { "off" }))
+        }
+        ParkedCommandContinuation::Compact | ParkedCommandContinuation::Rename(_) => None,
+    }
+}
+
+fn decode_cache_confirmation(encoded: &str) -> Result<ParkedCommandContinuation, String> {
+    let (kind, value) = encoded
+        .split_once('.')
+        .ok_or_else(|| "cache confirmation continuation is malformed".to_owned())?;
+    let decoded = || {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| "cache confirmation continuation is not valid base64".to_owned())
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|_| "cache confirmation continuation is not UTF-8".to_owned())
+            })
+    };
+    match kind {
+        "model" => decoded().map(ParkedCommandContinuation::Model),
+        "provider" => decoded().map(ParkedCommandContinuation::Provider),
+        "effort" => decoded().map(|effort| {
+            ParkedCommandContinuation::Effort((effort != "default").then_some(effort))
+        }),
+        "fast" if value == "on" => Ok(ParkedCommandContinuation::Fast(true)),
+        "fast" if value == "off" => Ok(ParkedCommandContinuation::Fast(false)),
+        _ => Err("unknown cache confirmation continuation; no action was taken".into()),
+    }
+}
 
 pub(crate) fn transcription_secret_alias() -> haider_protocol::ids::CredentialAlias {
     haider_protocol::ids::CredentialAlias::new(TRANSCRIPTION_SECRET_ALIAS)
@@ -1672,6 +1885,44 @@ impl HubConnection {
             );
         }
         match body {
+            RequestBody::CommandList {
+                query,
+                in_session,
+                slots,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::CommandList {
+                        items: haider_rpc::command_catalog_items(&query, in_session, &slots),
+                    },
+                })
+            }
+            RequestBody::CommandInvoke {
+                command_id,
+                command,
+                session_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.command_invoke(request_id, command_id, command, session_id)
+                    .await
+            }
             RequestBody::ArtifactPut { data_base64 } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -2093,6 +2344,72 @@ impl HubConnection {
                     fork_node_id,
                     fork_seq,
                     name,
+                )
+                .await
+            }
+            RequestBody::SessionFork {
+                command_id,
+                session_id,
+                worker_generation,
+                source_branch_id,
+                fork_node_id,
+                fork_seq,
+                name,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_fork(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    source_branch_id,
+                    fork_node_id,
+                    fork_seq,
+                    name,
+                )
+                .await
+            }
+            RequestBody::SessionMetafork {
+                command_id,
+                session_id,
+                worker_generation,
+                source_branch_id,
+                fork_node_id,
+                fork_seq,
+                name,
+                description,
+                model_proposal,
+                accepted_proposal_digest,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_metafork(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    source_branch_id,
+                    fork_node_id,
+                    fork_seq,
+                    name,
+                    description,
+                    model_proposal,
+                    accepted_proposal_digest,
                 )
                 .await
             }
@@ -3224,6 +3541,918 @@ impl HubConnection {
                 None,
             ),
         }
+    }
+
+    async fn command_invoke(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        command: String,
+        session_id: Option<SessionId>,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "command.invoke needs a non-empty command id",
+                false,
+                None,
+            );
+        }
+        let normalized = command.trim().strip_prefix('/').unwrap_or(command.trim());
+        let mut parts = normalized.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("").to_ascii_lowercase();
+        let argument = parts.next().map(str::trim).unwrap_or("");
+        let Some(spec) = haider_rpc::command_spec(&name) else {
+            return self.respond_command_outcome(
+                request_id,
+                haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                    command: name,
+                    reason: Some("unknown command".into()),
+                },
+            );
+        };
+        // `/model` at the launcher selects a client-local default identity;
+        // there is no session truth for this daemon to mutate.
+        if name == "model" && session_id.is_none() {
+            return self.respond_command_outcome(
+                request_id,
+                haider_rpc::CommandInvokeOutcomeWire::ClientOwned { command: name },
+            );
+        }
+        match spec.ownership {
+            haider_rpc::CommandOwnershipWire::ClientView => {
+                return self.respond_command_outcome(
+                    request_id,
+                    haider_rpc::CommandInvokeOutcomeWire::ClientOwned {
+                        command: spec.name.to_owned(),
+                    },
+                );
+            }
+            haider_rpc::CommandOwnershipWire::DaemonOperation => {}
+            // `Unknown` and future ownership kinds are non-executable. The
+            // fallback deliberately asserts no concrete daemon action.
+            _ => {
+                return self.respond_command_outcome(
+                    request_id,
+                    haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                        command: spec.name.to_owned(),
+                        reason: Some("command ownership is unknown".into()),
+                    },
+                );
+            }
+        }
+
+        let supported_session_command = matches!(
+            name.as_str(),
+            "compact" | "rename" | "model" | "provider" | "effort" | "fast"
+        );
+        if !supported_session_command {
+            return self.respond_command_outcome(
+                request_id,
+                haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                    command: name,
+                    reason: Some("daemon operation is not implemented by the command door".into()),
+                },
+            );
+        }
+        let Some(session_id) = session_id else {
+            return self.respond_command_outcome(
+                request_id,
+                haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                    command: name,
+                    reason: Some("command requires a session".into()),
+                },
+            );
+        };
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "command.invoke requires a control attachment to this session",
+                false,
+                None,
+            );
+        }
+
+        let continuation = match name.as_str() {
+            "rename" if argument.is_empty() => {
+                return self
+                    .park_command_menu(request_id, &command_id, session_id, "rename")
+                    .await;
+            }
+            "rename" => ParkedCommandContinuation::Rename(argument.to_owned()),
+            "model" if argument.is_empty() => {
+                return self
+                    .park_command_menu(request_id, &command_id, session_id, "model")
+                    .await;
+            }
+            "model" => ParkedCommandContinuation::Model(argument.to_owned()),
+            "provider" if argument.is_empty() => {
+                return self
+                    .park_command_menu(request_id, &command_id, session_id, "provider")
+                    .await;
+            }
+            "provider" => ParkedCommandContinuation::Provider(argument.to_owned()),
+            "effort" if argument.is_empty() => {
+                return self
+                    .park_command_menu(request_id, &command_id, session_id, "effort")
+                    .await;
+            }
+            "effort" if argument.eq_ignore_ascii_case("default") => {
+                ParkedCommandContinuation::Effort(None)
+            }
+            "effort" => ParkedCommandContinuation::Effort(Some(argument.to_owned())),
+            "fast" if argument.is_empty() => {
+                return self
+                    .park_command_menu(request_id, &command_id, session_id, "fast")
+                    .await;
+            }
+            "fast" => {
+                let enabled = match argument.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    _ => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "fast accepts only on or off",
+                            false,
+                            None,
+                        );
+                    }
+                };
+                ParkedCommandContinuation::Fast(enabled)
+            }
+            "compact" if argument.is_empty() => ParkedCommandContinuation::Compact,
+            "compact" => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "compact takes no arguments",
+                    false,
+                    None,
+                );
+            }
+            _ => {
+                return self.respond_command_outcome(
+                    request_id,
+                    haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                        command: name,
+                        reason: Some("command form is unsupported".into()),
+                    },
+                );
+            }
+        };
+        let expected = continuation.receipt_kind();
+        let operation_generation = match self
+            .hub
+            .command_receipt_worker_generation(&command_id, continuation.canonical_method())
+            .await
+        {
+            Ok(Some(generation)) => generation,
+            Ok(None) => self.hub.worker_generation(),
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        let body = self
+            .execute_command_continuation(
+                request_id.clone(),
+                command_id.clone(),
+                session_id.clone(),
+                continuation.clone(),
+                operation_generation,
+                false,
+            )
+            .await?;
+        if let ResponseBody::Error { code, message, .. } = &body
+            && code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED
+        {
+            let stored = self
+                .ensure_cache_confirmation_menu(
+                    &session_id,
+                    &command_id,
+                    spec.name,
+                    &continuation,
+                    message.clone(),
+                )
+                .await?;
+            return self
+                .respond_existing_command_menu(request_id, session_id, spec.name, stored)
+                .await;
+        }
+        self.respond_command_body(request_id, body, expected)
+    }
+
+    fn respond_command_outcome(
+        &self,
+        request_id: RequestId,
+        outcome: haider_rpc::CommandInvokeOutcomeWire,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::CommandInvoke { outcome },
+        })
+    }
+
+    fn respond_command_body(
+        &self,
+        request_id: RequestId,
+        body: ResponseBody,
+        expected: CommandReceiptKind,
+    ) -> Result<(), SessionHubError> {
+        if matches!(body, ResponseBody::Error { .. }) {
+            return self.send(WireFrame::Response { request_id, body });
+        }
+        if !expected.accepts(&body) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "command handler returned an unexpected response; no success was asserted",
+                false,
+                None,
+            );
+        }
+        self.respond_command_outcome(
+            request_id,
+            haider_rpc::CommandInvokeOutcomeWire::Receipt {
+                receipt: Box::new(body),
+            },
+        )
+    }
+
+    fn command_capture_connection(&self) -> (HubConnection, Arc<CommandResponseCapture>) {
+        let capture = Arc::new(CommandResponseCapture::default());
+        let sink: Arc<dyn FrameSink> = capture.clone();
+        (
+            HubConnection {
+                hub: self.hub.clone(),
+                connection_id: self.connection_id.clone(),
+                capabilities: self.capabilities.clone(),
+                sink,
+                transport: self.transport,
+                stages: Mutex::new(crate::accounts::StagedSecrets::default()),
+                roster_watch: Mutex::new(None),
+                accounts_watch: Mutex::new(None),
+                surface_watch: Mutex::new(None),
+                metafork_reviews: Arc::clone(&self.metafork_reviews),
+                closed: AtomicBool::new(false),
+            },
+            capture,
+        )
+    }
+
+    fn take_command_response(
+        capture: &CommandResponseCapture,
+        request_id: &RequestId,
+    ) -> Result<ResponseBody, SessionHubError> {
+        let frame = capture
+            .frame
+            .lock()
+            .map_err(|_| SessionHubError::Task("command response capture poisoned".into()))?
+            .take()
+            .ok_or_else(|| SessionHubError::Task("command handler produced no response".into()))?;
+        match frame {
+            WireFrame::Response {
+                request_id: captured,
+                body,
+            } if captured == *request_id => Ok(body),
+            _ => Err(SessionHubError::Task(
+                "command handler produced a non-correlated response".into(),
+            )),
+        }
+    }
+
+    async fn execute_command_continuation(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        continuation: ParkedCommandContinuation,
+        generation: u64,
+        confirm_new_epoch: bool,
+    ) -> Result<ResponseBody, SessionHubError> {
+        let (connection, capture) = self.command_capture_connection();
+        match continuation {
+            ParkedCommandContinuation::Compact => {
+                connection
+                    .session_compact(request_id.clone(), command_id, session_id, generation, None)
+                    .await?;
+            }
+            ParkedCommandContinuation::Rename(title) => {
+                connection
+                    .session_rename(
+                        request_id.clone(),
+                        command_id,
+                        session_id,
+                        generation,
+                        Some(title),
+                    )
+                    .await?;
+            }
+            ParkedCommandContinuation::Model(model) => {
+                connection
+                    .session_select_model(
+                        request_id.clone(),
+                        command_id,
+                        session_id,
+                        generation,
+                        model,
+                        None,
+                        confirm_new_epoch,
+                    )
+                    .await?;
+            }
+            ParkedCommandContinuation::Provider(provider) => {
+                let Some(model) = self.provider_default_model(&session_id, &provider).await else {
+                    return Ok(ResponseBody::Error {
+                        code: ERROR_CODE_INVALID_ARGUMENT.into(),
+                        message: format!("provider {provider} has no daemon-known model"),
+                        retryable: false,
+                        data: None,
+                    });
+                };
+                connection
+                    .session_select_model(
+                        request_id.clone(),
+                        command_id,
+                        session_id,
+                        generation,
+                        model,
+                        Some(provider),
+                        confirm_new_epoch,
+                    )
+                    .await?;
+            }
+            ParkedCommandContinuation::Effort(effort) => {
+                connection
+                    .session_select_effort(
+                        request_id.clone(),
+                        command_id,
+                        session_id,
+                        generation,
+                        effort,
+                        confirm_new_epoch,
+                    )
+                    .await?;
+            }
+            ParkedCommandContinuation::Fast(enabled) => {
+                connection
+                    .session_select_fast(
+                        request_id.clone(),
+                        command_id,
+                        session_id,
+                        generation,
+                        enabled,
+                        confirm_new_epoch,
+                    )
+                    .await?;
+            }
+        }
+        Self::take_command_response(&capture, &request_id)
+    }
+
+    async fn provider_default_model(
+        &self,
+        session_id: &SessionId,
+        provider: &str,
+    ) -> Option<String> {
+        let summaries = self
+            .hub
+            .accounts()
+            .ok()
+            .flatten()
+            .and_then(|facade| facade.management.read())
+            .map(|view| view.providers)
+            .unwrap_or_default();
+        if let Some(summary) = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+        {
+            return summary
+                .default_model
+                .clone()
+                .or_else(|| summary.models.first().cloned());
+        }
+        self.hub
+            .session_metadata(session_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|metadata| metadata.provider == provider)
+            .map(|metadata| metadata.model)
+    }
+
+    async fn stored_command_menu(
+        &self,
+        session_id: &SessionId,
+        command: &str,
+        invocation_key: &str,
+    ) -> Result<StoredCommandMenuLookup, SessionHubError> {
+        let mut after_seq = 0;
+        let mut found = None::<StoredCommandMenu>;
+        loop {
+            let page = self
+                .hub
+                .inner
+                .store
+                .read(session_id, after_seq, REPLAY_PAGE_SIZE)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for envelope in &page {
+                let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                else {
+                    continue;
+                };
+                match payload {
+                    EventPayload::MenuOpened(menu) => {
+                        let Ok(Some(CommandMenuOrigin {
+                            command: stored_command,
+                            invocation_key: Some(stored_key),
+                            ..
+                        })) = command_menu_origin_parts(&menu.origin)
+                        else {
+                            continue;
+                        };
+                        if stored_key != invocation_key {
+                            continue;
+                        }
+                        if stored_command != command {
+                            return Ok(StoredCommandMenuLookup::CommandIdConflict);
+                        }
+                        found.get_or_insert(StoredCommandMenu {
+                            opening: envelope.clone(),
+                            menu,
+                            answer: None,
+                            closed: false,
+                        });
+                    }
+                    EventPayload::MenuAnswered(answer) => {
+                        if let Some(stored) = found.as_mut()
+                            && answer.menu == stored.menu.id
+                        {
+                            stored.answer = Some(answer);
+                        }
+                    }
+                    EventPayload::MenuClosed { menu, .. } => {
+                        if let Some(stored) = found.as_mut()
+                            && menu == stored.menu.id
+                        {
+                            stored.closed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let page_len = page.len();
+            after_seq = page.last().map_or(after_seq, |envelope| envelope.seq);
+            if page_len < REPLAY_PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(found.map_or(
+            StoredCommandMenuLookup::Missing,
+            StoredCommandMenuLookup::Found,
+        ))
+    }
+
+    fn command_needs_input(
+        opening: &haider_protocol::envelope::RawEnvelope,
+        menu: &Menu,
+    ) -> haider_rpc::NeedsInputWire {
+        haider_rpc::NeedsInputWire {
+            kind: match menu.kind {
+                MenuKind::Question => haider_rpc::NeedsInputKindWire::Question,
+                MenuKind::Choice => haider_rpc::NeedsInputKindWire::Choice,
+                _ => haider_rpc::NeedsInputKindWire::Unknown,
+            },
+            title: menu.title.clone(),
+            safe_body: menu.body.clone(),
+            menu_id: Some(menu.id.clone()),
+            request_seq: Some(opening.seq),
+            worker_generation: Some(opening.worker_generation),
+            since_ms: Some(opening.committed_at_ms),
+            options: menu
+                .options
+                .iter()
+                .cloned()
+                .map(|option| haider_rpc::ObserveMenuOptionWire {
+                    key: option.key,
+                    label: option.label,
+                    detail: option.detail,
+                    decision: None,
+                })
+                .collect(),
+            secret_answer: false,
+        }
+    }
+
+    fn respond_stored_command_menu(
+        &self,
+        request_id: RequestId,
+        stored: &StoredCommandMenu,
+    ) -> Result<(), SessionHubError> {
+        self.respond_command_outcome(
+            request_id,
+            haider_rpc::CommandInvokeOutcomeWire::Parked {
+                needs_input: Self::command_needs_input(&stored.opening, &stored.menu),
+            },
+        )
+    }
+
+    async fn respond_existing_command_menu(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        command: &str,
+        stored: StoredCommandMenu,
+    ) -> Result<(), SessionHubError> {
+        if let Some(answer) = stored.answer.as_ref() {
+            return match self
+                .command_menu_lookup(&session_id, stored.opening.seq, &stored.menu.id, answer)
+                .await?
+            {
+                CommandMenuLookup::Continuation(resolved) => {
+                    let (body, expected) = self
+                        .execute_parked_command(
+                            session_id,
+                            &stored.menu.id,
+                            resolved.action,
+                            resolved.opening_generation,
+                            resolved.confirm_new_epoch,
+                        )
+                        .await?;
+                    self.respond_command_body(request_id, body, expected)
+                }
+                CommandMenuLookup::Invalid(message) => self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &message,
+                    false,
+                    None,
+                ),
+                CommandMenuLookup::Ordinary => self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "stored command menu lost its typed origin; no action was taken",
+                    false,
+                    None,
+                ),
+            };
+        }
+        if stored.closed {
+            return self.respond_command_outcome(
+                request_id,
+                haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                    command: command.to_owned(),
+                    reason: Some("the parked command menu was closed without an answer".into()),
+                },
+            );
+        }
+        self.respond_stored_command_menu(request_id, &stored)
+    }
+
+    async fn ensure_cache_confirmation_menu(
+        &self,
+        session_id: &SessionId,
+        invocation_id: &CommandId,
+        command: &'static str,
+        continuation: &ParkedCommandContinuation,
+        message: String,
+    ) -> Result<StoredCommandMenu, SessionHubError> {
+        let invocation_key = command_menu_invocation_key(session_id, invocation_id);
+        match self
+            .stored_command_menu(session_id, command, &invocation_key)
+            .await?
+        {
+            StoredCommandMenuLookup::Found(stored) => return Ok(stored),
+            StoredCommandMenuLookup::CommandIdConflict => {
+                return Err(SessionHubError::Task(
+                    "command id was already used for a different parked command".into(),
+                ));
+            }
+            StoredCommandMenuLookup::Missing => {}
+        }
+        let encoded = encode_cache_confirmation(continuation).ok_or_else(|| {
+            SessionHubError::Task("command cannot require cache confirmation".into())
+        })?;
+        let latest_seq = self.hub.inner.store.latest_seq(session_id).await?;
+        let mut head = self
+            .hub
+            .inner
+            .store
+            .read(session_id, latest_seq.saturating_sub(1), 1)
+            .await?;
+        let head = head.pop().ok_or_else(|| {
+            SessionHubError::Task("cache confirmation could not resolve the session head".into())
+        })?;
+        let menu = Menu {
+            id: MenuId::new(format!("command-cache-menu-{invocation_key}")),
+            kind: MenuKind::Choice,
+            title: "Confirm cache epoch".into(),
+            body: vec![message],
+            options: vec![MenuOption {
+                key: "confirm".into(),
+                label: "Confirm change".into(),
+                detail: Some("Start a new cache epoch and apply the command".into()),
+                decision: None,
+            }],
+            blocking: false,
+            scope: MenuScope::Session,
+            origin: format!("{COMMAND_MENU_ORIGIN_PREFIX}{command}:{invocation_key}:{encoded}"),
+            ttl_ms: None,
+            timeout_option: None,
+        };
+        let mut envelopes = [haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id: EventId::new(format!("command-cache-menu-opened-{invocation_key}")),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: self.hub.inner.device_id.clone(),
+            authority_epoch: head.authority_epoch,
+            worker_generation: self.hub.worker_generation(),
+            causation_id: Some(head.event_id),
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::MenuOpened(menu.clone())).map_err(
+                |error| {
+                    SessionHubError::Task(format!(
+                        "cannot encode command cache confirmation: {error}"
+                    ))
+                },
+            )?,
+        }];
+        if let Err(error) = self.hub.append(&mut envelopes).await {
+            if let StoredCommandMenuLookup::Found(stored) = self
+                .stored_command_menu(session_id, command, &invocation_key)
+                .await?
+            {
+                return Ok(stored);
+            }
+            return Err(error.into());
+        }
+        Ok(StoredCommandMenu {
+            opening: envelopes[0].clone(),
+            menu,
+            answer: None,
+            closed: false,
+        })
+    }
+
+    async fn park_command_menu(
+        &self,
+        request_id: RequestId,
+        command_id: &CommandId,
+        session_id: SessionId,
+        command: &'static str,
+    ) -> Result<(), SessionHubError> {
+        let invocation_key = command_menu_invocation_key(&session_id, command_id);
+        match self
+            .stored_command_menu(&session_id, command, &invocation_key)
+            .await?
+        {
+            StoredCommandMenuLookup::Found(stored) => {
+                return self
+                    .respond_existing_command_menu(request_id, session_id, command, stored)
+                    .await;
+            }
+            StoredCommandMenuLookup::CommandIdConflict => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "command id was already used for a different parked command",
+                    false,
+                    None,
+                );
+            }
+            StoredCommandMenuLookup::Missing => {}
+        }
+        let latest_seq = self.hub.inner.store.latest_seq(&session_id).await?;
+        if latest_seq == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "command menu requires a live session",
+                false,
+                None,
+            );
+        }
+        let mut head = self
+            .hub
+            .inner
+            .store
+            .read(&session_id, latest_seq.saturating_sub(1), 1)
+            .await?;
+        let Some(head) = head.pop() else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "command menu could not resolve the session head",
+                false,
+                None,
+            );
+        };
+        let metadata = self.hub.session_metadata(&session_id).await?;
+        let summaries = self
+            .hub
+            .accounts()?
+            .and_then(|facade| facade.management.read())
+            .map(|view| view.providers)
+            .unwrap_or_default();
+        let (kind, title, body, options) = match command {
+            "rename" => (
+                MenuKind::Question,
+                "Rename session".to_owned(),
+                vec!["Enter the new session name.".to_owned()],
+                Vec::new(),
+            ),
+            "model" => {
+                let Some(metadata) = metadata.as_ref() else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_NOT_FOUND,
+                        "model menu requires typed session metadata",
+                        false,
+                        None,
+                    );
+                };
+                let mut models = summaries
+                    .iter()
+                    .find(|summary| summary.provider == metadata.provider)
+                    .map(|summary| summary.models.clone())
+                    .unwrap_or_default();
+                if !models.iter().any(|model| model == &metadata.model) {
+                    models.insert(0, metadata.model.clone());
+                }
+                (
+                    MenuKind::Choice,
+                    "Choose model".to_owned(),
+                    vec![format!("Provider: {}", metadata.provider)],
+                    command_menu_options(models),
+                )
+            }
+            "provider" => {
+                let mut providers: BTreeSet<String> = summaries
+                    .iter()
+                    .filter(|summary| {
+                        summary.enabled
+                            && (summary.default_model.is_some() || !summary.models.is_empty())
+                    })
+                    .map(|summary| summary.provider.clone())
+                    .collect();
+                if let Some(metadata) = metadata.as_ref() {
+                    providers.insert(metadata.provider.clone());
+                }
+                (
+                    MenuKind::Choice,
+                    "Choose provider".to_owned(),
+                    Vec::new(),
+                    command_menu_options(providers),
+                )
+            }
+            "effort" => {
+                let Some(metadata) = metadata.as_ref() else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_NOT_FOUND,
+                        "effort menu requires typed session metadata",
+                        false,
+                        None,
+                    );
+                };
+                let mut efforts = vec!["default".to_owned()];
+                if let Some(detail) = summaries
+                    .iter()
+                    .find(|summary| summary.provider == metadata.provider)
+                    .and_then(|summary| {
+                        summary
+                            .model_details
+                            .iter()
+                            .find(|detail| detail.name == metadata.model)
+                    })
+                {
+                    efforts.extend(detail.supported_efforts.clone());
+                }
+                if let Some(current) = metadata.effort.as_ref()
+                    && !efforts.iter().any(|effort| effort == current)
+                {
+                    efforts.push(current.clone());
+                }
+                (
+                    MenuKind::Choice,
+                    "Choose reasoning effort".to_owned(),
+                    vec![format!("Model: {}", metadata.model)],
+                    command_menu_options(efforts),
+                )
+            }
+            "fast" => {
+                let current = metadata.as_ref().map(|metadata| metadata.fast);
+                (
+                    MenuKind::Choice,
+                    "Choose fast mode".to_owned(),
+                    current.map_or_else(Vec::new, |enabled| {
+                        vec![format!("Currently: {}", if enabled { "on" } else { "off" })]
+                    }),
+                    command_menu_options(["on".to_owned(), "off".to_owned()]),
+                )
+            }
+            _ => {
+                return self.respond_command_outcome(
+                    request_id,
+                    haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                        command: command.to_owned(),
+                        reason: Some("command has no safe menu producer".into()),
+                    },
+                );
+            }
+        };
+        if matches!(kind, MenuKind::Choice) && options.is_empty() {
+            return self.respond_command_outcome(
+                request_id,
+                haider_rpc::CommandInvokeOutcomeWire::Unsupported {
+                    command: command.to_owned(),
+                    reason: Some("daemon has no choices for this command".into()),
+                },
+            );
+        }
+        let menu_id = MenuId::new(format!("command-menu-{invocation_key}"));
+        let menu = Menu {
+            id: menu_id.clone(),
+            kind: kind.clone(),
+            title: title.clone(),
+            body: body.clone(),
+            options: options.clone(),
+            blocking: false,
+            scope: MenuScope::Session,
+            origin: format!("{COMMAND_MENU_ORIGIN_PREFIX}{command}:{invocation_key}"),
+            ttl_ms: None,
+            timeout_option: None,
+        };
+        let mut envelopes = [haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id: EventId::new(format!("command-menu-opened-{invocation_key}")),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: self.hub.inner.device_id.clone(),
+            authority_epoch: head.authority_epoch,
+            worker_generation: self.hub.worker_generation(),
+            causation_id: Some(head.event_id),
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::MenuOpened(menu)).map_err(|error| {
+                SessionHubError::Task(format!("cannot encode command menu: {error}"))
+            })?,
+        }];
+        if let Err(error) = self.hub.append(&mut envelopes).await {
+            // Two control connections can race the preflight read. The
+            // deterministic opening identity makes one append win; the loser
+            // replays that exact card instead of minting a second menu.
+            if let StoredCommandMenuLookup::Found(stored) = self
+                .stored_command_menu(&session_id, command, &invocation_key)
+                .await?
+            {
+                return self.respond_stored_command_menu(request_id, &stored);
+            }
+            return self.respond_turn_error(request_id, error);
+        }
+        let opened = &envelopes[0];
+        let EventPayload::MenuOpened(menu) = serde_json::from_value(opened.payload.clone())
+            .map_err(|error| {
+                SessionHubError::Task(format!("cannot decode committed command menu: {error}"))
+            })?
+        else {
+            return Err(SessionHubError::Task(
+                "committed command menu changed payload kind".into(),
+            ));
+        };
+        let needs_input = Self::command_needs_input(opened, &menu);
+        self.respond_command_outcome(
+            request_id,
+            haider_rpc::CommandInvokeOutcomeWire::Parked { needs_input },
+        )
     }
 
     /// The transport + vault gate shared by `vault.stage` and
@@ -4462,6 +5691,524 @@ impl HubConnection {
                 created_seq: created.created_seq,
                 worker_generation: created.worker_generation,
                 name: created.name,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn session_fork(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        source_session_id: SessionId,
+        worker_generation: u64,
+        source_branch_id: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        name: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let name = normalize_session_title(name);
+        if command_id.as_str().is_empty() || fork_node_id.as_str().is_empty() || fork_seq == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session-fork command and fork coordinate must be valid",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &source_session_id,
+            "worker_generation": worker_generation,
+            "source_branch_id": &source_branch_id,
+            "fork_node_id": &fork_node_id,
+            "fork_seq": fork_seq,
+            "name": &name,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode session-fork coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .session_fork_receipt(&command_id, &request_digest, &request_json, false)
+            .await
+        {
+            Ok(Some(created)) => return self.respond_session_fork_created(request_id, created),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &source_session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "session fork requires a control attachment to the source session",
+                false,
+                None,
+            );
+        }
+        let command = SessionForkCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            source_session_id,
+            session_id: SessionId::new(random_id("session")?),
+            worker_generation,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            name,
+            metafork: None,
+            audit_event_id: EventId::new(random_id("session-forked")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let created = match self.hub.fork_session(command).await {
+            Ok(SessionForkOutcome::Committed { created, .. })
+            | Ok(SessionForkOutcome::IdempotentReplay { created }) => created,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_session_fork_created(request_id, created)
+    }
+
+    fn respond_session_fork_created(
+        &self,
+        request_id: RequestId,
+        created: CreatedSessionFork,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionFork {
+                session_id: created.session_id,
+                source_session_id: created.source_session_id,
+                source_branch_id: created.source_branch_id,
+                fork_node_id: created.fork_node_id,
+                fork_seq: created.fork_seq,
+                created_seq: created.created_seq,
+                worker_generation: created.worker_generation,
+                metadata: created.metadata,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn session_metafork(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        source_session_id: SessionId,
+        worker_generation: u64,
+        source_branch_id: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        name: Option<String>,
+        description: String,
+        model_proposal: haider_protocol::session_fork::SessionMetaforkProposal,
+        accepted_proposal_digest: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let name = normalize_session_title(name);
+        if let Err(message) = validate_metafork_review_shape(
+            &command_id,
+            &fork_node_id,
+            fork_seq,
+            &description,
+            &model_proposal,
+        ) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &message,
+                false,
+                None,
+            );
+        }
+        let Some(accepted_proposal_digest) = accepted_proposal_digest else {
+            if !self
+                .hub
+                .holds_control_attachment(&self.connection_id, &source_session_id)?
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_CAPABILITY_DENIED,
+                    "session metafork review requires a control attachment to the source session",
+                    false,
+                    None,
+                );
+            }
+            let canonical = match self
+                .canonical_metafork_proposal(
+                    &source_session_id,
+                    worker_generation,
+                    source_branch_id.as_ref(),
+                    &fork_node_id,
+                    fork_seq,
+                    &model_proposal,
+                )
+                .await
+            {
+                Ok(proposal) => proposal,
+                Err(SessionHubError::Store(error)) => {
+                    return self.respond_turn_error(request_id, error);
+                }
+                Err(error) => return Err(error),
+            };
+            let review_manifest = haider_protocol::session_fork::SessionMetaforkReviewManifest {
+                command_id: command_id.0.clone(),
+                source_session_id: source_session_id.clone(),
+                worker_generation,
+                source_branch_id: source_branch_id.clone(),
+                fork_node_id: fork_node_id.clone(),
+                fork_seq,
+                name: name.clone(),
+                description: description.clone(),
+                model_proposal: canonical.clone(),
+            };
+            let proposal_digest = review_manifest.digest().map_err(|error| {
+                SessionHubError::Task(format!("cannot digest metafork review manifest: {error}"))
+            })?;
+            let gate_command_id = command_id.0.clone();
+            let gate_digest = proposal_digest.clone();
+            {
+                let mut reviews = lock(&self.metafork_reviews)?;
+                if !reviews.contains_key(command_id.as_str()) && reviews.len() >= 64 {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_OVERLOADED,
+                        "this connection already has 64 metafork reviews awaiting acceptance",
+                        true,
+                        None,
+                    );
+                }
+                // Reserve capacity without making acceptance possible. The real
+                // digest is installed only after the review response is served.
+                reviews.insert(gate_command_id.clone(), String::new());
+            }
+            // Proposal phase is intentionally write-free: no receipt, source
+            // journal fact, child row, or durable review token is created. A
+            // connection-local gate proves this exact review was served, and
+            // the daemon replaces model previews with source-row truth.
+            let delivery = self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionMetafork {
+                    committed: false,
+                    source_session_id,
+                    session_id: None,
+                    source_branch_id,
+                    fork_node_id,
+                    fork_seq,
+                    description,
+                    model_proposal: canonical,
+                    review_manifest: Some(review_manifest),
+                    proposal_digest,
+                    created_seq: None,
+                    worker_generation: None,
+                    metadata: None,
+                    omission_count: None,
+                },
+            });
+            {
+                let mut reviews = lock(&self.metafork_reviews)?;
+                if delivery.is_ok() {
+                    reviews.insert(gate_command_id, gate_digest);
+                } else if reviews
+                    .get(&gate_command_id)
+                    .is_some_and(|digest| digest.is_empty())
+                {
+                    reviews.remove(&gate_command_id);
+                }
+            }
+            return delivery;
+        };
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &source_session_id,
+            "worker_generation": worker_generation,
+            "source_branch_id": &source_branch_id,
+            "fork_node_id": &fork_node_id,
+            "fork_seq": fork_seq,
+            "name": &name,
+            "description": &description,
+            "model_proposal": &model_proposal,
+            "accepted_proposal_digest": &accepted_proposal_digest,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!(
+                "cannot encode session-metafork coordinates: {error}"
+            ))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .session_fork_receipt(&command_id, &request_digest, &request_json, true)
+            .await
+        {
+            Ok(Some(created)) => return self.respond_session_metafork_created(request_id, created),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &source_session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "session metafork requires a control attachment to the source session",
+                false,
+                None,
+            );
+        }
+        let canonical = match self
+            .canonical_metafork_proposal(
+                &source_session_id,
+                worker_generation,
+                source_branch_id.as_ref(),
+                &fork_node_id,
+                fork_seq,
+                &model_proposal,
+            )
+            .await
+        {
+            Ok(proposal) => proposal,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        if canonical != model_proposal {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "metafork acceptance must echo the exact source-derived proposal shown for review",
+                false,
+                None,
+            );
+        }
+        let review_digest = haider_protocol::session_fork::SessionMetaforkReviewManifest {
+            command_id: command_id.0.clone(),
+            source_session_id: source_session_id.clone(),
+            worker_generation,
+            source_branch_id: source_branch_id.clone(),
+            fork_node_id: fork_node_id.clone(),
+            fork_seq,
+            name: name.clone(),
+            description: description.clone(),
+            model_proposal: model_proposal.clone(),
+        }
+        .digest()
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot digest metafork review manifest: {error}"))
+        })?;
+        if accepted_proposal_digest != review_digest
+            || lock(&self.metafork_reviews)?
+                .get(command_id.as_str())
+                .is_none_or(|reviewed| reviewed != &review_digest)
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "metafork acceptance requires the exact review served on this connection",
+                false,
+                None,
+            );
+        }
+        let review_command_id = command_id.0.clone();
+        let command = SessionForkCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            source_session_id,
+            session_id: SessionId::new(random_id("session")?),
+            worker_generation,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            name,
+            metafork: Some(SessionMetaforkCommit {
+                description,
+                model_proposal,
+                accepted_proposal_digest,
+            }),
+            audit_event_id: EventId::new(random_id("session-metaforked")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let created = match self.hub.fork_session(command).await {
+            Ok(SessionForkOutcome::Committed { created, .. })
+            | Ok(SessionForkOutcome::IdempotentReplay { created }) => created,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        lock(&self.metafork_reviews)?.remove(&review_command_id);
+        self.respond_session_metafork_created(request_id, created)
+    }
+
+    async fn canonical_metafork_proposal(
+        &self,
+        source_session_id: &SessionId,
+        worker_generation: u64,
+        source_branch_id: Option<&haider_protocol::ids::BranchId>,
+        fork_node_id: &haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        proposal: &haider_protocol::session_fork::SessionMetaforkProposal,
+    ) -> Result<haider_protocol::session_fork::SessionMetaforkProposal, SessionHubError> {
+        self.hub
+            .inner
+            .store
+            .validate_session_fork_source(
+                worker_generation,
+                source_session_id.clone(),
+                source_branch_id.cloned(),
+                fork_node_id.clone(),
+                fork_seq,
+            )
+            .await?;
+        let lineage = self
+            .hub
+            .inner
+            .store
+            .branch_lineage(source_session_id, source_branch_id)
+            .await?;
+        let source_owner_agent = self
+            .hub
+            .inner
+            .store
+            .delegation_for_child_session(source_session_id.clone())
+            .await?
+            .map(|delegation| delegation.agent_id);
+        let mut scopes = std::collections::HashMap::new();
+        let mut ceiling = u64::MAX;
+        for descriptor in lineage.iter().rev() {
+            scopes.insert(Some(descriptor.branch_id.clone()), ceiling);
+            ceiling = ceiling.min(descriptor.fork_seq);
+        }
+        scopes.insert(None, ceiling);
+
+        let mut admitted = Vec::new();
+        let mut cursor = 0;
+        while cursor < fork_seq {
+            let page = self
+                .hub
+                .inner
+                .store
+                .read(source_session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                if envelope.seq > fork_seq {
+                    break;
+                }
+                if scopes
+                    .get(&envelope.branch_id)
+                    .is_some_and(|through| envelope.seq <= *through)
+                {
+                    admitted.push(envelope);
+                }
+            }
+        }
+
+        let mut canonical = proposal.clone();
+        let mut reviewed_event_count = 0_usize;
+        for removal in &mut canonical.removals {
+            let matches = admitted
+                .iter()
+                .filter(|envelope| {
+                    envelope.seq >= removal.from_seq
+                        && envelope.seq <= removal.through_seq
+                        && (envelope.agent_id.is_none()
+                            || envelope.agent_id.as_ref() == source_owner_agent.as_ref())
+                        && envelope.render.prompt != haider_protocol::envelope::PromptRender::Omit
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Err(SessionHubError::Store(HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "metafork proposal range has no prompt-visible event in the copied source lineage",
+                    false,
+                )));
+            }
+            reviewed_event_count = reviewed_event_count.saturating_add(matches.len());
+            if reviewed_event_count > 512 {
+                return Err(SessionHubError::Store(HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "metafork review selects more than 512 prompt-visible events; split the proposal",
+                    false,
+                )));
+            }
+            let mut reviewed_events = Vec::with_capacity(matches.len());
+            for envelope in matches {
+                let kind = envelope
+                    .payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let payload = serde_json::to_string(&envelope.payload).map_err(|error| {
+                    SessionHubError::Task(format!("cannot render metafork review preview: {error}"))
+                })?;
+                let mut excerpt = String::new();
+                append_bounded_review_text(&mut excerpt, &payload, 384);
+                reviewed_events.push(haider_protocol::session_fork::SessionMetaforkReviewEvent {
+                    source_seq: envelope.seq,
+                    source_event_id: envelope.event_id.clone(),
+                    payload_kind: kind.to_owned(),
+                    excerpt_truncated: excerpt.len() < payload.len(),
+                    excerpt,
+                });
+            }
+            removal.preview = Some(format!(
+                "{} prompt-visible event(s); see reviewed_events",
+                reviewed_events.len()
+            ));
+            removal.reviewed_events = reviewed_events;
+        }
+        Ok(canonical)
+    }
+
+    fn respond_session_metafork_created(
+        &self,
+        request_id: RequestId,
+        created: CreatedSessionFork,
+    ) -> Result<(), SessionHubError> {
+        let description = created.description.ok_or_else(|| {
+            SessionHubError::Task("metafork receipt is missing its description".into())
+        })?;
+        let model_proposal = created.model_proposal.ok_or_else(|| {
+            SessionHubError::Task("metafork receipt is missing its model proposal".into())
+        })?;
+        let proposal_digest = created.proposal_digest.ok_or_else(|| {
+            SessionHubError::Task("metafork receipt is missing its proposal digest".into())
+        })?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionMetafork {
+                committed: true,
+                source_session_id: created.source_session_id,
+                session_id: Some(created.session_id),
+                source_branch_id: created.source_branch_id,
+                fork_node_id: created.fork_node_id,
+                fork_seq: created.fork_seq,
+                description,
+                model_proposal,
+                review_manifest: None,
+                proposal_digest,
+                created_seq: Some(created.created_seq),
+                worker_generation: Some(created.worker_generation),
+                metadata: Some(created.metadata),
+                omission_count: Some(created.omission_count),
             },
         })
     }
@@ -7804,6 +9551,235 @@ impl HubConnection {
         })
     }
 
+    async fn command_menu_lookup(
+        &self,
+        session_id: &SessionId,
+        request_seq: u64,
+        menu_id: &MenuId,
+        answer: &DurableMenuAnswer,
+    ) -> Result<CommandMenuLookup, SessionHubError> {
+        let opening = self
+            .hub
+            .inner
+            .store
+            .read(session_id, request_seq.saturating_sub(1), 1)
+            .await?
+            .into_iter()
+            .find(|envelope| envelope.seq == request_seq);
+        let Some(opening) = opening else {
+            return Ok(CommandMenuLookup::Ordinary);
+        };
+        let Ok(EventPayload::MenuOpened(menu)) =
+            serde_json::from_value::<EventPayload>(opening.payload.clone())
+        else {
+            return Ok(CommandMenuLookup::Ordinary);
+        };
+        if menu.id != *menu_id {
+            return Ok(CommandMenuLookup::Ordinary);
+        }
+        let (command, encoded_continuation) = match command_menu_origin_parts(&menu.origin) {
+            Ok(Some(origin)) => (origin.command, origin.encoded_continuation),
+            Ok(None) => return Ok(CommandMenuLookup::Ordinary),
+            Err(()) => {
+                return Ok(CommandMenuLookup::Invalid(
+                    "unknown parked command origin version; no action was taken".into(),
+                ));
+            }
+        };
+        let selected_key = || {
+            let key = answer.option_key.as_deref().ok_or_else(|| {
+                "command choice answer is missing its stable option key".to_owned()
+            })?;
+            if !menu.options.iter().any(|option| option.key == key) {
+                return Err("command choice key is not in the parked option set".to_owned());
+            }
+            Ok(key.to_owned())
+        };
+        let (continuation, confirm_new_epoch) = if let Some(encoded) = encoded_continuation {
+            if !matches!(menu.kind, MenuKind::Choice) {
+                return Ok(CommandMenuLookup::Invalid(
+                    "cache confirmation menu is not a choice".into(),
+                ));
+            }
+            match selected_key() {
+                Ok(key) if key == "confirm" => match decode_cache_confirmation(encoded) {
+                    Ok(continuation) => (continuation, true),
+                    Err(message) => return Ok(CommandMenuLookup::Invalid(message)),
+                },
+                Ok(_) => {
+                    return Ok(CommandMenuLookup::Invalid(
+                        "cache confirmation answer is not confirm".into(),
+                    ));
+                }
+                Err(message) => return Ok(CommandMenuLookup::Invalid(message)),
+            }
+        } else {
+            let continuation = match command {
+                "rename" if matches!(menu.kind, MenuKind::Question) => {
+                    let value = answer
+                        .value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| "rename command answer needs a non-empty value".to_owned());
+                    match value {
+                        Ok(value) => ParkedCommandContinuation::Rename(value.to_owned()),
+                        Err(message) => return Ok(CommandMenuLookup::Invalid(message)),
+                    }
+                }
+                "model" if matches!(menu.kind, MenuKind::Choice) => match selected_key() {
+                    Ok(model) => ParkedCommandContinuation::Model(model),
+                    Err(message) => return Ok(CommandMenuLookup::Invalid(message)),
+                },
+                "provider" if matches!(menu.kind, MenuKind::Choice) => match selected_key() {
+                    Ok(provider) => ParkedCommandContinuation::Provider(provider),
+                    Err(message) => return Ok(CommandMenuLookup::Invalid(message)),
+                },
+                "effort" if matches!(menu.kind, MenuKind::Choice) => match selected_key() {
+                    Ok(effort) if effort == "default" => ParkedCommandContinuation::Effort(None),
+                    Ok(effort) => ParkedCommandContinuation::Effort(Some(effort)),
+                    Err(message) => return Ok(CommandMenuLookup::Invalid(message)),
+                },
+                "fast" if matches!(menu.kind, MenuKind::Choice) => match selected_key() {
+                    Ok(value) if value == "on" => ParkedCommandContinuation::Fast(true),
+                    Ok(value) if value == "off" => ParkedCommandContinuation::Fast(false),
+                    Ok(_) => {
+                        return Ok(CommandMenuLookup::Invalid(
+                            "fast command choice is neither on nor off".into(),
+                        ));
+                    }
+                    Err(message) => return Ok(CommandMenuLookup::Invalid(message)),
+                },
+                "rename" | "model" | "provider" | "effort" | "fast" => {
+                    return Ok(CommandMenuLookup::Invalid(
+                        "parked command menu kind does not match its command".into(),
+                    ));
+                }
+                _ => {
+                    return Ok(CommandMenuLookup::Invalid(
+                        "unknown parked command origin; no action was taken".into(),
+                    ));
+                }
+            };
+            (continuation, false)
+        };
+        Ok(CommandMenuLookup::Continuation(ResolvedCommandMenu {
+            action: continuation,
+            opening_generation: opening.worker_generation,
+            confirm_new_epoch,
+        }))
+    }
+
+    async fn execute_parked_command(
+        &self,
+        session_id: SessionId,
+        menu_id: &MenuId,
+        continuation: ParkedCommandContinuation,
+        opening_generation: u64,
+        confirm_new_epoch: bool,
+    ) -> Result<(ResponseBody, CommandReceiptKind), SessionHubError> {
+        let internal_request_id =
+            RequestId::new(format!("command-menu-execute-{}", menu_id.as_str()));
+        let operation_command_id =
+            CommandId::new(format!("command-menu-{}-execute", menu_id.as_str()));
+        let expected = continuation.receipt_kind();
+        let receipt_generation = self
+            .hub
+            .command_receipt_worker_generation(
+                &operation_command_id,
+                continuation.canonical_method(),
+            )
+            .await?;
+        let first_generation = receipt_generation.unwrap_or(opening_generation);
+        let mut body = self
+            .execute_command_continuation(
+                internal_request_id.clone(),
+                operation_command_id.clone(),
+                session_id.clone(),
+                continuation.clone(),
+                first_generation,
+                confirm_new_epoch,
+            )
+            .await?;
+        let current_generation = self.hub.worker_generation();
+        if receipt_generation.is_none()
+            && first_generation != current_generation
+            && matches!(
+                &body,
+                ResponseBody::Error { code, .. } if code == ERROR_CODE_STALE_GENERATION
+            )
+        {
+            // If the operation committed before a crash, the old-generation
+            // attempt above replays its exact receipt. If only MenuAnswered
+            // committed, it returns stale and this current-generation retry
+            // completes the deterministic continuation command.
+            body = self
+                .execute_command_continuation(
+                    internal_request_id,
+                    operation_command_id,
+                    session_id,
+                    continuation,
+                    current_generation,
+                    confirm_new_epoch,
+                )
+                .await?;
+        }
+        Ok((body, expected))
+    }
+
+    async fn finish_command_menu(
+        &self,
+        request_id: Option<RequestId>,
+        session_id: SessionId,
+        menu_id: &MenuId,
+        resolved: ResolvedCommandMenu,
+        resolution_seq: u64,
+    ) -> Result<(), SessionHubError> {
+        let continuation = resolved.action;
+        let confirm_new_epoch = resolved.confirm_new_epoch;
+        let (body, expected) = self
+            .execute_parked_command(
+                session_id.clone(),
+                menu_id,
+                continuation.clone(),
+                resolved.opening_generation,
+                confirm_new_epoch,
+            )
+            .await?;
+        if let ResponseBody::Error { code, message, .. } = &body
+            && code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED
+            && !confirm_new_epoch
+        {
+            let confirmation_id =
+                CommandId::new(format!("command-cache-confirm-{}", menu_id.as_str()));
+            self.ensure_cache_confirmation_menu(
+                &session_id,
+                &confirmation_id,
+                continuation.slash_name(),
+                &continuation,
+                message.clone(),
+            )
+            .await?;
+            return self.menu_success(request_id, resolution_seq);
+        }
+        match body {
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                data,
+            } => self.menu_error(request_id, &code, &message, retryable, data),
+            body if expected.accepts(&body) => self.menu_success(request_id, resolution_seq),
+            _ => self.menu_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "command handler returned an unexpected response; no success was asserted",
+                false,
+                None,
+            ),
+        }
+    }
+
     /// Handles the durable top-level `MenuAnswer` command.
     ///
     /// The arbitration law — first COMMITTED answer wins, losers get the
@@ -7896,6 +9872,22 @@ impl HubConnection {
                 None,
             );
         }
+        let command_menu = match self
+            .command_menu_lookup(&session_id, request_seq, &answer.menu, &answer)
+            .await?
+        {
+            CommandMenuLookup::Ordinary => None,
+            CommandMenuLookup::Continuation(resolved) => Some(resolved),
+            CommandMenuLookup::Invalid(message) => {
+                return self.menu_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &message,
+                    false,
+                    None,
+                );
+            }
+        };
         let actor = self.hub.actor_for(session_id.clone()).await?;
         let recovery_answer = answer.clone();
         let recovery_session = session_id.clone();
@@ -7904,7 +9896,11 @@ impl HubConnection {
             session_id,
             request_seq,
             worker_generation,
-            allow_prior_generation: false,
+            // The durable origin was validated above. Unlike a worker-owned
+            // checkpoint, a command-door menu has no volatile harness
+            // registration to recover after restart, so its exact opening
+            // coordinates are the authority for prior-generation recovery.
+            allow_prior_generation: command_menu.is_some(),
             answer,
             device_id: self.hub.inner.device_id.clone(),
             input_is_secret_reference: secret_reference,
@@ -7928,7 +9924,7 @@ impl HubConnection {
                         Some(EffectRecoveryAction::Probe) => {
                             self.hub
                                 .probe_effect_outcome(
-                                    recovery_session,
+                                    recovery_session.clone(),
                                     effect.clone(),
                                     menu.id.clone(),
                                     envelope,
@@ -7938,7 +9934,7 @@ impl HubConnection {
                         Some(EffectRecoveryAction::Retry) => {
                             self.hub
                                 .submit_effect_retry(
-                                    recovery_session,
+                                    recovery_session.clone(),
                                     effect.clone(),
                                     menu.id.clone(),
                                     envelope.seq,
@@ -7957,9 +9953,31 @@ impl HubConnection {
                         );
                     }
                 }
+                if let Some(resolved) = command_menu {
+                    return self
+                        .finish_command_menu(
+                            request_id,
+                            recovery_session,
+                            &recovery_answer.menu,
+                            resolved,
+                            envelope.seq,
+                        )
+                        .await;
+                }
                 self.menu_success(request_id, envelope.seq)
             }
             Ok(MenuResolutionOutcome::IdempotentReplay { resolution_seq }) => {
+                if let Some(resolved) = command_menu {
+                    return self
+                        .finish_command_menu(
+                            request_id,
+                            recovery_session,
+                            &recovery_answer.menu,
+                            resolved,
+                            resolution_seq,
+                        )
+                        .await;
+                }
                 self.menu_success(request_id, resolution_seq)
             }
             Ok(MenuResolutionOutcome::AlreadyResolved { resolution_seq }) => self.menu_error(
@@ -8393,6 +10411,64 @@ fn normalize_session_title(title: Option<String>) -> Option<String> {
     } else {
         Some(capped.to_owned())
     }
+}
+
+fn validate_metafork_review_shape(
+    command_id: &CommandId,
+    fork_node_id: &haider_protocol::ids::NodeId,
+    fork_seq: u64,
+    description: &str,
+    proposal: &haider_protocol::session_fork::SessionMetaforkProposal,
+) -> Result<(), String> {
+    if command_id.as_str().is_empty()
+        || fork_node_id.as_str().is_empty()
+        || fork_seq == 0
+        || description.trim().is_empty()
+        || description.len() > 16 * 1024
+        || proposal.removals.is_empty()
+        || proposal.removals.len() > 256
+    {
+        return Err(
+            "metafork command, fork coordinate, description, and model proposal must be valid"
+                .into(),
+        );
+    }
+    for (index, removal) in proposal.removals.iter().enumerate() {
+        if removal.from_seq == 0
+            || removal.through_seq < removal.from_seq
+            || removal.reason.trim().is_empty()
+            || removal.reason.len() > 4 * 1024
+            || removal
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.trim().is_empty() || preview.len() > 2 * 1024)
+            || proposal.removals.iter().take(index).any(|prior| {
+                removal.from_seq <= prior.through_seq && prior.from_seq <= removal.through_seq
+            })
+        {
+            return Err(
+                "metafork removal ranges must be bounded, non-overlapping, and carry reasons"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn append_bounded_review_text(target: &mut String, text: &str, limit: usize) {
+    let remaining = limit.saturating_sub(target.len());
+    if remaining == 0 {
+        return;
+    }
+    if text.len() <= remaining {
+        target.push_str(text);
+        return;
+    }
+    let mut end = remaining.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&text[..end]);
 }
 
 #[cfg(test)]

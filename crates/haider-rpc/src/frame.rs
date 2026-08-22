@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::command::{CommandCatalogItemWire, CommandDynamicSlotsWire, CommandInvokeOutcomeWire};
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::{AgentMessageReceipt, AgentMetricsSnapshot, AgentUsageMetrics};
 use haider_protocol::branch::BranchDescriptor;
@@ -13,6 +14,7 @@ use haider_protocol::ids::{
     NodeId, RunId, SessionId,
 };
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session_fork::{SessionMetaforkProposal, SessionMetaforkReviewManifest};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -295,6 +297,8 @@ pub const FEATURE_EFFECT_RECOVERY_V1: &str = "effect_recovery_v1";
 pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
 pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
+/// Daemon serves receipt-backed session-level fork and review-gated metafork.
+pub const FEATURE_SESSION_FORK_V1: &str = "session_fork_v1";
 /// The daemon accepts receipt-free, content-addressed `artifact.put` uploads.
 pub const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 /// Daemon-owned hook discovery, execution, decision answers, and trust receipts.
@@ -321,6 +325,9 @@ pub const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
 /// presents one typed, secret-free, answerable card, so any surface can
 /// resolve it through `menu.answer` without a terminal.
 pub const FEATURE_SESSION_NEEDS_INPUT_V1: &str = "session_needs_input_v1";
+/// Daemon owns the shared dynamic command catalog and the receipted/parked
+/// command invocation door.
+pub const FEATURE_COMMAND_DOOR_V1: &str = "command_door_v1";
 /// Daemon implements receipted live-session effort selection
 /// (`session.select_effort`), validated against the CURRENT pair's declared
 /// effort ladder; `effort: null` reverts to the provider default (G3).
@@ -1527,6 +1534,24 @@ pub enum HookTrustStateWire {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// Lists the shared command catalog for the requesting surface's exact
+    /// current context.
+    #[serde(rename = "command.list")]
+    CommandList {
+        query: String,
+        in_session: bool,
+        #[serde(default, skip_serializing_if = "CommandDynamicSlotsWire::is_empty")]
+        slots: CommandDynamicSlotsWire,
+    },
+    /// Invokes one shared-catalog command. Durable operations use the
+    /// caller's command id as their idempotency key.
+    #[serde(rename = "command.invoke")]
+    CommandInvoke {
+        command_id: CommandId,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
     /// Receipt-free byte ingress into the daemon-owned content-addressed
     /// store. Repeating the same decoded bytes is naturally idempotent.
     #[serde(rename = "artifact.put")]
@@ -1744,6 +1769,45 @@ pub enum RequestBody {
         fork_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+    },
+    /// Creates a complete new session from one exact source-history node.
+    /// This is session-level cloning, not `branch.create`.
+    #[serde(rename = "session.fork")]
+    SessionFork {
+        command_id: CommandId,
+        /// Source session; the child id is daemon-minted and receipt-stable.
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<BranchId>,
+        fork_node_id: NodeId,
+        fork_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Review-gated session fork with model-proposed prompt omissions.
+    ///
+    /// The first call omits `accepted_proposal_digest`; it is read-only and
+    /// returns the canonical digest plus the exact proposal for operator
+    /// review. Echoing the complete review-manifest digest on the same
+    /// connection is the human acceptance proof and is the only form allowed
+    /// to claim a receipt and create the child.
+    #[serde(rename = "session.metafork")]
+    SessionMetafork {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<BranchId>,
+        fork_node_id: NodeId,
+        fork_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        description: String,
+        model_proposal: SessionMetaforkProposal,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Digest of the complete source/name/description/proposal review.
+        accepted_proposal_digest: Option<String>,
     },
     /// Message one direct child of the named parent session. The daemon
     /// chooses current-round STEER versus an immediate fresh child turn.
@@ -2168,6 +2232,13 @@ pub enum RequestBody {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum ResponseBody {
+    #[serde(rename = "command.list")]
+    CommandList {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<CommandCatalogItemWire>,
+    },
+    #[serde(rename = "command.invoke")]
+    CommandInvoke { outcome: CommandInvokeOutcomeWire },
     /// Verified content address and decoded byte count for `artifact.put`.
     #[serde(rename = "artifact.put")]
     ArtifactPut { artifact: ArtifactRef, bytes: u64 },
@@ -2344,6 +2415,48 @@ pub enum ResponseBody {
         created_seq: u64,
         worker_generation: u64,
         name: String,
+    },
+    /// Stable receipt coordinates of a complete session-level fork.
+    #[serde(rename = "session.fork")]
+    SessionFork {
+        session_id: SessionId,
+        source_session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<BranchId>,
+        fork_node_id: NodeId,
+        fork_seq: u64,
+        created_seq: u64,
+        worker_generation: u64,
+        metadata: SessionMetadataV1,
+    },
+    /// A metafork review (`committed=false`) or its stable committed receipt.
+    /// Optional child fields are absent during the write-free review phase.
+    #[serde(rename = "session.metafork")]
+    SessionMetafork {
+        committed: bool,
+        source_session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<BranchId>,
+        fork_node_id: NodeId,
+        fork_seq: u64,
+        description: String,
+        model_proposal: SessionMetaforkProposal,
+        /// Exact operation whose digest is awaiting/records acceptance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_manifest: Option<SessionMetaforkReviewManifest>,
+        /// Digest of the complete review manifest (legacy field name retained
+        /// within this new feature's v1 wire shape).
+        proposal_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_generation: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<SessionMetadataV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        omission_count: Option<u64>,
     },
     #[serde(rename = "agent.message")]
     AgentMessage { receipt: AgentMessageReceipt },

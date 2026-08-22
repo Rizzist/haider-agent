@@ -47,6 +47,53 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// MUTATION CHECK: make `accepted_proposal_digest` required or serialize it as
+/// null. Expected RUNTIME failure: the write-free review request below no
+/// longer has the additive old-reader-friendly shape.
+///
+/// MUTATION CHECK: remove the typed proposal/range fields. Expected RUNTIME
+/// failure: the operator review cannot show the exact model-proposed history
+/// removal before a metafork commit.
+#[test]
+fn session_metafork_review_shape_is_additive_and_exact() {
+    let json = serde_json::json!({
+        "method": "session.metafork",
+        "command_id": "meta-command",
+        "session_id": "source-session",
+        "worker_generation": 7,
+        "fork_node_id": "fork-node",
+        "fork_seq": 19,
+        "description": "remove parts about chocolate",
+        "model_proposal": {
+            "removals": [{
+                "from_seq": 8,
+                "through_seq": 11,
+                "reason": "chocolate discussion",
+                "preview": "tempering chocolate"
+            }]
+        },
+        "future_additive_field": true
+    });
+    let decoded: RequestBody = serde_json::from_value(json).expect("metafork review request");
+    let RequestBody::SessionMetafork {
+        accepted_proposal_digest,
+        model_proposal,
+        ..
+    } = &decoded
+    else {
+        panic!("typed metafork request");
+    };
+    assert!(accepted_proposal_digest.is_none());
+    assert_eq!(model_proposal.removals[0].from_seq, 8);
+    assert_eq!(
+        model_proposal.removals[0].preview.as_deref(),
+        Some("tempering chocolate")
+    );
+    let encoded = serde_json::to_value(decoded).expect("metafork re-encode");
+    assert!(encoded.get("accepted_proposal_digest").is_none());
+    assert!(encoded.get("future_additive_field").is_none());
+}
+
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     assert_eq!(hex.len() % 2, 0, "hex must contain whole bytes");
     (0..hex.len())

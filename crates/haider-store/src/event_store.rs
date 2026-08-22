@@ -66,6 +66,10 @@ use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
     SessionPermissionOverridesV1,
 };
+use haider_protocol::session_fork::{
+    ForkContextEpoch, SessionForkMode, SessionForked, SessionHistoryOmission,
+    SessionMetaforkProposal, SessionMetaforkReviewManifest,
+};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::task::TaskEventPayload;
 use haider_protocol::tool::{AttachmentBlock, ImageBlockRef};
@@ -141,9 +145,10 @@ pub struct MenuResolutionCommand {
     pub session_id: SessionId,
     pub request_seq: u64,
     pub worker_generation: u64,
-    /// Internal recovery authority: only the daemon session actor may elevate
-    /// this after registering the exact durable request_input checkpoint.
-    /// Ordinary wire callers always enter with `false`.
+    /// Internal recovery authority. The daemon session actor may elevate this
+    /// after registering the exact durable request-input checkpoint; the RPC
+    /// command door may request it only after validating its own durable menu
+    /// origin and exact answer coordinates. Ordinary wire menus remain false.
     pub allow_prior_generation: bool,
     pub answer: MenuAnswer,
     pub device_id: DeviceId,
@@ -700,6 +705,66 @@ pub enum BranchCreateOutcome {
     },
     IdempotentReplay {
         created: CreatedBranch,
+    },
+}
+
+/// Accepted metafork coordinates. The digest covers the complete reviewed
+/// operation and is the exact content address journaled in the child.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionMetaforkCommit {
+    pub description: String,
+    pub model_proposal: SessionMetaforkProposal,
+    pub accepted_proposal_digest: String,
+}
+
+/// Secret-free coordinates for one atomic session-level fork.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionForkCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub source_session_id: SessionId,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub source_branch_id: Option<BranchId>,
+    pub fork_node_id: NodeId,
+    pub fork_seq: u64,
+    pub name: Option<String>,
+    pub metafork: Option<SessionMetaforkCommit>,
+    pub audit_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed fork/metafork command receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CreatedSessionFork {
+    pub session_id: SessionId,
+    pub source_session_id: SessionId,
+    pub source_branch_id: Option<BranchId>,
+    pub fork_node_id: NodeId,
+    pub fork_seq: u64,
+    pub created_seq: u64,
+    pub worker_generation: u64,
+    pub metadata: SessionMetadataV1,
+    pub mode: SessionForkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_proposal: Option<SessionMetaforkProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_digest: Option<String>,
+    pub omission_count: u64,
+}
+
+/// Result of the atomic child metadata/history/audit/receipt transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionForkOutcome {
+    Committed {
+        created: CreatedSessionFork,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        created: CreatedSessionFork,
     },
 }
 
@@ -4971,6 +5036,396 @@ impl Store {
         })
     }
 
+    /// Looks up a committed `session.fork` response before source/generation
+    /// validation so response-loss replay remains recoverable after restart.
+    pub fn session_fork_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<CreatedSessionFork>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.fork",
+            request_digest,
+            request_json,
+            "session-fork",
+        )
+    }
+
+    /// Looks up a committed `session.metafork` response before mutable source
+    /// validation. Proposal-only review never creates a receipt.
+    pub fn session_metafork_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<CreatedSessionFork>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.metafork",
+            request_digest,
+            request_json,
+            "session-metafork",
+        )
+    }
+
+    /// Read-only validation for the exact source coordinate displayed by a
+    /// metafork review. Delegated child sessions validate their owning agent
+    /// lane; ordinary sessions validate the root lane.
+    pub fn validate_session_fork_source(
+        &self,
+        worker_generation: u64,
+        source_session_id: &SessionId,
+        source_branch_id: Option<&BranchId>,
+        fork_node_id: &NodeId,
+        fork_seq: u64,
+    ) -> StoreResult<()> {
+        if worker_generation != self.worker_generation {
+            return Err(stale_generation(worker_generation, self.worker_generation));
+        }
+        let connection = self.connection()?;
+        require_typed_session(&connection, source_session_id)?;
+        let owner_agent = lookup_delegation_by_child_session(&connection, source_session_id)?
+            .map(|delegation| delegation.agent_id);
+        validate_branch_fork(
+            &connection,
+            source_session_id,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            owner_agent.as_ref(),
+        )
+    }
+
+    /// Atomically creates an independent child session, copies exactly the
+    /// admitted source lineage through the requested node, appends an audit
+    /// fact, and finalizes the command receipt. Source rows are read-only.
+    pub fn fork_session(&self, command: &SessionForkCommand) -> StoreResult<SessionForkOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.source_session_id == command.session_id
+            || command.session_id.as_str().is_empty()
+            || command.fork_node_id.as_str().is_empty()
+            || command.fork_seq == 0
+            || command.name.as_ref().is_some_and(|title| {
+                title.trim().is_empty()
+                    || title.chars().count() > 80
+                    || title.chars().any(char::is_control)
+            })
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "session fork ids, fork coordinate, and optional name must be valid",
+                false,
+            ));
+        }
+        let (method, description, model_proposal, proposal_digest, mode) =
+            if let Some(metafork) = &command.metafork {
+                validate_metafork_commit(command, metafork)?;
+                (
+                    "session.metafork",
+                    Some(metafork.description.clone()),
+                    Some(metafork.model_proposal.clone()),
+                    Some(metafork.accepted_proposal_digest.clone()),
+                    SessionForkMode::Metafork,
+                )
+            } else {
+                ("session.fork", None, None, None, SessionForkMode::Fork)
+            };
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(created) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            method,
+            &command.request_digest,
+            &command.request_json,
+            if command.metafork.is_some() {
+                "session-metafork"
+            } else {
+                "session-fork"
+            },
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionForkOutcome::IdempotentReplay { created });
+        }
+
+        require_typed_session(&transaction, &command.source_session_id)?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some()
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "daemon-minted child session id already exists",
+                false,
+            ));
+        }
+        let source_owner_agent =
+            lookup_delegation_by_child_session(&transaction, &command.source_session_id)?
+                .map(|delegation| delegation.agent_id);
+        validate_branch_fork(
+            &transaction,
+            &command.source_session_id,
+            command.source_branch_id.as_ref(),
+            &command.fork_node_id,
+            command.fork_seq,
+            source_owner_agent.as_ref(),
+        )?;
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            method,
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let source_metadata_json: String = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [command.source_session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let mut metadata =
+            decode_session_metadata(&command.source_session_id, &source_metadata_json)?
+                .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
+        metadata.created_at_ms = now;
+        if let Some(name) = &command.name {
+            metadata.title = Some(name.clone());
+        }
+        let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize forked session metadata: {error}"),
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
+                params![
+                    command.session_id.as_str(),
+                    to_sqlite_integer(now)?,
+                    metadata_json
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+        let scopes = branch_lineage_scopes(
+            &transaction,
+            &command.source_session_id,
+            command.source_branch_id.as_ref(),
+        )?;
+        let source_envelopes = load_fork_source_envelopes(
+            &transaction,
+            &command.source_session_id,
+            command.fork_seq,
+            &scopes,
+        )?;
+        if source_envelopes.is_empty() || source_envelopes[0].seq != 1 {
+            return Err(corrupt(
+                "fork source lineage does not contain its created envelope",
+            ));
+        }
+
+        let event_ids = source_envelopes
+            .iter()
+            .map(|envelope| {
+                (
+                    envelope.event_id.clone(),
+                    remapped_fork_event_id(&command.session_id, &envelope.event_id),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut matched_removals = model_proposal
+            .as_ref()
+            .map(|proposal| vec![false; proposal.removals.len()])
+            .unwrap_or_default();
+        let mut omissions = Vec::new();
+        let mut child_envelopes = Vec::with_capacity(source_envelopes.len() + 4);
+        for (index, source) in source_envelopes.iter().enumerate() {
+            let child_seq = u64::try_from(index)
+                .map_err(|_| corrupt("forked journal is too large"))?
+                .checked_add(1)
+                .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
+            let child_event_id = event_ids
+                .get(&source.event_id)
+                .cloned()
+                .ok_or_else(|| corrupt("fork event-id remap is incomplete"))?;
+            let mut child = source.clone();
+            child.event_id = child_event_id.clone();
+            child.seq = child_seq;
+            child.session_id = command.session_id.clone();
+            // A session fork materializes the selected lineage as the child's
+            // ordinary main history; source named refs remain parent-owned.
+            child.branch_id = None;
+            if child.agent_id.as_ref() == source_owner_agent.as_ref() {
+                // A delegated source's owning lane becomes the independent
+                // child's ordinary root lane. Other lanes remain attributed.
+                child.agent_id = None;
+            }
+            child.device_id = command.device_id.clone();
+            child.authority_epoch = 0;
+            child.worker_generation = self.worker_generation;
+            child.causation_id = source
+                .causation_id
+                .as_ref()
+                .and_then(|event_id| event_ids.get(event_id).cloned());
+            child.correlation_id = source
+                .correlation_id
+                .as_ref()
+                .and_then(|event_id| event_ids.get(event_id).cloned());
+
+            if let Some(proposal) = &model_proposal {
+                for (removal_index, removal) in proposal.removals.iter().enumerate() {
+                    if source.seq >= removal.from_seq
+                        && source.seq <= removal.through_seq
+                        && source.render.prompt != PromptRender::Omit
+                        && child.agent_id.is_none()
+                    {
+                        matched_removals[removal_index] = true;
+                        child.render.prompt = PromptRender::Omit;
+                        omissions.push(SessionHistoryOmission {
+                            source_seq: source.seq,
+                            child_seq,
+                            source_event_id: source.event_id.clone(),
+                            child_event_id: child_event_id.clone(),
+                            payload_kind: payload_kind(source).to_owned(),
+                            reason: removal.reason.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+            insert_forked_envelope(&transaction, &child)?;
+            child_envelopes.push(child);
+        }
+        if matched_removals.iter().any(|matched| !matched) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "metafork proposal contains a range outside the copied source lineage",
+                false,
+            ));
+        }
+
+        // A copied source run is historical authority, never live child work.
+        // Close any run whose terminal fact lies after the fork coordinate so
+        // startup recovery cannot resume it in the independent child.
+        append_fork_boundary_closures(&transaction, command, now, &mut child_envelopes)?;
+
+        let audit_seq = u64::try_from(child_envelopes.len())
+            .map_err(|_| corrupt("forked journal is too large"))?
+            .checked_add(1)
+            .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
+        let audit = EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: command.audit_event_id.clone(),
+            seq: audit_seq,
+            session_id: command.session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: command.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: self.worker_generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: now,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: SessionForked {
+                source_session_id: command.source_session_id.clone(),
+                source_branch_id: command.source_branch_id.clone(),
+                fork_node_id: command.fork_node_id.clone(),
+                fork_seq: command.fork_seq,
+                mode,
+                description: description.clone(),
+                accepted_proposal_digest: proposal_digest.clone(),
+                omissions: omissions.clone(),
+                // A distinct session id gives both prompt cache and native
+                // pipe sidecar a fresh root; parent segments are never copied.
+                context_epoch: ForkContextEpoch::Fresh,
+            }
+            .to_payload_value()
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize session-fork audit fact: {error}"),
+                    false,
+                )
+            })?,
+        };
+        insert_forked_envelope(&transaction, &audit)?;
+        enqueue_hook_dispatch(&transaction, &audit)?;
+        child_envelopes.push(audit);
+
+        let created = CreatedSessionFork {
+            session_id: command.session_id.clone(),
+            source_session_id: command.source_session_id.clone(),
+            source_branch_id: command.source_branch_id.clone(),
+            fork_node_id: command.fork_node_id.clone(),
+            fork_seq: command.fork_seq,
+            created_seq: audit_seq,
+            worker_generation: self.worker_generation,
+            metadata,
+            mode,
+            description,
+            model_proposal,
+            proposal_digest,
+            omission_count: u64::try_from(omissions.len()).unwrap_or(u64::MAX),
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(audit_seq),
+            &created,
+            now,
+            if command.metafork.is_some() {
+                "session-metafork"
+            } else {
+                "session-fork"
+            },
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionForkOutcome::Committed {
+            created,
+            envelopes: child_envelopes,
+        })
+    }
+
     /// Looks up a committed `branch.create` response before mutable branch,
     /// generation, or attachment validation (R2 response-loss replay).
     pub fn branch_create_receipt(
@@ -5053,6 +5508,7 @@ impl Store {
             command.source_branch_id.as_ref(),
             &command.fork_node_id,
             command.fork_seq,
+            None,
         )?;
 
         let now = now_ms()?;
@@ -5162,6 +5618,52 @@ impl Store {
             created,
             envelope: Box::new(envelopes.remove(0)),
         })
+    }
+
+    /// Returns the generation embedded in an existing receipt request.
+    ///
+    /// This is intentionally method-fenced and returns no request or response
+    /// bytes. It lets a higher-level idempotent door reconstruct the exact
+    /// canonical request generation after a daemon restart without exposing a
+    /// generic receipt-inspection surface.
+    pub fn command_receipt_worker_generation(
+        &self,
+        command_id: &str,
+        expected_method: &str,
+    ) -> StoreResult<Option<u64>> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT method, request_json FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let Some((method, request_json)) = row else {
+            return Ok(None);
+        };
+        if method != expected_method {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "command id was already used by a different canonical method",
+                false,
+            ));
+        }
+        let request: serde_json::Value = serde_json::from_str(&request_json).map_err(|error| {
+            corrupt(format!(
+                "{expected_method} receipt request JSON is invalid: {error}"
+            ))
+        })?;
+        request
+            .get("worker_generation")
+            .and_then(serde_json::Value::as_u64)
+            .map(Some)
+            .ok_or_else(|| {
+                corrupt(format!(
+                    "{expected_method} receipt request has no worker generation"
+                ))
+            })
     }
 
     /// Looks up a committed `session.select_model` response before session,
@@ -13128,12 +13630,299 @@ fn branch_lineage_scopes(
     Ok(scopes)
 }
 
+fn validate_metafork_commit(
+    fork: &SessionForkCommand,
+    command: &SessionMetaforkCommit,
+) -> StoreResult<()> {
+    const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
+    const MAX_REASON_BYTES: usize = 4 * 1024;
+    const MAX_REMOVALS: usize = 256;
+    if command.description.trim().is_empty()
+        || command.description.len() > MAX_DESCRIPTION_BYTES
+        || command.model_proposal.removals.is_empty()
+        || command.model_proposal.removals.len() > MAX_REMOVALS
+    {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "metafork description and bounded non-empty model proposal are required",
+            false,
+        ));
+    }
+    let mut reviewed_event_count = 0_usize;
+    for (index, removal) in command.model_proposal.removals.iter().enumerate() {
+        if removal.from_seq == 0
+            || removal.through_seq < removal.from_seq
+            || removal.reason.trim().is_empty()
+            || removal.reason.len() > MAX_REASON_BYTES
+            || removal
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.trim().is_empty() || preview.len() > 2 * 1024)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "metafork removal ranges and reasons must be valid",
+                false,
+            ));
+        }
+        reviewed_event_count = reviewed_event_count.saturating_add(removal.reviewed_events.len());
+        if reviewed_event_count > 512
+            || removal.reviewed_events.iter().any(|event| {
+                event.source_seq < removal.from_seq
+                    || event.source_seq > removal.through_seq
+                    || event.source_event_id.as_str().is_empty()
+                    || event.payload_kind.trim().is_empty()
+                    || event.excerpt.is_empty()
+                    || event.excerpt.len() > 384
+            })
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "metafork reviewed-event roster must be bounded and remain inside its range",
+                false,
+            ));
+        }
+        if command
+            .model_proposal
+            .removals
+            .iter()
+            .take(index)
+            .any(|prior| {
+                removal.from_seq <= prior.through_seq && prior.from_seq <= removal.through_seq
+            })
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "metafork removal ranges must not overlap",
+                false,
+            ));
+        }
+    }
+    let expected = SessionMetaforkReviewManifest {
+        command_id: fork.command_id.clone(),
+        source_session_id: fork.source_session_id.clone(),
+        worker_generation: fork.worker_generation,
+        source_branch_id: fork.source_branch_id.clone(),
+        fork_node_id: fork.fork_node_id.clone(),
+        fork_seq: fork.fork_seq,
+        name: fork.name.clone(),
+        description: command.description.clone(),
+        model_proposal: command.model_proposal.clone(),
+    }
+    .digest()
+    .map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot digest metafork review manifest: {error}"),
+            false,
+        )
+    })?;
+    if command.accepted_proposal_digest != expected {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "metafork acceptance does not match the reviewed proposal",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn load_fork_source_envelopes(
+    connection: &Connection,
+    session_id: &SessionId,
+    fork_seq: u64,
+    scopes: &HashMap<Option<BranchId>, u64>,
+) -> StoreResult<Vec<RawEnvelope>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json, event_id, committed_at_ms
+             FROM events WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+        let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
+        let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            corrupt(format!(
+                "invalid fork-source envelope for session {session_id}, seq {stored_seq}: {error}"
+            ))
+        })?;
+        validate_stored_envelope(
+            session_id,
+            stored_seq,
+            &stored_event_id,
+            stored_committed_at_ms,
+            &envelope,
+        )?;
+        if envelope.seq <= fork_seq
+            && scopes
+                .get(&envelope.branch_id)
+                .is_some_and(|ceiling| envelope.seq <= *ceiling)
+        {
+            envelopes.push(envelope);
+        }
+    }
+    Ok(envelopes)
+}
+
+fn remapped_fork_event_id(session_id: &SessionId, source_event_id: &EventId) -> EventId {
+    let digest = blake3::hash(
+        format!(
+            "session-fork-event-v1\0{}\0{}",
+            session_id.as_str(),
+            source_event_id.as_str()
+        )
+        .as_bytes(),
+    );
+    EventId::new(format!("session-fork-{}", digest.to_hex()))
+}
+
+fn fork_boundary_event_id(session_id: &SessionId, coordinate: &str) -> EventId {
+    let digest = blake3::hash(
+        format!(
+            "session-fork-boundary-v1\0{}\0{coordinate}",
+            session_id.as_str()
+        )
+        .as_bytes(),
+    );
+    EventId::new(format!("session-fork-boundary-{}", digest.to_hex()))
+}
+
+fn insert_forked_envelope(connection: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
+    let bytes = encode_envelope(envelope).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize forked envelope: {error}"),
+            false,
+        )
+    })?;
+    connection
+        .execute(
+            "INSERT INTO events(
+                session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                envelope.session_id.as_str(),
+                to_sqlite_integer(envelope.seq)?,
+                bytes,
+                envelope.event_id.as_str(),
+                to_sqlite_integer(envelope.committed_at_ms)?,
+                payload_kind(envelope),
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
+fn append_fork_boundary_closures(
+    connection: &Connection,
+    command: &SessionForkCommand,
+    now: u64,
+    envelopes: &mut Vec<RawEnvelope>,
+) -> StoreResult<()> {
+    let mut run_states = HashMap::<RunId, RunState>::new();
+    for envelope in envelopes.iter() {
+        if let Some(run_id) = envelope.run_id.clone()
+            && let Ok(EventPayload::RunState(state)) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        {
+            run_states.insert(run_id, state);
+        }
+    }
+    for (run_id, state) in run_states {
+        if state.is_terminal() {
+            continue;
+        }
+        let seq = u64::try_from(envelopes.len())
+            .map_err(|_| corrupt("forked journal is too large"))?
+            .checked_add(1)
+            .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
+        let envelope = EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: fork_boundary_event_id(
+                &command.session_id,
+                &format!("run:{}", run_id.as_str()),
+            ),
+            seq,
+            session_id: command.session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id),
+            agent_id: None,
+            device_id: command.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: command.worker_generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: now,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::RunState(RunState::Cancelled)).map_err(
+                |error| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        format!("cannot serialize fork run boundary: {error}"),
+                        false,
+                    )
+                },
+            )?,
+        };
+        insert_forked_envelope(connection, &envelope)?;
+        envelopes.push(envelope);
+    }
+    let seq = u64::try_from(envelopes.len())
+        .map_err(|_| corrupt("forked journal is too large"))?
+        .checked_add(1)
+        .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
+    let idle = EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: fork_boundary_event_id(&command.session_id, "session-idle"),
+        seq,
+        session_id: command.session_id.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: command.device_id.clone(),
+        authority_epoch: 0,
+        worker_generation: command.worker_generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: now,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::SessionState(SessionState::Idle {
+            interrupted: false,
+        }))
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize fork session boundary: {error}"),
+                false,
+            )
+        })?,
+    };
+    insert_forked_envelope(connection, &idle)?;
+    envelopes.push(idle);
+    Ok(())
+}
+
 fn validate_branch_fork(
     connection: &Connection,
     session_id: &SessionId,
     source_branch_id: Option<&BranchId>,
     fork_node_id: &NodeId,
     fork_seq: u64,
+    owner_agent_id: Option<&AgentId>,
 ) -> StoreResult<()> {
     let scopes = branch_lineage_scopes(connection, session_id, source_branch_id)?;
     let mut statement = connection
@@ -13155,7 +13944,7 @@ fn validate_branch_fork(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
         })?;
-        let admitted = envelope.agent_id.is_none()
+        let admitted = envelope.agent_id.as_ref() == owner_agent_id
             && scopes
                 .get(&envelope.branch_id)
                 .is_some_and(|ceiling| seq <= *ceiling);

@@ -12,6 +12,9 @@ use haider_protocol::graph::{EvidenceVerdict, GraphPhase, SHIP_LOOP_TEMPLATE};
 use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, MenuOption, MenuScope};
+use haider_protocol::session_fork::{
+    SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
+};
 use haider_protocol::state::RunState;
 use haider_store::{
     GraphEvidenceCommand, GraphPinCommand, SessionCreateCommand, ShellExecAcceptCommand,
@@ -471,17 +474,546 @@ impl FrameSink for CapturingFrameSink {
     }
 }
 
+/// MUTATION CHECK: route a proposal-only `session.metafork` through
+/// `fork_session` or claim its command receipt. Expected RUNTIME failure: the
+/// session roster gains a child, the source journal moves, or a receipt exists
+/// before the operator echoes the reviewed proposal digest.
+///
+/// MUTATION CHECK: remove the connection-local reviewed-manifest lookup.
+/// Expected RUNTIME failure: the direct accepted request commits without the
+/// operator ever receiving that command's review response.
+///
+/// MUTATION CHECK: digest only `model_proposal` instead of the full review
+/// manifest. Expected RUNTIME failure: the altered-description acceptance
+/// commits a child journaling an instruction the operator never reviewed.
+///
+/// MUTATION CHECK: change the review response to `review_manifest: None`.
+/// Expected RUNTIME failure: the operator cannot inspect the complete source,
+/// fork coordinate, child name, directive, and exact event roster being gated.
+#[tokio::test]
+async fn metafork_review_is_write_free_until_human_acceptance() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let source = SessionId::new("metafork-review-parent");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-metafork-review-parent".into(),
+        request_digest: "create-metafork-review-parent-digest".into(),
+        request_json: r#"{"session":"metafork-review-parent"}"#.into(),
+        session_id: source.clone(),
+        cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+            .expect("canonical cwd")
+            .to_string_lossy()
+            .into_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-metafork-review-parent"),
+        device_id: DeviceId::new("metafork-review-device"),
+    })
+    .await
+    .expect("create source");
+    let run_id = RunId::new("metafork-review-run");
+    hub.accept_internal_turn(TurnAcceptCommand {
+        command_id: "accept-metafork-review-turn".into(),
+        request_digest: "accept-metafork-review-turn-digest".into(),
+        request_json: r#"{"text":"review this chocolate event"}"#.into(),
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        branch_id: None,
+        run_id: run_id.clone(),
+        agent_id: None,
+        text: "review this chocolate event".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new("metafork-review-queued"),
+        user_event_id: EventId::new("metafork-review-user"),
+        active_event_id: EventId::new("metafork-review-active"),
+        device_id: DeviceId::new("metafork-review-device"),
+    })
+    .await
+    .expect("accept review source turn");
+    let mut done = [run_state_envelope(
+        &source,
+        &run_id,
+        store.worker_generation(),
+        "metafork-review-done",
+        RunState::Done,
+    )];
+    hub.append(&mut done)
+        .await
+        .expect("terminalize review source turn");
+    let source_events = store.read(&source, 0, 64).await.expect("source events");
+    let user_seq = source_events
+        .iter()
+        .find(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::UserMessage { ref text, .. })
+                    if text == "review this chocolate event"
+            )
+        })
+        .expect("review source user event")
+        .seq;
+    let (fork_node_id, fork_seq) = source_events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            (event.run_id.as_ref() == Some(&run_id)).then_some((node.node, event.seq))
+        })
+        .expect("review source fork node");
+    let source_before = store.read(&source, 0, 64).await.expect("source before");
+    let sessions_before = store.session_ids().await.expect("sessions before");
+    let command_id = haider_rpc::CommandId::new("metafork-review-command");
+    let proposal = SessionMetaforkProposal {
+        removals: vec![SessionMetaforkRemoval {
+            from_seq: user_seq,
+            through_seq: user_seq,
+            reason: "model proposal awaiting operator review".into(),
+            preview: Some("source sequence 1".into()),
+            reviewed_events: Vec::new(),
+        }],
+    };
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            haider_rpc::RequestId::new("metafork-review-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: source.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attach source control");
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            haider_rpc::RequestId::new("metafork-review-request"),
+            haider_rpc::RequestBody::SessionMetafork {
+                command_id: command_id.clone(),
+                session_id: source.clone(),
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: fork_node_id.clone(),
+                fork_seq,
+                name: Some("reviewed child".into()),
+                description: "remove the proposed source event".into(),
+                model_proposal: proposal,
+                accepted_proposal_digest: None,
+            },
+        )
+        .await
+        .expect("review response");
+    let (reviewed, review_manifest, reviewed_digest) = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                body:
+                    haider_rpc::ResponseBody::SessionMetafork {
+                        committed: false,
+                        session_id: None,
+                        model_proposal,
+                        review_manifest: Some(review_manifest),
+                        proposal_digest,
+                        ..
+                    },
+                ..
+            } => Some((
+                model_proposal.clone(),
+                review_manifest.clone(),
+                proposal_digest.clone(),
+            )),
+            _ => None,
+        })
+        .expect("write-free metafork review response");
+    assert_eq!(review_manifest.command_id, command_id.0);
+    assert_eq!(review_manifest.source_session_id, source);
+    assert_eq!(review_manifest.fork_node_id, fork_node_id);
+    assert_eq!(review_manifest.fork_seq, fork_seq);
+    assert_eq!(review_manifest.name.as_deref(), Some("reviewed child"));
+    assert_eq!(
+        review_manifest.description,
+        "remove the proposed source event"
+    );
+    assert_eq!(review_manifest.model_proposal, reviewed);
+    assert_eq!(
+        review_manifest.digest().expect("review manifest digest"),
+        reviewed_digest
+    );
+    let preview = reviewed.removals[0]
+        .preview
+        .as_deref()
+        .expect("source-derived removal preview");
+    assert_eq!(preview, "1 prompt-visible event(s); see reviewed_events");
+    assert!(!preview.contains("source sequence 1"));
+    assert_eq!(reviewed.removals[0].reviewed_events.len(), 1);
+    let reviewed_event = &reviewed.removals[0].reviewed_events[0];
+    assert_eq!(reviewed_event.source_seq, user_seq);
+    assert_eq!(reviewed_event.payload_kind, "user_message");
+    assert!(
+        reviewed_event
+            .excerpt
+            .contains("review this chocolate event")
+    );
+    let unreviewed_command = haider_rpc::CommandId::new("metafork-direct-accept-command");
+    let unreviewed_digest = SessionMetaforkReviewManifest {
+        command_id: unreviewed_command.0.clone(),
+        source_session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        fork_node_id: fork_node_id.clone(),
+        fork_seq,
+        name: Some("reviewed child".into()),
+        description: "remove the proposed source event".into(),
+        model_proposal: reviewed.clone(),
+    }
+    .digest()
+    .expect("unreviewed manifest digest");
+    connection
+        .request(
+            haider_rpc::RequestId::new("metafork-direct-accept-request"),
+            haider_rpc::RequestBody::SessionMetafork {
+                command_id: unreviewed_command.clone(),
+                session_id: source.clone(),
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: fork_node_id.clone(),
+                fork_seq,
+                name: Some("reviewed child".into()),
+                description: "remove the proposed source event".into(),
+                model_proposal: reviewed.clone(),
+                accepted_proposal_digest: Some(unreviewed_digest),
+            },
+        )
+        .await
+        .expect("direct acceptance is answered");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::Error { .. },
+        } if request_id.as_str() == "metafork-direct-accept-request"
+    )));
+    assert_eq!(
+        store.read(&source, 0, 64).await.expect("source after"),
+        source_before
+    );
+    assert_eq!(
+        store.session_ids().await.expect("sessions after"),
+        sessions_before
+    );
+    assert!(
+        store
+            .session_metafork_receipt(
+                command_id.0.clone(),
+                "unused-review-digest".into(),
+                "{}".into(),
+            )
+            .await
+            .expect("receipt lookup")
+            .is_none()
+    );
+
+    connection
+        .request(
+            haider_rpc::RequestId::new("metafork-altered-description"),
+            haider_rpc::RequestBody::SessionMetafork {
+                command_id: command_id.clone(),
+                session_id: source.clone(),
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: fork_node_id.clone(),
+                fork_seq,
+                name: Some("reviewed child".into()),
+                description: "an instruction that was not reviewed".into(),
+                model_proposal: reviewed.clone(),
+                accepted_proposal_digest: Some(reviewed_digest.clone()),
+            },
+        )
+        .await
+        .expect("altered acceptance is answered");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::Error { .. },
+        } if request_id.as_str() == "metafork-altered-description"
+    )));
+    assert_eq!(
+        store
+            .session_ids()
+            .await
+            .expect("sessions after altered accept"),
+        sessions_before
+    );
+
+    let accepted_request = haider_rpc::RequestBody::SessionMetafork {
+        command_id: command_id.clone(),
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        fork_node_id,
+        fork_seq,
+        name: Some("reviewed child".into()),
+        description: "remove the proposed source event".into(),
+        model_proposal: reviewed,
+        accepted_proposal_digest: Some(reviewed_digest),
+    };
+    connection
+        .request(
+            haider_rpc::RequestId::new("metafork-reviewed-accept"),
+            accepted_request.clone(),
+        )
+        .await
+        .expect("reviewed acceptance commits");
+    assert_eq!(
+        store
+            .read(&source, 0, 64)
+            .await
+            .expect("source after accept"),
+        source_before
+    );
+    assert_eq!(
+        store
+            .session_ids()
+            .await
+            .expect("sessions after accept")
+            .len(),
+        sessions_before.len() + 1
+    );
+    let first_commit = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    body @ haider_rpc::ResponseBody::SessionMetafork {
+                        committed: true, ..
+                    },
+            } if request_id.as_str() == "metafork-reviewed-accept" => Some(body.clone()),
+            _ => None,
+        })
+        .expect("committed metafork response");
+    connection
+        .request(
+            haider_rpc::RequestId::new("metafork-reviewed-replay"),
+            accepted_request,
+        )
+        .await
+        .expect("accepted receipt replay");
+    let replay_commit = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    body @ haider_rpc::ResponseBody::SessionMetafork {
+                        committed: true, ..
+                    },
+            } if request_id.as_str() == "metafork-reviewed-replay" => Some(body.clone()),
+            _ => None,
+        })
+        .expect("replayed metafork response");
+    assert_eq!(replay_commit, first_commit);
+    assert!(
+        store
+            .session_metafork_receipt(
+                unreviewed_command.0,
+                "unused-direct-digest".into(),
+                "{}".into(),
+            )
+            .await
+            .expect("direct receipt lookup")
+            .is_none()
+    );
+
+    drop(connection);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 #[derive(Default)]
-struct RefusingRequiredFrameSink(AtomicBool);
+struct RefusingRequiredFrameSink {
+    accepted_baseline: AtomicBool,
+    closed: AtomicBool,
+}
 
 impl FrameSink for RefusingRequiredFrameSink {
     fn try_send(&self, _frame: WireFrame) -> Result<(), FrameSendError> {
-        Err(FrameSendError)
+        if self.accepted_baseline.swap(true, Ordering::AcqRel) {
+            Err(FrameSendError)
+        } else {
+            Ok(())
+        }
     }
 
     fn close_after_required_delivery_failure(&self) {
-        self.0.store(true, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
     }
+}
+
+/// MUTATION CHECK: restore the one-line `visible()`-only baseline admission.
+/// Expected runtime failure: this never-bound viewer captures zero frames
+/// instead of one explicit unbound frame in the current daemon generation.
+#[tokio::test]
+async fn resident_session_binding_never_bound_viewer_receives_unbound_baseline() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let generation = store.worker_generation();
+    let sink = Arc::new(CapturingFrameSink::default());
+
+    let viewer = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("never-bound viewer opens");
+
+    assert_eq!(
+        sink.0.lock().expect("viewer frames").as_slice(),
+        &[WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: generation,
+        }]
+    );
+    viewer.close().await.expect("viewer closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: replace the one-line `visible()` baseline selection with
+/// the synthesized unbound tuple. Expected runtime failure: the late viewer
+/// receives `None` instead of the resident publisher's bound session.
+#[tokio::test]
+async fn resident_session_binding_bound_viewer_still_receives_binding_baseline() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session = SessionId::new("resident-binding-bound-baseline");
+    hub.create_internal_session(create_command(&session, "resident-binding-bound-baseline"))
+        .await
+        .expect("session created");
+    let generation = store.worker_generation();
+    let capabilities = std::collections::BTreeSet::from([
+        haider_rpc::Capability::Control,
+        haider_rpc::Capability::View,
+    ]);
+    let publisher = hub
+        .open_connection(
+            capabilities.clone(),
+            Arc::new(CapturingFrameSink::default()),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("publisher opens");
+    publisher
+        .resident_session_binding(Some(session.clone()), generation)
+        .await
+        .expect("publisher binds");
+    let sink = Arc::new(CapturingFrameSink::default());
+
+    let viewer = hub
+        .open_connection(
+            capabilities,
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("bound viewer opens");
+
+    assert_eq!(
+        sink.0.lock().expect("viewer frames").as_slice(),
+        &[WireFrame::ResidentSessionBinding {
+            session_id: Some(session),
+            worker_generation: generation,
+        }]
+    );
+    publisher.close().await.expect("publisher closes");
+    viewer.close().await.expect("viewer closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: change the one-line `if may_view_binding` baseline guard
+/// to `if false`. Expected runtime failure: the authorized viewer becomes
+/// indistinguishable from the capability-empty connection because both
+/// capture zero frames.
+#[tokio::test]
+async fn resident_session_binding_unbound_baseline_is_distinct_from_silence() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let generation = store.worker_generation();
+    let viewer_sink = Arc::new(CapturingFrameSink::default());
+    let silent_sink = Arc::new(CapturingFrameSink::default());
+
+    let viewer = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            viewer_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("viewer opens");
+    let capability_empty = hub
+        .open_connection(
+            std::collections::BTreeSet::new(),
+            silent_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("capability-empty connection opens");
+
+    assert_eq!(
+        viewer_sink.0.lock().expect("viewer frames").as_slice(),
+        &[WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: generation,
+        }],
+        "authorized absence is an explicit frame"
+    );
+    assert!(
+        silent_sink.0.lock().expect("silent frames").is_empty(),
+        "the capability-empty connection demonstrates actual no-frame silence"
+    );
+    viewer.close().await.expect("viewer closes");
+    capability_empty
+        .close()
+        .await
+        .expect("capability-empty connection closes");
+    hub.shutdown().await.expect("hub stops");
 }
 
 /// MUTATION CHECK: replace the retained baseline read in `open_connection`
@@ -524,7 +1056,7 @@ async fn resident_session_binding_recovers_refusal_with_late_subscriber_baseline
         .await
         .expect("binding is retained despite observer refusal");
     assert!(
-        refusing_sink.0.load(Ordering::Acquire),
+        refusing_sink.closed.load(Ordering::Acquire),
         "required-state refusal closes the stale transport"
     );
     refused_observer
@@ -610,10 +1142,16 @@ async fn resident_session_binding_old_owner_cannot_clear_replacement() {
     first.close().await.expect("old publisher closes");
     assert_eq!(
         observer_sink.0.lock().expect("observer frames").as_slice(),
-        &[WireFrame::ResidentSessionBinding {
-            session_id: Some(session),
-            worker_generation: generation,
-        }],
+        &[
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: generation,
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(session),
+                worker_generation: generation,
+            },
+        ],
         "old-owner close cannot append an unbind"
     );
 
@@ -691,6 +1229,10 @@ async fn resident_session_binding_restores_live_predecessor() {
     assert_eq!(
         observer_sink.0.lock().expect("observer frames").as_slice(),
         &[
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: generation,
+            },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(first_session.clone()),
                 worker_generation: generation,
@@ -818,6 +1360,10 @@ async fn resident_session_binding_fans_out_bind_rebind_and_unbind() {
         observer_sink.0.lock().expect("observer frames").as_slice(),
         &[
             WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: generation,
+            },
+            WireFrame::ResidentSessionBinding {
                 session_id: Some(first),
                 worker_generation: generation,
             },
@@ -886,10 +1432,16 @@ async fn resident_session_binding_discards_stale_generation_after_rebind() {
 
     assert_eq!(
         observer_sink.0.lock().expect("observer frames").as_slice(),
-        &[WireFrame::ResidentSessionBinding {
-            session_id: Some(current),
-            worker_generation: generation,
-        }]
+        &[
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: generation,
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(current),
+                worker_generation: generation,
+            },
+        ]
     );
     assert!(
         publisher_sink
@@ -933,6 +1485,7 @@ async fn session_pipe_path_resolves_absolute_path_and_rejects_unknown_session() 
             crate::accounts::ConnectionTransport::LocalSameUid,
         )
         .expect("view connection");
+    sink.0.lock().expect("frames").clear();
     connection
         .request(
             haider_rpc::RequestId::new("pipe-path-happy"),
@@ -1019,6 +1572,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
             crate::accounts::ConnectionTransport::LocalSameUid,
         )
         .expect("view connection");
+    view_sink.0.lock().expect("view frames").clear();
     view.request(
         haider_rpc::RequestId::new("view-refresh"),
         haider_rpc::RequestBody::ProviderModelsRefresh {
@@ -1047,6 +1601,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
             crate::accounts::ConnectionTransport::LocalSameUid,
         )
         .expect("control connection");
+    control_sink.0.lock().expect("control frames").clear();
     control
         .request(
             haider_rpc::RequestId::new("control-refresh"),
@@ -3069,6 +3624,7 @@ async fn transcription_request(
         .await
         .expect("request routes");
     let mut frames = sink.0.lock().expect("frames");
+    frames.retain(|frame| !matches!(frame, WireFrame::ResidentSessionBinding { .. }));
     let frame = frames.pop().expect("one correlated response");
     assert!(frames.is_empty(), "exactly one response per request");
     drop(frames);

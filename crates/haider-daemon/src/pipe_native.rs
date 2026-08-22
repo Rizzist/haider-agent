@@ -15,7 +15,9 @@
 //! version bump rebuilds the complete reachable chain from the authoritative
 //! journal and atomically replaces the stable root last; old-generation
 //! successor files are unreachable historical debris, never mixed into the
-//! new chain.
+//! new chain. First-touch reconciliation follows the live root's successor
+//! pointers to prove the complete reachable set before sweeping that debris;
+//! an uncertain chain always leaves every file untouched.
 
 use haider_core::{SqliteStoreHandle, StoreHandle};
 use haider_protocol::envelope::RawEnvelope;
@@ -210,6 +212,7 @@ impl PipeNativeWriter {
                     .await?
             }
         };
+        sweep_orphan_segments_best_effort(&reconciled.base_path, session_id).await;
         self.reconciled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -406,6 +409,7 @@ impl PipeNativeWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
+        let first_touch = known.is_none();
 
         let dirty = self
             .dirty
@@ -458,6 +462,10 @@ impl PipeNativeWriter {
                 }
             }
         };
+
+        if first_touch {
+            sweep_orphan_segments_best_effort(&state.base_path, session_id).await;
+        }
 
         self.reconciled
             .lock()
@@ -822,6 +830,467 @@ fn segment_path(
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| PipeNativeError("sidecar path has no UTF-8 file stem".into()))?;
     Ok(parent.join(format!("{stem}.g{generation}.s{segment}.pipe")))
+}
+
+async fn sweep_orphan_segments_best_effort(base_path: &Path, session_id: &SessionId) {
+    let base_path = base_path.to_owned();
+    let session_for_sweep = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        sweep_orphan_segments_blocking(&base_path, &session_for_sweep)
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "native pipe orphan sweep skipped; live chain was left untouched"
+        ),
+        Err(error) => tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "native pipe orphan sweep task failed; live chain was left untouched"
+        ),
+    }
+}
+
+/// Deletes only same-session segment files proven unreachable from the live
+/// root. Reachability is a property of the on-disk successor pointers, never
+/// of generation/segment-looking filename adjacency. The full pointer walk
+/// and candidate discovery both complete before the first unlink.
+fn sweep_orphan_segments_blocking(
+    base_path: &Path,
+    session_id: &SessionId,
+) -> Result<usize, PipeNativeError> {
+    let reachable = reachable_sidecar_paths(base_path, session_id)?;
+    let candidates = orphan_segment_candidates(base_path, session_id, &reachable)?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let mut swept = 0;
+    for candidate in &candidates {
+        if quarantine_and_sweep_candidate(base_path, session_id, candidate)? {
+            swept += 1;
+        }
+    }
+    let parent = base_path
+        .parent()
+        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+    File::open(parent)?.sync_all()?;
+    Ok(swept)
+}
+
+/// Atomically detaches a candidate pathname before trusting its contents,
+/// then repeats both ownership validation and the live-root pointer walk.
+/// The profile singleton and per-session writer serialize cooperating chain
+/// mutations; quarantine additionally prevents a pathname replacement from
+/// making us unlink bytes other than the bytes inspected here.
+fn quarantine_and_sweep_candidate(
+    base_path: &Path,
+    session_id: &SessionId,
+    candidate: &Path,
+) -> Result<bool, PipeNativeError> {
+    let Some(quarantine) = quarantine_candidate(base_path, candidate)? else {
+        return Ok(false);
+    };
+    let header = match read_sidecar_header_without_following(&quarantine) {
+        Ok(header) => header,
+        Err(error) => {
+            restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
+                PipeNativeError(format!(
+                    "{error}; quarantined file was preserved but could not be restored: {restore_error}"
+                ))
+            })?;
+            return Err(error);
+        }
+    };
+    let owns_segment = match header_owns_segment(base_path, session_id, candidate, &header) {
+        Ok(owns_segment) => owns_segment,
+        Err(error) => {
+            restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
+                PipeNativeError(format!(
+                    "{error}; quarantined file was preserved but could not be restored: {restore_error}"
+                ))
+            })?;
+            return Err(error);
+        }
+    };
+    if !owns_segment {
+        let error = PipeNativeError(format!(
+            "quarantined sidecar candidate changed ownership: {}",
+            candidate.display()
+        ));
+        restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
+            PipeNativeError(format!(
+                "{error}; quarantined file was preserved but could not be restored: {restore_error}"
+            ))
+        })?;
+        return Err(error);
+    }
+    let reachable = match reachable_sidecar_paths(base_path, session_id) {
+        Ok(reachable) => reachable,
+        Err(error) => {
+            restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
+                PipeNativeError(format!(
+                    "{error}; quarantined file was preserved but could not be restored: {restore_error}"
+                ))
+            })?;
+            return Err(error);
+        }
+    };
+    if reachable.contains(&quarantine) {
+        // The live chain now names the quarantine path. Moving or deleting it
+        // would destroy history, so preserve it exactly where the pointer found it.
+        return Err(PipeNativeError(format!(
+            "quarantined sidecar candidate became reachable: {}",
+            quarantine.display()
+        )));
+    }
+    if reachable.contains(candidate) {
+        let error = PipeNativeError(format!(
+            "sidecar candidate pathname became reachable while quarantined: {}",
+            candidate.display()
+        ));
+        restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
+            PipeNativeError(format!(
+                "{error}; quarantined file was preserved but could not be restored: {restore_error}"
+            ))
+        })?;
+        return Err(error);
+    }
+    std::fs::remove_file(&quarantine)?;
+    Ok(true)
+}
+
+fn quarantine_candidate(
+    base_path: &Path,
+    candidate: &Path,
+) -> Result<Option<PathBuf>, PipeNativeError> {
+    let parent = base_path
+        .parent()
+        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+    let stem = base_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| PipeNativeError("sidecar path has no UTF-8 file stem".into()))?;
+    loop {
+        let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let quarantine = parent.join(format!(
+            ".{stem}.orphan-sweep-{}-{suffix}.tmp",
+            std::process::id()
+        ));
+        match rename_noreplace(candidate, &quarantine) {
+            Ok(()) => return Ok(Some(quarantine)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn restore_quarantined_candidate(
+    quarantine: &Path,
+    candidate: &Path,
+) -> Result<(), PipeNativeError> {
+    rename_noreplace(quarantine, candidate).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        from,
+        rustix::fs::CWD,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.try_exists()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "sidecar quarantine destination already exists",
+        ));
+    }
+    std::fs::rename(from, to)
+}
+
+fn reachable_sidecar_paths(
+    base_path: &Path,
+    session_id: &SessionId,
+) -> Result<HashSet<PathBuf>, PipeNativeError> {
+    let parent = base_path
+        .parent()
+        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+    let mut reachable = HashSet::new();
+    let mut current_path = base_path.to_owned();
+    let mut expected_segment = 0_u64;
+    let mut expected_starts_after = 0_u64;
+    let mut chain_generation = None;
+    loop {
+        if !reachable.insert(current_path.clone()) {
+            return Err(PipeNativeError(
+                "sidecar successor chain contains a loop".into(),
+            ));
+        }
+        let data = read_sidecar_without_following(&current_path)?;
+        if data.is_empty() || !data.ends_with(b"\n") {
+            return Err(PipeNativeError(format!(
+                "sidecar chain member is empty or torn: {}",
+                current_path.display()
+            )));
+        }
+        let text = std::str::from_utf8(&data).map_err(|_| {
+            PipeNativeError(format!(
+                "sidecar chain member is not UTF-8: {}",
+                current_path.display()
+            ))
+        })?;
+        let mut lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
+        let header_line = lines.next().ok_or_else(|| {
+            PipeNativeError(format!(
+                "sidecar chain member has no header: {}",
+                current_path.display()
+            ))
+        })?;
+        let header: SidecarHeader = serde_json::from_str(header_line).map_err(|error| {
+            PipeNativeError(format!(
+                "sidecar chain header is unreadable at {}: {error}",
+                current_path.display()
+            ))
+        })?;
+        let generation = chain_generation.unwrap_or(header.generation);
+        if header.pipe != SIDECAR_MAGIC
+            || header.version != SIDECAR_VERSION
+            || header.session_id != session_id.as_str()
+            || header.generation == 0
+            || header.generation != generation
+            || header.segment != expected_segment
+            || header.starts_after != expected_starts_after
+        {
+            return Err(PipeNativeError(format!(
+                "sidecar chain header does not match the live root at {}",
+                current_path.display()
+            )));
+        }
+        chain_generation = Some(generation);
+
+        let body = lines
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+                    PipeNativeError(format!(
+                        "sidecar chain row is unreadable at {}: {error}",
+                        current_path.display()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(tail) = body.last() else {
+            return Ok(reachable);
+        };
+        if body[..body.len() - 1]
+            .iter()
+            .any(|value| value.get("segment_end").is_some())
+        {
+            return Err(PipeNativeError(format!(
+                "sidecar chain has a non-final terminator at {}",
+                current_path.display()
+            )));
+        }
+        if tail.get("segment_end").is_some() {
+            let end: SidecarSegmentEnd = serde_json::from_value(tail.clone()).map_err(|error| {
+                PipeNativeError(format!(
+                    "sidecar chain terminator is unreadable at {}: {error}",
+                    current_path.display()
+                ))
+            })?;
+            let previous_is_boundary =
+                body.get(body.len().saturating_sub(2))
+                    .is_some_and(|previous| {
+                        previous.get("kind").and_then(serde_json::Value::as_str)
+                            == Some("compaction_boundary")
+                            && previous.get("seq").and_then(serde_json::Value::as_u64)
+                                == Some(end.coverage)
+                    });
+            if end.segment_end != "sealed"
+                || end.generation != generation
+                || end.coverage < expected_starts_after
+                || !previous_is_boundary
+            {
+                return Err(PipeNativeError(format!(
+                    "sidecar chain terminator is inconsistent at {}",
+                    current_path.display()
+                )));
+            }
+            current_path = direct_successor_path(parent, &end.successor)?;
+            expected_segment = expected_segment
+                .checked_add(1)
+                .ok_or_else(|| PipeNativeError("sidecar segment ordinal exhausted".into()))?;
+            expected_starts_after = end.coverage;
+            continue;
+        }
+
+        let boundary_shaped = tail.get("kind").and_then(serde_json::Value::as_str)
+            == Some("compaction_boundary")
+            && tail
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .is_some();
+        let row_shaped = tail
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|role| matches!(role, "user" | "assistant" | "error" | "tool"))
+            && tail
+                .get("at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some();
+        let coverage_shaped = tail
+            .get("coverage")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+            && tail.get("generation").and_then(serde_json::Value::as_u64) == Some(generation);
+        if boundary_shaped || (!row_shaped && !coverage_shaped) {
+            return Err(PipeNativeError(format!(
+                "sidecar chain has an invalid active tail at {}",
+                current_path.display()
+            )));
+        }
+        let seq = tail
+            .get(if row_shaped { "seq" } else { "coverage" })
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                PipeNativeError(format!(
+                    "sidecar chain tail has no sequence at {}",
+                    current_path.display()
+                ))
+            })?;
+        if seq < expected_starts_after {
+            return Err(PipeNativeError(format!(
+                "sidecar chain tail regresses coverage at {}",
+                current_path.display()
+            )));
+        }
+        return Ok(reachable);
+    }
+}
+
+fn direct_successor_path(parent: &Path, successor: &str) -> Result<PathBuf, PipeNativeError> {
+    let mut components = Path::new(successor).components();
+    let Some(std::path::Component::Normal(filename)) = components.next() else {
+        return Err(PipeNativeError(
+            "sidecar successor is not one direct-child filename".into(),
+        ));
+    };
+    if components.next().is_some() {
+        return Err(PipeNativeError(
+            "sidecar successor is not one direct-child filename".into(),
+        ));
+    }
+    Ok(parent.join(filename))
+}
+
+fn orphan_segment_candidates(
+    base_path: &Path,
+    session_id: &SessionId,
+    reachable: &HashSet<PathBuf>,
+) -> Result<Vec<PathBuf>, PipeNativeError> {
+    let parent = base_path
+        .parent()
+        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+    let stem = base_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| PipeNativeError("sidecar path has no UTF-8 file stem".into()))?;
+    let prefix = format!("{stem}.g");
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let Some(filename) = filename.to_str() else {
+            continue;
+        };
+        if !filename.starts_with(&prefix) || !filename.ends_with(".pipe") {
+            continue;
+        }
+        let path = entry.path();
+        if reachable.contains(&path) || entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let Ok(header) = read_sidecar_header_without_following(&path) else {
+            // An unreadable candidate is not proven to be ours.
+            continue;
+        };
+        if header_owns_segment(base_path, session_id, &path, &header)? {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
+fn header_owns_segment(
+    base_path: &Path,
+    session_id: &SessionId,
+    candidate_path: &Path,
+    header: &SidecarHeader,
+) -> Result<bool, PipeNativeError> {
+    if header.pipe != SIDECAR_MAGIC
+        || header.session_id != session_id.as_str()
+        || header.generation == 0
+        || header.segment == 0
+    {
+        return Ok(false);
+    }
+    // The header, not parsed filename components, proves both ownership and
+    // the canonical segment filename. It conveys no reachability; that comes
+    // exclusively from the live-root pointer walk.
+    Ok(segment_path(base_path, header.generation, header.segment)? == candidate_path)
+}
+
+fn read_sidecar_header_without_following(path: &Path) -> Result<SidecarHeader, PipeNativeError> {
+    let mut file = open_sidecar_readonly(path)?;
+    let mut header = String::new();
+    BufReader::new(&mut file).read_line(&mut header)?;
+    serde_json::from_str(header.trim_end_matches('\n')).map_err(|error| {
+        PipeNativeError(format!(
+            "sidecar candidate header is unreadable at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_sidecar_without_following(path: &Path) -> Result<Vec<u8>, PipeNativeError> {
+    let mut file = open_sidecar_readonly(path)?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+#[cfg(unix)]
+fn open_sidecar_readonly(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn open_sidecar_readonly(path: &Path) -> std::io::Result<File> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sidecar path is a symlink",
+        ));
+    }
+    OpenOptions::new().read(true).open(path)
 }
 
 fn segment_end_line(
@@ -1314,4 +1783,156 @@ async fn finish_temp(file: File, temp_path: PathBuf, path: PathBuf) -> Result<()
     })
     .await
     .map_err(|error| PipeNativeError(format!("sidecar rebuild finalize task failed: {error}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// MUTATION CHECK: remove the one-line boot-path
+    /// `sweep_orphan_segments_best_effort` call. Expected RUNTIME failure:
+    /// the old-generation orphan remains after boot reconciliation succeeds.
+    #[tokio::test]
+    async fn boot_first_touch_sweeps_previous_generation_orphan() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let writer = PipeNativeWriter::new(root.path());
+        let session_id = SessionId::new("pipe-boot-orphan-sweep");
+        let base = writer.sidecar_path(&session_id).expect("sidecar path");
+        std::fs::create_dir_all(base.parent().expect("pipe directory"))
+            .expect("pipe directory creates");
+        std::fs::write(
+            &base,
+            format!(
+                "{}{}",
+                header_line(&session_id, 7, 0, 0).expect("root header serializes"),
+                coverage_line(0, 7).expect("root coverage serializes")
+            ),
+        )
+        .expect("root fixture writes");
+        let orphan = segment_path(&base, 6, 1).expect("orphan path");
+        std::fs::write(
+            &orphan,
+            format!(
+                "{}{}",
+                header_line(&session_id, 6, 1, 0).expect("orphan header serializes"),
+                coverage_line(0, 6).expect("orphan coverage serializes")
+            ),
+        )
+        .expect("orphan fixture writes");
+
+        writer
+            .maintain_from_boot_journal(&store, &session_id, &[])
+            .await
+            .expect("boot reconciliation succeeds");
+
+        assert!(base.exists(), "live root survives boot sweep");
+        assert!(!orphan.exists(), "old-generation orphan is swept");
+        drop(writer);
+        store.close().await.expect("store closes");
+    }
+
+    /// MUTATION CHECK: delete the one-line post-quarantine ownership
+    /// revalidation. Expected RUNTIME failure: a foreign file replacing the
+    /// discovered candidate is unlinked instead of restored intact.
+    #[test]
+    fn orphan_sweep_revalidates_the_exact_quarantined_file() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let session_id = SessionId::new("pipe-quarantine-owner");
+        let foreign_session = SessionId::new("pipe-quarantine-foreign");
+        let base = root.path().join("pipe-quarantine-owner.pipe");
+        std::fs::write(
+            &base,
+            format!(
+                "{}{}",
+                header_line(&session_id, 7, 0, 0).expect("root header serializes"),
+                coverage_line(0, 7).expect("root coverage serializes")
+            ),
+        )
+        .expect("root fixture writes");
+        let candidate = segment_path(&base, 6, 1).expect("candidate path");
+        std::fs::write(
+            &candidate,
+            format!(
+                "{}{}",
+                header_line(&session_id, 6, 1, 0).expect("candidate header serializes"),
+                coverage_line(0, 6).expect("candidate coverage serializes")
+            ),
+        )
+        .expect("candidate fixture writes");
+        let reachable = reachable_sidecar_paths(&base, &session_id).expect("live chain validates");
+        let candidates =
+            orphan_segment_candidates(&base, &session_id, &reachable).expect("candidates list");
+        assert_eq!(candidates, vec![candidate.clone()]);
+
+        let foreign_contents = format!(
+            "{}{}",
+            header_line(&foreign_session, 6, 1, 0).expect("foreign header serializes"),
+            coverage_line(0, 6).expect("foreign coverage serializes")
+        );
+        std::fs::write(&candidate, &foreign_contents).expect("candidate replacement writes");
+
+        assert!(
+            quarantine_and_sweep_candidate(&base, &session_id, &candidate).is_err(),
+            "ownership change aborts the sweep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&candidate).expect("replacement survives"),
+            foreign_contents
+        );
+    }
+
+    /// MUTATION CHECK: return the partial reachable set when the one-line
+    /// successor read reports a torn file. Expected RUNTIME failure: the
+    /// orphan sentinel is deleted even though the live chain is uncertain.
+    #[test]
+    fn orphan_sweep_with_torn_reachable_chain_deletes_nothing() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let session_id = SessionId::new("pipe-torn-sweep");
+        let base = root.path().join("pipe-torn-sweep.pipe");
+        let reachable_successor = segment_path(&base, 7, 1).expect("successor path");
+        let mut root_segment = header_line(&session_id, 7, 0, 0).expect("root header serializes");
+        root_segment.push_str("{\"kind\":\"compaction_boundary\",\"seq\":4}\n");
+        root_segment.push_str(
+            &segment_end_line(4, 7, &reachable_successor).expect("terminator serializes"),
+        );
+        std::fs::write(&base, root_segment).expect("root fixture writes");
+        std::fs::write(
+            &reachable_successor,
+            header_line(&session_id, 7, 1, 4).expect("successor header serializes"),
+        )
+        .expect("successor fixture writes");
+        OpenOptions::new()
+            .append(true)
+            .open(&reachable_successor)
+            .expect("successor opens")
+            .write_all(b"{\"coverage\":4,\"generation\":7}")
+            .expect("torn tail writes");
+        let orphan = segment_path(&base, 6, 1).expect("orphan path");
+        std::fs::write(
+            &orphan,
+            format!(
+                "{}{}",
+                header_line(&session_id, 6, 1, 0).expect("orphan header serializes"),
+                coverage_line(0, 6).expect("orphan coverage serializes")
+            ),
+        )
+        .expect("orphan fixture writes");
+
+        assert!(
+            sweep_orphan_segments_blocking(&base, &session_id).is_err(),
+            "a torn reachable successor makes the sweep uncertain"
+        );
+        assert!(
+            orphan.exists(),
+            "uncertain reachability must leave every orphan candidate untouched"
+        );
+        assert!(base.exists(), "the live root remains untouched");
+        assert!(
+            reachable_successor.exists(),
+            "the torn reachable segment remains untouched"
+        );
+    }
 }
