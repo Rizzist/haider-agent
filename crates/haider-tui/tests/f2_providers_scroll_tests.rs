@@ -180,10 +180,12 @@ fn add_login_buttons_pin_at_the_bottom() {
     // U1 widened the footer to FOUR button rows (OpenCode Zen/Go joined the
     // HF row's band); G4a added the local-preset row (Ollama/LM Studio) and
     // split the key map into action + preset hint lines; G4b added the
-    // enterprise row (Azure/Bedrock/Vertex) and its own hint line, so the
-    // bottom band is footer(6) + hints(3) + status = 10.
+    // enterprise row (Azure/Bedrock/Vertex) and its own hint line; 940 added
+    // Haider Code, which did not fit on the six-button API row at 100 cols
+    // (~117 chars), so that row split 6 -> 4+3. Bottom band is now
+    // footer(7) + hints(3) + status = 11.
     assert!(
-        oauth_row >= rows.len() - 10,
+        oauth_row >= rows.len() - 11,
         "buttons pin at the bottom band (footer + status bar), not mid-page (row {oauth_row})"
     );
     // Same flows: the hits still carry the AccountAdd kinds.

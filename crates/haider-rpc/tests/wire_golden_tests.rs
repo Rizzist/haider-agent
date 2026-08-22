@@ -3295,3 +3295,80 @@ fn resident_session_binding_decodes_without_optional_fields() {
         bound
     );
 }
+
+/// MUTATION CHECK: flatten the plan snapshot, rename the feature bit, or
+/// derive allowance state from `percent_remaining`. Expected runtime failure:
+/// this exact typed frame/feature golden changes and the unknown state no
+/// longer survives its round trip verbatim.
+#[test]
+fn haider_code_plan_status_is_typed_tolerant_and_feature_detectable() {
+    use haider_protocol::ids::CredentialAlias;
+    use haider_protocol::usage::{HaiderCodeAllowanceStateV1, HaiderCodePlanOutcomeV1};
+
+    assert_eq!(
+        haider_rpc::FEATURE_HAIDER_CODE_PLAN_STATUS_V1,
+        "haider_code_plan_status_v1"
+    );
+    let value = serde_json::json!({
+        "v": 1,
+        "kind": "haider_code_plan_status",
+        "provider": "haider-code",
+        "account_alias": "haider-primary",
+        "outcome": {
+            "state": "indeterminate",
+            "snapshot": {
+                "plan": "go",
+                "weekly_allowance": {
+                    "percent_remaining": 99.0,
+                    "state": "warming",
+                    "future_window_field": true
+                },
+                "refresh_after_s": 37,
+                "future_account_field": {"safe": true}
+            }
+        },
+        "future_frame_field": "ignored"
+    });
+    let frame: WireFrame = serde_json::from_value(value).expect("typed plan frame decodes");
+    let WireFrame::HaiderCodePlanStatus {
+        provider,
+        account_alias,
+        outcome: HaiderCodePlanOutcomeV1::Indeterminate { snapshot },
+    } = &frame
+    else {
+        panic!("expected indeterminate Haider Code plan frame");
+    };
+    assert_eq!(provider, "haider-code");
+    assert_eq!(account_alias, &CredentialAlias::new("haider-primary"));
+    assert_eq!(snapshot.refresh_after_s, Some(37));
+    assert_eq!(
+        snapshot
+            .weekly_allowance
+            .as_ref()
+            .and_then(|allowance| allowance.state.as_ref()),
+        Some(&HaiderCodeAllowanceStateV1::Unknown("warming".into()))
+    );
+    assert_eq!(
+        serde_json::from_value::<WireFrame>(
+            serde_json::to_value(&frame).expect("typed plan frame encodes")
+        )
+        .expect("typed plan frame round trips"),
+        frame
+    );
+
+    let future: WireFrame = serde_json::from_value(serde_json::json!({
+        "v": 1,
+        "kind": "haider_code_plan_status",
+        "provider": "haider-code",
+        "account_alias": "haider-primary",
+        "outcome": {"state": "future_provider_outcome", "new": true}
+    }))
+    .expect("future outcome degrades");
+    assert!(matches!(
+        future,
+        WireFrame::HaiderCodePlanStatus {
+            outcome: HaiderCodePlanOutcomeV1::Unknown,
+            ..
+        }
+    ));
+}

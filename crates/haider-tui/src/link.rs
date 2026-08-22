@@ -1839,6 +1839,7 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         | WireFrame::Response { .. }
         | WireFrame::SessionRosterDelta { .. }
         | WireFrame::AccountsChanged { .. }
+        | WireFrame::HaiderCodePlanStatus { .. }
         | WireFrame::SessionSurfaceDelta { input: None, .. }
         | WireFrame::MenuAnswer { .. }
         | WireFrame::Ping { .. }

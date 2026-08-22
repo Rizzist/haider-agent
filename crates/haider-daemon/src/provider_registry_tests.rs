@@ -694,6 +694,43 @@ fn wh1_deepseek_registry_is_builtin_chat_completions_api_key() {
     );
 }
 
+/// MUTATION CHECK: remove the Haider Code seeded inventory row or change its
+/// auth/API-family fields. Expected runtime failure: provider listings lose
+/// the two first-party model aliases or advertise the wrong credential flow.
+#[test]
+fn haider_code_registry_is_builtin_chat_completions_api_key() {
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([HAIDER_CODE_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        model_source([]),
+    )
+    .expect("Haider Code provider registry");
+    let profile = registry
+        .get(HAIDER_CODE_PROVIDER_NAME)
+        .expect("Haider Code profile");
+    assert_eq!(profile.provenance, ProviderProvenance::BuiltIn);
+    assert_eq!(profile.configured_models, HAIDER_CODE_SEED_MODELS);
+
+    let summary = registry
+        .summary(HAIDER_CODE_PROVIDER_NAME, &|provider| {
+            provider == HAIDER_CODE_PROVIDER_NAME
+        })
+        .expect("Haider Code summary");
+    assert_eq!(summary.provider, HAIDER_CODE_PROVIDER_NAME);
+    assert_eq!(
+        summary.api_family,
+        ProviderApiFamilyWire::OpenAiChatCompletions
+    );
+    assert_eq!(summary.endpoint.as_deref(), Some(HAIDER_CODE_BASE_URL));
+    assert_eq!(summary.auth_methods, vec![AuthMethod::ApiKey]);
+    assert_eq!(summary.models, HAIDER_CODE_SEED_MODELS);
+    assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    assert_eq!(profile.default_model.as_deref(), Some("Go"));
+}
+
 /// MUTATION CHECK: xAI and Grok OAuth must remain two distinct release-owned
 /// profiles: API-key traffic uses api.x.ai while subscription traffic uses
 /// the dedicated CLI proxy and OAuth authentication.

@@ -455,6 +455,7 @@ async fn run_inner(
         resilience: _,
     } = accounts_runtime;
     let oauth_coordinator = accounts_facade.oauth.clone();
+    let account_management = accounts_facade.management.clone();
     hub.install_accounts(accounts_facade)
         .map_err(DaemonError::from)?;
     for work in recovered_work {
@@ -526,6 +527,13 @@ async fn run_inner(
             return Err(error);
         }
     };
+    let mut haider_code_plan_poller = credential_broker.clone().map(|broker| {
+        crate::haider_code_plan::HaiderCodePlanPoller::start_production(
+            hub.clone(),
+            account_management,
+            broker,
+        )
+    });
     let (drain_sender, drain_receiver) = watch::channel(Option::<DrainNotice>::None);
     // Every connection hands its writer task here; the barrier below owns
     // aborting and JOINING them, so no child outlives teardown (R17).
@@ -567,6 +575,9 @@ async fn run_inner(
         endpoint.close_listener();
         runtime.crash().await;
         worker_manager.crash().await;
+        if let Some(poller) = haider_code_plan_poller.as_mut() {
+            poller.abort_and_join().await;
+        }
         if let Some(broker) = &credential_broker {
             broker.abort_and_join().await;
         }
@@ -647,6 +658,15 @@ async fn run_inner(
             None
         }
     };
+    if let Some(poller) = haider_code_plan_poller.as_mut() {
+        match bounded_finalization(poller.shutdown(), barrier_deadline, &mut shutdown).await {
+            Some(true) => {}
+            Some(false) | None => {
+                forced = true;
+                poller.abort_and_join().await;
+            }
+        }
+    }
     // R10 drain: new account commands were already rejected by the hub's
     // draining flag; join the account actor (its in-flight login finishes or
     // the deadline forces it — pending receipts + reconciliation carry the

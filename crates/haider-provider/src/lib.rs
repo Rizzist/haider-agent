@@ -164,17 +164,19 @@ pub use gemini::{
 pub use openai::{
     CompatibleOriginPolicy, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
     GROK_OAUTH_BASE_URL, GROK_OAUTH_PROVIDER_NAME, GROK_SHELL_CLIENT_IDENTIFIER,
-    GROK_SHELL_CLIENT_MODE, GROK_SHELL_CLIENT_VERSION, GROK_XAI_TOKEN_AUTH, KIMI_OAUTH_BASE_URL,
-    KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig, KimiThinkingType, OPENAI_ALPHA_SEARCH_URL,
-    OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
-    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
-    OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
-    OpenAiTransportConfig, XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS,
-    XAI_SEED_MODELS, azure_openai_origin, codex_alpha_search_request_body,
-    codex_alpha_search_response_text, codex_alpha_search_url, grok_client_version,
-    openai_http_client_build_count, replay_deepseek_chat_sse, replay_deepseek_models_response,
-    replay_grok_chat_sse, replay_grok_models_response, replay_kimi_chat_sse,
+    GROK_SHELL_CLIENT_MODE, GROK_SHELL_CLIENT_VERSION, GROK_XAI_TOKEN_AUTH,
+    HAIDER_CODE_ACCOUNT_URL, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
+    HAIDER_CODE_SEED_MODELS, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig,
+    KimiThinkingType, OPENAI_ALPHA_SEARCH_URL, OPENAI_CODEX_RESPONSES_LITE_HEADER,
+    OPENAI_CODEX_RESPONSES_LITE_VALUE, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL,
+    OPENAI_SUBSCRIPTION_RESPONSES_URL, OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider,
+    OpenAiRetryPolicy, OpenAiTransportConfig, XAI_BASE_URL, XAI_PROVIDER_NAME,
+    XAI_SEED_MODEL_CONTEXT_WINDOWS, XAI_SEED_MODELS, azure_openai_origin,
+    codex_alpha_search_request_body, codex_alpha_search_response_text, codex_alpha_search_url,
+    grok_client_version, openai_http_client_build_count, replay_deepseek_chat_sse,
+    replay_deepseek_models_response, replay_grok_chat_sse, replay_grok_models_response,
+    replay_haider_code_chat_sse, replay_haider_code_models_response, replay_kimi_chat_sse,
     replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
     replay_openai_models_response, replay_openai_native_computer_sse, replay_openai_responses_sse,
     replay_xai_chat_sse, replay_xai_models_response, validate_openai_compatible_endpoint,
@@ -182,15 +184,17 @@ pub use openai::{
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{
     CACHE_PRICING_POLICIES, CachePricingPolicy, CacheReadSemantics, CacheRewarmEstimate,
-    CacheWriteTtl, MODEL_RATES, ModelRate, cache_pricing_policy, cache_pricing_policy_for,
-    estimate_cache_input_costs, estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd,
-    estimate_normalized_usage_cost_usd, model_rate,
+    CacheWriteTtl, HAIDER_CODE_PLAN_PRICES, HaiderCodePlanPrice, MODEL_RATES, ModelRate,
+    cache_pricing_policy, cache_pricing_policy_for, estimate_cache_input_costs,
+    estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd, estimate_normalized_usage_cost_usd,
+    model_rate,
 };
 pub use usage::{
     ANTHROPIC_OAUTH_USAGE_URL, ANTHROPIC_OAUTH_USAGE_USER_AGENT, KIMI_OAUTH_USAGE_URL,
     MeterReading, MeterUnavailable, OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint,
-    normalize_utilization, parse_anthropic_oauth_usage, parse_grok_billing, parse_kimi_usages,
-    parse_openai_wham_usage, parse_rfc3339_to_unix_ms,
+    normalize_utilization, parse_anthropic_oauth_usage, parse_grok_billing,
+    parse_haider_code_account, parse_kimi_usages, parse_openai_wham_usage,
+    parse_rfc3339_to_unix_ms,
 };
 pub use webfetch::{
     WEB_FETCH_MAX_REDIRECTS, WEB_FETCH_OUTPUT_CAP_BYTES, WebFetchExecution, WebFetchOutcome,
@@ -201,7 +205,7 @@ pub use webfetch::{
 /// Provider classes backed by production account credentials in this release.
 /// New named providers append to this stable roster; custom endpoint profiles
 /// remain a separate registry concern.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 12] = [
+pub const BUILTIN_PROVIDER_NAMES: [&str; 13] = [
     ANTHROPIC_PROVIDER_NAME,
     ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
@@ -214,6 +218,7 @@ pub const BUILTIN_PROVIDER_NAMES: [&str; 12] = [
     DEEPSEEK_PROVIDER_NAME,
     XAI_PROVIDER_NAME,
     GROK_OAUTH_PROVIDER_NAME,
+    HAIDER_CODE_PROVIDER_NAME,
 ];
 
 /// Provider-catalog declaration for PDF shaping. Every Anthropic Messages
@@ -1669,9 +1674,33 @@ mod e2_contract_tests {
 
     #[test]
     fn builtin_provider_roster_includes_both_xai_lanes() {
-        assert_eq!(BUILTIN_PROVIDER_NAMES.len(), 12);
+        assert_eq!(BUILTIN_PROVIDER_NAMES.len(), 13);
         assert!(BUILTIN_PROVIDER_NAMES.contains(&XAI_PROVIDER_NAME));
         assert!(BUILTIN_PROVIDER_NAMES.contains(&GROK_OAUTH_PROVIDER_NAME));
+        assert!(BUILTIN_PROVIDER_NAMES.contains(&HAIDER_CODE_PROVIDER_NAME));
+    }
+
+    /// MUTATION CHECK: record the monthly plans as token rates or change the
+    /// published 40/200 USD prices. Expected runtime failure: local usage
+    /// either fabricates per-token cost for a router plan or reports the
+    /// wrong subscription price.
+    #[test]
+    fn haider_code_plan_pricing_is_separate_from_token_rates() {
+        assert_eq!(
+            HAIDER_CODE_PLAN_PRICES,
+            [
+                HaiderCodePlanPrice {
+                    model: "Go",
+                    monthly_usd: 40.0,
+                },
+                HaiderCodePlanPrice {
+                    model: "Go Max",
+                    monthly_usd: 200.0,
+                },
+            ]
+        );
+        assert_eq!(model_rate("Go"), None);
+        assert_eq!(model_rate("Go Max"), None);
     }
 
     #[test]

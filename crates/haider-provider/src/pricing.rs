@@ -18,6 +18,29 @@
 //! price like their family. Unknown models price to `None` — the estimator
 //! never invents a rate.
 
+/// Published monthly subscription price for one Haider Code plan.
+///
+/// These are deliberately separate from [`ModelRate`]: `Go` and `Go Max`
+/// are subscription/router choices, not token-rate families, so treating
+/// 40/200 USD per month as a per-million-token rate would fabricate cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HaiderCodePlanPrice {
+    pub model: &'static str,
+    pub monthly_usd: f64,
+}
+
+/// Haider Code plan prices published at `https://haidercode.ai/pricing`.
+pub const HAIDER_CODE_PLAN_PRICES: &[HaiderCodePlanPrice] = &[
+    HaiderCodePlanPrice {
+        model: "Go",
+        monthly_usd: 40.0,
+    },
+    HaiderCodePlanPrice {
+        model: "Go Max",
+        monthly_usd: 200.0,
+    },
+];
+
 /// USD per million tokens for one model family.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelRate {

@@ -699,6 +699,11 @@ struct HubInner {
     commit_projection: Arc<CommitProjection>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     roster_publications: broadcast::Sender<SessionId>,
+    /// Coalescing wake for the Haider Code plan poller. The generation moves
+    /// only when attachment interest or a committed provider/model selection
+    /// changes; ordinary turn traffic cannot wake an unauthorized account
+    /// into a retry loop.
+    haider_code_plan_changes: watch::Sender<u64>,
     usage_report: Mutex<Option<Arc<crate::usage_report::UsageReportService>>>,
     /// W-A: the ONE in-memory projection of every session's background
     /// tasks. Hub-owned so every facade clone shares it; the journal's
@@ -749,6 +754,7 @@ pub(super) struct CommitProjection {
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     roster_publications: broadcast::Sender<SessionId>,
+    haider_code_plan_changes: watch::Sender<u64>,
 }
 
 impl CommitProjection {
@@ -763,6 +769,12 @@ impl CommitProjection {
         }
         if let Some(envelope) = envelopes.last() {
             let _ = self.roster_publications.send(envelope.session_id.clone());
+        }
+        if envelopes.iter().any(|envelope| {
+            haider_protocol::session::ModelSelected::from_payload_value(&envelope.payload).is_some()
+        }) {
+            self.haider_code_plan_changes
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
     }
 }
@@ -1413,12 +1425,14 @@ impl SessionHub {
         let append_commit_task = tokio::spawn(run_append_committer(store.clone(), append_receiver));
         let (surface_publications, _) = watch::channel(0_u64);
         let (roster_publications, _) = broadcast::channel(1_024);
+        let (haider_code_plan_changes, _) = watch::channel(0_u64);
         let hooks = Arc::new(Mutex::new(None));
         let observe_digests = Arc::new(rpc::ObserveDigestCache::default());
         let commit_projection = Arc::new(CommitProjection {
             hooks: Arc::clone(&hooks),
             observe_digests: Arc::clone(&observe_digests),
             roster_publications: roster_publications.clone(),
+            haider_code_plan_changes: haider_code_plan_changes.clone(),
         });
         let inner = Arc::new(HubInner {
             store,
@@ -1449,6 +1463,7 @@ impl SessionHub {
             commit_projection,
             observe_digests,
             roster_publications,
+            haider_code_plan_changes,
             usage_report: Mutex::new(None),
             tasks: crate::tasks::TaskRegistry::default(),
             web_degrade: Mutex::new(HashMap::new()),
@@ -1646,6 +1661,44 @@ impl SessionHub {
         &self,
     ) -> Result<Option<Arc<crate::usage_report::UsageReportService>>, SessionHubError> {
         Ok(lock(&self.inner.usage_report)?.clone())
+    }
+
+    pub(crate) fn subscribe_haider_code_plan_changes(&self) -> watch::Receiver<u64> {
+        self.inner.haider_code_plan_changes.subscribe()
+    }
+
+    fn notify_haider_code_plan_change(&self) {
+        self.inner
+            .haider_code_plan_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    pub(crate) fn attached_session_connections(
+        &self,
+    ) -> Result<Vec<(String, SessionId)>, SessionHubError> {
+        Ok(lock(&self.inner.attachments)?
+            .values()
+            .map(|owner| (owner.connection_id.clone(), owner.session_id.clone()))
+            .collect())
+    }
+
+    pub(crate) fn publish_haider_code_plan_status(
+        &self,
+        connection_ids: &[String],
+        frame: WireFrame,
+    ) {
+        let recipients = connection_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let Ok(sinks) = self.inner.diagnostic_sinks.lock() else {
+            return;
+        };
+        for (connection_id, sink) in sinks.iter() {
+            if recipients.contains(connection_id.as_str()) {
+                let _ = sink.try_send_droppable(frame.clone());
+            }
+        }
     }
 
     /// Installs the ONE `session.create` provider whitelist (D3-5): the
@@ -3275,6 +3328,7 @@ impl SessionHub {
             },
         );
         drop(deleting);
+        self.notify_haider_code_plan_change();
         Ok(RegisterResult::Registered(registration))
     }
 
@@ -3331,6 +3385,7 @@ impl SessionHub {
         if let Some(owner) = owner.as_ref() {
             let _ = owner.cancel.send(true);
             self.release_attachment_slot(&owner.connection_id);
+            self.notify_haider_code_plan_change();
         }
         Ok(owner)
     }

@@ -288,6 +288,9 @@ fn ungated_provider_button_is_honest() {
 /// `push_account_add_buttons`. Expected RUNTIME failure: the render and
 /// hit-region assertions below (on BOTH screens — the row is shared).
 /// Verified by revert on 2026-08-02.
+///
+/// MUTATION CHECK: drop `+ Haider Code (API)`. Expected runtime failure: the
+/// account surface loses its first-class API-key entry and hit region.
 #[test]
 fn providers_screen_shares_the_same_buttons() {
     let mut model = live_model(&["account_oauth_device_v1"]);
@@ -305,6 +308,7 @@ fn providers_screen_shares_the_same_buttons() {
         "gemini renders on /providers"
     );
     assert!(text.contains("[+ Grok (OAuth)]"));
+    assert!(text.contains("[+ Haider Code (API)]"));
     assert!(text.contains("[+ xAI (API)]"));
     assert!(
         hits.iter()
@@ -323,6 +327,10 @@ fn providers_screen_shares_the_same_buttons() {
     assert!(
         hits.iter()
             .any(|(_, hit)| matches!(hit, Hit::AccountAdd(AccountAddKind::XaiApi)))
+    );
+    assert!(
+        hits.iter()
+            .any(|(_, hit)| matches!(hit, Hit::AccountAdd(AccountAddKind::HaiderCodeApi)))
     );
 
     // A providers-screen click jumps home and opens the flow (the cards

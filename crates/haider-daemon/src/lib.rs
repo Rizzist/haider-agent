@@ -63,6 +63,9 @@ mod device_discovery;
 mod endpoint;
 mod error;
 mod gcloud;
+mod haider_code_plan;
+#[cfg(test)]
+mod haider_code_plan_tests;
 mod hooks;
 mod image_events;
 mod lifecycle;

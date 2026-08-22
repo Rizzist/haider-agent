@@ -1532,7 +1532,7 @@ fn push_account_add_buttons<'a>(
     lines_out: &mut Vec<Line<'a>>,
     rects_out: &mut Vec<(usize, u16, u16, Hit)>,
 ) {
-    let rows: [&[(&str, crate::app::AccountAddKind)]; 6] = [
+    let rows: [&[(&str, crate::app::AccountAddKind)]; 7] = [
         &[
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
             (
@@ -1549,6 +1549,12 @@ fn push_account_add_buttons<'a>(
             ("+ Kimi (OAuth)", crate::app::AccountAddKind::KimiOAuth),
             ("+ Grok (OAuth)", crate::app::AccountAddKind::GrokOAuth),
             ("+ Gemini (API)", crate::app::AccountAddKind::GeminiApi),
+        ],
+        &[
+            (
+                "+ Haider Code (API)",
+                crate::app::AccountAddKind::HaiderCodeApi,
+            ),
             ("+ DeepSeek (API)", crate::app::AccountAddKind::DeepSeekApi),
             ("+ xAI (API)", crate::app::AccountAddKind::XaiApi),
         ],

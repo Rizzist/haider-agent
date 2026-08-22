@@ -47,6 +47,10 @@ pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 /// returns the live inventory. V4 slugs deliberately come from `/models`
 /// rather than this fallback.
 pub const DEEPSEEK_SEED_MODELS: [&str; 2] = ["deepseek-chat", "deepseek-reasoner"];
+pub const HAIDER_CODE_PROVIDER_NAME: &str = "haider-code";
+pub const HAIDER_CODE_BASE_URL: &str = "https://haidercode.ai/v1";
+pub const HAIDER_CODE_ACCOUNT_URL: &str = "https://haidercode.ai/v1/account";
+pub const HAIDER_CODE_SEED_MODELS: [&str; 2] = ["Go", "Go Max"];
 pub const XAI_PROVIDER_NAME: &str = "xai";
 pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const XAI_SEED_MODELS: [&str; 4] = ["grok-4.6", "grok-4.5", "grok-4.3", "grok-build-0.1"];
@@ -101,6 +105,7 @@ pub const OPENAI_ALPHA_SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex
 const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
 const KIMI_OAUTH_HOST: &str = "api.kimi.com";
 const DEEPSEEK_HOST: &str = "api.deepseek.com";
+const HAIDER_CODE_HOST: &str = "haidercode.ai";
 const XAI_HOST: &str = "api.x.ai";
 const GROK_OAUTH_HOST: &str = "cli-chat-proxy.grok.com";
 
@@ -856,6 +861,7 @@ enum CompatibleDialect {
     Generic,
     KimiOAuth,
     DeepSeekApi,
+    HaiderCodeApi,
     XaiApi,
     GrokOAuth,
 }
@@ -1165,6 +1171,58 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    /// Constructs Haider Code's fixed API-key Chat Completions adapter.
+    pub fn new_haider_code_api(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        if base_url != HAIDER_CODE_BASE_URL {
+            return Err(invalid_request(
+                "Haider Code inference base URL is not sanctioned",
+            ));
+        }
+        Self::new_fixed_builtin(
+            credential,
+            model,
+            base_url,
+            HAIDER_CODE_HOST,
+            CompatibleDialect::HaiderCodeApi,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_haider_code_api_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if base_url != HAIDER_CODE_BASE_URL {
+            return Err(invalid_request(
+                "Haider Code inference base URL is not sanctioned",
+            ));
+        }
+        let endpoints = compatible_endpoints(base_url, CompatibleOriginPolicy::Strict)?;
+        let http = OpenAiHttp::new_fixed_origins(
+            credential,
+            model,
+            &[&endpoints.chat_url, &endpoints.models_url],
+            HAIDER_CODE_HOST,
+            resolver,
+            false,
+        )?;
+        Ok(Self {
+            http,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+            dialect: CompatibleDialect::HaiderCodeApi,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
+    }
+
     /// Constructs the fixed SuperGrok/X Premium subscription proxy adapter.
     pub fn new_grok_subscription(
         credential: SecretHandle,
@@ -1333,6 +1391,9 @@ impl OpenAiCompatibleProvider {
             CompatibleDialect::DeepSeekApi => {
                 replay_deepseek_models_response(&self.http.model, &body)
             }
+            CompatibleDialect::HaiderCodeApi => {
+                replay_haider_code_models_response(&self.http.model, &body)
+            }
             CompatibleDialect::XaiApi => replay_xai_models_response(&self.http.model, &body),
             CompatibleDialect::GrokOAuth => replay_grok_models_response(&self.http.model, &body),
         }
@@ -1383,6 +1444,7 @@ impl Provider for OpenAiCompatibleProvider {
         match self.dialect {
             CompatibleDialect::Generic
             | CompatibleDialect::DeepSeekApi
+            | CompatibleDialect::HaiderCodeApi
             | CompatibleDialect::XaiApi => crate::ProviderCredentialSurface::ApiKey,
             CompatibleDialect::KimiOAuth | CompatibleDialect::GrokOAuth => {
                 crate::ProviderCredentialSurface::OAuthSubscriptionBearer
@@ -1436,6 +1498,7 @@ impl Provider for OpenAiCompatibleProvider {
             CompatibleDialect::Generic => OPENAI_COMPATIBLE_PROVIDER_NAME,
             CompatibleDialect::KimiOAuth => KIMI_OAUTH_PROVIDER_NAME,
             CompatibleDialect::DeepSeekApi => DEEPSEEK_PROVIDER_NAME,
+            CompatibleDialect::HaiderCodeApi => HAIDER_CODE_PROVIDER_NAME,
             CompatibleDialect::XaiApi => XAI_PROVIDER_NAME,
             CompatibleDialect::GrokOAuth => GROK_OAUTH_PROVIDER_NAME,
         };
@@ -2985,6 +3048,11 @@ pub fn replay_deepseek_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
 }
 
 #[must_use]
+pub fn replay_haider_code_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    replay_chat_sse(bytes, CompatibleDialect::HaiderCodeApi)
+}
+
+#[must_use]
 pub fn replay_xai_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
     replay_chat_sse(bytes, CompatibleDialect::XaiApi)
 }
@@ -3011,6 +3079,15 @@ pub fn replay_deepseek_models_response(
     body: &[u8],
 ) -> Result<CapabilityDoc, ProviderError> {
     replay_compatible_models_response(DEEPSEEK_PROVIDER_NAME, model, body)
+}
+
+/// Replays Haider Code's OpenAI-shaped `/models` response while retaining
+/// the named builtin identity.
+pub fn replay_haider_code_models_response(
+    model: &str,
+    body: &[u8],
+) -> Result<CapabilityDoc, ProviderError> {
+    replay_compatible_models_response(HAIDER_CODE_PROVIDER_NAME, model, body)
 }
 
 /// Replays xAI's OpenAI-shaped API model inventory.
@@ -4153,6 +4230,7 @@ fn chat_request_json_with_boundary(
     match dialect {
         CompatibleDialect::Generic
         | CompatibleDialect::DeepSeekApi
+        | CompatibleDialect::HaiderCodeApi
         | CompatibleDialect::XaiApi
         | CompatibleDialect::GrokOAuth => {
             object.insert("max_tokens".into(), serde_json::json!(request.max_tokens));

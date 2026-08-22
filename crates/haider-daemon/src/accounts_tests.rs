@@ -359,6 +359,51 @@ fn wh1_deepseek_factory_builds_api_key_adapter() {
     assert_eq!(oauth.code, ErrorCode::InvalidArgument);
 }
 
+/// MUTATION CHECK: omit the `haider-code` builder dispatch or admit OAuth.
+/// Expected runtime failure: an API-key account cannot construct its fixed
+/// adapter, or an unsupported OAuth credential cross-wires into it.
+#[test]
+fn haider_code_factory_builds_only_the_api_key_adapter() {
+    let validator = ProviderCredentialValidator;
+    assert!(validator.supports(HAIDER_CODE_PROVIDER_NAME));
+    let vault = MemoryVault::default();
+    let alias = CredentialAlias::new("haider-code-factory");
+    vault
+        .put(&alias, b"HAIDER_CODE_FACTORY_KEY_SENTINEL_7ad1")
+        .expect("store Haider Code factory key");
+    let adapter = build_account_provider(
+        HAIDER_CODE_PROVIDER_NAME,
+        None,
+        None,
+        AuthMethod::ApiKey,
+        vault.resolve(&alias).expect("resolve Haider Code key"),
+        "Go",
+        &alias,
+        &ProviderTuning::default(),
+        None,
+    )
+    .expect("build Haider Code adapter");
+    assert_eq!(
+        adapter.credential_surface(),
+        haider_provider::ProviderCredentialSurface::ApiKey
+    );
+
+    let oauth = build_account_provider(
+        HAIDER_CODE_PROVIDER_NAME,
+        None,
+        None,
+        AuthMethod::OAuth,
+        vault
+            .resolve(&alias)
+            .expect("resolve Haider Code key again"),
+        "Go",
+        &alias,
+        &ProviderTuning::default(),
+        None,
+    );
+    assert!(matches!(oauth, Err(error) if error.code == ErrorCode::InvalidArgument));
+}
+
 /// The production validation path deliberately remains a real provider
 /// smoke: it creates the native Gemini adapter and sends the one-token ping
 /// built by `validate_provider_api_key`. It is ignored unless explicitly
@@ -5322,6 +5367,28 @@ enum ModelDiscoveryFixture {
     Panic,
 }
 
+/// MUTATION CHECK: omit Haider Code from `catalog_source`. Expected runtime
+/// failure: first-class model refresh cannot select its fixed authenticated
+/// provider catalog.
+#[test]
+fn haider_code_catalog_source_is_first_class_and_api_key_authenticated() {
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let providers = ProviderRegistry::new(
+        provider_store,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([HAIDER_CODE_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("Haider Code provider registry");
+    let (source, auth) =
+        catalog_source(HAIDER_CODE_PROVIDER_NAME, &providers).expect("Haider Code catalog source");
+    assert_eq!(source, CatalogSource::HaiderCodeApi);
+    assert_eq!(source.endpoint(), "https://haidercode.ai/v1/models");
+    assert_eq!(auth, ProviderAuthRequirementWire::ApiKey);
+}
+
 /// WH3 registry/refresh projection half — the named source resolves to the
 /// fixed DeepSeek catalog and an authenticated mocked discovery replaces
 /// the fallback inventory while lighting the pair Available.
@@ -8492,6 +8559,10 @@ fn custom_login_targets_only_chat_completions_profiles() {
     assert!(
         custom_login_target(Some(&management), DEEPSEEK_PROVIDER_NAME).is_none(),
         "the named DeepSeek builtin never routes through custom validation"
+    );
+    assert!(
+        custom_login_target(Some(&management), HAIDER_CODE_PROVIDER_NAME).is_none(),
+        "the named Haider Code builtin never routes through custom validation"
     );
     assert!(custom_login_target(None, "custom-llama").is_none());
 }

@@ -2068,6 +2068,63 @@ async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
     assert!(authorization.is_sensitive());
 }
 
+/// MUTATION CHECK: route Haider Code through a configurable origin, omit the
+/// bearer header, or rewrite its selected model. Expected runtime failure:
+/// the exact fixed URL, sensitive authorization bytes, or payload model
+/// assertion changes.
+#[tokio::test]
+async fn haider_code_request_uses_fixed_chat_completions_bearer_and_model() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("haider-code-request-golden");
+    vault
+        .put(&alias, b"HAIDER_CODE_API_KEY_SENTINEL_3d72")
+        .expect("store Haider Code key");
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        443,
+    ))]]));
+    let provider = OpenAiCompatibleProvider::new_haider_code_api_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve Haider Code key"),
+        "Go Max",
+        HAIDER_CODE_BASE_URL,
+        resolver,
+    )
+    .expect("construct Haider Code adapter");
+    let request = TurnRequest {
+        messages: vec![crate::Message::user_text("hello")],
+        model: "Go Max".to_owned(),
+        max_tokens: 17,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        cache_metadata: None,
+    };
+    let payload = provider
+        .request_payload(&request)
+        .expect("Haider Code request payload");
+    assert_eq!(payload["model"], "Go Max");
+    assert_eq!(payload["stream"], true);
+
+    let outbound = provider
+        .http
+        .post_json_request(&provider.chat_url, &payload)
+        .await
+        .expect("build fixed Haider Code request");
+    assert_eq!(
+        outbound.url().as_str(),
+        "https://haidercode.ai/v1/chat/completions"
+    );
+    let authorization = outbound
+        .headers()
+        .get(AUTHORIZATION)
+        .expect("Haider Code bearer header");
+    assert_eq!(
+        authorization.as_bytes(),
+        b"Bearer HAIDER_CODE_API_KEY_SENTINEL_3d72"
+    );
+    assert!(authorization.is_sensitive());
+}
+
 /// MUTATION CHECK: deleting any proxy identity header, applying the model
 /// override to discovery, or changing the single admitted client version
 /// breaks these exact request assertions.
@@ -2173,6 +2230,28 @@ fn xai_cached_prompt_details_map_to_normalized_usage() {
     assert_eq!(normalized.logical_input, 100);
     assert_eq!(normalized.uncached_input, 60);
     assert_eq!(normalized.cache_read_input, 40);
+}
+
+/// MUTATION CHECK: skip the normal OpenAI cached-token normalization for the
+/// Haider Code dialect. Expected runtime failure: uncached input remains 100
+/// or cache-read input becomes zero instead of the exact 60/40 split.
+#[test]
+fn haider_code_openai_usage_is_normalized() {
+    let usage = chat_usage(
+        &serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 40}
+        }),
+        None,
+        CompatibleDialect::HaiderCodeApi,
+    )
+    .expect("Haider Code usage");
+    let normalized = usage.normalized.expect("normalized Haider Code usage");
+    assert_eq!(normalized.logical_input, 100);
+    assert_eq!(normalized.uncached_input, 60);
+    assert_eq!(normalized.cache_read_input, 40);
+    assert_eq!(usage.output, 7);
 }
 
 /// WH4 — DeepSeek's top-level cache counters are the accounting authority:

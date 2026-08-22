@@ -30,9 +30,12 @@
 //! [`normalize_utilization`] therefore accepts BOTH scales and clamps; the
 //! wire always carries the 0–1 fraction.
 //!
-//! API-key providers (openai/anthropic/gemini keys, custom
+//! Most API-key providers (openai/anthropic/gemini keys, custom
 //! openai-compatible, OpenCode Zen/Go) have NO server meter — the daemon
-//! reports honest local accounting for them. OpenCode Zen serves an
+//! reports honest local accounting for them. Haider Code is the explicit
+//! exception: its same-key `/v1/account` status is parsed by
+//! [`parse_haider_code_account`] and published by the daemon's active-session
+//! poller. OpenCode Zen serves an
 //! unauthenticated model inventory at `{base}/models` but `GET
 //! /zen/v1/balance|usage|credits` all 404 (verified 2026-08-05); upstream
 //! feature request anomalyco/opencode#10448 tracks a future balance
@@ -69,6 +72,15 @@ impl MeterUnavailable {
             reason: reason.into(),
         }
     }
+}
+
+/// Parses a Haider Code account snapshot without deriving plan state from
+/// percentages. Unknown fields are ignored and absent optional fields remain
+/// absent through the protocol DTO.
+pub fn parse_haider_code_account(
+    body: &[u8],
+) -> Result<haider_protocol::usage::HaiderCodePlanSnapshotV1, MeterUnavailable> {
+    serde_json::from_slice(body).map_err(|_| MeterUnavailable::new("malformed_response"))
 }
 
 /// The three OAuth meter endpoints served in this release.

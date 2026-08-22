@@ -2736,6 +2736,8 @@ pub enum AccountAddKind {
     /// grant and dedicated CLI chat proxy.
     GrokOAuth,
     GeminiApi,
+    /// Haider Code hosted-model plans through the fixed first-party API.
+    HaiderCodeApi,
     HuggingFace,
     OpencodeZen,
     OpencodeGo,
@@ -8494,6 +8496,7 @@ impl AppModel {
             | AccountAddKind::Vertex
             | AccountAddKind::Custom
             | AccountAddKind::DeepSeekApi
+            | AccountAddKind::HaiderCodeApi
             | AccountAddKind::XaiApi => return,
         };
         let alias = smallest_free_alias(provider, &self.accounts.rows);
@@ -12516,6 +12519,15 @@ impl AppModel {
                         } else {
                             self.accounts.message =
                                 Some(self.stale_daemon_note("DeepSeek accounts"));
+                            self.dirty = true;
+                        }
+                    }
+                    AccountAddKind::HaiderCodeApi => {
+                        if self.daemon_lists_provider("haider-code") {
+                            self.open_login_card("haider-code", None);
+                        } else {
+                            self.accounts.message =
+                                Some(self.stale_daemon_note("Haider Code accounts"));
                             self.dirty = true;
                         }
                     }

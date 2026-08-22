@@ -49,10 +49,10 @@ use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
     BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DEEPSEEK_BASE_URL,
     DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, GEMINI_PROVIDER_NAME, GROK_OAUTH_PROVIDER_NAME,
-    GeminiProvider, KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME,
-    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider,
-    Provider, ProviderErrorKind, TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL,
-    XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
+    GeminiProvider, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME, KIMI_OAUTH_PROVIDER_NAME,
+    Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
+    VERTEX_PROVIDER_NAME, XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -195,6 +195,7 @@ impl CredentialValidator for ProviderCredentialValidator {
                 | BEDROCK_PROVIDER_NAME
                 | VERTEX_PROVIDER_NAME
                 | DEEPSEEK_PROVIDER_NAME
+                | HAIDER_CODE_PROVIDER_NAME
                 | XAI_PROVIDER_NAME
         )
     }
@@ -214,6 +215,8 @@ impl CredentialValidator for ProviderCredentialValidator {
         }
         if provider == DEEPSEEK_PROVIDER_NAME {
             validate_deepseek_api_key(secret).await
+        } else if provider == HAIDER_CODE_PROVIDER_NAME {
+            crate::haider_code_plan::validate_api_key(secret).await
         } else if provider == XAI_PROVIDER_NAME {
             validate_xai_api_key(secret).await
         } else {
@@ -373,7 +376,10 @@ fn custom_login_target(
     management: Option<&ManagementSnapshot>,
     provider: &str,
 ) -> Option<(String, Option<String>)> {
-    if matches!(provider, DEEPSEEK_PROVIDER_NAME | XAI_PROVIDER_NAME) {
+    if matches!(
+        provider,
+        DEEPSEEK_PROVIDER_NAME | HAIDER_CODE_PROVIDER_NAME | XAI_PROVIDER_NAME
+    ) {
         return None;
     }
     let view = management?.read()?;
@@ -387,7 +393,7 @@ fn custom_login_target(
     ) {
         return None;
     }
-    // The named DeepSeek builtin is excluded above. For the generic
+    // Fixed compatible builtins are excluded above. For the generic
     // compatible card, family + endpoint identifies custom rows without a
     // provenance field on the wire.
     let origin = profile.endpoint?;
@@ -1945,6 +1951,10 @@ fn catalog_source(
         }
         DEEPSEEK_PROVIDER_NAME => Some((
             CatalogSource::DeepSeekApi,
+            ProviderAuthRequirementWire::ApiKey,
+        )),
+        HAIDER_CODE_PROVIDER_NAME => Some((
+            CatalogSource::HaiderCodeApi,
             ProviderAuthRequirementWire::ApiKey,
         )),
         XAI_PROVIDER_NAME => Some((CatalogSource::XaiApi, ProviderAuthRequirementWire::ApiKey)),
@@ -6229,6 +6239,11 @@ fn build_account_provider(
         ),
         (DEEPSEEK_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiCompatibleProvider::new_deepseek_api(credential, model, DEEPSEEK_BASE_URL)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
+        ),
+        (HAIDER_CODE_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
+            OpenAiCompatibleProvider::new_haider_code_api(credential, model, HAIDER_CODE_BASE_URL)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),

@@ -11,6 +11,123 @@ use crate::ids::CredentialAlias;
 use crate::provider::{CacheStatAvailability, UsageRequestKind};
 use serde::{Deserialize, Serialize};
 
+/// Provider-native allowance state from Haider Code's account endpoint.
+///
+/// Known values may grow over time. Unknown strings are preserved verbatim
+/// so an older daemon never turns a future server state into a healthy claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HaiderCodeAllowanceStateV1 {
+    Ok,
+    Unknown(String),
+}
+
+impl Serialize for HaiderCodeAllowanceStateV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Ok => "ok",
+            Self::Unknown(state) => state,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for HaiderCodeAllowanceStateV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let state = String::deserialize(deserializer)?;
+        Ok(match state.as_str() {
+            "ok" => Self::Ok,
+            _ => Self::Unknown(state),
+        })
+    }
+}
+
+/// Weekly allowance fields exactly as Haider Code published them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HaiderCodeWeeklyAllowanceV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_remaining: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<HaiderCodeAllowanceStateV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until_ms: Option<u64>,
+}
+
+/// Account-hold fields exactly as Haider Code published them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HaiderCodeHoldV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_locked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe_banned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Tolerant snapshot of `GET https://haidercode.ai/v1/account`.
+///
+/// Every remote field is optional: absence stays absence, and unknown JSON
+/// fields are ignored by Serde's default forward-compatible behavior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HaiderCodePlanSnapshotV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_allowance: Option<HaiderCodeWeeklyAllowanceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_credits_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_topup_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<HaiderCodeHoldV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_live: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_after_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<bool>,
+}
+
+impl HaiderCodePlanSnapshotV1 {
+    /// Only explicit provider hold flags halt the account. Missing flags do
+    /// not assert either health or failure.
+    #[must_use]
+    pub fn is_halted(&self) -> bool {
+        self.hold.as_ref().is_some_and(|hold| {
+            hold.api_locked == Some(true) || hold.subscribe_banned == Some(true)
+        })
+    }
+}
+
+/// Typed result published for the active Haider Code account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HaiderCodePlanOutcomeV1 {
+    Available {
+        snapshot: HaiderCodePlanSnapshotV1,
+    },
+    /// The server reported a snapshot but did not assert a known healthy
+    /// allowance state. Clients render its typed/raw fields without guessing.
+    Indeterminate {
+        snapshot: HaiderCodePlanSnapshotV1,
+    },
+    Halted {
+        snapshot: HaiderCodePlanSnapshotV1,
+    },
+    Unauthorized,
+    #[serde(other)]
+    Unknown,
+}
+
 /// One `usage.report` snapshot: every known account with its meter state and
 /// journal-derived local statistics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -133,6 +133,8 @@ pub enum CatalogSource {
     OpenAiCompatible { origin: String },
     /// DeepSeek's fixed OpenAI-compatible API-key catalog.
     DeepSeekApi,
+    /// Haider Code's fixed OpenAI-compatible API-key catalog.
+    HaiderCodeApi,
     /// xAI's fixed OpenAI-compatible API-key catalog.
     XaiApi,
 }
@@ -156,6 +158,7 @@ pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
         | CatalogSource::GeminiApiKey
         | CatalogSource::OpenAiCompatible { .. }
         | CatalogSource::DeepSeekApi
+        | CatalogSource::HaiderCodeApi
         | CatalogSource::XaiApi => endpoint.to_owned(),
     }
 }
@@ -178,6 +181,7 @@ impl CatalogSource {
                 format!("{}/models", origin.trim().trim_end_matches('/'))
             }
             Self::DeepSeekApi => format!("{}/models", crate::DEEPSEEK_BASE_URL),
+            Self::HaiderCodeApi => format!("{}/models", crate::HAIDER_CODE_BASE_URL),
             Self::XaiApi => format!("{}/models", crate::XAI_BASE_URL),
         }
     }
@@ -191,6 +195,7 @@ impl CatalogSource {
             Self::GeminiApiKey => Some("generativelanguage.googleapis.com"),
             Self::OpenAiCompatible { .. } => None,
             Self::DeepSeekApi => Some("api.deepseek.com"),
+            Self::HaiderCodeApi => Some("haidercode.ai"),
             Self::XaiApi => Some("api.x.ai"),
         }
     }
@@ -221,6 +226,7 @@ impl CatalogSource {
             | Self::GrokOAuth
             | Self::OpenAiCompatible { .. }
             | Self::DeepSeekApi
+            | Self::HaiderCodeApi
             | Self::XaiApi => CatalogAuthMode::Bearer,
         }
     }
@@ -316,6 +322,7 @@ pub async fn discover_models_with_resolver(
         | CatalogSource::GrokOAuth
         | CatalogSource::GeminiApiKey
         | CatalogSource::DeepSeekApi
+        | CatalogSource::HaiderCodeApi
         | CatalogSource::XaiApi => {
             let endpoint = source.endpoint();
             let Some(trusted_host) = source.trusted_host() else {
@@ -458,6 +465,7 @@ pub fn parse_catalog(
         | CatalogSource::GrokOAuth
         | CatalogSource::OpenAiCompatible { .. }
         | CatalogSource::DeepSeekApi
+        | CatalogSource::HaiderCodeApi
         | CatalogSource::XaiApi => value.get("data"),
     }
     .and_then(serde_json::Value::as_array)
@@ -496,6 +504,7 @@ pub fn parse_catalog(
             source,
             CatalogSource::OpenAiCompatible { .. }
                 | CatalogSource::DeepSeekApi
+                | CatalogSource::HaiderCodeApi
                 | CatalogSource::XaiApi
         ) {
             let Some(slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
@@ -571,6 +580,7 @@ pub fn parse_catalog(
             | CatalogSource::GeminiApiKey
             | CatalogSource::OpenAiCompatible { .. }
             | CatalogSource::DeepSeekApi
+            | CatalogSource::HaiderCodeApi
             | CatalogSource::XaiApi => None,
         };
         let kimi_extensions =

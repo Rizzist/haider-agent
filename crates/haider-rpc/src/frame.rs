@@ -9,8 +9,8 @@ use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, GraphId, GraphRunSetId, ItemId, MenuId, NodeId, RunId,
-    SessionId,
+    AgentId, ArtifactRef, BranchId, CredentialAlias, GraphId, GraphRunSetId, ItemId, MenuId,
+    NodeId, RunId, SessionId,
 };
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
@@ -342,6 +342,9 @@ pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
 /// per-account OAuth meters (normalized 0–1 utilization) plus journal-derived
 /// local counters. Never carries secret material.
 pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+/// Daemon publishes typed, provider-owned Haider Code plan/account status to
+/// clients attached to sessions currently using the provider.
+pub const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
 /// Daemon can open allow-listed macOS TCC panes for a durable in-session
 /// computer permission card.
 pub const FEATURE_COMPUTER_PERMISSION_ACTIONS_V1: &str = "computer_permission_actions_v1";
@@ -2962,6 +2965,14 @@ pub enum WireFrame {
     /// Carries no descriptors on purpose — a watcher re-reads `account.list`,
     /// so this frame can never disagree with the snapshot it announces.
     AccountsChanged { revision: u64 },
+    /// Current server-published plan state for the active Haider Code account.
+    /// Transport failures publish no frame and therefore cannot overwrite a
+    /// client's last provider truth.
+    HaiderCodePlanStatus {
+        provider: String,
+        account_alias: CredentialAlias,
+        outcome: haider_protocol::usage::HaiderCodePlanOutcomeV1,
+    },
     /// The foreground session of the resident TUI on this daemon profile.
     ///
     /// A resident TUI publishes this uncorrelated signal whenever its binding
@@ -3081,6 +3092,11 @@ enum WireFrameRef<'a> {
     AccountsChanged {
         revision: u64,
     },
+    HaiderCodePlanStatus {
+        provider: &'a str,
+        account_alias: &'a CredentialAlias,
+        outcome: &'a haider_protocol::usage::HaiderCodePlanOutcomeV1,
+    },
     ResidentSessionBinding {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: &'a Option<SessionId>,
@@ -3156,6 +3172,11 @@ enum WireFrameOwned {
     },
     AccountsChanged {
         revision: u64,
+    },
+    HaiderCodePlanStatus {
+        provider: String,
+        account_alias: CredentialAlias,
+        outcome: haider_protocol::usage::HaiderCodePlanOutcomeV1,
     },
     ResidentSessionBinding {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3278,6 +3299,15 @@ impl Serialize for WireFrame {
             Self::AccountsChanged { revision } => WireFrameRef::AccountsChanged {
                 revision: *revision,
             },
+            Self::HaiderCodePlanStatus {
+                provider,
+                account_alias,
+                outcome,
+            } => WireFrameRef::HaiderCodePlanStatus {
+                provider,
+                account_alias,
+                outcome,
+            },
             Self::ResidentSessionBinding {
                 session_id,
                 worker_generation,
@@ -3386,6 +3416,15 @@ impl<'de> Deserialize<'de> for WireFrame {
                 Self::SessionRosterDelta { summaries }
             }
             WireFrameOwned::AccountsChanged { revision } => Self::AccountsChanged { revision },
+            WireFrameOwned::HaiderCodePlanStatus {
+                provider,
+                account_alias,
+                outcome,
+            } => Self::HaiderCodePlanStatus {
+                provider,
+                account_alias,
+                outcome,
+            },
             WireFrameOwned::ResidentSessionBinding {
                 session_id,
                 worker_generation,

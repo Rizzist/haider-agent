@@ -149,6 +149,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `welcome_features`. Expected runtime failure: web clients keep scraping
 /// OSC 7791 because the typed generation-fenced binding signal appears
 /// unavailable even though the daemon serves it.
+///
+/// MUTATION CHECK: remove `FEATURE_HAIDER_CODE_PLAN_STATUS_V1`. Expected
+/// runtime failure: clients cannot discover the typed provider-plan stream
+/// and would have to guess account health from percentages.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -175,6 +179,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_HOOKS_SERVER_V1.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
+            haider_rpc::FEATURE_HAIDER_CODE_PLAN_STATUS_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_RUN_ID_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),

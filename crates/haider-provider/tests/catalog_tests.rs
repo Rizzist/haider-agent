@@ -403,6 +403,37 @@ fn endpoints_are_the_vendor_paths() {
         CatalogSource::DeepSeekApi.endpoint(),
         "https://api.deepseek.com/models"
     );
+    assert_eq!(
+        CatalogSource::HaiderCodeApi.endpoint(),
+        "https://haidercode.ai/v1/models"
+    );
+}
+
+/// MUTATION CHECK: parse Haider Code with a provider-specific guessed schema.
+/// Expected runtime failure: an ordinary OpenAI-compatible `data[].id`
+/// response no longer yields exactly the server-published model IDs.
+#[test]
+fn haider_code_catalog_preserves_only_discovered_model_facts() {
+    let payload = serde_json::json!({"data": [
+        {"id": "Go", "object": "model", "future": true},
+        {"id": "Go Max", "object": "model"}
+    ]});
+    let models =
+        parse_catalog(CatalogSource::HaiderCodeApi, &payload).expect("Haider Code catalog parses");
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        ["Go", "Go Max"]
+    );
+    assert!(models.iter().all(|model| {
+        model.display_name == model.slug
+            && model.context_window.is_none()
+            && model.supported_efforts.is_empty()
+            && model.default_effort.is_none()
+            && model.extensions.is_none()
+    }));
 }
 
 /// WH3 parser/golden half: DeepSeek's `/models` response is deliberately
