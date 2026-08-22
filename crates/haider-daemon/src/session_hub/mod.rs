@@ -1304,7 +1304,27 @@ struct ConnectionIdentityLease {
 impl Drop for ConnectionIdentityLease {
     fn drop(&mut self) {
         self.hub.clear_resident_binding(&self.connection_id);
-        self.hub.clear_surface_owner(&self.connection_id);
+        let Ok(attachments) = self
+            .hub
+            .detach_connection_registrations(&self.connection_id)
+        else {
+            return;
+        };
+        for (attachment_id, owner) in attachments {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        SessionHub::finish_detach(&attachment_id, owner).await;
+                    });
+                }
+                Err(_) => {
+                    let _ = owner
+                        .actor
+                        .commands
+                        .try_send(ActorCommand::Detach { attachment_id });
+                }
+            }
+        }
     }
 }
 
@@ -2248,17 +2268,47 @@ impl SessionHub {
         &self,
         command: SessionForkCommand,
     ) -> Result<SessionForkOutcome, SessionHubError> {
-        let actor = self.actor_for(command.session_id.clone()).await?;
+        let candidate_session_id = command.session_id.clone();
+        let actor = self.actor_for(candidate_session_id.clone()).await?;
         let (completed, result) = oneshot::channel();
         actor
             .commands
             .send(ActorCommand::ForkSession { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
-        result
+        let outcome = result
             .await
             .map_err(|_| SessionHubError::Closed)?
-            .map_err(Into::into)
+            .map_err(SessionHubError::from)?;
+        if matches!(
+            &outcome,
+            SessionForkOutcome::IdempotentReplay { created }
+                if created.session_id != candidate_session_id
+        ) {
+            self.stop_discarded_candidate_actor(&candidate_session_id, &actor)
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    async fn stop_discarded_candidate_actor(
+        &self,
+        candidate_session_id: &SessionId,
+        candidate_actor: &SessionActorHandle,
+    ) -> Result<(), SessionHubError> {
+        let removed = {
+            let mut actors = lock(&self.inner.actors)?;
+            let owns_candidate = actors
+                .get(candidate_session_id)
+                .is_some_and(|current| current.commands.same_channel(&candidate_actor.commands));
+            owns_candidate
+                .then(|| actors.remove(candidate_session_id))
+                .flatten()
+        };
+        if let Some(actor) = removed {
+            let _ = actor.commands.send(ActorCommand::Stop).await;
+        }
+        Ok(())
     }
 
     async fn branch_create_receipt(
@@ -3809,11 +3859,14 @@ impl SessionHub {
         self.notify_surface_watchers();
     }
 
-    async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
+    fn detach_connection_registrations(
+        &self,
+        connection_id: &str,
+    ) -> Result<Vec<(AttachmentId, AttachmentOwner)>, SessionHubError> {
         lock(&self.inner.resident_binding_viewers)?.remove(connection_id);
         lock(&self.inner.diagnostic_sinks)?.remove(connection_id);
         self.clear_surface_owner(connection_id);
-        let attachments = {
+        let attachment_ids = {
             let owners = lock(&self.inner.attachments)?;
             owners
                 .iter()
@@ -3821,8 +3874,19 @@ impl SessionHub {
                 .map(|(attachment_id, _)| attachment_id.clone())
                 .collect::<Vec<_>>()
         };
-        for attachment_id in attachments {
-            let _ = self.detach(&attachment_id).await?;
+        let mut attachments = Vec::with_capacity(attachment_ids.len());
+        for attachment_id in attachment_ids {
+            if let Some(owner) = self.take_attachment(&attachment_id, Some(connection_id))? {
+                attachments.push((attachment_id, owner));
+            }
+        }
+        Ok(attachments)
+    }
+
+    async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
+        let attachments = self.detach_connection_registrations(connection_id)?;
+        for (attachment_id, owner) in attachments {
+            Self::finish_detach(&attachment_id, owner).await;
         }
         Ok(())
     }

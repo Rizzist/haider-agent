@@ -139,6 +139,8 @@ pub struct SessionForked {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionForkEventPayload {
     SessionForked(SessionForked),
+    #[serde(other)]
+    Unknown,
 }
 
 impl SessionForked {
@@ -150,6 +152,22 @@ impl SessionForked {
     pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
         match serde_json::from_value::<SessionForkEventPayload>(value.clone()).ok()? {
             SessionForkEventPayload::SessionForked(record) => Some(record),
+            SessionForkEventPayload::Unknown => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionForkEventPayload;
+
+    /// MUTATION CHECK: remove `#[serde(other)]` from `Unknown`. Expected
+    /// runtime failure: the future additive fact fails to deserialize.
+    #[test]
+    fn future_session_fork_event_decodes_as_unknown() {
+        let payload: SessionForkEventPayload =
+            serde_json::from_str(r#"{"type":"future_session_fork_fact"}"#)
+                .expect("future fork fact decodes");
+        assert!(matches!(payload, SessionForkEventPayload::Unknown));
     }
 }

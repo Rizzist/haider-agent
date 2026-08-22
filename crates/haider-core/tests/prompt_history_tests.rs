@@ -15,7 +15,7 @@ use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
 use haider_protocol::ids::{
-    ArtifactRef, BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{
     CommandExecutionOrigin, ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem,
@@ -91,6 +91,42 @@ impl ArtifactReader for TestArtifacts {
             haider_protocol::error::HaiderError::new(
                 haider_protocol::error::ErrorCode::StoreCorrupt,
                 format!("missing test artifact {artifact}"),
+                false,
+            )
+        })
+    }
+}
+
+struct CountingArtifacts {
+    values: HashMap<ArtifactRef, Vec<u8>>,
+    reads: Mutex<Vec<ArtifactRef>>,
+}
+
+impl CountingArtifacts {
+    fn read_count(&self, artifact: &ArtifactRef) -> usize {
+        self.reads
+            .lock()
+            .expect("artifact read ledger")
+            .iter()
+            .filter(|read| *read == artifact)
+            .count()
+    }
+}
+
+#[async_trait]
+impl ArtifactReader for CountingArtifacts {
+    async fn read_artifact(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<u8>, haider_protocol::error::HaiderError> {
+        self.reads
+            .lock()
+            .expect("artifact read ledger")
+            .push(artifact.clone());
+        self.values.get(artifact).cloned().ok_or_else(|| {
+            haider_protocol::error::HaiderError::new(
+                haider_protocol::error::ErrorCode::StoreCorrupt,
+                format!("missing counted artifact {artifact}"),
                 false,
             )
         })
@@ -1782,6 +1818,343 @@ async fn compaction_on_another_branch_does_not_invalidate_the_checkpoint() {
     assert!(
         !recording.read_cursors().contains(&0),
         "another timeline's compaction must not force a full replay"
+    );
+}
+
+/// MUTATION CHECK: replace the timeline-scoped `append_prefixes.retain` with
+/// `append_prefixes.clear()` whenever any compaction epoch changes. Expected
+/// runtime failure: the final main compile rereads `main_summary` after only
+/// the other agent timeline compacted.
+#[tokio::test]
+async fn warm_compaction_epoch_invalidation_is_timeline_scoped() {
+    let store = MemoryStore::new();
+    let cache = PromptHistoryCompiler::cache();
+    let session_id = SessionId::new("warm-scoped-compaction-session");
+    let main_prior = RunId::new("warm-main-prior");
+    let main_warm = RunId::new("warm-main-current");
+    let main_next = RunId::new("warm-main-next");
+    let other_agent = AgentId::new("warm-other-agent");
+    let other_prior = RunId::new("warm-other-prior");
+    let other_warm = RunId::new("warm-other-current");
+    let other_next = RunId::new("warm-other-next");
+    let main_summary = ArtifactRef::new(format!("blake3:{}", "d".repeat(64)));
+    let other_summary = ArtifactRef::new(format!("blake3:{}", "e".repeat(64)));
+    let other_next_summary = ArtifactRef::new(format!("blake3:{}", "f".repeat(64)));
+    let artifacts = CountingArtifacts {
+        values: HashMap::from([
+            (main_summary.clone(), b"main compacted summary".to_vec()),
+            (other_summary.clone(), b"other compacted summary".to_vec()),
+            (
+                other_next_summary.clone(),
+                b"other compacted summary again".to_vec(),
+            ),
+        ]),
+        reads: Mutex::new(Vec::new()),
+    };
+    let scoped = |mut envelope: haider_protocol::envelope::RawEnvelope| {
+        envelope.agent_id = Some(other_agent.clone());
+        envelope
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &main_prior,
+            "warm-main-user-message",
+            EventPayload::UserMessage {
+                text: "main history".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &main_prior,
+            "warm-main-user-node",
+            None,
+            NodeKind::UserTurn {
+                text: "main history".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &main_prior,
+            "warm-main-answer-item",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("warm-main-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "main answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &main_prior,
+            "warm-main-answer-node",
+            Some("warm-main-user-node"),
+            NodeKind::AssistantCommit {
+                text: "main answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        node(
+            &session_id,
+            &main_prior,
+            "warm-main-compaction",
+            Some("warm-main-answer-node"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("warm-main-user-node"),
+                covers_to: NodeId::new("warm-main-answer-node"),
+                summary_artifact: main_summary.clone(),
+                tokens_before: 100,
+                tokens_after: 10,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        envelope(
+            &session_id,
+            &main_prior,
+            "warm-main-compaction-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &main_warm,
+            "warm-main-current-message",
+            EventPayload::UserMessage {
+                text: "main warm request".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &main_warm,
+            "warm-main-current-node",
+            Some("warm-main-compaction"),
+            NodeKind::UserTurn {
+                text: "main warm request".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        scoped(envelope(
+            &session_id,
+            &other_prior,
+            "warm-other-user-message",
+            EventPayload::UserMessage {
+                text: "other history".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        )),
+        scoped(node(
+            &session_id,
+            &other_prior,
+            "warm-other-user-node",
+            None,
+            NodeKind::UserTurn {
+                text: "other history".into(),
+                attachments: Vec::new(),
+            },
+        )),
+        scoped(envelope(
+            &session_id,
+            &other_prior,
+            "warm-other-answer-item",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("warm-other-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "other answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        )),
+        scoped(node(
+            &session_id,
+            &other_prior,
+            "warm-other-answer-node",
+            Some("warm-other-user-node"),
+            NodeKind::AssistantCommit {
+                text: "other answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        )),
+        scoped(node(
+            &session_id,
+            &other_prior,
+            "warm-other-compaction",
+            Some("warm-other-answer-node"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("warm-other-user-node"),
+                covers_to: NodeId::new("warm-other-answer-node"),
+                summary_artifact: other_summary.clone(),
+                tokens_before: 80,
+                tokens_after: 8,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        )),
+        scoped(envelope(
+            &session_id,
+            &other_prior,
+            "warm-other-compaction-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        )),
+        scoped(envelope(
+            &session_id,
+            &other_warm,
+            "warm-other-current-message",
+            EventPayload::UserMessage {
+                text: "other warm request".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        )),
+        scoped(node(
+            &session_id,
+            &other_warm,
+            "warm-other-current-node",
+            Some("warm-other-compaction"),
+            NodeKind::UserTurn {
+                text: "other warm request".into(),
+                attachments: Vec::new(),
+            },
+        )),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append both warm timelines");
+
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &main_warm,
+    )
+    .await
+    .expect("prime real main warm cache");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        Some(&other_agent),
+        &other_warm,
+    )
+    .await
+    .expect("prime real other-agent warm cache");
+    let main_reads_before = artifacts.read_count(&main_summary);
+
+    let mut unrelated = vec![
+        scoped(node(
+            &session_id,
+            &other_next,
+            "warm-other-next-compaction",
+            Some("warm-other-current-node"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("warm-other-current-node"),
+                covers_to: NodeId::new("warm-other-current-node"),
+                summary_artifact: other_next_summary,
+                tokens_before: 60,
+                tokens_after: 6,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        )),
+        scoped(envelope(
+            &session_id,
+            &other_next,
+            "warm-other-next-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        )),
+        scoped(envelope(
+            &session_id,
+            &other_next,
+            "warm-other-next-message",
+            EventPayload::UserMessage {
+                text: "other request after compaction".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        )),
+        scoped(node(
+            &session_id,
+            &other_next,
+            "warm-other-next-node",
+            Some("warm-other-next-compaction"),
+            NodeKind::UserTurn {
+                text: "other request after compaction".into(),
+                attachments: Vec::new(),
+            },
+        )),
+    ];
+    StoreHandle::append(&store, &mut unrelated)
+        .await
+        .expect("append unrelated compaction");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        Some(&other_agent),
+        &other_next,
+    )
+    .await
+    .expect("compile unrelated compacted timeline");
+
+    let mut main_suffix = vec![
+        envelope(
+            &session_id,
+            &main_next,
+            "warm-main-next-message",
+            EventPayload::UserMessage {
+                text: "main request after unrelated compaction".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &main_next,
+            "warm-main-next-node",
+            Some("warm-main-current-node"),
+            NodeKind::UserTurn {
+                text: "main request after unrelated compaction".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut main_suffix)
+        .await
+        .expect("append main suffix");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &main_next,
+    )
+    .await
+    .expect("extend main warm prefix");
+    assert_eq!(
+        artifacts.read_count(&main_summary),
+        main_reads_before,
+        "another timeline's compaction must not reread the main summary artifact"
     );
 }
 

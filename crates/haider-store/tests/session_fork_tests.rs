@@ -377,6 +377,14 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
     else {
         panic!("fresh fork commits");
     };
+    assert!(
+        !serde_json::to_value(&created)
+            .expect("created fork serializes")
+            .as_object()
+            .expect("created fork is an object")
+            .contains_key("source_branch_id"),
+        "main-line durable fork receipt must omit its absent source branch"
+    );
     assert_eq!(source_bytes(&store, &source), before);
     assert_eq!(source_storage_bytes(root.path(), &source), storage_before);
     let source_event_ids = store
@@ -445,6 +453,44 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
     );
     assert_eq!(source_bytes(&store, &source), before);
     assert_eq!(source_storage_bytes(root.path(), &source), storage_before);
+
+    // Deleting the child removes its journal, never the append-only command
+    // receipt proving that this fork already executed.
+    store
+        .delete_session(&created.session_id)
+        .expect("forked child deletes");
+    let mut replay_after_delete = command.clone();
+    replay_after_delete.session_id = SessionId::new("must-not-be-created-after-delete");
+    replay_after_delete.audit_event_id = EventId::new("must-not-be-written-after-delete");
+    let SessionForkOutcome::IdempotentReplay {
+        created: replayed_after_delete,
+    } = store
+        .fork_session(&replay_after_delete)
+        .expect("fork receipt survives child deletion")
+    else {
+        panic!("replay after child deletion committed a second fork");
+    };
+    assert_eq!(replayed_after_delete, created);
+    assert!(
+        !store
+            .session_ids()
+            .expect("sessions after deleted-child replay")
+            .contains(&replay_after_delete.session_id),
+        "replay must not mint a replacement child"
+    );
+    drop(store);
+    let reopened = Store::open(root.path()).expect("store reopens after child deletion");
+    assert_eq!(
+        reopened
+            .session_fork_receipt(
+                &command.command_id,
+                &command.request_digest,
+                &command.request_json,
+            )
+            .expect("fork receipt lookup after restart"),
+        Some(created),
+        "the original response remains recoverable after restart"
+    );
 }
 
 /// MUTATION CHECK: persist `PromptRender::Omit` back into the matching source

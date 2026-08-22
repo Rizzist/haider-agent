@@ -753,6 +753,7 @@ pub struct SessionForkCommand {
 pub struct CreatedSessionFork {
     pub session_id: SessionId,
     pub source_session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_branch_id: Option<BranchId>,
     pub fork_node_id: NodeId,
     pub fork_seq: u64,
@@ -2251,7 +2252,6 @@ impl Store {
             "DELETE FROM branches WHERE session_id = ?1",
             "DELETE FROM delegations WHERE parent_session_id = ?1 OR child_session_id = ?1",
             "DELETE FROM events WHERE session_id = ?1",
-            "DELETE FROM command_receipts WHERE session_id = ?1",
             "DELETE FROM sessions WHERE id = ?1",
         ] {
             transaction

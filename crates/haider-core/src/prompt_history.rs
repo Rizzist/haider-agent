@@ -66,7 +66,7 @@ pub struct PromptHistoryCache {
 #[derive(Default)]
 struct CachedPromptSession {
     head_seq: u64,
-    compaction_epoch: u64,
+    compaction_epochs: HashMap<PromptTimelineKey, u64>,
     envelopes: Vec<RawEnvelope>,
     projections: HashMap<PromptProjectionKey, CompiledPromptProjection>,
     append_prefixes: HashMap<PromptProjectionScope, CachedCompiledPrefix>,
@@ -519,14 +519,16 @@ impl PromptHistoryCache {
                 agent_id: timeline.agent_id.clone(),
             };
             cached.head_seq = loaded.prefix.head_seq;
-            cached.compaction_epoch = loaded.compaction_epoch;
+            cached
+                .compaction_epochs
+                .insert(timeline.clone(), loaded.compaction_epoch);
             cached.checkpoint_base = Some(PromptCheckpointBase {
                 timeline: timeline.clone(),
             });
             cached.append_prefixes.insert(scope, loaded.prefix);
         }
 
-        let previous_compaction_epoch = cached.compaction_epoch;
+        let previous_compaction_epochs = cached.compaction_epochs.clone();
         let mut cursor = cached.head_seq;
         let mut compaction_after_checkpoint = false;
         while cursor < head_seq {
@@ -550,9 +552,7 @@ impl PromptHistoryCache {
                 ) {
                     let affects_checkpoint_timeline = envelope.branch_id == timeline.branch_id
                         && envelope.agent_id == timeline.agent_id;
-                    if cached.checkpoint_base.is_none() || affects_checkpoint_timeline {
-                        cached.compaction_epoch = envelope.seq;
-                    }
+                    cached.note_compaction(&envelope);
                     compaction_after_checkpoint |=
                         cached.checkpoint_base.is_some() && affects_checkpoint_timeline;
                 }
@@ -591,7 +591,7 @@ impl PromptHistoryCache {
                             )
                         },
                     ) {
-                        cached.compaction_epoch = envelope.seq;
+                        cached.note_compaction(&envelope);
                     }
                     cached.push_envelope(envelope);
                 }
@@ -606,13 +606,27 @@ impl PromptHistoryCache {
         if cached.head_seq < head_seq {
             cached.head_seq = head_seq;
             cached.projections.clear();
-            if cached.compaction_epoch != previous_compaction_epoch {
-                cached.append_prefixes.clear();
+            let changed_timelines = cached
+                .compaction_epochs
+                .iter()
+                .filter(|(timeline, epoch)| {
+                    previous_compaction_epochs.get(*timeline) != Some(*epoch)
+                })
+                .map(|(timeline, _)| timeline.clone())
+                .collect::<HashSet<_>>();
+            if !changed_timelines.is_empty() {
+                cached.append_prefixes.retain(|scope, _| {
+                    !changed_timelines.contains(&PromptTimelineKey {
+                        branch_id: scope.branch_id.clone(),
+                        agent_id: scope.agent_id.clone(),
+                    })
+                });
             }
         }
 
+        let compaction_epoch = cached.compaction_epoch(&timeline);
         let scope = PromptProjectionScope {
-            compaction_epoch: cached.compaction_epoch,
+            compaction_epoch,
             branch_id: branch_id.cloned(),
             agent_id: agent_id.cloned(),
         };
@@ -644,7 +658,7 @@ impl PromptHistoryCache {
                             )
                         },
                     ) {
-                        cached.compaction_epoch = envelope.seq;
+                        cached.note_compaction(&envelope);
                     }
                     cached.push_envelope(envelope);
                 }
@@ -657,14 +671,15 @@ impl PromptHistoryCache {
             cached.flush_boundary_rows();
             cached.head_seq = head_seq;
         }
+        let compaction_epoch = cached.compaction_epoch(&timeline);
         let scope = PromptProjectionScope {
-            compaction_epoch: cached.compaction_epoch,
+            compaction_epoch,
             branch_id: branch_id.cloned(),
             agent_id: agent_id.cloned(),
         };
         let key = PromptProjectionKey {
             head_seq,
-            compaction_epoch: cached.compaction_epoch,
+            compaction_epoch,
             branch_id: branch_id.cloned(),
             agent_id: agent_id.cloned(),
             current_run: current_run.clone(),
@@ -770,6 +785,20 @@ impl PromptHistoryCache {
 }
 
 impl CachedPromptSession {
+    fn note_compaction(&mut self, envelope: &RawEnvelope) {
+        self.compaction_epochs.insert(
+            PromptTimelineKey {
+                branch_id: envelope.branch_id.clone(),
+                agent_id: envelope.agent_id.clone(),
+            },
+            envelope.seq,
+        );
+    }
+
+    fn compaction_epoch(&self, timeline: &PromptTimelineKey) -> u64 {
+        self.compaction_epochs.get(timeline).copied().unwrap_or(0)
+    }
+
     fn push_envelope(&mut self, envelope: RawEnvelope) {
         let rows = self.boundary_projector.push(&envelope);
         self.envelopes.push(envelope);

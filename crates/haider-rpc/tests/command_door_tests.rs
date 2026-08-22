@@ -50,6 +50,27 @@ fn command_catalog_reflects_session_context_and_dynamic_slots() {
     );
 }
 
+/// MUTATION CHECK: remove either `in_session` guard from the provider or
+/// effort argument arm. Expected runtime failure: that launcher query returns
+/// a session-only daemon operation.
+#[test]
+fn launcher_argument_queries_hide_session_only_operations() {
+    let slots = CommandDynamicSlotsWire {
+        providers: vec![("future-provider".into(), "served provider".into())],
+        efforts: vec![("high".into(), "high effort".into())],
+        ..CommandDynamicSlotsWire::default()
+    };
+    for query in ["provider ", "effort "] {
+        let rows = command_catalog_items(query, false, &slots);
+        assert!(
+            rows.is_empty(),
+            "launcher query {query:?} leaked session-only rows: {rows:?}"
+        );
+    }
+    assert_eq!(command_catalog_items("provider ", true, &slots).len(), 1);
+    assert_eq!(command_catalog_items("effort ", true, &slots).len(), 1);
+}
+
 /// MUTATION CHECK: change one client-routed/stub command to
 /// `session_operation_cmd` without adding its command-door dispatcher arm.
 /// Runtime failure: the operation-name pin grows, exposing an advertised

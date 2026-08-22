@@ -464,6 +464,98 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
     reopened.close().await.expect("reopened store closes");
 }
 
+/// MUTATION CHECK: remove `stop_discarded_candidate_actor` from the
+/// idempotent-replay mismatch arm. Expected runtime failure: both candidate
+/// child IDs remain resident even though only one was committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_duplicate_fork_discards_the_losing_candidate_actor() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let source = SessionId::new("duplicate-fork-source");
+    let generation = store.worker_generation();
+    hub.create_internal_session(create_command(&source, "duplicate-fork-source"))
+        .await
+        .expect("source creates");
+    let run_id = RunId::new("duplicate-fork-run");
+    hub.accept_internal_turn(accept_command(
+        &source,
+        &run_id,
+        generation,
+        "duplicate-fork-turn",
+    ))
+    .await
+    .expect("source turn accepts");
+    let mut terminal = [run_state_envelope(
+        &source,
+        &run_id,
+        generation,
+        "duplicate-fork-done",
+        RunState::Done,
+    )];
+    hub.append(&mut terminal)
+        .await
+        .expect("source turn completes");
+    let source_events = store.read(&source, 0, 64).await.expect("source reads");
+    let (fork_node_id, fork_seq) = source_events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            Some((node.node, event.seq))
+        })
+        .expect("source has fork node");
+    let request_json = r#"{"source":"duplicate-fork-source"}"#.to_owned();
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    let command = |candidate: &str| SessionForkCommand {
+        command_id: "duplicate-fork-command".into(),
+        request_digest: request_digest.clone(),
+        request_json: request_json.clone(),
+        source_session_id: source.clone(),
+        session_id: SessionId::new(candidate),
+        worker_generation: generation,
+        source_branch_id: None,
+        fork_node_id: fork_node_id.clone(),
+        fork_seq,
+        name: None,
+        metafork: None,
+        audit_event_id: EventId::new(format!("audit-{candidate}")),
+        device_id: DeviceId::new("duplicate-fork-device"),
+    };
+    let candidate_a = SessionId::new("duplicate-fork-candidate-a");
+    let candidate_b = SessionId::new("duplicate-fork-candidate-b");
+    let (first, second) = tokio::join!(
+        hub.fork_session(command(candidate_a.as_str())),
+        hub.fork_session(command(candidate_b.as_str())),
+    );
+    let created_id = match first.expect("first duplicate returns") {
+        SessionForkOutcome::Committed { created, .. }
+        | SessionForkOutcome::IdempotentReplay { created } => created.session_id,
+    };
+    let second_id = match second.expect("second duplicate returns") {
+        SessionForkOutcome::Committed { created, .. }
+        | SessionForkOutcome::IdempotentReplay { created } => created.session_id,
+    };
+    assert_eq!(second_id, created_id, "duplicates return one durable child");
+    let actors = hub.inner.actors.lock().expect("actor registry");
+    let resident_candidates = [&candidate_a, &candidate_b]
+        .into_iter()
+        .filter(|candidate| actors.contains_key(*candidate))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resident_candidates,
+        vec![created_id],
+        "only the committed child candidate remains resident"
+    );
+    drop(actors);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 #[derive(Default)]
 struct CapturingFrameSink(Mutex<Vec<WireFrame>>);
 
@@ -587,7 +679,41 @@ async fn command_capture_preserves_callers_binding_and_surface_ownership() {
         );
     }
 
-    connection.close().await.expect("connection closes");
+    let connection_id = connection.connection_id.clone();
+    drop(connection);
+    assert!(
+        !hub.inner
+            .diagnostic_sinks
+            .lock()
+            .expect("diagnostic sinks")
+            .contains_key(&connection_id),
+        "raw drop removes the connection sink"
+    );
+    assert!(
+        !hub.inner
+            .resident_binding_viewers
+            .lock()
+            .expect("binding viewers")
+            .contains(&connection_id),
+        "raw drop removes the binding viewer"
+    );
+    assert!(
+        hub.inner
+            .attachments
+            .lock()
+            .expect("attachments")
+            .values()
+            .all(|owner| owner.connection_id != connection_id),
+        "raw drop removes every owned attachment"
+    );
+    {
+        let slots = hub.inner.attachment_slots.lock().expect("attachment slots");
+        assert_eq!(slots.total, 0, "raw drop refunds the global slot");
+        assert!(
+            !slots.per_connection.contains_key(&connection_id),
+            "raw drop refunds the connection slot"
+        );
+    }
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }

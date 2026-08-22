@@ -417,8 +417,11 @@ impl PipeNativeWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(session_id);
         let state = if let Some(mut state) = known {
+            let durable_head = store.latest_seq(session_id).await.map_err(|error| {
+                PipeNativeError(format!("journal head inspection failed: {error:?}"))
+            })?;
             let (data, mut next_cursor) =
-                render_hot_batch(committed, state.cursor, &mut state.projector)?;
+                render_hot_batch(committed, durable_head, state.cursor, &mut state.projector)?;
             if !data.is_empty() {
                 let mut sealed_root = None;
                 let (file, segment) = write_segmented_open(
@@ -1398,14 +1401,14 @@ async fn write_segmented_open(
 /// covered envelopes can be represented by one watermark.
 fn render_hot_batch(
     envelopes: &[RawEnvelope],
+    durable_head: u64,
     cursor: SidecarCursor,
     projector: &mut TranscriptProjector,
 ) -> Result<(String, SidecarCursor), PipeNativeError> {
     let ordered = ordered_after(envelopes, cursor.pending_seq);
-    let Some(last) = ordered.last() else {
-        return Ok((String::new(), cursor));
-    };
-    let pending_seq = last.seq;
+    let pending_seq = ordered
+        .last()
+        .map_or(cursor.pending_seq, |envelope| envelope.seq);
     let mut data = String::new();
     let mut produced_row = false;
     for envelope in ordered {
@@ -1414,6 +1417,15 @@ fn render_hot_batch(
             data.push_str(&render_projected_rows(rows));
             produced_row = true;
         }
+    }
+    // A queued writer batch can lag a later SQLite commit. Preserve the join
+    // while it is not at EOF; once this projector has processed the durable
+    // head, use the exact same unresolved-tool EOF rule as every cold path
+    // and the prompt boundary fold.
+    if pending_seq == durable_head {
+        let trailing = projector.flush_unresolved_tools();
+        produced_row |= !trailing.is_empty();
+        data.push_str(&render_projected_rows(trailing));
     }
     let coverable_seq = projector
         .blocked_seq()

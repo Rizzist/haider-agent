@@ -417,9 +417,13 @@ pub fn palette_items(
         "theme" if done_args == 0 => theme_args(&fragment),
         "login" if done_args < 2 => login_args(done_args, &fragment),
         "model" if done_args == 0 => dynamic_args("model", &slots.models, &fragment),
-        "provider" if done_args == 0 => dynamic_args("provider", &slots.providers, &fragment),
+        "provider" if in_session && done_args == 0 => {
+            dynamic_args("provider", &slots.providers, &fragment)
+        }
         "account" if done_args == 0 => dynamic_args("account", &slots.accounts, &fragment),
-        "effort" if done_args == 0 => dynamic_args("effort", &slots.efforts, &fragment),
+        "effort" if in_session && done_args == 0 => {
+            dynamic_args("effort", &slots.efforts, &fragment)
+        }
         "usage" if done_args == 0 => dynamic_args("usage", &slots.providers, &fragment),
         _ => Vec::new(),
     }

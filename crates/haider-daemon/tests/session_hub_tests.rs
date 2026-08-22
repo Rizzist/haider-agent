@@ -7663,6 +7663,105 @@ async fn native_pipe_multiple_compaction_passes_create_exactly_one_segment() {
     assert_eq!(files, 2, "root plus exactly one successor");
 }
 
+/// MUTATION CHECK: remove the at-durable-head
+/// `projector.flush_unresolved_tools()` call from `render_hot_batch`.
+/// Expected runtime failure: the hot root has neither the unresolved tool row
+/// nor the terminal compaction boundary, and no successor segment exists.
+#[tokio::test]
+async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-hot-tool-boundary");
+    let generation = store.worker_generation();
+    let run_id = RunId::new("hot-tool-boundary-run");
+
+    // First touch takes a cold rebuild path; the next append below is the
+    // dominant live `render_hot_batch` path this regression must pin.
+    let mut seed = vec![user_pipe_event(
+        &session_id,
+        "hot-tool-boundary-seed",
+        generation,
+        "before",
+    )];
+    hub.append(&mut seed).await.expect("seed commits");
+    let _ = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+
+    let mut tool_call = pipe_event(
+        &session_id,
+        "hot-unresolved-tool-call",
+        generation,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("hot-unresolved-tool-item"),
+            item: TurnItem::ToolCall {
+                call_id: "hot-unresolved-call".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"cmd": "printf hot"}),
+                status: haider_protocol::item::ToolStatus::Completed,
+            },
+        }),
+    );
+    tool_call.run_id = Some(run_id.clone());
+    let mut tool_node = pipe_event(
+        &session_id,
+        "hot-unresolved-tool-node",
+        generation,
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("hot-unresolved-tool-node"),
+            parent: None,
+            kind: NodeKind::ToolExchange {
+                tool: "shell".into(),
+                summary: "ran without a provider result".into(),
+                artifact: None,
+            },
+        }),
+    );
+    tool_node.run_id = Some(run_id.clone());
+    let mut hot = vec![
+        tool_call,
+        tool_node,
+        compaction_pipe_event(
+            &session_id,
+            "hot-tool-boundary-compaction",
+            generation,
+            run_id.as_str(),
+        ),
+        run_state_pipe_event(
+            &session_id,
+            "hot-tool-boundary-done",
+            generation,
+            run_id.as_str(),
+            RunState::Done,
+        ),
+    ];
+    hub.append(&mut hot)
+        .await
+        .expect("hot compacting batch commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let base = sidecar_path(&root, &session_id);
+    let root_segment = std::fs::read_to_string(&base).expect("root segment reads");
+    let tool_at = root_segment
+        .find("\"name\":\"shell\"")
+        .expect("unresolved tool row is emitted at hot EOF");
+    let boundary_at = root_segment
+        .find("\"kind\":\"compaction_boundary\"")
+        .expect("terminal boundary follows the tool row");
+    assert!(
+        tool_at < boundary_at,
+        "tool must precede boundary: {root_segment}"
+    );
+    let successor = successor_path(&base, &root_segment);
+    let successor_segment =
+        std::fs::read_to_string(successor).expect("terminal boundary creates successor");
+    let tail: serde_json::Value = serde_json::from_str(
+        successor_segment
+            .lines()
+            .last()
+            .expect("successor coverage"),
+    )
+    .expect("successor coverage JSON");
+    assert_eq!(tail["coverage"], hot.last().expect("durable head").seq);
+}
+
 /// MUTATION CHECK: omit the `segment_end` line after writing the boundary.
 /// Expected RUNTIME failure: EOF of the root segment with coverage equal to
 /// `head_seq` is indistinguishable from the final at-head EOF.
