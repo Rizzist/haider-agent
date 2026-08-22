@@ -1476,16 +1476,28 @@ mod tests {
     #[test]
     fn a_row_without_reasoning_keeps_its_compat_status() {
         let mut projector = TranscriptProjector::default();
+        projector.push(&reasoning_started(1, "run-a", "reason-a"));
         // An empty turn-start assistant row is compat by construction.
-        let rows = projector.push(&assistant(1, "run-a", ""));
-        let row = serde_json::to_value(&rows[0]).expect("row serializes");
+        projector.push(&assistant(2, "run-a", ""));
+        // Sealing with an EMPTY summary still runs the attachment path, so
+        // this exercises the guard rather than bypassing it: a row that goes
+        // THROUGH `set_reasoning_summary` but gains nothing must keep its
+        // compat status. Pushing a row that never enters that function would
+        // pass no matter what the function did.
+        let rows = projector.push(&reasoning_sealed(3, "run-a", "reason-a", ""));
+        let row = rows
+            .iter()
+            .map(|row| serde_json::to_value(row).expect("row serializes"))
+            .find(|row| row["role"] == "assistant")
+            .expect("the assistant row is emitted");
+
         assert!(
             row.get("reasoning").is_none(),
-            "no reasoning on this row: {row}"
+            "an empty summary attaches nothing: {row}"
         );
         assert_eq!(
             row["compat"], true,
-            "an empty turn-start row is still redundant: {row}"
+            "a row that gained no reasoning stays redundant: {row}"
         );
     }
 
