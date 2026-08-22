@@ -84,7 +84,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
         )
         .await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionList { ref sessions, .. },
             ..
@@ -106,7 +106,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
         )
         .await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionRead { ref result },
             ..
@@ -126,7 +126,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
             config.frame_limit,
         )
         .await;
-    let attachment_id = match client.next().await {
+    let attachment_id = match client.next_reply().await {
         WireFrame::Response {
             body:
                 ResponseBody::SessionAttach {
@@ -167,7 +167,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
         )
         .await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionDetach { attachment_id: found },
             ..
@@ -229,6 +229,10 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
             )
             .await;
     }
+    assert!(matches!(
+        client.next_reply().await,
+        WireFrame::Response { .. }
+    ));
 
     let mut cold_caught_up = false;
     let mut hot_events = 0_u64;
@@ -317,6 +321,10 @@ async fn paced_replay_of_a_long_history_never_laggs_a_reading_client() {
             config.frame_limit,
         )
         .await;
+    assert!(matches!(
+        client.next_reply().await,
+        WireFrame::Response { .. }
+    ));
 
     let mut next_seq = 1_u64;
     loop {
@@ -401,6 +409,10 @@ async fn byte_bound_replay_of_large_envelopes_never_laggs_a_reading_client() {
             config.frame_limit,
         )
         .await;
+    assert!(matches!(
+        client.next_reply().await,
+        WireFrame::Response { .. }
+    ));
 
     let mut next_seq = 1_u64;
     loop {
@@ -474,6 +486,10 @@ async fn five_concurrent_replay_lanes_on_one_connection_never_lag_a_reading_clie
             )
             .await;
     }
+    assert!(matches!(
+        client.next_reply().await,
+        WireFrame::Response { .. }
+    ));
 
     let mut caught_up = 0_usize;
     let mut next_seq: std::collections::HashMap<SessionId, u64> = sessions

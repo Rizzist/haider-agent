@@ -32,6 +32,8 @@
 //! - client frame-limit honored    -> `client_max_receive_frame_is_enforced_on_welcome`
 //! - duplicate Hello               -> `duplicate_hello_after_handshake_is_a_fatal_unexpected_frame`
 //! - capability downscoping        -> `view_only_connection_is_denied_the_control_frame`
+//! - binding capability rule       -> `binding_baseline_requires_view_or_control_capability`
+//! - ordered unbound baseline      -> `view_connection_receives_exactly_one_unbound_baseline_after_welcome`
 //! - pre-Hello slot exhaustion     -> `silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot`
 //! - connection admission cap      -> `connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot`
 //! - queued-byte budget            -> `outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold`
@@ -418,7 +420,7 @@ async fn cold_start_socket_missing_serves_handshake_ping_and_session_list() {
     client
         .send(&WireFrame::Ping { nonce: 77 }, config.frame_limit)
         .await;
-    assert_eq!(client.receive().await, WireFrame::Pong { nonce: 77 });
+    assert_eq!(client.receive_reply().await, WireFrame::Pong { nonce: 77 });
     client
         .send(
             &WireFrame::Request {
@@ -432,7 +434,7 @@ async fn cold_start_socket_missing_serves_handshake_ping_and_session_list() {
         )
         .await;
     assert!(matches!(
-        client.receive().await,
+        client.receive_reply().await,
         WireFrame::Response {
             request_id,
             body: ResponseBody::SessionList {
@@ -637,7 +639,7 @@ async fn abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves() {
     client
         .send(&WireFrame::Ping { nonce: 9 }, config.frame_limit)
         .await;
-    assert_eq!(client.receive().await, WireFrame::Pong { nonce: 9 });
+    assert_eq!(client.receive_reply().await, WireFrame::Pong { nonce: 9 });
     recovered.signal(Signal::TERM);
     assert!(recovered.wait().await.success());
 }
@@ -731,6 +733,165 @@ async fn client_max_receive_frame_is_enforced_on_welcome() {
     );
 }
 
+/// Both capabilities that can act on binding state receive the baseline;
+/// a capability-empty connection receives no binding frames at all.
+///
+/// MUTATION CHECK (Control omitted): remove the `Capability::Control` arm of
+/// `may_view_binding` in `SessionHub::open_connection`. The raw post-Welcome
+/// read gets Pong instead of the required control baseline.
+///
+/// MUTATION CHECK (gate widened): replace `may_view_binding` with `true`.
+/// The capability-empty connection gets a binding baseline instead of Pong.
+#[tokio::test]
+async fn binding_baseline_requires_view_or_control_capability() {
+    let root = test_root("w3b1-");
+    let config = test_config(&root, "binding-capability-rule");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut controller = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect control-only client");
+    let mut request = hello(
+        WIRE_PROTOCOL_VERSION,
+        WIRE_PROTOCOL_VERSION,
+        u32::try_from(config.frame_limit).expect("frame limit fits"),
+    );
+    if let WireFrame::Hello(hello) = &mut request {
+        hello.capabilities_requested = CapabilitySet::from([Capability::Control]);
+    }
+    controller.send(&request, config.frame_limit).await;
+    match controller.next().await {
+        WireFrame::Welcome(welcome) => assert_eq!(
+            welcome.capabilities_granted,
+            CapabilitySet::from([Capability::Control])
+        ),
+        frame => panic!("expected Welcome first, got {frame:?}"),
+    }
+
+    controller
+        .send(&WireFrame::Ping { nonce: 41 }, config.frame_limit)
+        .await;
+    let control_baseline = controller.next().await;
+    assert!(
+        matches!(
+            &control_baseline,
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation,
+            } if *worker_generation > 0
+        ),
+        "a control-only connection must receive the explicit unbound baseline, got {control_baseline:?}"
+    );
+    assert_eq!(controller.next().await, WireFrame::Pong { nonce: 41 });
+
+    let mut unprivileged = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect capability-empty client");
+    let mut request = hello(
+        WIRE_PROTOCOL_VERSION,
+        WIRE_PROTOCOL_VERSION,
+        u32::try_from(config.frame_limit).expect("frame limit fits"),
+    );
+    if let WireFrame::Hello(hello) = &mut request {
+        hello.capabilities_requested = CapabilitySet::new();
+    }
+    unprivileged.send(&request, config.frame_limit).await;
+    match unprivileged.next().await {
+        WireFrame::Welcome(welcome) => {
+            assert_eq!(welcome.capabilities_granted, CapabilitySet::new());
+        }
+        frame => panic!("expected Welcome first, got {frame:?}"),
+    }
+    unprivileged
+        .send(&WireFrame::Ping { nonce: 43 }, config.frame_limit)
+        .await;
+    assert_eq!(
+        unprivileged.next().await,
+        WireFrame::Pong { nonce: 43 },
+        "a connection with neither View nor Control must receive no binding baseline"
+    );
+
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
+/// The open-time binding snapshot is an explicit frame, not silence: Welcome
+/// is first, then exactly one unbound baseline precedes a later Pong.
+///
+/// MUTATION CHECK (Welcome first): change the System-lane admission in
+/// `OutboundLane::try_push_with_floor` from `push_back` to `push_front`. The
+/// first raw read gets the binding baseline instead of Welcome.
+///
+/// MUTATION CHECK (exactly one): send the open-time baseline twice in
+/// `SessionHub::open_connection`. The second raw post-baseline read gets the
+/// duplicate binding frame instead of Pong.
+///
+/// MUTATION CHECK (present unbound state): synthesize a non-`None` session id
+/// in the no-binding fallback. The baseline's `session_id.is_none()` assertion
+/// fails on the frame that was actually received.
+#[tokio::test]
+async fn view_connection_receives_exactly_one_unbound_baseline_after_welcome() {
+    let root = test_root("w3b1-");
+    let config = test_config(&root, "ordered-binding-baseline");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect view client");
+    let mut request = hello(
+        WIRE_PROTOCOL_VERSION,
+        WIRE_PROTOCOL_VERSION,
+        u32::try_from(config.frame_limit).expect("frame limit fits"),
+    );
+    if let WireFrame::Hello(hello) = &mut request {
+        hello.capabilities_requested = CapabilitySet::from([Capability::View]);
+    }
+    client.send(&request, config.frame_limit).await;
+    match client.next().await {
+        WireFrame::Welcome(welcome) => assert_eq!(
+            welcome.capabilities_granted,
+            CapabilitySet::from([Capability::View])
+        ),
+        frame => panic!("expected Welcome first, got {frame:?}"),
+    }
+
+    match client.next().await {
+        WireFrame::ResidentSessionBinding {
+            session_id,
+            worker_generation,
+        } => {
+            assert!(
+                session_id.is_none(),
+                "the present open-time baseline must explicitly say nothing is bound, got {session_id:?}"
+            );
+            assert!(
+                worker_generation > 0,
+                "the unbound baseline must carry the daemon's live generation"
+            );
+        }
+        frame => panic!("expected exactly one binding baseline after Welcome, got {frame:?}"),
+    }
+    client
+        .send(&WireFrame::Ping { nonce: 42 }, config.frame_limit)
+        .await;
+    assert_eq!(
+        client.next().await,
+        WireFrame::Pong { nonce: 42 },
+        "a duplicate open-time baseline must not precede the next reply"
+    );
+
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
 #[tokio::test]
 async fn drain_notifies_every_open_connection_before_close() {
     let root = test_root("w3b1-");
@@ -743,7 +904,7 @@ async fn drain_notifies_every_open_connection_before_close() {
     task.shutdown_handle().request("maintenance");
     for client in [&mut first, &mut second] {
         assert!(matches!(
-            client.receive().await,
+            client.receive_reply().await,
             WireFrame::ServerDraining {
                 ref reason,
                 deadline_unix_ms,
@@ -1581,7 +1742,7 @@ async fn drain_reason_is_truncated_to_fit_a_small_client_frame_limit() {
 
     let reason = format!("maintenance-{}", "r".repeat(4 * 1024));
     task.shutdown_handle().request(&reason);
-    let notice = client.receive().await;
+    let notice = client.receive_reply().await;
     let WireFrame::ServerDraining {
         reason: notice_reason,
         ..
@@ -1640,7 +1801,7 @@ async fn view_only_connection_is_denied_the_control_frame() {
         .await;
     assert!(
         matches!(
-            viewer.receive().await,
+            viewer.receive_reply().await,
             WireFrame::Response {
                 ref request_id,
                 body: ResponseBody::Error { ref code, .. },
@@ -1656,7 +1817,7 @@ async fn view_only_connection_is_denied_the_control_frame() {
         .send(&menu_answer(None), config.frame_limit)
         .await;
     assert!(matches!(
-        controller.receive().await,
+        controller.receive_reply().await,
         WireFrame::ProtocolError(ProtocolError { ref code, fatal: false, .. })
             if code == "capability_denied"
     ));
@@ -1722,7 +1883,7 @@ async fn duplicate_hello_after_handshake_is_a_fatal_unexpected_frame() {
         )
         .await;
     assert!(matches!(
-        client.receive().await,
+        client.receive_reply().await,
         WireFrame::ProtocolError(ProtocolError { ref code, fatal: true, .. })
             if code == "unexpected_frame"
     ));

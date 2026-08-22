@@ -179,10 +179,29 @@ impl UdsClient {
             .expect("connection closed before a frame arrived")
     }
 
+    /// Receives the next request/reply outcome while draining uncorrelated
+    /// resident-binding pushes. Tests that assert push delivery or ordering
+    /// must keep using [`Self::receive`] (or [`Self::next`]) directly.
+    pub async fn receive_reply(&mut self) -> WireFrame {
+        loop {
+            let frame = self.receive().await;
+            if !matches!(frame, WireFrame::ResidentSessionBinding { .. }) {
+                return frame;
+            }
+        }
+    }
+
     pub async fn next(&mut self) -> WireFrame {
         tokio::time::timeout(DEADLINE, self.receive())
             .await
             .expect("frame deadline")
+    }
+
+    /// Deadline-bounded counterpart to [`Self::receive_reply`].
+    pub async fn next_reply(&mut self) -> WireFrame {
+        tokio::time::timeout(DEADLINE, self.receive_reply())
+            .await
+            .expect("reply deadline")
     }
 
     /// Waits for one frame while preserving the negotiated peer's R9 side of

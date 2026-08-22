@@ -67,7 +67,7 @@ async fn usage_report_is_advertised_and_answers_typed_over_uds() {
             config.frame_limit,
         )
         .await;
-    let WireFrame::Response { request_id, body } = client.next().await else {
+    let WireFrame::Response { request_id, body } = client.next_reply().await else {
         panic!("expected a response frame");
     };
     assert_eq!(request_id, RequestId::new("usage-1"));

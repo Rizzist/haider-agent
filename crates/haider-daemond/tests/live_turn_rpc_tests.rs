@@ -310,7 +310,7 @@ async fn create_and_attach_for_provider(
         ),
     )
     .await;
-    let (session_id, generation) = match client.next().await {
+    let (session_id, generation) = match client.next_reply().await {
         WireFrame::Response {
             body:
                 ResponseBody::SessionCreate {
@@ -335,7 +335,7 @@ async fn create_and_attach_for_provider(
     )
     .await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionAttach { .. },
             ..
@@ -3770,7 +3770,7 @@ async fn metadata_less_live_submit_is_correlated_invalid_argument_without_accept
         },
     )
     .await;
-    let generation = match client.next().await {
+    let generation = match client.next_reply().await {
         WireFrame::Response {
             body: ResponseBody::SessionList { sessions, .. },
             ..
@@ -3796,7 +3796,7 @@ async fn metadata_less_live_submit_is_correlated_invalid_argument_without_accept
         ),
     )
     .await;
-    let rejection = client.next().await;
+    let rejection = client.next_reply().await;
     assert!(
         matches!(
         rejection,
@@ -4773,7 +4773,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
         create_body("create-command", workspace.to_string_lossy().into_owned()),
     )
     .await;
-    let (session_id, metadata) = created_response(client.next().await);
+    let (session_id, metadata) = created_response(client.next_reply().await);
     assert_eq!(
         metadata.cwd,
         fs::canonicalize(&workspace)
@@ -4795,7 +4795,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
     )
     .await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionAttach { .. },
             ..
@@ -4828,7 +4828,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
         },
     )
     .await;
-    let summary = match client.next().await {
+    let summary = match client.next_reply().await {
         WireFrame::Response {
             body: ResponseBody::SessionList { sessions, .. },
             ..
@@ -4884,7 +4884,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
     )
     .await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionRead { result },
             ..
@@ -4960,7 +4960,7 @@ async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_cha
             },
         )
         .await;
-        match observer.next().await {
+        match observer.next_reply().await {
             WireFrame::Response {
                 body: ResponseBody::SessionList { sessions, .. },
                 ..
@@ -4982,7 +4982,7 @@ async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_cha
         create_body("same-command", original),
     )
     .await;
-    let (retried_session, _) = created_response(observer.next().await);
+    let (retried_session, _) = created_response(observer.next_reply().await);
     assert_eq!(retried_session, first_session);
 
     send_request(
@@ -4993,7 +4993,7 @@ async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_cha
     )
     .await;
     assert!(matches!(
-        observer.next().await,
+        observer.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::Error { ref code, .. },
             ..
@@ -5052,7 +5052,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         body(Some(expected)),
     )
     .await;
-    let (session_id, metadata) = created_response(client.next().await);
+    let (session_id, metadata) = created_response(client.next_reply().await);
     assert_eq!(metadata.permission_overrides, Some(expected));
 
     send_request(
@@ -5062,13 +5062,13 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         body(Some(expected)),
     )
     .await;
-    let (retried, retried_metadata) = created_response(client.next().await);
+    let (retried, retried_metadata) = created_response(client.next_reply().await);
     assert_eq!(retried, session_id);
     assert_eq!(retried_metadata.permission_overrides, Some(expected));
 
     send_request(&mut client, &config, "changed-overrides", body(None)).await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::Error { ref code, .. },
             ..
@@ -5086,7 +5086,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
     )
     .await;
     assert!(matches!(
-        client.next().await,
+        client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionList { sessions, .. },
             ..
@@ -5151,7 +5151,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
     )
     .await;
     assert!(matches!(
-        viewer.next().await,
+        viewer.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::Error { ref code, .. },
             ..
@@ -5169,7 +5169,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
     )
     .await;
     assert!(matches!(
-        feature_client.next().await,
+        feature_client.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::SessionList { ref sessions, .. },
             ..
@@ -5185,7 +5185,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
         ),
     )
     .await;
-    let (session_id, generation) = match feature_client.next().await {
+    let (session_id, generation) = match feature_client.next_reply().await {
         WireFrame::Response {
             body:
                 ResponseBody::SessionCreate {
@@ -5210,7 +5210,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
     )
     .await;
     assert!(matches!(
-        viewer.next().await,
+        viewer.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::Error { ref code, .. },
             ..
@@ -5229,7 +5229,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
     )
     .await;
     assert!(matches!(
-        viewer.next().await,
+        viewer.next_reply().await,
         WireFrame::Response {
             body: ResponseBody::Error { ref code, .. },
             ..
