@@ -2,25 +2,25 @@ class Haider < Formula
   desc "Provider-agnostic coding-agent TUI and runtime"
   homepage "https://github.com/Rizzist/haider-agent"
   license "LicenseRef-KOA-P-1.0"
-  version "0.0.941"
+  version "0.0.942"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.941/haider-v0.0.941-aarch64-apple-darwin.tar.xz"
-      sha256 "ebfa8b905467a5bfa50524e995e45e1a8debd09ca5479729c7723673183b7b81"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.942/haider-v0.0.942-aarch64-apple-darwin.tar.xz"
+      sha256 "95f5cc3b36e43b6c0da9e787a79ddfbe3f31ec2dcf11cd915577007db6db49c1"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.941/haider-v0.0.941-x86_64-apple-darwin.tar.xz"
-      sha256 "01021b51e4f6bda5abfc1154e67d7242af6b72db73463bd0a77ab7ca96c25534"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.942/haider-v0.0.942-x86_64-apple-darwin.tar.xz"
+      sha256 "871433d6f8bd46c5659d3b5105fefc2995f45a081ad3a9d6f61c163ec6b726e0"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.941/haider-v0.0.941-aarch64-unknown-linux-gnu.tar.xz"
-      sha256 "7a8548d4ae4a5a42f0b82153ef8da8314b693b959d571428ad144444f3d04b64"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.942/haider-v0.0.942-aarch64-unknown-linux-gnu.tar.xz"
+      sha256 "4bf4d9c22aa1abdeb7432a78e50e28e374dce9c27ed5b61119e84a1a93581a2f"
     else
-      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.941/haider-v0.0.941-x86_64-unknown-linux-gnu.tar.xz"
-      sha256 "9b730cf5c4817a2c5e20e0aec44fef564b8b203f036706a0aa054a38eed2d541"
+      url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.942/haider-v0.0.942-x86_64-unknown-linux-gnu.tar.xz"
+      sha256 "77c7db1854d8a9447b3676b2a0a0f7059cd7f3036daa4e8b9e42c4cda1edc7d5"
     end
   end
 
