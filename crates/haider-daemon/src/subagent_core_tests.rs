@@ -1561,6 +1561,10 @@ async fn wait_for_state(
     .expect("expected run state");
 }
 
+// Every caller of this helper lives in a `cfg(unix)` test (the UDS/menu
+// scenarios), so on Windows it has no callers at all and `-D warnings`
+// turns dead_code into a build failure. Gate the helper with its callers.
+#[cfg(unix)]
 fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<EventPayload> {
     events
         .iter()
