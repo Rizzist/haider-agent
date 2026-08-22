@@ -112,13 +112,14 @@ use haider_core::{
     ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache,
     RenamedSession, RunRetryCommand, RunRetryOutcome, SeenSession, SelectedAgentType,
     SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
-    SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit, SessionRenameCommand,
-    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
-    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit, SessionProjectionCheckpoint,
+    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
+    SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -4062,6 +4063,32 @@ impl StoreHandle for HubStoreHandle {
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.ensure_session(session_id)?;
         self.hub.inner.store.latest_seq(session_id).await
+    }
+
+    async fn projection_checkpoint(
+        &self,
+        session_id: &SessionId,
+        projection: &str,
+        timeline_key: &str,
+    ) -> Result<Option<SessionProjectionCheckpoint>, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .projection_checkpoint(session_id, projection.to_owned(), timeline_key.to_owned())
+            .await
+    }
+
+    async fn put_projection_checkpoint(
+        &self,
+        checkpoint: SessionProjectionCheckpoint,
+    ) -> Result<(), HaiderError> {
+        self.ensure_session(&checkpoint.session_id)?;
+        self.hub
+            .inner
+            .store
+            .put_projection_checkpoint(checkpoint)
+            .await
     }
 
     async fn branch_lineage(

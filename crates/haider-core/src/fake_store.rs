@@ -4,7 +4,7 @@
 //! starting at 1, one `committed_at_ms` per batch, batches never span
 //! sessions. The durable store must preserve exactly these observable rules.
 
-use crate::{CommittedRange, StoreHandle, unix_time_ms};
+use crate::{CommittedRange, SessionProjectionCheckpoint, StoreHandle, unix_time_ms};
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     sessions: Mutex<HashMap<SessionId, Vec<RawEnvelope>>>,
+    checkpoints: Mutex<HashMap<(SessionId, String, String), SessionProjectionCheckpoint>>,
 }
 
 impl MemoryStore {
@@ -128,6 +129,61 @@ impl StoreHandle for MemoryStore {
             .get(session_id)
             .and_then(|journal| journal.last())
             .map_or(0, |envelope| envelope.seq))
+    }
+
+    async fn projection_checkpoint(
+        &self,
+        session_id: &SessionId,
+        projection: &str,
+        timeline_key: &str,
+    ) -> Result<Option<SessionProjectionCheckpoint>, HaiderError> {
+        Ok(self
+            .checkpoints
+            .lock()
+            .await
+            .get(&(
+                session_id.clone(),
+                projection.to_owned(),
+                timeline_key.to_owned(),
+            ))
+            .cloned())
+    }
+
+    async fn put_projection_checkpoint(
+        &self,
+        checkpoint: SessionProjectionCheckpoint,
+    ) -> Result<(), HaiderError> {
+        let boundary_matches = self
+            .sessions
+            .lock()
+            .await
+            .get(&checkpoint.session_id)
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|event| event.seq == checkpoint.through_seq)
+            })
+            .is_some_and(|event| event.event_id == checkpoint.boundary_event_id);
+        if !boundary_matches {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "projection checkpoint does not name its immutable boundary event",
+                false,
+            ));
+        }
+        let key = (
+            checkpoint.session_id.clone(),
+            checkpoint.projection.clone(),
+            checkpoint.timeline_key.clone(),
+        );
+        let mut checkpoints = self.checkpoints.lock().await;
+        if checkpoints
+            .get(&key)
+            .is_none_or(|current| current.through_seq <= checkpoint.through_seq)
+        {
+            checkpoints.insert(key, checkpoint);
+        }
+        Ok(())
     }
 
     async fn branch_lineage(

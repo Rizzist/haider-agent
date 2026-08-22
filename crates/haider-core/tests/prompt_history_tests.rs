@@ -4,11 +4,12 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_core::{
-    ArtifactReader, MemoryStore, PromptHistoryCompiler, SessionCreateCommand, SqliteStoreHandle,
-    StoreHandle, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
+    ArtifactReader, CommittedRange, MemoryStore, PromptHistoryCompiler, SessionCreateCommand,
+    SessionProjectionCheckpoint, SqliteStoreHandle, StoreHandle, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -24,7 +25,9 @@ use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{AttachmentBlock, BoundedResult};
 use haider_protocol::verify::VerifyVerdict;
+use haider_provider::{Message, MessageRole};
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 fn envelope(
     session_id: &SessionId,
@@ -91,6 +94,108 @@ impl ArtifactReader for TestArtifacts {
                 false,
             )
         })
+    }
+}
+
+struct RecordingStore<'a, S: ?Sized> {
+    inner: &'a S,
+    reads: Mutex<Vec<u64>>,
+    loaded_checkpoints: Mutex<Vec<SessionProjectionCheckpoint>>,
+    checkpoint_override: Option<SessionProjectionCheckpoint>,
+}
+
+impl<'a, S: ?Sized> RecordingStore<'a, S> {
+    fn new(inner: &'a S) -> Self {
+        Self {
+            inner,
+            reads: Mutex::new(Vec::new()),
+            loaded_checkpoints: Mutex::new(Vec::new()),
+            checkpoint_override: None,
+        }
+    }
+
+    fn with_checkpoint(inner: &'a S, checkpoint: SessionProjectionCheckpoint) -> Self {
+        Self {
+            inner,
+            reads: Mutex::new(Vec::new()),
+            loaded_checkpoints: Mutex::new(Vec::new()),
+            checkpoint_override: Some(checkpoint),
+        }
+    }
+
+    fn read_cursors(&self) -> Vec<u64> {
+        self.reads.lock().expect("read ledger").clone()
+    }
+
+    fn loaded_checkpoints(&self) -> Vec<SessionProjectionCheckpoint> {
+        self.loaded_checkpoints
+            .lock()
+            .expect("checkpoint ledger")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl<S: StoreHandle + ?Sized> StoreHandle for RecordingStore<'_, S> {
+    async fn append(
+        &self,
+        envelopes: &mut [haider_protocol::envelope::RawEnvelope],
+    ) -> Result<CommittedRange, haider_protocol::error::HaiderError> {
+        StoreHandle::append(self.inner, envelopes).await
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<haider_protocol::envelope::RawEnvelope>, haider_protocol::error::HaiderError>
+    {
+        self.reads.lock().expect("read ledger").push(since_seq);
+        StoreHandle::read(self.inner, session_id, since_seq, limit).await
+    }
+
+    async fn latest_seq(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<u64, haider_protocol::error::HaiderError> {
+        StoreHandle::latest_seq(self.inner, session_id).await
+    }
+
+    async fn projection_checkpoint(
+        &self,
+        session_id: &SessionId,
+        projection: &str,
+        timeline_key: &str,
+    ) -> Result<Option<SessionProjectionCheckpoint>, haider_protocol::error::HaiderError> {
+        let loaded = if let Some(checkpoint) = &self.checkpoint_override {
+            Some(checkpoint.clone())
+        } else {
+            StoreHandle::projection_checkpoint(self.inner, session_id, projection, timeline_key)
+                .await?
+        };
+        if let Some(checkpoint) = &loaded {
+            self.loaded_checkpoints
+                .lock()
+                .expect("checkpoint ledger")
+                .push(checkpoint.clone());
+        }
+        Ok(loaded)
+    }
+
+    async fn put_projection_checkpoint(
+        &self,
+        checkpoint: SessionProjectionCheckpoint,
+    ) -> Result<(), haider_protocol::error::HaiderError> {
+        StoreHandle::put_projection_checkpoint(self.inner, checkpoint).await
+    }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, haider_protocol::error::HaiderError> {
+        StoreHandle::branch_lineage(self.inner, session_id, branch_id).await
     }
 }
 
@@ -1041,9 +1146,10 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
     );
 }
 
-/// MUTATION CHECK: retain covered journal fragments after inserting the
-/// summary. Expected runtime failure: `old prefix` remains in the prompt or
-/// the two restart-equivalent compiles produce different bytes.
+/// MUTATION CHECK: initialize the resumed fold at sequence zero instead of
+/// the stored terminal boundary. Expected runtime failure: the read-cursor
+/// assertion observes zero. Changing the checkpoint's `boundary_event_id` to
+/// the compaction-node event also fails the terminal-boundary identity pin.
 #[tokio::test]
 async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let root = tempfile::tempdir().expect("temp profile");
@@ -1131,13 +1237,6 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
-        envelope(
-            &session_id,
-            &first,
-            "compacted-first-done",
-            EventPayload::RunState(RunState::Done),
-            PromptRender::Omit,
-        ),
         node(
             &session_id,
             &first,
@@ -1151,6 +1250,13 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
                 tokens_after: 12,
                 resume_cause: CompactionResume::ManualIdle,
             },
+        ),
+        envelope(
+            &session_id,
+            &first,
+            "compacted-first-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
         ),
         envelope(
             &session_id,
@@ -1224,7 +1330,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
             },
         ),
     ];
-    let mut compacted_suffix = events.split_off(5);
+    let mut compacted_suffix = events.split_off(4);
     StoreHandle::append(&store, &mut events)
         .await
         .expect("append pre-compaction history");
@@ -1270,16 +1376,32 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let restarted = SqliteStoreHandle::open(root.path())
         .await
         .expect("reopen store");
-    let restarted_projection = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
-        &restarted,
-        &restarted,
-        &session_id,
-        None,
-        None,
-        &current,
-    )
-    .await
-    .expect("compile after restart-equivalent replay");
+    let recording = RecordingStore::new(&restarted);
+    let restarted_cache = PromptHistoryCompiler::cache();
+    let restarted_projection =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &restarted_cache,
+            &recording,
+            &restarted,
+            &session_id,
+            None,
+            None,
+            &current,
+        )
+        .await
+        .expect("compile after restart from durable boundary");
+    let loaded_checkpoints = recording.loaded_checkpoints();
+    assert_eq!(loaded_checkpoints.len(), 1);
+    assert_eq!(
+        loaded_checkpoints[0].boundary_event_id,
+        EventId::new("compacted-first-done"),
+        "the checkpoint must use TranscriptProjector's terminal boundary, not the compaction node"
+    );
+    assert!(
+        !recording.read_cursors().contains(&0),
+        "a readable boundary checkpoint must not replay from zero: {:?}",
+        recording.read_cursors()
+    );
     let text = first_projection
         .messages
         .iter()
@@ -1303,11 +1425,472 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     assert_eq!(first_projection.stable_history_end, 3);
     assert_eq!(first_projection.current_user_start, 3);
     assert_eq!(first_projection, restarted_projection);
+    assert_eq!(restarted_projection, fresh_projection);
     assert_eq!(
         serde_json::to_vec(&first_projection.messages).expect("serialize first compile"),
         serde_json::to_vec(&restarted_projection.messages).expect("serialize restarted compile")
     );
     restarted.close().await.expect("close restarted store");
+}
+
+/// MUTATION CHECK: replace the `Ok(stored) => stored?` cache-miss arm with
+/// `Some(stored.expect("checkpoint"))`. Expected runtime failure: this
+/// never-compacted session panics instead of folding normally from sequence 0.
+#[tokio::test]
+async fn session_without_compaction_folds_from_zero_without_a_checkpoint() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let session_id = SessionId::new("no-compaction-checkpoint-session");
+    let current = RunId::new("no-compaction-current");
+    let mut events = vec![envelope(
+        &session_id,
+        &current,
+        "no-compaction-user",
+        EventPayload::UserMessage {
+            text: "ordinary short session".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        },
+        PromptRender::Verbatim,
+    )];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append uncompacted history");
+
+    let full = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("fold uncompacted journal");
+    let recording = RecordingStore::new(&store);
+    let resumed = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &PromptHistoryCompiler::cache(),
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("cache miss falls back to journal");
+
+    assert_eq!(resumed, full);
+    assert!(
+        recording.read_cursors().contains(&0),
+        "a session without a checkpoint must begin at zero"
+    );
+}
+
+/// MUTATION CHECK: remove `decoded.branch_id != timeline.branch_id` from the
+/// checkpoint validator. Expected runtime failure: the branch-A summary is
+/// prepended to branch B and the full/resumed equality assertion fails.
+#[tokio::test]
+async fn checkpoint_from_another_branch_is_rejected() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let session_id = SessionId::new("cross-branch-checkpoint-session");
+    let branch_a = BranchId::new("checkpoint-branch-a");
+    let branch_b = BranchId::new("requested-branch-b");
+    let compacting = RunId::new("branch-a-compaction");
+    let current = RunId::new("branch-b-current");
+    let mut compact_node = node(
+        &session_id,
+        &compacting,
+        "branch-a-compaction-node",
+        None,
+        NodeKind::Compaction {
+            covers_from: NodeId::new("branch-a-covered-from"),
+            covers_to: NodeId::new("branch-a-covered-to"),
+            summary_artifact: ArtifactRef::new(format!("blake3:{}", "a".repeat(64))),
+            tokens_before: 40,
+            tokens_after: 4,
+            resume_cause: CompactionResume::ManualIdle,
+        },
+    );
+    compact_node.branch_id = Some(branch_a.clone());
+    let mut terminal = envelope(
+        &session_id,
+        &compacting,
+        "branch-a-compaction-done",
+        EventPayload::RunState(RunState::Done),
+        PromptRender::Omit,
+    );
+    terminal.branch_id = Some(branch_a.clone());
+    let mut current_user = envelope(
+        &session_id,
+        &current,
+        "branch-b-current-user",
+        EventPayload::UserMessage {
+            text: "branch B only".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        },
+        PromptRender::Verbatim,
+    );
+    current_user.branch_id = Some(branch_b.clone());
+    let mut events = vec![compact_node, terminal, current_user];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append divergent timelines");
+
+    let wrong_message = Message {
+        role: MessageRole::User,
+        blocks: vec![Block::Text {
+            text: "branch A summary must never leak".into(),
+        }],
+    };
+    let wrong_checkpoint = SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: "prompt_history".into(),
+        timeline_key: "branch-a-key-returned-adversarially".into(),
+        through_seq: 2,
+        boundary_event_id: events[1].event_id.clone(),
+        payload: serde_json::to_vec(&serde_json::json!({
+            "shape_version": 1,
+            "reducer_version": format!("{}/prompt-v1", env!("CARGO_PKG_VERSION")),
+            "through_seq": 2,
+            "boundary_event_id": events[1].event_id,
+            "boundary_run_id": compacting,
+            "branch_id": branch_a,
+            "compaction_epoch": 1,
+            "messages": [serde_json::to_value(wrong_message).expect("message value")],
+            "stable_history_end": 1,
+            "current_user_start": 1,
+            "latest_compaction_summary_end": 1
+        }))
+        .expect("encode shape-valid wrong-branch checkpoint"),
+    };
+    let recording = RecordingStore::with_checkpoint(&store, wrong_checkpoint);
+    let resumed = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &PromptHistoryCompiler::cache(),
+        &recording,
+        &artifacts,
+        &session_id,
+        Some(&branch_b),
+        None,
+        &current,
+    )
+    .await
+    .expect("reject wrong-branch checkpoint");
+    let full = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        Some(&branch_b),
+        None,
+        &current,
+    )
+    .await
+    .expect("fold requested branch from zero");
+
+    assert_eq!(resumed, full);
+    assert!(
+        recording.read_cursors().contains(&0),
+        "an unprovable timeline checkpoint must fall back to sequence zero"
+    );
+}
+
+/// MUTATION CHECK: replace `.ok()?` on the checkpoint JSON decode with
+/// `.expect("checkpoint JSON")`. Expected runtime failure: corrupt cache bytes
+/// panic instead of falling back to the authoritative journal.
+#[tokio::test]
+async fn unreadable_checkpoint_falls_back_to_full_replay() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let session_id = SessionId::new("unreadable-checkpoint-session");
+    let current = RunId::new("unreadable-checkpoint-current");
+    let mut events = vec![envelope(
+        &session_id,
+        &current,
+        "unreadable-checkpoint-user",
+        EventPayload::UserMessage {
+            text: "journal remains authoritative".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        },
+        PromptRender::Verbatim,
+    )];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append authoritative journal");
+    let corrupt_checkpoint = SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: "prompt_history".into(),
+        timeline_key: "corrupt-main-key".into(),
+        through_seq: 1,
+        boundary_event_id: events[0].event_id.clone(),
+        payload: b"not valid checkpoint JSON".to_vec(),
+    };
+    let recording = RecordingStore::with_checkpoint(&store, corrupt_checkpoint);
+
+    let resumed = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &PromptHistoryCompiler::cache(),
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("corrupt checkpoint falls back");
+    let full = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("fold authoritative journal");
+
+    assert_eq!(resumed, full);
+    assert!(
+        recording.read_cursors().contains(&0),
+        "corrupt checkpoint bytes must trigger replay from sequence zero"
+    );
+}
+
+/// Manual timing probe for the cold-cache path. Kept ignored because elapsed
+/// time is diagnostic, while the ordinary equivalence test above owns the
+/// correctness gate.
+#[tokio::test]
+#[ignore = "manual multi-compaction cold-cache timing probe"]
+async fn measure_cold_fold_after_several_compactions() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open timing store");
+    let session_id = SessionId::new("multi-compaction-timing-session");
+    store
+        .create_session(SessionCreateCommand {
+            command_id: "create-timing-session".into(),
+            request_digest: "create-timing-session-digest".into(),
+            request_json: r#"{"session":"multi-compaction-timing-session"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "test-v1".into(),
+            event_id: EventId::new("created-timing-session"),
+            device_id: DeviceId::new("checkpoint-timing-test"),
+        })
+        .await
+        .expect("create timing session");
+
+    let mut artifacts = HashMap::new();
+    let mut events = Vec::new();
+    let mut previous_compaction = None::<NodeId>;
+    for cycle in 0..5 {
+        let run = RunId::new(format!("timing-run-{cycle}"));
+        let user_node = NodeId::new(format!("timing-user-node-{cycle}"));
+        let assistant_node = NodeId::new(format!("timing-assistant-node-{cycle}"));
+        let compaction_node = NodeId::new(format!("timing-compaction-node-{cycle}"));
+        let summary_ordinal = u64::try_from(cycle + 1).expect("small timing cycle");
+        let summary_artifact = ArtifactRef::new(format!("blake3:{summary_ordinal:064x}"));
+        artifacts.insert(
+            summary_artifact.clone(),
+            format!("summary after compaction {cycle}").into_bytes(),
+        );
+        events.push(envelope(
+            &session_id,
+            &run,
+            &format!("timing-user-{cycle}"),
+            EventPayload::UserMessage {
+                text: format!("user turn {cycle}"),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ));
+        events.push(node(
+            &session_id,
+            &run,
+            user_node.as_str(),
+            previous_compaction.as_ref().map(NodeId::as_str),
+            NodeKind::UserTurn {
+                text: format!("user turn {cycle}"),
+                attachments: Vec::new(),
+            },
+        ));
+        events.push(envelope(
+            &session_id,
+            &run,
+            &format!("timing-assistant-{cycle}"),
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!("timing-answer-{cycle}")),
+                item: TurnItem::AgentMessage {
+                    text: format!("assistant turn {cycle}"),
+                },
+            }),
+            PromptRender::Verbatim,
+        ));
+        events.push(node(
+            &session_id,
+            &run,
+            assistant_node.as_str(),
+            Some(user_node.as_str()),
+            NodeKind::AssistantCommit {
+                text: format!("assistant turn {cycle}"),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ));
+        for filler in 0..600 {
+            let mut ignored = envelope(
+                &session_id,
+                &run,
+                &format!("timing-filler-{cycle}-{filler}"),
+                EventPayload::RunState(RunState::Thinking),
+                PromptRender::Omit,
+            );
+            ignored.payload = serde_json::json!({
+                "type": "timing_filler",
+                "padding": "0123456789abcdef0123456789abcdef"
+            });
+            events.push(ignored);
+        }
+        events.push(node(
+            &session_id,
+            &run,
+            compaction_node.as_str(),
+            Some(assistant_node.as_str()),
+            NodeKind::Compaction {
+                covers_from: previous_compaction
+                    .clone()
+                    .unwrap_or_else(|| user_node.clone()),
+                covers_to: assistant_node.clone(),
+                summary_artifact,
+                tokens_before: 10_000,
+                tokens_after: 100,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ));
+        events.push(envelope(
+            &session_id,
+            &run,
+            &format!("timing-done-{cycle}"),
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ));
+        previous_compaction = Some(compaction_node);
+    }
+    let current = RunId::new("timing-current");
+    events.push(envelope(
+        &session_id,
+        &current,
+        "timing-current-user",
+        EventPayload::UserMessage {
+            text: "measure the suffix".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        },
+        PromptRender::Verbatim,
+    ));
+    events.push(node(
+        &session_id,
+        &current,
+        "timing-current-node",
+        previous_compaction.as_ref().map(NodeId::as_str),
+        NodeKind::UserTurn {
+            text: "measure the suffix".into(),
+            attachments: Vec::new(),
+        },
+    ));
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append timing journal");
+    let journal_json_bytes = events
+        .iter()
+        .map(|event| {
+            serde_json::to_vec(event)
+                .expect("encode timing event")
+                .len()
+        })
+        .sum::<usize>();
+    let artifacts = TestArtifacts(artifacts);
+
+    let oracle = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("compile timing oracle");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &PromptHistoryCompiler::cache(),
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("install latest boundary checkpoint");
+
+    let mut full_micros = Vec::new();
+    let mut resumed_micros = Vec::new();
+    for _ in 0..9 {
+        let started = std::time::Instant::now();
+        let full = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+            &store,
+            &artifacts,
+            &session_id,
+            None,
+            None,
+            &current,
+        )
+        .await
+        .expect("timed full fold");
+        full_micros.push(started.elapsed().as_micros());
+        assert_eq!(full, oracle);
+    }
+    for _ in 0..9 {
+        let recording = RecordingStore::new(&store);
+        let started = std::time::Instant::now();
+        let resumed = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &PromptHistoryCompiler::cache(),
+            &recording,
+            &artifacts,
+            &session_id,
+            None,
+            None,
+            &current,
+        )
+        .await
+        .expect("timed resumed fold");
+        resumed_micros.push(started.elapsed().as_micros());
+        assert_eq!(resumed, oracle);
+        assert!(!recording.read_cursors().contains(&0));
+    }
+    full_micros.sort_unstable();
+    resumed_micros.sort_unstable();
+    eprintln!(
+        "multi-compaction cold fold: envelopes={} journal_json_bytes={} full_median_us={} resumed_median_us={}",
+        events.len(),
+        journal_json_bytes,
+        full_micros[full_micros.len() / 2],
+        resumed_micros[resumed_micros.len() / 2]
+    );
+    store.close().await.expect("close timing store");
 }
 
 /// MUTATION CHECK: make intent itself switch the projection. Expected runtime

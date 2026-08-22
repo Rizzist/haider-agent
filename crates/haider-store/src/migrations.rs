@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 17;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 18;
 
 struct Migration {
     version: u32,
@@ -334,6 +334,24 @@ const MIGRATIONS: &[Migration] = &[
         sql: "
             ALTER TABLE sessions ADD COLUMN seen_at_ms INTEGER
                 CHECK (seen_at_ms IS NULL OR seen_at_ms >= 0);
+        ",
+    },
+    Migration {
+        version: 18,
+        sql: "
+            CREATE TABLE session_projection_checkpoints (
+                session_id        TEXT NOT NULL,
+                projection        TEXT NOT NULL,
+                timeline_key      TEXT NOT NULL,
+                through_seq       INTEGER NOT NULL CHECK (through_seq > 0),
+                boundary_event_id TEXT NOT NULL,
+                payload           BLOB NOT NULL,
+                payload_digest    BLOB NOT NULL,
+                PRIMARY KEY (session_id, projection, timeline_key),
+                FOREIGN KEY (session_id) REFERENCES sessions(id),
+                FOREIGN KEY (session_id, through_seq)
+                    REFERENCES events(session_id, seq)
+            );
         ",
     },
 ];

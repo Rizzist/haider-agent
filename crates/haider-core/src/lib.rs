@@ -58,13 +58,13 @@ pub use haider_store::{
     RecordedProcessSignal, RenamedSession, RunRetryCommand, RunRetryOutcome, SUBAGENT_LIVE_LIMIT,
     SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
     SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
-    SessionMetaforkCommit, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
-    SessionSeenOutcome, SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    SessionMetaforkCommit, SessionProjectionCheckpoint, SessionRenameCommand, SessionRenameOutcome,
+    SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
+    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SwitchedGraph,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptHistoryCache, PromptHistoryCompiler,
@@ -106,6 +106,26 @@ pub trait StoreHandle: Send + Sync {
     ) -> Result<Vec<RawEnvelope>, HaiderError>;
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError>;
+
+    /// Loads rebuildable projection state for one exact timeline. Stores that
+    /// do not implement the optimization behave as an ordinary cache miss.
+    async fn projection_checkpoint(
+        &self,
+        _session_id: &SessionId,
+        _projection: &str,
+        _timeline_key: &str,
+    ) -> Result<Option<SessionProjectionCheckpoint>, HaiderError> {
+        Ok(None)
+    }
+
+    /// Persists rebuildable projection state. The default deliberately does
+    /// nothing; journal-only StoreHandle implementations remain complete.
+    async fn put_projection_checkpoint(
+        &self,
+        _checkpoint: SessionProjectionCheckpoint,
+    ) -> Result<(), HaiderError> {
+        Ok(())
+    }
 
     /// Resolves the durable named-ref registry from root to requested leaf.
     /// The implicit legacy/main branch returns an empty concrete lineage.

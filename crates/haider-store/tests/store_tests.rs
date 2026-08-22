@@ -3,7 +3,7 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, SessionId};
-use haider_store::{Cas, EventStore, Store};
+use haider_store::{Cas, EventStore, SessionProjectionCheckpoint, Store};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::fmt::Debug;
@@ -158,6 +158,98 @@ fn append_stores_msgpack_blob_and_payload_kind() {
     ));
     assert_eq!(storage_class, "blob");
     assert_eq!(kind, "storage_pin");
+}
+
+/// MUTATION CHECK: insert a one-line `UPDATE events SET envelope_json = X''`
+/// into the checkpoint transaction. Expected runtime failure: the raw journal
+/// blob comparison changes even though the checkpoint write reports success.
+#[test]
+fn projection_checkpoint_write_leaves_journal_bytes_unchanged() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("checkpoint-journal-immutability");
+    let mut batch = vec![envelope(
+        &session,
+        "checkpoint-boundary-event",
+        json!({"type": "checkpoint_boundary_fixture"}),
+    )];
+    must(store.append(&mut batch));
+    let connection = must(Connection::open(store.database_path()));
+    let before: Vec<Vec<u8>> = must(
+        connection
+            .prepare("SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY seq")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([session.as_str()], |row| row.get(0))?
+                    .collect()
+            }),
+    );
+
+    must(
+        store.put_session_projection_checkpoint(&SessionProjectionCheckpoint {
+            session_id: session.clone(),
+            projection: "prompt_history".into(),
+            timeline_key: "main-agentless".into(),
+            through_seq: batch[0].seq,
+            boundary_event_id: batch[0].event_id.clone(),
+            payload: br#"{"shape_version":1}"#.to_vec(),
+        }),
+    );
+
+    let after: Vec<Vec<u8>> = must(
+        connection
+            .prepare("SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY seq")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([session.as_str()], |row| row.get(0))?
+                    .collect()
+            }),
+    );
+    assert_eq!(after, before);
+    assert_eq!(must(store.latest_seq(&session)), 1);
+}
+
+/// MUTATION CHECK: remove `timeline_key = ?3` from the checkpoint lookup.
+/// Expected runtime failure: the branch-B cache miss returns branch A's row.
+#[test]
+fn projection_checkpoint_lookup_is_timeline_exact_and_corruption_is_a_miss() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("checkpoint-timeline-keying");
+    let mut batch = vec![envelope(
+        &session,
+        "timeline-a-boundary",
+        json!({"type": "checkpoint_boundary_fixture"}),
+    )];
+    must(store.append(&mut batch));
+    let checkpoint = SessionProjectionCheckpoint {
+        session_id: session.clone(),
+        projection: "prompt_history".into(),
+        timeline_key: "branch-a".into(),
+        through_seq: batch[0].seq,
+        boundary_event_id: batch[0].event_id.clone(),
+        payload: br#"{"shape_version":1}"#.to_vec(),
+    };
+    must(store.put_session_projection_checkpoint(&checkpoint));
+    assert_eq!(
+        must(store.session_projection_checkpoint(&session, "prompt_history", "branch-a")),
+        Some(checkpoint)
+    );
+    assert_eq!(
+        must(store.session_projection_checkpoint(&session, "prompt_history", "branch-b")),
+        None
+    );
+
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute(
+        "UPDATE session_projection_checkpoints SET payload = X'00' WHERE session_id = ?1",
+        [session.as_str()],
+    ));
+    assert_eq!(
+        must(store.session_projection_checkpoint(&session, "prompt_history", "branch-a")),
+        None,
+        "digest-invalid checkpoint bytes are an ordinary cache miss"
+    );
 }
 
 /// MUTATION CHECK: remove the global UNIQUE law on `events.event_id`.
@@ -465,12 +557,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 17);
+        assert_eq!(must(store.schema_version()), 18);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 17);
+    assert_eq!(must(reopened.schema_version()), 18);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -490,6 +582,7 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
         "delegations",
         "branches",
         "hook_dispatch_outbox",
+        "session_projection_checkpoints",
     ] {
         let count: u32 = must(connection.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

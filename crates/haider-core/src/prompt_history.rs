@@ -1,7 +1,7 @@
 //! Deterministic reconstruction of provider messages from the durable history
 //! tree and its byte-preserving journal sidecars.
 
-use crate::StoreHandle;
+use crate::{SessionProjectionCheckpoint, StoreHandle};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -10,18 +10,24 @@ use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
 use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
-use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, MenuId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, ArtifactRef, BranchId, EventId, MenuId, NodeId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
+use haider_protocol::pipe::TranscriptProjector;
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
 use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState};
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, MessageRole, UserCommandRecord};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
 
 const HISTORY_PAGE: usize = 256;
+const PROMPT_CHECKPOINT_PROJECTION: &str = "prompt_history";
+const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
 pub const USER_COMMAND_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
 
 /// Read-only CAS port used only when a durable compaction node is projected.
@@ -41,8 +47,9 @@ pub struct PromptHistoryCompiler;
 /// Durable journal bytes remain the only authority: the cache first samples
 /// the session head, reads only the missing suffix, and keys a compiled
 /// projection by that head plus its compaction epoch and complete branch,
-/// agent, and current-run scope. A restart starts empty and rebuilds from the
-/// same journal, so this is never a persistence seam.
+/// agent, and current-run scope. On restart it may seed one exact timeline
+/// from a validated terminal compaction-boundary checkpoint; any absent or
+/// unreadable checkpoint falls back to the same journal fold from zero.
 #[derive(Default)]
 pub struct PromptHistoryCache {
     sessions: Mutex<HashMap<SessionId, CachedPromptSession>>,
@@ -55,6 +62,10 @@ struct CachedPromptSession {
     envelopes: Vec<RawEnvelope>,
     projections: HashMap<PromptProjectionKey, CompiledPromptProjection>,
     append_prefixes: HashMap<PromptProjectionScope, CachedCompiledPrefix>,
+    checkpoint_base: Option<PromptCheckpointBase>,
+    boundary_projector: TranscriptProjector,
+    boundaries: HashMap<PromptTimelineKey, PromptBoundary>,
+    saved_boundaries: HashMap<PromptTimelineKey, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -73,11 +84,47 @@ struct PromptProjectionScope {
     agent_id: Option<AgentId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PromptTimelineKey {
+    branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
+}
+
+struct PromptCheckpointBase {
+    timeline: PromptTimelineKey,
+}
+
+#[derive(Clone)]
+struct PromptBoundary {
+    through_seq: u64,
+    event_id: EventId,
+    run_id: RunId,
+}
+
 #[derive(Clone)]
 struct CachedCompiledPrefix {
     head_seq: u64,
     current_run: RunId,
     projection: CompiledPromptProjection,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DurablePromptCheckpoint {
+    shape_version: u32,
+    reducer_version: String,
+    through_seq: u64,
+    boundary_event_id: EventId,
+    boundary_run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch_id: Option<BranchId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<AgentId>,
+    compaction_epoch: u64,
+    messages: Vec<serde_json::Value>,
+    stable_history_end: usize,
+    current_user_start: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_compaction_summary_end: Option<usize>,
 }
 
 /// Provider-facing prompt projection plus ephemeral cache boundaries.
@@ -431,6 +478,10 @@ impl PromptHistoryCache {
         current_run: &RunId,
     ) -> Result<CompiledPromptProjection, HaiderError> {
         let head_seq = store.latest_seq(session_id).await?;
+        let timeline = PromptTimelineKey {
+            branch_id: branch_id.cloned(),
+            agent_id: agent_id.cloned(),
+        };
         let mut cached = self
             .sessions
             .lock()
@@ -440,8 +491,36 @@ impl PromptHistoryCache {
         if cached.head_seq > head_seq {
             cached = CachedPromptSession::default();
         }
+
+        // A checkpoint truncates only ONE exact branch+agent timeline. A
+        // later request for another timeline must not inherit that prefix.
+        if cached
+            .checkpoint_base
+            .as_ref()
+            .is_some_and(|base| base.timeline != timeline)
+        {
+            cached = CachedPromptSession::default();
+        }
+        if cached.head_seq == 0
+            && let Some(loaded) =
+                load_prompt_checkpoint(store, session_id, &timeline, head_seq, current_run).await
+        {
+            let scope = PromptProjectionScope {
+                compaction_epoch: loaded.compaction_epoch,
+                branch_id: timeline.branch_id.clone(),
+                agent_id: timeline.agent_id.clone(),
+            };
+            cached.head_seq = loaded.prefix.head_seq;
+            cached.compaction_epoch = loaded.compaction_epoch;
+            cached.checkpoint_base = Some(PromptCheckpointBase {
+                timeline: timeline.clone(),
+            });
+            cached.append_prefixes.insert(scope, loaded.prefix);
+        }
+
         let previous_compaction_epoch = cached.compaction_epoch;
         let mut cursor = cached.head_seq;
+        let mut compaction_after_checkpoint = false;
         while cursor < head_seq {
             let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
             let before = cached.envelopes.len();
@@ -462,13 +541,51 @@ impl PromptHistoryCache {
                     },
                 ) {
                     cached.compaction_epoch = envelope.seq;
+                    compaction_after_checkpoint |= cached.checkpoint_base.is_some();
                 }
-                cached.envelopes.push(envelope);
+                cached.push_envelope(envelope);
             }
             if cached.envelopes.len() == before {
                 return Err(corrupt(format!(
                     "prompt cache could not read durable head {head_seq} after sequence {cursor}"
                 )));
+            }
+        }
+
+        // A later compaction resets the model context again. The prior
+        // checkpoint cannot derive the new overlay without its omitted tree;
+        // replay once from zero, then install the newer boundary checkpoint.
+        if compaction_after_checkpoint {
+            cached = CachedPromptSession::default();
+            let mut cursor = 0;
+            while cursor < head_seq {
+                let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+                let before = cached.envelopes.len();
+                for envelope in page {
+                    if envelope.seq > head_seq {
+                        break;
+                    }
+                    cursor = envelope.seq;
+                    if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(
+                                payload,
+                                EventPayload::NodeCommitted(TreeNode {
+                                    kind: NodeKind::Compaction { .. },
+                                    ..
+                                })
+                            )
+                        },
+                    ) {
+                        cached.compaction_epoch = envelope.seq;
+                    }
+                    cached.push_envelope(envelope);
+                }
+                if cached.envelopes.len() == before {
+                    return Err(corrupt(format!(
+                        "prompt cache could not read durable head {head_seq} after sequence {cursor}"
+                    )));
+                }
             }
         }
         if cached.head_seq < head_seq {
@@ -479,6 +596,56 @@ impl PromptHistoryCache {
             }
         }
 
+        let scope = PromptProjectionScope {
+            compaction_epoch: cached.compaction_epoch,
+            branch_id: branch_id.cloned(),
+            agent_id: agent_id.cloned(),
+        };
+        if cached.checkpoint_base.is_some()
+            && cached.append_prefixes.get(&scope).is_none_or(|prefix| {
+                prefix.head_seq >= head_seq || prefix.current_run == *current_run
+            })
+        {
+            // A decoded checkpoint that cannot enter the existing suffix
+            // extension seam proves nothing; rebuild with the oracle.
+            cached = CachedPromptSession::default();
+            let mut cursor = 0;
+            while cursor < head_seq {
+                let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+                let before = cached.envelopes.len();
+                for envelope in page {
+                    if envelope.seq > head_seq {
+                        break;
+                    }
+                    cursor = envelope.seq;
+                    if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(
+                                payload,
+                                EventPayload::NodeCommitted(TreeNode {
+                                    kind: NodeKind::Compaction { .. },
+                                    ..
+                                })
+                            )
+                        },
+                    ) {
+                        cached.compaction_epoch = envelope.seq;
+                    }
+                    cached.push_envelope(envelope);
+                }
+                if cached.envelopes.len() == before {
+                    return Err(corrupt(format!(
+                        "prompt cache could not read durable head {head_seq} after sequence {cursor}"
+                    )));
+                }
+            }
+            cached.head_seq = head_seq;
+        }
+        let scope = PromptProjectionScope {
+            compaction_epoch: cached.compaction_epoch,
+            branch_id: branch_id.cloned(),
+            agent_id: agent_id.cloned(),
+        };
         let key = PromptProjectionKey {
             head_seq,
             compaction_epoch: cached.compaction_epoch,
@@ -490,12 +657,6 @@ impl PromptHistoryCache {
             self.install(session_id.clone(), cached).await;
             return Ok(projection);
         }
-
-        let scope = PromptProjectionScope {
-            compaction_epoch: cached.compaction_epoch,
-            branch_id: branch_id.cloned(),
-            agent_id: agent_id.cloned(),
-        };
         let projection = match cached.append_prefixes.get(&scope) {
             Some(prefix) if prefix.head_seq < head_seq && prefix.current_run != *current_run => {
                 extend_compiled_projection(
@@ -538,6 +699,45 @@ impl PromptHistoryCache {
             );
         }
         cached.projections.insert(key, projection.clone());
+
+        if cached.checkpoint_base.is_none()
+            && let Some(boundary) = cached.boundaries.get(&timeline).cloned()
+            && cached
+                .saved_boundaries
+                .get(&timeline)
+                .is_none_or(|saved| *saved < boundary.through_seq)
+        {
+            match build_prompt_checkpoint(
+                store,
+                artifacts,
+                session_id,
+                &timeline,
+                &boundary,
+                &cached.envelopes,
+            )
+            .await
+            {
+                Ok(checkpoint) => match store.put_projection_checkpoint(checkpoint).await {
+                    Ok(()) => {
+                        cached
+                            .saved_boundaries
+                            .insert(timeline.clone(), boundary.through_seq);
+                    }
+                    Err(error) => tracing::debug!(
+                        session_id = %session_id,
+                        boundary_seq = boundary.through_seq,
+                        ?error,
+                        "prompt projection checkpoint write failed; journal replay remains authoritative"
+                    ),
+                },
+                Err(error) => tracing::debug!(
+                    session_id = %session_id,
+                    boundary_seq = boundary.through_seq,
+                    ?error,
+                    "prompt projection checkpoint build failed; journal replay remains authoritative"
+                ),
+            }
+        }
         self.install(session_id.clone(), cached).await;
         Ok(projection)
     }
@@ -551,6 +751,236 @@ impl PromptHistoryCache {
             sessions.insert(session_id, cached);
         }
     }
+}
+
+impl CachedPromptSession {
+    fn push_envelope(&mut self, envelope: RawEnvelope) {
+        let rows = self.boundary_projector.push(&envelope);
+        self.envelopes.push(envelope);
+        for row in rows {
+            if !row.is_compaction_boundary() {
+                continue;
+            }
+            let Some(boundary) = self
+                .envelopes
+                .iter()
+                .rev()
+                .find(|envelope| envelope.seq == row.seq())
+            else {
+                continue;
+            };
+            let Some(run_id) = boundary.run_id.clone() else {
+                continue;
+            };
+            let timeline = PromptTimelineKey {
+                branch_id: boundary.branch_id.clone(),
+                agent_id: boundary.agent_id.clone(),
+            };
+            let candidate = PromptBoundary {
+                through_seq: boundary.seq,
+                event_id: boundary.event_id.clone(),
+                run_id,
+            };
+            if self
+                .boundaries
+                .get(&timeline)
+                .is_none_or(|current| current.through_seq < candidate.through_seq)
+            {
+                self.boundaries.insert(timeline, candidate);
+            }
+        }
+    }
+}
+
+struct LoadedPromptCheckpoint {
+    compaction_epoch: u64,
+    prefix: CachedCompiledPrefix,
+}
+
+fn prompt_timeline_key(timeline: &PromptTimelineKey) -> String {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "branch_id": timeline.branch_id,
+        "agent_id": timeline.agent_id,
+    }))
+    .unwrap_or_default();
+    format!("v1:{}", blake3::hash(&bytes).to_hex())
+}
+
+fn prompt_checkpoint_reducer_version() -> String {
+    format!("{}/prompt-v1", env!("CARGO_PKG_VERSION"))
+}
+
+async fn load_prompt_checkpoint(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    timeline: &PromptTimelineKey,
+    head_seq: u64,
+    current_run: &RunId,
+) -> Option<LoadedPromptCheckpoint> {
+    let timeline_key = prompt_timeline_key(timeline);
+    let stored = match store
+        .projection_checkpoint(session_id, PROMPT_CHECKPOINT_PROJECTION, &timeline_key)
+        .await
+    {
+        Ok(stored) => stored?,
+        Err(error) => {
+            tracing::debug!(
+                session_id = %session_id,
+                ?error,
+                "prompt projection checkpoint read failed; replaying journal"
+            );
+            return None;
+        }
+    };
+    let decoded = serde_json::from_slice::<DurablePromptCheckpoint>(&stored.payload).ok()?;
+    if decoded.shape_version != PROMPT_CHECKPOINT_SHAPE_VERSION
+        || decoded.reducer_version != prompt_checkpoint_reducer_version()
+        || decoded.through_seq == 0
+        || decoded.through_seq > head_seq
+        || decoded.through_seq != stored.through_seq
+        || decoded.boundary_event_id != stored.boundary_event_id
+        || decoded.boundary_run_id == *current_run
+        || decoded.branch_id != timeline.branch_id
+        || decoded.agent_id != timeline.agent_id
+        || decoded.compaction_epoch == 0
+        || decoded.compaction_epoch > decoded.through_seq
+        || decoded.stable_history_end != decoded.messages.len()
+        || decoded.current_user_start != decoded.messages.len()
+        || decoded
+            .latest_compaction_summary_end
+            .is_none_or(|boundary| boundary == 0 || boundary > decoded.messages.len())
+    {
+        return None;
+    }
+    let boundary = match store
+        .read(session_id, decoded.through_seq.saturating_sub(1), 1)
+        .await
+    {
+        Ok(events) => events.into_iter().next()?,
+        Err(error) => {
+            tracing::debug!(
+                session_id = %session_id,
+                ?error,
+                "prompt checkpoint boundary could not be read; replaying journal"
+            );
+            return None;
+        }
+    };
+    if boundary.seq != decoded.through_seq
+        || boundary.event_id != decoded.boundary_event_id
+        || boundary.run_id.as_ref() != Some(&decoded.boundary_run_id)
+        || boundary.branch_id != decoded.branch_id
+        || boundary.agent_id != decoded.agent_id
+    {
+        return None;
+    }
+    let messages = decoded
+        .messages
+        .into_iter()
+        .map(serde_json::from_value::<Message>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(LoadedPromptCheckpoint {
+        compaction_epoch: decoded.compaction_epoch,
+        prefix: CachedCompiledPrefix {
+            head_seq: decoded.through_seq,
+            current_run: decoded.boundary_run_id,
+            projection: CompiledPromptProjection {
+                messages,
+                stable_history_end: decoded.stable_history_end,
+                current_user_start: decoded.current_user_start,
+                latest_compaction_summary_end: decoded.latest_compaction_summary_end,
+            },
+        },
+    })
+}
+
+async fn build_prompt_checkpoint(
+    store: &dyn StoreHandle,
+    artifacts: &dyn ArtifactReader,
+    session_id: &SessionId,
+    timeline: &PromptTimelineKey,
+    boundary: &PromptBoundary,
+    envelopes: &[RawEnvelope],
+) -> Result<SessionProjectionCheckpoint, HaiderError> {
+    let prefix = envelopes
+        .iter()
+        .take_while(|envelope| envelope.seq <= boundary.through_seq)
+        .cloned()
+        .collect::<Vec<_>>();
+    let boundary_envelope = prefix
+        .last()
+        .ok_or_else(|| corrupt("prompt checkpoint boundary is absent from the replayed prefix"))?;
+    if boundary_envelope.seq != boundary.through_seq
+        || boundary_envelope.event_id != boundary.event_id
+        || boundary_envelope.run_id.as_ref() != Some(&boundary.run_id)
+        || boundary_envelope.branch_id != timeline.branch_id
+        || boundary_envelope.agent_id != timeline.agent_id
+    {
+        return Err(corrupt(
+            "prompt checkpoint boundary identity disagrees with the journal",
+        ));
+    }
+    let compaction_epoch = prefix
+        .iter()
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::NodeCommitted(TreeNode {
+                            kind: NodeKind::Compaction { .. },
+                            ..
+                        })
+                    )
+                })
+                .then_some(envelope.seq)
+        })
+        .max()
+        .ok_or_else(|| corrupt("compaction boundary has no preceding compaction node"))?;
+    let projection = compile_idle_projection_at_prefix(
+        store,
+        artifacts,
+        session_id,
+        timeline.branch_id.as_ref(),
+        timeline.agent_id.as_ref(),
+        &prefix,
+    )
+    .await?;
+    if projection.latest_compaction_summary_end.is_none() {
+        return Err(corrupt(
+            "compaction boundary produced no active summary in the prompt projection",
+        ));
+    }
+    let messages = projection
+        .messages
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| corrupt(format!("prompt checkpoint message encode failed: {error}")))?;
+    let payload = serde_json::to_vec(&DurablePromptCheckpoint {
+        shape_version: PROMPT_CHECKPOINT_SHAPE_VERSION,
+        reducer_version: prompt_checkpoint_reducer_version(),
+        through_seq: boundary.through_seq,
+        boundary_event_id: boundary.event_id.clone(),
+        boundary_run_id: boundary.run_id.clone(),
+        branch_id: timeline.branch_id.clone(),
+        agent_id: timeline.agent_id.clone(),
+        compaction_epoch,
+        messages,
+        stable_history_end: projection.stable_history_end,
+        current_user_start: projection.current_user_start,
+        latest_compaction_summary_end: projection.latest_compaction_summary_end,
+    })
+    .map_err(|error| corrupt(format!("prompt checkpoint encode failed: {error}")))?;
+    Ok(SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: PROMPT_CHECKPOINT_PROJECTION.to_owned(),
+        timeline_key: prompt_timeline_key(timeline),
+        through_seq: boundary.through_seq,
+        boundary_event_id: boundary.event_id.clone(),
+        payload,
+    })
 }
 
 /// Extends a completed request projection with only the journal suffix that
@@ -596,6 +1026,47 @@ fn extend_compiled_projection(
         latest_compaction_summary_end: prefix.projection.latest_compaction_summary_end,
         messages,
     })
+}
+
+async fn compile_idle_projection_at_prefix(
+    store: &dyn StoreHandle,
+    artifacts: &dyn ArtifactReader,
+    session_id: &SessionId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    envelopes: &[RawEnvelope],
+) -> Result<CompiledPromptProjection, HaiderError> {
+    let mut lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+    if branch_id.is_some() {
+        lineage.head = envelopes.iter().rev().find_map(|envelope| {
+            if envelope.branch_id.as_ref() != branch_id || envelope.agent_id.as_ref() != agent_id {
+                return None;
+            }
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            Some((node.node, envelope.seq))
+        });
+    }
+    let tree = TreeProjection::build(envelopes, &lineage, agent_id)?;
+    let ancestry = tree
+        .latest_ancestry(lineage.head.as_ref())?
+        .ok_or_else(|| corrupt("compaction boundary has no durable history ancestry"))?;
+    let tree_head_seq = ancestry.last().map_or(0, |entry| entry.seq);
+    let mut projection =
+        compile_ancestry(envelopes, &ancestry, Some(artifacts), agent_id, None).await?;
+    let tail = envelopes
+        .iter()
+        .filter(|envelope| envelope.seq > tree_head_seq && scoped(envelope, branch_id, agent_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let rendered = render_journal(&tail, envelopes, branch_id, agent_id, None, false)?;
+    projection.messages.extend(rendered.messages);
+    projection.stable_history_end = projection.messages.len();
+    projection.current_user_start = projection.messages.len();
+    Ok(projection)
 }
 
 async fn compile_projection_from_envelopes(

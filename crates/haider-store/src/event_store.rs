@@ -134,6 +134,19 @@ pub struct CommittedSeqRange {
     pub last_seq: u64,
 }
 
+/// Opaque, rebuildable projection state anchored to one immutable journal
+/// event. The event journal remains authoritative; consumers must reject an
+/// unreadable payload and replay rather than infer state from these bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProjectionCheckpoint {
+    pub session_id: SessionId,
+    pub projection: String,
+    pub timeline_key: String,
+    pub through_seq: u64,
+    pub boundary_event_id: EventId,
+    pub payload: Vec<u8>,
+}
+
 /// Durable coordinates for one menu-resolution compare-and-set.
 ///
 /// `command_id` is the cross-connection idempotency key. The selected answer
@@ -2066,6 +2079,146 @@ impl Store {
         Ok(ids.into_iter().map(SessionId::new).collect())
     }
 
+    /// Reads an opaque projection checkpoint. A malformed row is treated as
+    /// a cache miss so callers can replay the authoritative journal.
+    pub fn session_projection_checkpoint(
+        &self,
+        session_id: &SessionId,
+        projection: &str,
+        timeline_key: &str,
+    ) -> StoreResult<Option<SessionProjectionCheckpoint>> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT checkpoint.through_seq, checkpoint.boundary_event_id,
+                        checkpoint.payload, checkpoint.payload_digest, event.event_id
+                 FROM session_projection_checkpoints AS checkpoint
+                 LEFT JOIN events AS event
+                   ON event.session_id = checkpoint.session_id
+                  AND event.seq = checkpoint.through_seq
+                 WHERE checkpoint.session_id = ?1
+                   AND checkpoint.projection = ?2
+                   AND checkpoint.timeline_key = ?3",
+                params![session_id.as_str(), projection, timeline_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let Some((through_seq, boundary_event_id, payload, digest, event_id)) = row else {
+            return Ok(None);
+        };
+        let Ok(through_seq) = u64::try_from(through_seq) else {
+            return Ok(None);
+        };
+        if through_seq == 0
+            || payload.is_empty()
+            || event_id.as_deref() != Some(boundary_event_id.as_str())
+            || digest.as_slice()
+                != projection_checkpoint_digest(
+                    session_id,
+                    projection,
+                    timeline_key,
+                    through_seq,
+                    &boundary_event_id,
+                    &payload,
+                )
+                .as_bytes()
+        {
+            return Ok(None);
+        }
+        Ok(Some(SessionProjectionCheckpoint {
+            session_id: session_id.clone(),
+            projection: projection.to_owned(),
+            timeline_key: timeline_key.to_owned(),
+            through_seq,
+            boundary_event_id: EventId::new(boundary_event_id),
+            payload,
+        }))
+    }
+
+    /// Installs a newer checkpoint for one exact projection timeline. The
+    /// referenced boundary event must already exist; checkpoint writes never
+    /// update or delete journal rows.
+    pub fn put_session_projection_checkpoint(
+        &self,
+        checkpoint: &SessionProjectionCheckpoint,
+    ) -> StoreResult<()> {
+        if checkpoint.projection.is_empty()
+            || checkpoint.timeline_key.is_empty()
+            || checkpoint.through_seq == 0
+            || checkpoint.payload.is_empty()
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "projection checkpoint coordinates must be non-empty",
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_session(&transaction, &checkpoint.session_id)?;
+        let event_id = transaction
+            .query_row(
+                "SELECT event_id FROM events WHERE session_id = ?1 AND seq = ?2",
+                params![
+                    checkpoint.session_id.as_str(),
+                    to_sqlite_integer(checkpoint.through_seq)?
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        if event_id.as_deref() != Some(checkpoint.boundary_event_id.as_str()) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "projection checkpoint does not name its immutable boundary event",
+                false,
+            ));
+        }
+        let digest = projection_checkpoint_digest(
+            &checkpoint.session_id,
+            &checkpoint.projection,
+            &checkpoint.timeline_key,
+            checkpoint.through_seq,
+            checkpoint.boundary_event_id.as_str(),
+            &checkpoint.payload,
+        );
+        transaction
+            .execute(
+                "INSERT INTO session_projection_checkpoints(
+                     session_id, projection, timeline_key, through_seq,
+                     boundary_event_id, payload, payload_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(session_id, projection, timeline_key) DO UPDATE SET
+                     through_seq = excluded.through_seq,
+                     boundary_event_id = excluded.boundary_event_id,
+                     payload = excluded.payload,
+                     payload_digest = excluded.payload_digest
+                 WHERE excluded.through_seq >= session_projection_checkpoints.through_seq",
+                params![
+                    checkpoint.session_id.as_str(),
+                    checkpoint.projection,
+                    checkpoint.timeline_key,
+                    to_sqlite_integer(checkpoint.through_seq)?,
+                    checkpoint.boundary_event_id.as_str(),
+                    checkpoint.payload,
+                    digest.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
     /// Deletes one already-quiesced session and every row it owns in one
     /// transaction. Runtime quiescence and admission fencing belong to the
     /// daemon; this store operation owns only referentially complete removal.
@@ -2076,6 +2229,7 @@ impl Store {
             .map_err(map_sqlite_error)?;
         require_session(&transaction, session_id)?;
         for statement in [
+            "DELETE FROM session_projection_checkpoints WHERE session_id = ?1",
             "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
             "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
             "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
@@ -11056,6 +11210,30 @@ fn stable_digest(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn projection_checkpoint_digest(
+    session_id: &SessionId,
+    projection: &str,
+    timeline_key: &str,
+    through_seq: u64,
+    boundary_event_id: &str,
+    payload: &[u8],
+) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider/session-projection-checkpoint/v1\0");
+    for bytes in [
+        session_id.as_str().as_bytes(),
+        projection.as_bytes(),
+        timeline_key.as_bytes(),
+        boundary_event_id.as_bytes(),
+        payload,
+    ] {
+        hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bytes);
+    }
+    hasher.update(&through_seq.to_be_bytes());
+    hasher.finalize()
 }
 
 #[allow(clippy::result_large_err)]

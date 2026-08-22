@@ -24,10 +24,10 @@ use haider_store::{
     HookTrustChange, HookTrustCommand, JournalAppendBatch, MenuResolutionCommand,
     MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
     RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
-    SessionForkCommand, SessionForkOutcome, SessionRenameCommand, SessionRenameOutcome,
-    SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome,
+    SessionForkCommand, SessionForkOutcome, SessionProjectionCheckpoint, SessionRenameCommand,
+    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -193,6 +193,35 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.session_metadata(&session_id))).await
+    }
+
+    /// Loads one opaque, rebuildable session projection checkpoint.
+    pub async fn projection_checkpoint(
+        &self,
+        session_id: &SessionId,
+        projection: String,
+        timeline_key: String,
+    ) -> Result<Option<SessionProjectionCheckpoint>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_projection_checkpoint(&session_id, &projection, &timeline_key)
+            })
+        })
+        .await
+    }
+
+    /// Persists one opaque checkpoint without changing journal rows.
+    pub async fn put_projection_checkpoint(
+        &self,
+        checkpoint: SessionProjectionCheckpoint,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.put_session_projection_checkpoint(&checkpoint))
+        })
+        .await
     }
 
     pub async fn graph_status(
@@ -1613,6 +1642,28 @@ impl StoreHandle for SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.latest_seq(&session_id))).await
+    }
+
+    async fn projection_checkpoint(
+        &self,
+        session_id: &SessionId,
+        projection: &str,
+        timeline_key: &str,
+    ) -> Result<Option<SessionProjectionCheckpoint>, HaiderError> {
+        SqliteStoreHandle::projection_checkpoint(
+            self,
+            session_id,
+            projection.to_owned(),
+            timeline_key.to_owned(),
+        )
+        .await
+    }
+
+    async fn put_projection_checkpoint(
+        &self,
+        checkpoint: SessionProjectionCheckpoint,
+    ) -> Result<(), HaiderError> {
+        SqliteStoreHandle::put_projection_checkpoint(self, checkpoint).await
     }
 
     async fn branch_lineage(
