@@ -73,7 +73,7 @@ use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashSet};
 #[cfg(unix)]
 use std::ffi::CStr;
 #[cfg(unix)]
@@ -1582,90 +1582,88 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 fn wildcard_matches(pattern: &str, text: &str, slash_sensitive: bool) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let text = text.chars().collect::<Vec<_>>();
-    fn matches_from(
-        pattern: &[char],
-        text: &[char],
-        slash_sensitive: bool,
-        pattern_index: usize,
-        text_index: usize,
-        memo: &mut HashMap<(usize, usize), bool>,
-    ) -> bool {
-        if let Some(result) = memo.get(&(pattern_index, text_index)) {
-            return *result;
+    // The old recursive matcher memoized these states, which bounded the total
+    // work but not the call depth: a leading `*` still added one stack frame
+    // per text character. Keep both the pending and visited states on the heap
+    // so long minified lines cannot exhaust a worker's small native stack.
+    let mut pending = vec![(0, 0)];
+    let mut visited = HashSet::new();
+    while let Some((pattern_index, text_index)) = pending.pop() {
+        if !visited.insert((pattern_index, text_index)) {
+            continue;
         }
-        let result = match pattern.get(pattern_index) {
-            None => text_index == text.len(),
+        match pattern.get(pattern_index) {
+            None => {
+                if text_index == text.len() {
+                    return true;
+                }
+            }
             Some('*') => {
                 let double = pattern.get(pattern_index + 1) == Some(&'*');
                 let next_pattern = pattern_index + if double { 2 } else { 1 };
-                (double
-                    && pattern.get(next_pattern) == Some(&'/')
-                    && matches_from(
-                        pattern,
-                        text,
-                        slash_sensitive,
-                        next_pattern + 1,
-                        text_index,
-                        memo,
-                    ))
-                    || matches_from(
-                        pattern,
-                        text,
-                        slash_sensitive,
-                        next_pattern,
-                        text_index,
-                        memo,
-                    )
-                    || text.get(text_index).is_some_and(|character| {
-                        (double || !slash_sensitive || *character != '/')
-                            && matches_from(
-                                pattern,
-                                text,
-                                slash_sensitive,
-                                pattern_index,
-                                text_index + 1,
-                                memo,
-                            )
-                    })
+                if text
+                    .get(text_index)
+                    .is_some_and(|character| double || !slash_sensitive || *character != '/')
+                {
+                    pending.push((pattern_index, text_index + 1));
+                }
+                pending.push((next_pattern, text_index));
+                if double && pattern.get(next_pattern) == Some(&'/') {
+                    pending.push((next_pattern + 1, text_index));
+                }
             }
-            Some('?') => text.get(text_index).is_some_and(|character| {
-                (!slash_sensitive || *character != '/')
-                    && matches_from(
-                        pattern,
-                        text,
-                        slash_sensitive,
-                        pattern_index + 1,
-                        text_index + 1,
-                        memo,
-                    )
-            }),
+            Some('?') => {
+                if text
+                    .get(text_index)
+                    .is_some_and(|character| !slash_sensitive || *character != '/')
+                {
+                    pending.push((pattern_index + 1, text_index + 1));
+                }
+            }
             Some('\\') if pattern.get(pattern_index + 1).is_some() => {
-                text.get(text_index) == pattern.get(pattern_index + 1)
-                    && matches_from(
-                        pattern,
-                        text,
-                        slash_sensitive,
-                        pattern_index + 2,
-                        text_index + 1,
-                        memo,
-                    )
+                if text.get(text_index) == pattern.get(pattern_index + 1) {
+                    pending.push((pattern_index + 2, text_index + 1));
+                }
             }
             Some(expected) => {
-                text.get(text_index) == Some(expected)
-                    && matches_from(
-                        pattern,
-                        text,
-                        slash_sensitive,
-                        pattern_index + 1,
-                        text_index + 1,
-                        memo,
-                    )
+                if text.get(text_index) == Some(expected) {
+                    pending.push((pattern_index + 1, text_index + 1));
+                }
             }
-        };
-        memo.insert((pattern_index, text_index), result);
-        result
+        }
     }
-    matches_from(&pattern, &text, slash_sensitive, 0, 0, &mut HashMap::new())
+    false
+}
+
+#[cfg(test)]
+mod wildcard_match_tests {
+    use super::wildcard_matches;
+
+    const SMALL_STACK_BYTES: usize = 256 * 1024;
+    const LONG_LINE_CHARS: usize = 100_000;
+
+    #[test]
+    fn long_wildcard_search_survives_a_small_worker_stack() {
+        std::thread::Builder::new()
+            .name("wildcard-small-stack".into())
+            .stack_size(SMALL_STACK_BYTES)
+            .spawn(|| {
+                let line = "x".repeat(LONG_LINE_CHARS);
+                assert!(!wildcard_matches("*needle*", &line, false));
+            })
+            .expect("spawn small-stack matcher thread")
+            .join()
+            .expect("small-stack matcher thread survives");
+    }
+
+    #[test]
+    fn long_wildcard_search_keeps_correct_results() {
+        let matching = format!("{}needle{}", "x".repeat(LONG_LINE_CHARS), "y".repeat(1_000));
+        let missing = "x".repeat(LONG_LINE_CHARS);
+
+        assert!(wildcard_matches("*needle*", &matching, false));
+        assert!(!wildcard_matches("*needle*", &missing, false));
+    }
 }
 
 #[cfg(windows)]
