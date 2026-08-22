@@ -108,6 +108,11 @@ pub(crate) struct FleetListEntry {
     pub snapshot: SessionFleetSnapshot,
 }
 
+pub(crate) struct CacheView {
+    pub lifetime_basis_points: Option<u32>,
+    pub reread_basis_points: Option<u32>,
+}
+
 pub(crate) struct SessionSummaryView {
     pub id: String,
     pub title: String,
@@ -129,6 +134,12 @@ pub(crate) struct SessionSummaryView {
     /// summary as `run_state` — the pair is one observation.
     pub run_id: Option<String>,
     pub worker_generation: Option<u64>,
+    /// Prompt-cache health, projected from `agent_metrics.usage`. TWO numbers
+    /// because either alone misleads: the lifetime ratio counts the first send
+    /// of new content as a miss (definitionally, so it can never reach 100%),
+    /// and the re-read rate hides real cold-start cost. `None` on the re-read
+    /// rate is NOT zero — a session with nothing to re-read has no rate at all.
+    pub cache: Option<CacheView>,
     pub effort: Option<String>,
     pub fast: Option<bool>,
     pub agent_type: Option<String>,
@@ -248,6 +259,20 @@ impl ObserveJson for SessionSummaryView {
         }
         if let Some(generation) = self.worker_generation {
             object["worker_generation"] = json!(generation);
+        }
+        if let Some(cache) = &self.cache {
+            // Each rate is emitted only when the daemon measured it. An absent
+            // rate means "not measured", which must never be readable as 0%.
+            let mut view = serde_json::Map::new();
+            if let Some(points) = cache.lifetime_basis_points {
+                view.insert("lifetime_basis_points".into(), json!(points));
+            }
+            if let Some(points) = cache.reread_basis_points {
+                view.insert("reread_basis_points".into(), json!(points));
+            }
+            if !view.is_empty() {
+                object["cache"] = Value::Object(view);
+            }
         }
         if let Some(parked_since) = self.parked_since {
             object["parked_since"] = json!(parked_since);
@@ -584,6 +609,14 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
             if let Some(summary) = scalars {
                 // The roster summary is the LIVE observation; take the
                 // cancel pair from it together, never one from each source.
+                view.cache = summary
+                    .agent_metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics.usage.as_ref())
+                    .map(|usage| CacheView {
+                        lifetime_basis_points: usage.cache_hit_basis_points,
+                        reread_basis_points: usage.cache_reread_hit_basis_points,
+                    });
                 view.run_id = summary.run_id.as_ref().map(|run| run.as_str().to_owned());
                 view.worker_generation = Some(summary.worker_generation);
                 view.effort = summary.effort.clone();
@@ -846,6 +879,14 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         run_state: run_state_name(digest.run_state),
         run_id: digest.run_id.as_ref().map(|run| run.as_str().to_owned()),
         worker_generation: Some(digest.worker_generation),
+        cache: digest
+            .agent_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.usage.as_ref())
+            .map(|usage| CacheView {
+                lifetime_basis_points: usage.cache_hit_basis_points,
+                reread_basis_points: usage.cache_reread_hit_basis_points,
+            }),
         active_branch: digest
             .active_branch_id
             .as_ref()
@@ -1245,6 +1286,7 @@ mod roster_scalar_tests {
             run_state: "idle",
             run_id: None,
             worker_generation: None,
+            cache: None,
             active_branch: "main".into(),
             branches: vec!["main".into()],
             provider: None,

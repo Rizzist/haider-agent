@@ -95,7 +95,7 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
         ("footprint_tokens", "flattened into `footprint`"),
         ("footprint_truth", "flattened into `footprint`"),
         ("workspace_cwd", "not surfaced by the sessions view"),
-        ("agent_metrics", "fleet view surfaces these, not sessions"),
+        ("agent_metrics", "flattened into `cache`; fleet carries a DIFFERENT snapshot (roots/rollup) and never had usage"),
         ("last_model", "flattened into `model`"),
         ("parent_session_id", "lineage is its own view"),
         ("kind", "lineage is its own view"),
