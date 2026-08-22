@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
-use haider_protocol::ids::RunId;
+use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageMetrics};
+use haider_protocol::ids::{RunId, SessionId};
 use haider_protocol::provider::{
     CacheStatAvailability, NormalizedUsage, Usage, UsageRequestKind, UsageScope, UsageSource,
 };
@@ -70,6 +71,82 @@ fn draw(model: &AppModel, width: u16) -> String {
         .join("\n")
 }
 
+fn footer_model(reread_basis_points: Option<u32>) -> AppModel {
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.cache_usage.note(&usage(
+        "footer-authority",
+        "openai",
+        UsageRequestKind::MainTurn,
+        // The locally derivable lifetime share is 7680 / (7680 + 4375) =
+        // 63.71%, intentionally far from the published re-read rate.
+        present(4_375, 7_680, 0),
+    ));
+    let session = SessionId::new("footer-authority");
+    model.active_session = Some(session.clone());
+    model.session_metrics.insert(
+        session.clone(),
+        AgentMetricsSnapshot {
+            agent: None,
+            session_id: session,
+            head_seq: 1,
+            started_at_ms: 0,
+            terminal_at_ms: None,
+            live: true,
+            tool_attempts: 0,
+            usage: Some(AgentUsageMetrics {
+                cache_hit_basis_points: Some(6_370),
+                cache_reread_hit_basis_points: reread_basis_points,
+                ..AgentUsageMetrics::default()
+            }),
+        },
+    );
+    model
+}
+
+/// MUTATION `FOOTER_LOCAL_LIFETIME_SHARE` (executed, observed red): feed the locally computed 63.71%
+/// lifetime share to the formatter instead of the session's published re-read
+/// field. Expected runtime failure: the authoritative 90.58% assertion.
+#[test]
+fn footer_uses_published_reread_rate_not_local_lifetime_share() {
+    let line = haider_tui::render::status_left_string(&footer_model(Some(9_058)), 180);
+    assert!(
+        line.contains("⚡7.7k re-read 90.58%"),
+        "footer must use the daemon's re-read authority: {line}"
+    );
+    assert!(
+        !line.contains("63.71%") && !line.contains("63.70%"),
+        "neither independently computed nor published lifetime share is cache health: {line}"
+    );
+}
+
+/// MUTATION `ABSENT_REREAD_DEFAULTS_TO_ZERO` (executed, observed red): replace the `None` display with
+/// `unwrap_or_default()`/0. Expected runtime failure: the n/a assertion.
+#[test]
+fn footer_absent_reread_rate_is_na_never_zero() {
+    let line = haider_tui::render::status_left_string(&footer_model(None), 180);
+    assert!(
+        line.contains("⚡7.7k re-read n/a"),
+        "no re-readable denominator must stay absent: {line}"
+    );
+    assert!(
+        !line.contains("re-read 0.00%"),
+        "absence must never look like total cache failure: {line}"
+    );
+}
+
+/// MUTATION `REREAD_INTEGER_PERCENT` (executed, observed red): divide basis points as an integer before
+/// formatting. Expected runtime failure: 9058 must retain both decimal places.
+#[test]
+fn footer_reread_basis_points_keep_two_decimal_places() {
+    let totals = footer_model(Some(9_058)).cache_usage.totals();
+    assert_eq!(
+        wide_status(&totals, Some(9_058)),
+        "↑4.4k ↓0 ⚡7.7k re-read 90.58%"
+    );
+    assert_eq!(medium_status(&totals, Some(9_058)), "⚡7.7k re-read 90.58%");
+}
+
 /// CM1g — token-weighted sample formatting is exact, latest cumulative
 /// snapshots replace earlier updates, compaction remains a separate lane,
 /// and partial coverage can never produce a complete session hit rate.
@@ -99,8 +176,14 @@ fn cm1g_session_fold_and_responsive_cache_readout_laws() {
     let totals = fold.totals();
     assert_eq!(totals.uncached_input_tokens, 450_000);
     assert_eq!(totals.cache_read_tokens, 108_800_000);
-    assert_eq!(wide_status(&totals), "↑450k ↓227k ⚡108.8M 99.59% hit");
-    assert_eq!(medium_status(&totals), "⚡108.8M 99.6% hit");
+    assert_eq!(
+        wide_status(&totals, Some(9_959)),
+        "↑450k ↓227k ⚡108.8M re-read 99.59%"
+    );
+    assert_eq!(
+        medium_status(&totals, Some(9_959)),
+        "⚡108.8M re-read 99.59%"
+    );
 
     fold.note(&usage(
         "sample",
@@ -134,7 +217,10 @@ fn cm1g_session_fold_and_responsive_cache_readout_laws() {
     ));
     let mixed = fold.totals();
     assert_eq!(mixed.complete_hit_rate(), None);
-    assert_eq!(wide_status(&mixed), "⚡n/a · hit n/a");
+    assert_eq!(
+        wide_status(&mixed, None),
+        "↑600k ↓229k ⚡108.8M re-read n/a"
+    );
     let coverage = mixed.telemetry_coverage().expect("nonzero input");
     assert!(coverage < 1.0 && coverage > 0.0);
 
@@ -148,7 +234,7 @@ fn cm1g_session_fold_and_responsive_cache_readout_laws() {
     ));
     let wide_frame = draw(&model, 180);
     assert!(
-        wide_frame.contains("↑450k ↓227k") && wide_frame.contains("108.8M 99.59% hit"),
+        wide_frame.contains("↑450k ↓227k") && wide_frame.contains("108.8M re-read n/a"),
         "wide status uses the exact form:\n{wide_frame}"
     );
     assert!(
@@ -157,7 +243,7 @@ fn cm1g_session_fold_and_responsive_cache_readout_laws() {
     );
 }
 
-/// A reported zero is a real 0.00% rate; missing telemetry is n/a.
+/// A published zero is a real 0.00% rate; an absent rate is n/a.
 #[test]
 fn cm1c_reported_zero_and_missing_render_differently() {
     let mut reported = SessionUsageFold::default();
@@ -167,7 +253,10 @@ fn cm1c_reported_zero_and_missing_render_differently() {
         UsageRequestKind::MainTurn,
         present(1_000, 0, 1),
     ));
-    assert_eq!(wide_status(&reported.totals()), "↑1.0k ↓1 ⚡0 0.00% hit");
+    assert_eq!(
+        wide_status(&reported.totals(), Some(0)),
+        "↑1.0k ↓1 ⚡0 re-read 0.00%"
+    );
 
     let mut missing = SessionUsageFold::default();
     missing.note(&usage(
@@ -181,7 +270,10 @@ fn cm1c_reported_zero_and_missing_render_differently() {
             ..NormalizedUsage::default()
         },
     ));
-    assert_eq!(wide_status(&missing.totals()), "⚡n/a · hit n/a");
+    assert_eq!(
+        wide_status(&missing.totals(), None),
+        "↑1.0k ↓1 ⚡0 re-read n/a"
+    );
 }
 
 #[test]

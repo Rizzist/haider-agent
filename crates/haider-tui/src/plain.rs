@@ -175,7 +175,7 @@ fn render_plain_impl(
     out.push_str(&status_line(projection, window));
     if let Some(totals) = &cache_totals {
         out.push_str(" · ");
-        out.push_str(&crate::cache_usage::wide_status(totals));
+        out.push_str(&crate::cache_usage::wide_status(totals, None));
     }
     out.push('\n');
     out
@@ -183,14 +183,14 @@ fn render_plain_impl(
 
 fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> String {
     use crate::cache_usage::CacheUsageStatsExt as _;
-    let hit = stats
+    let all_input_share = stats
         .complete_hit_rate()
         .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.2}%", rate * 100.0));
     let coverage = stats
         .telemetry_coverage()
         .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.0}%", rate * 100.0));
     let mut out = format!(
-        "cache usage — logical {} · uncached {} · write {} (5m {} · 1h {}) · read {} · hit {hit} · coverage {coverage}",
+        "cache usage — logical {} · uncached {} · write {} (5m {} · 1h {}) · read {} · all-input share {all_input_share} · coverage {coverage}",
         fmt_tok(stats.logical_input_tokens),
         fmt_tok(stats.uncached_input_tokens),
         fmt_tok(stats.cache_write_tokens),
@@ -302,7 +302,7 @@ fn cache_breakdown_plain(stats: &haider_protocol::usage::CacheUsageStatsV1) -> S
             )
         };
         out.push_str(&format!(
-            "\n  {} / {} / {} / {:?} — uncached {} · write {} · read {} · hit {part_hit} · coverage {part_coverage}{cost}",
+            "\n  {} / {} / {} / {:?} — uncached {} · write {} · read {} · all-input share {part_hit} · coverage {part_coverage}{cost}",
             if breakdown.provider.is_empty() {
                 "unknown"
             } else {

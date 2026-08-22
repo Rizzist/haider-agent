@@ -2309,7 +2309,7 @@ fn render_usage(
 
     if !model.cache_usage.is_empty() {
         let cache = model.cache_usage.totals();
-        let hit = cache
+        let all_input_share = cache
             .complete_hit_rate()
             .map_or_else(|| "n/a".to_owned(), |rate| format!("{:.2}%", rate * 100.0));
         let coverage = cache
@@ -2329,7 +2329,7 @@ fn render_usage(
         ]));
         lines.push(Line::styled(
             format!(
-                "    input — logical {} · uncached {} · cache read {} · {hit} hit · coverage {coverage}",
+                "    input — logical {} · uncached {} · cache read {} · all-input share {all_input_share} · coverage {coverage}",
                 fmt_tok(cache.logical_input_tokens),
                 fmt_tok(cache.uncached_input_tokens),
                 fmt_tok(cache.cache_read_tokens),
@@ -2466,7 +2466,7 @@ fn render_usage(
             };
             lines.push(Line::styled(
                 format!(
-                    "      {provider} · {model_name} · epoch {epoch} · {lane} — uncached {} · write {} · read {} · {part_hit} hit{part_cost}",
+                    "      {provider} · {model_name} · epoch {epoch} · {lane} — uncached {} · write {} · read {} · all-input share {part_hit}{part_cost}",
                     fmt_tok(breakdown.uncached_input_tokens),
                     fmt_tok(breakdown.cache_write_tokens),
                     fmt_tok(breakdown.cache_read_tokens),
@@ -9826,8 +9826,12 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     }
     if meter_shown && !model.cache_usage.is_empty() {
         let totals = model.cache_usage.totals();
-        let wide = crate::cache_usage::wide_status(&totals);
-        let medium = crate::cache_usage::medium_status(&totals);
+        let reread_basis_points = model
+            .main_agent_metrics()
+            .and_then(|metrics| metrics.usage.as_ref())
+            .and_then(|usage| usage.cache_reread_hit_basis_points);
+        let wide = crate::cache_usage::wide_status(&totals, reread_basis_points);
+        let medium = crate::cache_usage::medium_status(&totals, reread_basis_points);
         let branch_reserve = if model.screen == Screen::Session {
             model.active_branch_name().chars().count() + 4
         } else {

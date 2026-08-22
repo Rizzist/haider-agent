@@ -306,28 +306,32 @@ impl CacheUsageStatsExt for CacheUsageStatsV1 {
     }
 }
 
-#[must_use]
-pub fn wide_status(stats: &CacheUsageStatsV1) -> String {
-    match stats.complete_hit_rate() {
-        Some(hit) => format!(
-            "↑{} ↓{} ⚡{} {:.2}% hit",
-            crate::format::fmt_tok(stats.uncached_input_tokens),
-            crate::format::fmt_tok(stats.billed_output_tokens),
-            crate::format::fmt_tok(stats.cache_read_tokens),
-            hit * 100.0,
-        ),
-        None => "⚡n/a · hit n/a".to_owned(),
-    }
+fn reread_rate(basis_points: Option<u32>) -> String {
+    basis_points.map_or_else(
+        || "n/a".to_owned(),
+        |rate| format!("{}.{:02}%", rate / 100, rate % 100),
+    )
 }
 
 #[must_use]
-pub fn medium_status(stats: &CacheUsageStatsV1) -> String {
-    match stats.complete_hit_rate() {
-        Some(hit) => format!(
-            "⚡{} {:.1}% hit",
-            crate::format::fmt_tok(stats.cache_read_tokens),
-            hit * 100.0,
-        ),
-        None => "⚡n/a · hit n/a".to_owned(),
-    }
+/// Status-bar cache summary. Token counts come from the session usage fold,
+/// but cache health comes only from the daemon-published re-read rate. In
+/// particular, `None` has no denominator and must remain distinct from 0%.
+pub fn wide_status(stats: &CacheUsageStatsV1, reread_basis_points: Option<u32>) -> String {
+    format!(
+        "↑{} ↓{} ⚡{} re-read {}",
+        crate::format::fmt_tok(stats.uncached_input_tokens),
+        crate::format::fmt_tok(stats.billed_output_tokens),
+        crate::format::fmt_tok(stats.cache_read_tokens),
+        reread_rate(reread_basis_points),
+    )
+}
+
+#[must_use]
+pub fn medium_status(stats: &CacheUsageStatsV1, reread_basis_points: Option<u32>) -> String {
+    format!(
+        "⚡{} re-read {}",
+        crate::format::fmt_tok(stats.cache_read_tokens),
+        reread_rate(reread_basis_points),
+    )
 }
