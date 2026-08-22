@@ -566,6 +566,7 @@ fn roster_row_accent_joins_the_summary_and_falls_back() {
         head_seq: 4,
         worker_generation: 7,
         run_state: None,
+        run_id: None,
         seen_at_ms: None,
         last_activity_ms: None,
         waiting_why: None,

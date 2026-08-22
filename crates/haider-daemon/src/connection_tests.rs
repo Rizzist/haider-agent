@@ -127,6 +127,11 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_MODELS_LIST_V1`. Expected RUNTIME failure: the ADE cannot sniff
 /// the headless session-config door / model-library enumeration (W-CFG).
 ///
+/// MUTATION CHECK: remove `FEATURE_SESSION_RUN_ID_V1`. Expected RUNTIME
+/// failure: clients cannot discover that observation surfaces report the
+/// active run id, leaving every session started elsewhere uncancellable
+/// from any surface but the one that submitted it (W-flow).
+///
 /// MUTATION CHECK: remove `FEATURE_LOOM_CLI_PRESENCE_V1`. Expected RUNTIME
 /// failure: clients cannot discover that `loom.list` reports device PATH
 /// presence, so a missing declared CLI stays invisible until the agent
@@ -163,6 +168,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_RUN_ID_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
             haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),
             haider_rpc::FEATURE_PIPE_NATIVE_V2.to_owned(),

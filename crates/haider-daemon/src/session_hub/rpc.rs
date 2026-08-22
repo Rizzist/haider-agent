@@ -482,6 +482,8 @@ struct ObserveFoldSnapshot {
     head_seq: u64,
     title: Option<String>,
     run_state: haider_rpc::ObserveRunStateWire,
+    /// Identity of the run `run_state` describes; `None` when idle.
+    run_id: Option<RunId>,
     active_branch_id: Option<BranchId>,
     branches: Vec<haider_protocol::branch::BranchDescriptor>,
     main_head_node_id: Option<haider_protocol::ids::NodeId>,
@@ -565,10 +567,11 @@ impl ObserveFold {
 
     fn snapshot(&self, session_id: &SessionId) -> ObserveFoldSnapshot {
         let selected = select_observed_run(&self.projection.runs);
-        let run_state = selected.map_or(haider_rpc::ObserveRunStateWire::Idle, |run| {
+        let run_state = selected.map_or(haider_rpc::ObserveRunStateWire::Idle, |(_, run)| {
             observe_run_state(&run.state)
         });
-        let active_branch_id = selected.and_then(|run| run.branch_id.clone());
+        let run_id = selected.map(|(run_id, _)| run_id.clone());
+        let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
         let mut branches = self
             .projection
             .branches
@@ -580,6 +583,7 @@ impl ObserveFold {
             head_seq: self.head_seq,
             title: self.projection.title.clone(),
             run_state,
+            run_id,
             active_branch_id,
             branches,
             main_head_node_id: self.projection.main_head_node_id.clone(),
@@ -647,6 +651,7 @@ impl ObserveFoldSnapshot {
             metadata,
             title,
             run_state: self.run_state,
+            run_id: self.run_id.clone(),
             active_branch_id: self.active_branch_id.clone(),
             branches: self.branches.clone(),
             main_head_node_id: self.main_head_node_id.clone(),
@@ -1120,10 +1125,11 @@ impl ObserveProjection {
         metadata: Option<haider_protocol::session::SessionMetadataV1>,
     ) -> haider_rpc::SessionObserveDigest {
         let selected = select_observed_run(&self.runs);
-        let run_state = selected.map_or(haider_rpc::ObserveRunStateWire::Idle, |run| {
+        let run_state = selected.map_or(haider_rpc::ObserveRunStateWire::Idle, |(_, run)| {
             observe_run_state(&run.state)
         });
-        let active_branch_id = selected.and_then(|run| run.branch_id.clone());
+        let run_id = selected.map(|(run_id, _)| run_id.clone());
+        let active_branch_id = selected.and_then(|(_, run)| run.branch_id.clone());
         let title = self.title.unwrap_or_else(|| {
             metadata
                 .as_ref()
@@ -1150,6 +1156,7 @@ impl ObserveProjection {
             metadata,
             title,
             run_state,
+            run_id,
             active_branch_id,
             branches,
             main_head_node_id: self.main_head_node_id,
@@ -1169,7 +1176,14 @@ impl ObserveProjection {
     }
 }
 
-fn select_observed_run(runs: &HashMap<RunId, ObservedRun>) -> Option<&ObservedRun> {
+/// Pick the ONE run a session's observed `run_state` describes.
+///
+/// Returns the map KEY alongside the run (W-flow, owner 2026-08-22): the id
+/// and the state must come from the same selection or a client cancelling
+/// "what it sees" could name a different run than the one whose state it is
+/// rendering. Discarding the key here was why no observation surface could
+/// report a cancellable run id.
+fn select_observed_run(runs: &HashMap<RunId, ObservedRun>) -> Option<(&RunId, &ObservedRun)> {
     let predicates: [fn(&RunState) -> bool; 5] = [
         |state| matches!(state, RunState::EffectOutcomeUnknown),
         |state| matches!(state, RunState::PermissionRequired { .. }),
@@ -1178,15 +1192,15 @@ fn select_observed_run(runs: &HashMap<RunId, ObservedRun>) -> Option<&ObservedRu
         |state| matches!(state, RunState::Queued),
     ];
     for predicate in predicates {
-        if let Some(run) = runs
-            .values()
-            .filter(|run| predicate(&run.state))
-            .max_by_key(|run| run.seq)
+        if let Some(entry) = runs
+            .iter()
+            .filter(|(_, run)| predicate(&run.state))
+            .max_by_key(|(_, run)| run.seq)
         {
-            return Some(run);
+            return Some(entry);
         }
     }
-    runs.values().max_by_key(|run| run.seq)
+    runs.iter().max_by_key(|(_, run)| run.seq)
 }
 
 pub(crate) fn observe_run_state(state: &RunState) -> haider_rpc::ObserveRunStateWire {
@@ -8081,6 +8095,8 @@ pub(crate) async fn session_summaries(
         let turns = snapshot.turns;
         let footprint = snapshot.footprint;
         let run_state = snapshot.run_state;
+        // Same selection as `run_state` — the pair is one observation.
+        let run_id = snapshot.run_id.clone();
         let last_activity_ms = snapshot.last_activity_ms;
         let waiting_why = waiting_why(run_state, &snapshot.pending_menus);
         let needs_input = needs_input(run_state, &snapshot.pending_menus);
@@ -8118,6 +8134,7 @@ pub(crate) async fn session_summaries(
             head_seq,
             worker_generation: hub.inner.store.worker_generation(),
             run_state: Some(run_state),
+            run_id,
             seen_at_ms,
             last_activity_ms,
             waiting_why,
@@ -8375,6 +8392,7 @@ mod roster_wave_tests {
             kind: None,
             agent_type: None,
             run_state: None,
+            run_id: None,
             seen_at_ms: None,
             last_activity_ms: None,
             waiting_why: None,
@@ -8825,5 +8843,129 @@ mod error_wave3_tests {
         assert!(first.contains("5 bytes"), "{first}");
         assert!(second.contains("14 bytes"), "{second}");
         assert_ne!(first, second, "probe must inspect current state each time");
+    }
+}
+
+/// W-flow (owner 2026-08-22) — the active run's IDENTITY on every observation
+/// surface, so a client can cancel the run it is rendering.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod run_identity_tests {
+    use super::*;
+    use haider_protocol::EventPayload;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EventId};
+
+    fn state_envelope(run: &str, seq: u64, state: RunState) -> RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("run-identity-{run}-{seq}")),
+            seq,
+            session_id: SessionId::new("session-run-identity"),
+            branch_id: None,
+            run_id: Some(RunId::new(run)),
+            agent_id: None,
+            device_id: DeviceId::new("run-identity-test"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: seq,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::RunState(state)).expect("state serializes"),
+        }
+    }
+
+    fn digest_of(envelopes: Vec<RawEnvelope>) -> haider_rpc::SessionObserveDigest {
+        let mut projection = ObserveProjection::new(8);
+        let head = envelopes.len() as u64;
+        for envelope in envelopes {
+            projection.apply(envelope);
+        }
+        projection.finish(SessionId::new("session-run-identity"), head, 1, None)
+    }
+
+    /// The id and the state are ONE observation. A client told "running" must
+    /// be told *which* run is running, or its stop button cancels whatever
+    /// happens to be live when the call lands rather than what it displayed.
+    ///
+    /// MUTATION CHECK (executed): make `select_observed_run` return the id of
+    /// a different entry than the one it returns the state for — e.g. pair
+    /// `runs.keys().next()` with the selected run. Expected RUNTIME failure:
+    /// the same-selection assertion below, since the ranked selector must
+    /// pick the PARKED run while an unranked pick lands on either.
+    #[test]
+    fn the_reported_run_id_names_the_run_the_state_describes() {
+        // Two live runs. The selector ranks a parked run above a plain
+        // running one regardless of seq, so an id taken from anywhere else
+        // in the map would disagree with the state.
+        let digest = digest_of(vec![
+            state_envelope("run-parked", 1, RunState::EffectOutcomeUnknown),
+            state_envelope("run-plain", 2, RunState::Streaming),
+        ]);
+        assert_eq!(
+            digest.run_state,
+            haider_rpc::ObserveRunStateWire::EffectUnknown,
+            "the parked run outranks the newer plain one"
+        );
+        assert_eq!(
+            digest.run_id.as_ref().map(RunId::as_str),
+            Some("run-parked"),
+            "the id must name the SAME run the state describes"
+        );
+    }
+
+    /// MUTATION CHECK (executed): report an id for a settled session (drop
+    /// the `Idle` correlation by always emitting the newest run's key).
+    /// Expected RUNTIME failure: the terminal-run assertion — a stop button
+    /// would appear on a session with nothing to stop.
+    #[test]
+    fn a_session_with_no_live_run_reports_no_run_id() {
+        // No runs at all.
+        let empty = digest_of(Vec::new());
+        assert_eq!(empty.run_state, haider_rpc::ObserveRunStateWire::Idle);
+        assert!(
+            empty.run_id.is_none(),
+            "an unstarted session has no run to cancel"
+        );
+    }
+
+    /// The `metadata_only` fast path skips the projection entirely, so it
+    /// reports no run id — and that ABSENCE is honest rather than a claim of
+    /// idleness. Pinned so nobody later "fixes" it into a lie.
+    ///
+    /// MUTATION CHECK (executed): have the metadata-only branch fabricate a
+    /// run id. Expected RUNTIME failure: the assertion below.
+    #[test]
+    fn the_metadata_only_fast_path_reports_no_run_id() {
+        let mut projection = ObserveProjection::new(8);
+        projection.title = Some("titled".to_owned());
+        let digest = projection.finish(SessionId::new("session-run-identity"), 42, 1, None);
+        assert!(
+            digest.run_id.is_none(),
+            "the fast path projects nothing, so it must claim nothing"
+        );
+        assert_eq!(digest.head_seq, 42, "authoritative fields still hold");
+    }
+
+    /// The wire field is additive: an older daemon omits it entirely, and a
+    /// client must decode that as "no active run", never as a decode error.
+    ///
+    /// MUTATION CHECK (executed): drop `#[serde(default)]` from
+    /// `SessionSummary::run_id`. Expected RUNTIME failure: the decode below.
+    #[test]
+    fn an_older_daemons_summary_still_decodes() {
+        let legacy = serde_json::json!({
+            "session_id": "session-legacy",
+            "head_seq": 7,
+            "worker_generation": 3,
+        });
+        let summary: SessionSummary =
+            serde_json::from_value(legacy).expect("a summary without run_id must decode");
+        assert!(summary.run_id.is_none(), "absent decodes as no active run");
     }
 }

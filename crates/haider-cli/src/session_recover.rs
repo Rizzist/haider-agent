@@ -555,6 +555,7 @@ mod tests {
             metadata: None,
             title: "parked".into(),
             run_state: ObserveRunStateWire::EffectUnknown,
+            run_id: None,
             active_branch_id: None,
             branches: Vec::new(),
             main_head_node_id: None,

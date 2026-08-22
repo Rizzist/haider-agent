@@ -56,10 +56,10 @@ use haider_rpc::{
     FEATURE_PROVIDER_REMOVE_V1, FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_RETRY_V1,
     FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_MUTATION_V1,
     FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
-    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, Hello,
-    LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome, WireEncoding, WireFrame,
-    negotiate, uds_codec,
+    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RUN_ID_V1, FEATURE_SHELL_EXEC_V1,
+    FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_USER_COMMAND_V1,
+    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome,
+    WireEncoding, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::IoSlice;
@@ -1725,6 +1725,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
         FEATURE_LOOM_V1.to_owned(),
         FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
+        FEATURE_SESSION_RUN_ID_V1.to_owned(),
         FEATURE_PIPE_NATIVE_V2.to_owned(),
         haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1.to_owned(),
         haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned(),

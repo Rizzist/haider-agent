@@ -41,6 +41,7 @@ fn summary(
         head_seq,
         worker_generation: 7,
         run_state: None,
+        run_id: None,
         seen_at_ms: None,
         last_activity_ms: None,
         waiting_why: None,

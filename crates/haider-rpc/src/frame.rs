@@ -361,6 +361,8 @@ pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 pub const FEATURE_LOOM_V1: &str = "loom_v1";
 /// W-flow — `loom.list` carries the declared-CLI device presence map.
 pub const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
+/// W-flow — observation surfaces report the active run id (cancel coordinate).
+pub const FEATURE_SESSION_RUN_ID_V1: &str = "session_run_id_v1";
 /// Daemon can push changed/new session summaries after a read-only roster
 /// watch is accepted.
 pub const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
@@ -981,6 +983,20 @@ pub struct SessionSummary {
     /// older daemon; current list/watch producers always populate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_state: Option<ObserveRunStateWire>,
+    /// W-flow (owner 2026-08-22) — identity of the run `run_state` describes,
+    /// so a client can CANCEL what it is rendering.
+    ///
+    /// `turn.cancel` needs `run_id` + `worker_generation`, and until now no
+    /// observation surface reported the id at all: it existed only on the
+    /// acceptance reply of a client's OWN `turn.submit`, so a session started
+    /// on another surface was uncancellable from anywhere else.
+    ///
+    /// Absent means NO ACTIVE RUN (or an older daemon) — never an error, and
+    /// never a reason to render a stop control. Read it together with
+    /// `run_state` from the SAME summary: pairing an id from one poll with a
+    /// state from another can cancel a run that has already ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
     /// Durable time at which any surface last acknowledged this session's
     /// activity. `None` means no acknowledgement has ever committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1333,6 +1349,10 @@ pub struct SessionObserveDigest {
     pub metadata: Option<SessionMetadataV1>,
     pub title: String,
     pub run_state: ObserveRunStateWire,
+    /// Identity of the run `run_state` describes — same law as
+    /// [`SessionSummary::run_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
     /// `None` names the implicit main branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_branch_id: Option<BranchId>,

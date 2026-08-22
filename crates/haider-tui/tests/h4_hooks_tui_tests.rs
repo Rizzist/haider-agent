@@ -494,6 +494,7 @@ fn trust_revision_event_refreshes_the_summary_workspace() {
                 head_seq: 0,
                 worker_generation: 7,
                 run_state: None,
+                run_id: None,
                 seen_at_ms: None,
                 last_activity_ms: None,
                 waiting_why: None,

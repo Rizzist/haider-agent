@@ -80,6 +80,7 @@ fn digest(
         }),
         title: "Inspect durable automation truth".into(),
         run_state,
+        run_id: None,
         active_branch_id: Some(BranchId::new("branch-review")),
         branches: vec![BranchDescriptor {
             branch_id: BranchId::new("branch-review"),

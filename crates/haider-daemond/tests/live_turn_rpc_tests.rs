@@ -4842,6 +4842,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             head_seq: 1,
             worker_generation: created.worker_generation,
             run_state: Some(haider_rpc::ObserveRunStateWire::Idle),
+            run_id: None,
             seen_at_ms: None,
             last_activity_ms: None,
             waiting_why: None,

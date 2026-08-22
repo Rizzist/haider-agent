@@ -32,6 +32,7 @@ fn summary(id: &str, seen_at_ms: Option<u64>, last_activity_ms: Option<u64>) -> 
         head_seq: 4,
         worker_generation: 7,
         run_state: None,
+        run_id: None,
         seen_at_ms,
         last_activity_ms,
         waiting_why: None,
