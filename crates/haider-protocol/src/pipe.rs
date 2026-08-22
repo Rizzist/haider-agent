@@ -162,6 +162,16 @@ impl TranscriptProjector {
         if let Some(projection) = sidecar_projection(&mut self.joiner, envelope, run_repeats_items)
         {
             let mut row = projection.row;
+            // A projected row with NO run scope is a turn boundary — a user
+            // turn. It ends every open turn at once, so whatever was being
+            // thought before the user spoke cannot belong to an answer that
+            // comes after them. The run-scoped cleanup below cannot do this:
+            // it is keyed on the INCOMING row's run, and a user turn has none,
+            // so without this the orphaned summary survives the boundary and
+            // attaches to the next assistant row of the earlier run.
+            if run_key.is_none() && !row.is_attachable_assistant() {
+                self.pending_reasoning.clear();
+            }
             let unresolved_reasoning = run_key.as_ref().and_then(|run_key| {
                 if !row.is_attachable_assistant() {
                     self.settle_waiting_assistants(run_key);
@@ -1409,6 +1419,51 @@ mod tests {
         let second = serde_json::to_value(&second[0]).expect("second row serializes");
         assert_eq!(second["text"], "answer-b");
         assert_eq!(second["reasoning"], "sealed-b");
+    }
+
+    /// Reasoning that never found its assistant row must be DISCARDED when a
+    /// non-attachable row settles the run, not held for whatever assistant row
+    /// comes next. Holding it is how a turn's thinking ends up stapled to a
+    /// later answer it did not produce — the same wrong-turn failure as the
+    /// cross-run case above, one scope in.
+    ///
+    /// MUTATION CHECK (executed): delete `self.pending_reasoning.remove(run_key)`
+    /// from the non-attachable branch. Expected RUNTIME failure: the assertion
+    /// below — the stale summary attaches to the later assistant row. This gap
+    /// was found by mutation: the whole protocol and pipe suite passed without
+    /// that line, so nothing pinned it.
+    #[test]
+    fn reasoning_orphaned_by_a_non_assistant_row_never_attaches_later() {
+        let mut projector = TranscriptProjector::default();
+        projector.push(&reasoning_started(1, "run-a", "reason-a"));
+        projector.push(&reasoning_sealed(
+            2,
+            "run-a",
+            "reason-a",
+            "orphaned-thinking",
+        ));
+        // A USER TURN is unambiguously a new turn: whatever the model was
+        // thinking before it cannot belong to an answer that comes after it.
+        projector.push(&node(
+            3,
+            NodeKind::UserTurn {
+                text: "a new question".into(),
+                attachments: Vec::new(),
+            },
+        ));
+
+        let mut rows = projector.push(&assistant(4, "run-a", "later-answer"));
+        // The assistant row may be held pending; `finish` releases the tail.
+        rows.extend(projector.finish());
+        let later = rows
+            .iter()
+            .map(|row| serde_json::to_value(row).expect("row serializes"))
+            .find(|row| row["text"] == "later-answer")
+            .expect("the later assistant row is emitted");
+        assert!(
+            later.get("reasoning").is_none(),
+            "orphaned reasoning must not attach to a later turn: {later}"
+        );
     }
 
     /// MUTATION CHECK: remove the lifecycle barrier from `take_ready_rows`.
