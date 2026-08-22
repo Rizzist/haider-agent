@@ -40,10 +40,21 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const SIDECAR_MAGIC: &str = "haider.session.jsonl";
 // V2 added coverage lines and `(seq, ordinal)` row identity. V3 guarantees
 // cold tool preview projection. V4 adds sealed reasoning, compaction boundary
-// rows, and physical segments. Every bump intentionally forces existing
-// at-head files (including every sealed segment) through a journal rebuild so
-// old projections cannot remain silently "current" at EOF.
-const SIDECAR_VERSION: u64 = 4;
+// rows, and physical segments. V5 carries no new row shape at all — it exists
+// solely to REWRITE what v4 already wrote.
+//
+// v0.0.940 stopped marking reasoning-bearing rows `compat` (a row whose loss
+// costs data is not redundant), but a producer-side contract fix does not
+// reach a durable artefact unless something forces a rewrite. With the
+// version unchanged the rebuild trigger `header.version != SIDECAR_VERSION`
+// never fired, so every file on disk kept v4's flags and 93 reasoning rows
+// went on advertising themselves as droppable. The fix and the fix's REACH
+// are two different questions, and shipping only answers the first.
+//
+// Every bump intentionally forces existing at-head files (including every
+// sealed segment) through a journal rebuild so old projections cannot remain
+// silently "current" at EOF.
+const SIDECAR_VERSION: u64 = 5;
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarCursor {

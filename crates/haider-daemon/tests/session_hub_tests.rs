@@ -612,7 +612,7 @@ fn expected_sidecar_batches(
     batches: &[&[RawEnvelope]],
 ) -> String {
     let mut expected = format!(
-        "{{\"pipe\":\"haider.session.jsonl\",\"version\":4,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
+        "{{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
     );
     for batch in batches {
         expected.push_str(&expected_sidecar_body(batch));
@@ -1101,6 +1101,112 @@ fn pdf_fixture(pages: u32, content: Option<&str>) -> Vec<u8> {
     }
     pdf.push_str("trailer\n<< /Root 1 0 R >>\n%%EOF\n");
     pdf.into_bytes()
+}
+
+/// v0.0.940 stopped marking reasoning rows `compat`, but the fix could not
+/// reach the 93 rows already on disk: with `SIDECAR_VERSION` unchanged the
+/// rebuild trigger never fired, so every file kept v4's flags and went on
+/// advertising reasoning as droppable. v5 exists to force that rewrite.
+///
+/// This pins the REACH, not the fix — that a REBUILD lands the corrected flag
+/// on a file that previously carried the wrong one. The failure mode it guards
+/// is quiet: files rebuild, versions match, flags stay wrong, nothing errors.
+///
+/// MUTATION CHECK (executed): revert `SIDECAR_VERSION` to 4. Expected RUNTIME
+/// failure: the stale file is considered current, no rebuild runs, and the
+/// wrong `compat: true` survives the assertion below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_v4_file_rebuilds_with_the_reasoning_compat_flag_cleared() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-compat-reach");
+    let generation = store.worker_generation();
+    let reasoning_id = ItemId::new("reach-reasoning");
+
+    let mut started = pipe_event(
+        &session_id,
+        "reach-started",
+        generation,
+        EventPayload::Item(ItemEvent::Started {
+            item_id: reasoning_id.clone(),
+            item: TurnItem::Reasoning {
+                summary: String::new(),
+            },
+        }),
+    );
+    started.run_id = Some(RunId::new("reach-run"));
+    let mut assistant = pipe_event(
+        &session_id,
+        "reach-assistant",
+        generation,
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("reach-assistant-node"),
+            parent: None,
+            kind: NodeKind::AssistantCommit {
+                text: "the answer".into(),
+                verdict: VerifyVerdict::Unverified,
+            },
+        }),
+    );
+    assistant.run_id = Some(RunId::new("reach-run"));
+    let mut sealed = pipe_event(
+        &session_id,
+        "reach-sealed",
+        generation,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: reasoning_id,
+            item: TurnItem::Reasoning {
+                summary: "the thinking".into(),
+            },
+        }),
+    );
+    sealed.run_id = Some(RunId::new("reach-run"));
+    let mut seed = vec![started, assistant, sealed];
+    hub.append(&mut seed).await.expect("seed commits");
+    hub.shutdown().await.expect("hub stops");
+
+    // Stand in for what v0.0.939 actually left on disk: a CURRENT-looking v4
+    // file whose reasoning row wears the flag the contract now forbids.
+    let path = sidecar_path(&root, &session_id);
+    let head = seed.last().expect("head").seq;
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":4,\"session_id\":\"{session_id}\",\"generation\":4}}\n             {{\"role\":\"assistant\",\"text\":\"the answer\",\"reasoning\":\"the thinking\",\"at_ms\":1,\"seq\":{head},\"ordinal\":0,\"compat\":true}}\n"
+        ),
+    )
+    .expect("stale v4 sidecar writes");
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("stale reads")
+            .contains("\"compat\":true"),
+        "precondition: the stale file carries the WRONG flag"
+    );
+
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    let mut trigger = vec![user_pipe_event(
+        &session_id,
+        "reach-trigger",
+        generation,
+        "next",
+    )];
+    hub.append(&mut trigger).await.expect("trigger commits");
+    hub.shutdown().await.expect("second hub stops");
+
+    let rebuilt = std::fs::read_to_string(&path).expect("rebuilt reads");
+    let header: serde_json::Value =
+        serde_json::from_str(rebuilt.lines().next().expect("header")).expect("header JSON");
+    assert_eq!(header["version"], 5, "the bump forced a rebuild");
+
+    let reasoning_row: serde_json::Value = rebuilt
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row.get("reasoning").is_some())
+        .expect("the rebuilt reasoning row");
+    assert_eq!(reasoning_row["reasoning"], "the thinking");
+    assert!(
+        reasoning_row.get("compat").is_none(),
+        "the rebuild must land the CORRECTED flag, not reproduce the stale one: {reasoning_row}"
+    );
 }
 
 /// MUTATION CHECK: bypass daemon CAS ingress, return a caller-provided ref,
@@ -6902,7 +7008,7 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     std::fs::write(
         &path,
         format!(
-            "{{\"pipe\":\"haider.session.jsonl\",\"version\":4,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
         ),
     )
     .expect("corruption writes");
@@ -6977,7 +7083,7 @@ async fn native_pipe_coverage_tail_ahead_rebuilds_and_increments_generation() {
 /// line kinds beneath a stale header instead of performing the
 /// generation-bumped atomic rebuild (v1 through v3 alike rebuild to v4).
 #[tokio::test]
-async fn native_pipe_v1_header_rebuilds_to_v4_with_generation_bump() {
+async fn native_pipe_v1_header_rebuilds_to_current_with_generation_bump() {
     let (root, store, hub) = open_hub(None, 8).await;
     let session_id = SessionId::new("native-pipe-v1-rebuild");
     let generation = store.worker_generation();
@@ -7007,7 +7113,7 @@ async fn native_pipe_v1_header_rebuilds_to_v4_with_generation_bump() {
 /// Expected RUNTIME failure: the at-head v3 file remains generation 4 instead
 /// of rebuilding all journal rows into a generation-5 v4 projection.
 #[tokio::test]
-async fn native_pipe_v3_header_rebuilds_to_v4_with_generation_bump() {
+async fn native_pipe_v3_header_rebuilds_to_current_with_generation_bump() {
     let (root, store, hub) = open_hub(None, 8).await;
     let session_id = SessionId::new("native-pipe-v3-rebuild");
     let generation = store.worker_generation();
@@ -7094,7 +7200,7 @@ async fn native_pipe_v3_header_rebuilds_to_v4_with_generation_bump() {
     let root_segment = std::fs::read_to_string(&path).expect("rebuilt root reads");
     let header: serde_json::Value =
         serde_json::from_str(root_segment.lines().next().expect("v4 header")).expect("header JSON");
-    assert_eq!(header["version"], 4);
+    assert_eq!(header["version"], 5);
     assert_eq!(header["generation"], 5);
     assert!(root_segment.contains("\"reasoning\":\"sealed v3 summary\""));
     assert!(!root_segment.contains("v3 partial"));
@@ -7138,7 +7244,7 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     std::fs::create_dir(root.path().join("pipe")).expect("sidecar directory creates");
     std::fs::write(
         sidecar_path(&root, &session_id),
-        b"{\"pipe\":\"haider.session.jsonl\",\"version\":4,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
+        b"{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
     )
     .expect("stale sidecar writes");
     append_one(&hub, &session_id, generation, "retry-trigger").await;
