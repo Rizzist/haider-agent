@@ -123,6 +123,12 @@ pub(crate) struct SessionSummaryView {
     /// Additive roster scalars merged from `session.list` (v0.0.936): the
     /// digest path predates them, so they are optional and omitted when the
     /// daemon or the merge has nothing to say.
+    /// The cancel coordinates (v0.0.938 `session_run_id_v1`). `turn.cancel`
+    /// takes BOTH, so a projection reporting neither leaves every session
+    /// uncancellable from anything reading this JSON. Read them off the SAME
+    /// summary as `run_state` — the pair is one observation.
+    pub run_id: Option<String>,
+    pub worker_generation: Option<u64>,
     pub effort: Option<String>,
     pub fast: Option<bool>,
     pub agent_type: Option<String>,
@@ -231,6 +237,12 @@ impl ObserveJson for SessionSummaryView {
             "subagent_count": self.subagent_count,
             "updated_at": self.updated_at,
         });
+        if let Some(run_id) = &self.run_id {
+            object["run_id"] = json!(run_id);
+        }
+        if let Some(generation) = self.worker_generation {
+            object["worker_generation"] = json!(generation);
+        }
         if let Some(parked_since) = self.parked_since {
             object["parked_since"] = json!(parked_since);
         }
@@ -564,6 +576,10 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
             let scalars = roster.get(&digest.session_id);
             let mut view = summary_view(digest);
             if let Some(summary) = scalars {
+                // The roster summary is the LIVE observation; take the
+                // cancel pair from it together, never one from each source.
+                view.run_id = summary.run_id.as_ref().map(|run| run.as_str().to_owned());
+                view.worker_generation = Some(summary.worker_generation);
                 view.effort = summary.effort.clone();
                 view.fast = summary.fast;
                 view.agent_type = summary.agent_type.clone();
@@ -822,6 +838,8 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         needs_input: None,
         title: digest.title,
         run_state: run_state_name(digest.run_state),
+        run_id: digest.run_id.as_ref().map(|run| run.as_str().to_owned()),
+        worker_generation: Some(digest.worker_generation),
         active_branch: digest
             .active_branch_id
             .as_ref()
@@ -1219,6 +1237,8 @@ mod roster_scalar_tests {
             id: "session-view".into(),
             title: "t".into(),
             run_state: "idle",
+            run_id: None,
+            worker_generation: None,
             active_branch: "main".into(),
             branches: vec!["main".into()],
             provider: None,
