@@ -165,6 +165,9 @@ fn test_count(update: bool) -> ExitCode {
 }
 
 #[cfg(test)]
+// Same scope the rest of the workspace uses for test modules: the allow covers
+// fixture setup only, never production paths.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
