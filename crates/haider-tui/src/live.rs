@@ -72,6 +72,10 @@ fn recognized_payload(payload: &serde_json::Value) -> bool {
 /// never ask for a 17th.)
 pub const ATTACHMENT_CAP: usize = 16;
 
+/// Optional launch environment variable carrying the consumer-minted opaque
+/// resident-binding correlator for this TUI process.
+pub const RESIDENT_BINDING_TOKEN_ENV: &str = "HAIDER_BINDING_TOKEN";
+
 /// One page size for the launcher's session listing.
 pub const LIST_PAGE: u32 = 64;
 
@@ -134,6 +138,7 @@ pub enum LiveCommand {
     ResidentSessionBinding {
         session: Option<SessionId>,
         worker_generation: u64,
+        binding_token: Option<String>,
     },
     Submit {
         command_id: CommandId,
@@ -585,6 +590,7 @@ impl LiveDriver {
         vec![LiveCommand::ResidentSessionBinding {
             session,
             worker_generation,
+            binding_token: self.resident_binding_token.clone(),
         }]
     }
 
@@ -1532,6 +1538,9 @@ pub struct LiveDriver {
     /// Cleared on disconnect so an old generation is never re-announced on a
     /// fresh socket before list/attach grounds the new daemon truth.
     binding_worker_generation: Option<u64>,
+    /// Client-minted surface correlator echoed by the daemon. It never
+    /// participates in attachment, routing, or authorization decisions.
+    resident_binding_token: Option<String>,
     /// Last typed binding sent, including connection epoch and generation.
     /// The epoch forces a resend after reconnect even when the foreground
     /// session itself did not change.
@@ -1649,6 +1658,7 @@ impl LiveDriver {
             menus: HashMap::new(),
             generations: HashMap::new(),
             binding_worker_generation: None,
+            resident_binding_token: None,
             announced_resident_binding: None,
             active_run: HashMap::new(),
             instance: instance.into(),
@@ -1666,6 +1676,19 @@ impl LiveDriver {
             graph_chase: false,
             graph_inspect_inflight: false,
         }
+    }
+
+    /// Installs the client-minted resident-binding correlator. The value is
+    /// echoed on binding publications only; it never affects driver identity,
+    /// attachment selection, routing, or authorization.
+    pub fn with_resident_binding_token(mut self, token: String) -> Result<Self, &'static str> {
+        if !haider_rpc::resident_binding_token_is_valid(&token) {
+            return Err(
+                "binding token must be 1..=128 bytes of ASCII alphanumeric, '-', '_', '.', or ':'",
+            );
+        }
+        self.resident_binding_token = Some(token);
+        Ok(self)
     }
 
     /// Stamp the pass clock. [`crate::runtime::live_pass`] calls this once

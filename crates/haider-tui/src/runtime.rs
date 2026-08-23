@@ -2917,12 +2917,35 @@ pub async fn run_live(
     use crate::live::LiveDriver;
 
     model.mode = crate::app::RuntimeMode::Live;
+    let binding_token = match std::env::var(crate::live::RESIDENT_BINDING_TOKEN_ENV) {
+        Ok(token) => Some(token),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} must contain valid UTF-8",
+                    crate::live::RESIDENT_BINDING_TOKEN_ENV
+                ),
+            ));
+        }
+    };
     let instance = if config.client_instance_id.is_empty() {
         format!("haider-tui-{}", std::process::id())
     } else {
         config.client_instance_id.clone()
     };
     let mut driver = LiveDriver::new(instance);
+    if let Some(token) = binding_token {
+        driver = driver
+            .with_resident_binding_token(token)
+            .map_err(|message| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{}: {message}", crate::live::RESIDENT_BINDING_TOKEN_ENV),
+                )
+            })?;
+    }
     // T2: the talk supervisor needs the profile store dir (config home)
     // before the profile moves into the link.
     let store_dir = profile.store_dir.clone();

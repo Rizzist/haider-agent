@@ -76,12 +76,11 @@ and MUST NOT build a substitute, even when the substitute appears to work.
 - **Resident binding.** The authority is the baseline and push
   `ResidentSessionBinding` frame. Never scrape a terminal or OSC escape for
   this fact. The frame is profile-global, last-writer-wins across N live
-  publishers; it is not a per-surface, pane, or terminal identity source. The
-  observed substitute turned the OSC 7791 compatibility announcement into a
-  second state transport and therefore could not preserve those authority
-  semantics. This prohibition is scoped to the profile-level resident-binding
-  fact. Per-pane identity is a different fact with its own source in §11.1; it
-  is not a substitute projection of the resident binding.
+  publishers. Its optional client-minted `binding_token` correlates an
+  individual publication to the launching surface without changing those
+  authority semantics or exposing daemon connection identity. A client using
+  that launch-token arrangement also does not scrape OSC for per-pane
+  correlation; see §11.1.
 
 - **Roster facts.** For facts rendered in a roster, the winning projection is
   the top-level field of `SessionSummary` from `session.list` or
@@ -269,34 +268,42 @@ affordance before the response exists.
 | `loom_v1` | `loom.list/register_agent_type/register_workflow` |
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
 | `store_health_v1` | unsolicited latched/replayed store-health `ProtocolError` transitions |
-| `resident_session_binding_v1` | bidirectional `ResidentSessionBinding` frame |
+| `resident_session_binding_v1` | bidirectional `ResidentSessionBinding` frame, including the optional opaque `binding_token` |
 | `tui_attach_announce_v1` | OSC 7791 compatibility announcement by this release's TUI; it is not the RPC binding contract |
 | `wire_msgpack_v1` | post-Welcome MessagePack selection |
 | `session_attach_sealed_v1` | `session.attach.sealed_replay` |
 | `export_seq_v1` | CLI export `seq`, `head_seq`, and exact `--since`; no RPC method |
 | `pipe_native_v2` | `session.pipe_path` plus v2-or-newer native sidecar laws (current file version is 5) |
 
-### 4.1 The one feature whose absence is deliberately ambiguous
+### 4.1 The one feature with an explicit withheld marker
 
 Normally a feature token means “this daemon implements the named surface,” so
 its absence reads as unimplemented. `FEATURE_USER_COMMAND_V1`
 (`"user_command_v1"`) is the sole exception. In
-`crates/haider-daemon/src/connection.rs:1821`, `encode_welcome_for_peer`
+`crates/haider-daemon/src/connection.rs:1829`, `encode_welcome_for_peer`
 removes only this token and retries the otherwise unchanged `Welcome` when
 advertising that token is exactly what pushes the frame past the peer's
 receive-frame limit. Every other encoding failure remains fatal. The reason
 is that one additive feature must not make the whole pre-existing connection
 surface unavailable to a tightly bounded peer.
 
-For this token only, absence means **conservatively unavailable**, not
-necessarily **unimplemented**. That ambiguity does not authorize probing: the
-omitted token reports the direct-user-command semantics unavailable, and a
-typed client rejects before sending a mutating `shell.exec`. The feature is
-paired with `shell_exec_v1`: it covers committing a direct user shell
-command's provenance and output into later model context and returning a
-synthetic-run cancellation coordinate. It has nothing to do with catalog rows
-whose `CommandCatalogItemKindWire` value is `"custom"` or with the
-`custom_commands` slot of `command.list`.
+The additive Welcome field `uw` disambiguates that cause. It is absent by
+default and when false; it is serialized only as `"uw":true` after this one
+token was actually withheld. Therefore the three observable states are:
+
+- absent `user_command_v1`, absent `uw`: an old or non-implementing daemon;
+- present `user_command_v1`, absent `uw`: implemented and not withheld;
+- absent `user_command_v1`, `uw=true`: implemented but withheld for this
+  peer's receive-frame limit.
+
+The marker does not change the safe action. Whenever `user_command_v1` is
+absent, the direct-user-command semantics are unavailable to that connection
+and a typed client rejects before sending a mutating `shell.exec`; `uw` only
+reports why. The feature is paired with `shell_exec_v1`: it covers committing
+a direct user shell command's provenance and output into later model context
+and returning a synthetic-run cancellation coordinate. It has nothing to do
+with catalog rows whose `CommandCatalogItemKindWire` value is `"custom"` or
+with the `custom_commands` slot of `command.list`.
 
 The additive `availability` field on `account.list`, `provider.list`, and
 `usage.report` has no separate token. Field presence is its feature test.
@@ -455,7 +462,7 @@ generation, or surface owner/revision as if they were one observation.
 | Cross-account usage | `usage.report` | Session summaries contain only per-session promoted cache metrics, not the account report. |
 | Per-session cache health | `SessionSummary.cache_reread_hit_basis_points`; use `cache_lifetime_hit_basis_points` only for the separately labeled lifetime/all-input share | The same-summary nested `agent_metrics.usage.cache_reread_hit_basis_points` and `cache_hit_basis_points` are compatibility sources only when their promoted field is absent. Never calculate a substitute from token counts. |
 | Volatile composer/status | surface watch response/delta | Journal and terminal scraping are not fallback sources. Reconnect/watch again after owner loss. |
-| Resident profile binding | `ResidentSessionBinding` baseline/push | OSC 7791 does not project this profile-level fact; it separately owns per-pane identity. Using it for that different fact is not a lower-precedence fallback; see §11. |
+| Resident profile binding and client-minted surface correlation | `ResidentSessionBinding` baseline/push and optional `binding_token` | OSC 7791 is compatibility output, not an authority or required per-pane source; see §11. |
 | Commands and ownership | `command.list` result | Never mirror `COMMANDS`. Ownership `"client_view"` is deliberately client-owned; `"unknown"` is non-executable. |
 | Workflows/agent types | `loom.list` | Compiled graph material is derived; `LoomWorkflow.source` is the workflow structure of record. |
 
@@ -854,40 +861,53 @@ rechecks the OS. Clients must not treat a successful open action as a grant.
 
 ## 11. Resident binding and volatile surfaces
 
-### 11.1 Profile binding and pane identity are different facts
+### 11.1 Profile binding and client-minted surface correlation
 
 `ResidentSessionBinding` answers the profile-level question: “something in
 this profile is currently bound to session X.” The daemon registry holds N
 publishers keyed by connection, and each accepted publication receives a
 daemon-local monotonically increasing revision. `visible()` selects the live
-publisher with the greatest revision and exposes only its
-`(session_id, worker_generation)`. Thus N publisher records collapse to one
-profile-global most-recent value. The baseline/push RPC frame is the authority
-for this profile-level fact and retires OSC 7791 as a source for that fact.
+publisher with the greatest revision and exposes its
+`(session_id, worker_generation, binding_token)`. Thus N publisher records
+still collapse to one profile-global most-recent value; the token does not
+turn the daemon into a pane, window, or embedding registry.
 
-OSC 7791 answers a different, per-pane question: “this pane is now showing
-session Y.” `tui_attach_announce_v1` advertises this compatibility channel.
-The announcement arrives inside that pane's own PTY stream, so it can report
-an in-TUI session hop for that pane. The profile-level frame cannot express
-that hop or correlate it to a pane. OSC 7791 therefore remains a legitimate
-per-pane identity source even when `resident_session_binding_v1` is
-advertised.
+`binding_token` is an optional, opaque correlator minted by the client that
+launches a TUI surface. The supported TUI launch mechanism is the
+`HAIDER_BINDING_TOKEN` environment variable. A consumer that spawns
+`haider tui --session <id>` sets a different token on each child process. The
+TUI copies that value into every resident-binding publication, and the daemon
+stores and echoes it verbatim without parsing it or using it for identity,
+routing, authorization, or any other behavior. Sanity validation is limited
+to 1–128 UTF-8 bytes in the ASCII set `[A-Za-z0-9._:-]`.
 
-Using the RPC frame for profile binding and OSC 7791 for per-pane identity is
-not a precedence violation or an exception to §1 or §8: the mechanisms answer
-different questions and neither overwrites the other's fact.
+A TUI process holds one daemon connection for its lifetime. Consequently an
+in-TUI hop replaces that connection's publisher record and emits the same
+`binding_token` with the new `session_id`. A separately launched TUI uses a
+different connection and client-minted token, inserts a separate publisher
+record, and emits that different token. A client can therefore distinguish a
+hop from a second surface without observing or receiving either daemon
+connection id.
+
+The complete client arrangement is: open the View/Control binding stream,
+mint and retain one token per child surface, set `HAIDER_BINDING_TOKEN` when
+launching that child, and apply each echoed token/session pair to the matching
+surface. The launch record supplies the initial mapping; later same-token
+frames report in-TUI hops. This arrangement needs no terminal read. A client
+using it can delete its OSC 7791 per-pane path entirely. OSC 7791 remains only
+a compatibility announcement for clients that have not migrated; it is not a
+second authority.
 
 Consequences:
 
-- it is not a per-pane, per-terminal, per-window, or connection identity
-  source;
-- a multi-surface client MUST NOT map the visible value to any one of its
-  panes;
-- a per-pane correlator does not exist on the RPC wire today. Internally,
-  `ResidentBindingRegistry::current()` returns the owning connection id with
-  the binding, while `visible()` discards that id and the publisher revision
-  before the frame is built. The information in the registry is not a promised
-  client coordinate and must not be guessed;
+- it is not a daemon-minted pane, terminal, window, or connection identity;
+- a multi-surface client maps a token-bearing publication only to the surface
+  for which it minted that exact token. It MUST NOT assign a tokenless visible
+  value to a pane by recency or guesswork;
+- daemon connection ids and publisher revisions remain internal and are not
+  promised client coordinates;
+- absent `binding_token` means the publisher supplied none. The daemon never
+  synthesizes, defaults, or derives one from a connection id or process id;
 - `session_id=None` is an explicit publisher unbind/launcher state, not
   missing data;
 - a Control publisher sends the same top-level frame. The daemon validates
@@ -1096,10 +1116,10 @@ These are not guesses; they are explicit gaps in the current source contract:
 
 - roster deltas cannot announce removal; full `session.list` reconciliation
   is required;
-- the RPC resident-binding projection exposes neither publisher identity nor
-  a per-pane correlator/mapping. The registry's current publisher connection id
-  is discarded before the frame is built, so per-pane RPC identity is a known
-  capability gap rather than a client coordinate;
+- the RPC resident-binding baseline remains the single most-recent live
+  publication, not an inventory of surfaces. `binding_token` lets a client
+  correlate publications to tokens it minted and retire terminal reads, but
+  does not make the daemon own or enumerate panes;
 - there is no independent current-todo snapshot; normal raw replay supplies
   the durable lifecycle;
 - `SessionSummary.account_alias` is not populated, so a per-session account is
@@ -1113,6 +1133,6 @@ These are not guesses; they are explicit gaps in the current source contract:
   combine an old-daemon case with a real domain absence. This document records
   the ambiguity instead of inventing a discriminator.
 
-No additional precedence, latency guarantee, provider default, pane identity,
-or per-session account binding could be established from source, so none is
-claimed here.
+No additional precedence, latency guarantee, provider default, daemon-minted
+pane identity, or per-session account binding could be established from
+source, so none is claimed here.

@@ -800,16 +800,26 @@ impl ResidentBindingRegistry {
             .map(|(owner, binding)| (owner.as_str(), binding))
     }
 
-    fn visible(&self) -> Option<(Option<SessionId>, u64)> {
+    fn visible(&self) -> Option<(Option<SessionId>, u64, Option<String>)> {
         self.current()
-            .map(|(_, binding)| (binding.session_id.clone(), binding.worker_generation))
-            .or_else(|| self.vacant_generation.map(|generation| (None, generation)))
+            .map(|(_, binding)| {
+                (
+                    binding.session_id.clone(),
+                    binding.worker_generation,
+                    binding.binding_token.clone(),
+                )
+            })
+            .or_else(|| {
+                self.vacant_generation
+                    .map(|generation| (None, generation, None))
+            })
     }
 }
 
 struct ResidentBindingState {
     session_id: Option<SessionId>,
     worker_generation: u64,
+    binding_token: Option<String>,
     revision: u64,
 }
 
@@ -2168,19 +2178,21 @@ impl SessionHub {
             resident_binding_viewers.insert(connection_id.clone());
         }
         if may_view_binding {
-            let (session_id, worker_generation) = resident_binding.visible().unwrap_or_else(|| {
-                // With no publisher and no recorded vacancy, `None` is still
-                // authoritative state for this daemon generation. Using the
-                // current store generation (rather than 0) lets consumers
-                // apply the explicit unbound baseline through the same stale-
-                // generation fence as later binding announcements. This is
-                // synthesized per open, not retained as a publisher event.
-                (None, self.inner.store.worker_generation())
-            });
+            let (session_id, worker_generation, binding_token) =
+                resident_binding.visible().unwrap_or_else(|| {
+                    // With no publisher and no recorded vacancy, `None` is still
+                    // authoritative state for this daemon generation. Using the
+                    // current store generation (rather than 0) lets consumers
+                    // apply the explicit unbound baseline through the same stale-
+                    // generation fence as later binding announcements. This is
+                    // synthesized per open, not retained as a publisher event.
+                    (None, self.inner.store.worker_generation(), None)
+                });
             if sink
                 .try_send(WireFrame::ResidentSessionBinding {
                     session_id,
                     worker_generation,
+                    binding_token,
                 })
                 .is_err()
             {
@@ -3833,6 +3845,7 @@ impl SessionHub {
         source_connection_id: &str,
         session_id: Option<SessionId>,
         worker_generation: u64,
+        binding_token: Option<String>,
     ) -> Result<(), SessionHubError> {
         let mut registry = lock(&self.inner.resident_binding)?;
         let previous = registry.visible();
@@ -3843,6 +3856,7 @@ impl SessionHub {
             ResidentBindingState {
                 session_id: session_id.clone(),
                 worker_generation,
+                binding_token: binding_token.clone(),
                 revision,
             },
         );
@@ -3854,6 +3868,7 @@ impl SessionHub {
         let frame = WireFrame::ResidentSessionBinding {
             session_id,
             worker_generation,
+            binding_token,
         };
         let viewers = lock(&self.inner.resident_binding_viewers)?;
         let sinks = lock(&self.inner.diagnostic_sinks)?;
@@ -3890,10 +3905,12 @@ impl SessionHub {
         if previous == next {
             return;
         }
-        let (session_id, worker_generation) = next.unwrap_or((None, removed.worker_generation));
+        let (session_id, worker_generation, binding_token) =
+            next.unwrap_or((None, removed.worker_generation, None));
         let frame = WireFrame::ResidentSessionBinding {
             session_id,
             worker_generation,
+            binding_token,
         };
         let Ok(viewers) = self.inner.resident_binding_viewers.lock() else {
             return;

@@ -1621,6 +1621,7 @@ async fn handle_frame(
         WireFrame::ResidentSessionBinding {
             session_id,
             worker_generation,
+            binding_token,
         } => {
             if !grant
                 .as_ref()
@@ -1644,7 +1645,7 @@ async fn handle_frame(
                 message: "negotiated connection has no session-hub registration".into(),
             })?;
             connection
-                .resident_session_binding(session_id, worker_generation)
+                .resident_session_binding(session_id, worker_generation, binding_token)
                 .await
                 .map_err(DaemonError::from)?;
             Ok(false)
@@ -1726,6 +1727,7 @@ fn negotiate_hello(
         lifecycle_phase,
         capabilities_granted: negotiated.capabilities_granted.clone(),
         features: welcome_features(),
+        user_command_withheld: false,
         encoding: negotiated.encoding.clone(),
     };
     let bytes = encode_welcome_for_peer(welcome, outbound_limit)?;
@@ -1833,6 +1835,7 @@ fn encode_welcome_for_peer(
         Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
             if welcome.features.remove(FEATURE_USER_COMMAND_V1) =>
         {
+            welcome.user_command_withheld = true;
             encode_outbound(
                 &WireFrame::Welcome(welcome),
                 outbound_limit,

@@ -1752,6 +1752,7 @@ impl HubConnection {
         &self,
         session_id: Option<SessionId>,
         worker_generation: u64,
+        binding_token: Option<String>,
     ) -> Result<(), SessionHubError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
@@ -1774,6 +1775,19 @@ impl HubConnection {
                 failed_write_ids: Vec::new(),
             }));
         }
+        if binding_token
+            .as_deref()
+            .is_some_and(|token| !haider_rpc::resident_binding_token_is_valid(token))
+        {
+            return self.send(WireFrame::ProtocolError(ProtocolError {
+                code: ERROR_CODE_INVALID_ARGUMENT.into(),
+                message: "resident binding token must be 1..=128 bytes of ASCII alphanumeric, '-', '_', '.', or ':'"
+                    .into(),
+                fatal: false,
+                presentation: None,
+                failed_write_ids: Vec::new(),
+            }));
+        }
         if let Some(session_id) = session_id.as_ref()
             && self.hub.inner.store.latest_seq(session_id).await? == 0
         {
@@ -1785,8 +1799,12 @@ impl HubConnection {
                 failed_write_ids: Vec::new(),
             }));
         }
-        self.hub
-            .publish_resident_binding(&self.connection_id, session_id, worker_generation)
+        self.hub.publish_resident_binding(
+            &self.connection_id,
+            session_id,
+            worker_generation,
+            binding_token,
+        )
     }
 
     pub(super) fn clear_resident_binding(&self) {

@@ -452,12 +452,14 @@ async fn issue(
     if let LiveCommand::ResidentSessionBinding {
         session,
         worker_generation,
+        binding_token,
     } = command
     {
         let _ = client
             .send_frame(WireFrame::ResidentSessionBinding {
                 session_id: session,
                 worker_generation,
+                binding_token,
             })
             .await;
         return false;

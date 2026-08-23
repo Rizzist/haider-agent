@@ -158,6 +158,7 @@ fn resident_binding_announce_fires_on_bind() {
         vec![LiveCommand::ResidentSessionBinding {
             session: Some(sid(0)),
             worker_generation: 7,
+            binding_token: None,
         }]
     );
     assert!(
@@ -182,6 +183,7 @@ fn resident_binding_announce_fires_on_rebind() {
         vec![LiveCommand::ResidentSessionBinding {
             session: Some(sid(1)),
             worker_generation: 7,
+            binding_token: None,
         }]
     );
 }
@@ -202,6 +204,37 @@ fn resident_binding_announce_fires_on_unbind() {
         vec![LiveCommand::ResidentSessionBinding {
             session: None,
             worker_generation: 7,
+            binding_token: None,
+        }]
+    );
+}
+
+/// MUTATION CHECK: replace `self.resident_binding_token.clone()` in
+/// `sync_resident_binding` with `None`. Expected runtime failure: the
+/// pane-spawned token disappears before the link can publish it.
+#[test]
+fn resident_binding_announce_carries_the_launch_token_across_session_hops() {
+    let (driver, mut model) = resident_binding_fixture();
+    let mut driver = driver
+        .with_resident_binding_token("pane-client_7".into())
+        .expect("valid client-minted token");
+    model.open_session(&sid(0));
+    assert_eq!(
+        driver.sync_resident_binding(&model),
+        vec![LiveCommand::ResidentSessionBinding {
+            session: Some(sid(0)),
+            worker_generation: 7,
+            binding_token: Some("pane-client_7".into()),
+        }]
+    );
+
+    model.open_session(&sid(1));
+    assert_eq!(
+        driver.sync_resident_binding(&model),
+        vec![LiveCommand::ResidentSessionBinding {
+            session: Some(sid(1)),
+            worker_generation: 7,
+            binding_token: Some("pane-client_7".into()),
         }]
     );
 }

@@ -42,6 +42,22 @@ pub const WIRE_PROTOCOL_VERSION: u32 = 1;
 /// W3b advertises its actual configured value in [`Welcome::frame_limit`].
 pub const DEFAULT_FRAME_LIMIT: usize = 48 * 1024 * 1024;
 
+/// Maximum UTF-8 byte length of an opaque resident-binding correlator.
+pub const RESIDENT_BINDING_TOKEN_MAX_BYTES: usize = 128;
+
+/// Applies the wire's only resident-binding-token policy: a non-empty,
+/// bounded ASCII token made from characters safe in argv/environment values.
+/// The token remains opaque; no component may parse these characters into
+/// structure or use the value for routing or authorization.
+#[must_use]
+pub fn resident_binding_token_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= RESIDENT_BINDING_TOKEN_MAX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 /// Maximum decoded payload accepted by one `artifact.put` request.
 ///
 /// The payload is base64 on the wire, so callers must also keep the encoded
@@ -565,6 +581,14 @@ pub struct Welcome {
     /// features answer whether the negotiated v1 peer implements a method.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub features: BTreeSet<String>,
+    /// True only when `user_command_v1` was implemented but omitted because
+    /// advertising it would exceed this peer's Welcome-frame limit.
+    ///
+    /// The short wire key is intentional: this marker replaces the sole
+    /// withheld feature token on an already-tight frame and must make that
+    /// frame smaller. False is never serialized.
+    #[serde(rename = "uw", default, skip_serializing_if = "is_false")]
+    pub user_command_withheld: bool,
     /// Selected post-handshake encoding. Absent means JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
@@ -3154,6 +3178,9 @@ pub enum WireFrame {
     ResidentSessionBinding {
         session_id: Option<SessionId>,
         worker_generation: u64,
+        /// Opaque publisher-supplied correlator for this binding. The daemon
+        /// echoes it but never treats it as identity, routing, or authority.
+        binding_token: Option<String>,
     },
     /// Complete latest volatile surface snapshot after one or more accepted
     /// changes. `None` means the corresponding surface is cleared.
@@ -3271,6 +3298,8 @@ enum WireFrameRef<'a> {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: &'a Option<SessionId>,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_token: &'a Option<String>,
     },
     SessionSurfaceDelta {
         session_id: &'a SessionId,
@@ -3352,6 +3381,8 @@ enum WireFrameOwned {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<SessionId>,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_token: Option<String>,
     },
     SessionSurfaceDelta {
         session_id: SessionId,
@@ -3481,9 +3512,11 @@ impl Serialize for WireFrame {
             Self::ResidentSessionBinding {
                 session_id,
                 worker_generation,
+                binding_token,
             } => WireFrameRef::ResidentSessionBinding {
                 session_id,
                 worker_generation: *worker_generation,
+                binding_token,
             },
             Self::SessionSurfaceDelta {
                 session_id,
@@ -3598,9 +3631,11 @@ impl<'de> Deserialize<'de> for WireFrame {
             WireFrameOwned::ResidentSessionBinding {
                 session_id,
                 worker_generation,
+                binding_token,
             } => Self::ResidentSessionBinding {
                 session_id,
                 worker_generation,
+                binding_token,
             },
             WireFrameOwned::SessionSurfaceDelta {
                 session_id,

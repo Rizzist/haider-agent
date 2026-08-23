@@ -627,6 +627,7 @@ fn additive_handshake_identity_fields_have_tolerant_decode_defaults() {
         profile_id,
         daemon_version,
         features,
+        user_command_withheld,
         ..
     }) = welcome
     else {
@@ -635,6 +636,7 @@ fn additive_handshake_identity_fields_have_tolerant_decode_defaults() {
     assert!(profile_id.is_empty());
     assert!(daemon_version.is_empty());
     assert!(features.is_empty());
+    assert!(!user_command_withheld);
 }
 
 /// MUTATION CHECK: make `permission_overrides` required or default either
@@ -3826,12 +3828,13 @@ fn account_list_watch_is_a_signal_not_a_delta() {
 }
 
 /// The resident binding signal represents unbind by omitting `session_id`,
-/// keeps the generation fence required, and ignores additive future fields.
+/// keeps the generation fence required, defaults an old publisher's absent
+/// token, and ignores additive future fields.
 ///
-/// MUTATION CHECK: delete `skip_serializing_if = "Option::is_none"` from the
-/// borrowed `session_id` field. Expected runtime failure: the exact unbind
-/// golden contains `"session_id":null` instead of the additive absent-field
-/// shape older clients decode.
+/// MUTATION CHECK: replace `binding_token` with `None` in the enclosing
+/// `WireFrameOwned::ResidentSessionBinding` conversion. Expected runtime
+/// failure: the additive token disappears from the bound round trip while the
+/// v0.0.944 tokenless frame continues to decode unchanged.
 #[test]
 fn resident_session_binding_decodes_without_optional_fields() {
     use haider_protocol::ids::SessionId;
@@ -3849,6 +3852,7 @@ fn resident_session_binding_decodes_without_optional_fields() {
         WireFrame::ResidentSessionBinding {
             session_id: None,
             worker_generation: 17,
+            binding_token: None,
         }
     );
     assert_eq!(
@@ -3863,12 +3867,30 @@ fn resident_session_binding_decodes_without_optional_fields() {
     let bound = WireFrame::ResidentSessionBinding {
         session_id: Some(SessionId::new("session-bound")),
         worker_generation: 17,
+        binding_token: Some("surface-A_7".into()),
     };
+    let bound_json = serde_json::to_value(&bound).expect("bound encodes");
+    assert_eq!(bound_json["binding_token"], "surface-A_7");
     assert_eq!(
-        serde_json::from_value::<WireFrame>(serde_json::to_value(&bound).expect("bound encodes"))
-            .expect("bound decodes"),
+        serde_json::from_value::<WireFrame>(bound_json).expect("bound decodes"),
         bound
     );
+}
+
+/// MUTATION CHECK: accept whitespace or more than 128 bytes in
+/// `resident_binding_token_is_valid`. Expected runtime failure: an invalid
+/// token crosses the protocol's only sanity boundary instead of being
+/// rejected as an opaque launch correlator.
+#[test]
+fn resident_binding_token_sanity_is_bounded_without_interpretation() {
+    assert!(haider_rpc::resident_binding_token_is_valid(
+        "client-minted.surface_7:hop"
+    ));
+    assert!(!haider_rpc::resident_binding_token_is_valid(""));
+    assert!(!haider_rpc::resident_binding_token_is_valid("has space"));
+    assert!(!haider_rpc::resident_binding_token_is_valid(
+        &"a".repeat(haider_rpc::RESIDENT_BINDING_TOKEN_MAX_BYTES + 1)
+    ));
 }
 
 /// MUTATION CHECK: flatten the plan snapshot, rename the feature bit, or

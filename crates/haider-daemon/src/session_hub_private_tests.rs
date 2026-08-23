@@ -713,7 +713,7 @@ async fn command_capture_preserves_callers_binding_and_surface_ownership() {
         .await
         .expect("control attachment opens");
     connection
-        .resident_session_binding(Some(session.clone()), generation)
+        .resident_session_binding(Some(session.clone()), generation, None)
         .await
         .expect("resident binding publishes");
     connection
@@ -770,7 +770,7 @@ async fn command_capture_preserves_callers_binding_and_surface_ownership() {
             .lock()
             .expect("resident binding")
             .visible(),
-        Some((Some(session.clone()), generation)),
+        Some((Some(session.clone()), generation, None)),
         "the real connection must remain resident-bound after capture drops"
     );
     // Scoped so the guard cannot outlive the block: clippy denies a
@@ -1487,6 +1487,7 @@ async fn resident_session_binding_never_bound_viewer_receives_unbound_baseline()
         &[WireFrame::ResidentSessionBinding {
             session_id: None,
             worker_generation: generation,
+            binding_token: None,
         }]
     );
     viewer.close().await.expect("viewer closes");
@@ -1520,7 +1521,7 @@ async fn resident_session_binding_bound_viewer_still_receives_binding_baseline()
         )
         .expect("publisher opens");
     publisher
-        .resident_session_binding(Some(session.clone()), generation)
+        .resident_session_binding(Some(session.clone()), generation, None)
         .await
         .expect("publisher binds");
     let sink = Arc::new(CapturingFrameSink::default());
@@ -1538,6 +1539,7 @@ async fn resident_session_binding_bound_viewer_still_receives_binding_baseline()
         &[WireFrame::ResidentSessionBinding {
             session_id: Some(session),
             worker_generation: generation,
+            binding_token: None,
         }]
     );
     publisher.close().await.expect("publisher closes");
@@ -1580,6 +1582,7 @@ async fn resident_session_binding_unbound_baseline_is_distinct_from_silence() {
         &[WireFrame::ResidentSessionBinding {
             session_id: None,
             worker_generation: generation,
+            binding_token: None,
         }],
         "authorized absence is an explicit frame"
     );
@@ -1631,7 +1634,7 @@ async fn resident_session_binding_recovers_refusal_with_late_subscriber_baseline
     let generation = store.worker_generation();
 
     publisher
-        .resident_session_binding(Some(session.clone()), generation)
+        .resident_session_binding(Some(session.clone()), generation, None)
         .await
         .expect("binding is retained despite observer refusal");
     assert!(
@@ -1660,11 +1663,159 @@ async fn resident_session_binding_recovers_refusal_with_late_subscriber_baseline
         &[WireFrame::ResidentSessionBinding {
             session_id: Some(session),
             worker_generation: generation,
+            binding_token: None,
         }]
     );
 
     publisher.close().await.expect("publisher closes");
     replacement.close().await.expect("replacement closes");
+    hub.shutdown().await.expect("hub stops");
+}
+
+/// MUTATION CHECK: replace the stored `binding_token` in
+/// `publish_resident_binding` with `None`. Expected runtime failure: both the
+/// same-connection hop and the different-connection publication lose their
+/// client-minted correlators, so the observer cannot distinguish the two.
+#[tokio::test]
+async fn resident_binding_distinguishes_a_hop_from_a_second_surface() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let first_session = SessionId::new("binding-token-first");
+    let hopped_session = SessionId::new("binding-token-hop");
+    hub.create_internal_session(create_command(&first_session, "binding-token-first"))
+        .await
+        .expect("first session created");
+    hub.create_internal_session(create_command(&hopped_session, "binding-token-hop"))
+        .await
+        .expect("hop session created");
+    let capabilities = std::collections::BTreeSet::from([
+        haider_rpc::Capability::Control,
+        haider_rpc::Capability::View,
+    ]);
+    let first_surface_sink = Arc::new(CapturingFrameSink::default());
+    let first_surface = hub
+        .open_connection(
+            capabilities.clone(),
+            first_surface_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("first surface opens");
+    let observer_sink = Arc::new(CapturingFrameSink::default());
+    let observer = hub
+        .open_connection(
+            capabilities.clone(),
+            observer_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("observer opens");
+    let generation = store.worker_generation();
+
+    first_surface
+        .resident_session_binding(
+            Some(first_session.clone()),
+            generation,
+            Some("not a sane token".into()),
+        )
+        .await
+        .expect("invalid token is rejected without closing the publisher");
+    assert!(
+        first_surface_sink
+            .0
+            .lock()
+            .expect("publisher frames")
+            .iter()
+            .any(|frame| matches!(
+                frame,
+                WireFrame::ProtocolError(error)
+                    if error.code == haider_rpc::ERROR_CODE_INVALID_ARGUMENT && !error.fatal
+            ))
+    );
+    assert_eq!(
+        observer_sink.0.lock().expect("observer frames").len(),
+        1,
+        "invalid token is never stored or echoed"
+    );
+
+    first_surface
+        .resident_session_binding(
+            Some(first_session.clone()),
+            generation,
+            Some("surface-A".into()),
+        )
+        .await
+        .expect("first surface binds");
+    first_surface
+        .resident_session_binding(
+            Some(hopped_session.clone()),
+            generation,
+            Some("surface-A".into()),
+        )
+        .await
+        .expect("same connection hops with the same token");
+
+    let second_surface_sink = Arc::new(CapturingFrameSink::default());
+    let second_surface = hub
+        .open_connection(
+            capabilities,
+            second_surface_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("second surface opens");
+    assert_eq!(
+        second_surface_sink
+            .0
+            .lock()
+            .expect("second surface baseline")
+            .as_slice(),
+        &[WireFrame::ResidentSessionBinding {
+            session_id: Some(hopped_session.clone()),
+            worker_generation: generation,
+            binding_token: Some("surface-A".into()),
+        }],
+        "a late viewer receives the current publisher's correlator"
+    );
+    second_surface
+        .resident_session_binding(
+            Some(hopped_session.clone()),
+            generation,
+            Some("surface-B".into()),
+        )
+        .await
+        .expect("different connection publishes its token");
+
+    assert_eq!(
+        observer_sink.0.lock().expect("observer frames").as_slice(),
+        &[
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: generation,
+                binding_token: None,
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(first_session),
+                worker_generation: generation,
+                binding_token: Some("surface-A".into()),
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(hopped_session.clone()),
+                worker_generation: generation,
+                binding_token: Some("surface-A".into()),
+            },
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(hopped_session),
+                worker_generation: generation,
+                binding_token: Some("surface-B".into()),
+            },
+        ],
+        "same token + new session is a hop; different token is a second surface"
+    );
+
+    second_surface.close().await.expect("second surface closes");
+    first_surface.close().await.expect("first surface closes");
+    observer.close().await.expect("observer closes");
     hub.shutdown().await.expect("hub stops");
 }
 
@@ -1703,7 +1854,7 @@ async fn resident_session_binding_old_owner_cannot_clear_replacement() {
         .expect("observer");
     let generation = store.worker_generation();
     first
-        .resident_session_binding(Some(session.clone()), generation)
+        .resident_session_binding(Some(session.clone()), generation, None)
         .await
         .expect("first bind");
 
@@ -1715,7 +1866,7 @@ async fn resident_session_binding_old_owner_cannot_clear_replacement() {
         )
         .expect("replacement publisher");
     replacement
-        .resident_session_binding(Some(session.clone()), generation)
+        .resident_session_binding(Some(session.clone()), generation, None)
         .await
         .expect("same-state reannounce transfers ownership");
     first.close().await.expect("old publisher closes");
@@ -1725,10 +1876,12 @@ async fn resident_session_binding_old_owner_cannot_clear_replacement() {
             WireFrame::ResidentSessionBinding {
                 session_id: None,
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(session),
                 worker_generation: generation,
+                binding_token: None,
             },
         ],
         "old-owner close cannot append an unbind"
@@ -1740,6 +1893,7 @@ async fn resident_session_binding_old_owner_cannot_clear_replacement() {
         Some(WireFrame::ResidentSessionBinding {
             session_id: None,
             worker_generation: observed_generation,
+            binding_token: None,
         }) if *observed_generation == generation
     ));
     observer.close().await.expect("observer closes");
@@ -1796,11 +1950,11 @@ async fn resident_session_binding_restores_live_predecessor() {
     let generation = store.worker_generation();
 
     first
-        .resident_session_binding(Some(first_session.clone()), generation)
+        .resident_session_binding(Some(first_session.clone()), generation, None)
         .await
         .expect("predecessor binds");
     second
-        .resident_session_binding(Some(second_session.clone()), generation)
+        .resident_session_binding(Some(second_session.clone()), generation, None)
         .await
         .expect("newest binds");
     second.close().await.expect("newest publisher closes");
@@ -1811,18 +1965,22 @@ async fn resident_session_binding_restores_live_predecessor() {
             WireFrame::ResidentSessionBinding {
                 session_id: None,
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(first_session.clone()),
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(second_session),
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(first_session),
                 worker_generation: generation,
+                binding_token: None,
             },
         ]
     );
@@ -1855,7 +2013,7 @@ async fn resident_session_binding_requires_view_for_baseline_and_push() {
         .expect("publisher");
     let generation = store.worker_generation();
     publisher
-        .resident_session_binding(Some(session), generation)
+        .resident_session_binding(Some(session), generation, None)
         .await
         .expect("bind publishes");
 
@@ -1868,7 +2026,7 @@ async fn resident_session_binding_requires_view_for_baseline_and_push() {
         )
         .expect("capability-empty connection remains valid");
     publisher
-        .resident_session_binding(None, generation)
+        .resident_session_binding(None, generation, None)
         .await
         .expect("unbind publishes");
     assert!(
@@ -1923,15 +2081,15 @@ async fn resident_session_binding_fans_out_bind_rebind_and_unbind() {
     let generation = store.worker_generation();
 
     publisher
-        .resident_session_binding(Some(first.clone()), generation)
+        .resident_session_binding(Some(first.clone()), generation, None)
         .await
         .expect("bind publishes");
     publisher
-        .resident_session_binding(Some(second.clone()), generation)
+        .resident_session_binding(Some(second.clone()), generation, None)
         .await
         .expect("rebind publishes");
     publisher
-        .resident_session_binding(None, generation)
+        .resident_session_binding(None, generation, None)
         .await
         .expect("unbind publishes");
 
@@ -1941,18 +2099,22 @@ async fn resident_session_binding_fans_out_bind_rebind_and_unbind() {
             WireFrame::ResidentSessionBinding {
                 session_id: None,
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(first),
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(second),
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: None,
                 worker_generation: generation,
+                binding_token: None,
             },
         ]
     );
@@ -2001,11 +2163,11 @@ async fn resident_session_binding_discards_stale_generation_after_rebind() {
     assert!(generation > 0, "worker generations are positive fences");
 
     publisher
-        .resident_session_binding(Some(current.clone()), generation)
+        .resident_session_binding(Some(current.clone()), generation, None)
         .await
         .expect("fresh rebind publishes");
     publisher
-        .resident_session_binding(None, generation - 1)
+        .resident_session_binding(None, generation - 1, None)
         .await
         .expect("stale publish is rejected without closing the connection");
 
@@ -2015,10 +2177,12 @@ async fn resident_session_binding_discards_stale_generation_after_rebind() {
             WireFrame::ResidentSessionBinding {
                 session_id: None,
                 worker_generation: generation,
+                binding_token: None,
             },
             WireFrame::ResidentSessionBinding {
                 session_id: Some(current),
                 worker_generation: generation,
+                binding_token: None,
             },
         ]
     );

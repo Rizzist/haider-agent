@@ -87,12 +87,13 @@ pub use frame::{
     ObserveMenuOptionWire, ObserveMenuWire, ObserveRunStateWire, ObserveSubagentWire,
     ProtocolError, ProviderActiveWire, ProviderApiFamilyWire, ProviderAuthRequirementWire,
     ProviderAvailabilityWire, ProviderDefaultWire, ProviderRemoveRefusalReasonWire,
-    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
-    SURFACE_STATUS_MAX_BYTES, SecretWire, SeqRange, SessionFleetSnapshot, SessionKindWire,
-    SessionObserveDigest, SessionReadResult, SessionSummary, SnapshotAvailabilityWire,
-    StagePurpose, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire,
-    SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire, WIRE_PROTOCOL_VERSION,
-    WaitingWhyKindWire, WaitingWhyWire, Welcome, WireFrame,
+    ProviderSummaryWire, RESIDENT_BINDING_TOKEN_MAX_BYTES, RequestBody, RequestId, ResponseBody,
+    SURFACE_INPUT_MAX_BYTES, SURFACE_STATUS_MAX_BYTES, SecretWire, SeqRange, SessionFleetSnapshot,
+    SessionKindWire, SessionObserveDigest, SessionReadResult, SessionSummary,
+    SnapshotAvailabilityWire, StagePurpose, SubmitDisposition, SurfaceInjectOp,
+    SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire, SurfaceStatusWire,
+    TodoGraphOpenedWire, WIRE_PROTOCOL_VERSION, WaitingWhyKindWire, WaitingWhyWire, Welcome,
+    WireFrame, resident_binding_token_is_valid,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

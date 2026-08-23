@@ -238,10 +238,9 @@ fn welcome_features_pin_served_management_families() {
     );
 }
 
-/// MUTATION CHECK: enqueue the full T4 Welcome without the tight-limit
-/// fallback. Expected runtime failure: the second encode is rejected instead
-/// of preserving the shipped handshake surface. Removing any feature other
-/// than `user_command_v1` fails the exact decoded set assertion.
+/// MUTATION CHECK: replace `welcome.user_command_withheld = true` in the
+/// fallback with `false`. Expected runtime failure: the tight Welcome still
+/// omits `user_command_v1` but loses the causal marker pinned below.
 #[test]
 fn tight_welcome_omits_only_the_additive_user_command_feature() {
     let welcome = Welcome {
@@ -254,6 +253,7 @@ fn tight_welcome_omits_only_the_additive_user_command_feature() {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: welcome_features(),
+        user_command_withheld: false,
         encoding: None,
     };
     let full = uds_codec::encode(&WireFrame::Welcome(welcome.clone()), usize::MAX)
@@ -262,25 +262,78 @@ fn tight_welcome_omits_only_the_additive_user_command_feature() {
 
     let ample = encode_welcome_for_peer(welcome.clone(), full_body_len)
         .expect("exact full limit carries every feature");
+    assert_eq!(ample.as_slice(), full.as_slice());
+    assert!(
+        !std::str::from_utf8(&ample[4..])
+            .expect("Welcome is JSON")
+            .contains("\"uw\""),
+        "nothing withheld serializes no marker, never false"
+    );
     let mut ample_decoder = uds_codec::Decoder::new(full_body_len);
     let ample_frames = ample_decoder.push(&ample).frames;
     assert!(matches!(
         ample_frames.as_slice(),
-        [WireFrame::Welcome(Welcome { features, .. })]
-            if features == &welcome.features
+        [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
+            if features == &welcome.features && !user_command_withheld
     ));
 
     let tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
         .expect("tight peer retains the pre-T4 handshake");
+    let mut without_feature = welcome.clone();
+    assert!(without_feature.features.remove(FEATURE_USER_COMMAND_V1));
+    let without_feature = uds_codec::encode(&WireFrame::Welcome(without_feature), usize::MAX)
+        .expect("unmarked Welcome without user command encodes");
+    let without_feature_body_len = without_feature.len() - 4;
+    let tight_body_len = tight.len() - 4;
+    assert_eq!(
+        full_body_len - without_feature_body_len,
+        18,
+        "the real encoder's feature-array element costs 18 bytes"
+    );
+    assert_eq!(
+        tight_body_len - without_feature_body_len,
+        10,
+        "the short true marker costs 10 bytes"
+    );
+    assert_eq!(
+        full_body_len - tight_body_len,
+        8,
+        "replacement must be strictly smaller than the withheld token"
+    );
+    assert!(
+        std::str::from_utf8(&tight[4..])
+            .expect("Welcome is JSON")
+            .contains("\"uw\":true"),
+        "a withheld token carries the causal marker"
+    );
     let mut tight_decoder = uds_codec::Decoder::new(full_body_len - 1);
     let tight_frames = tight_decoder.push(&tight).frames;
-    let mut expected = welcome.features;
+    let mut expected = welcome.features.clone();
     assert!(expected.remove(FEATURE_USER_COMMAND_V1));
     assert!(matches!(
         tight_frames.as_slice(),
-        [WireFrame::Welcome(Welcome { features, .. })]
-            if features == &expected
+        [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
+            if features == &expected && *user_command_withheld
     ));
+
+    let mut selected_encoding = welcome;
+    selected_encoding.encoding = Some("msgpack".into());
+    let selected_full =
+        uds_codec::encode(&WireFrame::Welcome(selected_encoding.clone()), usize::MAX)
+            .expect("selected-encoding Welcome encodes");
+    let selected_full_body_len = selected_full.len() - 4;
+    let mut selected_unmarked = selected_encoding.clone();
+    assert!(selected_unmarked.features.remove(FEATURE_USER_COMMAND_V1));
+    let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
+        .expect("selected-encoding unmarked Welcome encodes");
+    let selected_tight = encode_welcome_for_peer(selected_encoding, selected_full_body_len - 1)
+        .expect("selected-encoding fallback fits");
+    assert_eq!(selected_full_body_len - (selected_unmarked.len() - 4), 18);
+    assert_eq!(
+        (selected_tight.len() - 4) - (selected_unmarked.len() - 4),
+        10
+    );
+    assert_eq!(selected_full_body_len - (selected_tight.len() - 4), 8);
 }
 
 /// MUTATION CHECK: replace the round-robin ring with one FIFO/hot-lane drain.
@@ -972,9 +1025,9 @@ impl PairedClient {
     }
 }
 
-/// MUTATION CHECK: delete the one-line `resident_session_binding` call from
-/// `handle_frame`. Expected runtime failure: the real framed UDS publish is
-/// read successfully but the observer times out without an RPC push.
+/// MUTATION CHECK: pass `None` instead of `binding_token` from `handle_frame`
+/// into `resident_session_binding`. Expected runtime failure: the framed UDS
+/// publication reaches the observer but its opaque correlator is missing.
 #[tokio::test]
 async fn resident_binding_frame_routes_across_the_paired_connection() {
     let (_root, hub) = liveness_hub().await;
@@ -992,6 +1045,7 @@ async fn resident_binding_frame_routes_across_the_paired_connection() {
         WireFrame::ResidentSessionBinding {
             session_id: None,
             worker_generation: generation,
+            binding_token: None,
         }
     );
 
@@ -1011,6 +1065,7 @@ async fn resident_binding_frame_routes_across_the_paired_connection() {
         .send(&WireFrame::ResidentSessionBinding {
             session_id: None,
             worker_generation: generation,
+            binding_token: Some("paired-surface".into()),
         })
         .await;
 
@@ -1022,6 +1077,7 @@ async fn resident_binding_frame_routes_across_the_paired_connection() {
         WireFrame::ResidentSessionBinding {
             session_id: None,
             worker_generation: generation,
+            binding_token: Some("paired-surface".into()),
         }
     );
 
