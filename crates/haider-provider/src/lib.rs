@@ -13,6 +13,7 @@
 mod anthropic;
 #[cfg(test)]
 mod anthropic_tests;
+mod cache;
 mod catalog;
 #[cfg(test)]
 mod catalog_tests;
@@ -144,6 +145,10 @@ pub use anthropic::{
     replay_anthropic_http_error, replay_anthropic_native_computer_sse, replay_anthropic_sse,
     select_anthropic_cache_ttl, validate_bedrock_mantle_base_url, validate_vertex_models_base_url,
     vertex_models_base_url,
+};
+pub use cache::{
+    CACHEABLE_PROMPT_MINIMUM_POLICIES, CacheUsageAssessment, CacheablePromptMinimumPolicy,
+    assess_cache_usage, cacheable_prompt_minimum, cacheable_prompt_minimum_policy,
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,

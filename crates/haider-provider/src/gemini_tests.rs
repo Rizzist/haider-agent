@@ -621,3 +621,45 @@ async fn cm2f_unknown_gemini_model_is_byte_exact_implicit_cache_fallback() {
             .is_empty()
     );
 }
+
+/// The explicit-cache gate consumes the shared documented-minimum registry.
+/// Similar but undocumented model names cannot inherit a threshold.
+#[tokio::test]
+async fn gemini_explicit_cache_gate_uses_documented_model_minimums() {
+    let registry = GeminiCacheRegistry::default();
+    let backend = Arc::new(RecordingCacheBackend::default());
+    let mut request = gemini_cache_request("gemini-3.7-flash");
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .stable_prefix_tokens = 4_095;
+    let full = gemini_request_json(&request, None, false).expect("full payload");
+    let below = registry
+        .prepare_generate_payload(&request, full.clone(), backend.clone(), None, false)
+        .await;
+    assert_eq!(below, full);
+
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .stable_prefix_tokens = 4_096;
+    let eligible = gemini_request_json(&request, None, false).expect("eligible payload");
+    let cached = registry
+        .prepare_generate_payload(&request, eligible, backend.clone(), None, false)
+        .await;
+    assert_eq!(cached["cachedContent"], "cachedContents/mock-1");
+
+    let unknown = gemini_cache_request("gemini-2.5-flash-lite");
+    let unknown_full = gemini_request_json(&unknown, None, false).expect("unknown full payload");
+    let unknown_registry = GeminiCacheRegistry::default();
+    let fallback = unknown_registry
+        .prepare_generate_payload(&unknown, unknown_full.clone(), backend.clone(), None, false)
+        .await;
+    assert_eq!(fallback, unknown_full);
+    assert_eq!(
+        *backend.operations.lock().expect("operations lock"),
+        ["create:1"]
+    );
+}

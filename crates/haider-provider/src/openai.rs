@@ -4965,19 +4965,21 @@ fn chat_usage(
         }
     } else {
         let details = value.get("prompt_tokens_details");
-        let cached = if dialect == CompatibleDialect::KimiOAuth {
-            value
-                .get("cached_tokens")
-                .and_then(serde_json::Value::as_u64)
+        let kimi_cached = value.get("cached_tokens");
+        let cached = if let Some(cached) = kimi_cached {
+            // Kimi's native counter is top-level. Proxies preserve that shape,
+            // so field presence selects it regardless of the local dialect.
+            // A malformed present field is authoritative and cannot fall
+            // through to a nested counter.
+            cached.as_u64()
         } else {
-            // Generic OpenAI-compatible endpoints are capability-probed only
-            // through the recognized vLLM/OpenAI nested detail shape. An
-            // arbitrary top-level `cached_tokens` is not authoritative.
+            // Kimi also accepts/returns the OpenAI-compatible nested shape;
+            // absence of the native field permits that recognized fallback.
             details
                 .and_then(|details| details.get("cached_tokens"))
                 .and_then(serde_json::Value::as_u64)
         };
-        let cache_write = if dialect == CompatibleDialect::KimiOAuth {
+        let cache_write = if kimi_cached.is_some() {
             None
         } else {
             value

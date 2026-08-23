@@ -759,7 +759,8 @@ impl GeminiCacheRegistry {
             }
         }
 
-        let Some(minimum) = gemini_explicit_cache_minimum(&request.model) else {
+        let Some(minimum) = crate::cacheable_prompt_minimum(GEMINI_PROVIDER_NAME, &request.model)
+        else {
             return full_payload;
         };
         if metadata.stable_prefix_tokens < minimum
@@ -808,16 +809,6 @@ fn gemini_cached_coverage_needs_refresh(cached_tokens: u64, current_tokens: u64)
     // Refresh below 80% coverage. The multiplicative threshold makes writes
     // geometric as a conversation grows instead of recreating on every turn.
     u128::from(cached_tokens) * 100 < u128::from(current_tokens) * 80
-}
-
-fn gemini_explicit_cache_minimum(model: &str) -> Option<u64> {
-    if model.starts_with("gemini-2.5-flash") || model.starts_with("gemini-2.5-pro") {
-        Some(2_048)
-    } else if model.starts_with("gemini-3.1-pro-preview") || model.starts_with("gemini-3.5-flash") {
-        Some(4_096)
-    } else {
-        None
-    }
 }
 
 fn payload_contents(payload: &serde_json::Value) -> Option<&[serde_json::Value]> {

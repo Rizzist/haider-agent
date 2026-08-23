@@ -2544,10 +2544,13 @@ fn cm1b_cm1c_cm1d_openai_subset_availability_and_malformed_laws() {
     assert_eq!(malformed.uncached_input, 100);
 }
 
-/// Kimi's recognized top-level cache counter is a subset of prompt_tokens;
-/// generic compatible payloads without a recognized counter stay n/a.
+/// Kimi's recorded top-level cache counter is a subset of prompt_tokens, and
+/// pass-through adapters select it from the shape rather than their label.
+///
+/// MUTATION CHECK: restrict top-level `cached_tokens` to `KimiOAuth`.
+/// Expected runtime failure: generic and Haider Code report Unavailable/0.
 #[test]
-fn cm1b_kimi_top_level_cached_tokens_are_subset() {
+fn cm1b_kimi_top_level_cached_tokens_are_shape_driven() {
     use haider_protocol::provider::{CacheStatAvailability, StreamEvent};
 
     let usage = replay_kimi_chat_sse(include_bytes!(
@@ -2564,20 +2567,75 @@ fn cm1b_kimi_top_level_cached_tokens_are_subset() {
     assert_eq!(normalized.cache_read_input, 75);
     assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
 
-    let generic = replay_openai_chat_sse(include_bytes!(
-        "../tests/fixtures/openai/kimi_cache_usage.sse"
-    ))
-    .into_iter()
-    .find_map(|event| match event {
-        Ok(StreamEvent::UsageUpdate(usage)) => usage.normalized,
-        _ => None,
-    })
-    .expect("generic normalized usage");
-    assert_eq!(
-        generic.cache_status,
-        CacheStatAvailability::Unavailable,
-        "unknown compatible top-level fields are not cache telemetry"
-    );
+    for usage in [
+        replay_openai_chat_sse(include_bytes!(
+            "../tests/fixtures/openai/kimi_cache_usage.sse"
+        )),
+        replay_haider_code_chat_sse(include_bytes!(
+            "../tests/fixtures/openai/kimi_cache_usage.sse"
+        )),
+    ] {
+        let usage = usage
+            .into_iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+                _ => None,
+            })
+            .expect("pass-through Kimi usage");
+        let normalized = usage.normalized.expect("normalized pass-through usage");
+        assert_eq!(normalized.uncached_input, 25);
+        assert_eq!(normalized.cache_read_input, 75);
+        assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+    }
+}
+
+/// Kimi's official client accepts the standard nested OpenAI counter when the
+/// native top-level field is absent.
+///
+/// MUTATION CHECK: retain the old Kimi-only top-level branch. Expected runtime
+/// failure: the nested recorded fixture reports Unavailable/0 instead of 5.
+#[test]
+fn kimi_reads_recorded_openai_nested_cache_usage() {
+    use haider_protocol::provider::{CacheStatAvailability, StreamEvent};
+
+    let usage = replay_kimi_chat_sse(include_bytes!("../tests/fixtures/openai/chat.sse"))
+        .into_iter()
+        .find_map(|event| match event {
+            Ok(StreamEvent::UsageUpdate(usage)) => Some(usage),
+            _ => None,
+        })
+        .expect("Kimi OpenAI-compatible usage");
+    let normalized = usage.normalized.expect("normalized Kimi nested usage");
+    assert_eq!(normalized.logical_input, 33);
+    assert_eq!(normalized.uncached_input, 28);
+    assert_eq!(normalized.cache_read_input, 5);
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+}
+
+/// Once Kimi's top-level field is present it is authoritative: malformed
+/// telemetry cannot hide behind a valid nested counter.
+///
+/// MUTATION CHECK: fall through to nested `cached_tokens` when the top-level
+/// value is malformed. Expected runtime failure: status becomes Present.
+#[test]
+fn malformed_kimi_top_level_cache_usage_does_not_fall_back() {
+    use haider_protocol::provider::CacheStatAvailability;
+
+    let usage = chat_usage(
+        &serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 7,
+            "cached_tokens": "75",
+            "prompt_tokens_details": {"cached_tokens": 75}
+        }),
+        None,
+        CompatibleDialect::HaiderCodeApi,
+    )
+    .expect("malformed Kimi usage");
+    let normalized = usage.normalized.expect("normalized malformed usage");
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Unavailable);
+    assert_eq!(normalized.uncached_input, 100);
+    assert_eq!(normalized.cache_read_input, 0);
 }
 
 /// WH5 — DeepSeek reasoner streams non-namespaced `reasoning_content`; it
