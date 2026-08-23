@@ -250,6 +250,17 @@ try:
             "tool_result": 0,
             "run_failed": None,
             "resolutions": None,
+            # DIAGNOSTIC, not an assertion. Every scoped count above reading
+            # zero is consistent with two very different causes: the store the
+            # probe opened contains none of this run's events, or it contains
+            # them and no sentinel matched. Those need opposite fixes, and the
+            # counts alone cannot tell them apart. `rows_read` discriminates in
+            # one CI run: zero means the store is empty or unreadable to this
+            # reader; thousands means the store is fine and the matchers are
+            # wrong. Reported unconditionally — a diagnostic behind an env var
+            # is a diagnostic nobody has.
+            "rows_read": 0,
+            "decoded": 0,
         }
         connection = sqlite3.connect(
             "file:" + os.path.join(store, "store.sqlite") + "?mode=ro", uri=True
@@ -258,6 +269,7 @@ try:
             blob_rows = 0
             envelopes = []
             for (envelope,) in connection.execute("select envelope_json from events"):
+                counts["rows_read"] += 1
                 # v0.0.931+: new rows are msgpack BLOBs (bytes); legacy rows
                 # stay JSON text. Decode both; without the msgpack module,
                 # count blob rows honestly instead of crashing or lying.
@@ -272,6 +284,7 @@ try:
                 else:
                     decoded = json.loads(envelope)
                 envelopes.append(decoded)
+            counts["decoded"] = len(envelopes)
 
             def is_sentinel_menu(payload):
                 options = payload.get("options", [])
@@ -615,6 +628,24 @@ finally:
 # card's (session, menu), failures to its (session, run), and ToolResult to the
 # planted call id. `menu_resolutions` can hold only one row for that coordinate
 # because (session_id, menu_id) is its primary key.
+#
+# Print how much the reader actually SAW before reporting what it matched.
+# On v0.0.950 every scoped count read 0 or UNAVAILABLE, which is equally
+# consistent with "the store held none of this run's events" and "the store was
+# fine and no sentinel matched" — opposite causes needing opposite fixes. This
+# line separates them without another guess: the store is WAL-mode and the probe
+# opens it read-only while the daemon is still writing, so an empty read is a
+# live hypothesis rather than a wild one.
+_rows = journal["rows_read"] if journal is not None else None
+_decoded = journal["decoded"] if journal is not None else None
+print(
+    f"  [diagnostic] journal reader: rows_read="
+    f"{_rows if _rows is not None else 'UNAVAILABLE'}"
+    f" decoded={_decoded if _decoded is not None else 'UNAVAILABLE'}"
+    f"  (0 rows => store empty or unreadable to this reader;"
+    f" many rows => matchers are wrong)"
+)
+
 for key, label, expected in (
     ("menu_opened", "sentinel menu_opened events", 1),
     ("menu_answered", "sentinel menu_answered events", 1),
