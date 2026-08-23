@@ -111,6 +111,14 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
     let source_sensitive_projection: &[(&str, &str)] = &[
         ("provider", "&summary.provider"),
         ("last_model", "&summary.last_model"),
+        (
+            "cache_lifetime_hit_basis_points",
+            "summary.cache_lifetime_hit_basis_points",
+        ),
+        (
+            "cache_reread_hit_basis_points",
+            "summary.cache_reread_hit_basis_points",
+        ),
     ];
 
     let wire = wire_fields(&frame, "SessionSummary");

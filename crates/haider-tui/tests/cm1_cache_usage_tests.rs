@@ -84,23 +84,51 @@ fn footer_model(reread_basis_points: Option<u32>) -> AppModel {
     ));
     let session = SessionId::new("footer-authority");
     model.active_session = Some(session.clone());
-    model.session_metrics.insert(
-        session.clone(),
-        AgentMetricsSnapshot {
-            agent: None,
-            session_id: session,
-            head_seq: 1,
-            started_at_ms: 0,
-            terminal_at_ms: None,
-            live: true,
-            tool_attempts: 0,
-            usage: Some(AgentUsageMetrics {
-                cache_hit_basis_points: Some(6_370),
-                cache_reread_hit_basis_points: reread_basis_points,
-                ..AgentUsageMetrics::default()
-            }),
-        },
-    );
+    let metrics = AgentMetricsSnapshot {
+        agent: None,
+        session_id: session.clone(),
+        head_seq: 1,
+        started_at_ms: 0,
+        terminal_at_ms: None,
+        live: true,
+        tool_attempts: 0,
+        usage: Some(AgentUsageMetrics {
+            cache_hit_basis_points: Some(6_370),
+            cache_reread_hit_basis_points: reread_basis_points,
+            ..AgentUsageMetrics::default()
+        }),
+    };
+    model.note_summary_counts(&haider_rpc::SessionSummary {
+        session_id: session,
+        head_seq: 1,
+        worker_generation: 1,
+        run_state: None,
+        run_id: None,
+        seen_at_ms: None,
+        last_activity_ms: None,
+        waiting_why: None,
+        needs_input: None,
+        metadata: None,
+        provider: None,
+        last_model: None,
+        cache_lifetime_hit_basis_points: Some(6_370),
+        cache_reread_hit_basis_points: reread_basis_points,
+        workspace_cwd: None,
+        turn_count: None,
+        footprint_tokens: None,
+        footprint_truth: None,
+        title: None,
+        agent_metrics: Some(metrics),
+        parent_session_id: None,
+        kind: None,
+        agent_type: None,
+        effort: None,
+        fast: None,
+        account_alias: None,
+    });
+    // The nested copy was valid and equal when the summary arrived, but the
+    // footer must remain driven by the independently hydrated promoted field.
+    model.session_metrics.clear();
     model
 }
 

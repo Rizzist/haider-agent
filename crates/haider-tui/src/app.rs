@@ -2493,6 +2493,16 @@ pub struct SessionAttention {
     pub needs_input: Option<haider_rpc::NeedsInputWire>,
 }
 
+/// Cache-rate truth from one committed roster head. Both values are optional:
+/// in particular, an absent re-read rate means there was no cacheable
+/// preceding prefix, never 0% cache health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCacheRates {
+    pub head_seq: u64,
+    pub lifetime_basis_points: Option<u32>,
+    pub reread_basis_points: Option<u32>,
+}
+
 /// One rendered row of the `/resume` browser — roster truth only, no
 /// journal replay (the 936 attention fields are exactly what this needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3422,6 +3432,11 @@ pub struct AppModel {
     /// swap this registry, so `/usage` can refresh it in place.
     pub session_metrics:
         std::collections::HashMap<SessionId, haider_protocol::agent::AgentMetricsSnapshot>,
+    /// Promoted cache-rate scalars from `SessionSummary`, kept independently
+    /// of the retained nested metrics snapshot so the footer reads the
+    /// first-class roster facts. The nested path is used only when an older
+    /// daemon omits both promoted fields.
+    pub session_cache_rates: std::collections::HashMap<SessionId, SessionCacheRates>,
     /// Attention state is roster-only daemon truth. It is kept outside the
     /// checked-in session slots so a summary can update an active session.
     pub session_attention: std::collections::HashMap<SessionId, SessionAttention>,
@@ -3766,6 +3781,7 @@ impl Default for AppModel {
             // `next_ui_generation` continues at 4.
             sessions: seed_session_states(UiGeneration::FIRST.get()),
             session_metrics: std::collections::HashMap::new(),
+            session_cache_rates: std::collections::HashMap::new(),
             session_attention: std::collections::HashMap::new(),
             active_session: None,
             custom_commands: Vec::new(),
@@ -12288,6 +12304,34 @@ impl AppModel {
                 self.dirty = true;
             }
         }
+        let nested_cache = summary
+            .agent_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.usage.as_ref());
+        let promoted_present = summary.cache_lifetime_hit_basis_points.is_some()
+            || summary.cache_reread_hit_basis_points.is_some();
+        let cache_rates = SessionCacheRates {
+            head_seq: summary.head_seq,
+            lifetime_basis_points: if promoted_present {
+                summary.cache_lifetime_hit_basis_points
+            } else {
+                nested_cache.and_then(|usage| usage.cache_hit_basis_points)
+            },
+            reread_basis_points: if promoted_present {
+                summary.cache_reread_hit_basis_points
+            } else {
+                nested_cache.and_then(|usage| usage.cache_reread_hit_basis_points)
+            },
+        };
+        let replace_cache = self
+            .session_cache_rates
+            .get(&summary.session_id)
+            .is_none_or(|held| held.head_seq < summary.head_seq);
+        if replace_cache {
+            self.session_cache_rates
+                .insert(summary.session_id.clone(), cache_rates);
+            self.dirty = true;
+        }
         // Model truth (owner 2026-08-15): the roster wears the model the
         // session ACTUALLY runs — the daemon's journal-folded `last_model` —
         // never this client's own identity (the old seed made every row wear
@@ -12369,6 +12413,17 @@ impl AppModel {
         self.active_session
             .as_ref()
             .and_then(|session| self.session_metrics.get(session))
+    }
+
+    /// The cache-health headline for the active session, sourced from the
+    /// promoted roster field (with a pre-promotion-daemon fallback applied
+    /// while hydrating [`Self::session_cache_rates`]).
+    #[must_use]
+    pub fn main_cache_reread_hit_basis_points(&self) -> Option<u32> {
+        self.active_session
+            .as_ref()
+            .and_then(|session| self.session_cache_rates.get(session))
+            .and_then(|rates| rates.reread_basis_points)
     }
 
     /// Seed a session's cursor with the sequence its attach asked FROM, so

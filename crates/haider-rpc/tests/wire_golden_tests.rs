@@ -684,6 +684,8 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         metadata: None,
         provider: None,
         last_model: None,
+        cache_lifetime_hit_basis_points: None,
+        cache_reread_hit_basis_points: None,
         workspace_cwd: Some("/work/original".into()),
         turn_count: None,
         footprint_tokens: None,
@@ -764,6 +766,138 @@ fn session_summary_without_top_level_provider_still_decodes() {
         Some("anthropic"),
         "the compatibility copy remains readable"
     );
+}
+
+/// A v0.0.942 summary predates both promoted cache-rate scalars. New readers
+/// must decode that exact shape without inventing either value, while the
+/// explicit serde declaration keeps the additive wire contract visible.
+///
+/// MUTATION `REMOVE_CACHE_FIELD_DEFAULT` (executed, observed red): remove the
+/// explicit `default` from either new field. Serde implicitly defaults a
+/// missing `Option`, so the enclosing source-law assertion (not the payload
+/// decode alone) is what turns this mutation red.
+#[test]
+fn v0_0_942_session_summary_without_promoted_cache_rates_still_decodes() {
+    let frame = include_str!("../src/frame.rs");
+    for declaration in [
+        "#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub cache_lifetime_hit_basis_points: Option<u32>",
+        "#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub cache_reread_hit_basis_points: Option<u32>",
+    ] {
+        assert!(
+            frame.contains(declaration),
+            "cache-rate fields must retain the explicit additive wire law: {declaration}"
+        );
+    }
+    let v0_0_942 = serde_json::json!({
+        "session_id": "session-cache-compat",
+        "head_seq": 17,
+        "worker_generation": 15,
+        "last_model": "gpt-5.2"
+    });
+    let decoded: haider_rpc::SessionSummary =
+        serde_json::from_value(v0_0_942).expect("0.0.942 summary decodes");
+    assert_eq!(decoded.cache_lifetime_hit_basis_points, None);
+    assert_eq!(decoded.cache_reread_hit_basis_points, None);
+
+    #[derive(Deserialize)]
+    struct V0_0_942Summary {
+        session_id: haider_protocol::ids::SessionId,
+        head_seq: u64,
+        worker_generation: u64,
+    }
+    let v0_0_943 = serde_json::json!({
+        "session_id": "session-cache-compat",
+        "head_seq": 18,
+        "worker_generation": 16,
+        "cache_lifetime_hit_basis_points": 6370,
+        "cache_reread_hit_basis_points": 9058
+    });
+    let legacy: V0_0_942Summary =
+        serde_json::from_value(v0_0_943).expect("0.0.942 reader ignores promoted fields");
+    assert_eq!(legacy.session_id.as_str(), "session-cache-compat");
+    assert_eq!(legacy.head_seq, 18);
+    assert_eq!(legacy.worker_generation, 16);
+}
+
+/// Absence at each retained nesting level remains inspectable even though all
+/// three cases correctly provide no re-read number. This is why promotion is
+/// additive: old-session diagnostics still distinguish no snapshot, a
+/// snapshot without usage, and measured usage without a re-readable prefix.
+///
+/// MUTATION `COLLAPSE_CACHE_ABSENCES` (executed, observed red): omit
+/// `agent_metrics` whenever its usage/rate is absent. Expected RUNTIME
+/// failure: the structural assertions can no longer distinguish the rows.
+#[test]
+fn session_summary_cache_absence_levels_remain_distinguishable() {
+    let decode = |value| {
+        serde_json::from_value::<haider_rpc::SessionSummary>(value).expect("summary shape decodes")
+    };
+    let no_metrics = decode(serde_json::json!({
+        "session_id": "cache-absence-no-metrics",
+        "head_seq": 1,
+        "worker_generation": 1
+    }));
+    let no_usage = decode(serde_json::json!({
+        "session_id": "cache-absence-no-usage",
+        "head_seq": 2,
+        "worker_generation": 1,
+        "agent_metrics": {
+            "session_id": "cache-absence-no-usage",
+            "head_seq": 2,
+            "started_at_ms": 1,
+            "live": true,
+            "tool_attempts": 0
+        }
+    }));
+    let no_rate = decode(serde_json::json!({
+        "session_id": "cache-absence-no-rate",
+        "head_seq": 3,
+        "worker_generation": 1,
+        "cache_lifetime_hit_basis_points": 0,
+        "agent_metrics": {
+            "session_id": "cache-absence-no-rate",
+            "head_seq": 3,
+            "started_at_ms": 1,
+            "live": true,
+            "tool_attempts": 0,
+            "usage": {
+                "logical_input_tokens": 4098,
+                "billed_output_tokens": 0,
+                "additional_reasoning_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_hit_basis_points": 0,
+                "all_lanes_priced": false,
+                "has_metered_lanes": false,
+                "has_oauth_lanes": true,
+                "breakdowns": []
+            }
+        }
+    }));
+
+    assert!(no_metrics.agent_metrics.is_none());
+    assert!(
+        no_usage
+            .agent_metrics
+            .as_ref()
+            .is_some_and(|metrics| metrics.usage.is_none())
+    );
+    assert!(
+        no_rate
+            .agent_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.usage.as_ref())
+            .is_some_and(|usage| usage.cache_reread_hit_basis_points.is_none())
+    );
+
+    let no_metrics_wire = serde_json::to_value(no_metrics).expect("no-metrics serializes");
+    let no_usage_wire = serde_json::to_value(no_usage).expect("no-usage serializes");
+    let no_rate_wire = serde_json::to_value(no_rate).expect("no-rate serializes");
+    assert!(no_metrics_wire.get("agent_metrics").is_none());
+    assert!(no_usage_wire["agent_metrics"].get("usage").is_none());
+    assert!(no_rate_wire["agent_metrics"]["usage"].is_object());
+    assert!(no_rate_wire.get("cache_reread_hit_basis_points").is_none());
+    assert_eq!(no_rate_wire["cache_lifetime_hit_basis_points"], 0);
 }
 
 /// R7 additive-field tolerance for the two turn mutation methods
@@ -2145,6 +2279,8 @@ fn session_rename_frames_are_additive_and_golden() {
         metadata: None,
         provider: None,
         last_model: None,
+        cache_lifetime_hit_basis_points: None,
+        cache_reread_hit_basis_points: None,
         workspace_cwd: None,
         turn_count: None,
         footprint_tokens: None,
@@ -2720,6 +2856,8 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
         metadata: None,
         provider: None,
         last_model: None,
+        cache_lifetime_hit_basis_points: None,
+        cache_reread_hit_basis_points: None,
         workspace_cwd: None,
         turn_count: None,
         footprint_tokens: None,

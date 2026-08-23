@@ -10221,6 +10221,16 @@ pub(crate) async fn session_summaries(
         let (footprint_tokens, footprint_truth) =
             summary_footprint_fields(turns, footprint.as_ref());
         let agent_metrics = snapshot.agent_metrics;
+        // Promotion, not a second calculation: both top-level values are
+        // copied from the exact usage snapshot that remains published below.
+        let cache_lifetime_hit_basis_points = agent_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.usage.as_ref())
+            .and_then(|usage| usage.cache_hit_basis_points);
+        let cache_reread_hit_basis_points = agent_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.usage.as_ref())
+            .and_then(|usage| usage.cache_reread_hit_basis_points);
         // Promote the provider from the exact metadata value published below.
         // Keeping one source makes disagreement between the two locations
         // impossible.
@@ -10265,6 +10275,8 @@ pub(crate) async fn session_summaries(
             metadata,
             provider,
             last_model,
+            cache_lifetime_hit_basis_points,
+            cache_reread_hit_basis_points,
             turn_count: Some(turns),
             footprint_tokens,
             footprint_truth,
@@ -10564,6 +10576,8 @@ mod roster_wave_tests {
             metadata: None,
             provider: None,
             last_model: None,
+            cache_lifetime_hit_basis_points: None,
+            cache_reread_hit_basis_points: None,
             workspace_cwd: None,
             turn_count: None,
             footprint_tokens: None,

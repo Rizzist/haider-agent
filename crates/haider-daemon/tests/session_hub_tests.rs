@@ -36,7 +36,10 @@ use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     DecisionKind, EffectRecoveryAction, Menu, MenuKind, MenuOption, MenuScope,
 };
-use haider_protocol::provider::{FinishReason, Usage, UsageRequestKind, UsageScope, UsageSource};
+use haider_protocol::provider::{
+    CacheStatAvailability, FinishReason, NormalizedUsage, Usage, UsageRequestKind, UsageScope,
+    UsageSource,
+};
 use haider_protocol::session::ModelSelected;
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
@@ -142,6 +145,53 @@ fn footprint_envelope(
         item: footprint.extension_item().expect("footprint serializes"),
     }))
     .expect("footprint event serializes");
+    envelope
+}
+
+fn cache_rate_usage_envelope(
+    session_id: &SessionId,
+    event_id: &str,
+    worker_generation: u64,
+    run: &str,
+    logical_input: u64,
+    cache_read_input: u64,
+) -> RawEnvelope {
+    let mut envelope = envelope(session_id, event_id, worker_generation);
+    let run_id = RunId::new(run);
+    envelope.run_id = Some(run_id.clone());
+    envelope.payload = serde_json::to_value(EventPayload::Usage(Usage {
+        input: logical_input,
+        output: 0,
+        reasoning: 0,
+        cached: cache_read_input,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: Some(NormalizedUsage {
+            logical_input,
+            uncached_input: logical_input.saturating_sub(cache_read_input),
+            cache_read_input,
+            billed_output: 0,
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: logical_input,
+            ..NormalizedUsage::default()
+        }),
+        scope: Some(UsageScope {
+            provider: "openai".into(),
+            model: "gpt-5.2".into(),
+            account_scope: None,
+            auth_scope: "oauth".into(),
+            cache_epoch: "summary-cache-rate".into(),
+            stable_prefix_tokens: 0,
+            cache_boundaries: None,
+            request_kind: UsageRequestKind::MainTurn,
+            run: Some(run_id),
+            agent: None,
+            prefix_digests: None,
+        }),
+        cache_cost: None,
+    }))
+    .expect("cache-rate usage serializes");
     envelope
 }
 
@@ -3835,6 +3885,101 @@ async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
     assert!(!snapshot.live);
     assert_eq!(snapshot.tool_attempts, 1);
     assert!(snapshot.usage.is_none(), "no usage fact stays unknown");
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Promoted cache rates and the retained nested compatibility copy are one
+/// fact: both are read from the same folded usage snapshot at the sealed head.
+///
+/// MUTATION `PROMOTED_REREAD_DIVERGES` (executed, observed red): replace the
+/// promoted re-read clone in `session_summaries` with `Some(0)`. Expected
+/// RUNTIME failure: the exact 9_058 assertion and nested-equality assertion.
+#[tokio::test]
+async fn session_summary_promotes_measured_cache_rates_from_nested_authority() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-promoted-cache-rate");
+    let generation = store.worker_generation();
+    let mut events = vec![
+        cache_rate_usage_envelope(
+            &session_id,
+            "cache-rate-first",
+            generation,
+            "cache-rate-run-first",
+            4_098,
+            0,
+        ),
+        cache_rate_usage_envelope(
+            &session_id,
+            "cache-rate-reread",
+            generation,
+            "cache-rate-run-reread",
+            4_098,
+            3_712,
+        ),
+    ];
+    hub.append(&mut events).await.expect("cache usage commits");
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("cache-rate summary");
+    let usage = summary
+        .agent_metrics
+        .as_ref()
+        .and_then(|metrics| metrics.usage.as_ref())
+        .expect("nested usage authority");
+    assert_eq!(summary.cache_reread_hit_basis_points, Some(9_058));
+    assert_eq!(
+        summary.cache_lifetime_hit_basis_points,
+        usage.cache_hit_basis_points
+    );
+    assert_eq!(
+        summary.cache_reread_hit_basis_points, usage.cache_reread_hit_basis_points,
+        "promoted and nested cache health must never disagree"
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// One first request has complete lifetime telemetry but no preceding prefix
+/// that could be re-read. Its missing re-read rate stays absent on the wire;
+/// it must never become a numeric zero or placeholder.
+///
+/// MUTATION `ABSENT_REREAD_BECOMES_ZERO` (executed, observed red): default the
+/// promoted clone with `unwrap_or_default()`. Expected RUNTIME failure: the
+/// field is `Some(0)` and serializes as `"cache_reread_hit_basis_points":0`.
+#[tokio::test]
+async fn session_summary_omits_unmeasured_reread_rate_instead_of_zero() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-no-cacheable-prefix");
+    let generation = store.worker_generation();
+    let mut events = vec![cache_rate_usage_envelope(
+        &session_id,
+        "cache-rate-first-only",
+        generation,
+        "cache-rate-run-only",
+        4_098,
+        0,
+    )];
+    hub.append(&mut events).await.expect("first usage commits");
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("first-turn summary");
+    assert_eq!(summary.cache_lifetime_hit_basis_points, Some(0));
+    assert_eq!(summary.cache_reread_hit_basis_points, None);
+    let wire = serde_json::to_value(&summary).expect("summary serializes");
+    assert_eq!(wire["cache_lifetime_hit_basis_points"], 0);
+    assert!(
+        wire.get("cache_reread_hit_basis_points").is_none(),
+        "no denominator must omit the field, not publish zero: {wire}"
+    );
 
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");

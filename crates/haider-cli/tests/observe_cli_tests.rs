@@ -384,6 +384,70 @@ fn sessions_json_projects_top_level_provider_beside_last_model() {
     assert_eq!(legacy_json["model"], "gpt-roster");
 }
 
+/// Cache rates take the promoted roster path. The CLI keeps its established
+/// `cache` object, but the values inside it come from the top-level wire facts;
+/// a pre-promotion daemon still falls back to the retained nested snapshot.
+///
+/// MUTATION CHECK: source either current value from `agent_metrics.usage` (or
+/// drop the promoted merge). Expected RUNTIME failure: the current row omits
+/// its cache object because this fixture intentionally carries no nested copy.
+#[test]
+fn sessions_json_projects_promoted_cache_rates_with_legacy_fallback() {
+    let mut current = summary_view(digest(
+        "session-cache-current",
+        ObserveRunStateWire::Idle,
+        None,
+    ));
+    let current_summary: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-cache-current",
+        "head_seq": 14,
+        "worker_generation": 8,
+        "cache_lifetime_hit_basis_points": 6370,
+        "cache_reread_hit_basis_points": 9058
+    }))
+    .expect("current summary decodes");
+    merge_roster_summary(&mut current, &current_summary);
+    let current_json = current.json();
+    assert_eq!(current_json["cache"]["lifetime_basis_points"], 6_370);
+    assert_eq!(current_json["cache"]["reread_basis_points"], 9_058);
+
+    let mut legacy = summary_view(digest(
+        "session-cache-legacy",
+        ObserveRunStateWire::Idle,
+        None,
+    ));
+    let legacy_summary: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-cache-legacy",
+        "head_seq": 12,
+        "worker_generation": 7,
+        "agent_metrics": {
+            "session_id": "session-cache-legacy",
+            "head_seq": 12,
+            "started_at_ms": 1,
+            "live": true,
+            "tool_attempts": 0,
+            "usage": {
+                "logical_input_tokens": 12055,
+                "billed_output_tokens": 0,
+                "additional_reasoning_tokens": 0,
+                "cache_read_tokens": 7680,
+                "cache_write_tokens": 0,
+                "cache_hit_basis_points": 6370,
+                "cache_reread_hit_basis_points": 9058,
+                "all_lanes_priced": false,
+                "has_metered_lanes": false,
+                "has_oauth_lanes": true,
+                "breakdowns": []
+            }
+        }
+    }))
+    .expect("v0.0.942-shaped summary decodes");
+    merge_roster_summary(&mut legacy, &legacy_summary);
+    let legacy_json = legacy.json();
+    assert_eq!(legacy_json["cache"]["lifetime_basis_points"], 6_370);
+    assert_eq!(legacy_json["cache"]["reread_basis_points"], 9_058);
+}
+
 /// MUTATION CHECK: accept ambiguous snapshot/watch flags or remove the
 /// explicit forward-compatibility help. Expected RUNTIME failure: a parser
 /// assertion changes or the literal compatibility sentence is absent.

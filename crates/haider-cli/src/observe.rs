@@ -134,11 +134,13 @@ pub(crate) struct SessionSummaryView {
     /// summary as `run_state` — the pair is one observation.
     pub run_id: Option<String>,
     pub worker_generation: Option<u64>,
-    /// Prompt-cache health, projected from `agent_metrics.usage`. TWO numbers
-    /// because either alone misleads: the lifetime ratio counts the first send
-    /// of new content as a miss (definitionally, so it can never reach 100%),
-    /// and the re-read rate hides real cold-start cost. `None` on the re-read
-    /// rate is NOT zero — a session with nothing to re-read has no rate at all.
+    /// Prompt-cache health, projected from the promoted roster scalars with
+    /// `agent_metrics.usage` retained only as a pre-promotion-daemon fallback.
+    /// TWO numbers because either alone misleads: the lifetime ratio counts the
+    /// first send of new content as a miss (definitionally, so it can never
+    /// reach 100%), and the re-read rate hides real cold-start cost. `None` on
+    /// the re-read rate is NOT zero — a session with nothing to re-read has no
+    /// rate at all.
     pub cache: Option<CacheView>,
     pub effort: Option<String>,
     pub fast: Option<bool>,
@@ -919,14 +921,27 @@ pub(crate) fn merge_roster_summary(
     if let Some(model) = &summary.last_model {
         view.model = Some(model.clone());
     }
-    view.cache = summary
-        .agent_metrics
-        .as_ref()
-        .and_then(|metrics| metrics.usage.as_ref())
-        .map(|usage| CacheView {
-            lifetime_basis_points: usage.cache_hit_basis_points,
-            reread_basis_points: usage.cache_reread_hit_basis_points,
-        });
+    let promoted_cache = CacheView {
+        lifetime_basis_points: summary.cache_lifetime_hit_basis_points,
+        reread_basis_points: summary.cache_reread_hit_basis_points,
+    };
+    view.cache = if promoted_cache.lifetime_basis_points.is_some()
+        || promoted_cache.reread_basis_points.is_some()
+    {
+        Some(promoted_cache)
+    } else {
+        // A v0.0.942 daemon has no promoted scalars. Its nested snapshot is
+        // still the compatibility authority and stays readable for as long as
+        // clients can connect to that daemon generation.
+        summary
+            .agent_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.usage.as_ref())
+            .map(|usage| CacheView {
+                lifetime_basis_points: usage.cache_hit_basis_points,
+                reread_basis_points: usage.cache_reread_hit_basis_points,
+            })
+    };
     // The cancel coordinates are another pair from the same live summary.
     view.run_id = summary.run_id.as_ref().map(|run| run.as_str().to_owned());
     view.worker_generation = Some(summary.worker_generation);

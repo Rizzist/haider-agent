@@ -1062,6 +1062,22 @@ pub struct SessionSummary {
     /// from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
+    /// Lifetime cache-hit share over all logical input observed through this
+    /// committed head. This includes the first request and each turn's new
+    /// content, which could never have been cache hits, so it is not a cache
+    /// health percentage and is mathematically unable to reach 100% for a
+    /// nonempty session. A UI should label it as lifetime/all-input share and
+    /// headline [`Self::cache_reread_hit_basis_points`] instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_lifetime_hit_basis_points: Option<u32>,
+    /// Cache-hit rate over only input that could have been re-read from the
+    /// preceding provider-call prefix. This answers "is the cache working?"
+    /// and is the cache rate a UI should headline. For a current summary with
+    /// usage, `None` means no input could yet have been re-read (for example,
+    /// a first turn), not 0%; older daemons and sessions without usage truth
+    /// also omit this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_reread_hit_basis_points: Option<u32>,
     /// Additive canonical workspace coordinate for clients that list a
     /// session from a different process cwd. Absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]

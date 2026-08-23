@@ -9826,10 +9826,7 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     }
     if meter_shown && !model.cache_usage.is_empty() {
         let totals = model.cache_usage.totals();
-        let reread_basis_points = model
-            .main_agent_metrics()
-            .and_then(|metrics| metrics.usage.as_ref())
-            .and_then(|usage| usage.cache_reread_hit_basis_points);
+        let reread_basis_points = model.main_cache_reread_hit_basis_points();
         let wide = crate::cache_usage::wide_status(&totals, reread_basis_points);
         let medium = crate::cache_usage::medium_status(&totals, reread_basis_points);
         let branch_reserve = if model.screen == Screen::Session {
