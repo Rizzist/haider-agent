@@ -93,6 +93,7 @@ impl TestWorker {
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
+                diagnostics: None,
                 provider_factory: Arc::new(FixedProviderFactory {
                     provider,
                     context_window,
@@ -841,6 +842,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: fake.clone(),
                 context_window: Some(64_000),

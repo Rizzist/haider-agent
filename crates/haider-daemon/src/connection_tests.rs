@@ -1208,6 +1208,7 @@ impl PairedTurnFixture {
         let manager = crate::worker::WorkerManager::start(
             hub.clone(),
             crate::worker::WorkerDependencies {
+                diagnostics: None,
                 provider_factory: Arc::new(PairedFakeFactory {
                     provider: fake.clone(),
                 }),

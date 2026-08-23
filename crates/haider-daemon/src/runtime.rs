@@ -48,6 +48,7 @@
 mod runtime_tests;
 
 use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_over_limit, serve};
+use crate::diagnostics::EffectDiagnostics;
 use crate::endpoint;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns_report};
@@ -229,6 +230,11 @@ async fn run_inner(
         }
         Err(error) => return Err(error.into()),
     };
+    haider_platform::publish_active_daemon_log(&config.store_dir).map_err(|error| {
+        DaemonError::Task {
+            message: format!("cannot publish active daemon log: {error}"),
+        }
+    })?;
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         drop(lease);
@@ -240,6 +246,37 @@ async fn run_inner(
     // this may a listener bind or Ready be advertised.
     states.publish(DaemonState::Recovering);
     let store = SqliteStoreHandle::open_locked(lease).await?;
+    let (effect_diagnostics, prior_unexpected_exits) =
+        EffectDiagnostics::open(config.store_dir.clone())
+            .await
+            .map_err(|error| DaemonError::Task {
+                message: format!("cannot open effect diagnostic journal: {error}"),
+            })?;
+    for evidence in &prior_unexpected_exits {
+        eprintln!(
+            "haiderd: prior unexpected exit evidence: build={} build_uuid={} pid={} \
+             process_started_unix_ms={} thread={} effect={} session={} run={} tool={} \
+             workspace_root_digest={} args_digest={} effect_started_unix_ms={}",
+            evidence.build_version,
+            evidence.build_uuid,
+            evidence.pid,
+            evidence.process_started_unix_ms,
+            evidence.thread_name,
+            evidence.effect_id,
+            evidence.session_id,
+            evidence.run_id,
+            evidence.tool_name,
+            evidence.workspace_root_digest,
+            evidence.args_digest,
+            evidence.started_unix_ms,
+        );
+    }
+    effect_diagnostics
+        .record_surfaced(prior_unexpected_exits)
+        .await
+        .map_err(|error| DaemonError::Task {
+            message: format!("cannot persist surfaced effect diagnostics: {error}"),
+        })?;
     let instance_id = random_instance_id()?;
     let daemon_generation = match store.advance_daemon_generation().await {
         Ok(generation) => generation,
@@ -438,6 +475,7 @@ async fn run_inner(
         tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),
         delegation: None,
         web_search,
+        diagnostics: Some(effect_diagnostics),
     };
     let worker_manager = WorkerManager::start(
         hub.clone(),

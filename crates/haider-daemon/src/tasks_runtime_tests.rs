@@ -174,6 +174,7 @@ async fn task_dispatcher_with_grant(
     TurnToolFactory::create(
         &BrokerToolFactory,
         WorkerToolContext {
+            diagnostics: None,
             metadata: task_metadata(cwd),
             store: lease,
             run_id: context_run.clone(),
@@ -790,6 +791,7 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),

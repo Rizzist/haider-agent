@@ -158,6 +158,7 @@ impl PairSwitchWorld {
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
+                diagnostics: None,
                 provider_factory: Arc::new(RoutingProviderFactory {
                     providers: HashMap::from([
                         ("fake-a".to_owned(), fake_a),

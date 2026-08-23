@@ -18,7 +18,7 @@
 //! - Parent exit leaves the daemon running; nothing here implies shutdown.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
@@ -45,7 +45,11 @@ pub fn required_live_features() -> BTreeSet<String> {
 }
 
 /// Name of the owner-only daemon log inside the profile store directory.
-pub const DAEMON_LOG_FILE: &str = "daemon.log";
+///
+/// Retained as the legacy basename for diagnostics that predate per-process
+/// logs. New candidates use `daemon-logs/haiderd-<launch>.log` so racing
+/// processes never share a writable file.
+pub const DAEMON_LOG_FILE: &str = haider_platform::DAEMON_LOG_FILE;
 
 /// R8 step 7: configurable startup deadline for spawn + handshake polling.
 pub const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
@@ -254,7 +258,7 @@ pub async fn ensure_daemon(
     profile: &ResolvedProfile,
     options: EnsureOptions,
 ) -> Result<EnsuredDaemon, EnsureError> {
-    let log_path = profile.store_dir.join(DAEMON_LOG_FILE);
+    let mut log_path = None;
     let mut child: Option<Child> = None;
     let mut spawned = false;
     let mut race_lost = false;
@@ -311,7 +315,9 @@ pub async fn ensure_daemon(
                     // The one spawn decision (R8 step 5): only a missing or
                     // refused endpoint ever launches a candidate, and only
                     // one candidate per launcher.
-                    child = Some(spawn_daemon(profile, &options, &log_path)?);
+                    let (candidate, candidate_log_path) = spawn_daemon(profile, &options)?;
+                    child = Some(candidate);
+                    log_path = Some(candidate_log_path);
                     spawned = true;
                 }
             }
@@ -331,7 +337,11 @@ pub async fn ensure_daemon(
                 // serve; if the endpoint is also unreachable, fail loudly
                 // with the log path instead of burning the whole deadline.
                 if let Attach::Spawnable(_) = try_attach(profile, &options).await {
-                    return Err(EnsureError::DaemonExited { status, log_path });
+                    return Err(EnsureError::DaemonExited {
+                        status,
+                        log_path: log_path
+                            .unwrap_or_else(|| profile.store_dir.join(DAEMON_LOG_FILE)),
+                    });
                 }
             }
         }
@@ -339,7 +349,7 @@ pub async fn ensure_daemon(
             return Err(EnsureError::StartupTimeout {
                 last_error,
                 child_status,
-                log_path,
+                log_path: log_path.unwrap_or_else(|| profile.store_dir.join(DAEMON_LOG_FILE)),
             });
         }
         tokio::time::sleep(backoff).await;
@@ -376,15 +386,21 @@ fn daemon_binary(options: &EnsureOptions) -> Result<PathBuf, EnsureError> {
 fn spawn_daemon(
     profile: &ResolvedProfile,
     options: &EnsureOptions,
-    log_path: &Path,
-) -> Result<Child, EnsureError> {
+) -> Result<(Child, PathBuf), EnsureError> {
     let binary = daemon_binary(options)?;
-    haider_platform::spawn_daemon(haider_platform::DaemonSpawn {
+    let log_path =
+        haider_platform::allocate_daemon_log_path(&profile.store_dir).map_err(|error| {
+            EnsureError::Spawn {
+                binary: binary.clone(),
+                message: format!("cannot allocate per-process daemon log: {error}"),
+            }
+        })?;
+    let child = haider_platform::spawn_daemon(haider_platform::DaemonSpawn {
         binary: &binary,
         profile_id: &profile.profile_id,
         store_dir: &profile.store_dir,
         runtime_dir: &profile.runtime_dir,
-        log_path,
+        log_path: &log_path,
     })
     .map_err(|error| {
         let message = match error {
@@ -397,7 +413,8 @@ fn spawn_daemon(
             haider_platform::DaemonSpawnError::Spawn(error) => error.to_string(),
         };
         EnsureError::Spawn { binary, message }
-    })
+    })?;
+    Ok((child, log_path))
 }
 
 /// Starts an explicitly named daemon sibling and returns the live child.
@@ -418,8 +435,7 @@ pub fn spawn_daemon_retained(
         daemon_binary: Some(binary.into()),
         ..EnsureOptions::default()
     };
-    let log_path = profile.store_dir.join(DAEMON_LOG_FILE);
-    spawn_daemon(profile, &options, &log_path)
+    spawn_daemon(profile, &options).map(|(child, _)| child)
 }
 
 /// Sends the one graceful termination signal to an authenticated UDS peer.

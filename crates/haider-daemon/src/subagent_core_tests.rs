@@ -547,6 +547,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -784,6 +785,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -872,6 +874,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
     let dispatcher = TurnToolFactory::create(
         &BrokerToolFactory,
         WorkerToolContext {
+            diagnostics: None,
             metadata: SessionMetadataV1 {
                 cwd: workspace,
                 provider: "fake".into(),
@@ -1126,6 +1129,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -1654,6 +1658,7 @@ async fn start_parked_child(
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory { provider }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: Some(DelegationHandle::with_stall_deadline(
@@ -2187,6 +2192,7 @@ async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() 
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -2301,6 +2307,7 @@ async fn committed_child_progress_resets_the_stall_deadline() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -2424,6 +2431,7 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -2518,6 +2526,7 @@ async fn parent_cancel_sweeps_its_outstanding_child() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -2733,6 +2742,7 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -2934,6 +2944,7 @@ async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -3038,6 +3049,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
     let manager = WorkerManager::start(
         first_hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -3102,6 +3114,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),

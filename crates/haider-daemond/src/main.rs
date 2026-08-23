@@ -5,8 +5,9 @@
 //! for this profile is already running).
 
 use haider_daemon::{
-    DaemonConfig, DaemonDependencies, ProviderFactory, ProviderFactoryConfig, ResolvedTurnProvider,
-    ShutdownOutcome, run_with_signals_and_dependencies,
+    BUILD_UUID, BUILD_VERSION, DaemonConfig, DaemonDependencies, DaemonError, ProviderFactory,
+    ProviderFactoryConfig, ResolvedTurnProvider, ShutdownOutcome, process_started_unix_ms,
+    run_with_signals_and_dependencies,
 };
 use haider_protocol::error::HaiderError;
 use haider_protocol::session::SessionMetadataV1;
@@ -14,6 +15,7 @@ use haider_provider::FakeProvider;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// TEST-ONLY seam, OFF by default (W3c3 M3).
 ///
@@ -44,29 +46,34 @@ use std::sync::Arc;
 /// exits 64 rather than degrading), and it announces itself loudly on
 /// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
-#[cfg(windows)]
 const EX_SOFTWARE: u8 = 70;
+const DAEMON_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+const CONTENTION_NOTICE_FILE: &str = ".daemon-start-contention.notice";
+const CONTENTION_NOTICE_WINDOW: Duration = Duration::from_secs(60);
 
 #[cfg(not(windows))]
-#[tokio::main]
-async fn main() -> ExitCode {
-    dispatch().await
+fn main() -> ExitCode {
+    initialize_process_diagnostics();
+    match daemon_runtime() {
+        Ok(runtime) => runtime.block_on(dispatch()),
+        Err(error) => {
+            eprintln!("haiderd: could not start async runtime: {error}");
+            ExitCode::from(EX_SOFTWARE)
+        }
+    }
 }
 
 // `run_with_signals_and_dependencies` owns the whole daemon lifecycle and
 // produces a large debug future. Poll it on an explicitly sized Windows
-// entry thread; Unix retains its ordinary Tokio main path.
+// entry thread; Unix constructs the same explicitly sized Tokio runtime on
+// its ordinary process main thread.
 #[cfg(windows)]
 fn main() -> ExitCode {
+    initialize_process_diagnostics();
     let launched = std::thread::Builder::new()
         .name("haiderd-main".into())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map(|runtime| runtime.block_on(dispatch()))
-        });
+        .stack_size(DAEMON_THREAD_STACK_BYTES)
+        .spawn(|| daemon_runtime().map(|runtime| runtime.block_on(dispatch())));
     match launched {
         Ok(thread) => match thread.join() {
             Ok(Ok(code)) => code,
@@ -84,6 +91,36 @@ fn main() -> ExitCode {
             ExitCode::from(EX_SOFTWARE)
         }
     }
+}
+
+fn daemon_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("haiderd-worker")
+        .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
+        .build()
+}
+
+fn initialize_process_diagnostics() {
+    let started = process_started_unix_ms();
+    std::panic::set_hook(Box::new(move |panic| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+        let (line, column) = panic
+            .location()
+            .map_or((0, 0), |location| (location.line(), location.column()));
+        // This is explicitly an ordinary Rust-panic marker. The payload is
+        // intentionally omitted because it can contain prompts, arguments,
+        // paths, tokens, or other user data. Direct runtime termination does
+        // not run this hook; the pre-dispatch journal covers that class.
+        eprintln!(
+            "haiderd: diagnostic event=rust_panic_hook build={BUILD_VERSION} \
+             build_uuid={BUILD_UUID} pid={} process_started_unix_ms={started} \
+             thread={} source_line={line} source_column={column}",
+            std::process::id(),
+            safe_thread_name(thread),
+        );
+    }));
 }
 
 async fn dispatch() -> ExitCode {
@@ -106,13 +143,77 @@ async fn dispatch() -> ExitCode {
             return ExitCode::from(64);
         }
     };
+    let store_dir = config.store_dir.clone();
     match run_with_signals_and_dependencies(config, dependencies).await {
         Ok(ShutdownOutcome::Graceful) => ExitCode::SUCCESS,
         Ok(ShutdownOutcome::Forced) => ExitCode::from(130),
         Err(error) => {
-            eprintln!("haiderd: {error}");
+            if !matches!(&error, DaemonError::AlreadyRunning { .. })
+                || contention_notice_due(&store_dir)
+            {
+                eprintln!("haiderd: {error}");
+            }
             ExitCode::from(error.exit_code())
         }
+    }
+}
+
+fn safe_thread_name(name: &str) -> String {
+    if name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    {
+        name.to_owned()
+    } else {
+        "redacted".into()
+    }
+}
+
+fn contention_notice_due(store_dir: &std::path::Path) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    contention_notice_due_at(store_dir, now)
+}
+
+fn contention_notice_due_at(store_dir: &std::path::Path, now_secs: u64) -> bool {
+    let path = store_dir.join(CONTENTION_NOTICE_FILE);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut marker) => {
+            use std::io::Write as _;
+            let _ = writeln!(marker, "{now_secs}");
+            let _ = marker.sync_data();
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let prior = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            if prior.is_some_and(|prior| {
+                now_secs.saturating_sub(prior) < CONTENTION_NOTICE_WINDOW.as_secs()
+            }) {
+                return false;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => contention_notice_due_at(store_dir, now_secs),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    contention_notice_due_at(store_dir, now_secs)
+                }
+                Err(_) => false,
+            }
+        }
+        // If the de-duplication marker itself is unavailable, retain evidence
+        // by logging rather than silently losing the contention diagnostic.
+        Err(_) => true,
     }
 }
 
@@ -240,4 +341,20 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
         config.discovery_disabled = true;
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_contention_notice_is_rate_limited_but_not_silenced() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        assert!(contention_notice_due_at(root.path(), 1_000));
+        assert!(!contention_notice_due_at(root.path(), 1_001));
+        assert!(contention_notice_due_at(
+            root.path(),
+            1_000 + CONTENTION_NOTICE_WINDOW.as_secs()
+        ));
+    }
 }

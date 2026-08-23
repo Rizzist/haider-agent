@@ -60,6 +60,7 @@ mod delegation;
 #[cfg(all(test, unix))]
 mod delegation_rollup_tests;
 mod device_discovery;
+mod diagnostics;
 mod endpoint;
 mod error;
 mod gcloud;
@@ -105,6 +106,7 @@ pub use accounts::{
     ValidationFailureKind, VaultProvision,
 };
 pub use config::DaemonConfig;
+pub use diagnostics::{BUILD_UUID, BUILD_VERSION, process_started_unix_ms};
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use gcloud::{GcloudAccessTokenSource, GcloudCli};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};

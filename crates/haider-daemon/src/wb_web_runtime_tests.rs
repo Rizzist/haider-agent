@@ -207,6 +207,7 @@ impl WebWorld {
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
+                diagnostics: None,
                 provider_factory: Arc::new(factory),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,

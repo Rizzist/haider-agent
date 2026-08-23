@@ -895,6 +895,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(RecoveryProviderFactory { provider }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
@@ -1193,6 +1194,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FailingProviderFactory),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,

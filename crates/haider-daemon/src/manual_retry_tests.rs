@@ -163,6 +163,7 @@ impl RetryWorld {
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
+                diagnostics: None,
                 provider_factory: Arc::new(StaticProviderFactory { provider }),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,
@@ -666,6 +667,7 @@ async fn run_retry_lost_handoff_recovers_once_after_restart() {
     let restarted_manager = WorkerManager::start(
         restarted_hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(StaticProviderFactory {
                 provider: Arc::clone(&fake),
             }),

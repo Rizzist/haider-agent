@@ -665,6 +665,7 @@ async fn image_tool_ref_reaches_provider_request_without_journal_bytes() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: Arc::clone(&provider),
             }),

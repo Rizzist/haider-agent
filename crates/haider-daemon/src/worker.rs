@@ -42,6 +42,7 @@ mod pair_switch_runtime_tests;
 mod wd_pdf_runtime_tests;
 
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
+use crate::diagnostics::{EffectBreadcrumb, EffectDiagnostics};
 use crate::image_events::{detect_created_images, image_created_payload};
 use crate::project_instructions::{self, LoadedProjectInstructions};
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
@@ -811,6 +812,7 @@ pub struct WorkerToolContext {
     /// W-B: the client web_search executor for this turn (None = typed
     /// unavailable result).
     pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
+    pub(crate) diagnostics: Option<Arc<EffectDiagnostics>>,
 }
 
 /// Injectable tool/effect boundary (R4). Production uses the shipped broker;
@@ -907,6 +909,7 @@ pub(crate) struct WorkerDependencies {
     /// W-B: the client `web_search` executor. `None` (test worlds without
     /// one) makes the tool answer with a typed "unavailable" result.
     pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
+    pub(crate) diagnostics: Option<Arc<EffectDiagnostics>>,
 }
 
 impl WorkerDependencies {
@@ -919,6 +922,7 @@ impl WorkerDependencies {
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
             web_search: None,
+            diagnostics: None,
         }
     }
 }
@@ -2314,6 +2318,7 @@ async fn run_supervisor(
                     &lease,
                     &device_id,
                     Arc::clone(&event_ids),
+                    dependencies.diagnostics.clone(),
                     pending,
                     &mut cancellation_wakes,
                     &mut drain_wakes,
@@ -2872,6 +2877,7 @@ async fn run_supervisor(
                             &lease,
                             &device_id,
                             Arc::clone(&event_ids),
+                            dependencies.diagnostics.clone(),
                             *pending,
                             &mut cancellation_wakes,
                             &mut drain_wakes,
@@ -4152,6 +4158,7 @@ async fn perform_shell_exec(
     lease: &HubStoreHandle,
     device_id: &DeviceId,
     event_ids: Arc<EventIdGenerator>,
+    diagnostics: Option<Arc<EffectDiagnostics>>,
     pending: PendingShellExec,
     cancellation_wakes: &mut tokio::sync::watch::Receiver<u64>,
     drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
@@ -4242,6 +4249,11 @@ async fn perform_shell_exec(
         branch_id: pending.branch_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
+        diagnostics,
+        workspace_root_digest: EffectDiagnostics::workspace_digest(&metadata.cwd),
+        active_tool_name: Arc::new(StdMutex::new(Some("shell_exec".into()))),
+        intent_digests: HashMap::new(),
+        pending_breadcrumbs: HashMap::new(),
     };
     let mut broker = match EffectBroker::new(
         Box::new(journal),
@@ -4904,6 +4916,7 @@ async fn start_turn(
             grant: grant.clone(),
             cli_scope,
             web_search: dependencies.web_search.clone(),
+            diagnostics: dependencies.diagnostics.clone(),
         })
         .await?;
     let mut config = HarnessConfig::for_session(
@@ -7358,7 +7371,8 @@ async fn create_broker_tool_dispatcher(
     let durable_permissions =
         durable_session_tool_state(&context.store, context.store.session_id()).await?;
     let session_id = context.store.session_id().clone();
-    let journal = HubJournalSink::new(&context);
+    let active_tool_name = Arc::new(StdMutex::new(None));
+    let journal = HubJournalSink::new(&context, Arc::clone(&active_tool_name));
     let mut broker = EffectBroker::new(
         Box::new(journal),
         &context.metadata.cwd,
@@ -7413,6 +7427,7 @@ async fn create_broker_tool_dispatcher(
         grant: context.grant,
         cli_scope: context.cli_scope,
         deferred: Mutex::new(HashMap::new()),
+        active_tool_name,
     })))
 }
 
@@ -7484,6 +7499,32 @@ struct BrokerToolDispatcher {
     grant: Option<Grant>,
     cli_scope: Option<Vec<String>>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
+    /// The journal sink reads this only while `broker` is held. Setting it
+    /// after acquiring that mutex keeps concurrent tool calls correctly named.
+    active_tool_name: Arc<StdMutex<Option<String>>>,
+}
+
+struct ActiveToolName {
+    slot: Arc<StdMutex<Option<String>>>,
+}
+
+impl ActiveToolName {
+    fn set(slot: &Arc<StdMutex<Option<String>>>, name: &str) -> ToolResult<Self> {
+        *slot.lock().map_err(|_| ToolError::Runtime {
+            message: "effect diagnostic tool-name lock is poisoned".into(),
+        })? = Some(name.to_owned());
+        Ok(Self {
+            slot: Arc::clone(slot),
+        })
+    }
+}
+
+impl Drop for ActiveToolName {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -8340,6 +8381,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }));
         }
         let mut broker_guard = self.broker.lock().await;
+        let _active_tool = ActiveToolName::set(&self.active_tool_name, name).map_err(tool_error)?;
         let broker = broker_guard.as_mut().ok_or_else(|| {
             HaiderError::new(
                 ErrorCode::Internal,
@@ -10730,23 +10772,81 @@ struct HubJournalSink {
     branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
+    diagnostics: Option<Arc<EffectDiagnostics>>,
+    workspace_root_digest: String,
+    active_tool_name: Arc<StdMutex<Option<String>>>,
+    intent_digests: HashMap<EffectId, String>,
+    pending_breadcrumbs: HashMap<EffectId, EffectBreadcrumb>,
 }
 
 impl HubJournalSink {
-    fn new(context: &WorkerToolContext) -> Self {
+    fn new(context: &WorkerToolContext, active_tool_name: Arc<StdMutex<Option<String>>>) -> Self {
         Self {
             store: context.store.clone(),
             run_id: context.run_id.clone(),
             branch_id: context.branch_id.clone(),
             device_id: context.device_id.clone(),
             event_ids: Arc::clone(&context.event_ids),
+            diagnostics: context.diagnostics.clone(),
+            workspace_root_digest: EffectDiagnostics::workspace_digest(&context.metadata.cwd),
+            active_tool_name,
+            intent_digests: HashMap::new(),
+            pending_breadcrumbs: HashMap::new(),
         }
+    }
+
+    fn breadcrumb(&self, effect: &EffectId) -> ToolResult<EffectBreadcrumb> {
+        let args_digest =
+            self.intent_digests
+                .get(effect)
+                .cloned()
+                .ok_or_else(|| ToolError::Runtime {
+                    message: format!(
+                        "effect diagnostic dispatch {effect} has no preceding intent digest"
+                    ),
+                })?;
+        let tool_name = self
+            .active_tool_name
+            .lock()
+            .map_err(|_| ToolError::Runtime {
+                message: "effect diagnostic tool-name lock is poisoned".into(),
+            })?
+            .clone()
+            .unwrap_or_else(|| "unknown".into());
+        Ok(EffectBreadcrumb {
+            session_id: self.store.session_id().clone(),
+            run_id: self.run_id.clone(),
+            effect_id: effect.clone(),
+            tool_name,
+            workspace_root_digest: self.workspace_root_digest.clone(),
+            args_digest,
+        })
     }
 }
 
 #[async_trait]
 impl JournalSink for HubJournalSink {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        if let EventPayload::Effect(EffectPhase::Intent(intent)) = &payload {
+            self.intent_digests
+                .insert(intent.effect.clone(), intent.args_digest.clone());
+        }
+        let dispatched = match &payload {
+            EventPayload::Effect(EffectPhase::Dispatched { effect })
+                if self.diagnostics.is_some() =>
+            {
+                Some(self.breadcrumb(effect)?)
+            }
+            _ => None,
+        };
+        let completed = match &payload {
+            EventPayload::Effect(EffectPhase::Outcome { effect, .. })
+                if self.diagnostics.is_some() =>
+            {
+                self.pending_breadcrumbs.get(effect).cloned()
+            }
+            _ => None,
+        };
         let mut envelopes = [EventEnvelope {
             schema_version: SCHEMA_VERSION,
             event_id: self.event_ids.next(),
@@ -10777,6 +10877,26 @@ impl JournalSink for HubJournalSink {
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,
             })?;
+        if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, dispatched) {
+            diagnostics
+                .record_start(breadcrumb.clone())
+                .await
+                .map_err(|error| ToolError::Runtime {
+                    message: format!("cannot persist pre-dispatch diagnostic breadcrumb: {error}"),
+                })?;
+            self.pending_breadcrumbs
+                .insert(breadcrumb.effect_id.clone(), breadcrumb);
+        }
+        if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, completed) {
+            diagnostics
+                .record_completion(breadcrumb.clone())
+                .await
+                .map_err(|error| ToolError::Runtime {
+                    message: format!("cannot persist completion diagnostic breadcrumb: {error}"),
+                })?;
+            self.pending_breadcrumbs.remove(&breadcrumb.effect_id);
+            self.intent_digests.remove(&breadcrumb.effect_id);
+        }
         Ok(())
     }
 }

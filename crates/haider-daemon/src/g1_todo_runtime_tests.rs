@@ -74,6 +74,7 @@ impl World {
         let manager = WorkerManager::start(
             hub.clone(),
             WorkerDependencies {
+                diagnostics: None,
                 provider_factory: Arc::new(FixedProviderFactory { provider }),
                 tool_factory: Arc::new(BrokerToolFactory),
                 delegation: None,

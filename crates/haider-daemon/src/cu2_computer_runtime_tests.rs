@@ -565,6 +565,7 @@ async fn explicit_intent_auto_grants_and_tcc_flip_retries_the_parked_action() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: Arc::clone(&provider),
             }),
@@ -717,6 +718,7 @@ async fn permission_poll_timeout_leaves_the_card_actionable_and_undispatched() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory { provider }),
             tool_factory: Arc::new(BrokerToolFactory::with_computer_backend(
                 Arc::clone(&backend) as Arc<dyn ComputerBackend>,
@@ -851,6 +853,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
     let first_manager = WorkerManager::start(
         first_hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: Arc::clone(&provider),
             }),
@@ -944,6 +947,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
     let fresh_manager = WorkerManager::start(
         fresh_hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory { provider }),
             tool_factory: Arc::new(BrokerToolFactory::with_computer_backend(Arc::clone(
                 &fresh_backend,
@@ -1052,6 +1056,7 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: Arc::clone(&provider),
             }),
@@ -1268,6 +1273,7 @@ async fn turn_cancel_emergency_stops_backend_and_journals_computer_cancelled() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: Arc::clone(&provider),
             }),

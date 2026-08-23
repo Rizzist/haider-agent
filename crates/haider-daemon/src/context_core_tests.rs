@@ -134,6 +134,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -510,6 +511,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedWindowProviderFactory {
                 provider: provider.clone(),
                 context_window: 12_000,
@@ -767,6 +769,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
@@ -1010,6 +1013,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     let replay_manager = WorkerManager::start(
         replay_hub.clone(),
         WorkerDependencies {
+            diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: replay_provider.clone(),
             }),
