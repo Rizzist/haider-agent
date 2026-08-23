@@ -994,6 +994,17 @@ be marked compat. `args_preview`/`result_preview` absence means unavailable,
 not empty output. `branch_id` absence means main. Ordinal distinguishes
 multiple rows from the same sequence.
 
+`reasoning` has no independent sequence position. It is a field on the
+assistant row, not an item in the ordering. Therefore no client rendering
+choice for its placement can violate append-only ordering: there is no wire
+order to respect or break. A client MUST NOT infer that field order implies
+temporal order, for this field or as a general habit. Reasoning always precedes
+the response text it produced, so rendering it above the response is the
+correct presentation. This is presentation guidance, not a wire requirement,
+because the wire expresses no ordering here. More generally, when this
+contract states a field's location but not its ordering semantics, a reader
+must not supply the missing semantics by inference.
+
 ### 12.2 Raw item lifecycle to transcript
 
 For an interactive transcript or when the native pipe is unavailable, reduce
