@@ -1753,20 +1753,16 @@ fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
     );
 }
 
-/// CM2f — DELIBERATE re-pin 2026-08-21: subscription/lite caching is now
-/// VERIFIED (codex 0.145 sends a stable per-thread `prompt_cache_key` +
-/// `prompt_cache_retention: "24h"` and reads 13M+ cached tokens; without a
-/// key, live sessions measured ~0%-cached agentic rounds). Lite therefore
-/// carries the derived stable key + the captured retention — and stripping
-/// exactly those two fields restores the CM1 byte-exact request, so cache
-/// annotation never changes model-visible content.
+/// CM2f — subscription/lite caching keeps its stable routing key, but omits
+/// `prompt_cache_retention`: the backend rejects that parameter. Stripping
+/// the key restores the CM1 byte-exact request, so cache annotation never
+/// changes model-visible content.
 ///
-/// MUTATION CHECK (executed): restore the lite refusal in
-/// `openai_prompt_cache_key` (key absent on lite) and the presence pins
-/// fail; vary the derived key across identical requests and the stability
-/// pin fails.
+/// MUTATION CHECK (executed 2026-08-23): restore the rejected retention insert
+/// or suppress OAuth key derivation; the corresponding absence/presence
+/// assertion fails.
 #[test]
-fn cm2f_openai_lite_carries_stable_cache_key_and_retention() {
+fn cm2f_openai_lite_carries_stable_cache_key_without_retention() {
     let mut request = probe_request("gpt-5.6-sol");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
     let with_metadata = responses_request_json(&request, true, None, false).expect("lite wire");
@@ -1783,18 +1779,15 @@ fn cm2f_openai_lite_carries_stable_cache_key_and_retention() {
         Some(key),
         "the cache key must be stable across identical requests"
     );
-    assert_eq!(
-        with_metadata
-            .get("prompt_cache_retention")
-            .and_then(serde_json::Value::as_str),
-        Some("24h"),
+    assert!(
+        with_metadata.get("prompt_cache_retention").is_none(),
+        "lite request must omit backend-rejected prompt_cache_retention: {with_metadata}"
     );
-    // Content invariance: strip exactly the cache annotations and the CM1
-    // unannotated request comes back byte-exact.
+    // Content invariance: strip the cache key and the CM1 unannotated request
+    // comes back byte-exact.
     let mut stripped = with_metadata.clone();
     let object = stripped.as_object_mut().expect("request object");
     object.remove("prompt_cache_key");
-    object.remove("prompt_cache_retention");
     request.cache_metadata = None;
     let baseline = responses_request_json(&request, true, None, false).expect("CM1 wire");
     assert_eq!(stripped, baseline);
@@ -1802,9 +1795,10 @@ fn cm2f_openai_lite_carries_stable_cache_key_and_retention() {
 }
 
 /// OAuth and API-key sessions both receive stable cache routing, while the
-/// provider name keeps their cache domains separate.
+/// provider name keeps their cache domains separate. The OAuth/lite request
+/// must not carry the backend-rejected retention parameter.
 #[test]
-fn cm2f_openai_oauth_cache_key_has_retention_and_is_separate_from_api_key() {
+fn cm2f_openai_oauth_keeps_cache_key_without_retention_and_is_separate_from_api_key() {
     let mut oauth_request = probe_request("gpt-5.6-sol");
     oauth_request.cache_metadata = Some(cm2_cache_metadata(OPENAI_OAUTH_PROVIDER_NAME, 1));
     let oauth_payload =
@@ -1813,11 +1807,14 @@ fn cm2f_openai_oauth_cache_key_has_retention_and_is_separate_from_api_key() {
         .get("prompt_cache_key")
         .and_then(serde_json::Value::as_str)
         .expect("OAuth request carries prompt_cache_key");
+    assert!(
+        oauth_payload.get("prompt_cache_retention").is_none(),
+        "OAuth/lite request must omit backend-rejected prompt_cache_retention: {oauth_payload}"
+    );
     assert_eq!(
-        oauth_payload
-            .get("prompt_cache_retention")
-            .and_then(serde_json::Value::as_str),
-        Some("24h")
+        openai_cache_control_observation(&oauth_request, &oauth_payload),
+        haider_protocol::provider::CacheControlObservationV1::Emitted { ttl_ms: None },
+        "without an accepted retention parameter, cache telemetry must not claim a 24h TTL"
     );
 
     let mut api_key_request = probe_request("gpt-5.6-sol");

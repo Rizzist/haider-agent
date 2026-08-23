@@ -807,11 +807,7 @@ impl Provider for OpenAiProvider {
             "instructions",
             "tools",
         )?;
-        let cache_control = openai_cache_control_observation(
-            request,
-            &full_payload,
-            self.http.codex_responses_lite,
-        );
+        let cache_control = openai_cache_control_observation(request, &full_payload);
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
@@ -2669,11 +2665,6 @@ fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Ve
 /// own `base_url` wins when it carries one (an imported codex credential may
 /// point at a proxy); otherwise the sanctioned subscription base. Always
 /// `{base}/alpha/search` — the same `{provider_base}` join codex performs.
-/// Prompt-cache retention codex 0.145 requests on the subscription lite
-/// dialect (echoed accepted in `response.created`; capture 2026-08-21 —
-/// /Users/rizzist/haider-run/contract-capture-2026-08-21.md).
-const CODEX_LITE_PROMPT_CACHE_RETENTION: &str = "24h";
-
 #[must_use]
 pub fn codex_alpha_search_url(base_url: Option<&str>) -> String {
     let base = base_url
@@ -3930,12 +3921,6 @@ fn responses_request_json_with_boundary(
                 serde_json::json!({"mode": "explicit", "ttl": "30m"}),
             );
         }
-        if codex_responses_lite {
-            object.insert(
-                "prompt_cache_retention".into(),
-                serde_json::json!(CODEX_LITE_PROMPT_CACHE_RETENTION),
-            );
-        }
     }
     // Reasoning object: `summary: auto` + encrypted-content include for
     // reasoning models; lite ADDS the required `context: all_turns` and
@@ -4183,14 +4168,11 @@ fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) ->
 fn openai_cache_control_observation(
     request: &TurnRequest,
     payload: &serde_json::Value,
-    codex_responses_lite: bool,
 ) -> haider_protocol::provider::CacheControlObservationV1 {
     use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
 
     if payload.get("prompt_cache_key").is_some() {
-        let ttl_ms = if codex_responses_lite {
-            Some(24 * 60 * 60 * 1_000)
-        } else if payload.get("prompt_cache_options").is_some() {
+        let ttl_ms = if payload.get("prompt_cache_options").is_some() {
             Some(30 * 60 * 1_000)
         } else {
             None
