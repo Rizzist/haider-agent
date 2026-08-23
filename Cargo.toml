@@ -79,10 +79,10 @@ large_enum_variant = "allow"
 
 [profile.release]
 lto = "thin"
-# Keep line tables and symbols in the shipped artifact so an OS crash offset
-# can be resolved against the embedded HAIDER_BUILD_UUID without disassembly.
-# This increases release artifact size; packaging may instead archive the
-# unstripped artifact under that UUID before applying its own distribution
-# stripping step.
+# Emit a separate dSYM (Mach-O), DWP (ELF), or PDB (MSVC), while retaining the
+# native image identity in the executable. Release packaging must archive that
+# companion by Mach-O UUID / ELF build ID / PDB GUID+age before uploading the
+# stripped executable.
 debug = "line-tables-only"
-strip = "none"
+split-debuginfo = "packed"
+strip = "symbols"

@@ -47,6 +47,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
 const EX_SOFTWARE: u8 = 70;
+// This mitigation makes Tokio workers match the deliberately large daemon
+// entry stack and raises the depth at which accidental recursion overflows.
+// It does not make recursion safe or close this failure class: recursive work
+// must still be bounded or rewritten iteratively, and every worker reserves
+// this much virtual address space while its committed pages grow on demand.
 const DAEMON_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 const CONTENTION_NOTICE_FILE: &str = ".daemon-start-contention.notice";
 const CONTENTION_NOTICE_WINDOW: Duration = Duration::from_secs(60);
@@ -347,13 +352,89 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
 mod tests {
     use super::*;
 
+    const STACK_PROBE_CHILD: &str = "HAIDER_DAEMON_STACK_PROBE_CHILD";
+    const STACK_PROBE_BYTES: usize = 3 * 1024 * 1024;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn create(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "haider-daemond-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path)
+                .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[inline(never)]
+    fn consume_worker_stack() -> u8 {
+        let mut bytes = [0_u8; STACK_PROBE_BYTES];
+        for index in (0..bytes.len()).step_by(4096) {
+            bytes[index] = u8::try_from((index / 4096) % 251).unwrap_or_default();
+        }
+        std::hint::black_box(&bytes);
+        bytes[STACK_PROBE_BYTES - 4096]
+    }
+
+    /// MUTATION PIN (daemon worker stack): remove the `thread_stack_size`
+    /// call from `daemon_runtime`. The isolated child then terminates with
+    /// `thread 'haiderd-worker' has overflowed its stack`, while this parent
+    /// reports a normal assertion failure instead of aborting the test suite.
+    #[test]
+    fn daemon_runtime_workers_have_explicit_stack_headroom() {
+        if std::env::var_os(STACK_PROBE_CHILD).is_some() {
+            let runtime = daemon_runtime()
+                .unwrap_or_else(|error| panic!("construct daemon runtime: {error}"));
+            let touched = runtime.block_on(async {
+                tokio::spawn(async { consume_worker_stack() })
+                    .await
+                    .unwrap_or_else(|error| panic!("join worker stack probe: {error}"))
+            });
+            assert_ne!(touched, 255, "probe must touch every stack page");
+            return;
+        }
+
+        let executable = std::env::current_exe()
+            .unwrap_or_else(|error| panic!("locate current test executable: {error}"));
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "tests::daemon_runtime_workers_have_explicit_stack_headroom",
+                "--nocapture",
+            ])
+            .env(STACK_PROBE_CHILD, "1")
+            .env_remove("TOKIO_WORKER_STACK_SIZE")
+            .output()
+            .unwrap_or_else(|error| panic!("launch isolated stack probe: {error}"));
+        assert!(
+            output.status.success(),
+            "isolated worker stack probe failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[test]
     fn start_contention_notice_is_rate_limited_but_not_silenced() {
-        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        assert!(contention_notice_due_at(root.path(), 1_000));
-        assert!(!contention_notice_due_at(root.path(), 1_001));
+        let root = TestDir::create("contention-notice");
+        assert!(contention_notice_due_at(&root.0, 1_000));
+        assert!(!contention_notice_due_at(&root.0, 1_001));
         assert!(contention_notice_due_at(
-            root.path(),
+            &root.0,
             1_000 + CONTENTION_NOTICE_WINDOW.as_secs()
         ));
     }

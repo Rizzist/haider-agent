@@ -9,6 +9,7 @@ use crate::session_hub::{SessionHub, SessionHubConfig};
 #[cfg(windows)]
 use base64::Engine as _;
 use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
+use haider_platform::{process_group, process_group_exists, process_id, process_leader_exited};
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectIntent, EffectPhase};
@@ -2656,6 +2657,70 @@ async fn fired_count(fixture: &EngineFixture) -> usize {
         .count()
 }
 
+// Outer TEST observation budget only. Server command and idle timeouts remain
+// product-owned and unchanged; full-suite scheduling and SQLite/process I/O
+// may legitimately delay when their already-bounded outcomes become visible.
+const SERVER_MODE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn first_spawn_pid(log: &Path) -> u32 {
+    std::fs::read_to_string(log)
+        .expect("spawn log")
+        .lines()
+        .next()
+        .expect("pid line")
+        .trim()
+        .parse()
+        .expect("numeric server pid")
+}
+
+async fn wait_for_server_fires(fixture: &EngineFixture, expected: usize) {
+    wait_for_with_timeout(fixture, SERVER_MODE_OBSERVATION_TIMEOUT, |events| {
+        events
+            .iter()
+            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+            .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+            .count()
+            >= expected
+    })
+    .await;
+}
+
+async fn wait_for_server_leader_exit(raw_pid: u32) {
+    let pid = process_id(Some(raw_pid)).expect("valid server pid");
+    tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+        loop {
+            match process_leader_exited(pid) {
+                Ok(true) => break,
+                Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
+                // Another task may reap between observations; either result
+                // establishes the test's required "already exited" premise.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => panic!("observe server leader {raw_pid}: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("server leader exit observation deadline");
+}
+
+async fn wait_for_server_group_exit(raw_pid: u32) {
+    tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+        loop {
+            let exists = match process_group(Some(raw_pid)) {
+                Some(group) => process_group_exists(group)
+                    .unwrap_or_else(|error| panic!("observe server group {raw_pid}: {error}")),
+                None => false,
+            };
+            if !exists {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server process-group exit observation deadline");
+}
+
 async fn fire_user_message(fixture: &EngineFixture, index: usize) {
     let generation = fixture.store.worker_generation();
     let mut events = [raw_event(
@@ -2687,18 +2752,7 @@ async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
     let (fixture, spawn_log) = server_fixture(0, RESIDENT_SERVER).await;
     for index in 0..3 {
         fire_user_message(&fixture, index).await;
-        let expected = index + 1;
-        wait_for(&fixture, |events| {
-            events
-                .iter()
-                .filter_map(|event| {
-                    HookEventPayload::from_payload_value(event.payload.clone()).ok()
-                })
-                .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
-                .count()
-                >= expected
-        })
-        .await;
+        wait_for_server_fires(&fixture, index + 1).await;
     }
     assert_eq!(fired_count(&fixture).await, 3, "every event got a response");
     assert_eq!(
@@ -2706,25 +2760,11 @@ async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
         1,
         "idle_timeout_ms=0 keeps ONE resident server across events"
     );
-    let pid = std::fs::read_to_string(&spawn_log)
-        .expect("spawn log")
-        .lines()
-        .next()
-        .expect("pid line")
-        .trim()
-        .to_owned();
+    let pid = first_spawn_pid(&spawn_log);
     fixture.close().await;
-    // Drain killed the resident server: signal 0 delivery must now fail.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let alive = std::process::Command::new("kill")
-        .args(["-0", &pid])
-        .status()
-        .expect("kill probe runs")
-        .success();
-    assert!(
-        !alive,
-        "engine shutdown kills the resident server (pid {pid})"
-    );
+    // Observe the transition instead of assuming a fixed sleep gave the
+    // scheduler enough time to reap the process group under suite load.
+    wait_for_server_group_exit(pid).await;
 }
 
 /// MUTATION CHECK (hooks_server_v1): drop the actor-start shutdown check in
@@ -2760,25 +2800,13 @@ async fn post_shutdown_dispatch_never_spawns_a_server_actor() {
 async fn server_mode_reaps_idle_and_respawns_for_the_next_event() {
     let (fixture, spawn_log) = server_fixture(150, RESIDENT_SERVER).await;
     fire_user_message(&fixture, 0).await;
-    wait_for(&fixture, |events| {
-        events
-            .iter()
-            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
-            .any(|payload| matches!(payload, HookEventPayload::HookFired(_)))
-    })
-    .await;
-    // Idle past the reap deadline: the server is torn down from IDLE only.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_for_server_fires(&fixture, 1).await;
+    let first_pid = first_spawn_pid(&spawn_log);
+    // Elapsed wall time alone does not prove the reaper was scheduled. Observe
+    // the actual process-group transition before asserting respawn.
+    wait_for_server_group_exit(first_pid).await;
     fire_user_message(&fixture, 1).await;
-    wait_for(&fixture, |events| {
-        events
-            .iter()
-            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
-            .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
-            .count()
-            >= 2
-    })
-    .await;
+    wait_for_server_fires(&fixture, 2).await;
     assert_eq!(
         spawn_count(&spawn_log),
         2,
@@ -2795,18 +2823,13 @@ async fn server_mode_respawns_after_the_process_exits() {
     let (fixture, spawn_log) = server_fixture(0, one_shot).await;
     for index in 0..2 {
         fire_user_message(&fixture, index).await;
-        let expected = index + 1;
-        wait_for(&fixture, |events| {
-            events
-                .iter()
-                .filter_map(|event| {
-                    HookEventPayload::from_payload_value(event.payload.clone()).ok()
-                })
-                .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
-                .count()
-                >= expected
-        })
-        .await;
+        wait_for_server_fires(&fixture, index + 1).await;
+        if index == 0 {
+            // Reading the response does not prove the one-shot shell has
+            // exited. Establish the test-name premise before dispatching the
+            // event that is supposed to exercise lazy respawn.
+            wait_for_server_leader_exit(first_spawn_pid(&spawn_log)).await;
+        }
     }
     assert_eq!(
         spawn_count(&spawn_log),
