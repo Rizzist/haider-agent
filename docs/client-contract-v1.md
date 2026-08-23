@@ -515,7 +515,7 @@ empty collection wins over an older fallback.
 | `run_state` | old daemon; current producers populate it |
 | `run_id` | no active run or old daemon; never render a stop action; read with `run_state` from the same summary |
 | `seen_at_ms` | no acknowledgement has ever committed |
-| `last_activity_ms` | no user-relevant committed activity |
+| `last_activity_ms` | no user-relevant committed activity — the session has **no position in an activity ordering**; see 9.2.1 |
 | `waiting_why` | no legacy three-kind park reason; superseded by `needs_input` |
 | `needs_input` | nothing currently requires human input; if present without all answer coordinates it is badgeable but not answerable |
 | `metadata` | legacy/untyped row or old daemon; do not infer configuration |
@@ -535,6 +535,37 @@ empty collection wins over an older fallback.
 | `effort` | provider default or old daemon; do not invent a named effort |
 | `fast` | old daemon. `Some(false)` is real normal mode |
 | `account_alias` | no per-session account seam exists yet; it is currently always absent. Never substitute the global active account |
+
+#### 9.2.1 Ordering sessions by activity
+
+`last_activity_ms` **is** the activity coordinate. It is the field to sort by
+when a surface shows "latest", "recent", or "most active". Naming a field is not
+the same as saying what it is for, and this document previously named it twice —
+once under `session_seen_v1`, once in the table above — without ever stating this.
+
+Do not confuse it with its neighbours. `seen_at_ms` is an acknowledgement
+coordinate, not an activity one; `updated_at` reflects row maintenance, which
+advances for reasons a user never caused.
+
+**When `last_activity_ms` is absent, the session has no position in an activity
+ordering, and no other timestamp may take its place.** In particular, creation
+time answers a different question — *when was this made* rather than *when did
+something happen* — so ordering a never-active session by its creation ranks it
+as though being created were activity. That value is not zero, which makes it
+worse than an obvious sentinel: a rail ordered this way still *looks* ordered,
+and nothing about it appears broken.
+
+Render such sessions as unordered — a separate group, or a position that is
+visibly not an activity rank. Do not interleave them with ranked rows.
+
+This is §1.1 applied to ordering: the prohibition on substituting a calculated
+value covers substituting a *different published* value just as much as an
+invented one. The plausibility of the substitute is what makes it dangerous.
+
+A client's OWN rows, which the harness has never seen, are outside this rule.
+A client may order those by whatever coordinate it defines, because no harness
+fact is being replaced — but it must not present them as ranked by a harness
+activity coordinate they do not have.
 
 `head_seq = 0` is the actual empty journal head. `worker_generation = 0` is not
 a general absence sentinel; generation comparisons use the supplied integer.
