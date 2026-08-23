@@ -177,6 +177,7 @@ pub fn detail_lines(snapshot: &AgentMetricsSnapshot) -> Vec<String> {
             haider_protocol::provider::UsageRequestKind::MainTurn => "main",
             haider_protocol::provider::UsageRequestKind::Compaction => "compaction",
             haider_protocol::provider::UsageRequestKind::DelegatedAgent => "delegated",
+            _ => "unclassified",
         };
         let provider = if breakdown.provider.is_empty() {
             "unknown"

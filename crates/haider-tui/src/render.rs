@@ -2307,7 +2307,7 @@ fn render_usage(
     }
     lines.push(Line::raw(""));
 
-    if !model.cache_usage.is_empty() {
+    if model.cache_usage.has_classified_usage() {
         let cache = model.cache_usage.totals();
         let all_input_share = cache
             .complete_hit_rate()
@@ -2327,6 +2327,12 @@ fn render_usage(
                 theme.dim_style(),
             ),
         ]));
+        if model.cache_usage.has_unclassified_usage() {
+            lines.push(Line::styled(
+                "    unclassified request usage present — excluded from totals and rates",
+                theme.warn_style(),
+            ));
+        }
         lines.push(Line::styled(
             format!(
                 "    input — logical {} · uncached {} · cache read {} · all-input share {all_input_share} · coverage {coverage}",
@@ -2411,6 +2417,7 @@ fn render_usage(
                 haider_protocol::provider::UsageRequestKind::MainTurn => "main",
                 haider_protocol::provider::UsageRequestKind::Compaction => "compaction",
                 haider_protocol::provider::UsageRequestKind::DelegatedAgent => "delegated",
+                _ => "unclassified",
             };
             let provider = if breakdown.provider.is_empty() {
                 "unknown"
@@ -2480,6 +2487,12 @@ fn render_usage(
                 },
             ));
         }
+        lines.push(Line::raw(""));
+    } else if model.cache_usage.has_unclassified_usage() {
+        lines.push(Line::styled(
+            "CURRENT SESSION — unclassified request usage present; excluded from totals and rates",
+            theme.warn_style(),
+        ));
         lines.push(Line::raw(""));
     }
 

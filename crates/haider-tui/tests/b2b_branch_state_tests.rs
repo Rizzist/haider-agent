@@ -402,6 +402,7 @@ fn sibling_compaction_and_footprint_never_leak_into_the_active_branch() {
         normalized: None,
         scope: None,
         cache_cost: None,
+        request: None,
     });
     assert_eq!(
         model.route_raw(&stamped(&sid(0), 4, "b-exp", &usage)),

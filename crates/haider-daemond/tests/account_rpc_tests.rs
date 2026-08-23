@@ -972,6 +972,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
                 normalized: None,
                 scope: None,
                 cache_cost: None,
+                request: None,
             },
         },
         FakeStep::Finish {

@@ -278,6 +278,7 @@ fn pdb_key_from_bytes(bytes: [u8; 16], age: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

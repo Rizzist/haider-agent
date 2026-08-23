@@ -238,6 +238,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
         normalized: None,
         scope: None,
         cache_cost: None,
+        request: None,
     }));
     script.push(EventPayload::RunState(RunState::Done));
     script
@@ -765,6 +766,7 @@ pub fn seed_session_states(first_generation: u64) -> Vec<crate::session::Session
                         normalized: None,
                         scope: None,
                         cache_cost: None,
+                        request: None,
                     },
                 ));
             if let Some(seed) = sample_seed_chip(index) {

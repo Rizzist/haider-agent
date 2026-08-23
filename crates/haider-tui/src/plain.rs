@@ -165,8 +165,13 @@ fn render_plain_impl(
         out.push_str(&readout.plain_text());
         out.push('\n');
     }
+    if cache_usage.is_some_and(crate::cache_usage::SessionUsageFold::has_unclassified_usage) {
+        out.push_str(
+            "cache usage — unclassified request usage present; excluded from totals and rates\n",
+        );
+    }
     let cache_totals = cache_usage
-        .filter(|usage| !usage.is_empty())
+        .filter(|usage| usage.has_classified_usage())
         .map(crate::cache_usage::SessionUsageFold::totals);
     if let Some(totals) = &cache_totals {
         out.push_str(&cache_breakdown_plain(totals));

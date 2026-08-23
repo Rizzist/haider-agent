@@ -36,7 +36,9 @@ use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{Menu, MenuAnswer};
-use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
+use haider_protocol::provider::{
+    Block, CacheStatAvailability, CapabilityDoc, FinishReason, RequestUsage, Usage, UsageSource,
+};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{AttachmentBlock, ToolPermissionDefault};
@@ -67,6 +69,27 @@ use tokio::sync::Semaphore;
 #[derive(Clone)]
 struct FakeFactory {
     fake: Arc<FakeProvider>,
+}
+
+fn expected_request_usage(ordinal: u64, usage: &Usage) -> RequestUsage {
+    RequestUsage {
+        ordinal,
+        input: usage.input,
+        output: usage.output,
+        reasoning: (usage.reasoning > 0).then_some(usage.reasoning),
+        cached: (usage.cached > 0
+            || usage.normalized.as_ref().is_some_and(|normalized| {
+                normalized.cache_status == CacheStatAvailability::Present
+            }))
+        .then_some(usage.cached),
+        source: usage.source,
+        account: usage.account.clone(),
+        normalized: usage.normalized.clone(),
+        cache_cost: usage.cache_cost,
+        // The daemon supplies the request diagnostic from the rendered
+        // provider call; these fixtures only own the response-local usage.
+        cache: None,
+    }
 }
 
 #[async_trait]
@@ -1266,6 +1289,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         normalized: None,
         scope: None,
         cache_cost: None,
+        request: None,
     };
     let fake = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
@@ -1409,12 +1433,22 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         payload,
         EventPayload::Item(haider_protocol::item::ItemEvent::Completed { .. })
     )));
-    // CM1 enriches the journaled Usage with a measurement `scope` (provider/
-    // model/cache-epoch/prefix-digests) the fake provider does not emit; this
-    // test pins billing durability, so compare with scope normalized out.
+    // CM1 enriches the journaled Usage with a measurement `scope` and
+    // request-local cache diagnostic the fake provider does not emit. This
+    // test pins billing durability and request identity, so normalize only
+    // those daemon-owned measurements.
+    let mut expected_usage = usage.clone();
+    expected_usage.request = Some(expected_request_usage(1, &usage));
     assert!(payloads.iter().any(|payload| matches!(
         payload,
-        EventPayload::Usage(actual) if { let mut a = actual.clone(); a.scope = None; a == usage }
+        EventPayload::Usage(actual) if {
+            let mut actual = actual.clone();
+            actual.scope = None;
+            if let Some(request) = &mut actual.request {
+                request.cache = None;
+            }
+            actual == expected_usage
+        }
     )));
     assert!(payloads.contains(&&EventPayload::RunState(RunState::Done)));
     assert!(!run_id.as_str().is_empty());
@@ -1598,6 +1632,10 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
         )
     }));
 
+    // This scenario tests receipt replay across a graceful restart, not the
+    // forced-drain contract. Release the no-longer-used client so shutdown can
+    // close the store and its profile lease before the successor starts.
+    drop(retry);
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
     assert_eq!(fake.requests().len(), 2);
@@ -4598,6 +4636,7 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         normalized: None,
         scope: None,
         cache_cost: None,
+        request: None,
     };
     let second_usage = Usage {
         input: 6,
@@ -4610,6 +4649,7 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         normalized: None,
         scope: None,
         cache_cost: None,
+        request: None,
     };
     let expected_cumulative = Usage {
         input: 16,
@@ -4622,6 +4662,7 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         normalized: None,
         scope: None,
         cache_cost: None,
+        request: Some(expected_request_usage(2, &second_usage)),
     };
     let (dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitReasoning {
@@ -4684,12 +4725,16 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
             _ => None,
         })
         .collect::<Vec<_>>();
-    // CM1 enriches the journaled Usage with a measurement `scope`; pin the
-    // cumulative billing totals with scope normalized out.
+    // CM1 enriches the journaled Usage with a measurement `scope` and the
+    // request-local cache diagnostic; pin the accounting and request identity
+    // with only those daemon-owned measurements normalized out.
     assert_eq!(
         usages.last().map(|u| {
             let mut u = (*u).clone();
             u.scope = None;
+            if let Some(request) = &mut u.request {
+                request.cache = None;
+            }
             u
         }),
         Some(expected_cumulative.clone())
@@ -4848,6 +4893,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             waiting_why: None,
             needs_input: None,
             metadata: Some(metadata.clone()),
+            provider: Some(metadata.provider.clone()),
             workspace_cwd: Some(metadata.cwd.clone()),
             // A just-created session is truly empty: zero committed user
             // turns, so exactly-zero tokens is honest roster truth.
@@ -4859,6 +4905,8 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             // Model truth: no model_selected fact yet, so the fold falls
             // back to the create-time metadata model.
             last_model: Some(metadata.model.clone()),
+            cache_lifetime_hit_basis_points: None,
+            cache_reread_hit_basis_points: None,
             parent_session_id: None,
             // Lineage truth (session_lineage_v1): a session no delegation
             // names is a Root — the live daemon reports it typed.

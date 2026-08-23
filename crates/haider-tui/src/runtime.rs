@@ -2428,6 +2428,7 @@ impl Player {
                 normalized: None,
                 scope: None,
                 cache_cost: None,
+                request: None,
             }))
         };
         for beat in beats {

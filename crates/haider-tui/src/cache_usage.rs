@@ -59,6 +59,20 @@ impl SessionUsageFold {
     }
 
     #[must_use]
+    pub fn has_classified_usage(&self) -> bool {
+        self.chunks
+            .keys()
+            .any(|key| request_kind_rank(key.request_kind).is_some())
+    }
+
+    #[must_use]
+    pub fn has_unclassified_usage(&self) -> bool {
+        self.chunks
+            .keys()
+            .any(|key| request_kind_rank(key.request_kind).is_none())
+    }
+
+    #[must_use]
     pub fn totals(&self) -> CacheUsageStatsV1 {
         let mut totals = CacheUsageStatsV1::default();
         let mut breakdowns: HashMap<
@@ -77,6 +91,9 @@ impl SessionUsageFold {
         let mut has_lane = false;
 
         for (key, usage) in &self.chunks {
+            if request_kind_rank(key.request_kind).is_none() {
+                continue;
+            }
             has_lane = true;
             let normalized = usage.normalized.as_ref();
             let logical = normalized.map_or(usage.input, |usage| usage.logical_input);
@@ -264,11 +281,12 @@ fn merge_cost(target: &mut Option<f64>, source: Option<f64>, target_had_input: b
     };
 }
 
-const fn request_kind_rank(kind: UsageRequestKind) -> u8 {
+const fn request_kind_rank(kind: UsageRequestKind) -> Option<u8> {
     match kind {
-        UsageRequestKind::MainTurn => 0,
-        UsageRequestKind::Compaction => 1,
-        UsageRequestKind::DelegatedAgent => 2,
+        UsageRequestKind::MainTurn => Some(0),
+        UsageRequestKind::Compaction => Some(1),
+        UsageRequestKind::DelegatedAgent => Some(2),
+        _ => None,
     }
 }
 

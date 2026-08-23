@@ -37,6 +37,7 @@ fn usage(run: &str, provider: &str, kind: UsageRequestKind, normalized: Normaliz
             prefix_digests: None,
         }),
         cache_cost: None,
+        request: None,
     }
 }
 
@@ -268,6 +269,53 @@ fn cm1g_session_fold_and_responsive_cache_readout_laws() {
     assert!(
         !draw(&model, 30).contains('⚡'),
         "narrow status drops the cache segment as a unit"
+    );
+}
+
+/// A request kind unknown to this client has no classified meaning, so it is
+/// visible as omitted telemetry but cannot enter known-lane totals or rates.
+///
+/// MUTATION `UNKNOWN_KIND_FOLDS_AS_MAIN_TURN`: change the wildcard in
+/// `request_kind_rank` from `None` to `Some(0)`. The equality below must fail
+/// because the unknown counters are then silently absorbed into the fold.
+#[test]
+fn unknown_request_kind_is_visible_but_excluded_from_classified_totals() {
+    let mut fold = SessionUsageFold::default();
+    fold.note(&usage(
+        "known",
+        "openai",
+        UsageRequestKind::MainTurn,
+        present(100, 900, 10),
+    ));
+    let classified = fold.totals();
+
+    let mut unknown = usage(
+        "future",
+        "openai",
+        UsageRequestKind::Unknown,
+        present(9_000, 0, 500),
+    );
+    unknown.cache_cost = Some(haider_protocol::provider::CacheCostEstimate {
+        input_with_cache_usd: 9.0,
+        input_without_cache_usd: 10.0,
+        estimated_savings_usd: 1.0,
+        explicit_storage_usd: 0.0,
+    });
+    fold.note(&unknown);
+
+    assert_eq!(fold.totals(), classified);
+    assert_eq!(fold.totals().complete_hit_rate(), Some(0.9));
+    assert!(fold.has_unclassified_usage());
+    assert!(
+        fold.totals()
+            .breakdowns
+            .iter()
+            .all(|lane| lane.request_kind != UsageRequestKind::Unknown)
+    );
+    let plain = render_plain_with_cache(&SessionProjection::new(), 200_000, None, &fold);
+    assert!(
+        plain.contains("unclassified request usage present; excluded from totals and rates"),
+        "{plain}"
     );
 }
 
