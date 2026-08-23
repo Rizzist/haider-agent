@@ -156,12 +156,36 @@ variant identifiers. For a tagged enum the tag field is shown in
 parentheses. A `#[serde(other)]` arm also maps any unrecognized incoming
 discriminant to Rust `Unknown`, subject to the reader law above.
 
-Do not normalize acronym spellings between types. In particular,
-`ProviderAuthRequirementWire::OAuth` is `"o_auth"` because its
-`snake_case` rule has no variant override (`crates/haider-rpc/src/frame.rs:792`),
-while `AuthMethod::OAuth` is explicitly renamed to `"oauth"`
+Do not guess or normalize acronym/initialism spellings between types. Read a
+variant's `#[serde(rename = "...")]` first and its enum-level serde rule second.
+In particular, `ProviderAuthRequirementWire::OAuth` is `"o_auth"` because
+serde's `snake_case` conversion sees the capital `O` separately from `Auth`
+and the variant has no override (`crates/haider-rpc/src/frame.rs:792`), while
+`AuthMethod::OAuth` is explicitly renamed to `"oauth"`
 (`crates/haider-protocol/src/credential.rs:32-36`). These are two distinct
 existing wire spellings.
+
+The complete serialized-variant initialism/acronym sweep is below. Local-only
+`WireEncoding::Json` and `CodecError::{InvalidUtf8, Json}` are excluded because
+they have no wire discriminant. The detailed per-enum entries later in this
+appendix list every spelling in context.
+
+| Rust variant(s) | Exact wire spelling(s) | Source of spelling |
+|---|---|---|
+| `AuthMethod::{ApiKey, OAuth}` | `"api_key"`, `"oauth"` | snake case; explicit `OAuth` rename |
+| `EffectClass::{FsRead, FsWrite, GuiAct}` | `"fs_read"`, `"fs_write"`, `"gui_act"` | snake case |
+| `ErrorRecoveryCardKind::{OauthExpired, InvalidApiKey}` | `"oauth_expired"`, `"invalid_api_key"` | snake case |
+| `AnswerVia::{Tui, Gui, Rpc}` | `"tui"`, `"gui"`, `"rpc"` | snake case |
+| `CacheMissClassificationV1::SamePrefixInTtl` | `"same_prefix_in_ttl"` | snake case |
+| `AttachmentBlock::Pdf` | `"pdf"` | snake case |
+| `ClientKind::{Cli, Tui, Gui}` | `"cli"`, `"tui"`, `"gui"` | snake case |
+| `ProviderApiFamilyWire::{OpenAiResponses, OpenAiChatCompletions}` | `"openai_responses"`, `"openai_chat_completions"` | explicit renames |
+| `ProviderAuthRequirementWire::{ApiKey, OAuth}` | `"api_key"`, `"o_auth"` | snake case; `OAuth` is the shipped wart |
+| `AccountAddMethod::OAuth` | `"oauth"` | explicit rename |
+| `StagePurpose::ApiKey` | `"api_key"` | snake case |
+| `RequestBody::{TurnSubmitFromCli, AccountLoginApi, AccountOAuthStart, AccountOAuthStatus, AccountOAuthCancel, AccountOAuthImport}` | `"turn.submit_from_cli"`, `"account.login_api"`, `"account.oauth_start"`, `"account.oauth_status"`, `"account.oauth_cancel"`, `"account.oauth_import"` | explicit method renames |
+| `ResponseBody::{AccountLoginApi, AccountOAuthStart, AccountOAuthStatus, AccountOAuthCancel, AccountOAuthImport}` | `"account.login_api"`, `"account.oauth_start"`, `"account.oauth_status"`, `"account.oauth_cancel"`, `"account.oauth_import"` | explicit method renames |
+| `ErrorData::{PdfTooLarge, PdfTooManyPages, PdfMalformed}` | `"pdf_too_large"`, `"pdf_too_many_pages"`, `"pdf_malformed"` | snake case |
 
 ### `crates/haider-protocol/src/agent.rs`
 

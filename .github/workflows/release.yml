@@ -167,6 +167,24 @@ jobs:
           # stapler cannot attach tickets to raw Mach-O files or ZIP archives.
           # Apple publishes the nested-binary tickets for Gatekeeper to resolve
           # online; the exact signed bytes are packaged below without mutation.
+      - name: archive daemon symbols by native build ID
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
+          RELEASE_DIR=target/${{ matrix.target }}/release
+          DBIN="$RELEASE_DIR/haiderd$EXE"
+          ARCHIVER="$RELEASE_DIR/haider-symbol-archive$EXE"
+          case "$RUNNER_OS" in
+            macOS) SYMBOLS="$RELEASE_DIR/haiderd.dSYM" ;;
+            Linux) SYMBOLS="$RELEASE_DIR/haiderd.dwp" ;;
+            Windows) SYMBOLS="$RELEASE_DIR/haiderd.pdb" ;;
+            *) echo "Unsupported symbol platform: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+
+          "$ARCHIVER" "$DBIN" "$SYMBOLS" "symbols/${{ matrix.target }}"
+          du -sh "symbols/${{ matrix.target }}"
       - name: package
         shell: bash
         run: |
@@ -191,12 +209,24 @@ jobs:
             tar -C dist -cJf dist/$NAME.tar.xz $NAME
             shasum -a 256 dist/$NAME.tar.xz > dist/$NAME.tar.xz.sha256
           fi
-      - uses: actions/upload-artifact@v4
+      - name: upload distribution archives
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: distribution-${{ matrix.target }}
           path: |
             dist/*.tar.*
             dist/*.zip*
+          if-no-files-found: error
+      # Current arm64 macOS line-table symbols are 191 MiB raw / 43.7 MiB
+      # gzip-compressed. Keep this private CI artifact long enough for recent
+      # crash triage without paying unbounded storage on every release.
+      - name: upload native-ID-keyed daemon symbols (30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbols-${{ matrix.target }}
+          path: symbols/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 30
 
   publish:
     needs: build
@@ -206,6 +236,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          pattern: distribution-*
           path: dist
           merge-multiple: true
       - name: create or update release (prerelease until v0.1.0)
@@ -282,6 +313,7 @@ jobs:
           token: ${{ github.token }}
       - uses: actions/download-artifact@v4
         with:
+          pattern: distribution-*
           path: artifacts
           merge-multiple: true
 
@@ -393,6 +425,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          pattern: distribution-*
           path: artifacts
           merge-multiple: true
 

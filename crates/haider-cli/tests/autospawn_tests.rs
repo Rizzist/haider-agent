@@ -8,8 +8,10 @@
 //! through a drop guard, so no test leaks a process past its assertions.
 #![allow(clippy::expect_used)]
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use haider_client::{ProfileEnv, ResolvedProfile, resolve_profile};
@@ -79,6 +81,143 @@ fn haider_command(store: &Path) -> Command {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     command
+}
+
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Waits for a captured child without allowing a broken candidate or launcher
+/// to consume the test runner forever. Every caller supplies the operation it
+/// expects to finish so timeout failures identify the stuck boundary.
+fn wait_for_output(child: Child, waiting_for: &str) -> Output {
+    wait_for_output_with_timeout(child, waiting_for, CHILD_EXIT_TIMEOUT)
+}
+
+fn wait_for_output_with_timeout(mut child: Child, waiting_for: &str, timeout: Duration) -> Output {
+    #[derive(Clone, Copy)]
+    enum CapturedStream {
+        Stdout,
+        Stderr,
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let mut stream_count = 0;
+    if let Some(mut stdout) = child.stdout.take() {
+        stream_count += 1;
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = sender.send((CapturedStream::Stdout, result));
+        });
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        stream_count += 1;
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stderr.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = sender.send((CapturedStream::Stderr, result));
+        });
+    }
+    drop(sender);
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let kill_result = child.kill();
+                let reap_deadline = Instant::now() + Duration::from_millis(250);
+                let reap_result = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break format!("reaped with {status}"),
+                        Ok(None) if Instant::now() < reap_deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Ok(None) => break "still running after kill".to_owned(),
+                        Err(error) => break format!("reap failed: {error}"),
+                    }
+                };
+                panic!(
+                    "timed out after {timeout:?} waiting for {waiting_for}; \
+                     kill result: {kill_result:?}; {reap_result}"
+                );
+            }
+            Err(error) => panic!("poll child while waiting for {waiting_for}: {error}"),
+        }
+    };
+
+    let drain_deadline = Instant::now() + Duration::from_secs(1);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for _ in 0..stream_count {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        let (stream, bytes) = receiver.recv_timeout(remaining).unwrap_or_else(|error| {
+            panic!("drain captured output after waiting for {waiting_for}: {error}")
+        });
+        let bytes = bytes.unwrap_or_else(|error| {
+            panic!("read captured output after waiting for {waiting_for}: {error}")
+        });
+        match stream {
+            CapturedStream::Stdout => stdout = bytes,
+            CapturedStream::Stderr => stderr = bytes,
+        }
+    }
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+fn output_with_timeout(command: &mut Command, waiting_for: &str) -> Output {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn child while waiting for {waiting_for}: {error}"));
+    wait_for_output(child, waiting_for)
+}
+
+#[test]
+fn bounded_child_wait_allows_a_prompt_exit() {
+    let child = Command::new("sh")
+        .args(["-c", "sleep 0.05; printf done"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn prompt child");
+    let output = wait_for_output(child, "prompt fixture child to exit");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"done");
+}
+
+#[test]
+fn bounded_child_wait_failure_names_the_stuck_operation() {
+    let child = Command::new("sh")
+        .args(["-c", "sleep 60"])
+        .spawn()
+        .expect("spawn stalled child");
+    let panic = std::panic::catch_unwind(|| {
+        wait_for_output_with_timeout(
+            child,
+            "deliberately stalled fixture child to exit",
+            Duration::from_millis(50),
+        )
+    })
+    .expect_err("stalled child must time out");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        message.contains("waiting for deliberately stalled fixture child to exit"),
+        "timeout must name the stuck operation: {message}"
+    );
 }
 
 /// Kills the profile's daemon (via the advisory pid in the readable owner
@@ -173,8 +312,8 @@ fn two_simultaneous_launchers_elect_one_daemon_and_both_reach_ready() {
     let second = haider_command(store.path())
         .spawn()
         .expect("spawn second haider");
-    let first = first.wait_with_output().expect("first haider output");
-    let second = second.wait_with_output().expect("second haider output");
+    let first = wait_for_output(first, "first simultaneous haider launcher to exit");
+    let second = wait_for_output(second, "second simultaneous haider launcher to exit");
     for (name, output) in [("first", &first), ("second", &second)] {
         assert!(
             output.status.success(),
@@ -192,9 +331,10 @@ fn two_simultaneous_launchers_elect_one_daemon_and_both_reach_ready() {
     // Exactly one daemon serves the shared endpoint afterward, and a third
     // launcher attaches without spawning.
     assert_daemon_serves(&profile);
-    let third = haider_command(store.path())
-        .output()
-        .expect("third haider output");
+    let third = output_with_timeout(
+        &mut haider_command(store.path()),
+        "third haider launcher to attach and exit",
+    );
     assert!(third.status.success());
     assert!(
         String::from_utf8_lossy(&third.stdout).contains("already running"),
@@ -237,9 +377,10 @@ fn stale_owner_socket_is_recovered_by_the_winning_daemon() {
         "stale socket node must exist"
     );
 
-    let output = haider_command(store.path())
-        .output()
-        .expect("haider output over stale socket");
+    let output = output_with_timeout(
+        &mut haider_command(store.path()),
+        "haider launcher to recover the stale socket and exit",
+    );
     assert!(
         output.status.success(),
         "launcher must recover through the daemon: stdout {} stderr {}",
@@ -265,9 +406,10 @@ fn parent_exit_leaves_the_daemon_running() {
         store: store.path().to_path_buf(),
     };
 
-    let output = haider_command(store.path())
-        .output()
-        .expect("haider output");
+    let output = output_with_timeout(
+        &mut haider_command(store.path()),
+        "haider launcher to spawn the persistent daemon and exit",
+    );
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("daemon ready"));
@@ -308,7 +450,7 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
         store: store.path().to_path_buf(),
     };
 
-    let mut winner = Command::new(&haiderd)
+    let winner = Command::new(&haiderd)
         .arg("--profile")
         .arg(&profile.profile_id)
         .arg("--store-dir")
@@ -330,15 +472,16 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
         "winner must bind its endpoint"
     );
 
-    let loser = Command::new(&haiderd)
-        .arg("--profile")
-        .arg(&profile.profile_id)
-        .arg("--store-dir")
-        .arg(&profile.store_dir)
-        .arg("--runtime-dir")
-        .arg(&profile.runtime_dir)
-        .output()
-        .expect("second candidate output");
+    let loser = output_with_timeout(
+        Command::new(&haiderd)
+            .arg("--profile")
+            .arg(&profile.profile_id)
+            .arg("--store-dir")
+            .arg(&profile.store_dir)
+            .arg("--runtime-dir")
+            .arg(&profile.runtime_dir),
+        "second daemon candidate to concede the profile lock and exit",
+    );
     assert_eq!(
         loser.status.code(),
         Some(75),
@@ -347,5 +490,5 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
     );
 
     guard.terminate_and_wait(&profile.endpoint_path);
-    let _ = winner.wait();
+    let _ = wait_for_output(winner, "winning daemon to exit after test cleanup");
 }

@@ -47,6 +47,32 @@ fn availability_compat_fixture_path() -> PathBuf {
         .join("snapshot_availability_compat_v1.json")
 }
 
+#[test]
+fn provider_auth_oauth_wire_wart_is_stable_and_documented() {
+    let encoded = serde_json::to_string(&haider_rpc::ProviderAuthRequirementWire::OAuth)
+        .expect("serialize provider OAuth requirement");
+    assert_eq!(
+        encoded, r#""o_auth""#,
+        "the shipped ProviderAuthRequirementWire spelling must not be normalized"
+    );
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let audit = std::fs::read_to_string(workspace.join("docs/client-contract-v1-enum-audit.md"))
+        .expect("read enum audit");
+    assert!(
+        audit.contains(
+            "`ProviderAuthRequirementWire::{ApiKey, OAuth}` | `\"api_key\"`, `\"o_auth\"`"
+        ),
+        "the initialism sweep must list the shipped o_auth wart"
+    );
+    let contract = std::fs::read_to_string(workspace.join("docs/client-contract-v1.md"))
+        .expect("read client contract");
+    assert!(
+        contract.contains("Rust `OAuth` becomes\n`\"o_auth\"`"),
+        "the contract must warn that source-derived snake case splits OAuth"
+    );
+}
+
 fn request_methods_declared_in_source() -> BTreeSet<String> {
     let source =
         std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/frame.rs"))

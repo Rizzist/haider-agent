@@ -1075,6 +1075,13 @@ a raw additive event family. Others explicitly absorb unknown variants. The
 complete classification is normative in
 [Client contract v1 — wire enum audit](client-contract-v1-enum-audit.md).
 
+Never derive an enum's wire spelling from its Rust variant name. Read the
+variant's `#[serde(rename = "...")]` first, then its enum-level serde rule, and
+use the exact-spelling audit below. This is especially important for
+initialisms: under serde `rename_all = "snake_case"`, Rust `OAuth` becomes
+`"o_auth"`, while an explicit per-variant rename can make another `OAuth`
+variant serialize as `"oauth"`.
+
 ## 15. Compatibility fixtures and change law
 
 The machine-checkable contract lives in these fixtures/tests:
