@@ -5,7 +5,7 @@
 //! for this profile is already running).
 
 use haider_daemon::{
-    BUILD_UUID, BUILD_VERSION, DaemonConfig, DaemonDependencies, DaemonError, ProviderFactory,
+    BUILD_UUID, BUILD_VERSION, DaemonConfig, DaemonDependencies, ProviderFactory,
     ProviderFactoryConfig, ResolvedTurnProvider, ShutdownOutcome, process_started_unix_ms,
     run_with_signals_and_dependencies,
 };
@@ -15,7 +15,6 @@ use haider_provider::FakeProvider;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// TEST-ONLY seam, OFF by default (W3c3 M3).
 ///
@@ -53,8 +52,6 @@ const EX_SOFTWARE: u8 = 70;
 // must still be bounded or rewritten iteratively, and every worker reserves
 // this much virtual address space while its committed pages grow on demand.
 const DAEMON_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
-const CONTENTION_NOTICE_FILE: &str = ".daemon-start-contention.notice";
-const CONTENTION_NOTICE_WINDOW: Duration = Duration::from_secs(60);
 
 #[cfg(not(windows))]
 fn main() -> ExitCode {
@@ -148,16 +145,15 @@ async fn dispatch() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    let store_dir = config.store_dir.clone();
     match run_with_signals_and_dependencies(config, dependencies).await {
         Ok(ShutdownOutcome::Graceful) => ExitCode::SUCCESS,
         Ok(ShutdownOutcome::Forced) => ExitCode::from(130),
         Err(error) => {
-            if !matches!(&error, DaemonError::AlreadyRunning { .. })
-                || contention_notice_due(&store_dir)
-            {
-                eprintln!("haiderd: {error}");
-            }
+            // Every spawned candidate owns a distinct output file. Suppressing
+            // repeated lock-contention errors at the profile level therefore
+            // creates convincing-but-empty process logs and hides the only
+            // event that process experienced.
+            eprintln!("haiderd: {error}");
             ExitCode::from(error.exit_code())
         }
     }
@@ -172,53 +168,6 @@ fn safe_thread_name(name: &str) -> String {
         name.to_owned()
     } else {
         "redacted".into()
-    }
-}
-
-fn contention_notice_due(store_dir: &std::path::Path) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    contention_notice_due_at(store_dir, now)
-}
-
-fn contention_notice_due_at(store_dir: &std::path::Path, now_secs: u64) -> bool {
-    let path = store_dir.join(CONTENTION_NOTICE_FILE);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    match options.open(&path) {
-        Ok(mut marker) => {
-            use std::io::Write as _;
-            let _ = writeln!(marker, "{now_secs}");
-            let _ = marker.sync_data();
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let prior = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok());
-            if prior.is_some_and(|prior| {
-                now_secs.saturating_sub(prior) < CONTENTION_NOTICE_WINDOW.as_secs()
-            }) {
-                return false;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => contention_notice_due_at(store_dir, now_secs),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    contention_notice_due_at(store_dir, now_secs)
-                }
-                Err(_) => false,
-            }
-        }
-        // If the de-duplication marker itself is unavailable, retain evidence
-        // by logging rather than silently losing the contention diagnostic.
-        Err(_) => true,
     }
 }
 
@@ -355,30 +304,6 @@ mod tests {
     const STACK_PROBE_CHILD: &str = "HAIDER_DAEMON_STACK_PROBE_CHILD";
     const STACK_PROBE_BYTES: usize = 3 * 1024 * 1024;
 
-    struct TestDir(std::path::PathBuf);
-
-    impl TestDir {
-        fn create(label: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "haider-daemond-{label}-{}-{nonce}",
-                std::process::id()
-            ));
-            std::fs::create_dir(&path)
-                .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[inline(never)]
     fn consume_worker_stack() -> u8 {
         let mut bytes = [0_u8; STACK_PROBE_BYTES];
@@ -426,16 +351,5 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-    }
-
-    #[test]
-    fn start_contention_notice_is_rate_limited_but_not_silenced() {
-        let root = TestDir::create("contention-notice");
-        assert!(contention_notice_due_at(&root.0, 1_000));
-        assert!(!contention_notice_due_at(&root.0, 1_001));
-        assert!(contention_notice_due_at(
-            &root.0,
-            1_000 + CONTENTION_NOTICE_WINDOW.as_secs()
-        ));
     }
 }

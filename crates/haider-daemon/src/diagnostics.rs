@@ -446,6 +446,19 @@ mod tests {
             .unwrap_or_else(|error| panic!("spawn abrupt child: {error}"));
         assert_eq!(status.code(), Some(ABRUPT_CHILD_EXIT));
 
+        let journal = std::fs::read_to_string(root.path().join(EFFECT_DIAGNOSTIC_FILE))
+            .unwrap_or_else(|error| panic!("inspect crash journal: {error}"));
+        let records = journal
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<DiagnosticRecord>(line)
+                    .unwrap_or_else(|error| panic!("decode produced breadcrumb: {error}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "the child must produce one real record");
+        assert_eq!(records[0].phase, RecordPhase::Start);
+        assert_eq!(records[0].effect_id, "effect-diag");
+
         let (second, evidence) = EffectDiagnostics::open(root.path().to_path_buf())
             .await
             .unwrap_or_else(|error| panic!("open after crash: {error}"));

@@ -779,6 +779,7 @@ async fn binding_baseline_requires_view_or_control_capability() {
             WireFrame::ResidentSessionBinding {
                 session_id: None,
                 worker_generation,
+                ..
             } if *worker_generation > 0
         ),
         "a control-only connection must receive the explicit unbound baseline, got {control_baseline:?}"
@@ -864,6 +865,7 @@ async fn view_connection_receives_exactly_one_unbound_baseline_after_welcome() {
         WireFrame::ResidentSessionBinding {
             session_id,
             worker_generation,
+            ..
         } => {
             assert!(
                 session_id.is_none(),
