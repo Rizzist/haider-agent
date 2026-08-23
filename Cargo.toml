@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.943"
+version = "0.0.944"
 edition = "2024"
 license = "LicenseRef-KOA-P-1.0"
 repository = "https://github.com/Rizzist/haider-agent"
