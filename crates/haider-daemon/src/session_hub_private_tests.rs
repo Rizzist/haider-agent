@@ -2250,7 +2250,8 @@ async fn session_pipe_path_resolves_absolute_path_and_rejects_unknown_session() 
 
     let expected_path = root
         .path()
-        .join("pipe/pipe-path-rpc-session.pipe")
+        .join("pipe")
+        .join("pipe-path-rpc-session.pipe")
         .to_string_lossy()
         .into_owned();
     {

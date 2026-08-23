@@ -37,6 +37,27 @@ struct ServerHandle {
     digest: String,
     workspace_cwd: PathBuf,
     run_scope: Option<(SessionId, RunId)>,
+    #[cfg(test)]
+    test_state: Arc<ServerTestState>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct ServerTestState {
+    leader_pid: std::sync::atomic::AtomicU32,
+    running: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl ServerTestState {
+    pub(super) fn leader_pid(&self) -> Option<u32> {
+        let pid = self.leader_pid.load(std::sync::atomic::Ordering::SeqCst);
+        (pid != 0).then_some(pid)
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -72,6 +93,22 @@ impl HookServerRegistry {
                         let actor_service = service.clone();
                         let actor_definition = definition.clone();
                         let actor_run_override = run_scope.is_some();
+                        #[cfg(test)]
+                        let test_state = Arc::new(ServerTestState::default());
+                        #[cfg(test)]
+                        let actor_test_state = Arc::clone(&test_state);
+                        #[cfg(test)]
+                        let task = tokio::spawn(async move {
+                            run_server_actor(
+                                actor_service,
+                                actor_definition,
+                                receiver,
+                                actor_run_override,
+                                actor_test_state,
+                            )
+                            .await;
+                        });
+                        #[cfg(not(test))]
                         let task = tokio::spawn(async move {
                             run_server_actor(
                                 actor_service,
@@ -88,6 +125,8 @@ impl HookServerRegistry {
                             digest: definition.digest.clone(),
                             workspace_cwd: definition.workspace_cwd.clone(),
                             run_scope: run_scope.clone(),
+                            #[cfg(test)]
+                            test_state,
                         }
                     })
                     .sender
@@ -169,6 +208,18 @@ impl HookServerRegistry {
         self.remove_where(|_| true);
     }
 
+    #[cfg(test)]
+    pub(super) fn only_test_state(&self) -> Option<Arc<ServerTestState>> {
+        let handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (handles.len() == 1)
+            .then(|| handles.values().next())
+            .flatten()
+            .map(|handle| Arc::clone(&handle.test_state))
+    }
+
     fn remove_where(&self, mut remove: impl FnMut(&ServerHandle) -> bool) {
         let mut handles = self
             .handles
@@ -190,6 +241,8 @@ struct ServerProcess {
     stdin: tokio::process::ChildStdin,
     stdout: BufReader<tokio::process::ChildStdout>,
     group: ProcessGroupGuard,
+    #[cfg(test)]
+    test_state: Arc<ServerTestState>,
 }
 
 impl ServerProcess {
@@ -200,11 +253,21 @@ impl ServerProcess {
     }
 }
 
+#[cfg(test)]
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        self.test_state
+            .running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 async fn run_server_actor(
     service: HookService,
     definition: HookDefinition,
     mut requests: mpsc::Receiver<ServerRequest>,
     run_override: bool,
+    #[cfg(test)] test_state: Arc<ServerTestState>,
 ) {
     let HookKind::Server { idle_timeout_ms } = definition.kind else {
         return;
@@ -302,7 +365,11 @@ async fn run_server_actor(
             return;
         }
         if process.is_none() {
-            match spawn_server(&definition) {
+            #[cfg(test)]
+            let spawned = spawn_server(&definition, Arc::clone(&test_state));
+            #[cfg(not(test))]
+            let spawned = spawn_server(&definition);
+            match spawned {
                 Ok(spawned) => process = Some(spawned),
                 Err(reason) => {
                     let _ = request
@@ -413,7 +480,10 @@ async fn run_server_event(
     }
 }
 
-fn spawn_server(definition: &HookDefinition) -> Result<ServerProcess, String> {
+fn spawn_server(
+    definition: &HookDefinition,
+    #[cfg(test)] test_state: Arc<ServerTestState>,
+) -> Result<ServerProcess, String> {
     let cwd_fd = open_canonical_directory(&definition.workspace_cwd)
         .ok_or_else(|| "workspace cwd is no longer canonical".to_owned())?;
     let mut command = hook_command(&definition.command);
@@ -457,11 +527,22 @@ fn spawn_server(definition: &HookDefinition) -> Result<ServerProcess, String> {
         let _ = child.start_kill();
         "hook server stdout unavailable".to_owned()
     })?;
+    #[cfg(test)]
+    {
+        test_state
+            .leader_pid
+            .store(raw_pid, std::sync::atomic::Ordering::SeqCst);
+        test_state
+            .running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     Ok(ServerProcess {
         child,
         stdin,
         stdout: BufReader::new(stdout),
         group,
+        #[cfg(test)]
+        test_state,
     })
 }
 

@@ -9,7 +9,7 @@ use crate::session_hub::{SessionHub, SessionHubConfig};
 #[cfg(windows)]
 use base64::Engine as _;
 use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
-use haider_platform::{process_group, process_group_exists, process_id, process_leader_exited};
+use haider_platform::{process_id, process_leader_exited};
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectIntent, EffectPhase};
@@ -26,6 +26,7 @@ use haider_protocol::tool::AttachmentBlock;
 use haider_rpc::{CommandId, HookTrustStateWire};
 use haider_tools::{EffectBroker, JournalSink, PermissionPolicy, ProcessExec, ToolResult};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn canonical(path: &Path) -> PathBuf {
@@ -2600,7 +2601,7 @@ fn write_server_hook(workspace: &Path, command: &str, idle_timeout_ms: u64) {
 
 async fn server_fixture(
     idle_timeout_ms: u64,
-    script_body: &str,
+    kind: TestServerKind,
 ) -> (EngineFixture, std::path::PathBuf) {
     let fixture = EngineFixture::start_with_event_and_trust(
         "printf placeholder",
@@ -2612,17 +2613,8 @@ async fn server_fixture(
     )
     .await;
     let spawn_log = fixture.workspace.join("spawns.log");
-    let script = fixture.workspace.join("server.sh");
-    std::fs::write(
-        &script,
-        script_body.replace("SPAWN_LOG", spawn_log.to_str().expect("UTF-8 log path")),
-    )
-    .expect("write server script");
-    write_server_hook(
-        &fixture.workspace,
-        &format!("/bin/sh {}", script.display()),
-        idle_timeout_ms,
-    );
+    let command = server_command(&fixture.workspace, &spawn_log, kind);
+    write_server_hook(&fixture.workspace, &command, idle_timeout_ms);
     let (_, _, hooks) = fixture
         .service
         .list(fixture.workspace.clone())
@@ -2639,6 +2631,42 @@ async fn server_fixture(
         .await
         .expect("trust server hook");
     (fixture, spawn_log)
+}
+
+#[derive(Clone, Copy)]
+enum TestServerKind {
+    Resident,
+    OneShot,
+}
+
+#[cfg(unix)]
+fn server_command(_workspace: &Path, spawn_log: &Path, kind: TestServerKind) -> String {
+    let prefix = format!("printf 'spawn\\n' >> '{}'", spawn_log.display());
+    match kind {
+        TestServerKind::Resident => {
+            format!("{prefix}; while IFS= read -r line; do printf '\"ok\"\\n'; done")
+        }
+        TestServerKind::OneShot => {
+            format!("{prefix}; IFS= read -r line; printf '\"ok\"\\n'")
+        }
+    }
+}
+
+#[cfg(windows)]
+fn server_command(workspace: &Path, spawn_log: &Path, kind: TestServerKind) -> String {
+    let script = workspace.join("server.cmd");
+    let body = match kind {
+        TestServerKind::Resident => format!(
+            "@echo off\r\n>>\"{}\" echo spawn\r\n:read\r\nset \"line=\"\r\nset /p \"line=\" || exit /b 0\r\necho \"ok\"\r\ngoto read\r\n",
+            spawn_log.display()
+        ),
+        TestServerKind::OneShot => format!(
+            "@echo off\r\n>>\"{}\" echo spawn\r\nset \"line=\"\r\nset /p \"line=\" || exit /b 0\r\necho \"ok\"\r\n",
+            spawn_log.display()
+        ),
+    };
+    std::fs::write(&script, body).expect("write Windows server script");
+    format!("\"{}\"", script.display())
 }
 
 fn spawn_count(log: &Path) -> usize {
@@ -2662,15 +2690,13 @@ async fn fired_count(fixture: &EngineFixture) -> usize {
 // may legitimately delay when their already-bounded outcomes become visible.
 const SERVER_MODE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn first_spawn_pid(log: &Path) -> u32 {
-    std::fs::read_to_string(log)
-        .expect("spawn log")
-        .lines()
-        .next()
-        .expect("pid line")
-        .trim()
-        .parse()
-        .expect("numeric server pid")
+fn server_test_state(fixture: &EngineFixture) -> Arc<super::hooks_server::ServerTestState> {
+    fixture
+        .service
+        .inner
+        .servers
+        .only_test_state()
+        .expect("fixture owns exactly one server actor")
 }
 
 async fn wait_for_server_fires(fixture: &EngineFixture, expected: usize) {
@@ -2692,9 +2718,9 @@ async fn wait_for_server_leader_exit(raw_pid: u32) {
             match process_leader_exited(pid) {
                 Ok(true) => break,
                 Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
-                // Another task may reap between observations; either result
-                // establishes the test's required "already exited" premise.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                // Tokio may reap between observations. Not-found everywhere,
+                // and ECHILD on Unix, both establish the required premise.
+                Err(error) if process_observation_means_exited(&error) => break,
                 Err(error) => panic!("observe server leader {raw_pid}: {error}"),
             }
         }
@@ -2703,22 +2729,25 @@ async fn wait_for_server_leader_exit(raw_pid: u32) {
     .expect("server leader exit observation deadline");
 }
 
-async fn wait_for_server_group_exit(raw_pid: u32) {
+fn process_observation_means_exited(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) {
+        return true;
+    }
+    false
+}
+
+async fn wait_for_server_stopped(state: &super::hooks_server::ServerTestState) {
     tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
-        loop {
-            let exists = match process_group(Some(raw_pid)) {
-                Some(group) => process_group_exists(group)
-                    .unwrap_or_else(|error| panic!("observe server group {raw_pid}: {error}")),
-                None => false,
-            };
-            if !exists {
-                break;
-            }
+        while state.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("server process-group exit observation deadline");
+    .expect("server actor stop observation deadline");
 }
 
 async fn fire_user_message(fixture: &EngineFixture, index: usize) {
@@ -2741,15 +2770,12 @@ async fn fire_user_message(fixture: &EngineFixture, index: usize) {
         .expect("append user message fact");
 }
 
-const RESIDENT_SERVER: &str =
-    "echo $$ >> SPAWN_LOG\nwhile IFS= read -r line; do printf '\"ok\"\\n'; done\n";
-
 /// MUTATION CHECK (hooks_server_v1): make server-mode dispatch spawn per
 /// event like spawn mode. Expected runtime failure: the spawn log below
 /// records three pids instead of one.
 #[tokio::test]
 async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
-    let (fixture, spawn_log) = server_fixture(0, RESIDENT_SERVER).await;
+    let (fixture, spawn_log) = server_fixture(0, TestServerKind::Resident).await;
     for index in 0..3 {
         fire_user_message(&fixture, index).await;
         wait_for_server_fires(&fixture, index + 1).await;
@@ -2760,11 +2786,16 @@ async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
         1,
         "idle_timeout_ms=0 keeps ONE resident server across events"
     );
-    let pid = first_spawn_pid(&spawn_log);
+    let state = server_test_state(&fixture);
+    assert!(
+        state.is_running(),
+        "the resident server is live before drain"
+    );
     fixture.close().await;
-    // Observe the transition instead of assuming a fixed sleep gave the
-    // scheduler enough time to reap the process group under suite load.
-    wait_for_server_group_exit(pid).await;
+    assert!(
+        !state.is_running(),
+        "engine drain waits until the resident server is dropped"
+    );
 }
 
 /// MUTATION CHECK (hooks_server_v1): drop the actor-start shutdown check in
@@ -2774,7 +2805,7 @@ async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
 /// log below gains a line.
 #[tokio::test]
 async fn post_shutdown_dispatch_never_spawns_a_server_actor() {
-    let (fixture, spawn_log) = server_fixture(0, RESIDENT_SERVER).await;
+    let (fixture, spawn_log) = server_fixture(0, TestServerKind::Resident).await;
     // Reproduce the shutdown window deterministically: the flag has flipped
     // and the registry has drained, but the engine is still draining queued
     // commits (`HookEngine::shutdown` only ENQUEUES its Shutdown message, so
@@ -2798,13 +2829,13 @@ async fn post_shutdown_dispatch_never_spawns_a_server_actor() {
 /// reuses the first pid and the spawn log stays at one line.
 #[tokio::test]
 async fn server_mode_reaps_idle_and_respawns_for_the_next_event() {
-    let (fixture, spawn_log) = server_fixture(150, RESIDENT_SERVER).await;
+    let (fixture, spawn_log) = server_fixture(150, TestServerKind::Resident).await;
     fire_user_message(&fixture, 0).await;
     wait_for_server_fires(&fixture, 1).await;
-    let first_pid = first_spawn_pid(&spawn_log);
-    // Elapsed wall time alone does not prove the reaper was scheduled. Observe
-    // the actual process-group transition before asserting respawn.
-    wait_for_server_group_exit(first_pid).await;
+    let state = server_test_state(&fixture);
+    // The actor flips this only when its idle branch has killed and dropped
+    // the process. This is the product synchronization point, not wall time.
+    wait_for_server_stopped(&state).await;
     fire_user_message(&fixture, 1).await;
     wait_for_server_fires(&fixture, 2).await;
     assert_eq!(
@@ -2819,16 +2850,17 @@ async fn server_mode_reaps_idle_and_respawns_for_the_next_event() {
 /// view: the NEXT event respawns and still succeeds — no wedged hook.
 #[tokio::test]
 async fn server_mode_respawns_after_the_process_exits() {
-    let one_shot = "echo $$ >> SPAWN_LOG\nIFS= read -r line\nprintf '\"ok\"\\n'\n";
-    let (fixture, spawn_log) = server_fixture(0, one_shot).await;
+    let (fixture, spawn_log) = server_fixture(0, TestServerKind::OneShot).await;
     for index in 0..2 {
         fire_user_message(&fixture, index).await;
         wait_for_server_fires(&fixture, index + 1).await;
         if index == 0 {
-            // Reading the response does not prove the one-shot shell has
-            // exited. Establish the test-name premise before dispatching the
-            // event that is supposed to exercise lazy respawn.
-            wait_for_server_leader_exit(first_spawn_pid(&spawn_log)).await;
+            // Read the daemon-owned PID, not a nested script's `$$`: shell
+            // tail-exec is an optimization and differs across Unix variants.
+            let pid = server_test_state(&fixture)
+                .leader_pid()
+                .expect("server leader pid");
+            wait_for_server_leader_exit(pid).await;
         }
     }
     assert_eq!(
