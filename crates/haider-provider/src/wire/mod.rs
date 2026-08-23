@@ -1462,6 +1462,7 @@ impl StreamState {
                     normalized: Some(normalized),
                     scope: None,
                     cache_cost: None,
+                    request: None,
                 })])
             }
             WireEvent::MessageStop => {

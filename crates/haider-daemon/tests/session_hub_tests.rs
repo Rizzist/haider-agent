@@ -190,6 +190,7 @@ fn cache_rate_usage_envelope(
             prefix_digests: None,
         }),
         cache_cost: None,
+        request: None,
     }))
     .expect("cache-rate usage serializes");
     envelope
@@ -1660,6 +1661,7 @@ async fn command_cache_epoch_confirmation_parks_and_resumes_through_menu_answer(
             prefix_digests: None,
         }),
         cache_cost: None,
+        request: None,
     }))
     .expect("usage encodes");
     hub.append(&mut [usage]).await.expect("warm scope commits");
@@ -2110,6 +2112,7 @@ async fn append_fleet_metrics(
                 prefix_digests: None,
             }),
             cache_cost: None,
+            request: None,
         }))
         .expect("usage event"),
     );

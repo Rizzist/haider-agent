@@ -759,6 +759,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
                 }),
                 scope: None,
                 cache_cost: None,
+                request: None,
             },
         },
         FakeStep::Finish {

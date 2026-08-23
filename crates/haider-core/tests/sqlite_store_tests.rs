@@ -8,9 +8,11 @@ use haider_core::{
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
+use haider_protocol::cache::CACHE_REQUEST_ATTEMPT_EXTENSION_KIND;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{BranchId, DeviceId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, SessionId};
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep};
@@ -295,6 +297,94 @@ async fn explicit_close_releases_lock_for_immediate_reopen() {
         .expect("immediate reopen completes")
         .expect("profile lock was released");
     reopened.close().await.expect("reopened handle closes");
+}
+
+#[tokio::test]
+async fn cache_request_attempt_sqlite_write_cost_is_measured() {
+    let root = tempfile::tempdir().expect("temporary profile");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("real store opens");
+    let actor_store: Arc<dyn StoreHandle> = Arc::new(store.clone());
+    let (actor, handle) =
+        HarnessActor::new(config(store.worker_generation()), provider(), actor_store);
+    let actor = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("measure one diagnostic write"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    finish_actor(handle, actor).await;
+
+    let replay = store
+        .read(&SessionId::new(SESSION), 0, usize::MAX)
+        .await
+        .expect("turn reads");
+    let mut templates = replay
+        .into_iter()
+        .filter(|envelope| {
+            matches!(
+                typed(envelope),
+                EventPayload::Item(ItemEvent::Started {
+                    item: TurnItem::Extension { ref kind, .. },
+                    ..
+                }) | EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { ref kind, .. },
+                    ..
+                }) if kind == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(templates.len(), 2, "one dispatch writes one item lifecycle");
+    let diagnostic_bytes = match typed(&templates[1]) {
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { data, .. },
+            ..
+        }) => serde_json::to_vec(&data)
+            .expect("diagnostic data serializes")
+            .len(),
+        _ => unreachable!("filtered completed cache diagnostic"),
+    };
+    let journal_bytes = templates
+        .iter()
+        .map(|envelope| {
+            serde_json::to_vec(envelope)
+                .expect("envelope serializes")
+                .len()
+        })
+        .sum::<usize>();
+
+    let mut latencies = Vec::with_capacity(200);
+    for sample in 0..200_u64 {
+        for (part, envelope) in templates.iter_mut().enumerate() {
+            envelope.event_id = EventId::new(format!("cache-cost-{sample}-{part}"));
+            envelope.seq = 0;
+            envelope.committed_at_ms = 0;
+        }
+        let started = std::time::Instant::now();
+        store
+            .append(&mut templates)
+            .await
+            .expect("diagnostic batch appends");
+        latencies.push(started.elapsed());
+    }
+    latencies.sort_unstable();
+    let total_micros = latencies
+        .iter()
+        .map(std::time::Duration::as_micros)
+        .sum::<u128>();
+    let mean_micros = total_micros / latencies.len() as u128;
+    let p95_micros = latencies[latencies.len() * 95 / 100].as_micros();
+    eprintln!(
+        "cache diagnostic SQLite write: diagnostic_bytes={diagnostic_bytes} journal_batch_bytes={journal_bytes} mean_us={mean_micros} p95_us={p95_micros} samples={}",
+        latencies.len()
+    );
+    assert!(diagnostic_bytes <= 1_024);
+    assert!(journal_bytes <= 4_096);
+    store.close().await.expect("store closes");
 }
 
 #[tokio::test]

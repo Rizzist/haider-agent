@@ -18,8 +18,11 @@ use haider_core::{
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::history::{CompactionIntent, CompactionResume};
+use haider_protocol::history::{
+    COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume,
+};
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::{Block, CapabilityDoc, FeatureResolve, FinishReason, UsageScope};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
@@ -41,6 +44,55 @@ fn png_fixture() -> Vec<u8> {
         .write_to(&mut encoded, ImageFormat::Png)
         .expect("encode fixture PNG");
     encoded.into_inner()
+}
+
+async fn seed_compaction_run(
+    lease: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    intent: &CompactionIntent,
+    label: &str,
+) {
+    let item_id = ItemId::new(format!("{label}-intent-item"));
+    let item = TurnItem::Extension {
+        kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
+        data: serde_json::to_value(intent).expect("serialize compaction intent"),
+    };
+    let mut envelopes = vec![
+        super::supervisor_envelope(
+            lease,
+            device_id,
+            None,
+            Some(run_id.clone()),
+            EventId::new(format!("{label}-intent-start")),
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: item.clone(),
+            }),
+        )
+        .expect("build compaction intent start"),
+        super::supervisor_envelope(
+            lease,
+            device_id,
+            None,
+            Some(run_id.clone()),
+            EventId::new(format!("{label}-intent-complete")),
+            EventPayload::Item(ItemEvent::Completed { item_id, item }),
+        )
+        .expect("build compaction intent completion"),
+        super::supervisor_envelope(
+            lease,
+            device_id,
+            None,
+            Some(run_id.clone()),
+            EventId::new(format!("{label}-compacting")),
+            EventPayload::RunState(RunState::Compacting),
+        )
+        .expect("build compacting state"),
+    ];
+    StoreHandle::append(lease, &mut envelopes)
+        .await
+        .expect("seed durable compaction run");
 }
 
 struct FixtureArtifact {
@@ -470,15 +522,18 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
         covers_to: NodeId::new("cu1-to"),
         resume_cause: CompactionResume::ManualIdle,
     };
+    let run_id = RunId::new("cu1-compactor-run");
+    seed_compaction_run(
+        &compactor.store,
+        &compactor.device_id,
+        &run_id,
+        &intent,
+        "cu1-compactor",
+    )
+    .await;
 
     let _result = compactor
-        .compact(
-            &RunId::new("cu1-compactor-run"),
-            &intent,
-            covered_messages.clone(),
-            Vec::new(),
-            None,
-        )
+        .compact(&run_id, &intent, covered_messages.clone(), Vec::new(), None)
         .await;
 
     let requests = provider.requests();
@@ -592,18 +647,23 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
         covers_to: NodeId::new("cu1-fallback-to"),
         resume_cause: CompactionResume::ManualIdle,
     };
+    let run_id = RunId::new("cu1-compactor-fallback-run");
+    seed_compaction_run(
+        &compactor.store,
+        &compactor.device_id,
+        &run_id,
+        &intent,
+        "cu1-compactor-fallback",
+    )
+    .await;
 
-    let post_summary_error = compactor
-        .compact(
-            &RunId::new("cu1-compactor-fallback-run"),
-            &intent,
-            covered_messages.clone(),
-            Vec::new(),
-            None,
-        )
-        .await
-        .expect_err("fixture has no durable accepted run for the final commit");
-    assert_eq!(post_summary_error.code, ErrorCode::RunNotActive);
+    let post_summary_result = compactor
+        .compact(&run_id, &intent, covered_messages.clone(), Vec::new(), None)
+        .await;
+    assert!(
+        post_summary_result.is_ok(),
+        "durably accepted compaction should commit: {post_summary_result:?}"
+    );
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);

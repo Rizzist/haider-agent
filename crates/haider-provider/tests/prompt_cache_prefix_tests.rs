@@ -102,6 +102,7 @@ fn cache_metadata(
     PromptCacheMetadata {
         stable_history_end,
         current_user_start,
+        previous_stable_history_end: None,
         latest_compaction_summary_end: Some(1),
         prefix_digests: PrefixDigests {
             system: "stable-system".into(),

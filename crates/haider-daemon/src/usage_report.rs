@@ -37,12 +37,13 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{AgentId, CredentialAlias, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::{
-    CacheCostEstimate, CacheStatAvailability, NormalizedUsage, UsageRequestKind, UsageScope,
+    CacheCostEstimate, CacheStatAvailability, NormalizedUsage, RequestUsage, UsageRequestKind,
+    UsageScope,
 };
 use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
-    AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageStatsV1,
-    LocalUsageStatsV1, UsageReportV1,
+    AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageRequestScopeV1,
+    CacheUsageRequestV1, CacheUsageStatsV1, LocalUsageStatsV1, UsageReportV1,
 };
 use haider_provider::{MeterReading, MeterUnavailable, UsageMeterEndpoint};
 use serde::Deserialize;
@@ -446,6 +447,7 @@ impl TokenTotals {
         normalized: Option<&NormalizedUsage>,
         scope: Option<&UsageScope>,
         cache_cost: Option<CacheCostEstimate>,
+        request: Option<&RequestUsage>,
     ) {
         self.input = self.input.saturating_add(input);
         self.output = self.output.saturating_add(output);
@@ -466,7 +468,7 @@ impl TokenTotals {
         if !known_auth || cost.is_none() {
             self.api_equivalent_cost_missing = true;
         }
-        add_cache_stats(&mut self.cache, normalized, scope, cache_cost);
+        add_cache_stats(&mut self.cache, normalized, scope, cache_cost, request);
         if metered && normalized.is_some() && cache_cost.is_none() {
             self.metered_cache_cost_missing = true;
         }
@@ -503,6 +505,8 @@ struct UsagePayload {
     scope: Option<UsageScope>,
     #[serde(default)]
     cache_cost: Option<CacheCostEstimate>,
+    #[serde(default)]
+    request: Option<RequestUsage>,
 }
 
 #[derive(Deserialize)]
@@ -529,7 +533,21 @@ fn add_cache_stats(
     normalized: Option<&NormalizedUsage>,
     scope: Option<&UsageScope>,
     cost: Option<CacheCostEstimate>,
+    request: Option<&RequestUsage>,
 ) {
+    if let Some(request) = request {
+        totals.requests.push(CacheUsageRequestV1 {
+            scope: scope.map(|scope| CacheUsageRequestScopeV1 {
+                provider: scope.provider.clone(),
+                model: scope.model.clone(),
+                cache_epoch: scope.cache_epoch.clone(),
+                request_kind: scope.request_kind,
+                auth_method: scope_auth_method(scope),
+                run: scope.run.clone(),
+            }),
+            request: request.clone(),
+        });
+    }
     let Some(usage) = normalized else {
         return;
     };
@@ -750,13 +768,15 @@ fn fs_receipt_lines(name: &str, args: &serde_json::Value) -> (u64, u64) {
 
 /// Incremental fold of one session's committed envelopes (in seq order)
 /// into local stats. Exact across page boundaries: the folder holds the
-/// last cumulative usage snapshot per
-/// `(run, agent, provider, model, cache epoch, request kind)` and only
-/// reduces on [`SessionFolder::finish`].
+/// last usage snapshot per `(run, agent, provider, model, cache epoch,
+/// request kind, request ordinal)` and only reduces on
+/// [`SessionFolder::finish`]. Modern records use response-local counters and
+/// one key per physical request; legacy cumulative records retain a missing
+/// ordinal and therefore preserve their last-snapshot-wins behavior.
 ///
 /// - `model_selected` facts switch the pricing model for LATER usage;
-/// - usage snapshots are cumulative per cache/request lane — the last
-///   snapshot wins (summing them would double-count);
+/// - legacy usage snapshots are cumulative per cache/request lane — the
+///   last snapshot wins (summing them would double-count);
 /// - unattributed usage (no account, no subtotals) is skipped, never
 ///   invented onto an account.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -767,6 +787,7 @@ struct UsageChunkKey {
     model: String,
     cache_epoch: String,
     request_kind: UsageRequestKind,
+    request_ordinal: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1058,10 +1079,22 @@ impl SessionFolder {
                 }
             }
             "usage" => {
-                let Ok(usage) = serde_json::from_value::<UsagePayload>(envelope.payload.clone())
+                let Ok(mut usage) =
+                    serde_json::from_value::<UsagePayload>(envelope.payload.clone())
                 else {
                     return;
                 };
+                let request_ordinal = usage.request.as_ref().map(|request| request.ordinal);
+                if let Some(request) = usage.request.as_ref() {
+                    usage.input = request.input;
+                    usage.output = request.output;
+                    usage.reasoning = request.reasoning.unwrap_or(0);
+                    usage.cached = request.cached.unwrap_or(0);
+                    usage.account.clone_from(&request.account);
+                    usage.accounts.clear();
+                    usage.normalized.clone_from(&request.normalized);
+                    usage.cache_cost = request.cache_cost;
+                }
                 let scope = usage.scope.as_ref();
                 let model = scope
                     .map(|scope| scope.model.as_str())
@@ -1082,6 +1115,7 @@ impl SessionFolder {
                     cache_epoch: scope.map_or_else(String::new, |scope| scope.cache_epoch.clone()),
                     request_kind: scope
                         .map_or(UsageRequestKind::MainTurn, |scope| scope.request_kind),
+                    request_ordinal,
                 };
                 self.chunks.insert(key, (usage, model, envelope.seq));
             }
@@ -1376,6 +1410,7 @@ impl SessionFolder {
                         subtotal.normalized.as_ref(),
                         subtotal.scope.as_ref(),
                         cache_cost,
+                        None,
                     );
                 }
             } else if let Some(account) = usage.account {
@@ -1407,6 +1442,7 @@ impl SessionFolder {
                     usage.normalized.as_ref(),
                     usage.scope.as_ref(),
                     cache_cost,
+                    usage.request.as_ref(),
                 );
             }
         }
@@ -1437,6 +1473,7 @@ const fn request_kind_rank(kind: UsageRequestKind) -> u8 {
         UsageRequestKind::MainTurn => 0,
         UsageRequestKind::Compaction => 1,
         UsageRequestKind::DelegatedAgent => 2,
+        _ => 3,
     }
 }
 
@@ -1517,6 +1554,7 @@ fn merge_cache_stats(target: &mut CacheUsageStatsV1, source: &CacheUsageStatsV1)
     target.metered_input_tokens = target
         .metered_input_tokens
         .saturating_add(source.metered_input_tokens);
+    target.requests.extend(source.requests.iter().cloned());
     if source.metered_input_tokens > 0 {
         merge_optional_cost(
             &mut target.input_with_cache_usd,

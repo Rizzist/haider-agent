@@ -7,8 +7,8 @@
 //! types.
 
 use crate::credential::AuthMethod;
-use crate::ids::CredentialAlias;
-use crate::provider::{CacheStatAvailability, UsageRequestKind};
+use crate::ids::{CredentialAlias, RunId};
+use crate::provider::{CacheStatAvailability, RequestUsage, UsageRequestKind};
 use serde::{Deserialize, Serialize};
 
 /// Provider-native allowance state from Haider Code's account endpoint.
@@ -255,6 +255,10 @@ pub struct CacheUsageStatsV1 {
     pub api_equivalent_estimated_savings_usd: Option<f64>,
     #[serde(default)]
     pub breakdowns: Vec<CacheUsageBreakdownV1>,
+    /// Response-local request records, retained even when normalized cache
+    /// counters are unavailable. No zero-filled breakdown is synthesized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<CacheUsageRequestV1>,
 }
 
 impl CacheUsageStatsV1 {
@@ -276,6 +280,7 @@ impl CacheUsageStatsV1 {
             && self.api_equivalent_input_without_cache_usd.is_none()
             && self.api_equivalent_estimated_savings_usd.is_none()
             && self.breakdowns.is_empty()
+            && self.requests.is_empty()
     }
 }
 
@@ -313,4 +318,28 @@ pub struct CacheUsageBreakdownV1 {
     pub api_equivalent_input_without_cache_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_equivalent_estimated_savings_usd: Option<f64>,
+}
+
+/// Request-local cache evidence retained without requiring normalized cache
+/// counters to exist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheUsageRequestV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CacheUsageRequestScopeV1>,
+    pub request: RequestUsage,
+}
+
+/// Non-secret coordinates for one reported physical request. This omits the
+/// legacy plain component digests; the request carries keyed fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUsageRequestScopeV1 {
+    pub provider: String,
+    pub model: String,
+    pub cache_epoch: String,
+    #[serde(default)]
+    pub request_kind: UsageRequestKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<AuthMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
 }

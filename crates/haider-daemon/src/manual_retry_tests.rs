@@ -794,6 +794,7 @@ async fn run_retry_duplicate_while_live_is_refused_without_a_second_run() {
         1,
         "only one retry run is durably accepted"
     );
+    wait_for_provider_requests(&fake, 1).await;
     assert_eq!(fake.requests().len(), 1, "only one provider run starts");
     drop(connection_one);
     drop(connection_two);

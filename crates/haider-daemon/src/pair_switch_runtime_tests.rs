@@ -1069,6 +1069,13 @@ async fn submit_during_manual_compaction_queues_and_runs_after() {
     let compaction = world
         .start_compaction_and_await_window("f3-queue-compact")
         .await;
+    timeout(Duration::from_secs(10), async {
+        while fake_a.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("summarizer request starts inside compaction window");
 
     // INSIDE the window: the submission queues and no provider work leaks.
     let (queued_run, disposition) = world

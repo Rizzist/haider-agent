@@ -1463,6 +1463,7 @@ fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheM
     PromptCacheMetadata {
         stable_history_end,
         current_user_start: stable_history_end,
+        previous_stable_history_end: None,
         latest_compaction_summary_end: Some(1),
         prefix_digests: PrefixDigests {
             system: "system-a".into(),
@@ -1496,6 +1497,44 @@ fn remove_openai_cache_metadata(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+#[test]
+fn cache_diagnostic_openai_hashes_current_wire_through_previous_history_length() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("openai-cache-diagnostic");
+    vault
+        .put(&alias, b"openai-cache-diagnostic-key")
+        .expect("store test credential");
+    let provider = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolve test credential"),
+        "gpt-5.6",
+    )
+    .expect("construct OpenAI provider");
+    let mut first = probe_request("gpt-5.6");
+    first.messages.push(Message::assistant(vec![Block::Text {
+        text: "first answer".into(),
+    }]));
+    first.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let first_prepared = crate::Provider::prepare_turn(&provider, &first).expect("first prepared");
+
+    let mut grown = first;
+    grown.messages.push(Message::user_text("next question"));
+    let metadata = grown.cache_metadata.as_mut().expect("metadata");
+    metadata.previous_stable_history_end = Some(1);
+    metadata.stable_history_end = 2;
+    metadata.current_user_start = 2;
+    let grown_prepared = crate::Provider::prepare_turn(&provider, &grown).expect("grown prepared");
+
+    assert_eq!(
+        grown_prepared.previous_immutable_history_digest(),
+        Some(first_prepared.prefix_digests().immutable_history.as_str()),
+        "the old Responses wire prefix remains hashable after history grows"
+    );
+    assert_ne!(
+        grown_prepared.prefix_digests().immutable_history,
+        first_prepared.prefix_digests().immutable_history
+    );
 }
 
 /// CM2d — the routing key is a cache-domain key, not a turn/run key. It is

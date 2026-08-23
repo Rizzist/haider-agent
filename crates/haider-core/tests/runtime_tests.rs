@@ -83,6 +83,25 @@ fn completed_footprint(envelope: &RawEnvelope) -> Option<ContextFootprint> {
 }
 
 fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
+    fn mask_keyed_hashes(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) if text.starts_with("blake3-keyed:") => {
+                *text = "<hash>".into();
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    mask_keyed_hashes(value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    mask_keyed_hashes(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     if payload["type"] == "item" {
         payload["item_id"] = serde_json::Value::String("<item>".into());
     }
@@ -101,6 +120,7 @@ fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
             object.remove("cache_cost");
         }
     }
+    mask_keyed_hashes(&mut payload);
     payload
 }
 
@@ -279,6 +299,7 @@ async fn full_turn_commits_exact_projected_sequence() {
         normalized: None,
         scope: None,
         cache_cost: None,
+        request: None,
     };
     let (handle, store, provider) = runtime(vec![
         FakeStep::EmitText {
@@ -327,6 +348,54 @@ async fn full_turn_commits_exact_projected_sequence() {
             }
         }),
         serde_json::json!({"type":"run_state","state":"thinking"}),
+        serde_json::json!({
+            "type":"item",
+            "event":"started",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"cache_request_attempt_v1",
+                "data":{
+                    "ordinal":1,
+                    "diagnostic":{
+                        "stable_prefix_tokens":3,
+                        "history_message_count":0,
+                        "breakpoint_hashes":{
+                            "system":"<hash>",
+                            "tools":"<hash>",
+                            "history":"<hash>"
+                        },
+                        "cache_domain_hash":"<hash>",
+                        "prefix_match":{"state":"unavailable"},
+                        "control":{"state":"unavailable"}
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
+            "event":"completed",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"cache_request_attempt_v1",
+                "data":{
+                    "ordinal":1,
+                    "diagnostic":{
+                        "stable_prefix_tokens":3,
+                        "history_message_count":0,
+                        "breakpoint_hashes":{
+                            "system":"<hash>",
+                            "tools":"<hash>",
+                            "history":"<hash>"
+                        },
+                        "cache_domain_hash":"<hash>",
+                        "prefix_match":{"state":"unavailable"},
+                        "control":{"state":"unavailable"}
+                    }
+                }
+            }
+        }),
         serde_json::json!({"type":"run_state","state":"streaming"}),
         serde_json::json!({
             "type":"item",
@@ -399,7 +468,35 @@ async fn full_turn_commits_exact_projected_sequence() {
                 "summary":"tool call settled as Pending"
             }
         }),
-        serde_json::to_value(EventPayload::Usage(usage)).expect("usage serializes"),
+        serde_json::json!({
+            "type":"usage",
+            "input":11,
+            "output":7,
+            "reasoning":2,
+            "cached":3,
+            "source":"provider_reported",
+            "request":{
+                "ordinal":1,
+                "input":11,
+                "output":7,
+                "reasoning":2,
+                "cached":3,
+                "source":"provider_reported",
+                "cache":{
+                    "stable_prefix_tokens":3,
+                    "history_message_count":0,
+                    "breakpoint_hashes":{
+                        "system":"<hash>",
+                        "tools":"<hash>",
+                        "history":"<hash>"
+                    },
+                    "cache_domain_hash":"<hash>",
+                    "prefix_match":{"state":"unavailable"},
+                    "control":{"state":"unavailable"},
+                    "classification":{"class":"unavailable"}
+                }
+            }
+        }),
         serde_json::json!({"type":"run_state","state":"done"}),
     ];
     assert_eq!(actual, expected);
@@ -1208,6 +1305,7 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
                 normalized: None,
                 scope: None,
                 cache_cost: None,
+                request: None,
             },
         },
         FakeStep::Finish {
@@ -1258,6 +1356,7 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
                 normalized: None,
                 scope: None,
                 cache_cost: None,
+                request: None,
             },
         },
         FakeStep::Finish {
@@ -2575,6 +2674,7 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
                 normalized: None,
                 scope: None,
                 cache_cost: None,
+                request: None,
             },
         },
         FakeStep::EmitToolCall {
@@ -2607,6 +2707,7 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
                 normalized: None,
                 scope: None,
                 cache_cost: None,
+                request: None,
             },
         },
         FakeStep::Finish {
@@ -3491,7 +3592,10 @@ async fn actor_restarts_do_not_reuse_run_or_item_ids() {
             .iter()
             .any(|id| id.starts_with("run-session-test-24-"))
     );
-    assert_eq!(item_ids.len(), 2);
+    // Each request now has both a diagnostic extension item and the visible
+    // assistant item. The four unique IDs still prove neither actor reused an
+    // item ID across the restart boundary.
+    assert_eq!(item_ids.len(), 4);
     assert!(
         item_ids
             .iter()
@@ -3521,14 +3625,14 @@ async fn memory_store_allocates_and_reads_committed_sequences() {
         StoreHandle::latest_seq(store.as_ref(), &SessionId::new(SESSION))
             .await
             .expect("latest"),
-        6
+        8
     );
     let tail = StoreHandle::read(store.as_ref(), &SessionId::new(SESSION), 3, 10)
         .await
         .expect("read");
     assert_eq!(
         tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        vec![4, 5, 6]
+        vec![4, 5, 6, 7, 8]
     );
 }
 

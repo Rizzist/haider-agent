@@ -164,6 +164,7 @@ fn cache_assertion_request(
         cache_metadata: Some(haider_provider::PromptCacheMetadata {
             stable_history_end,
             current_user_start,
+            previous_stable_history_end: None,
             latest_compaction_summary_end: None,
             prefix_digests: PrefixDigests {
                 system: "live-stable-system".into(),

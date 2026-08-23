@@ -280,6 +280,13 @@ impl AnthropicCacheTtl {
             Self::OneHour => "1h",
         }
     }
+
+    const fn milliseconds(self) -> u64 {
+        match self {
+            Self::FiveMinutes => 5 * 60 * 1_000,
+            Self::OneHour => 60 * 60 * 1_000,
+        }
+    }
 }
 
 /// Selects the explicit-cache TTL without guessing future reuse. Unknown or
@@ -526,18 +533,11 @@ impl AnthropicProvider {
         self.client.execute(request).await
     }
 
-    /// Builds the secret-free JSON body. Capture tools use this to record the
-    /// exact payload shape without gaining access to the credential.
-    ///
-    /// The body shape follows the provider's auth mode: OAuth-subscription
-    /// requests must open `system` with the Claude Code identity block (see
-    /// [`ANTHROPIC_OAUTH_SYSTEM_IDENTITY`]); `x-api-key` requests keep the
-    /// plain-string system prompt untouched.
-    pub fn request_payload(
+    fn render_payload(
         &self,
         request: &TurnRequest,
+        cache_ttl: Option<AnthropicCacheTtl>,
     ) -> Result<serde_json::Value, ProviderError> {
-        self.validate_model(request)?;
         let system_shape = match self.auth_mode {
             AnthropicAuthMode::ApiKey | AnthropicAuthMode::CloudBearer => {
                 AnthropicSystemShape::ApiKey
@@ -550,31 +550,10 @@ impl AnthropicProvider {
             self.effort.as_deref(),
             self.fast,
             self.web_tools,
-            self.prompt_caching_verified
-                .then_some(request.cache_metadata.as_ref())
-                .flatten()
-                .filter(|metadata| {
-                    metadata.boundaries_valid(request.messages.len())
-                        && metadata.account_scope.is_some()
-                        && match self.auth_mode {
-                            AnthropicAuthMode::ApiKey => {
-                                metadata.provider == ANTHROPIC_PROVIDER_NAME
-                            }
-                            AnthropicAuthMode::OAuthBearer => {
-                                metadata.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
-                            }
-                            AnthropicAuthMode::CloudBearer => false,
-                        }
-                        && known_anthropic_cache_model(&request.model)
-                })
-                .map(|metadata| {
-                    select_anthropic_cache_ttl(metadata.reuse_gap_ms, metadata.expected_later_reads)
-                }),
+            cache_ttl,
         )?;
         // G4b Vertex wire deltas (LV1): the model is URL-addressed, so the
-        // body DROPS `model` and carries `anthropic_version` in its place —
-        // the Vertex replacement for the standard `anthropic-version`
-        // header, which this shape never sends.
+        // body DROPS `model` and carries `anthropic_version` in its place.
         if self.endpoint_shape == AnthropicEndpointShape::Vertex {
             let Some(object) = payload.as_object_mut() else {
                 return Err(ProviderError::new(
@@ -588,6 +567,41 @@ impl AnthropicProvider {
                 serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.into()),
             );
         }
+        Ok(payload)
+    }
+
+    /// Builds the secret-free JSON body. Capture tools use this to record the
+    /// exact payload shape without gaining access to the credential.
+    ///
+    /// The body shape follows the provider's auth mode: OAuth-subscription
+    /// requests must open `system` with the Claude Code identity block (see
+    /// [`ANTHROPIC_OAUTH_SYSTEM_IDENTITY`]); `x-api-key` requests keep the
+    /// plain-string system prompt untouched.
+    pub fn request_payload(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.validate_model(request)?;
+        let cache_ttl = self
+            .prompt_caching_verified
+            .then_some(request.cache_metadata.as_ref())
+            .flatten()
+            .filter(|metadata| {
+                metadata.boundaries_valid(request.messages.len())
+                    && metadata.account_scope.is_some()
+                    && match self.auth_mode {
+                        AnthropicAuthMode::ApiKey => metadata.provider == ANTHROPIC_PROVIDER_NAME,
+                        AnthropicAuthMode::OAuthBearer => {
+                            metadata.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
+                        }
+                        AnthropicAuthMode::CloudBearer => false,
+                    }
+                    && known_anthropic_cache_model(&request.model)
+            })
+            .map(|metadata| {
+                select_anthropic_cache_ttl(metadata.reuse_gap_ms, metadata.expected_later_reads)
+            });
+        let payload = self.render_payload(request, cache_ttl)?;
         let has_pdf = request.messages.iter().any(|message| {
             message.blocks.iter().any(|block| {
                 matches!(
@@ -620,6 +634,52 @@ impl AnthropicProvider {
             }
         }
         Ok(payload)
+    }
+
+    fn cache_control_observation(
+        &self,
+        request: &TurnRequest,
+        payload: &serde_json::Value,
+        prompt_payload: &serde_json::Value,
+    ) -> haider_protocol::provider::CacheControlObservationV1 {
+        use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
+
+        if crate::payload_has_added_key(payload, prompt_payload, "cache_control") {
+            let ttl = request.cache_metadata.as_ref().map(|metadata| {
+                select_anthropic_cache_ttl(metadata.reuse_gap_ms, metadata.expected_later_reads)
+                    .milliseconds()
+            });
+            return CacheControlObservationV1::Emitted { ttl_ms: ttl };
+        }
+        if !self.prompt_caching_verified {
+            return CacheControlObservationV1::NotEmitted {
+                reason: CacheControlOmissionReasonV1::Unverified,
+            };
+        }
+        let Some(metadata) = request.cache_metadata.as_ref() else {
+            return CacheControlObservationV1::NotEmitted {
+                reason: CacheControlOmissionReasonV1::AdapterUnavailable,
+            };
+        };
+        let reason = if !metadata.boundaries_valid(request.messages.len()) {
+            CacheControlOmissionReasonV1::InvalidBoundaries
+        } else if metadata.account_scope.is_none() {
+            CacheControlOmissionReasonV1::MissingAccountScope
+        } else if !matches!(
+            (self.auth_mode, metadata.provider.as_str()),
+            (AnthropicAuthMode::ApiKey, ANTHROPIC_PROVIDER_NAME)
+                | (
+                    AnthropicAuthMode::OAuthBearer,
+                    ANTHROPIC_OAUTH_PROVIDER_NAME
+                )
+        ) {
+            CacheControlOmissionReasonV1::ProviderMismatch
+        } else if !known_anthropic_cache_model(&request.model) {
+            CacheControlOmissionReasonV1::UnsupportedModel
+        } else {
+            CacheControlOmissionReasonV1::AdapterUnavailable
+        };
+        CacheControlObservationV1::NotEmitted { reason }
     }
 
     /// Records one raw response for the ignored promotion harness.
@@ -806,17 +866,32 @@ impl Provider for AnthropicProvider {
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.stable_history_end;
         let full_payload = self.request_payload(request).ok()?;
+        // Cache-control objects select breakpoints but are not prompt
+        // content. Re-render without them so a marker that moves as history
+        // grows cannot falsely report that the old token prefix changed.
+        let prompt_payload = self.render_payload(request, None).ok()?;
         let immutable_history =
-            crate::rendered_array_prefix_digest(&full_payload, "messages", boundary)?;
+            crate::rendered_array_prefix_digest(&prompt_payload, "messages", boundary)?;
+        let previous_immutable_history_digest = request
+            .cache_metadata
+            .as_ref()?
+            .previous_stable_history_end
+            .filter(|previous| *previous <= request.messages.len())
+            .and_then(|previous| {
+                crate::rendered_array_prefix_digest(&prompt_payload, "messages", previous)
+            });
         let prefix_digests = crate::rendered_prefix_digests(
             request,
-            &full_payload,
+            &prompt_payload,
             immutable_history,
             "system",
             "tools",
         )?;
+        let cache_control = self.cache_control_observation(request, &full_payload, &prompt_payload);
         Some(crate::PreparedTurn {
             prefix_digests,
+            previous_immutable_history_digest,
+            cache_control,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,

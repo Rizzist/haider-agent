@@ -773,8 +773,22 @@ impl Provider for OpenAiProvider {
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.stable_history_end;
         self.http.validate_model(request).ok()?;
-        let (full_payload, stable_wire_end) = responses_request_json_with_boundary(
-            request,
+        let (full_payload, stable_wire_end, previous_wire_end) =
+            responses_request_json_with_boundary(
+                request,
+                self.http.codex_responses_lite,
+                self.effort.as_deref(),
+                self.web_search,
+                boundary,
+            )
+            .ok()?;
+        // Explicit breakpoint fields and routing keys are cache controls,
+        // not prompt content. Re-render the identical request without cache
+        // metadata so a moving marker does not masquerade as prefix drift.
+        let mut prompt_request = request.clone();
+        prompt_request.cache_metadata = None;
+        let (prompt_payload, _, _) = responses_request_json_with_boundary(
+            &prompt_request,
             self.http.codex_responses_lite,
             self.effort.as_deref(),
             self.web_search,
@@ -782,16 +796,26 @@ impl Provider for OpenAiProvider {
         )
         .ok()?;
         let immutable_history =
-            crate::rendered_array_prefix_digest(&full_payload, "input", stable_wire_end)?;
+            crate::rendered_array_prefix_digest(&prompt_payload, "input", stable_wire_end)?;
+        let previous_immutable_history_digest = previous_wire_end.and_then(|previous| {
+            crate::rendered_array_prefix_digest(&prompt_payload, "input", previous)
+        });
         let prefix_digests = crate::rendered_prefix_digests(
             request,
-            &full_payload,
+            &prompt_payload,
             immutable_history,
             "instructions",
             "tools",
         )?;
+        let cache_control = openai_cache_control_observation(
+            request,
+            &full_payload,
+            self.http.codex_responses_lite,
+        );
         Some(crate::PreparedTurn {
             prefix_digests,
+            previous_immutable_history_digest,
+            cache_control,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
@@ -1463,7 +1487,7 @@ impl Provider for OpenAiCompatibleProvider {
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.stable_history_end;
         self.http.validate_model(request).ok()?;
-        let (full_payload, stable_wire_end) = chat_request_json_with_boundary(
+        let (full_payload, stable_wire_end, previous_wire_end) = chat_request_json_with_boundary(
             request,
             self.dialect,
             self.kimi_thinking.as_ref(),
@@ -1471,17 +1495,34 @@ impl Provider for OpenAiCompatibleProvider {
             boundary,
         )
         .ok()?;
+        let mut prompt_request = request.clone();
+        prompt_request.cache_metadata = None;
+        let (prompt_payload, _, _) = chat_request_json_with_boundary(
+            &prompt_request,
+            self.dialect,
+            self.kimi_thinking.as_ref(),
+            self.kimi_reasoning_effort.as_deref(),
+            boundary,
+        )
+        .ok()?;
         let immutable_history =
-            crate::rendered_array_prefix_digest(&full_payload, "messages", stable_wire_end)?;
+            crate::rendered_array_prefix_digest(&prompt_payload, "messages", stable_wire_end)?;
+        let previous_immutable_history_digest = previous_wire_end.and_then(|previous| {
+            crate::rendered_array_prefix_digest(&prompt_payload, "messages", previous)
+        });
         let prefix_digests = crate::rendered_prefix_digests(
             request,
-            &full_payload,
+            &prompt_payload,
             immutable_history,
             "system",
             "tools",
         )?;
+        let cache_control =
+            compatible_cache_control_observation(request, &full_payload, self.dialect);
         Some(crate::PreparedTurn {
             prefix_digests,
+            previous_immutable_history_digest,
+            cache_control,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
@@ -3350,7 +3391,7 @@ fn responses_request_json(
         hosted_web_search,
         request.messages.len(),
     )
-    .map(|(payload, _)| payload)
+    .map(|(payload, _, _)| payload)
 }
 
 fn responses_request_json_with_boundary(
@@ -3359,7 +3400,7 @@ fn responses_request_json_with_boundary(
     effort: Option<&str>,
     hosted_web_search: bool,
     stable_history_end: usize,
-) -> Result<(serde_json::Value, usize), ProviderError> {
+) -> Result<(serde_json::Value, usize, Option<usize>), ProviderError> {
     let computer_kind = openai_computer_tool_kind(&request.model, codex_responses_lite);
     let computer_display = latest_computer_display_dimensions(request).unwrap_or((
         OPENAI_COMPUTER_BOOTSTRAP_WIDTH,
@@ -3379,6 +3420,12 @@ fn responses_request_json_with_boundary(
     let mut input = Vec::new();
     let stable_history_end = stable_history_end.min(request.messages.len());
     let mut stable_wire_end = (stable_history_end == 0).then_some(0);
+    let previous_history_end = request
+        .cache_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.previous_stable_history_end)
+        .filter(|previous| *previous <= request.messages.len());
+    let mut previous_wire_end = (previous_history_end == Some(0)).then_some(0);
     for (message_index, message) in request.messages.iter().enumerate() {
         let mut content = Vec::new();
         for block in &message.blocks {
@@ -3636,6 +3683,9 @@ fn responses_request_json_with_boundary(
         if message_index.saturating_add(1) == stable_history_end {
             stable_wire_end = Some(input.len());
         }
+        if previous_history_end == Some(message_index.saturating_add(1)) {
+            previous_wire_end = Some(input.len());
+        }
     }
     let mut tools = request
         .tools
@@ -3754,7 +3804,7 @@ fn responses_request_json_with_boundary(
             );
         }
     }
-    Ok((payload, stable_wire_end))
+    Ok((payload, stable_wire_end, previous_wire_end))
 }
 
 #[derive(Debug, Clone)]
@@ -3971,6 +4021,84 @@ fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) ->
     .then(|| derive_prompt_cache_key(request, metadata))
 }
 
+fn openai_cache_control_observation(
+    request: &TurnRequest,
+    payload: &serde_json::Value,
+    codex_responses_lite: bool,
+) -> haider_protocol::provider::CacheControlObservationV1 {
+    use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
+
+    if payload.get("prompt_cache_key").is_some() {
+        let ttl_ms = if codex_responses_lite {
+            Some(24 * 60 * 60 * 1_000)
+        } else if payload.get("prompt_cache_options").is_some() {
+            Some(30 * 60 * 1_000)
+        } else {
+            None
+        };
+        return CacheControlObservationV1::Emitted { ttl_ms };
+    }
+    if !openai_automatic_cache_key_supported(&request.model) {
+        return CacheControlObservationV1::NotEmitted {
+            reason: CacheControlOmissionReasonV1::UnsupportedModel,
+        };
+    }
+    let Some(metadata) = request.cache_metadata.as_ref() else {
+        return CacheControlObservationV1::NotEmitted {
+            reason: CacheControlOmissionReasonV1::AdapterUnavailable,
+        };
+    };
+    let reason = if !metadata.boundaries_valid(request.messages.len()) {
+        CacheControlOmissionReasonV1::InvalidBoundaries
+    } else if metadata.account_scope.is_none() {
+        CacheControlOmissionReasonV1::MissingAccountScope
+    } else if !matches!(
+        metadata.provider.as_str(),
+        OPENAI_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME
+    ) {
+        CacheControlOmissionReasonV1::ProviderMismatch
+    } else {
+        CacheControlOmissionReasonV1::AdapterUnavailable
+    };
+    CacheControlObservationV1::NotEmitted { reason }
+}
+
+fn compatible_cache_control_observation(
+    request: &TurnRequest,
+    payload: &serde_json::Value,
+    dialect: CompatibleDialect,
+) -> haider_protocol::provider::CacheControlObservationV1 {
+    use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
+
+    match dialect {
+        CompatibleDialect::DeepSeekApi => CacheControlObservationV1::NotRequired,
+        CompatibleDialect::KimiOAuth if payload.get("prompt_cache_key").is_some() => {
+            CacheControlObservationV1::Emitted { ttl_ms: None }
+        }
+        CompatibleDialect::KimiOAuth => {
+            let Some(metadata) = request.cache_metadata.as_ref() else {
+                return CacheControlObservationV1::NotEmitted {
+                    reason: CacheControlOmissionReasonV1::AdapterUnavailable,
+                };
+            };
+            let reason = if !metadata.boundaries_valid(request.messages.len()) {
+                CacheControlOmissionReasonV1::InvalidBoundaries
+            } else if metadata.account_scope.is_none() {
+                CacheControlOmissionReasonV1::MissingAccountScope
+            } else if metadata.provider != KIMI_OAUTH_PROVIDER_NAME {
+                CacheControlOmissionReasonV1::ProviderMismatch
+            } else {
+                CacheControlOmissionReasonV1::AdapterUnavailable
+            };
+            CacheControlObservationV1::NotEmitted { reason }
+        }
+        CompatibleDialect::Generic
+        | CompatibleDialect::HaiderCodeApi
+        | CompatibleDialect::XaiApi
+        | CompatibleDialect::GrokOAuth => CacheControlObservationV1::Unavailable,
+    }
+}
+
 fn derive_prompt_cache_key(request: &TurnRequest, metadata: &crate::PromptCacheMetadata) -> String {
     let domain = serde_json::json!({
         "schema": "haider.prompt-cache-key.v1",
@@ -4049,7 +4177,7 @@ fn chat_request_json(
         kimi_reasoning_effort,
         request.messages.len(),
     )
-    .map(|(payload, _)| payload)
+    .map(|(payload, _, _)| payload)
 }
 
 fn chat_request_json_with_boundary(
@@ -4058,7 +4186,7 @@ fn chat_request_json_with_boundary(
     kimi_thinking: Option<&KimiThinkingConfig>,
     kimi_reasoning_effort: Option<&str>,
     stable_history_end: usize,
-) -> Result<(serde_json::Value, usize), ProviderError> {
+) -> Result<(serde_json::Value, usize, Option<usize>), ProviderError> {
     let attachments = attachment_index(request)?;
     let mut messages = Vec::new();
     if let Some(system) = &request.system_prompt {
@@ -4066,6 +4194,12 @@ fn chat_request_json_with_boundary(
     }
     let stable_history_end = stable_history_end.min(request.messages.len());
     let mut stable_wire_end = (stable_history_end == 0).then_some(messages.len());
+    let previous_history_end = request
+        .cache_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.previous_stable_history_end)
+        .filter(|previous| *previous <= request.messages.len());
+    let mut previous_wire_end = (previous_history_end == Some(0)).then_some(messages.len());
     for (message_index, message) in request.messages.iter().enumerate() {
         match message.role {
             MessageRole::Assistant => {
@@ -4204,6 +4338,9 @@ fn chat_request_json_with_boundary(
         if message_index.saturating_add(1) == stable_history_end {
             stable_wire_end = Some(messages.len());
         }
+        if previous_history_end == Some(message_index.saturating_add(1)) {
+            previous_wire_end = Some(messages.len());
+        }
     }
     let tools = request
         .tools
@@ -4271,7 +4408,7 @@ fn chat_request_json_with_boundary(
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
-    Ok((payload, stable_wire_end))
+    Ok((payload, stable_wire_end, previous_wire_end))
 }
 
 /// OpenAI-compatible ordering law: the tool-role result is immediately
@@ -4912,6 +5049,7 @@ fn openai_usage(
         normalized: Some(normalized),
         scope: None,
         cache_cost: None,
+        request: None,
     })
 }
 
@@ -5012,6 +5150,7 @@ fn chat_usage(
         normalized: Some(normalized),
         scope: None,
         cache_cost: None,
+        request: None,
     })
 }
 

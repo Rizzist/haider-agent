@@ -67,6 +67,7 @@ async fn json_fixture_drives_events_and_records_request() {
             normalized: None,
             scope: None,
             cache_cost: None,
+            request: None,
         })
     );
     assert_eq!(

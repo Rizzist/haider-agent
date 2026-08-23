@@ -24,16 +24,17 @@ mod recovery;
 mod sqlite_store;
 
 pub use actor::{
-    COMPACTION_MIN_FREED_PERCENT, CancelToken, ChildWaitCheckpoint, ContextCompactor,
-    DeferredTicket, DeferredToolCheckpoint, DeferredToolResult, EventIdGenerator,
+    COMPACTION_MIN_FREED_PERCENT, CacheDiagnosticKey, CancelToken, ChildWaitCheckpoint,
+    ContextCompactor, DeferredTicket, DeferredToolCheckpoint, DeferredToolResult, EventIdGenerator,
     FinalizationGuard, FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle,
-    PartialStreamCheckpoint, ProviderAttemptDecision, ProviderAttemptResolver,
-    ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCause,
-    ProviderPairSwitchCommitter, ProviderPairSwitchTarget, RealRetrySleeper,
-    RequestInputCheckpoint, ResolvedProviderAttempt, RetrySleeper, STREAM_DELTA_COALESCE_WINDOW,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome,
-    VISION_IMAGE_ESTIMATE_TOKENS, compaction_guard_tripped, context_soft_threshold_tokens,
+    PartialStreamCheckpoint, PreviousCacheRequest, ProviderAttemptDecision,
+    ProviderAttemptResolver, ProviderDerivedRequestState, ProviderPairSwitch,
+    ProviderPairSwitchCause, ProviderPairSwitchCommitter, ProviderPairSwitchTarget,
+    RealRetrySleeper, RequestInputCheckpoint, ResolvedProviderAttempt, RetrySleeper,
+    STREAM_DELTA_COALESCE_WINDOW, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    TurnOutcome, VISION_IMAGE_ESTIMATE_TOKENS, build_cache_request_diagnostic,
+    classify_cache_request, compaction_guard_tripped, context_soft_threshold_tokens,
     estimate_provider_request_input_tokens, presentation_for_haider_error, retry_backoff_ms,
     retry_jittered_backoff_ms, sanitized_failure_message,
 };

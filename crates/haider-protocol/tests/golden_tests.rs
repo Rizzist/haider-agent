@@ -1448,6 +1448,7 @@ fn golden_usage_account_tagged() {
                 estimated_savings_usd: 0.0044,
                 explicit_storage_usd: 0.0,
             }),
+            request: None,
         },
     );
 }

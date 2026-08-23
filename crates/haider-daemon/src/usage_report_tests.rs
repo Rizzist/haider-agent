@@ -16,7 +16,7 @@ use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialSt
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::ids::{AgentId, CredentialAlias, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::provider::{
-    AccountUsage, CacheCostEstimate, CacheStatAvailability, NormalizedUsage, Usage,
+    AccountUsage, CacheCostEstimate, CacheStatAvailability, NormalizedUsage, RequestUsage, Usage,
     UsageRequestKind, UsageScope, UsageSource,
 };
 use haider_protocol::session::ModelSelected;
@@ -392,6 +392,7 @@ fn plain_usage(input: u64, output: u64, account: &str) -> Usage {
         normalized: None,
         scope: Some(account_scope(account)),
         cache_cost: None,
+        request: None,
     }
 }
 
@@ -562,6 +563,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
             normalized: None,
             scope: None,
             cache_cost: None,
+            request: None,
         }),
     ));
     // Unattributed usage: no account, no subtotals — skipped, not invented.
@@ -581,6 +583,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
             normalized: None,
             scope: None,
             cache_cost: None,
+            request: None,
         }),
     ));
 
@@ -667,6 +670,7 @@ fn cm1_session_folder_uses_latest_full_cache_lane_snapshot() {
             estimated_savings_usd: logical as f64 / 1_000_000.0,
             explicit_storage_usd: 0.0,
         }),
+        request: None,
     };
 
     let mut folder = SessionFolder::new("gpt-5");
@@ -726,6 +730,106 @@ fn cm1_session_folder_uses_latest_full_cache_lane_snapshot() {
     }));
 }
 
+#[test]
+fn cache_requests_fold_by_ordinal_with_response_local_counters() {
+    let account = CredentialAlias::new("billing-key");
+    let request_usage = |ordinal: u64, logical: u64, output: u64| RequestUsage {
+        ordinal,
+        input: logical,
+        output,
+        reasoning: None,
+        cached: Some(0),
+        source: UsageSource::ProviderReported,
+        account: Some(account.clone()),
+        normalized: Some(NormalizedUsage {
+            logical_input: logical,
+            uncached_input: logical,
+            cache_read_input: 0,
+            billed_output: output,
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: logical,
+            ..NormalizedUsage::default()
+        }),
+        cache_cost: None,
+        cache: None,
+    };
+    let cumulative = |logical: u64, output: u64, request: RequestUsage| Usage {
+        input: logical,
+        output,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: Some(account.clone()),
+        accounts: Vec::new(),
+        normalized: Some(NormalizedUsage {
+            logical_input: logical,
+            uncached_input: logical,
+            cache_read_input: 0,
+            billed_output: output,
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: logical,
+            ..NormalizedUsage::default()
+        }),
+        scope: Some(UsageScope {
+            provider: "openai".into(),
+            model: "gpt-5.6-terra".into(),
+            account_scope: Some(account.clone()),
+            auth_scope: "api_key".into(),
+            cache_epoch: "epoch-request-local".into(),
+            stable_prefix_tokens: 4_096,
+            cache_boundaries: None,
+            request_kind: UsageRequestKind::MainTurn,
+            run: Some(RunId::new("run-request-local")),
+            agent: None,
+            prefix_digests: None,
+        }),
+        cache_cost: None,
+        request: Some(request),
+    };
+
+    let mut folder = SessionFolder::new("gpt-5.6-terra");
+    folder.push(&envelope(
+        1,
+        Some("run-request-local"),
+        None,
+        1,
+        usage_payload(cumulative(100, 10, request_usage(1, 100, 10))),
+    ));
+    folder.push(&envelope(
+        2,
+        Some("run-request-local"),
+        None,
+        2,
+        usage_payload(cumulative(300, 30, request_usage(2, 200, 20))),
+    ));
+    let mut unavailable_request = request_usage(3, 50, 5);
+    unavailable_request.normalized = None;
+    let mut unavailable_cumulative = cumulative(350, 35, unavailable_request);
+    unavailable_cumulative.normalized = None;
+    folder.push(&envelope(
+        3,
+        Some("run-request-local"),
+        None,
+        3,
+        usage_payload(unavailable_cumulative),
+    ));
+
+    let stats = folder.finish();
+    let totals = &stats.tokens[&account];
+    assert_eq!(totals.input, 350, "request-local input is summed once");
+    assert_eq!(totals.output, 35, "request-local output is summed once");
+    assert_eq!(totals.cache.logical_input_tokens, 300);
+    let requests = &totals.cache.requests;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].request.ordinal, 1);
+    assert_eq!(requests[0].request.input, 100);
+    assert_eq!(requests[1].request.ordinal, 2);
+    assert_eq!(requests[1].request.input, 200);
+    assert_eq!(requests[2].request.ordinal, 3);
+    assert_eq!(requests[2].request.input, 50);
+    assert_eq!(requests[2].request.normalized, None);
+}
+
 fn metrics_usage(logical: u64, output: u64, model: &str, request_kind: UsageRequestKind) -> Usage {
     Usage {
         input: logical,
@@ -757,6 +861,7 @@ fn metrics_usage(logical: u64, output: u64, model: &str, request_kind: UsageRequ
             prefix_digests: None,
         }),
         cache_cost: None,
+        request: None,
     }
 }
 

@@ -1,10 +1,44 @@
 //! Cache-epoch policy and visible transition facts (CM3).
 
 use crate::item::TurnItem;
+use crate::provider::CacheRequestDiagnosticV1;
 use serde::{Deserialize, Serialize};
 
 /// Stable additive extension kind for a named cache-epoch transition.
 pub const CACHE_EPOCH_TRANSITION_EXTENSION_KIND: &str = "cache_epoch_transition_v1";
+
+/// Stable hidden extension kind written immediately before a physical
+/// provider request. It preserves hashes even when opening or streaming the
+/// request fails before the provider can report usage.
+pub const CACHE_REQUEST_ATTEMPT_EXTENSION_KIND: &str = "cache_request_attempt_v1";
+
+/// Hashes-and-counts-only evidence captured at provider dispatch time.
+/// Response-local counters later join this record by `ordinal` through
+/// [`crate::provider::RequestUsage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRequestAttemptV1 {
+    pub ordinal: u64,
+    pub diagnostic: CacheRequestDiagnosticV1,
+}
+
+impl CacheRequestAttemptV1 {
+    pub fn extension_item(&self) -> Result<TurnItem, serde_json::Error> {
+        Ok(TurnItem::Extension {
+            kind: CACHE_REQUEST_ATTEMPT_EXTENSION_KIND.to_owned(),
+            data: serde_json::to_value(self)?,
+        })
+    }
+
+    #[must_use]
+    pub fn from_extension_item(item: &TurnItem) -> Option<Self> {
+        let TurnItem::Extension { kind, data } = item else {
+            return None;
+        };
+        (kind == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND)
+            .then(|| serde_json::from_value(data.clone()).ok())
+            .flatten()
+    }
+}
 
 /// Session policy for cache-destructive configuration changes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

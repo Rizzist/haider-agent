@@ -317,6 +317,7 @@ fn cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetad
     PromptCacheMetadata {
         stable_history_end,
         current_user_start: stable_history_end,
+        previous_stable_history_end: None,
         latest_compaction_summary_end: Some(1),
         prefix_digests: PrefixDigests {
             system: "system-digest".into(),
@@ -543,11 +544,24 @@ fn cm2a_anthropic_final_wire_system_and_tool_digests_are_stable() {
     let metadata = second.cache_metadata.as_mut().expect("cache metadata");
     metadata.stable_history_end = 5;
     metadata.current_user_start = 5;
+    metadata.previous_stable_history_end = Some(3);
     let second_digests = provider
         .rendered_cache_prefix_digests(&second)
         .expect("second rendered digests");
     assert_eq!(first_digests.system, second_digests.system);
     assert_eq!(first_digests.tools, second_digests.tools);
+    let second_prepared = provider
+        .prepare_turn(&second)
+        .expect("second prepared turn");
+    assert_eq!(
+        second_prepared.previous_immutable_history_digest(),
+        Some(first_digests.immutable_history.as_str()),
+        "the grown wire retains the old rendered history prefix"
+    );
+    assert_ne!(
+        first_digests.immutable_history, second_digests.immutable_history,
+        "the current moving history breakpoint advances"
+    );
 
     let mut mutated = second;
     mutated.tools[0].description.push_str(" mutated");
@@ -557,6 +571,66 @@ fn cm2a_anthropic_final_wire_system_and_tool_digests_are_stable() {
         .expect("mutated rendered digests");
     assert_ne!(first_digests.system, mutated_digests.system);
     assert_ne!(first_digests.tools, mutated_digests.tools);
+}
+
+#[test]
+fn cache_diagnostic_provider_prepare_added_cpu_cost_is_measured() {
+    let provider = payload_provider(true).with_prompt_caching_verified(true);
+    let request = cache_control_request();
+    let samples = 5_000_usize;
+    let mut baseline = Vec::with_capacity(samples);
+    let mut prepared = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        if sample % 2 == 0 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(
+                provider
+                    .request_payload(std::hint::black_box(&request))
+                    .expect("baseline renders"),
+            );
+            baseline.push(started.elapsed());
+            let started = std::time::Instant::now();
+            std::hint::black_box(
+                provider
+                    .prepare_turn(std::hint::black_box(&request))
+                    .expect("diagnostic prepares"),
+            );
+            prepared.push(started.elapsed());
+        } else {
+            let started = std::time::Instant::now();
+            std::hint::black_box(
+                provider
+                    .prepare_turn(std::hint::black_box(&request))
+                    .expect("diagnostic prepares"),
+            );
+            prepared.push(started.elapsed());
+            let started = std::time::Instant::now();
+            std::hint::black_box(
+                provider
+                    .request_payload(std::hint::black_box(&request))
+                    .expect("baseline renders"),
+            );
+            baseline.push(started.elapsed());
+        }
+    }
+    baseline.sort_unstable();
+    prepared.sort_unstable();
+    let mean = |values: &[std::time::Duration]| {
+        values
+            .iter()
+            .map(std::time::Duration::as_nanos)
+            .sum::<u128>()
+            / values.len() as u128
+    };
+    let baseline_mean = mean(&baseline);
+    let prepared_mean = mean(&prepared);
+    let baseline_p95 = baseline[baseline.len() * 95 / 100].as_nanos();
+    let prepared_p95 = prepared[prepared.len() * 95 / 100].as_nanos();
+    eprintln!(
+        "cache diagnostic provider prepare: added_mean_ns={} added_p95_ns={} baseline_mean_ns={baseline_mean} prepared_mean_ns={prepared_mean} samples={samples}",
+        prepared_mean.saturating_sub(baseline_mean),
+        prepared_p95.saturating_sub(baseline_p95),
+    );
 }
 
 /// MUTATION CHECK: change or drop the identity text, merge it into the turn's

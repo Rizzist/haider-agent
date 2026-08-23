@@ -56,16 +56,19 @@ use haider_core::{
     DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
     GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
-    ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler, ProviderDerivedRequestState,
-    ProviderPairSwitch, ProviderPairSwitchCommitter, RequestInputCheckpoint,
-    SessionSelectModelCommand, SessionSelectModelOutcome, StoreHandle, SubmitCheckpointTurn,
-    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
-    ToolDispatcher, TurnHandle, context_soft_threshold_tokens, effect_recovery_evidence,
+    PreviousCacheRequest, ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler,
+    ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
+    RequestInputCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, StoreHandle,
+    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, build_cache_request_diagnostic,
+    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_input_tokens, presentation_for_haider_error,
     sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
-use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
+use haider_protocol::cache::{
+    CacheEpochTransitionReason, CacheEpochTransitionV1, CacheRequestAttemptV1,
+};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
@@ -96,8 +99,9 @@ use haider_protocol::permission::{
 };
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{
-    AccountUsage, CacheBoundaryIdentity, CapabilityDoc, FeatureResolve, FinishReason,
-    PrefixDigests, StreamEvent, Usage, UsageRequestKind, UsageScope,
+    AccountUsage, CacheBoundaryIdentity, CacheControlObservationV1, CacheRewarmReasonV1,
+    CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests,
+    RequestUsage, StreamEvent, Usage, UsageRequestKind, UsageScope,
 };
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
@@ -332,10 +336,63 @@ impl std::fmt::Debug for DaemonContextCompactor {
 }
 
 impl DaemonContextCompactor {
+    async fn record_cache_request_attempt(
+        &self,
+        run_id: &RunId,
+        ordinal: u64,
+        diagnostic: &haider_protocol::provider::CacheRequestDiagnosticV1,
+    ) -> Result<(), HaiderError> {
+        let item = CacheRequestAttemptV1 {
+            ordinal,
+            diagnostic: diagnostic.clone(),
+        }
+        .extension_item()
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cache request diagnostic could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let item_id = ItemId::new(format!(
+            "cache-request-attempt-{}-{ordinal}",
+            self.event_ids.next()
+        ));
+        let mut envelopes = vec![
+            supervisor_envelope(
+                &self.store,
+                &self.device_id,
+                self.branch_id.clone(),
+                Some(run_id.clone()),
+                self.event_ids.next(),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+            )?,
+            supervisor_envelope(
+                &self.store,
+                &self.device_id,
+                self.branch_id.clone(),
+                Some(run_id.clone()),
+                self.event_ids.next(),
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            )?,
+        ];
+        for envelope in &mut envelopes {
+            envelope.agent_id = self.agent_id.clone();
+            envelope.render.ui = false;
+        }
+        StoreHandle::append(&self.store, &mut envelopes)
+            .await
+            .map(|_| ())
+    }
+
     fn compaction_cache_metadata(
         &self,
         messages: &[Message],
         stable_history_end: usize,
+        previous_stable_history_end: Option<usize>,
         prefix_digests: PrefixDigests,
         latest_compaction_summary_end: Option<usize>,
     ) -> PromptCacheMetadata {
@@ -367,6 +424,7 @@ impl DaemonContextCompactor {
         PromptCacheMetadata {
             stable_history_end,
             current_user_start: stable_history_end,
+            previous_stable_history_end,
             latest_compaction_summary_end,
             prefix_digests,
             cache_epoch,
@@ -461,6 +519,11 @@ impl ContextCompactor for DaemonContextCompactor {
         attachments: Vec<haider_provider::ResolvedAttachment>,
         latest_compaction_summary_end: Option<usize>,
     ) -> Result<Message, HaiderError> {
+        let (previous_cache_request, _) =
+            prior_cache_request_context(&self.store, &self.usage_scope).await?;
+        let previous_stable_history_end = previous_cache_request
+            .as_ref()
+            .map(|previous| previous.history_message_count);
         let immutable_history_digest = digest_json(&covered_messages);
         let covered_history_end = covered_messages.len();
         let mut replay_messages = covered_messages.clone();
@@ -473,9 +536,20 @@ impl ContextCompactor for DaemonContextCompactor {
             auth_mode: digest_json(&self.usage_scope.auth_scope),
             reasoning_settings: digest_json(&self.reasoning_settings),
         };
+        let mut previous_prefix_digests = previous_stable_history_end
+            .filter(|previous| *previous <= replay_messages.len())
+            .map(|previous| PrefixDigests {
+                system: prefix_digests.system.clone(),
+                tools: prefix_digests.tools.clone(),
+                immutable_history: digest_json(&replay_messages[..previous]),
+                model: prefix_digests.model.clone(),
+                auth_mode: prefix_digests.auth_mode.clone(),
+                reasoning_settings: prefix_digests.reasoning_settings.clone(),
+            });
         let mut cache_metadata = self.compaction_cache_metadata(
             &replay_messages,
             covered_history_end,
+            previous_stable_history_end,
             prefix_digests.clone(),
             latest_compaction_summary_end,
         );
@@ -496,21 +570,59 @@ impl ContextCompactor for DaemonContextCompactor {
         let prepared = self.provider.prepare_turn(&request);
         if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
             prefix_digests = rendered.clone();
+            previous_prefix_digests = prepared
+                .as_ref()
+                .and_then(|prepared| prepared.previous_immutable_history_digest())
+                .map(|history| {
+                    let mut previous = rendered.clone();
+                    previous.immutable_history = history.to_owned();
+                    previous
+                });
             cache_metadata = self.compaction_cache_metadata(
                 &request.messages,
                 covered_history_end,
+                previous_stable_history_end,
                 prefix_digests.clone(),
                 latest_compaction_summary_end,
             );
-            request.cache_metadata = Some(cache_metadata);
+            request.cache_metadata = Some(cache_metadata.clone());
         }
+        let cache_control = prepared
+            .as_ref()
+            .map_or(CacheControlObservationV1::Unavailable, |prepared| {
+                *prepared.cache_control()
+            });
+        let replay_cache_diagnostic = build_cache_request_diagnostic(
+            &self.store.hub().cache_diagnostic_key(),
+            &self.usage_scope.provider,
+            &self.model,
+            &cache_metadata.cache_epoch,
+            &prefix_digests,
+            previous_prefix_digests.as_ref(),
+            previous_cache_request.as_ref(),
+            covered_history_end,
+            cache_metadata.stable_prefix_tokens,
+            cache_metadata.reuse_gap_ms,
+            cache_control,
+            None,
+        );
+        self.record_cache_request_attempt(run_id, 1, &replay_cache_diagnostic)
+            .await?;
         let replay_request_messages = request.messages.clone();
-        let (mut stream, request_messages, request_prefix_digests) = match self
-            .provider
-            .stream_prepared_turn(request, prepared)
-            .await
-        {
-            Ok(stream) => (stream, replay_request_messages, prefix_digests),
+        let (
+            mut stream,
+            request_messages,
+            request_ordinal,
+            request_cache_epoch,
+            request_cache_diagnostic,
+        ) = match self.provider.stream_prepared_turn(request, prepared).await {
+            Ok(stream) => (
+                stream,
+                replay_request_messages,
+                1_u64,
+                cache_metadata.cache_epoch.clone(),
+                replay_cache_diagnostic,
+            ),
             // Round 5: a RETRYABLE start failure (transport, overload,
             // rate limit) propagates so the caller's retry semantics run —
             // burning it as an uncached full-price fallback both lies about
@@ -554,13 +666,6 @@ impl ContextCompactor for DaemonContextCompactor {
                     attachments: Vec::new(),
                     cache_metadata: None,
                 };
-                let stream = self.provider.stream_turn(fallback).await.map_err(|error| {
-                    HaiderError::new(
-                        ErrorCode::ProviderError,
-                        format!("context summarization could not start: {error}"),
-                        error.retryable,
-                    )
-                })?;
                 let fallback_prefix_digests = PrefixDigests {
                     system: digest_json(&Option::<String>::None),
                     tools: canonical_tool_definitions_digest(&[]),
@@ -571,7 +676,52 @@ impl ContextCompactor for DaemonContextCompactor {
                     // — usage must not claim a default it did not use.
                     reasoning_settings: digest_json(&self.reasoning_settings),
                 };
-                (stream, request_messages, fallback_prefix_digests)
+                let fallback_stable_prefix_tokens = estimate_provider_request_input_tokens(
+                    &request_messages[..covered_history_end.min(request_messages.len())],
+                    &None,
+                    &[],
+                    &[],
+                );
+                let fallback_cache_epoch = digest_json(&serde_json::json!({
+                    "provider": self.usage_scope.provider,
+                    "model": self.model,
+                    "account_scope": self.usage_account,
+                    "system_digest": fallback_prefix_digests.system,
+                    "tool_digest": fallback_prefix_digests.tools,
+                    "auth_digest": fallback_prefix_digests.auth_mode,
+                    "reasoning_digest": fallback_prefix_digests.reasoning_settings,
+                    "compaction_epoch": cache_metadata.compaction_epoch,
+                }));
+                let fallback_cache_diagnostic = build_cache_request_diagnostic(
+                    &self.store.hub().cache_diagnostic_key(),
+                    &self.usage_scope.provider,
+                    &self.model,
+                    &fallback_cache_epoch,
+                    &fallback_prefix_digests,
+                    None,
+                    previous_cache_request.as_ref(),
+                    covered_history_end,
+                    fallback_stable_prefix_tokens,
+                    cache_metadata.reuse_gap_ms,
+                    CacheControlObservationV1::Unavailable,
+                    None,
+                );
+                self.record_cache_request_attempt(run_id, 2, &fallback_cache_diagnostic)
+                    .await?;
+                let stream = self.provider.stream_turn(fallback).await.map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::ProviderError,
+                        format!("context summarization could not start: {error}"),
+                        error.retryable,
+                    )
+                })?;
+                (
+                    stream,
+                    request_messages,
+                    2_u64,
+                    fallback_cache_epoch,
+                    fallback_cache_diagnostic,
+                )
             }
         };
         let mut summary = String::new();
@@ -592,7 +742,8 @@ impl ContextCompactor for DaemonContextCompactor {
                     scope.request_kind = UsageRequestKind::Compaction;
                     scope.run = Some(run_id.clone());
                     scope.agent = self.agent_id.clone();
-                    scope.prefix_digests = Some(request_prefix_digests.clone());
+                    scope.cache_epoch.clone_from(&request_cache_epoch);
+                    scope.prefix_digests = None;
                     if let Some(account) = &self.usage_account {
                         usage.account = Some(account.clone());
                         scope.account_scope = Some(account.clone());
@@ -614,6 +765,25 @@ impl ContextCompactor for DaemonContextCompactor {
                             cache_cost: usage.cache_cost,
                         }];
                     }
+                    let mut cache_diagnostic = request_cache_diagnostic.clone();
+                    cache_diagnostic.classification =
+                        classify_cache_request(&cache_diagnostic, usage.normalized.as_ref());
+                    usage.request = Some(RequestUsage {
+                        ordinal: request_ordinal,
+                        input: usage.input,
+                        output: usage.output,
+                        reasoning: (usage.reasoning > 0).then_some(usage.reasoning),
+                        cached: (usage.cached > 0
+                            || usage.normalized.as_ref().is_some_and(|normalized| {
+                                normalized.cache_status == CacheStatAvailability::Present
+                            }))
+                        .then_some(usage.cached),
+                        source: usage.source,
+                        account: usage.account.clone(),
+                        normalized: usage.normalized.clone(),
+                        cache_cost: usage.cache_cost,
+                        cache: Some(cache_diagnostic),
+                    });
                     // Provider streaming usage is cumulative within this
                     // request; the latest snapshot replaces earlier ones.
                     reported_usage = Some(usage);
@@ -5021,6 +5191,11 @@ async fn start_turn(
         &config.usage_scope,
     )
     .await?;
+    let (previous_cache_request, cache_initial_rewarm) =
+        prior_cache_request_context(lease, &config.usage_scope).await?;
+    config.cache_diagnostic_key = lease.hub().cache_diagnostic_key();
+    config.cache_previous_request = previous_cache_request;
+    config.cache_initial_rewarm = cache_initial_rewarm;
     config.cache_reuse_gap_ms =
         prior_cache_domain_gap_ms(lease, &accepted.run_id, &config.usage_scope).await?;
     config.cache_stable_history_end = Some(compiled_stable_history_end);
@@ -5223,7 +5398,7 @@ fn credential_surface_name(surface: ProviderCredentialSurface) -> &'static str {
     }
 }
 
-fn digest_json(value: &impl serde::Serialize) -> String {
+fn digest_json(value: &(impl serde::Serialize + ?Sized)) -> String {
     serde_json::to_vec(value).map_or_else(
         |_| blake3::hash(b"serialization-error").to_hex().to_string(),
         |bytes| blake3::hash(&bytes).to_hex().to_string(),
@@ -6149,6 +6324,76 @@ async fn latest_main_usage_scope(
         }
     }
     Ok(latest)
+}
+
+async fn prior_cache_request_context(
+    store: &HubStoreHandle,
+    lane: &UsageScope,
+) -> Result<(Option<PreviousCacheRequest>, Option<CacheRewarmReasonV1>), HaiderError> {
+    let mut latest_main_usage_seq = 0_u64;
+    let mut previous_request = None;
+    let mut latest_deliberate_boundary = None::<(u64, CacheRewarmReasonV1)>;
+    let mut cursor = 0_u64;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if let Ok(EventPayload::Usage(usage)) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                && usage.scope.as_ref().is_some_and(|scope| {
+                    scope.request_kind == UsageRequestKind::MainTurn
+                        && scope.agent.is_none()
+                        && scope.provider == lane.provider
+                        && scope.model == lane.model
+                        && scope.account_scope == lane.account_scope
+                        && scope.auth_scope == lane.auth_scope
+                })
+            {
+                latest_main_usage_seq = envelope.seq;
+                previous_request = usage.request.and_then(|request| {
+                    request.cache.map(|cache| PreviousCacheRequest {
+                        history_message_count: usize::try_from(cache.history_message_count)
+                            .unwrap_or(usize::MAX),
+                        breakpoint_hashes: cache.breakpoint_hashes,
+                        cache_domain_hash: cache.cache_domain_hash,
+                    })
+                });
+                continue;
+            }
+            if let Ok(EventPayload::NodeCommitted(TreeNode {
+                kind: NodeKind::Compaction { .. },
+                ..
+            })) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            {
+                latest_deliberate_boundary =
+                    Some((envelope.seq, CacheRewarmReasonV1::PlannedCompaction));
+                continue;
+            }
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            let Some(transition) = CacheEpochTransitionV1::from_extension_item(&item) else {
+                continue;
+            };
+            let reason = if transition.reason == CacheEpochTransitionReason::Compaction
+                || transition.planned
+            {
+                CacheRewarmReasonV1::PlannedCompaction
+            } else {
+                CacheRewarmReasonV1::ConfigurationChange
+            };
+            latest_deliberate_boundary = Some((envelope.seq, reason));
+        }
+    }
+    let pending = latest_deliberate_boundary
+        .filter(|(seq, _)| *seq > latest_main_usage_seq)
+        .map(|(_, reason)| reason);
+    Ok((previous_request, pending))
 }
 
 async fn cache_transition_was_emitted(

@@ -133,6 +133,35 @@ pub(crate) fn rendered_array_prefix_digest(
     )))
 }
 
+/// Finds a metadata key introduced by the adapter by comparing the final
+/// payload with the same rendered prompt before cache controls are applied.
+/// A provider-opaque or user-authored key present in both values is ignored.
+pub(crate) fn payload_has_added_key(
+    final_value: &serde_json::Value,
+    prompt_value: &serde_json::Value,
+    needle: &str,
+) -> bool {
+    match (final_value, prompt_value) {
+        (serde_json::Value::Array(final_values), serde_json::Value::Array(prompt_values)) => {
+            final_values
+                .iter()
+                .zip(prompt_values)
+                .any(|(final_value, prompt_value)| {
+                    payload_has_added_key(final_value, prompt_value, needle)
+                })
+        }
+        (serde_json::Value::Object(final_values), serde_json::Value::Object(prompt_values)) => {
+            (final_values.contains_key(needle) && !prompt_values.contains_key(needle))
+                || final_values.iter().any(|(key, final_value)| {
+                    prompt_values.get(key).is_some_and(|prompt_value| {
+                        payload_has_added_key(final_value, prompt_value, needle)
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
 pub use anthropic::{
     ANTHROPIC_API_URL, ANTHROPIC_COMPUTER_BETA_20250124, ANTHROPIC_COMPUTER_BETA_20251124,
     ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
@@ -550,6 +579,11 @@ pub struct PromptCacheMetadata {
     pub stable_history_end: usize,
     /// Start of the accepted current user turn.
     pub current_user_start: usize,
+    /// The preceding request's moving immutable-history boundary. Adapters
+    /// hash the current rendered wire through this old normalized boundary
+    /// so append-only growth can be distinguished from a rewritten prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_stable_history_end: Option<usize>,
     /// End of the latest active compaction-summary message, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_compaction_summary_end: Option<usize>,
@@ -612,6 +646,8 @@ pub struct TurnRequest {
 /// refreshed from finalized metadata before transmission.
 pub struct PreparedTurn {
     pub(crate) prefix_digests: PrefixDigests,
+    pub(crate) previous_immutable_history_digest: Option<String>,
+    pub(crate) cache_control: haider_protocol::provider::CacheControlObservationV1,
     pub(crate) wire: Option<PreparedWire>,
 }
 
@@ -630,6 +666,16 @@ impl PreparedTurn {
     #[must_use]
     pub fn prefix_digests(&self) -> &PrefixDigests {
         &self.prefix_digests
+    }
+
+    #[must_use]
+    pub fn previous_immutable_history_digest(&self) -> Option<&str> {
+        self.previous_immutable_history_digest.as_deref()
+    }
+
+    #[must_use]
+    pub fn cache_control(&self) -> &haider_protocol::provider::CacheControlObservationV1 {
+        &self.cache_control
     }
 }
 
@@ -1033,6 +1079,8 @@ pub trait Provider: Send + Sync {
         self.rendered_cache_prefix_digests(request)
             .map(|prefix_digests| PreparedTurn {
                 prefix_digests,
+                previous_immutable_history_digest: None,
+                cache_control: haider_protocol::provider::CacheControlObservationV1::Unavailable,
                 wire: None,
             })
     }

@@ -160,6 +160,12 @@ pub struct Usage {
     /// cache split, or required write telemetry is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_cost: Option<CacheCostEstimate>,
+    /// One physical provider request's response-local counters and cache
+    /// evidence. The legacy fields above remain cumulative within their
+    /// run/cache lane; this additive record is what makes individual misses
+    /// attributable without changing existing accounting semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RequestUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,6 +184,174 @@ pub struct AccountUsage {
     pub scope: Option<UsageScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_cost: Option<CacheCostEstimate>,
+}
+
+/// Response-local accounting and cache evidence for one physical provider
+/// request. A provider stream may publish several cumulative usage updates;
+/// records with the same ordinal replace one another and the last one wins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestUsage {
+    pub ordinal: u64,
+    pub input: u64,
+    pub output: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<u64>,
+    pub source: UsageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<CredentialAlias>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized: Option<NormalizedUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_cost: Option<CacheCostEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheRequestDiagnosticV1>,
+}
+
+/// Keyed cumulative hashes at the provider-visible cache breakpoints.
+///
+/// `tools` covers system+tools and `history` covers system+tools+immutable
+/// history. This makes the first differing value the location of the first
+/// moved prefix component without persisting any prompt bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheBreakpointHashesV1 {
+    pub system: String,
+    pub tools: String,
+    pub history: String,
+}
+
+/// The previous request's moving history boundary checked against the
+/// current rendered wire. `actual_hash` is absent when the old boundary no
+/// longer exists in the current request; absence is never rendered as an
+/// all-zero or empty digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviousCacheBreakpointV1 {
+    pub message_count: u64,
+    pub expected_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_hash: Option<String>,
+}
+
+/// Provider-visible breakpoint at which a reused prefix first moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheBreakpointV1 {
+    System,
+    Tools,
+    History,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Comparison with the immediately preceding cache entry in this lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CachePrefixMatchV1 {
+    Same,
+    Changed {
+        first: CacheBreakpointV1,
+    },
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why an adapter that requires an explicit cache control did not emit one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheControlOmissionReasonV1 {
+    InvalidBoundaries,
+    MissingAccountScope,
+    ProviderMismatch,
+    UnsupportedModel,
+    Unverified,
+    AdapterUnavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Exact observation of the cache control in the final synchronous adapter
+/// payload. Asynchronous resource adapters use `Unavailable` rather than
+/// predicting whether a later network-side create/reuse operation succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheControlObservationV1 {
+    Emitted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_ms: Option<u64>,
+    },
+    NotRequired,
+    NotEmitted {
+        reason: CacheControlOmissionReasonV1,
+    },
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A deliberate cold boundary owned by Haider rather than the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheRewarmReasonV1 {
+    PlannedCompaction,
+    ConfigurationChange,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Response-local classification for an observed zero cache read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheMissClassificationV1 {
+    PrefixChanged {
+        first: CacheBreakpointV1,
+    },
+    ControlNotEmitted {
+        reason: CacheControlOmissionReasonV1,
+    },
+    BelowMinimum,
+    Expired,
+    PlannedCompaction,
+    ConfigurationChange,
+    SamePrefixInTtl,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Hashes-and-counts-only evidence needed to explain one cache result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRequestDiagnosticV1 {
+    pub history_message_count: u64,
+    pub stable_prefix_tokens: u64,
+    pub breakpoint_hashes: CacheBreakpointHashesV1,
+    /// Keyed identity of provider/model/account/auth/reasoning/cache epoch.
+    /// Optional for additive decoding of records written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_domain_hash: Option<String>,
+    /// `false` is an observed same-domain comparison, not an unavailable
+    /// measurement. Absent means there was no comparable prior record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_domain_changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_breakpoint: Option<PreviousCacheBreakpointV1>,
+    pub prefix_match: CachePrefixMatchV1,
+    pub control: CacheControlObservationV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cacheable_minimum_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_gap_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewarm: Option<CacheRewarmReasonV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<CacheMissClassificationV1>,
 }
 
 /// Honest availability for a provider-reported cache counter. A reported
@@ -246,11 +420,14 @@ pub struct NormalizedUsage {
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum UsageRequestKind {
     #[default]
     MainTurn,
     Compaction,
     DelegatedAgent,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Non-secret hashes of provider-visible prefix components. These are

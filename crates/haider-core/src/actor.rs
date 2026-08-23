@@ -40,7 +40,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerification};
-use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
+use haider_protocol::cache::{
+    CACHE_REQUEST_ATTEMPT_EXTENSION_KIND, CacheEpochTransitionReason, CacheEpochTransitionV1,
+    CacheRequestAttemptV1,
+};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
@@ -60,9 +63,11 @@ use haider_protocol::menu::{
     ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
 use haider_protocol::provider::{
-    AccountUsage, Block, CacheCostEstimate, CacheStatAvailability, FinishReason, NormalizedUsage,
-    PROVIDER_OPAQUE_EXTENSION_KIND, PrefixDigests, StreamEvent, Usage, UsageRequestKind,
-    UsageScope, WEB_SOURCES_EXTENSION_KIND, WebSource,
+    AccountUsage, Block, CacheBreakpointHashesV1, CacheBreakpointV1, CacheControlObservationV1,
+    CacheCostEstimate, CacheMissClassificationV1, CachePrefixMatchV1, CacheRequestDiagnosticV1,
+    CacheRewarmReasonV1, CacheStatAvailability, FinishReason, NormalizedUsage,
+    PROVIDER_OPAQUE_EXTENSION_KIND, PrefixDigests, PreviousCacheBreakpointV1, RequestUsage,
+    StreamEvent, Usage, UsageRequestKind, UsageScope, WEB_SOURCES_EXTENSION_KIND, WebSource,
 };
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
@@ -83,6 +88,62 @@ use std::sync::{Mutex, PoisonError};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
+
+/// Profile-scoped secret used only for diagnostic prefix fingerprints.
+/// Custom debug output is deliberately redacted so a config dump cannot
+/// disclose the key that protects short prompt components from guessing.
+#[derive(Clone)]
+pub struct CacheDiagnosticKey([u8; 32]);
+
+impl CacheDiagnosticKey {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    fn ephemeral(session_id: &SessionId, device_id: &DeviceId) -> Self {
+        use std::io::Read as _;
+
+        let mut bytes = [0_u8; 32];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .is_err()
+        {
+            // Production daemon journals replace this process-local key with
+            // the profile key created from `getrandom`. This fallback keeps
+            // direct core embedders functional on platforms without
+            // `/dev/urandom`, while mixing RandomState's per-process secret.
+            use std::hash::{BuildHasher as _, Hasher as _};
+
+            for (index, chunk) in bytes.chunks_exact_mut(8).enumerate() {
+                let random = std::collections::hash_map::RandomState::new();
+                let mut entropy = random.build_hasher();
+                entropy.write(session_id.as_str().as_bytes());
+                entropy.write(device_id.as_str().as_bytes());
+                entropy.write_u32(std::process::id());
+                entropy.write_u64(unix_time_ms());
+                entropy.write_usize(index);
+                chunk.copy_from_slice(&entropy.finish().to_le_bytes());
+            }
+        }
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for CacheDiagnosticKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CacheDiagnosticKey([REDACTED])")
+    }
+}
+
+/// The immediately preceding request boundary loaded by the daemon or
+/// retained between tool-loop requests in the same actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousCacheRequest {
+    pub history_message_count: usize,
+    pub breakpoint_hashes: CacheBreakpointHashesV1,
+    pub cache_domain_hash: Option<String>,
+}
 const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
 /// Maximum time a provider-stream text, reasoning, or tool-argument delta may
 /// remain in memory before it is journaled. Contiguous deltas for one item and
@@ -176,6 +237,14 @@ pub struct HarnessConfig {
     pub cache_expected_later_reads: u32,
     /// Observed gap in the current ephemeral cache domain.
     pub cache_reuse_gap_ms: Option<u64>,
+    /// Secret profile key for non-reversible cache diagnostics.
+    pub cache_diagnostic_key: CacheDiagnosticKey,
+    /// Last completed provider request in this cache lane, when durable
+    /// request-level telemetry exists.
+    pub cache_previous_request: Option<PreviousCacheRequest>,
+    /// Deliberate cold-boundary marker consumed by the first request that
+    /// actually yields usage telemetry.
+    pub cache_initial_rewarm: Option<CacheRewarmReasonV1>,
     /// Canonical provider-visible reasoning/fast settings used only for the
     /// prefix digest. It never enters a request body from this field.
     pub reasoning_settings: String,
@@ -230,6 +299,7 @@ impl HarnessConfig {
         authority_epoch: u64,
         worker_generation: u64,
     ) -> Self {
+        let cache_diagnostic_key = CacheDiagnosticKey::ephemeral(&session_id, &device_id);
         Self {
             session_id,
             branch_id: None,
@@ -259,6 +329,9 @@ impl HarnessConfig {
             cache_compaction_summary_end: None,
             cache_expected_later_reads: 0,
             cache_reuse_gap_ms: None,
+            cache_diagnostic_key,
+            cache_previous_request: None,
+            cache_initial_rewarm: None,
             reasoning_settings: String::new(),
             initial_rotation: None,
             rotation_budget_consumed: false,
@@ -1909,6 +1982,11 @@ impl HarnessActor {
         let mut provider_pair_switch_ordinal = 0u32;
         let mut provider_attempt = 0usize;
         let mut completed_usage: Option<Usage> = None;
+        let mut provider_request_ordinal = 0_u64;
+        let mut previous_cache_request = self.config.cache_previous_request.clone();
+        let mut pending_previous_cache_request: Option<PreviousCacheRequest> = None;
+        let mut previous_cache_completed_at: Option<tokio::time::Instant> = None;
+        let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
         // W-B: provider-executed tool rows and cited web sources are
         // TURN-scoped — a pause_turn boundary can split a server call from
         // its result across requests, and the bounded sources list journals
@@ -1921,6 +1999,13 @@ impl HarnessActor {
         let mut tool_json_repair_used = false;
 
         'requests: loop {
+            if let Some(completed) = pending_previous_cache_request.take() {
+                previous_cache_request = Some(completed);
+                if let Some(completed_at) = previous_cache_completed_at {
+                    self.config.cache_reuse_gap_ms =
+                        Some(u64::try_from(completed_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+                }
+            }
             if let Some(dispatcher) = self.dispatcher.as_ref() {
                 match dispatcher.refresh_volatile_context_tail().await {
                     Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
@@ -1978,6 +2063,7 @@ impl HarnessActor {
                 stable_history_end = usize::from(!messages.is_empty());
                 current_turn_start = stable_history_end;
                 latest_compaction_summary_end = Some(stable_history_end);
+                cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
             }
             if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
@@ -1997,16 +2083,26 @@ impl HarnessActor {
                     .await;
             }
             provider_attempt = provider_attempt.saturating_add(1);
+            provider_request_ordinal = provider_request_ordinal.saturating_add(1);
+            let previous_stable_history_end = previous_cache_request
+                .as_ref()
+                .map(|previous| previous.history_message_count);
             let mut prefix_digests = usage_prefix_digests(
                 &self.config,
                 &messages[..stable_history_end.min(messages.len())],
             );
+            let mut previous_prefix_digests = previous_stable_history_end
+                .filter(|previous| *previous <= messages.len())
+                .map(|previous| usage_prefix_digests(&self.config, &messages[..previous]));
             let mut cache_metadata = prompt_cache_metadata(
                 &self.config,
                 &messages,
-                stable_history_end,
-                current_turn_start,
-                latest_compaction_summary_end,
+                PromptCacheBoundaries {
+                    stable_history_end,
+                    current_user_start: current_turn_start,
+                    previous_stable_history_end,
+                    latest_compaction_summary_end,
+                },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
             );
@@ -2041,17 +2137,84 @@ impl HarnessActor {
             let prepared = provider.prepare_turn(&provider_request);
             if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
                 prefix_digests = rendered.clone();
+                previous_prefix_digests = prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.previous_immutable_history_digest())
+                    .map(|history| {
+                        let mut previous = rendered.clone();
+                        previous.immutable_history = history.to_owned();
+                        previous
+                    });
                 cache_metadata = prompt_cache_metadata(
                     &self.config,
                     &messages,
-                    stable_history_end,
-                    current_turn_start,
-                    latest_compaction_summary_end,
+                    PromptCacheBoundaries {
+                        stable_history_end,
+                        current_user_start: current_turn_start,
+                        previous_stable_history_end,
+                        latest_compaction_summary_end,
+                    },
                     prefix_digests.clone(),
                     usage_account.as_ref(),
                 );
                 provider_request.cache_metadata = Some(cache_metadata.clone());
             }
+            let cache_control = prepared
+                .as_ref()
+                .map_or(CacheControlObservationV1::Unavailable, |prepared| {
+                    *prepared.cache_control()
+                });
+            let request_cache_diagnostic = build_cache_request_diagnostic(
+                &self.config.cache_diagnostic_key,
+                &cache_metadata.provider,
+                &self.config.model,
+                &cache_metadata.cache_epoch,
+                &prefix_digests,
+                previous_prefix_digests.as_ref(),
+                previous_cache_request.as_ref(),
+                stable_history_end,
+                cache_metadata.stable_prefix_tokens,
+                cache_metadata.reuse_gap_ms,
+                cache_control,
+                cache_rewarm_pending,
+            );
+            let request_attempt = CacheRequestAttemptV1 {
+                ordinal: provider_request_ordinal,
+                diagnostic: request_cache_diagnostic.clone(),
+            };
+            let request_attempt_data = match serde_json::to_value(request_attempt) {
+                Ok(data) => data,
+                Err(error) => {
+                    return self
+                        .errored_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            HaiderError::new(
+                                ErrorCode::Internal,
+                                format!("cache request diagnostic could not serialize: {error}"),
+                                false,
+                            ),
+                        )
+                        .await;
+                }
+            };
+            if let Err(error) = self
+                .commit_hidden_extension_marker(
+                    &run_id,
+                    CACHE_REQUEST_ATTEMPT_EXTENSION_KIND,
+                    request_attempt_data,
+                )
+                .await
+            {
+                return self.errored_state_outcome(&run_id, error).await;
+            }
+            // The durable attempt record above is the first post-compaction
+            // request even if opening or streaming later fails. A retry gets
+            // a fresh planned marker only when that failure itself triggers
+            // another compaction.
+            cache_rewarm_pending = None;
             let mut request_usage: Option<Usage> = None;
             let attempt_provider = Arc::clone(&provider);
             let mut opening =
@@ -2139,6 +2302,7 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
+                        cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
                         provider_attempt = 0;
                         continue 'requests;
                     }
@@ -2312,6 +2476,7 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
+                        cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
                         provider_attempt = 0;
                         continue 'requests;
                     }
@@ -2806,7 +2971,6 @@ impl HarnessActor {
                         attach_usage_scope_and_cost(
                             &self.config,
                             &run_id,
-                            prefix_digests.clone(),
                             &cache_metadata.cache_epoch,
                             cache_metadata.stable_prefix_tokens,
                             &mut usage,
@@ -2828,6 +2992,31 @@ impl HarnessActor {
                                 cache_cost: usage.cache_cost,
                             }];
                         }
+                        let mut cache_diagnostic = request_cache_diagnostic.clone();
+                        cache_diagnostic.classification =
+                            classify_cache_request(&cache_diagnostic, usage.normalized.as_ref());
+                        usage.request = Some(RequestUsage {
+                            ordinal: provider_request_ordinal,
+                            input: usage.input,
+                            output: usage.output,
+                            reasoning: (usage.reasoning > 0).then_some(usage.reasoning),
+                            cached: (usage.cached > 0
+                                || usage.normalized.as_ref().is_some_and(|normalized| {
+                                    normalized.cache_status == CacheStatAvailability::Present
+                                }))
+                            .then_some(usage.cached),
+                            source: usage.source,
+                            account: usage.account.clone(),
+                            normalized: usage.normalized.clone(),
+                            cache_cost: usage.cache_cost,
+                            cache: Some(cache_diagnostic.clone()),
+                        });
+                        pending_previous_cache_request = Some(PreviousCacheRequest {
+                            history_message_count: stable_history_end,
+                            breakpoint_hashes: cache_diagnostic.breakpoint_hashes,
+                            cache_domain_hash: cache_diagnostic.cache_domain_hash,
+                        });
+                        previous_cache_completed_at = Some(tokio::time::Instant::now());
                         let footprint =
                             context_footprint_from_usage(&self.config, &usage, &messages);
                         request_usage = Some(usage.clone());
@@ -7086,15 +7275,176 @@ fn usage_prefix_digests(config: &HarnessConfig, immutable_history: &[Message]) -
     }
 }
 
+fn keyed_breakpoint_hash(
+    key: &CacheDiagnosticKey,
+    breakpoint: &str,
+    components: &[&str],
+) -> String {
+    let mut hasher = blake3::Hasher::new_keyed(&key.0);
+    hasher.update(b"haider.cache-request-diagnostic.v1\0");
+    hasher.update(&(breakpoint.len() as u64).to_le_bytes());
+    hasher.update(breakpoint.as_bytes());
+    for component in components {
+        hasher.update(&(component.len() as u64).to_le_bytes());
+        hasher.update(component.as_bytes());
+    }
+    format!("blake3-keyed:{}", hasher.finalize().to_hex())
+}
+
+fn cache_breakpoint_hashes(
+    key: &CacheDiagnosticKey,
+    digests: &PrefixDigests,
+) -> CacheBreakpointHashesV1 {
+    CacheBreakpointHashesV1 {
+        system: keyed_breakpoint_hash(key, "system", &[&digests.system]),
+        tools: keyed_breakpoint_hash(key, "tools", &[&digests.system, &digests.tools]),
+        history: keyed_breakpoint_hash(
+            key,
+            "history",
+            &[&digests.system, &digests.tools, &digests.immutable_history],
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_cache_request_diagnostic(
+    key: &CacheDiagnosticKey,
+    provider: &str,
+    model: &str,
+    cache_epoch: &str,
+    current: &PrefixDigests,
+    current_through_previous_history: Option<&PrefixDigests>,
+    previous: Option<&PreviousCacheRequest>,
+    history_message_count: usize,
+    stable_prefix_tokens: u64,
+    reuse_gap_ms: Option<u64>,
+    control: CacheControlObservationV1,
+    rewarm: Option<CacheRewarmReasonV1>,
+) -> CacheRequestDiagnosticV1 {
+    let breakpoint_hashes = cache_breakpoint_hashes(key, current);
+    let cache_domain_hash = keyed_breakpoint_hash(key, "cache-domain", &[cache_epoch]);
+    let cache_domain_changed = previous
+        .and_then(|previous| previous.cache_domain_hash.as_ref())
+        .map(|previous| previous != &cache_domain_hash);
+    let previous_breakpoint = previous.map(|previous| PreviousCacheBreakpointV1 {
+        message_count: u64::try_from(previous.history_message_count).unwrap_or(u64::MAX),
+        expected_hash: previous.breakpoint_hashes.history.clone(),
+        actual_hash: current_through_previous_history
+            .map(|digests| cache_breakpoint_hashes(key, digests).history),
+    });
+    let prefix_match = previous.map_or(CachePrefixMatchV1::Unavailable, |previous| {
+        if previous.breakpoint_hashes.system != breakpoint_hashes.system {
+            CachePrefixMatchV1::Changed {
+                first: CacheBreakpointV1::System,
+            }
+        } else if previous.breakpoint_hashes.tools != breakpoint_hashes.tools {
+            CachePrefixMatchV1::Changed {
+                first: CacheBreakpointV1::Tools,
+            }
+        } else {
+            match previous_breakpoint
+                .as_ref()
+                .and_then(|breakpoint| breakpoint.actual_hash.as_ref())
+            {
+                Some(actual) if actual == &previous.breakpoint_hashes.history => {
+                    CachePrefixMatchV1::Same
+                }
+                Some(_) => CachePrefixMatchV1::Changed {
+                    first: CacheBreakpointV1::History,
+                },
+                None => CachePrefixMatchV1::Unavailable,
+            }
+        }
+    });
+    CacheRequestDiagnosticV1 {
+        history_message_count: u64::try_from(history_message_count).unwrap_or(u64::MAX),
+        stable_prefix_tokens,
+        breakpoint_hashes,
+        cache_domain_hash: Some(cache_domain_hash),
+        cache_domain_changed,
+        previous_breakpoint,
+        prefix_match,
+        control,
+        cacheable_minimum_tokens: haider_provider::cacheable_prompt_minimum(provider, model),
+        reuse_gap_ms,
+        rewarm,
+        classification: None,
+    }
+}
+
+pub fn classify_cache_request(
+    diagnostic: &CacheRequestDiagnosticV1,
+    normalized: Option<&NormalizedUsage>,
+) -> Option<CacheMissClassificationV1> {
+    let Some(usage) = normalized else {
+        return Some(CacheMissClassificationV1::Unavailable);
+    };
+    if usage.cache_status != CacheStatAvailability::Present {
+        return Some(CacheMissClassificationV1::Unavailable);
+    }
+    if usage.cache_read_input > 0 {
+        return None;
+    }
+    if let Some(rewarm) = diagnostic.rewarm {
+        return Some(match rewarm {
+            CacheRewarmReasonV1::PlannedCompaction => CacheMissClassificationV1::PlannedCompaction,
+            CacheRewarmReasonV1::ConfigurationChange => {
+                CacheMissClassificationV1::ConfigurationChange
+            }
+            _ => CacheMissClassificationV1::Unavailable,
+        });
+    }
+    if let CachePrefixMatchV1::Changed { first } = diagnostic.prefix_match {
+        return Some(CacheMissClassificationV1::PrefixChanged { first });
+    }
+    if diagnostic.cache_domain_changed == Some(true) {
+        return Some(CacheMissClassificationV1::ConfigurationChange);
+    }
+    if diagnostic
+        .cacheable_minimum_tokens
+        .is_some_and(|minimum| diagnostic.stable_prefix_tokens < minimum)
+    {
+        return Some(CacheMissClassificationV1::BelowMinimum);
+    }
+    if let CacheControlObservationV1::NotEmitted { reason } = diagnostic.control {
+        return Some(CacheMissClassificationV1::ControlNotEmitted { reason });
+    }
+    if let CacheControlObservationV1::Emitted { ttl_ms: Some(ttl) } = diagnostic.control
+        && let Some(gap) = diagnostic.reuse_gap_ms
+    {
+        if gap > ttl {
+            return Some(CacheMissClassificationV1::Expired);
+        }
+        if diagnostic.prefix_match == CachePrefixMatchV1::Same
+            && diagnostic.cache_domain_changed == Some(false)
+        {
+            return Some(CacheMissClassificationV1::SamePrefixInTtl);
+        }
+    }
+    Some(CacheMissClassificationV1::Unavailable)
+}
+
+#[derive(Clone, Copy)]
+struct PromptCacheBoundaries {
+    stable_history_end: usize,
+    current_user_start: usize,
+    previous_stable_history_end: Option<usize>,
+    latest_compaction_summary_end: Option<usize>,
+}
+
 fn prompt_cache_metadata(
     config: &HarnessConfig,
     messages: &[Message],
-    stable_history_end: usize,
-    current_user_start: usize,
-    latest_compaction_summary_end: Option<usize>,
+    boundaries: PromptCacheBoundaries,
     prefix_digests: PrefixDigests,
     account_scope: Option<&CredentialAlias>,
 ) -> PromptCacheMetadata {
+    let PromptCacheBoundaries {
+        stable_history_end,
+        current_user_start,
+        previous_stable_history_end,
+        latest_compaction_summary_end,
+    } = boundaries;
     let stable_history_end = stable_history_end.min(messages.len());
     let current_user_start = current_user_start.min(messages.len());
     let latest_compaction_summary_end = latest_compaction_summary_end
@@ -7118,6 +7468,7 @@ fn prompt_cache_metadata(
     PromptCacheMetadata {
         stable_history_end,
         current_user_start,
+        previous_stable_history_end,
         latest_compaction_summary_end,
         prefix_digests,
         cache_epoch,
@@ -7140,7 +7491,6 @@ fn prompt_cache_metadata(
 fn attach_usage_scope_and_cost(
     config: &HarnessConfig,
     run_id: &RunId,
-    prefix_digests: PrefixDigests,
     cache_epoch: &str,
     stable_prefix_tokens: u64,
     usage: &mut Usage,
@@ -7153,7 +7503,10 @@ fn attach_usage_scope_and_cost(
     if scope.agent.is_some() && scope.request_kind == UsageRequestKind::MainTurn {
         scope.request_kind = UsageRequestKind::DelegatedAgent;
     }
-    scope.prefix_digests = Some(prefix_digests);
+    // Legacy scopes may contain plain component hashes. New writers retain
+    // only the keyed breakpoint/domain fingerprints in `Usage.request` so
+    // short prompt components cannot be guessed offline from the journal.
+    scope.prefix_digests = None;
     usage.cache_cost = usage.normalized.as_ref().and_then(|normalized| {
         haider_provider::estimate_cache_input_costs(&config.model, normalized)
     });
@@ -7284,6 +7637,7 @@ fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage,
             .map(|(left, right)| cumulative_normalized(left, right)),
         scope: current.scope.clone(),
         cache_cost: cumulative_cache_cost(completed.cache_cost, current.cache_cost),
+        request: current.request.clone(),
     })
 }
 
@@ -7479,6 +7833,355 @@ mod usage_tests {
     use super::*;
     use haider_protocol::provider::UsageSource;
 
+    fn diagnostic_digests(system: &str, tools: &str, history: &str) -> PrefixDigests {
+        PrefixDigests {
+            system: system.into(),
+            tools: tools.into(),
+            immutable_history: history.into(),
+            model: "model-digest".into(),
+            auth_mode: "auth-digest".into(),
+            reasoning_settings: "reasoning-digest".into(),
+        }
+    }
+
+    fn cache_miss_usage() -> NormalizedUsage {
+        NormalizedUsage {
+            logical_input: 4_096,
+            uncached_input: 4_096,
+            cache_read_input: 0,
+            cache_write_input: 0,
+            billed_output: 10,
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: 4_096,
+            ..NormalizedUsage::default()
+        }
+    }
+
+    fn diagnostic_domain(key: &CacheDiagnosticKey, epoch: &str) -> Option<String> {
+        Some(keyed_breakpoint_hash(key, "cache-domain", &[epoch]))
+    }
+
+    #[test]
+    fn cache_diagnostic_stable_prefix_has_identical_keyed_breakpoints() {
+        let key = CacheDiagnosticKey::from_bytes([0x5a; 32]);
+        let digests = diagnostic_digests("system-a", "tools-a", "history-a");
+        let first = cache_breakpoint_hashes(&key, &digests);
+        let second = cache_breakpoint_hashes(&key, &digests);
+        assert_eq!(first, second, "stable requests must have stable hashes");
+
+        // Independent spelling of the v1 keyed-hash contract pins its domain
+        // separation, component order, and length framing.
+        let mut expected = blake3::Hasher::new_keyed(&[0x5a; 32]);
+        expected.update(b"haider.cache-request-diagnostic.v1\0");
+        expected.update(&("system".len() as u64).to_le_bytes());
+        expected.update(b"system");
+        expected.update(&("system-a".len() as u64).to_le_bytes());
+        expected.update(b"system-a");
+        assert_eq!(
+            first.system,
+            format!("blake3-keyed:{}", expected.finalize().to_hex())
+        );
+    }
+
+    #[test]
+    fn cache_diagnostic_changed_system_is_first_differing_breakpoint() {
+        let key = CacheDiagnosticKey::from_bytes([0x31; 32]);
+        let original = diagnostic_digests("system-a", "tools-a", "history-a");
+        let changed = diagnostic_digests("system-b", "tools-a", "history-a");
+        let previous = PreviousCacheRequest {
+            history_message_count: 1,
+            breakpoint_hashes: cache_breakpoint_hashes(&key, &original),
+            cache_domain_hash: diagnostic_domain(&key, "epoch-a"),
+        };
+        let diagnostic = build_cache_request_diagnostic(
+            &key,
+            "custom",
+            "model",
+            "epoch-a",
+            &changed,
+            Some(&changed),
+            Some(&previous),
+            1,
+            4_096,
+            Some(1_000),
+            CacheControlObservationV1::Emitted {
+                ttl_ms: Some(300_000),
+            },
+            None,
+        );
+        assert_eq!(
+            diagnostic.prefix_match,
+            CachePrefixMatchV1::Changed {
+                first: CacheBreakpointV1::System
+            }
+        );
+        assert_eq!(
+            classify_cache_request(&diagnostic, Some(&cache_miss_usage())),
+            Some(CacheMissClassificationV1::PrefixChanged {
+                first: CacheBreakpointV1::System
+            })
+        );
+    }
+
+    #[test]
+    fn cache_diagnostic_old_length_proves_grown_prefix_contains_previous_entry() {
+        let key = CacheDiagnosticKey::from_bytes([0x77; 32]);
+        let previous_digests = diagnostic_digests("system-a", "tools-a", "history-one");
+        let grown_digests = diagnostic_digests("system-a", "tools-a", "history-two");
+        let previous = PreviousCacheRequest {
+            history_message_count: 1,
+            breakpoint_hashes: cache_breakpoint_hashes(&key, &previous_digests),
+            cache_domain_hash: diagnostic_domain(&key, "epoch-a"),
+        };
+        let diagnostic = build_cache_request_diagnostic(
+            &key,
+            "custom",
+            "model",
+            "epoch-a",
+            &grown_digests,
+            Some(&previous_digests),
+            Some(&previous),
+            2,
+            4_096,
+            Some(1_000),
+            CacheControlObservationV1::Emitted {
+                ttl_ms: Some(300_000),
+            },
+            None,
+        );
+        let old = diagnostic
+            .previous_breakpoint
+            .as_ref()
+            .expect("previous moving boundary is recorded");
+        assert_eq!(old.message_count, 1);
+        assert_eq!(old.actual_hash.as_ref(), Some(&old.expected_hash));
+        assert_eq!(diagnostic.prefix_match, CachePrefixMatchV1::Same);
+        assert_ne!(
+            diagnostic.breakpoint_hashes.history, previous.breakpoint_hashes.history,
+            "the current moving breakpoint is expected to advance"
+        );
+    }
+
+    #[test]
+    fn cache_diagnostic_records_never_contain_prompt_or_secret_content() {
+        const SYSTEM_SECRET: &str = "system-secret-never-journal";
+        const TOOL_SECRET: &str = "tool-secret-never-journal";
+        const ARG_SECRET: &str = "argument-secret-never-journal";
+        const USER_SECRET: &str = "user-secret-never-journal";
+
+        let mut config = HarnessConfig::for_session(
+            SessionId::new("privacy-session"),
+            DeviceId::new("privacy-device"),
+            0,
+            0,
+        );
+        config.system_prompt = Some(SYSTEM_SECRET.into());
+        config.tools = vec![ToolDefinition {
+            name: "private_tool".into(),
+            description: TOOL_SECRET.into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }];
+        let history = vec![
+            Message::user_text(USER_SECRET),
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "private-call".into(),
+                name: "private_tool".into(),
+                args: serde_json::json!({"secret": ARG_SECRET}),
+            }]),
+        ];
+        let diagnostic = build_cache_request_diagnostic(
+            &config.cache_diagnostic_key,
+            "custom",
+            "model",
+            "epoch-a",
+            &usage_prefix_digests(&config, &history),
+            None,
+            None,
+            history.len(),
+            123,
+            None,
+            CacheControlObservationV1::Unavailable,
+            None,
+        );
+        let attempt = CacheRequestAttemptV1 {
+            ordinal: 1,
+            diagnostic: diagnostic.clone(),
+        }
+        .extension_item()
+        .expect("attempt serializes");
+        let response = RequestUsage {
+            ordinal: 1,
+            input: 10,
+            output: 2,
+            reasoning: None,
+            cached: None,
+            source: UsageSource::ProviderReported,
+            account: None,
+            normalized: None,
+            cache_cost: None,
+            cache: Some(diagnostic),
+        };
+        let records = serde_json::to_string(&(attempt, response)).expect("records serialize");
+        for secret in [SYSTEM_SECRET, TOOL_SECRET, ARG_SECRET, USER_SECRET] {
+            assert!(!records.contains(secret), "record leaked {secret}");
+        }
+        assert!(
+            !records.contains("\"normalized\"")
+                && !records.contains("\"cache_cost\"")
+                && !records.contains("\"reasoning\"")
+                && !records.contains("\"cached\"")
+                && !records.contains("\"classification\""),
+            "unmeasured optional telemetry must stay absent: {records}"
+        );
+    }
+
+    #[test]
+    fn cache_diagnostic_planned_rewarm_is_distinct_from_unexpected_miss() {
+        let key = CacheDiagnosticKey::from_bytes([0x22; 32]);
+        let digests = diagnostic_digests("system-a", "tools-a", "history-a");
+        let previous = PreviousCacheRequest {
+            history_message_count: 1,
+            breakpoint_hashes: cache_breakpoint_hashes(&key, &digests),
+            cache_domain_hash: diagnostic_domain(&key, "epoch-a"),
+        };
+        let build = |rewarm| {
+            build_cache_request_diagnostic(
+                &key,
+                "custom",
+                "model",
+                "epoch-a",
+                &digests,
+                Some(&digests),
+                Some(&previous),
+                1,
+                4_096,
+                Some(1_000),
+                CacheControlObservationV1::Emitted {
+                    ttl_ms: Some(300_000),
+                },
+                rewarm,
+            )
+        };
+        assert_eq!(
+            classify_cache_request(&build(None), Some(&cache_miss_usage())),
+            Some(CacheMissClassificationV1::SamePrefixInTtl)
+        );
+        assert_eq!(
+            classify_cache_request(
+                &build(Some(CacheRewarmReasonV1::PlannedCompaction)),
+                Some(&cache_miss_usage())
+            ),
+            Some(CacheMissClassificationV1::PlannedCompaction)
+        );
+        let changed_domain = build_cache_request_diagnostic(
+            &key,
+            "custom",
+            "model",
+            "epoch-b",
+            &digests,
+            Some(&digests),
+            Some(&previous),
+            1,
+            4_096,
+            Some(1_000),
+            CacheControlObservationV1::Emitted {
+                ttl_ms: Some(300_000),
+            },
+            None,
+        );
+        assert_eq!(
+            classify_cache_request(&changed_domain, Some(&cache_miss_usage())),
+            Some(CacheMissClassificationV1::ConfigurationChange)
+        );
+
+        let mut below_minimum = build(None);
+        below_minimum.cacheable_minimum_tokens = Some(8_192);
+        assert_eq!(
+            classify_cache_request(&below_minimum, Some(&cache_miss_usage())),
+            Some(CacheMissClassificationV1::BelowMinimum)
+        );
+
+        let mut control_missing = build(None);
+        control_missing.control = CacheControlObservationV1::NotEmitted {
+            reason: haider_protocol::provider::CacheControlOmissionReasonV1::UnsupportedModel,
+        };
+        assert_eq!(
+            classify_cache_request(&control_missing, Some(&cache_miss_usage())),
+            Some(CacheMissClassificationV1::ControlNotEmitted {
+                reason: haider_protocol::provider::CacheControlOmissionReasonV1::UnsupportedModel
+            })
+        );
+
+        let mut expired = build(None);
+        expired.reuse_gap_ms = Some(300_001);
+        assert_eq!(
+            classify_cache_request(&expired, Some(&cache_miss_usage())),
+            Some(CacheMissClassificationV1::Expired)
+        );
+
+        let mut hit = cache_miss_usage();
+        hit.cache_read_input = 1;
+        assert_eq!(classify_cache_request(&build(None), Some(&hit)), None);
+        assert_eq!(
+            classify_cache_request(&build(None), None),
+            Some(CacheMissClassificationV1::Unavailable)
+        );
+    }
+
+    #[test]
+    fn cache_diagnostic_record_size_and_cpu_cost_are_bounded() {
+        let key = CacheDiagnosticKey::from_bytes([0x44; 32]);
+        let digests = diagnostic_digests("system-a", "tools-a", "history-a");
+        let previous = PreviousCacheRequest {
+            history_message_count: 42,
+            breakpoint_hashes: cache_breakpoint_hashes(&key, &digests),
+            cache_domain_hash: diagnostic_domain(&key, "epoch-a"),
+        };
+        let mut latencies = Vec::with_capacity(10_000);
+        let mut last_size = 0_usize;
+        for _ in 0..10_000 {
+            let started = std::time::Instant::now();
+            let diagnostic = build_cache_request_diagnostic(
+                &key,
+                "openai",
+                "gpt-5.6-terra",
+                "epoch-a",
+                &digests,
+                Some(&digests),
+                Some(&previous),
+                43,
+                4_096,
+                Some(1_000),
+                CacheControlObservationV1::Emitted {
+                    ttl_ms: Some(300_000),
+                },
+                None,
+            );
+            last_size = serde_json::to_vec(&CacheRequestAttemptV1 {
+                ordinal: 1,
+                diagnostic,
+            })
+            .expect("diagnostic serializes")
+            .len();
+            latencies.push(started.elapsed());
+        }
+        latencies.sort_unstable();
+        let total_nanos = latencies
+            .iter()
+            .map(std::time::Duration::as_nanos)
+            .sum::<u128>();
+        let mean_nanos = total_nanos / latencies.len() as u128;
+        let p95_nanos = latencies[latencies.len() * 95 / 100].as_nanos();
+        eprintln!(
+            "cache diagnostic CPU: bytes={last_size} mean_ns={mean_nanos} p95_ns={p95_nanos} samples={}",
+            latencies.len()
+        );
+        assert!(
+            last_size <= 1_024,
+            "attempt record grew to {last_size} bytes"
+        );
+    }
+
     #[test]
     fn cumulative_usage_saturates_each_counter_without_failing_the_turn() {
         let completed = Usage {
@@ -7492,6 +8195,7 @@ mod usage_tests {
             normalized: None,
             scope: None,
             cache_cost: None,
+            request: None,
         };
         let current = Usage {
             input: 1,
@@ -7504,6 +8208,7 @@ mod usage_tests {
             normalized: None,
             scope: None,
             cache_cost: None,
+            request: None,
         };
         let cumulative = cumulative_usage(Some(&completed), &current).expect("same account");
         assert_eq!(cumulative.input, u64::MAX);

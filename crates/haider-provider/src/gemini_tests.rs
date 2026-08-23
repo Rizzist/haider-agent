@@ -338,6 +338,7 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
         cache_metadata: Some(PromptCacheMetadata {
             stable_history_end: 2,
             current_user_start: 2,
+            previous_stable_history_end: None,
             latest_compaction_summary_end: None,
             prefix_digests: PrefixDigests {
                 system: "system-a".into(),
@@ -357,6 +358,36 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
             reuse_gap_ms: None,
         }),
     }
+}
+
+#[test]
+fn cache_diagnostic_gemini_hashes_current_wire_through_previous_history_length() {
+    let provider = provider_with_resolver(SocketAddr::from(([127, 0, 0, 1], 443)));
+    let first = gemini_cache_request("gemini-2.5-flash");
+    let first_prepared = crate::Provider::prepare_turn(&provider, &first).expect("first prepared");
+
+    let mut grown = first;
+    grown.messages.extend([
+        Message::assistant(vec![Block::Text {
+            text: "current answer".into(),
+        }]),
+        Message::user_text("next question"),
+    ]);
+    let metadata = grown.cache_metadata.as_mut().expect("metadata");
+    metadata.previous_stable_history_end = Some(2);
+    metadata.stable_history_end = 4;
+    metadata.current_user_start = 4;
+    let grown_prepared = crate::Provider::prepare_turn(&provider, &grown).expect("grown prepared");
+
+    assert_eq!(
+        grown_prepared.previous_immutable_history_digest(),
+        Some(first_prepared.prefix_digests().immutable_history.as_str()),
+        "the old Gemini contents prefix remains hashable after history grows"
+    );
+    assert_ne!(
+        grown_prepared.prefix_digests().immutable_history,
+        first_prepared.prefix_digests().immutable_history
+    );
 }
 
 #[test]
