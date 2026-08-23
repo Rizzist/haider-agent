@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
-use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent};
+use haider_protocol::provider::{Block, FeatureResolve, FinishReason, PrefixDigests, StreamEvent};
 use haider_protocol::tool::ImageBlockRef;
 use haider_provider::{
-    Message, MessageRole, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, Provider,
+    Message, MessageRole, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_SUBSCRIPTION_BASE_URL,
+    OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, PromptCacheMetadata, Provider,
     ProviderError, ProviderErrorKind, ProviderStreamItem, ResolvedAttachment, ToolDefinition,
     TurnRequest, degrade_tool_result_images_to_placeholders, openai_http_client_build_count,
     replay_deepseek_chat_sse, replay_openai_chat_sse, replay_openai_http_error,
@@ -445,6 +446,72 @@ fn responses_payload_uses_native_input_tools_and_reasoning_summary() {
     assert_eq!(payload["tools"][0]["name"], "get_weather");
     assert_eq!(payload["reasoning"]["summary"], "auto");
     assert_eq!(payload["store"], false);
+}
+
+/// MUTATION PIN (a): re-add `prompt_cache_retention` to the HTTPS lite body.
+/// Expected runtime failure: the forbidden-field assertion prints the body.
+#[test]
+fn codex_https_lite_request_omits_prompt_cache_retention() {
+    let payload = codex_lite_payload(true);
+
+    assert!(
+        payload.get("prompt_cache_retention").is_none(),
+        "HTTPS responses-lite rejects prompt_cache_retention: {payload}"
+    );
+}
+
+/// MUTATION PIN (b): remove `prompt_cache_key` from the HTTPS lite body.
+/// Expected runtime failure: the required stable routing key is absent.
+#[test]
+fn codex_https_lite_request_keeps_prompt_cache_key() {
+    let payload = codex_lite_payload(true);
+
+    assert!(
+        payload
+            .get("prompt_cache_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.is_empty()),
+        "HTTPS responses-lite must keep prompt_cache_key: {payload}"
+    );
+}
+
+/// MUTATION PIN (c): revert lite instructions to the top-level field and
+/// remove the leading developer item. Expected runtime failure: one or both
+/// shape assertions expose the reverted request.
+#[test]
+fn codex_https_lite_request_leads_with_developer_instructions() {
+    let payload = codex_lite_payload(false);
+
+    assert!(
+        payload.get("instructions").is_none(),
+        "lite instructions must remain null/absent at top level: {payload}"
+    );
+    assert_eq!(
+        payload["input"][0],
+        serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Subscription system prompt."}],
+        }),
+        "lite system prompt must remain the first developer input item: {payload}"
+    );
+}
+
+/// MUTATION PIN (d): apply the lite instructions shape to the API-key path.
+/// Expected runtime failure: top-level instructions disappear or input gains
+/// a leading developer item.
+#[test]
+fn api_key_request_keeps_top_level_instructions() {
+    let request = openai_shape_request(false);
+    let payload = native_provider("gpt-5.6-sol")
+        .request_payload(&request)
+        .expect("API-key Responses payload");
+
+    assert_eq!(payload["instructions"], "Subscription system prompt.");
+    assert_eq!(
+        payload["input"][0]["role"], "user",
+        "API-key input must not gain the lite developer item: {payload}"
+    );
 }
 
 #[test]
@@ -962,6 +1029,59 @@ fn provider_debug_never_exposes_openai_secrets() {
 
 fn native_provider(model: &str) -> OpenAiProvider {
     provider_with_secret("fixture-secret", model)
+}
+
+fn codex_lite_payload(with_cache_metadata: bool) -> serde_json::Value {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("openai-oauth-shape-fixture");
+    vault
+        .put(&alias, b"fixture-subscription-secret")
+        .expect("store subscription fixture secret");
+    let provider = OpenAiProvider::new_subscription(
+        vault
+            .resolve(&alias)
+            .expect("resolve subscription fixture secret"),
+        "gpt-5.6-sol",
+        OPENAI_SUBSCRIPTION_BASE_URL,
+    )
+    .expect("construct subscription provider")
+    .with_account(alias);
+    provider
+        .request_payload(&openai_shape_request(with_cache_metadata))
+        .expect("subscription Responses payload")
+}
+
+fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
+    TurnRequest {
+        messages: vec![Message::user_text("Reply with exactly the word: PROBE")],
+        model: "gpt-5.6-sol".into(),
+        max_tokens: 32,
+        system_prompt: Some("Subscription system prompt.".into()),
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        cache_metadata: with_cache_metadata.then(|| PromptCacheMetadata {
+            stable_history_end: 1,
+            current_user_start: 1,
+            previous_stable_history_end: None,
+            latest_compaction_summary_end: Some(1),
+            prefix_digests: PrefixDigests {
+                system: "system-shape-pin".into(),
+                tools: "tools-shape-pin".into(),
+                immutable_history: "history-shape-pin".into(),
+                model: "model-shape-pin".into(),
+                auth_mode: "auth-shape-pin".into(),
+                reasoning_settings: "reasoning-shape-pin".into(),
+            },
+            cache_epoch: "cache-shape-pin".into(),
+            compaction_epoch: "compaction-shape-pin".into(),
+            provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+            session_scope: "session-shape-pin".into(),
+            account_scope: Some("account-shape-pin".into()),
+            stable_prefix_tokens: 8_192,
+            expected_later_reads: 2,
+            reuse_gap_ms: Some(1_000),
+        }),
+    }
 }
 
 fn provider_with_secret(secret: &str, model: &str) -> OpenAiProvider {

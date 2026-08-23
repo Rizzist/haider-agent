@@ -2661,10 +2661,6 @@ fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Ve
     sources
 }
 
-/// Prompt-cache retention accepted by the subscription backend in the
-/// official codex 0.145 `response.created` echo captured 2026-08-23.
-const CODEX_LITE_PROMPT_CACHE_RETENTION: &str = "24h";
-
 /// The alpha/search endpoint for one subscription origin. The credential's
 /// own `base_url` wins when it carries one (an imported codex credential may
 /// point at a proxy); otherwise the sanctioned subscription base. Always
@@ -3935,12 +3931,6 @@ fn responses_request_json_with_boundary(
                 serde_json::json!({"mode": "explicit", "ttl": "30m"}),
             );
         }
-        if codex_responses_lite {
-            object.insert(
-                "prompt_cache_retention".into(),
-                serde_json::json!(CODEX_LITE_PROMPT_CACHE_RETENTION),
-            );
-        }
     }
     // Reasoning object: `summary: auto` + encrypted-content include for
     // reasoning models; lite ADDS the required `context: all_turns` and
@@ -4192,13 +4182,7 @@ fn openai_cache_control_observation(
     use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
 
     if payload.get("prompt_cache_key").is_some() {
-        let ttl_ms = if payload
-            .get("prompt_cache_retention")
-            .and_then(serde_json::Value::as_str)
-            == Some(CODEX_LITE_PROMPT_CACHE_RETENTION)
-        {
-            Some(24 * 60 * 60 * 1_000)
-        } else if payload.get("prompt_cache_options").is_some() {
+        let ttl_ms = if payload.get("prompt_cache_options").is_some() {
             Some(30 * 60 * 1_000)
         } else {
             None
