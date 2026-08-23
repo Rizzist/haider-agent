@@ -79,7 +79,9 @@ and MUST NOT build a substitute, even when the substitute appears to work.
   publishers; it is not a per-surface, pane, or terminal identity source. The
   observed substitute turned the OSC 7791 compatibility announcement into a
   second state transport and therefore could not preserve those authority
-  semantics.
+  semantics. This prohibition is scoped to the profile-level resident-binding
+  fact. Per-pane identity is a different fact with its own source in §11.1; it
+  is not a substitute projection of the resident binding.
 
 - **Roster facts.** For facts rendered in a roster, the winning projection is
   the top-level field of `SessionSummary` from `session.list` or
@@ -156,9 +158,10 @@ for JSON.
 
 ### 3.2 Hello, Welcome, and the switch boundary
 
-`Hello` is the first application frame sent by the client. `Welcome` is the
-first successful daemon frame. Both are always JSON and length-prefixed on the
-local stream. `Hello.encodings` is an ordered client offer. Today
+`Hello` (`kind: "hello"`) is the first application frame sent by the client.
+`Welcome` (`kind: "welcome"`) is the first successful daemon frame. Both are
+always JSON and length-prefixed on the local stream. `Hello.encodings` is an
+ordered client offer. Today
 `"msgpack"` is the only alternative. `Welcome.encoding` selects the encoding;
 omission means JSON.
 
@@ -221,7 +224,7 @@ affordance before the response exists.
 | `hooks_server_v1` | long-lived JSONL hook runtime facts; no new method |
 | `agent_message_v1` | `agent.message` |
 | `shell_exec_v1` | receipt-backed direct user `shell.exec` |
-| `user_command_v1` | direct user shell-command provenance/output committed into later model context and the synthetic `shell.exec.run_id` cancellation coordinate; paired with `shell_exec_v1`, unrelated to catalog `Custom` rows |
+| `user_command_v1` | direct user shell-command provenance/output committed into later model context and the synthetic `shell.exec.run_id` cancellation coordinate; paired with `shell_exec_v1`, unrelated to catalog rows whose `kind` is `"custom"` |
 | `tool_inventory_v1` | `tools.inventory` |
 | `vault_stage_v1` | `vault.stage` |
 | `account_login_api_v1` | `account.login_api` |
@@ -291,9 +294,9 @@ omitted token reports the direct-user-command semantics unavailable, and a
 typed client rejects before sending a mutating `shell.exec`. The feature is
 paired with `shell_exec_v1`: it covers committing a direct user shell
 command's provenance and output into later model context and returning a
-synthetic-run cancellation coordinate. It has nothing to do with
-`CommandCatalogItemKindWire::Custom` rows or the `custom_commands` slot of
-`command.list`.
+synthetic-run cancellation coordinate. It has nothing to do with catalog rows
+whose `CommandCatalogItemKindWire` value is `"custom"` or with the
+`custom_commands` slot of `command.list`.
 
 The additive `availability` field on `account.list`, `provider.list`, and
 `usage.report` has no separate token. Field presence is its feature test.
@@ -330,7 +333,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Volatile input/status | `session.surface_watch` | `SessionSurfaceWatching`, then `SessionSurfaceDelta` | complete baseline then complete latest snapshots | live publisher registry; not journaled |
 | Volatile input action | `session.input_inject` | `SessionInputInjectAck`, then owner receives `SessionInputInjected` | routed action | current live input owner |
 | Workflows | `loom.list` | `LoomList` | snapshot | persisted Loom registry; pipe source is workflow structure of record |
-| Todos | raw `ItemEvent` envelopes (`TurnItem::Plan`) | no independent snapshot response | attach replay/live lifecycle | durable item lifecycle; reducer in §12 |
+| Todos | raw `ItemEvent` envelopes (`TurnItem` with `item: "plan"`) | no independent snapshot response | attach replay/live lifecycle | durable item lifecycle; reducer in §12 |
 
 ### 5.2 Mutation and specialist doors
 
@@ -446,14 +449,14 @@ generation, or surface owner/revision as if they were one observation.
 | Detailed current run/menu/branch/subagent state | `SessionObserveDigest` at its `head_seq` | Raw events are durable facts but a client need not rebuild the daemon reducer. `metadata_only=true` authorizes only metadata/title/head/generation; projected defaults are not state. |
 | Durable event fact and replay cursor | `RawEnvelope` from read/attach | Summary/digest are projections and cannot invent or reorder the event. Preserve raw payload. |
 | Transcript display rows | a current-generation native pipe followed to full coverage | Raw item/node events are the durable fallback. At equal coverage, do not show both pipe and fallback rows. Pipe is not authority for run, account, roster, or permission state. |
-| Current todo panel | latest open `TurnItem::Plan` lifecycle at the applied raw-event cursor | There is no summary/digest todo projection. Use the exact reducer in §12; do not infer a plan from tool text. |
+| Current todo panel | latest open `TurnItem` lifecycle whose `item` is `"plan"`, at the applied raw-event cursor | There is no summary/digest todo projection. Use the exact reducer in §12; do not infer a plan from tool text. |
 | Accounts/defaults/active aliases | `account.list` snapshot | `AccountsChanged` only invalidates. Provider rows do not replace descriptors. |
 | Provider/model inventory | `provider.list` snapshot | Account rows and a client hardcoded model list do not override it. `provider.models_refresh` produces a newer snapshot. |
 | Cross-account usage | `usage.report` | Session summaries contain only per-session promoted cache metrics, not the account report. |
 | Per-session cache health | `SessionSummary.cache_reread_hit_basis_points`; use `cache_lifetime_hit_basis_points` only for the separately labeled lifetime/all-input share | The same-summary nested `agent_metrics.usage.cache_reread_hit_basis_points` and `cache_hit_basis_points` are compatibility sources only when their promoted field is absent. Never calculate a substitute from token counts. |
 | Volatile composer/status | surface watch response/delta | Journal and terminal scraping are not fallback sources. Reconnect/watch again after owner loss. |
-| Resident profile binding | `ResidentSessionBinding` baseline/push | OSC 7791 is a compatibility announcement only. The RPC value does not identify a pane; see §11. |
-| Commands and ownership | `command.list` result | Never mirror `COMMANDS`. `ClientView` is deliberately client-owned; `Unknown` is non-executable. |
+| Resident profile binding | `ResidentSessionBinding` baseline/push | OSC 7791 does not project this profile-level fact; it separately owns per-pane identity. Using it for that different fact is not a lower-precedence fallback; see §11. |
+| Commands and ownership | `command.list` result | Never mirror `COMMANDS`. Ownership `"client_view"` is deliberately client-owned; `"unknown"` is non-executable. |
 | Workflows/agent types | `loom.list` | Compiled graph material is derived; `LoomWorkflow.source` is the workflow structure of record. |
 
 If two winning snapshots have different heads/revisions, select the newer
@@ -587,16 +590,15 @@ typed confirmation-required error.
 
 ### 9.5 Accounts, providers, and snapshot availability
 
-All three responses now carry:
+All three responses now carry one of these wire shapes:
 
-```rust
-#[serde(tag = "state", rename_all = "snake_case")]
-enum SnapshotAvailabilityWire {
-    Available,
-    Unavailable { reason: String },
-    #[serde(other)] Unknown,
-}
+```json
+{"state":"available"}
+{"state":"unavailable","reason":"public explanation"}
+{"state":"unknown"}
 ```
+
+These are exact wire spellings, not the Rust identifiers.
 
 The response field is optional and additive:
 
@@ -678,9 +680,9 @@ therefore stay unknown when absent; `Some(false)` and numeric zero are explicit
 provider values. Inside weekly allowance, percent, state, reset, and grace are
 independent facts. Inside hold, only `api_locked=Some(true)` or
 `subscribe_banned=Some(true)` proves a halt; missing flags and a missing reason
-prove neither health nor failure. The outer `Available`, `Indeterminate`, and
-`Halted` outcome is the health classification—never derive it from the partial
-snapshot.
+prove neither health nor failure. The outer `state: "available"`,
+`state: "indeterminate"`, and `state: "halted"` outcome is the health
+classification—never derive it from the partial snapshot.
 
 ### 9.7 Other optional response fields
 
@@ -704,7 +706,7 @@ snapshot.
 - `OAuthStart` optionals are present only when that flow form supplies them.
   `availability.available=false` must carry the public reason; absence of a
   URL/flow id is not permission to synthesize one. `user_code` exists only for
-  device flows. OAuth status `Ready` carries the single-use reference; other
+  device flows. OAuth status `"ready"` carries the single-use reference; other
   states do not.
 - transcription `secret=None` means no stored secret. The raw secret is
   same-UID UDS-only, zeroized, and must never be logged or converted through a
@@ -727,7 +729,7 @@ surface tables above.
 | `command.invoke.session_id` | launcher/global command context; an operation that needs a session must refuse, not choose one |
 | `command.list.items=[]` | no catalog rows match the supplied query/context; the advertised command-door feature establishes that the subsystem answered |
 | catalog row `name`, `value`, `arg_hint`, `session_only` | not applicable to that row kind; never reverse-engineer the omitted coordinate from `label` |
-| `CommandInvokeOutcomeWire::Unsupported.reason` | unsupported with no public detail; do not parse another field for a reason |
+| `CommandInvokeOutcomeWire` with `kind: "unsupported"`, `reason` omitted | unsupported with no public detail; do not parse another field for a reason |
 | `graph.inspect.cursor` | first page; response `next_cursor=None` is the last page |
 | todo child `depends_on_todo_id` | no predecessor todo; `opened_seq=None` means no child graph-open coordinate was returned and is not proof the child ran |
 | needs-input `safe_body=[]` | no additional secret-free body; `since_ms=None` means no stable notification timestamp |
@@ -794,19 +796,29 @@ custom_commands
 
 The requesting surface supplies these current-context values; the daemon
 combines them with its single `COMMANDS` registry and returns rendered rows.
-An omitted/empty slots object means no dynamic candidates. `ownership` is
-load-bearing:
+An omitted/empty slots object means no dynamic candidates. All discriminants
+are exact, case-sensitive wire strings; Rust variant identifiers are not wire
+values:
+
+- catalog row `kind` is `"built_in"`, `"argument"`, `"custom"`, or
+  `"unknown"`;
+- `ownership` is `"daemon_operation"`, `"client_view"`, or `"unknown"`;
+- `CommandInvokeOutcomeWire` uses the `kind` values `"receipt"`, `"parked"`,
+  `"client_owned"`, `"unsupported"`, or `"unknown"`.
+
+`ownership` is load-bearing:
 
 - `daemon_operation`: invoke through `command.invoke` with a durable
   `command_id` when the operation mutates.
 - `client_view`: perform only the client-local view behavior named by the row.
 - `unknown`: display-only/non-executable.
 
-`CommandInvokeOutcomeWire::Receipt` nests the canonical operation response;
-there is no second receipt vocabulary. `Parked` carries the same
-`NeedsInputWire`. `ClientOwned` redirects to client view behavior.
-`Unsupported.reason=None` means no public reason. Unknown outcome is
-non-executable. A client MUST NOT ship a hand-maintained slash-command list.
+Outcome `kind: "receipt"` nests the canonical operation response; there is no
+second receipt vocabulary. `"parked"` carries the same `NeedsInputWire`, and
+`"client_owned"` redirects to client view behavior. For `kind: "unsupported"`,
+an omitted `reason` means no public reason. Outcome `"unknown"`, including an
+unrecognized future value decoded by a typed client, is non-executable. A
+client MUST NOT ship a hand-maintained slash-command list.
 
 ### 10.2 Needs-input answer fence
 
@@ -823,9 +835,9 @@ returns the original `resolution_seq`; a different command loses with
 or option mismatch is stale/invalid; never answer a newer card using cached
 coordinates.
 
-When `secret_answer=true`, stage the secret through `vault.stage` and send
-`MenuInput::SecretVaultReference`. Secret bytes never enter the durable menu
-frame.
+When `secret_answer=true`, stage the secret through `vault.stage` and send a
+`MenuInput` object with `kind: "secret_vault_reference"`. Secret bytes never
+enter the durable menu frame.
 
 ### 10.3 Separate operating-system permission action
 
@@ -842,13 +854,28 @@ rechecks the OS. Clients must not treat a successful open action as a grant.
 
 ## 11. Resident binding and volatile surfaces
 
-### 11.1 Resident binding is profile-global, not pane identity
+### 11.1 Profile binding and pane identity are different facts
 
-The daemon registry holds N publishers keyed by connection. Each accepted
-publication receives a daemon-local monotonically increasing revision.
-`visible()` selects the live publisher with the greatest revision and exposes
-only its `(session_id, worker_generation)`. Thus N publisher records collapse
-to one profile-global most-recent value.
+`ResidentSessionBinding` answers the profile-level question: “something in
+this profile is currently bound to session X.” The daemon registry holds N
+publishers keyed by connection, and each accepted publication receives a
+daemon-local monotonically increasing revision. `visible()` selects the live
+publisher with the greatest revision and exposes only its
+`(session_id, worker_generation)`. Thus N publisher records collapse to one
+profile-global most-recent value. The baseline/push RPC frame is the authority
+for this profile-level fact and retires OSC 7791 as a source for that fact.
+
+OSC 7791 answers a different, per-pane question: “this pane is now showing
+session Y.” `tui_attach_announce_v1` advertises this compatibility channel.
+The announcement arrives inside that pane's own PTY stream, so it can report
+an in-TUI session hop for that pane. The profile-level frame cannot express
+that hop or correlate it to a pane. OSC 7791 therefore remains a legitimate
+per-pane identity source even when `resident_session_binding_v1` is
+advertised.
+
+Using the RPC frame for profile binding and OSC 7791 for per-pane identity is
+not a precedence violation or an exception to §1 or §8: the mechanisms answer
+different questions and neither overwrites the other's fact.
 
 Consequences:
 
@@ -856,8 +883,11 @@ Consequences:
   source;
 - a multi-surface client MUST NOT map the visible value to any one of its
   panes;
-- publisher connection id and revision are not on the wire and must not be
-  guessed;
+- a per-pane correlator does not exist on the RPC wire today. Internally,
+  `ResidentBindingRegistry::current()` returns the owning connection id with
+  the binding, while `visible()` discards that id and the publisher revision
+  before the frame is built. The information in the registry is not a promised
+  client coordinate and must not be guessed;
 - `session_id=None` is an explicit publisher unbind/launcher state, not
   missing data;
 - a Control publisher sends the same top-level frame. The daemon validates
@@ -868,12 +898,9 @@ Consequences:
 - every View or Control connection gets exactly one required baseline after
   `Welcome`. Later required-delivery failure closes the affected viewer rather
   than silently losing state;
-- consumers apply a binding only against the authoritative current worker
-  generation. A stale generation cannot bind a superseded session worker.
-
-OSC 7791 may still be advertised by `tui_attach_announce_v1` for embedding
-compatibility. It does not outrank, enrich, or identify the RPC resident value.
-Do not scrape it when `resident_session_binding_v1` is present.
+- consumers apply a profile binding only against the authoritative current
+  worker generation. A stale generation cannot bind a superseded session
+  worker.
 
 ### 11.2 Volatile input and status
 
@@ -952,15 +979,17 @@ multiple rows from the same sequence.
 For an interactive transcript or when the native pipe is unavailable, reduce
 raw `ItemEvent` values by `item_id`:
 
-1. `Started { item_id, item }` opens the item unless that id is already open or
-   closed. Duplicate starts are no-ops.
-2. `Delta { item_id, delta }` applies only to the matching open item and the
-   matching nested item/delta kind. Preserve streamed bytes exactly; command
-   output byte fields are base64 where the type says so.
-3. `Completed { item_id, item }` is the authoritative final item and replaces
-   the accumulated item. Do not append the final value to deltas.
-4. A `Completed` without a previously observed `Started` still inserts one
-   finished item; this is required for mid-stream attach and sealed replay.
+1. `event: "started"` with `{ item_id, item }` opens the item unless that id is
+   already open or closed. Duplicate starts are no-ops.
+2. `event: "delta"` with `{ item_id, delta }` applies only to the matching open
+   item and the matching nested item/delta kind. Preserve streamed bytes
+   exactly; command output byte fields are base64 where the type says so.
+3. `event: "completed"` with `{ item_id, item }` is the authoritative final
+   item and replaces the accumulated item. Do not append the final value to
+   deltas.
+4. A `"completed"` event without a previously observed `"started"` event still
+   inserts one finished item; this is required for mid-stream attach and
+   sealed replay.
 5. A completed id never reopens; duplicate completion is a no-op.
 6. Keep envelope payload as raw JSON even when a known nested event is decoded.
    Unknown item/event kinds must remain replayable.
@@ -974,24 +1003,26 @@ rather than implement a competing projector when the pipe is available.
 
 ### 12.3 Current todo plan
 
-There is no independent todo snapshot method. The durable `TurnItem::Plan`
-item lifecycle is the authority and is incrementally adoptable through normal
-attach replay.
+There is no independent todo snapshot method. The durable `TurnItem` lifecycle
+whose `item` is `"plan"` is the authority and is incrementally adoptable
+through normal attach replay.
 
-- The first nonempty `todo_write` in one open lifecycle commits
-  `ItemEvent::Started { item_id: fresh, item: Plan { items } }` and pins that
-  full list as the current panel.
+- The first nonempty `todo_write` in one open lifecycle commits an `ItemEvent`
+  with `event: "started"`, a fresh `item_id`, and `item: "plan"`, then pins
+  that full list as the current panel.
 - Later writes for the same lifecycle commit
-  `ItemEvent::Completed { same item_id, Plan { items } }`. The list has full
-  replacement semantics; never merge individual rows with the old list.
-- Keep the latest Plan list pinned while at least one item is not
-  `TodoState::Completed`.
+  `event: "completed"` with the same `item_id` and `item: "plan"`. The list
+  has full replacement semantics; never merge individual rows with the old
+  list.
+- Keep the latest plan list pinned while at least one item does not have
+  `TodoState` wire value `"completed"`.
 - An all-completed list closes the id, unpins it, and adds the completed plan
-  to the transcript/history (`NodeKind::Todos`). A later duplicate is ignored.
+  to the transcript/history (`NodeKind` with `kind: "todos"`). A later
+  duplicate is ignored.
 - An empty update closes/clears an open plan. An empty write before any plan
   commits no lifecycle event.
-- A plan born all-completed emits Started followed by Completed and closes
-  immediately.
+- A plan born all-completed emits `"started"` followed by `"completed"` and
+  closes immediately.
 - `TodoState` is exactly `listed`, `processing`, or `completed` and is frozen.
   `dep: None` means no dependency. A listed item whose referenced dependency
   is not completed is blocked. Do not derive dependency from ordering or text.
@@ -1065,7 +1096,10 @@ These are not guesses; they are explicit gaps in the current source contract:
 
 - roster deltas cannot announce removal; full `session.list` reconciliation
   is required;
-- resident binding exposes neither publisher identity nor per-pane mapping;
+- the RPC resident-binding projection exposes neither publisher identity nor
+  a per-pane correlator/mapping. The registry's current publisher connection id
+  is discarded before the frame is built, so per-pane RPC identity is a known
+  capability gap rather than a client coordinate;
 - there is no independent current-todo snapshot; normal raw replay supplies
   the durable lifecycle;
 - `SessionSummary.account_alias` is not populated, so a per-session account is
