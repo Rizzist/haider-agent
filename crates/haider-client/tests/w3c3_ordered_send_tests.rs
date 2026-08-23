@@ -47,6 +47,7 @@ fn welcome() -> Welcome {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: BTreeSet::new(),
+        user_command_withheld: false,
         encoding: None,
     }
 }

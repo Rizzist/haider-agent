@@ -917,6 +917,7 @@ mod tests {
             WireFrame::ResidentSessionBinding {
                 session_id: None,
                 worker_generation: 9,
+                binding_token: None,
             },
             &shared,
             &events,
@@ -946,6 +947,7 @@ mod tests {
             lifecycle_phase: haider_rpc::LifecyclePhase::Ready,
             capabilities_granted: CapabilitySet::from([Capability::View]),
             features: Default::default(),
+            user_command_withheld: false,
             encoding: Some("msgpack".into()),
         };
         let draining = WireFrame::ServerDraining {

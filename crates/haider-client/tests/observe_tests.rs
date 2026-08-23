@@ -105,6 +105,7 @@ fn welcome(profile: &ResolvedProfile, instance: &str) -> Welcome {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View]),
         features: BTreeSet::new(),
+        user_command_withheld: false,
         encoding: None,
     }
 }

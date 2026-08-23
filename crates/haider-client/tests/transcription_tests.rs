@@ -40,6 +40,7 @@ fn welcome() -> Welcome {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: BTreeSet::from([haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned()]),
+        user_command_withheld: false,
         encoding: None,
     }
 }

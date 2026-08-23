@@ -130,6 +130,7 @@ fn welcome(profile: &ResolvedProfile) -> Welcome {
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
         features: haider_client::required_live_features(),
+        user_command_withheld: false,
         encoding: None,
     }
 }
