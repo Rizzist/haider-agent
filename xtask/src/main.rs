@@ -82,18 +82,33 @@ fn loc_lint() -> ExitCode {
     ExitCode::SUCCESS // soft cap: warn only, by design
 }
 
+/// Counts EVERY test in the workspace, wherever it lives.
+///
+/// This counter previously filtered to `tests/` directories and `*_tests.rs`
+/// files, on the workspace convention that tests live there rather than inline.
+/// That made it blind to **211 tests (6.7% of the suite)** — including the pins
+/// guarding the OAuth cache fixes, whose last regression cost four releases, and
+/// the pins on the wildcard-recursion crash fix.
+///
+/// The blindness mattered because of what this guard PROMISES. Its failure
+/// message says reducing tests "requires an explicit reviewed waiver" — and for
+/// those 211 it could not deliver that: delete any of them and the count stayed
+/// green. A guard that is honest about what it examined, read as a statement
+/// about what exists.
+///
+/// Widening the counter is the right fix rather than relocating 211 tests. The
+/// guard's PURPOSE is preventing silent test deletion, and it serves that better
+/// by counting everything. The convention can remain a style preference enforced
+/// by review; it should not be the thing the arithmetic depends on.
+///
+/// The position rule below still applies, so prose mentioning a marker and
+/// markers embedded mid-line are still excluded — widening WHERE we look does
+/// not widen WHAT counts as a test.
 fn count_tests(root: &Path) -> usize {
     let mut files = Vec::new();
     rust_files(root, &mut files);
     files
         .iter()
-        // Workspace rule: tests live in tests/ dirs (and *_tests.rs files), never inline.
-        .filter(|p| {
-            p.components().any(|c| c.as_os_str() == "tests")
-                || p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with("_tests.rs"))
-        })
         .filter_map(|p| fs::read_to_string(p).ok())
         .map(|text| text.lines().filter(|line| is_test_marker(line)).count())
         .sum()
@@ -147,4 +162,53 @@ fn test_count(update: bool) -> ExitCode {
     }
     println!("test-count: {current} tests (baseline {baseline}) — ok");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This test is deliberately INLINE — in `main.rs`, not a `tests/` dir and
+    /// not a `*_tests.rs` file. Before the counter was widened it would have
+    /// been invisible to the very guard it exercises, which is the point: the
+    /// pin and the bug share a location.
+    ///
+    /// MUTATION: restore the old filter in `count_tests`
+    ///     .filter(|p| p.components().any(|c| c.as_os_str() == "tests") || ...)
+    /// and this test fails with 0 found instead of 2 — which is exactly the
+    /// silent re-blinding it exists to prevent.
+    #[test]
+    fn count_tests_sees_tests_that_are_not_in_a_tests_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "haider-xtask-count-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let src = dir.join("crates").join("thing").join("src");
+        fs::create_dir_all(&src).expect("create fixture tree");
+
+        // An ordinary source module with inline tests: the 211-test blind spot.
+        fs::write(
+            src.join("inline.rs"),
+            "fn f() {}\n#[test]\nfn a() {}\n#[tokio::test]\nasync fn b() {}\n",
+        )
+        .expect("write inline fixture");
+
+        // Prose naming a marker must still NOT count: widening WHERE we look
+        // must not widen WHAT counts.
+        fs::write(
+            src.join("prose.rs"),
+            "//! This module documents #[test] usage.\n/// See #[tokio::test] for async.\nfn g() {}\n",
+        )
+        .expect("write prose fixture");
+
+        let found = count_tests(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            found, 2,
+            "inline #[test] and #[tokio::test] must count, and prose mentioning \
+             a marker must not"
+        );
+    }
 }
