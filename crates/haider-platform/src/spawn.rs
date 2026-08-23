@@ -189,6 +189,75 @@ pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
     command.spawn().map_err(DaemonSpawnError::Spawn)
 }
 
+#[cfg(unix)]
+fn configure_daemon(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+    // SAFETY: the hook runs between fork and exec and calls only the
+    // async-signal-safe close(2); no allocation or runtime state is touched.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(|| {
+            crate::process::close_inherited_descriptors();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn configure_daemon(command: &mut std::process::Command) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    // Rust's stable `Command` duplicates the three configured child stdio
+    // handles as inheritable, but still calls `CreateProcessW` with
+    // `bInheritHandles=TRUE` and no explicit handle list. If this launcher was
+    // itself started with captured stdio, those original pipe handles are
+    // inheritable too. A daemon that outlives the launcher then keeps the
+    // capture pipes open forever, so `Command::output` never observes EOF.
+    //
+    // Clear inheritance on the launcher's standard handles permanently — the
+    // Windows equivalent of CLOEXEC. A later Rust child that intentionally
+    // uses `Stdio::inherit` still works: `Command` duplicates the selected
+    // handle with inheritance enabled for that one spawn.
+    for (kind, name) in [
+        (STD_INPUT_HANDLE, "stdin"),
+        (STD_OUTPUT_HANDLE, "stdout"),
+        (STD_ERROR_HANDLE, "stderr"),
+    ] {
+        let handle = unsafe { GetStdHandle(kind) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        clear_handle_inheritance(handle, name)?;
+    }
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn clear_handle_inheritance(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    name: &str,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+        return Ok(());
+    }
+    let source = std::io::Error::last_os_error();
+    Err(std::io::Error::new(
+        source.kind(),
+        format!("cannot clear inheritance on daemon launcher's {name}: {source}"),
+    ))
+}
+
 #[cfg(test)]
 mod log_tests {
     use super::*;
@@ -268,7 +337,7 @@ mod log_tests {
             })
             .collect::<Vec<_>>();
         for (path, marker) in &paths {
-            let text = std::fs::read_to_string(&path)
+            let text = std::fs::read_to_string(path)
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
             let lines = text.lines().collect::<Vec<_>>();
             assert_eq!(lines.len(), 128);
@@ -335,75 +404,6 @@ mod log_tests {
             .count();
         assert_eq!(count, DAEMON_LOG_RETENTION);
     }
-}
-
-#[cfg(unix)]
-fn configure_daemon(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt as _;
-    command.process_group(0);
-    // SAFETY: the hook runs between fork and exec and calls only the
-    // async-signal-safe close(2); no allocation or runtime state is touched.
-    #[allow(unsafe_code)]
-    unsafe {
-        command.pre_exec(|| {
-            crate::process::close_inherited_descriptors();
-            Ok(())
-        });
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn configure_daemon(command: &mut std::process::Command) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt as _;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
-
-    // Rust's stable `Command` duplicates the three configured child stdio
-    // handles as inheritable, but still calls `CreateProcessW` with
-    // `bInheritHandles=TRUE` and no explicit handle list. If this launcher was
-    // itself started with captured stdio, those original pipe handles are
-    // inheritable too. A daemon that outlives the launcher then keeps the
-    // capture pipes open forever, so `Command::output` never observes EOF.
-    //
-    // Clear inheritance on the launcher's standard handles permanently — the
-    // Windows equivalent of CLOEXEC. A later Rust child that intentionally
-    // uses `Stdio::inherit` still works: `Command` duplicates the selected
-    // handle with inheritance enabled for that one spawn.
-    for (kind, name) in [
-        (STD_INPUT_HANDLE, "stdin"),
-        (STD_OUTPUT_HANDLE, "stdout"),
-        (STD_ERROR_HANDLE, "stderr"),
-    ] {
-        let handle = unsafe { GetStdHandle(kind) };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            continue;
-        }
-        clear_handle_inheritance(handle, name)?;
-    }
-    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    Ok(())
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn clear_handle_inheritance(
-    handle: windows_sys::Win32::Foundation::HANDLE,
-    name: &str,
-) -> std::io::Result<()> {
-    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-
-    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
-        return Ok(());
-    }
-    let source = std::io::Error::last_os_error();
-    Err(std::io::Error::new(
-        source.kind(),
-        format!("cannot clear inheritance on daemon launcher's {name}: {source}"),
-    ))
 }
 
 #[cfg(all(test, windows))]

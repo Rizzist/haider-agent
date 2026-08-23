@@ -1643,6 +1643,8 @@ mod wildcard_match_tests {
     const LONG_LINE_CHARS: usize = 100_000;
 
     #[test]
+    // Test fixture failures should retain whether thread creation or execution failed.
+    #[allow(clippy::expect_used)]
     fn long_wildcard_search_survives_a_small_worker_stack() {
         std::thread::Builder::new()
             .name("wildcard-small-stack".into())
