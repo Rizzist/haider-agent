@@ -157,6 +157,11 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// OSC 7791 because the typed generation-fenced binding signal appears
 /// unavailable even though the daemon serves it.
 ///
+/// MUTATION CHECK: remove `FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1` from
+/// `welcome_features`. Expected runtime failure: multi-surface clients cannot
+/// discover the served client-originated token echo and keep scraping their
+/// terminals for per-pane correlation.
+///
 /// MUTATION CHECK: remove `FEATURE_HAIDER_CODE_PLAN_STATUS_V1`. Expected
 /// runtime failure: clients cannot discover the typed provider-plan stream
 /// and would have to guess account health from percentages.
@@ -205,6 +210,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
             haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_V1.to_owned(),
+            haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1.to_owned(),
             haider_rpc::FEATURE_RUN_RETRY_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
@@ -235,6 +241,14 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
+    );
+}
+
+#[test]
+fn welcome_advertises_resident_session_binding_token_echo() {
+    assert!(
+        welcome_features().contains(FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1),
+        "the daemon serves client-originated resident binding-token echo"
     );
 }
 

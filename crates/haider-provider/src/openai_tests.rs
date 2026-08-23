@@ -1753,16 +1753,17 @@ fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
     );
 }
 
-/// CM2f — subscription/lite caching keeps its stable routing key, but omits
-/// `prompt_cache_retention`: the backend rejects that parameter. Stripping
-/// the key restores the CM1 byte-exact request, so cache annotation never
-/// changes model-visible content.
+/// CM2f — the authoritative 2026-08-23 codex 0.145 backend echo accepts
+/// `prompt_cache_retention: "24h"` while top-level `instructions` is null.
+/// Haider matches that shape by putting its system prompt in the leading
+/// developer input item. Stripping the cache annotations restores the CM1
+/// byte-exact request, so they never change model-visible content.
 ///
-/// MUTATION CHECK (executed 2026-08-23): restore the rejected retention insert
-/// or suppress OAuth key derivation; the corresponding absence/presence
-/// assertion fails.
+/// MUTATION CHECK: restore top-level lite `instructions`, remove the leading
+/// developer item, remove retention, or suppress OAuth key derivation; the
+/// corresponding shape assertion fails.
 #[test]
-fn cm2f_openai_lite_carries_stable_cache_key_without_retention() {
+fn cm2f_openai_lite_moves_instructions_to_input_and_carries_retention() {
     let mut request = probe_request("gpt-5.6-sol");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
     let with_metadata = responses_request_json(&request, true, None, false).expect("lite wire");
@@ -1779,15 +1780,32 @@ fn cm2f_openai_lite_carries_stable_cache_key_without_retention() {
         Some(key),
         "the cache key must be stable across identical requests"
     );
-    assert!(
-        with_metadata.get("prompt_cache_retention").is_none(),
-        "lite request must omit backend-rejected prompt_cache_retention: {with_metadata}"
+    assert_eq!(
+        with_metadata
+            .get("prompt_cache_retention")
+            .and_then(serde_json::Value::as_str),
+        Some("24h"),
+        "lite request must carry the retention accepted in codex's backend echo: {with_metadata}"
     );
-    // Content invariance: strip the cache key and the CM1 unannotated request
-    // comes back byte-exact.
+    assert!(
+        with_metadata.get("instructions").is_none(),
+        "lite leaves the top-level instructions parameter null/absent: {with_metadata}"
+    );
+    assert_eq!(
+        with_metadata["input"][0],
+        serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Be terse."}],
+        }),
+        "lite instructions are the leading developer input item: {with_metadata}"
+    );
+    // Content invariance: strip the cache annotations and the CM1 unannotated
+    // request comes back byte-exact.
     let mut stripped = with_metadata.clone();
     let object = stripped.as_object_mut().expect("request object");
     object.remove("prompt_cache_key");
+    object.remove("prompt_cache_retention");
     request.cache_metadata = None;
     let baseline = responses_request_json(&request, true, None, false).expect("CM1 wire");
     assert_eq!(stripped, baseline);
@@ -1795,10 +1813,10 @@ fn cm2f_openai_lite_carries_stable_cache_key_without_retention() {
 }
 
 /// OAuth and API-key sessions both receive stable cache routing, while the
-/// provider name keeps their cache domains separate. The OAuth/lite request
-/// must not carry the backend-rejected retention parameter.
+/// provider name keeps their cache domains separate. OAuth also carries the
+/// backend-accepted retention parameter and reports only the TTL it emitted.
 #[test]
-fn cm2f_openai_oauth_keeps_cache_key_without_retention_and_is_separate_from_api_key() {
+fn cm2f_openai_oauth_has_retention_and_is_separate_from_api_key() {
     let mut oauth_request = probe_request("gpt-5.6-sol");
     oauth_request.cache_metadata = Some(cm2_cache_metadata(OPENAI_OAUTH_PROVIDER_NAME, 1));
     let oauth_payload =
@@ -1807,14 +1825,19 @@ fn cm2f_openai_oauth_keeps_cache_key_without_retention_and_is_separate_from_api_
         .get("prompt_cache_key")
         .and_then(serde_json::Value::as_str)
         .expect("OAuth request carries prompt_cache_key");
-    assert!(
-        oauth_payload.get("prompt_cache_retention").is_none(),
-        "OAuth/lite request must omit backend-rejected prompt_cache_retention: {oauth_payload}"
+    assert_eq!(
+        oauth_payload
+            .get("prompt_cache_retention")
+            .and_then(serde_json::Value::as_str),
+        Some("24h"),
+        "OAuth/lite request carries backend-accepted retention: {oauth_payload}"
     );
     assert_eq!(
         openai_cache_control_observation(&oauth_request, &oauth_payload),
-        haider_protocol::provider::CacheControlObservationV1::Emitted { ttl_ms: None },
-        "without an accepted retention parameter, cache telemetry must not claim a 24h TTL"
+        haider_protocol::provider::CacheControlObservationV1::Emitted {
+            ttl_ms: Some(24 * 60 * 60 * 1_000),
+        },
+        "cache telemetry reports the retention actually emitted on the wire"
     );
 
     let mut api_key_request = probe_request("gpt-5.6-sol");
@@ -1976,6 +1999,19 @@ fn codex_lite_payload_meets_the_subscription_contract() {
         "lite requires reasoning.context=all_turns: {payload}"
     );
     assert!(
+        !object.contains_key("instructions"),
+        "codex leaves top-level instructions null and uses developer input: {payload}"
+    );
+    assert_eq!(
+        payload["input"][0],
+        serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Be terse."}],
+        }),
+        "lite instructions must be the leading developer input item: {payload}"
+    );
+    assert!(
         !object.contains_key("tools"),
         "lite REJECTS hosted tools — the web_search flag must be structurally inert: {payload}"
     );
@@ -2103,6 +2139,17 @@ fn api_key_payload_keeps_max_output_tokens_and_no_lite_fields() {
     assert!(
         !object.contains_key("parallel_tool_calls"),
         "the lite-only field must not leak onto the API-key path"
+    );
+    assert_eq!(
+        object
+            .get("instructions")
+            .and_then(serde_json::Value::as_str),
+        Some("Be terse."),
+        "the API-key path keeps top-level instructions"
+    );
+    assert_eq!(
+        payload["input"][0]["role"], "user",
+        "the API-key path must not gain a leading developer item"
     );
     assert_eq!(
         payload

@@ -268,7 +268,8 @@ affordance before the response exists.
 | `loom_v1` | `loom.list/register_agent_type/register_workflow` |
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
 | `store_health_v1` | unsolicited latched/replayed store-health `ProtocolError` transitions |
-| `resident_session_binding_v1` | bidirectional `ResidentSessionBinding` frame, including the optional opaque `binding_token` |
+| `resident_session_binding_v1` | bidirectional `ResidentSessionBinding` baseline/push frame and its generation fence; it does not by itself guarantee publisher-token echo |
+| `resident_session_binding_token_v1` | for every accepted publication carrying a valid client-originated `binding_token`, the daemon stores it with that publisher and echoes it verbatim on `ResidentSessionBinding` baselines/pushes; a publisher that supplies no token produces no field, never an empty string |
 | `tui_attach_announce_v1` | OSC 7791 compatibility announcement by this release's TUI; it is not the RPC binding contract |
 | `wire_msgpack_v1` | post-Welcome MessagePack selection |
 | `session_attach_sealed_v1` | `session.attach.sealed_replay` |
@@ -881,6 +882,14 @@ stores and echoes it verbatim without parsing it or using it for identity,
 routing, authorization, or any other behavior. Sanity validation is limited
 to 1–128 UTF-8 bytes in the ASCII set `[A-Za-z0-9._:-]`.
 
+Token echo has its own discovery bit,
+`resident_session_binding_token_v1`; the older
+`resident_session_binding_v1` bit advertises only the binding frame. Without
+the token bit, an absent `binding_token` is ambiguous: the daemon may predate
+client-originated binding tokens, or this publisher may simply have supplied
+none. With the token bit, absence means only that this publisher supplied no
+token; the daemon never substitutes an empty string.
+
 A TUI process holds one daemon connection for its lifetime. Consequently an
 in-TUI hop replaces that connection's publisher record and emits the same
 `binding_token` with the new `session_id`. A separately launched TUI uses a
@@ -889,14 +898,16 @@ record, and emits that different token. A client can therefore distinguish a
 hop from a second surface without observing or receiving either daemon
 connection id.
 
-The complete client arrangement is: open the View/Control binding stream,
+The complete client arrangement is: after the daemon advertises
+`resident_session_binding_token_v1`, open the View/Control binding stream,
 mint and retain one token per child surface, set `HAIDER_BINDING_TOKEN` when
 launching that child, and apply each echoed token/session pair to the matching
 surface. The launch record supplies the initial mapping; later same-token
-frames report in-TUI hops. This arrangement needs no terminal read. A client
-using it can delete its OSC 7791 per-pane path entirely. OSC 7791 remains only
-a compatibility announcement for clients that have not migrated; it is not a
-second authority.
+frames report in-TUI hops. A client may retire its terminal-based per-pane
+read once the bit is advertised **and its own minted token round-trips**.
+Until both conditions hold, it keeps its old-daemon compatibility fallback.
+OSC 7791 remains only a compatibility announcement for clients that have not
+migrated; it is not a second authority.
 
 Consequences:
 
@@ -906,8 +917,11 @@ Consequences:
   value to a pane by recency or guesswork;
 - daemon connection ids and publisher revisions remain internal and are not
   promised client coordinates;
-- absent `binding_token` means the publisher supplied none. The daemon never
-  synthesizes, defaults, or derives one from a connection id or process id;
+- when `resident_session_binding_token_v1` is advertised, absent
+  `binding_token` means the publisher supplied none. Without the bit, absence
+  is ambiguous with an old daemon. The daemon that advertises the bit never
+  synthesizes, defaults, or derives a token from a connection id or process
+  id;
 - `session_id=None` is an explicit publisher unbind/launcher state, not
   missing data;
 - a Control publisher sends the same top-level frame. The daemon validates

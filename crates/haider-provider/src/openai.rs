@@ -2661,6 +2661,10 @@ fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Ve
     sources
 }
 
+/// Prompt-cache retention accepted by the subscription backend in the
+/// official codex 0.145 `response.created` echo captured 2026-08-23.
+const CODEX_LITE_PROMPT_CACHE_RETENTION: &str = "24h";
+
 /// The alpha/search endpoint for one subscription origin. The credential's
 /// own `base_url` wins when it carries one (an imported codex credential may
 /// point at a proxy); otherwise the sanctioned subscription base. Always
@@ -3568,14 +3572,24 @@ fn responses_request_json_with_boundary(
         })
         .collect::<HashSet<_>>();
     let mut input = Vec::new();
+    // Current codex sends subscription instructions as the first developer
+    // input item and leaves the top-level `instructions` parameter null. Keep
+    // the API-key Responses shape unchanged.
+    if codex_responses_lite && let Some(instructions) = &request.system_prompt {
+        input.push(serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": instructions}],
+        }));
+    }
     let stable_history_end = stable_history_end.min(request.messages.len());
-    let mut stable_wire_end = (stable_history_end == 0).then_some(0);
+    let mut stable_wire_end = (stable_history_end == 0).then_some(input.len());
     let previous_history_end = request
         .cache_metadata
         .as_ref()
         .and_then(|metadata| metadata.previous_stable_history_end)
         .filter(|previous| *previous <= request.messages.len());
-    let mut previous_wire_end = (previous_history_end == Some(0)).then_some(0);
+    let mut previous_wire_end = (previous_history_end == Some(0)).then_some(input.len());
     for (message_index, message) in request.messages.iter().enumerate() {
         let mut content = Vec::new();
         for block in &message.blocks {
@@ -3904,7 +3918,7 @@ fn responses_request_json_with_boundary(
     if computer_kind == OpenAiComputerToolKind::Preview {
         object.insert("truncation".into(), serde_json::json!("auto"));
     }
-    if let Some(instructions) = &request.system_prompt {
+    if !codex_responses_lite && let Some(instructions) = &request.system_prompt {
         object.insert(
             "instructions".into(),
             serde_json::Value::String(instructions.clone()),
@@ -3919,6 +3933,12 @@ fn responses_request_json_with_boundary(
             object.insert(
                 "prompt_cache_options".into(),
                 serde_json::json!({"mode": "explicit", "ttl": "30m"}),
+            );
+        }
+        if codex_responses_lite {
+            object.insert(
+                "prompt_cache_retention".into(),
+                serde_json::json!(CODEX_LITE_PROMPT_CACHE_RETENTION),
             );
         }
     }
@@ -4172,7 +4192,13 @@ fn openai_cache_control_observation(
     use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
 
     if payload.get("prompt_cache_key").is_some() {
-        let ttl_ms = if payload.get("prompt_cache_options").is_some() {
+        let ttl_ms = if payload
+            .get("prompt_cache_retention")
+            .and_then(serde_json::Value::as_str)
+            == Some(CODEX_LITE_PROMPT_CACHE_RETENTION)
+        {
+            Some(24 * 60 * 60 * 1_000)
+        } else if payload.get("prompt_cache_options").is_some() {
             Some(30 * 60 * 1_000)
         } else {
             None

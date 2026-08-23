@@ -67,6 +67,13 @@ pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_OAUTH_BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_OAUTH_BETA_HEADER: &str = "anthropic-beta";
 pub const ANTHROPIC_OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
+/// First-party cache-scope beta sent by the official Claude Code client on
+/// subscription-authenticated Messages requests that carry cache controls.
+pub const ANTHROPIC_OAUTH_PROMPT_CACHING_BETA_VALUE: &str = "prompt-caching-scope-2026-01-05";
+/// Beta paired with every explicit one-hour cache TTL by the official Claude
+/// Code client. This is composed only on OAuth cache-bearing requests here;
+/// the API-key contract retains its existing header policy.
+pub const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_VALUE: &str = "extended-cache-ttl-2025-04-11";
 /// Beta token the fast-mode research preview requires on `anthropic-beta`
 /// whenever the body carries `speed: "fast"` (G3). On OAuth requests it is
 /// comma-joined AFTER the subscription beta.
@@ -261,9 +268,10 @@ pub struct AnthropicProvider {
     /// resolved pair — first-party `anthropic`/`anthropic-oauth` only, never
     /// Bedrock/Vertex, and dropped after a session-scoped degrade.
     web_tools: bool,
-    /// Explicit prompt caching is enabled only after this exact
-    /// provider/model/auth surface is verified. Consumer OAuth and enterprise
-    /// endpoints default false and retain the byte-exact legacy request.
+    /// Explicit prompt-caching override for capture harnesses and artificial
+    /// test models. The first-party API constructor enables it directly;
+    /// known consumer-OAuth models are enabled by the verified surface policy
+    /// in `prompt_caching_enabled`, while enterprise endpoints remain off.
     prompt_caching_verified: bool,
 }
 
@@ -489,8 +497,9 @@ impl AnthropicProvider {
         self
     }
 
-    /// Installs the result of an auth/model cache capability probe. Production
-    /// consumer OAuth leaves this false until the private surface is verified.
+    /// Installs the result of an auth/model cache capability probe. Known
+    /// production OAuth models no longer require this override; it remains the
+    /// explicit seam for capture harnesses and artificial test models.
     #[must_use]
     pub fn with_prompt_caching_verified(mut self, verified: bool) -> Self {
         self.prompt_caching_verified = verified;
@@ -502,6 +511,25 @@ impl AnthropicProvider {
     pub fn with_api_url(mut self, api_url: impl Into<String>) -> Self {
         self.api_url = api_url.into();
         self
+    }
+
+    fn prompt_caching_enabled(&self, model: &str) -> bool {
+        self.prompt_caching_verified
+            || matches!(self.auth_mode, AnthropicAuthMode::OAuthBearer)
+                && verified_anthropic_cache_model(model)
+    }
+
+    fn cache_ttl(&self, metadata: &crate::PromptCacheMetadata) -> AnthropicCacheTtl {
+        if matches!(self.auth_mode, AnthropicAuthMode::OAuthBearer)
+            && verified_anthropic_cache_model(&self.model)
+        {
+            // Claude Code's first-party subscription path automatically uses
+            // the extended cache. Keep API-key economics on the existing
+            // metadata-driven selector; this is an OAuth-only contract.
+            AnthropicCacheTtl::OneHour
+        } else {
+            select_anthropic_cache_ttl(metadata.reuse_gap_ms, metadata.expected_later_reads)
+        }
     }
 
     #[cfg(test)]
@@ -583,7 +611,7 @@ impl AnthropicProvider {
     ) -> Result<serde_json::Value, ProviderError> {
         self.validate_model(request)?;
         let cache_ttl = self
-            .prompt_caching_verified
+            .prompt_caching_enabled(&request.model)
             .then_some(request.cache_metadata.as_ref())
             .flatten()
             .filter(|metadata| {
@@ -598,9 +626,7 @@ impl AnthropicProvider {
                     }
                     && known_anthropic_cache_model(&request.model)
             })
-            .map(|metadata| {
-                select_anthropic_cache_ttl(metadata.reuse_gap_ms, metadata.expected_later_reads)
-            });
+            .map(|metadata| self.cache_ttl(metadata));
         let payload = self.render_payload(request, cache_ttl)?;
         let has_pdf = request.messages.iter().any(|message| {
             message.blocks.iter().any(|block| {
@@ -645,13 +671,13 @@ impl AnthropicProvider {
         use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
 
         if crate::payload_has_added_key(payload, prompt_payload, "cache_control") {
-            let ttl = request.cache_metadata.as_ref().map(|metadata| {
-                select_anthropic_cache_ttl(metadata.reuse_gap_ms, metadata.expected_later_reads)
-                    .milliseconds()
-            });
+            let ttl = request
+                .cache_metadata
+                .as_ref()
+                .map(|metadata| self.cache_ttl(metadata).milliseconds());
             return CacheControlObservationV1::Emitted { ttl_ms: ttl };
         }
-        if !self.prompt_caching_verified {
+        if !self.prompt_caching_enabled(&request.model) {
             return CacheControlObservationV1::NotEmitted {
                 reason: CacheControlOmissionReasonV1::Unverified,
             };
@@ -788,6 +814,14 @@ impl AnthropicProvider {
                 // ONE comma-joined header — the subscription token must
                 // survive every composition.
                 let mut betas = vec![ANTHROPIC_OAUTH_BETA_VALUE];
+                if payload_uses_cache_ttl(payload, AnthropicCacheTtl::OneHour) {
+                    // Claude Code 2.1.238 sends both tokens on its accepted
+                    // one-hour subscription-cache requests. They are scoped
+                    // to OAuth payloads that actually contain a 1h marker;
+                    // API-key headers and uncached OAuth turns are unchanged.
+                    betas.push(ANTHROPIC_OAUTH_PROMPT_CACHING_BETA_VALUE);
+                    betas.push(ANTHROPIC_EXTENDED_CACHE_TTL_BETA_VALUE);
+                }
                 if self.fast {
                     betas.push(ANTHROPIC_FAST_BETA_VALUE);
                 }
@@ -831,7 +865,7 @@ impl AnthropicProvider {
     }
 }
 
-fn known_anthropic_cache_model(model: &str) -> bool {
+fn verified_anthropic_cache_model(model: &str) -> bool {
     let model = crate::effort::base_model(model);
     model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-5")
@@ -840,7 +874,33 @@ fn known_anthropic_cache_model(model: &str) -> bool {
         || model.starts_with("claude-sonnet-4")
         || model.starts_with("claude-haiku-4")
         || model.starts_with("claude-3-")
-        || cfg!(test) && model == "claude-audit"
+}
+
+fn known_anthropic_cache_model(model: &str) -> bool {
+    verified_anthropic_cache_model(model) || cfg!(test) && model == "claude-audit"
+}
+
+fn payload_uses_cache_ttl(payload: &serde_json::Value, ttl: AnthropicCacheTtl) -> bool {
+    match payload {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| payload_uses_cache_ttl(value, ttl)),
+        serde_json::Value::Object(values) => {
+            let matches_here = values.get("cache_control").is_some_and(|cache_control| {
+                cache_control
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("ephemeral")
+                    && cache_control.get("ttl").and_then(serde_json::Value::as_str)
+                        == Some(ttl.wire())
+            });
+            matches_here
+                || values
+                    .values()
+                    .any(|value| payload_uses_cache_ttl(value, ttl))
+        }
+        _ => false,
+    }
 }
 
 #[async_trait]
@@ -1342,4 +1402,117 @@ pub(crate) fn anthropic_billing_exhausted(kind: &str, message: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct ErrorEnvelope {
     error: WireApiError,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod oauth_cache_tests {
+    use haider_accounts::{MemoryVault, Vault};
+    use haider_protocol::ids::CredentialAlias;
+    use reqwest::header::AUTHORIZATION;
+
+    use super::*;
+    use crate::{Message, PromptCacheMetadata, TurnRequest};
+
+    fn credential(alias: &str) -> SecretHandle {
+        let vault = MemoryVault::new();
+        let alias = CredentialAlias::new(alias);
+        vault
+            .put(&alias, b"anthropic-cache-test-secret")
+            .expect("store cache-test secret");
+        vault.resolve(&alias).expect("resolve cache-test secret")
+    }
+
+    fn cache_turn(provider: &str) -> TurnRequest {
+        TurnRequest {
+            messages: vec![
+                Message::user_text("stable prefix"),
+                Message::user_text("current turn"),
+            ],
+            model: "claude-haiku-4-5-20251001".into(),
+            max_tokens: 16,
+            system_prompt: Some("stable system".into()),
+            tools: Vec::new(),
+            attachments: Vec::new(),
+            cache_metadata: Some(PromptCacheMetadata {
+                stable_history_end: 1,
+                current_user_start: 1,
+                provider: provider.into(),
+                account_scope: Some("account-a".into()),
+                expected_later_reads: 2,
+                reuse_gap_ms: Some(30_000),
+                ..PromptCacheMetadata::default()
+            }),
+        }
+    }
+
+    /// HAIDERANTHCACHE regression: a real subscription model enables caching
+    /// without the old manual verification seam, uses Claude Code's 1h TTL,
+    /// and composes the cache betas. The API-key request retains its existing
+    /// 5m selector and does not gain OAuth/cache beta headers.
+    #[tokio::test]
+    async fn oauth_real_model_uses_one_hour_cache_betas_without_changing_api_key() {
+        let oauth = AnthropicProvider::new_with_auth(
+            credential("oauth-cache"),
+            "claude-haiku-4-5-20251001",
+            AnthropicAuthMode::OAuthBearer,
+            None,
+        )
+        .expect("OAuth provider");
+        assert!(
+            !oauth.prompt_caching_verified,
+            "the real-model policy, not a test override, enables this path"
+        );
+        let oauth_payload = oauth
+            .request_payload(&cache_turn(ANTHROPIC_OAUTH_PROVIDER_NAME))
+            .expect("OAuth cache payload");
+        let one_hour = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(oauth_payload["system"][1]["cache_control"], one_hour);
+        assert_eq!(
+            oauth_payload["messages"][0]["content"][0]["cache_control"], one_hour,
+            "the stable boundary lands on its final content block"
+        );
+        assert!(
+            oauth_payload["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "the volatile current turn stays beyond the stable breakpoint"
+        );
+        let oauth_request = oauth
+            .request(&oauth_payload)
+            .await
+            .expect("OAuth HTTP request");
+        assert_eq!(
+            oauth_request
+                .headers()
+                .get(ANTHROPIC_OAUTH_BETA_HEADER)
+                .expect("OAuth cache betas"),
+            "oauth-2025-04-20,prompt-caching-scope-2026-01-05,extended-cache-ttl-2025-04-11"
+        );
+        assert!(oauth_request.headers().contains_key(AUTHORIZATION));
+        assert!(!oauth_request.headers().contains_key("x-api-key"));
+
+        let api_key = AnthropicProvider::new(credential("api-cache"), "claude-haiku-4-5-20251001")
+            .expect("API-key provider");
+        let api_payload = api_key
+            .request_payload(&cache_turn(ANTHROPIC_PROVIDER_NAME))
+            .expect("API-key cache payload");
+        assert_eq!(
+            api_payload["system"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"}),
+            "the API-key TTL policy is unchanged"
+        );
+        let api_request = api_key
+            .request(&api_payload)
+            .await
+            .expect("API-key HTTP request");
+        assert!(api_request.headers().contains_key("x-api-key"));
+        assert!(!api_request.headers().contains_key(AUTHORIZATION));
+        assert!(
+            !api_request
+                .headers()
+                .contains_key(ANTHROPIC_OAUTH_BETA_HEADER),
+            "the API-key cache path gains no OAuth-only beta header"
+        );
+    }
 }

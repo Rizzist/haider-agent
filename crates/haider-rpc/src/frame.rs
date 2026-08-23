@@ -424,6 +424,11 @@ pub const FEATURE_TUI_ATTACH_ANNOUNCE_V1: &str = "tui_attach_announce_v1";
 /// superseded daemon worker generation. The OSC 7791 compatibility channel is
 /// separate and remains advertised by [`FEATURE_TUI_ATTACH_ANNOUNCE_V1`].
 pub const FEATURE_RESIDENT_SESSION_BINDING_V1: &str = "resident_session_binding_v1";
+/// An accepted resident binding publication may carry an opaque
+/// `binding_token`; the daemon stores it with that publisher and echoes it
+/// verbatim on binding baselines and pushes. A tokenless publication remains
+/// tokenless.
+pub const FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1: &str = "resident_session_binding_token_v1";
 /// Receipted per-session Loom agent-type binding (`session.select_agent_type`)
 /// — the inline identity switch: a session takes a registered type's job
 /// (volatile prompt tail, cache-epoch free) and accent until reverted.

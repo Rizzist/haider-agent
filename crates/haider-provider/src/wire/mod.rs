@@ -1981,3 +1981,64 @@ mod lookback_tests {
         assert_eq!(anthropic_intermediate_boundary(&[], 0), None);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod cache_usage_tests {
+    use super::*;
+
+    /// An explicit provider-reported zero is available telemetry, not an
+    /// absent field. This pins the distinction used by HAIDERANTHCACHE: the
+    /// measured all-zero response is a genuine no-write, not a decode miss.
+    #[test]
+    fn explicit_zero_cache_counters_stay_present_while_absent_stays_absent() {
+        let mut explicit_zero = InputUsage::default();
+        explicit_zero
+            .update(&WireUsage {
+                input_tokens: Some(6_965),
+                output_tokens: Some(1),
+                cache_creation_input_tokens: Some(0),
+                cache_read_input_tokens: Some(0),
+                cache_creation: Some(WireCacheCreation {
+                    ephemeral_5m_input_tokens: Some(0),
+                    ephemeral_1h_input_tokens: Some(0),
+                }),
+            })
+            .expect("explicit-zero usage");
+        let normalized = explicit_zero.normalized(1).expect("normalized usage");
+        assert_eq!(normalized.cache_read_input, 0);
+        assert_eq!(normalized.cache_write_input, 0);
+        assert_eq!(normalized.cache_write_5m_input, 0);
+        assert_eq!(normalized.cache_write_1h_input, 0);
+        assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+        assert_eq!(
+            normalized.cache_write_status,
+            CacheStatAvailability::Present
+        );
+        assert_eq!(
+            normalized.cache_write_ttl_status,
+            CacheStatAvailability::Present
+        );
+
+        let mut absent = InputUsage::default();
+        absent
+            .update(&WireUsage {
+                input_tokens: Some(6_965),
+                output_tokens: Some(1),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation: None,
+            })
+            .expect("usage with absent cache counters");
+        let normalized = absent.normalized(1).expect("normalized absent usage");
+        assert_eq!(normalized.cache_status, CacheStatAvailability::Unavailable);
+        assert_eq!(
+            normalized.cache_write_status,
+            CacheStatAvailability::Unavailable
+        );
+        assert_eq!(
+            normalized.cache_write_ttl_status,
+            CacheStatAvailability::Unavailable
+        );
+    }
+}

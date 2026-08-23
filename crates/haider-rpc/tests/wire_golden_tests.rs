@@ -3855,16 +3855,28 @@ fn account_list_watch_is_a_signal_not_a_delta() {
 
 /// The resident binding signal represents unbind by omitting `session_id`,
 /// keeps the generation fence required, defaults an old publisher's absent
-/// token, and ignores additive future fields.
+/// token, and ignores additive future fields. The separate token-echo feature
+/// literal lets clients distinguish that additive behavior from the baseline
+/// resident-binding frame.
 ///
 /// MUTATION CHECK: replace `binding_token` with `None` in the enclosing
 /// `WireFrameOwned::ResidentSessionBinding` conversion. Expected runtime
 /// failure: the additive token disappears from the bound round trip while the
 /// v0.0.944 tokenless frame continues to decode unchanged.
+///
+/// MUTATION CHECK: remove `skip_serializing_if = "Option::is_none"` from the
+/// resident binding token in `WireFrameRef`. Expected runtime failure: a
+/// tokenless publisher serializes `binding_token:null` instead of omitting the
+/// field.
 #[test]
 fn resident_session_binding_decodes_without_optional_fields() {
     use haider_protocol::ids::SessionId;
     use haider_rpc::WireFrame;
+
+    assert_eq!(
+        haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1,
+        "resident_session_binding_token_v1"
+    );
 
     let unbound_json = serde_json::json!({
         "v": 1,
@@ -3881,8 +3893,13 @@ fn resident_session_binding_decodes_without_optional_fields() {
             binding_token: None,
         }
     );
+    let unbound_encoded = serde_json::to_value(&unbound).expect("unbind encodes");
+    assert!(
+        unbound_encoded.get("binding_token").is_none(),
+        "a tokenless publisher omits binding_token; it is never null or an empty string"
+    );
     assert_eq!(
-        serde_json::to_value(&unbound).expect("unbind encodes"),
+        unbound_encoded,
         serde_json::json!({
             "v": 1,
             "kind": "resident_session_binding",
