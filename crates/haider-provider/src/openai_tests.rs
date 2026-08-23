@@ -1709,6 +1709,98 @@ fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
     }
 }
 
+/// HAIDER949(a). MUTATION CHECK: drop `session_scope` from
+/// `derive_prompt_cache_key`; the equality assertion below reports that two
+/// otherwise identical sessions collided.
+#[test]
+fn openai_prompt_cache_key_differs_across_session_scopes() {
+    let mut request = probe_request("gpt-5.6");
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let first = derive_prompt_cache_key(
+        &request,
+        request.cache_metadata.as_ref().expect("first metadata"),
+    );
+
+    let mut other_session = request.cache_metadata.clone().expect("metadata");
+    other_session.session_scope = "session-b".into();
+    let second = derive_prompt_cache_key(&request, &other_session);
+
+    assert_ne!(
+        first, second,
+        "session_scope must isolate otherwise identical OpenAI cache domains"
+    );
+}
+
+/// HAIDER949(b). MUTATION CHECK: add `request.messages.len()` to the cache-key
+/// domain; the equality assertion below reports that append-only turn growth
+/// changed a session's key.
+#[test]
+fn openai_prompt_cache_key_is_stable_across_turns_in_one_session() {
+    let mut first_turn = probe_request("gpt-5.6");
+    first_turn.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let first = derive_prompt_cache_key(
+        &first_turn,
+        first_turn.cache_metadata.as_ref().expect("first metadata"),
+    );
+
+    let mut second_turn = first_turn.clone();
+    second_turn
+        .messages
+        .push(Message::assistant(vec![Block::Text {
+            text: "append-only answer".into(),
+        }]));
+    second_turn
+        .messages
+        .push(Message::user_text("next turn in the same session"));
+    let second_stable_history_end = second_turn.messages.len() - 1;
+    let metadata = second_turn
+        .cache_metadata
+        .as_mut()
+        .expect("second metadata");
+    metadata.previous_stable_history_end = Some(metadata.stable_history_end);
+    metadata.stable_history_end = second_stable_history_end;
+    metadata.current_user_start = second_stable_history_end;
+    metadata.prefix_digests.immutable_history = "history-b".into();
+    let second = derive_prompt_cache_key(
+        &second_turn,
+        second_turn
+            .cache_metadata
+            .as_ref()
+            .expect("second metadata"),
+    );
+
+    assert_eq!(
+        first, second,
+        "append-only turns in one session must retain the OpenAI cache key"
+    );
+}
+
+/// HAIDER949(c). `PromptCacheMetadata` uses the default empty string for an
+/// absent session scope. Such a request still receives a valid OpenAI key,
+/// but consecutive anonymous derivations must not share a cache bucket.
+#[test]
+fn openai_prompt_cache_key_is_usable_and_isolated_without_session_scope() {
+    let mut request = probe_request("gpt-5.6");
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("metadata")
+        .session_scope
+        .clear();
+    let metadata = request.cache_metadata.as_ref().expect("metadata");
+
+    let first = derive_prompt_cache_key(&request, metadata);
+    let second = derive_prompt_cache_key(&request, metadata);
+
+    assert_eq!(first.len(), 64, "OpenAI cache keys remain BLAKE3 hex");
+    assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(
+        first, second,
+        "anonymous requests must not collapse into one shared cache bucket"
+    );
+}
+
 /// GPT-5.6 gets explicit breakpoints plus the stable cache key. The volatile
 /// current-user suffix is deliberately beyond the final marker.
 #[test]

@@ -1985,7 +1985,7 @@ impl HarnessActor {
         let mut provider_request_ordinal = 0_u64;
         let mut previous_cache_request = self.config.cache_previous_request.clone();
         let mut pending_previous_cache_request: Option<PreviousCacheRequest> = None;
-        let mut previous_cache_completed_at: Option<tokio::time::Instant> = None;
+        let mut previous_cache_request_sent_at: Option<tokio::time::Instant> = None;
         let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
         // W-B: provider-executed tool rows and cited web sources are
         // TURN-scoped — a pause_turn boundary can split a server call from
@@ -1999,12 +1999,9 @@ impl HarnessActor {
         let mut tool_json_repair_used = false;
 
         'requests: loop {
+            let previous_cache_request_completed = pending_previous_cache_request.is_some();
             if let Some(completed) = pending_previous_cache_request.take() {
                 previous_cache_request = Some(completed);
-                if let Some(completed_at) = previous_cache_completed_at {
-                    self.config.cache_reuse_gap_ms =
-                        Some(u64::try_from(completed_at.elapsed().as_millis()).unwrap_or(u64::MAX));
-                }
             }
             if let Some(dispatcher) = self.dispatcher.as_ref() {
                 match dispatcher.refresh_volatile_context_tail().await {
@@ -2094,18 +2091,6 @@ impl HarnessActor {
             let mut previous_prefix_digests = previous_stable_history_end
                 .filter(|previous| *previous <= messages.len())
                 .map(|previous| usage_prefix_digests(&self.config, &messages[..previous]));
-            let mut cache_metadata = prompt_cache_metadata(
-                &self.config,
-                &messages,
-                PromptCacheBoundaries {
-                    stable_history_end,
-                    current_user_start: current_turn_start,
-                    previous_stable_history_end,
-                    latest_compaction_summary_end,
-                },
-                prefix_digests.clone(),
-                usage_account.as_ref(),
-            );
             let mut request_messages = messages.clone();
             if let Some(tail) = &volatile_user_tail {
                 request_messages.push(Message::user_text(tail.clone()));
@@ -2125,6 +2110,30 @@ impl HarnessActor {
                             .await;
                     }
                 };
+            // Cache metadata must exist before provider preparation, so this
+            // is the last provider-neutral request-send boundary available to
+            // the TTL selector. Sample every request at this same boundary;
+            // usage processing may happen much later after an in-stream tool.
+            let request_sent_at = tokio::time::Instant::now();
+            if previous_cache_request_completed
+                && let Some(previous_sent_at) = previous_cache_request_sent_at
+            {
+                let reuse_gap = request_sent_at.duration_since(previous_sent_at);
+                self.config.cache_reuse_gap_ms =
+                    Some(u64::try_from(reuse_gap.as_millis()).unwrap_or(u64::MAX));
+            }
+            let mut cache_metadata = prompt_cache_metadata(
+                &self.config,
+                &messages,
+                PromptCacheBoundaries {
+                    stable_history_end,
+                    current_user_start: current_turn_start,
+                    previous_stable_history_end,
+                    latest_compaction_summary_end,
+                },
+                prefix_digests.clone(),
+                usage_account.as_ref(),
+            );
             let mut provider_request = TurnRequest {
                 messages: request_messages,
                 model: self.config.model.clone(),
@@ -3016,7 +3025,7 @@ impl HarnessActor {
                             breakpoint_hashes: cache_diagnostic.breakpoint_hashes,
                             cache_domain_hash: cache_diagnostic.cache_domain_hash,
                         });
-                        previous_cache_completed_at = Some(tokio::time::Instant::now());
+                        previous_cache_request_sent_at = Some(request_sent_at);
                         let footprint =
                             context_footprint_from_usage(&self.config, &usage, &messages);
                         request_usage = Some(usage.clone());

@@ -4158,8 +4158,8 @@ fn openai_automatic_cache_key_supported(model: &str) -> bool {
 /// shard-routed, and fast agentic rounds always outran its async warm-up
 /// (observed 0%-cached rounds on live sessions, 2026-08-21). codex 0.145
 /// sends a stable per-thread key; the derived key below is stable per
-/// session prefix basis (system/tool digests + compaction epoch), which is
-/// the same contract.
+/// session prefix basis (session + system/tool digests + compaction epoch),
+/// which is the same contract.
 fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) -> Option<String> {
     let _ = codex_responses_lite;
     if !openai_automatic_cache_key_supported(&request.model) {
@@ -4251,10 +4251,28 @@ fn compatible_cache_control_observation(
 }
 
 fn derive_prompt_cache_key(request: &TurnRequest, metadata: &crate::PromptCacheMetadata) -> String {
+    // `PromptCacheMetadata` represents a missing/default session scope as an
+    // empty string rather than `Option::None`. Do not route every such caller
+    // into one shared cache bucket: without a session identity, safe reuse is
+    // impossible, so give that individual derivation an isolated key instead.
+    let session_scope = if metadata.session_scope.is_empty() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static ANONYMOUS_SCOPE_ORDINAL: AtomicU64 = AtomicU64::new(0);
+        let ordinal = ANONYMOUS_SCOPE_ORDINAL.fetch_add(1, Ordering::Relaxed);
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("anonymous:{}:{created_at}:{ordinal}", std::process::id())
+    } else {
+        metadata.session_scope.clone()
+    };
     let domain = serde_json::json!({
         "schema": "haider.prompt-cache-key.v1",
         "provider": metadata.provider,
         "model": request.model,
+        "session_scope": session_scope,
         "account_scope": metadata.account_scope,
         "system_digest": metadata.prefix_digests.system,
         "tool_digest": metadata.prefix_digests.tools,

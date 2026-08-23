@@ -1732,6 +1732,110 @@ impl ToolDispatcher for CompletingDispatcher {
     }
 }
 
+struct DelayedCompletingDispatcher {
+    delay: Duration,
+}
+
+#[async_trait]
+impl ToolDispatcher for DelayedCompletingDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        sleep(self.delay).await;
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: "done after a long tool wait".into(),
+            truncated: false,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        }))
+    }
+}
+
+/// HAIDER949(d). The fake stream queues usage behind a tool call, while the
+/// actor spends six virtual minutes executing that tool. MUTATION CHECK:
+/// restore the old `Instant::now()` usage-processing timestamp; request two
+/// then reports a near-zero gap instead of the send-to-send interval.
+#[tokio::test(start_paused = true)]
+async fn reuse_gap_tracks_request_send_interval_across_long_tool_loop() {
+    const TOOL_WAIT: Duration = Duration::from_secs(6 * 60);
+    let usage = Usage {
+        input: 1_024,
+        output: 32,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "slow-tool".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({}),
+        },
+        // This is queued immediately, but the actor cannot process it until
+        // the blocking tool dispatch above has completed.
+        FakeStep::EmitUsage { usage },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "slow-tool".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store,
+        Some(Arc::new(DelayedCompletingDispatcher { delay: TOOL_WAIT })),
+    );
+    let actor_task = tokio::spawn(actor.run());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("run the slow tool"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let measured_gap = requests[1]
+        .cache_metadata
+        .as_ref()
+        .expect("second request cache metadata")
+        .reuse_gap_ms
+        .expect("measured reuse gap");
+    assert_eq!(
+        measured_gap,
+        u64::try_from(TOOL_WAIT.as_millis()).expect("fixture duration fits u64"),
+        "reuse gap must span request send to request send, including tool execution"
+    );
+
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
+}
+
 struct LargeResultDispatcher {
     preview: String,
 }
