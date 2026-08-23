@@ -1049,6 +1049,14 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
 /// notice is refused by the exhausted budget, the client sees EOF after the
 /// Welcome, and `receive()` panics with "connection closed before a frame
 /// arrived". Verified 2026-07-27.
+///
+/// MUTATION CHECK (notice absent): remove every `ServerDraining` from the
+/// completed delivery set before validation. The notice cardinality assertion
+/// fails with 0 versus 1. Verified 2026-08-23.
+///
+/// MUTATION CHECK (duplicate baseline): append a clone of the delivered
+/// `ResidentSessionBinding` before validation. The baseline cardinality
+/// assertion fails with 2 versus 1. Verified 2026-08-23.
 #[tokio::test]
 async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
     let root = test_root("w3b1-");
@@ -1087,31 +1095,77 @@ async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
     client.absorb_at_least(8 * 1024).await;
 
     task.shutdown_handle().request(&reason);
-    let welcome = client.receive().await;
+    let mut delivered = Vec::new();
+    while let Some(frame) = client.try_receive().await {
+        delivered.push(frame);
+    }
+
     assert!(
-        matches!(welcome, WireFrame::Welcome(_)),
-        "the queued reply must still be delivered, got {welcome:?}"
+        matches!(delivered.first(), Some(WireFrame::Welcome(_))),
+        "Welcome must be delivered first, got {:?}",
+        delivered.first()
     );
-    let notice = client.receive().await;
+
+    // After Welcome, the drain notice and open-time binding baseline may arrive
+    // in either order: the writer contract permits already-queued traffic to
+    // follow ServerDraining while the client is disconnecting.
+    let notices: Vec<_> = delivered
+        .iter()
+        .filter(|frame| matches!(frame, WireFrame::ServerDraining { .. }))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "the reserved drain notice must be delivered exactly once among {} frames",
+        delivered.len()
+    );
+    let notice = notices[0];
     assert!(
         matches!(
             notice,
             WireFrame::ServerDraining {
-                reason: ref notice_reason,
+                reason: notice_reason,
                 deadline_unix_ms,
                 ..
-            } if *notice_reason == reason && deadline_unix_ms > 0
+            } if notice_reason == &reason && *deadline_unix_ms > 0
         ),
-        "the reserved drain notice must arrive last, got {notice:?}"
+        "the reserved drain notice must carry the requested reason and a deadline, got {notice:?}"
     );
-    client.expect_eof().await;
+
+    let baselines: Vec<_> = delivered
+        .iter()
+        .filter(|frame| matches!(frame, WireFrame::ResidentSessionBinding { .. }))
+        .collect();
+    assert_eq!(
+        baselines.len(),
+        1,
+        "exactly one resident-binding baseline must be delivered among {} frames",
+        delivered.len()
+    );
+    assert!(
+        matches!(
+            baselines[0],
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation,
+                ..
+            } if *worker_generation > 0
+        ),
+        "the resident-binding baseline must report live unbound state, got {:?}",
+        baselines[0]
+    );
+    assert_eq!(
+        delivered.len(),
+        3,
+        "expected only Welcome, one drain notice, and one binding baseline"
+    );
 
     // Pin the counterfactual: had the notice shared the ordinary budget with
     // the charged-but-unwritten Welcome, it could not have been queued at all.
-    let welcome_bytes = uds_codec::encode(&welcome, config.frame_limit)
+    let welcome_bytes = uds_codec::encode(&delivered[0], config.frame_limit)
         .expect("re-encode welcome")
         .len();
-    let notice_bytes = uds_codec::encode(&notice, config.frame_limit)
+    let notice_bytes = uds_codec::encode(notice, config.frame_limit)
         .expect("re-encode notice")
         .len();
     assert!(
