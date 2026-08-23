@@ -214,6 +214,7 @@ async fn provider_snapshot(
         ResponseBody::ProviderList {
             providers,
             revision,
+            ..
         } => Ok((providers, revision)),
         ResponseBody::Error {
             code,

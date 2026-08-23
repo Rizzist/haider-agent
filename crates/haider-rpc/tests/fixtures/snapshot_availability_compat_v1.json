@@ -1,0 +1,20 @@
+{
+  "contract": "haider-client-wire/v1",
+  "pairs": [
+    {
+      "method": "account.list",
+      "old": {"method":"account.list","descriptors":[]},
+      "new": {"method":"account.list","descriptors":[],"availability":{"state":"available"}}
+    },
+    {
+      "method": "provider.list",
+      "old": {"method":"provider.list","providers":[],"revision":0},
+      "new": {"method":"provider.list","providers":[],"revision":0,"availability":{"state":"unavailable","reason":"provider subsystem is not configured"}}
+    },
+    {
+      "method": "usage.report",
+      "old": {"method":"usage.report","report":{"generated_at_ms":0,"accounts":[]}},
+      "new": {"method":"usage.report","report":{"generated_at_ms":0,"accounts":[]},"availability":{"state":"unavailable","reason":"usage subsystem is not configured"}}
+    }
+  ]
+}

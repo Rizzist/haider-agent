@@ -1,0 +1,185 @@
+{
+  "contract": "haider-client-wire/v1",
+  "methods": [
+    {
+      "request_method": "command.list",
+      "response_method": "command.list",
+      "request": {"method":"command.list","query":"model ","in_session":true,"slots":{"providers":[["openai","OpenAI"]],"models":[["gpt-test","OpenAI · gpt-test"]],"accounts":[["work","Work account"]],"efforts":[["high","High effort"]],"custom_commands":[["review","Review changes"]]}},
+      "response": {"method":"command.list","items":[{"kind":"argument","ownership":"daemon_operation","label":"gpt-test","description":"OpenAI · gpt-test","name":"model","value":"gpt-test","session_only":true}]}
+    },
+    {
+      "request_method": "command.invoke",
+      "response_method": "command.invoke",
+      "request": {"method":"command.invoke","command_id":"command-invoke-1","command":"theme dark"},
+      "response": {"method":"command.invoke","outcome":{"kind":"client_owned","command":"theme dark"}}
+    },
+    {
+      "request_method": "session.list_watch",
+      "response_method": "session.list_watch",
+      "request": {"method":"session.list_watch"},
+      "response": {"method":"session.list_watch","accepted":true}
+    },
+    {
+      "request_method": "session.surface_publish",
+      "response_method": "session.surface_publish",
+      "request": {"method":"session.surface_publish","session_id":"session-1","input":{"text":"draft","revision":4},"status":{"line":"Running","state":"running","detail":"tool","revision":9}},
+      "response": {"method":"session.surface_publish","session_id":"session-1","accepted_input_revision":4,"accepted_status_revision":9}
+    },
+    {
+      "request_method": "session.surface_watch",
+      "response_method": "session.surface_watch",
+      "request": {"method":"session.surface_watch","session_id":"session-1"},
+      "response": {"method":"session.surface_watch","session_id":"session-1","input":{"text":"draft","revision":4,"owner":"tui-1"},"status":{"line":"Running","state":"running","detail":"tool","revision":9,"owner":"tui-1"}}
+    },
+    {
+      "request_method": "session.input_inject",
+      "response_method": "session.input_inject",
+      "request": {"method":"session.input_inject","session_id":"session-1","op":{"kind":"insert","text":"hello"}},
+      "response": {"method":"session.input_inject","session_id":"session-1","delivered":true}
+    },
+    {
+      "request_method": "session.pipe_path",
+      "response_method": "session.pipe_path",
+      "request": {"method":"session.pipe_path","session_id":"session-1"},
+      "response": {"method":"session.pipe_path","path":"/runtime/session-1.pipe"}
+    },
+    {
+      "request_method": "session.observe_batch",
+      "response_method": "session.observe_batch",
+      "request": {"method":"session.observe_batch","session_ids":["session-1"],"last_event_limit":0},
+      "response": {"method":"session.observe_batch","digests":[{"session_id":"session-1","head_seq":7,"worker_generation":3,"title":"Batch","run_state":"idle","branches":[],"main_head_seq":7,"pending_menus":[],"subagents":[],"updated_at_ms":1753500000000,"last_event_kinds":[]}]}
+    },
+    {
+      "request_method": "graph.pin",
+      "response_method": "graph.pin",
+      "request": {"method":"graph.pin","command_id":"command-graph-pin","session_id":"session-1","worker_generation":3,"template":"review-v1"},
+      "response": {"method":"graph.pin","session_id":"session-1","graph_id":"graph-1","template":"review-v1","digest":"digest-1","pinned_seq":8,"opened_seq":9,"worker_generation":3}
+    },
+    {
+      "request_method": "graph.run_set.open",
+      "response_method": "graph.run_set.open",
+      "request": {"method":"graph.run_set.open","command_id":"command-run-set","session_id":"session-1","worker_generation":3,"plan_item_id":"plan-1","plan_event_seq":10},
+      "response": {"method":"graph.run_set.open","session_id":"session-1","run_set_id":"run-set-1","root_graph_id":"graph-root","plan_item_id":"plan-1","plan_event_seq":10,"template":"todo-v1","digest":"digest-2","run_set_opened_seq":11,"through_seq":11,"children":[],"worker_generation":3}
+    },
+    {
+      "request_method": "graph.switch",
+      "response_method": "graph.switch",
+      "request": {"method":"graph.switch","command_id":"command-graph-switch","session_id":"session-1","worker_generation":3,"old_graph_id":"graph-1","template":"review-v2"},
+      "response": {"method":"graph.switch","session_id":"session-1","old_graph_id":"graph-1","new_graph_id":"graph-2","template":"review-v2","digest":"digest-3","superseded_seq":12,"pinned_seq":13,"opened_seq":14,"worker_generation":3}
+    },
+    {
+      "request_method": "graph.abandon",
+      "response_method": "graph.abandon",
+      "request": {"method":"graph.abandon","command_id":"command-graph-abandon","session_id":"session-1","worker_generation":3,"why":"operator stopped"},
+      "response": {"method":"graph.abandon","session_id":"session-1","graph_id":"graph-2","abandoned_seq":15,"worker_generation":3}
+    },
+    {
+      "request_method": "graph.status",
+      "response_method": "graph.status",
+      "request": {"method":"graph.status","session_id":"session-1"},
+      "response": {"method":"graph.status"}
+    },
+    {
+      "request_method": "loom.list",
+      "response_method": "loom.list",
+      "request": {"method":"loom.list"},
+      "response": {"method":"loom.list"}
+    },
+    {
+      "request_method": "loom.register_agent_type",
+      "response_method": "loom.registered",
+      "request": {"method":"loom.register_agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","rev":0}},
+      "response": {"method":"loom.registered","registration":{"id":"reviewer","rev":1,"digest":"digest-agent","updated":true}}
+    },
+    {
+      "request_method": "loom.register_workflow",
+      "response_method": "loom.registered",
+      "request": {"method":"loom.register_workflow","source":"review: Patch -> Verdict\ncheck @reviewer \"Review\" | ship"},
+      "response": {"method":"loom.registered","registration":{"id":"review","rev":1,"digest":"digest-workflow","updated":true}}
+    },
+    {
+      "request_method": "graph.inspect",
+      "response_method": "graph.inspect",
+      "request": {"method":"graph.inspect","session_id":"session-1","limit":50},
+      "response": {"method":"graph.inspect","snapshot":{"through_seq":15,"runs":[],"template_rollups":[],"evidence":[],"tool_selection":[]}}
+    },
+    {
+      "request_method": "session.diagnostic",
+      "response_method": "session.diagnostic",
+      "request": {"method":"session.diagnostic","command_id":"command-diagnostic","session_id":"session-1","code":"consumer_gap","message":"missing projection"},
+      "response": {"method":"session.diagnostic","recorded_seq":16}
+    },
+    {
+      "request_method": "hooks.trust",
+      "response_method": "hooks.trust",
+      "request": {"method":"hooks.trust","command_id":"command-hook-trust","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "response": {"method":"hooks.trust","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","trusted":true}
+    },
+    {
+      "request_method": "hooks.revoke",
+      "response_method": "hooks.revoke",
+      "request": {"method":"hooks.revoke","command_id":"command-hook-revoke","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "response": {"method":"hooks.revoke","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","trusted":false}
+    },
+    {
+      "request_method": "turn.submit_from_cli",
+      "response_method": "turn.submit",
+      "request": {"method":"turn.submit_from_cli","command_id":"command-cli-submit","session_id":"session-1","worker_generation":3,"text":"continue","attachments":[],"mode":"queue"},
+      "response": {"method":"turn.submit","session_id":"session-1","run_id":"run-cli","accepted_seq":17,"worker_generation":3,"disposition":"started"}
+    },
+    {
+      "request_method": "turn.submit_with_hook_trust",
+      "response_method": "turn.submit",
+      "request": {"method":"turn.submit_with_hook_trust","command_id":"command-hook-submit","session_id":"session-1","worker_generation":3,"text":"continue","attachments":[],"mode":"queue"},
+      "response": {"method":"turn.submit","session_id":"session-1","run_id":"run-hook","accepted_seq":18,"worker_generation":3,"disposition":"started"}
+    },
+    {
+      "request_method": "run.retry",
+      "response_method": "run.retry",
+      "request": {"method":"run.retry","command_id":"command-retry","session_id":"session-1","worker_generation":3},
+      "response": {"method":"run.retry","session_id":"session-1","run_id":"run-2","failed_run_id":"run-1","user_seq":4,"accepted_seq":19,"worker_generation":3}
+    },
+    {
+      "request_method": "session.select_model",
+      "response_method": "session.select_model",
+      "request": {"method":"session.select_model","command_id":"command-model","session_id":"session-1","worker_generation":3,"model":"gpt-test","provider":"openai"},
+      "response": {"method":"session.select_model","session_id":"session-1","provider":"openai","model":"gpt-test","selected_seq":20,"worker_generation":3}
+    },
+    {
+      "request_method": "session.seen",
+      "response_method": "session.seen",
+      "request": {"method":"session.seen","command_id":"command-seen","session_id":"session-1","worker_generation":3},
+      "response": {"method":"session.seen","session_id":"session-1","seen_at_ms":1753500000000,"seen_seq":21,"worker_generation":3}
+    },
+    {
+      "request_method": "session.select_agent_type",
+      "response_method": "session.select_agent_type",
+      "request": {"method":"session.select_agent_type","command_id":"command-agent-type","session_id":"session-1","worker_generation":3,"agent_type":"reviewer"},
+      "response": {"method":"session.select_agent_type","session_id":"session-1","agent_type":"reviewer","selected_seq":22,"worker_generation":3}
+    },
+    {
+      "request_method": "account.oauth_import",
+      "response_method": "account.oauth_import",
+      "request": {"method":"account.oauth_import","command_id":"command-oauth-import","source":"codex"},
+      "response": {"method":"account.oauth_import","descriptor":{"alias":"openai-0123456789abcdef01234567","provider":"openai","auth_method":"oauth","identity":"person@example.invalid","status":{"status":"ok"},"active":true},"revision":23}
+    },
+    {
+      "request_method": "account.set_label",
+      "response_method": "account.set_label",
+      "request": {"method":"account.set_label","alias":"openai-0123456789abcdef01234567","label":"Work"},
+      "response": {"method":"account.set_label","descriptor":{"alias":"openai-0123456789abcdef01234567","provider":"openai","auth_method":"oauth","identity":"person@example.invalid","status":{"status":"ok"},"active":true,"label":"Work"},"revision":24}
+    },
+    {
+      "request_method": "account.list_watch",
+      "response_method": "account.list_watch",
+      "request": {"method":"account.list_watch"},
+      "response": {"method":"account.list_watch","accepted":true}
+    },
+    {
+      "request_method": "computer.permission_open_settings",
+      "response_method": "computer.permission_open_settings",
+      "request": {"method":"computer.permission_open_settings","session_id":"session-1","request_id":"permission-1","permission":"screen_recording"},
+      "response": {"method":"computer.permission_open_settings","permission":"screen_recording"}
+    }
+  ]
+}

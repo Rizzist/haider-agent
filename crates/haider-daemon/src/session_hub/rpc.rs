@@ -5507,6 +5507,9 @@ impl HubConnection {
                     revision: None,
                     provider_active: Vec::new(),
                     provider_defaults: Vec::new(),
+                    availability: Some(haider_rpc::SnapshotAvailabilityWire::Unavailable {
+                        reason: "account subsystem is not configured".into(),
+                    }),
                 },
             });
         };
@@ -5568,6 +5571,7 @@ impl HubConnection {
                 revision: Some(view.revision),
                 provider_active,
                 provider_defaults,
+                availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
             },
         })
     }
@@ -5586,6 +5590,9 @@ impl HubConnection {
                 body: ResponseBody::ProviderList {
                     providers: Vec::new(),
                     revision: 0,
+                    availability: Some(haider_rpc::SnapshotAvailabilityWire::Unavailable {
+                        reason: "provider subsystem is not configured".into(),
+                    }),
                 },
             });
         };
@@ -5604,6 +5611,7 @@ impl HubConnection {
             body: ResponseBody::ProviderList {
                 providers,
                 revision: view.revision,
+                availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
             },
         })
     }
@@ -8070,13 +8078,19 @@ impl HubConnection {
                         generated_at_ms: 0,
                         accounts: Vec::new(),
                     },
+                    availability: Some(haider_rpc::SnapshotAvailabilityWire::Unavailable {
+                        reason: "usage subsystem is not configured".into(),
+                    }),
                 },
             });
         };
         let report = service.report(&self.hub.inner.store).await?;
         self.send(WireFrame::Response {
             request_id,
-            body: ResponseBody::UsageReport { report },
+            body: ResponseBody::UsageReport {
+                report,
+                availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
+            },
         })
     }
 

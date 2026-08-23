@@ -1335,7 +1335,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             revision,
             hooks,
         }],
-        ResponseBody::UsageReport { report } => vec![LiveReply::UsageReport {
+        ResponseBody::UsageReport { report, .. } => vec![LiveReply::UsageReport {
             report: Box::new(report),
         }],
         ResponseBody::SessionFleet { snapshot } => vec![LiveReply::Fleet {
@@ -1480,6 +1480,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::ProviderList {
             providers,
             revision,
+            ..
         } => vec![LiveReply::Providers {
             providers,
             revision,

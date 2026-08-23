@@ -510,6 +510,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 revision: None,
                 provider_active: Vec::new(),
                 provider_defaults: Vec::new(),
+                availability: None,
             },
         },
         WireFrame::Welcome(Welcome {
@@ -638,6 +639,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     provider: "anthropic".into(),
                     model: "frontier-anthropic".into(),
                 }],
+                availability: None,
             },
         },
         WireFrame::Request {
@@ -669,6 +671,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     enabled: true,
                 }],
                 revision: 7,
+                availability: None,
             },
         },
         WireFrame::Request {
@@ -1253,6 +1256,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     enabled: true,
                 }],
                 revision: 12,
+                availability: None,
             },
         },
         // H1 append-only observation frames. Every preceding frame remains
@@ -1528,6 +1532,7 @@ pub fn transcript() -> Vec<WireFrame> {
                         },
                     ],
                 },
+                availability: None,
             },
         },
         // G2 append-only session-rename frames. Every earlier frame stays

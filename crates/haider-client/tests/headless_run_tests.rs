@@ -391,6 +391,7 @@ async fn serve_flagless_done(
                 provider: provider.into(),
                 model: "wrong-account-list-default".into(),
             }],
+            availability: None,
         },
     )
     .await;
@@ -407,6 +408,7 @@ async fn serve_flagless_done(
         ResponseBody::ProviderList {
             providers: vec![provider_summary_fixture(provider, default_model, models)],
             revision: 4,
+            availability: None,
         },
     )
     .await;
@@ -512,6 +514,7 @@ async fn flagless_bootstrap_without_active_account_is_typed() {
                 revision: Some(1),
                 provider_active: Vec::new(),
                 provider_defaults: Vec::new(),
+                availability: None,
             },
         )
         .await;

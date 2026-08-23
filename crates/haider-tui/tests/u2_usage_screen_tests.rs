@@ -827,7 +827,10 @@ fn usage_wire_bodies_and_replies_map_onto_u1s_shapes() {
     let context = CommandContext::of(&LiveCommand::UsageReport);
     let replies = map_response(
         &context,
-        haider_rpc::ResponseBody::UsageReport { report: report() },
+        haider_rpc::ResponseBody::UsageReport {
+            report: report(),
+            availability: None,
+        },
     );
     assert!(
         matches!(

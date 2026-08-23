@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -26,11 +27,100 @@ use haider_rpc::{
     SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join("wire_transcript.json")
+}
+
+fn contract_methods_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join("client_contract_methods_v1.json")
+}
+
+fn availability_compat_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join("snapshot_availability_compat_v1.json")
+}
+
+fn request_methods_declared_in_source() -> BTreeSet<String> {
+    let source =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/frame.rs"))
+            .expect("read RequestBody source for fixture completeness");
+    let (_, after_request) = source
+        .split_once("pub enum RequestBody {")
+        .expect("RequestBody declaration exists");
+    let (request_source, _) = after_request
+        .split_once("pub enum ResponseBody {")
+        .expect("ResponseBody follows RequestBody");
+
+    request_source
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("#[serde(rename = \"")
+                .and_then(|rest| rest.split_once('"'))
+                .map(|(method, _)| method.to_owned())
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct ContractMethodFixture {
+    contract: String,
+    methods: Vec<ContractMethodPair>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContractMethodPair {
+    request_method: String,
+    response_method: String,
+    request: Value,
+    response: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AvailabilityCompatFixture {
+    contract: String,
+    pairs: Vec<AvailabilityCompatPair>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AvailabilityCompatPair {
+    method: String,
+    old: Value,
+    new: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyAccountListResponse {
+    method: String,
+    #[serde(default)]
+    descriptors: Vec<Value>,
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    provider_active: Vec<Value>,
+    #[serde(default)]
+    provider_defaults: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyProviderListResponse {
+    method: String,
+    #[serde(default)]
+    providers: Vec<Value>,
+    revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyUsageReportResponse {
+    method: String,
+    report: Value,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +135,257 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         write!(&mut hex, "{byte:02x}").expect("write to String");
     }
     hex
+}
+
+fn wire_method(value: &Value) -> &str {
+    value
+        .get("method")
+        .and_then(Value::as_str)
+        .expect("fixture body has a method")
+}
+
+/// Every v1 request method has a golden request and its successful response.
+/// The historical transcript supplies the original 40 methods; the focused
+/// contract fixture supplies every subsequently added door. Adding a request
+/// method without adding a fixture must make this pin red.
+#[test]
+fn every_request_method_has_a_golden_request_and_success_response() {
+    const EXPECTED_METHODS: &[&str] = &[
+        "account.add",
+        "account.device_candidates",
+        "account.import_device",
+        "account.list",
+        "account.list_watch",
+        "account.login_api",
+        "account.oauth_cancel",
+        "account.oauth_import",
+        "account.oauth_start",
+        "account.oauth_status",
+        "account.remove",
+        "account.set_active",
+        "account.set_default_model",
+        "account.set_label",
+        "agent.message",
+        "artifact.put",
+        "branch.create",
+        "command.invoke",
+        "command.list",
+        "computer.permission_open_settings",
+        "graph.abandon",
+        "graph.inspect",
+        "graph.pin",
+        "graph.run_set.open",
+        "graph.status",
+        "graph.switch",
+        "hooks.list",
+        "hooks.revoke",
+        "hooks.trust",
+        "loom.list",
+        "loom.register_agent_type",
+        "loom.register_workflow",
+        "provider.configure",
+        "provider.list",
+        "provider.models_refresh",
+        "provider.remove",
+        "run.retry",
+        "session.attach",
+        "session.compact",
+        "session.create",
+        "session.detach",
+        "session.diagnostic",
+        "session.fleet",
+        "session.fork",
+        "session.input_inject",
+        "session.list",
+        "session.list_watch",
+        "session.metafork",
+        "session.observe",
+        "session.observe_batch",
+        "session.pipe_path",
+        "session.read",
+        "session.rename",
+        "session.seen",
+        "session.select_agent_type",
+        "session.select_effort",
+        "session.select_fast",
+        "session.select_model",
+        "session.surface_publish",
+        "session.surface_watch",
+        "shell.exec",
+        "tools.inventory",
+        "transcription.secret_get",
+        "transcription.secret_set",
+        "turn.cancel",
+        "turn.submit",
+        "turn.submit_from_cli",
+        "turn.submit_with_hook_trust",
+        "usage.report",
+        "vault.stage",
+    ];
+
+    let expected_methods = EXPECTED_METHODS
+        .iter()
+        .map(|method| (*method).to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        request_methods_declared_in_source(),
+        expected_methods,
+        "RequestBody changed without updating the exhaustive client-contract fixture matrix"
+    );
+
+    let mut requests_by_id = BTreeMap::new();
+    let mut responses_by_id = BTreeMap::new();
+    for frame in transcript() {
+        match frame {
+            WireFrame::Request { request_id, body } => {
+                let value = serde_json::to_value(body).expect("encode transcript request");
+                requests_by_id.insert(request_id.0, wire_method(&value).to_owned());
+            }
+            WireFrame::Response { request_id, body }
+                if !matches!(body, ResponseBody::Error { .. }) =>
+            {
+                let value = serde_json::to_value(body).expect("encode transcript response");
+                responses_by_id.insert(request_id.0, wire_method(&value).to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    let mut covered = BTreeSet::new();
+    for (request_id, request_method) in requests_by_id {
+        if responses_by_id.contains_key(&request_id) {
+            covered.insert(request_method);
+        }
+    }
+
+    let fixture: ContractMethodFixture = serde_json::from_str(
+        &std::fs::read_to_string(contract_methods_fixture_path())
+            .expect("read client contract method fixture"),
+    )
+    .expect("decode client contract method fixture");
+    assert_eq!(fixture.contract, "haider-client-wire/v1");
+    for pair in fixture.methods {
+        assert_eq!(wire_method(&pair.request), pair.request_method);
+        assert_eq!(wire_method(&pair.response), pair.response_method);
+
+        let request: RequestBody =
+            serde_json::from_value(pair.request.clone()).expect("decode golden request");
+        let response: ResponseBody =
+            serde_json::from_value(pair.response.clone()).expect("decode golden response");
+        assert_eq!(
+            serde_json::to_value(request).expect("re-encode golden request"),
+            pair.request,
+            "non-canonical request fixture for {}",
+            pair.request_method
+        );
+        assert_eq!(
+            serde_json::to_value(response).expect("re-encode golden response"),
+            pair.response,
+            "non-canonical response fixture for {}",
+            pair.request_method
+        );
+        assert!(
+            covered.insert(pair.request_method.clone()),
+            "duplicate method fixture: {}",
+            pair.request_method
+        );
+    }
+
+    assert_eq!(covered, expected_methods);
+}
+
+/// v0.0.942-shaped readers ignore the additive availability field, while the
+/// current reader preserves omission as `None`. This is the two-direction N-1
+/// compatibility promise in executable form.
+#[test]
+fn snapshot_availability_is_compatible_in_both_n_minus_one_directions() {
+    let fixture: AvailabilityCompatFixture = serde_json::from_str(
+        &std::fs::read_to_string(availability_compat_fixture_path())
+            .expect("read availability compatibility fixture"),
+    )
+    .expect("decode availability compatibility fixture");
+    assert_eq!(fixture.contract, "haider-client-wire/v1");
+
+    for pair in fixture.pairs {
+        let current_from_old: ResponseBody =
+            serde_json::from_value(pair.old.clone()).expect("new client decodes old response");
+        let current_from_new: ResponseBody =
+            serde_json::from_value(pair.new.clone()).expect("new client decodes new response");
+
+        match (pair.method.as_str(), &current_from_old, &current_from_new) {
+            (
+                "account.list",
+                ResponseBody::AccountList {
+                    availability: None, ..
+                },
+                ResponseBody::AccountList {
+                    availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
+                    ..
+                },
+            ) => {
+                let legacy: LegacyAccountListResponse = serde_json::from_value(pair.new.clone())
+                    .expect("old client decodes new account response");
+                assert_eq!(legacy.method, "account.list");
+                assert!(legacy.descriptors.is_empty());
+                assert!(legacy.revision.is_none());
+                assert!(legacy.provider_active.is_empty());
+                assert!(legacy.provider_defaults.is_empty());
+            }
+            (
+                "provider.list",
+                ResponseBody::ProviderList {
+                    availability: None, ..
+                },
+                ResponseBody::ProviderList {
+                    availability: Some(haider_rpc::SnapshotAvailabilityWire::Unavailable { reason }),
+                    ..
+                },
+            ) => {
+                assert_eq!(reason, "provider subsystem is not configured");
+                let legacy: LegacyProviderListResponse = serde_json::from_value(pair.new.clone())
+                    .expect("old client decodes new provider response");
+                assert_eq!(legacy.method, "provider.list");
+                assert!(legacy.providers.is_empty());
+                assert_eq!(legacy.revision, 0);
+            }
+            (
+                "usage.report",
+                ResponseBody::UsageReport {
+                    availability: None, ..
+                },
+                ResponseBody::UsageReport {
+                    availability: Some(haider_rpc::SnapshotAvailabilityWire::Unavailable { reason }),
+                    ..
+                },
+            ) => {
+                assert_eq!(reason, "usage subsystem is not configured");
+                let legacy: LegacyUsageReportResponse = serde_json::from_value(pair.new.clone())
+                    .expect("old client decodes new usage response");
+                assert_eq!(legacy.method, "usage.report");
+                assert!(legacy.report.is_object());
+            }
+            _ => panic!("unexpected compatibility fixture for {}", pair.method),
+        }
+
+        assert_eq!(
+            serde_json::to_value(current_from_old).expect("re-encode old response"),
+            pair.old,
+            "omitted availability must remain omitted for {}",
+            pair.method
+        );
+        assert_eq!(
+            serde_json::to_value(current_from_new).expect("re-encode new response"),
+            pair.new,
+            "present availability must remain explicit for {}",
+            pair.method
+        );
+    }
+
+    let future_state: haider_rpc::SnapshotAvailabilityWire = serde_json::from_value(
+        serde_json::json!({"state": "temporarily_degraded", "retry_after_ms": 5000}),
+    )
+    .expect("unknown future availability state remains decodable");
+    assert_eq!(future_state, haider_rpc::SnapshotAvailabilityWire::Unknown);
 }
 
 /// MUTATION CHECK: make `accepted_proposal_digest` required or serialize it as
@@ -1634,6 +1975,7 @@ fn management_reads_preserve_legacy_account_list_and_tolerate_future_providers()
             revision: None,
             provider_active: Vec::new(),
             provider_defaults: Vec::new(),
+            availability: None,
         }
     );
     assert_eq!(
@@ -2495,7 +2837,7 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
     let future_response = r#"{"v":1,"kind":"response","request_id":"request-future-usage","body":{"method":"usage.report","report":{"generated_at_ms":1,"future_total":9,"accounts":[{"provider":"kimi-oauth","alias":"kimi-main","auth_method":"oauth","meter":{"state":"metered","windows":[{"window":"quota","utilization":0.25,"future_scope":"m"}]},"local":{"sessions":0,"total_duration_ms":0,"input_tokens":0,"output_tokens":0},"future_flag":true}]}}}"#;
     let decoded: WireFrame = serde_json::from_str(future_response).expect("tolerant U1 decode");
     let WireFrame::Response {
-        body: ResponseBody::UsageReport { report },
+        body: ResponseBody::UsageReport { report, .. },
         ..
     } = decoded
     else {

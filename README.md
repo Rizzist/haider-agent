@@ -136,6 +136,12 @@ It runs your model however you pay for it: twelve builtin providers — Anthropi
 | `haider-tui` / `haider-cli` | The terminal client and the `haider` binary |
 | `haider-accounts` · `haider-stt` · `haider-pdf` · `haider-platform` · `haider-verify` | Vault, dictation, PDF ladder, OS glue, verification gate |
 
+Third-party clients should start with the authoritative
+[client contract v1](docs/client-contract-v1.md): discovery and framing,
+feature gates, snapshot/watch/replay laws, field-level precedence, absence
+semantics, native-pipe following, and compatibility fixtures are specified
+there. Do not infer the interface from terminal output.
+
 ## 🚀 Development
 
 ```bash

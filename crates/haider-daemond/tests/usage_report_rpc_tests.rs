@@ -9,7 +9,7 @@ mod support;
 use haider_daemon::DaemonConfig;
 use haider_rpc::{
     Capability, CapabilitySet, ClientKind, Hello, RequestBody, RequestId, ResponseBody,
-    WIRE_PROTOCOL_VERSION, WireFrame,
+    SnapshotAvailabilityWire, WIRE_PROTOCOL_VERSION, WireFrame,
 };
 use support::{UdsClient as Client, ready, test_root};
 
@@ -71,9 +71,14 @@ async fn usage_report_is_advertised_and_answers_typed_over_uds() {
         panic!("expected a response frame");
     };
     assert_eq!(request_id, RequestId::new("usage-1"));
-    let ResponseBody::UsageReport { report } = body else {
+    let ResponseBody::UsageReport {
+        report,
+        availability,
+    } = body
+    else {
         panic!("expected a typed usage.report response, got {body:?}");
     };
+    assert_eq!(availability, Some(SnapshotAvailabilityWire::Available));
     assert!(
         report.accounts.is_empty(),
         "a fresh profile has no accounts to report"

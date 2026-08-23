@@ -596,6 +596,85 @@ impl FrameSink for CapturingFrameSink {
     }
 }
 
+/// Whole-subsystem absence must not masquerade as a measured zero/empty
+/// snapshot. These are the three legacy sentinel paths the additive
+/// `SnapshotAvailabilityWire` field disambiguates.
+///
+/// MUTATION CHECK: change the missing-account response availability from
+/// `Unavailable` to `Available`. Expected runtime failure: the first exact
+/// availability assertion below reports the wrong state even though all
+/// legacy empty fields remain unchanged.
+#[tokio::test]
+async fn missing_snapshot_subsystems_publish_reasoned_unavailability() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    sink.0.lock().expect("frames").clear();
+
+    for (request_id, body) in [
+        (
+            "availability-accounts",
+            haider_rpc::RequestBody::AccountList { provider: None },
+        ),
+        (
+            "availability-providers",
+            haider_rpc::RequestBody::ProviderList { provider: None },
+        ),
+        ("availability-usage", haider_rpc::RequestBody::UsageReport),
+    ] {
+        connection
+            .request(haider_rpc::RequestId::new(request_id), body)
+            .await
+            .expect("snapshot request routes");
+    }
+
+    {
+        let frames = sink.0.lock().expect("frames");
+        let availability = |request_id: &str| {
+            frames.iter().find_map(|frame| match frame {
+                WireFrame::Response {
+                    request_id: seen,
+                    body:
+                        haider_rpc::ResponseBody::AccountList { availability, .. }
+                        | haider_rpc::ResponseBody::ProviderList { availability, .. }
+                        | haider_rpc::ResponseBody::UsageReport { availability, .. },
+                } if seen.as_str() == request_id => availability.as_ref(),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            availability("availability-accounts"),
+            Some(&haider_rpc::SnapshotAvailabilityWire::Unavailable {
+                reason: "account subsystem is not configured".into(),
+            })
+        );
+        assert_eq!(
+            availability("availability-providers"),
+            Some(&haider_rpc::SnapshotAvailabilityWire::Unavailable {
+                reason: "provider subsystem is not configured".into(),
+            })
+        );
+        assert_eq!(
+            availability("availability-usage"),
+            Some(&haider_rpc::SnapshotAvailabilityWire::Unavailable {
+                reason: "usage subsystem is not configured".into(),
+            })
+        );
+    }
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// Regression pin: a command-response capture borrows the live caller's
 /// identity. Dropping that short-lived capture must not unregister the real
 /// connection's resident binding or either volatile surface it owns.

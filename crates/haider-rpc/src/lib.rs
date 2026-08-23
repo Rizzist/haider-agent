@@ -89,10 +89,10 @@ pub use frame::{
     ProviderAvailabilityWire, ProviderDefaultWire, ProviderRemoveRefusalReasonWire,
     ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
     SURFACE_STATUS_MAX_BYTES, SecretWire, SeqRange, SessionFleetSnapshot, SessionKindWire,
-    SessionObserveDigest, SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition,
-    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
-    SurfaceStatusWire, TodoGraphOpenedWire, WIRE_PROTOCOL_VERSION, WaitingWhyKindWire,
-    WaitingWhyWire, Welcome, WireFrame,
+    SessionObserveDigest, SessionReadResult, SessionSummary, SnapshotAvailabilityWire,
+    StagePurpose, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire,
+    SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire, WIRE_PROTOCOL_VERSION,
+    WaitingWhyKindWire, WaitingWhyWire, Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

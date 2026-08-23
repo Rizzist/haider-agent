@@ -810,6 +810,23 @@ pub enum ProviderAvailabilityWire {
     Unknown,
 }
 
+/// Whether a whole snapshot-producing subsystem was available for one read.
+///
+/// This is distinct from an empty successful snapshot: omitted means an old
+/// daemon (therefore unknown), while `Available` plus an empty collection is
+/// authoritative evidence that the collection is genuinely empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SnapshotAvailabilityWire {
+    Available,
+    Unavailable {
+        reason: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 /// Provider-declared metadata for one pickable model.
 ///
 /// The G3 tuning fields are DAEMON truth: the daemon projects them from the
@@ -2739,6 +2756,11 @@ pub enum ResponseBody {
         provider_active: Vec<ProviderActiveWire>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         provider_defaults: Vec<ProviderDefaultWire>,
+        /// Omitted by older daemons. `Available` plus an empty descriptor
+        /// list means genuinely empty; `Unavailable` means the empty legacy
+        /// fields are not account truth.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
     },
     /// Provider management summaries and their coherent snapshot revision.
     #[serde(rename = "provider.list")]
@@ -2746,6 +2768,10 @@ pub enum ResponseBody {
         #[serde(default)]
         providers: Vec<ProviderSummaryWire>,
         revision: u64,
+        /// Omitted by older daemons. Do not interpret legacy `revision: 0`
+        /// as subsystem absence when this field is omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
     },
     #[serde(rename = "provider.models_refresh")]
     ProviderModelsRefresh {
@@ -2777,6 +2803,10 @@ pub enum ResponseBody {
     #[serde(rename = "usage.report")]
     UsageReport {
         report: haider_protocol::usage::UsageReportV1,
+        /// Omitted by older daemons. Do not interpret a legacy
+        /// `generated_at_ms: 0` report as subsystem absence when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
     },
     #[serde(rename = "computer.permission_open_settings")]
     ComputerPermissionOpenSettings {
