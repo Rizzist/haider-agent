@@ -769,6 +769,29 @@ impl ProviderError {
         self.presentation = presentation;
         self
     }
+
+    /// Replaces only the operator-facing explanation while retaining the
+    /// typed recovery contract and provider metadata. The presentation
+    /// constructor supplies the durable public-text bound and control-byte
+    /// sanitization; adapters must redact credentials before calling this.
+    #[must_use]
+    pub(crate) fn with_provider_detail(mut self, detail: &str) -> Self {
+        let mut presentation = ErrorPresentation::new(
+            self.presentation.subcode.as_str(),
+            &self.presentation.title,
+            detail,
+            self.presentation.scope,
+            self.presentation.allowed_actions.clone(),
+        );
+        presentation.provider_http_status = self.presentation.provider_http_status;
+        presentation
+            .provider_request_id
+            .clone_from(&self.presentation.provider_request_id);
+        presentation.retry_after_ms = self.presentation.retry_after_ms;
+        presentation.reset_at_ms = self.presentation.reset_at_ms;
+        self.presentation = presentation;
+        self
+    }
 }
 
 impl ProviderErrorKind {
@@ -1827,9 +1850,12 @@ mod e2_contract_tests {
     }
 
     #[test]
-    fn e2a_provider_429_presentation_carries_retry_metadata_without_body_leak() {
-        const MARKER: &str = "RAW_BODY_MUST_NEVER_RENDER_98c4";
-        let body = format!(r#"{{"error":{{"type":"rate_limit_error","message":"{MARKER}"}}}}"#);
+    fn e2a_provider_429_presentation_carries_retry_metadata_and_safe_explanation() {
+        const DETAIL: &str = "Rate limit reached for this account.";
+        const SECRET: &str = "RAW_SECRET_MUST_NEVER_RENDER_98c4";
+        let body = format!(
+            r#"{{"error":{{"type":"rate_limit_error","message":"{DETAIL}"}},"api_key":"{SECRET}"}}"#
+        );
         let error = replay_openai_http_error(429, Some("3"), body.as_bytes());
         assert_eq!(error.presentation.subcode.as_str(), "rate-limited");
         assert_eq!(error.presentation.provider_http_status, Some(429));
@@ -1842,6 +1868,7 @@ mod e2_contract_tests {
                 .contains(&ErrorAction::Retry)
         );
         let rendered = serde_json::to_string(&error.presentation).expect("presentation JSON");
-        assert!(!rendered.contains(MARKER));
+        assert!(rendered.contains(DETAIL));
+        assert!(!rendered.contains(SECRET));
     }
 }

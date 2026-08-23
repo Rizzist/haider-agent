@@ -145,6 +145,142 @@ async fn hostile_probe_and_http_error_body_sources_are_bounded() {
     assert!(classified.message.contains("65536-byte limit"));
 }
 
+/// MUTATION CHECK: discard the extracted provider message, or restrict HTTP
+/// detail extraction to the typed OpenAI envelope. The exact parsed and raw
+/// explanations below disappear from the durable presentation.
+#[test]
+fn openai_http_errors_preserve_safe_provider_explanations() {
+    let parsed = replay_openai_http_error(
+        400,
+        None,
+        br#"{"error":{"type":"invalid_request_error","message":"Unsupported parameter: service_tier"}}"#,
+    );
+    assert_eq!(parsed.kind, ProviderErrorKind::InvalidRequest);
+    assert_eq!(
+        parsed.presentation.detail,
+        "Unsupported parameter: service_tier"
+    );
+
+    let plain = replay_openai_http_error(
+        400,
+        None,
+        b"The service is overloaded. Please try again later.",
+    );
+    assert_eq!(plain.kind, ProviderErrorKind::Overloaded);
+    assert!(plain.retryable);
+    assert_eq!(
+        plain.presentation.detail,
+        "The service is overloaded. Please try again later."
+    );
+
+    let redacted = replay_openai_http_error(
+        400,
+        None,
+        br#"{"error":{"message":"Credential Bearer sk-provider-secret-value was rejected"}}"#,
+    );
+    assert_eq!(
+        redacted.presentation.detail,
+        "Credential Bearer [REDACTED] was rejected"
+    );
+    assert!(
+        !redacted
+            .presentation
+            .detail
+            .contains("sk-provider-secret-value")
+    );
+
+    // MUTATION CHECK: clear `redact_next` after consuming `Bearer`. The
+    // opaque credential following `Authorization: Bearer` becomes durable.
+    let redacted = replay_openai_http_error(
+        400,
+        None,
+        br#"{"error":{"message":"Credential Authorization: Bearer opaque-provider-token-value was rejected"}}"#,
+    );
+    assert_eq!(
+        redacted.presentation.detail,
+        "Credential Authorization: [REDACTED] [REDACTED] was rejected"
+    );
+    assert!(
+        !redacted
+            .presentation
+            .detail
+            .contains("opaque-provider-token-value")
+    );
+
+    // MUTATION CHECK: remove prose-based authentication classification. The
+    // backend has historically returned this explanation under HTTP 400.
+    let invalidated = replay_openai_http_error(
+        400,
+        None,
+        br#"{"error":{"code":"invalid_request_error","message":"Your authentication token has been invalidated. Please sign in again."}}"#,
+    );
+    assert_eq!(invalidated.kind, ProviderErrorKind::Authentication);
+    assert!(!invalidated.retryable);
+    assert_eq!(
+        invalidated.presentation.detail,
+        "Your authentication token has been invalidated. Please sign in again."
+    );
+}
+
+/// MUTATION CHECK: return the kind-only stream error or require JSON data for
+/// `event:error`. The provider's explanation is lost in one of these cases.
+#[test]
+fn openai_stream_errors_preserve_enveloped_and_raw_explanations() {
+    let enveloped = replay_openai_responses_sse(
+        b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Unknown field: metadata\"}}}\n\n",
+    );
+    let error = enveloped
+        .into_iter()
+        .next()
+        .expect("one stream item")
+        .expect_err("response.failed is an error");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert_eq!(error.presentation.detail, "Unknown field: metadata");
+
+    let raw = replay_openai_responses_sse(
+        b"event: error\ndata: The service is overloaded. Please try again later.\n\n",
+    );
+    let error = raw
+        .into_iter()
+        .next()
+        .expect("one stream item")
+        .expect_err("raw error frame is an error");
+    assert_eq!(error.kind, ProviderErrorKind::Overloaded);
+    assert!(error.retryable);
+    assert_eq!(
+        error.presentation.detail,
+        "The service is overloaded. Please try again later."
+    );
+
+    let compatible =
+        replay_openai_chat_sse(b"event: error\ndata: The compatible upstream is overloaded.\n\n");
+    let error = compatible
+        .into_iter()
+        .next()
+        .expect("one compatible stream item")
+        .expect_err("raw compatible error frame is an error");
+    assert_eq!(error.kind, ProviderErrorKind::Overloaded);
+    assert_eq!(
+        error.presentation.detail,
+        "The compatible upstream is overloaded."
+    );
+
+    let invalidated = replay_openai_responses_sse(
+        b"event: error\ndata: Your authentication token has been invalidated. Please sign in again.\n\n",
+    );
+    let error = invalidated
+        .into_iter()
+        .next()
+        .expect("one authentication stream item")
+        .expect_err("invalidated token is an error");
+    assert_eq!(error.kind, ProviderErrorKind::Authentication);
+    assert!(!error.retryable);
+    assert_eq!(
+        error.presentation.detail,
+        "Your authentication token has been invalidated. Please sign in again."
+    );
+}
+
 #[tokio::test]
 async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
     tokio::time::pause();

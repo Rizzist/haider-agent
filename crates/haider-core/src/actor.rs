@@ -6927,6 +6927,7 @@ fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError)
     ) {
         return;
     }
+    let provider_detail = error.presentation.detail.clone();
     let mut specialized = match auth_scope {
         "api_key" => ErrorPresentation::new(
             "invalid-api-key",
@@ -6948,6 +6949,7 @@ fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError)
         ),
         _ => return,
     };
+    specialized.detail = provider_detail;
     copy_provider_metadata(&mut specialized, &error.presentation);
     error.presentation = specialized;
 }
@@ -6956,7 +6958,10 @@ fn stream_interruption_presentation(error: &ProviderError) -> ErrorPresentation 
     let mut presentation = ErrorPresentation::new(
         "stream-interrupted",
         "Response stream interrupted",
-        "The provider connection ended after part of the response was received.",
+        format!(
+            "{} The provider connection ended after part of the response was received.",
+            error.presentation.detail,
+        ),
         ErrorScope::Turn,
         [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
     );

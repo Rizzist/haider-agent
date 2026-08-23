@@ -6,7 +6,7 @@ use haider_core::{
     ToolDispatchResult, ToolDispatcher, retry_jittered_backoff_ms,
 };
 use haider_protocol::EventPayload;
-use haider_protocol::error::{ErrorAction, ErrorScope, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, ErrorRecoveryCardKind, MenuAnswer, MenuKind};
@@ -362,11 +362,18 @@ async fn e3a_quota_exhaustion_card_has_top_up_and_zero_retries() {
 #[tokio::test]
 async fn e3b_oauth_expired_produces_relogin_card() {
     let session = SessionId::new("e3-oauth-card");
-    let provider = Arc::new(FakeProvider::new(vec![FakeStep::ErrorWithRetryability {
+    const PROVIDER_DETAIL: &str =
+        "Your authentication token has been invalidated. Please sign in again.";
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::ErrorPresented {
         kind: ProviderErrorKind::Authentication,
-        message: "RAW_OAUTH_BODY_MARKER".into(),
-        retryable: false,
-        retry_after_ms: None,
+        message: "OpenAI HTTP 400 returned authentication".into(),
+        presentation: ErrorPresentation::new(
+            "authentication-failed",
+            "Sign-in required",
+            PROVIDER_DETAIL,
+            ErrorScope::Account,
+            [ErrorAction::Relogin],
+        ),
     }]));
     let store = Arc::new(MemoryStore::new());
     let mut config = HarnessConfig::for_session(session.clone(), DeviceId::new("e3"), 1, 1);
@@ -413,11 +420,19 @@ async fn e3b_oauth_expired_produces_relogin_card() {
             .allowed_actions
             .contains(&ErrorAction::Reimport)
     );
-    assert!(
-        !serde_json::to_string(presentation)
-            .expect("presentation JSON")
-            .contains("RAW_OAUTH_BODY_MARKER")
-    );
+    assert_eq!(presentation.detail, PROVIDER_DETAIL);
+    let durable = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::RunFailed {
+                presentation: Some(presentation),
+                ..
+            } => Some(presentation),
+            _ => None,
+        })
+        .expect("durable RunFailed presentation");
+    assert_eq!(durable.subcode.as_str(), "oauth-expired");
+    assert_eq!(durable.detail, PROVIDER_DETAIL);
 }
 
 /// LAW E4a: a post-content EOF closes the exact item as incomplete and parks
@@ -511,6 +526,101 @@ async fn e4a_midstream_failure_journals_incomplete_item_and_choice_card() {
             )
         }),
         "retry-fresh prompt must not carry the interrupted partial"
+    );
+}
+
+/// MUTATION CHECK: replace the partial-stream explanation with the harness's
+/// generic sentence. The provider's specific explanation disappears from the
+/// durable incomplete item and recovery menu.
+#[tokio::test]
+async fn e4a_midstream_failure_preserves_provider_explanation() {
+    const PROVIDER_DETAIL: &str = "Unknown field: service_tier";
+    let sleeper = Arc::new(RecordingSleeper::default());
+    let (handle, store, _) = spawn(
+        "e4-provider-detail",
+        vec![
+            FakeStep::EmitText {
+                text: "partial response".into(),
+            },
+            FakeStep::ErrorPresented {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: "OpenAI stream returned invalid request".into(),
+                presentation: ErrorPresentation::new(
+                    "invalid-provider-request",
+                    "Provider rejected request",
+                    PROVIDER_DETAIL,
+                    ErrorScope::Turn,
+                    [ErrorAction::Retry],
+                ),
+            },
+            FakeStep::EmitText {
+                text: "fresh response".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+        sleeper,
+    );
+    let turn = handle
+        .submit_turn(SubmitTurn::new("answer"))
+        .await
+        .expect("accepted");
+    let mut state = handle.state_receiver();
+    let parked = state
+        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
+        .await
+        .expect("actor stays available")
+        .clone();
+    let RunState::InputRequired { menu } = parked.expect("input state") else {
+        panic!("expected input state");
+    };
+    let payloads = store
+        .events(&SessionId::new("e4-provider-detail"))
+        .await
+        .into_iter()
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .collect::<Vec<_>>();
+    let presentations = payloads.iter().filter_map(|payload| match payload {
+        EventPayload::Item(ItemEvent::Completed {
+            item:
+                TurnItem::IncompleteAgentMessage {
+                    interruption: presentation,
+                    ..
+                },
+            ..
+        }) => Some(presentation),
+        EventPayload::MenuOpened(menu) => match &menu.kind {
+            MenuKind::ErrorRecovery {
+                card: ErrorRecoveryCardKind::PartialStream,
+                presentation,
+                ..
+            } => Some(presentation),
+            _ => None,
+        },
+        _ => None,
+    });
+    let presentations = presentations.collect::<Vec<_>>();
+    assert_eq!(presentations.len(), 2);
+    assert!(
+        presentations
+            .iter()
+            .all(|presentation| presentation.detail.contains(PROVIDER_DETAIL))
+    );
+
+    handle
+        .answer_menu(MenuAnswer {
+            menu,
+            option_key: Some("retry_fresh".into()),
+            option_index: 1,
+            value: None,
+            via: AnswerVia::Rpc,
+        })
+        .await
+        .expect("retry fresh answer");
+    assert_eq!(
+        turn.wait().await.expect("turn outcome").state,
+        RunState::Done
     );
 }
 
