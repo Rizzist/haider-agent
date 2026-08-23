@@ -49,8 +49,6 @@ pub const ERROR_CODE_NO_ACTIVE_ACCOUNT: &str = "no_active_account";
 /// The selected provider publishes neither a default nor a fallback model.
 pub const ERROR_CODE_NO_DEFAULT_MODEL: &str = "no_default_model";
 
-const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
-
 const MAX_RECONNECTS: u8 = 3;
 const ATTACH_HEALTH_POLL: Duration = Duration::from_millis(10);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -388,8 +386,9 @@ pub struct HeadlessSessionConfig {
     pub effort: Option<String>,
     /// `Some(true)` selects fast; `Some(false)` durably selects normal.
     pub fast: Option<bool>,
-    /// Reserved for the future per-session account selector. Current daemons
-    /// reject this through the named feature gate before session creation.
+    /// Reserved for a future per-session account selector. Current daemons
+    /// reject this before connecting and direct callers to a provider/model
+    /// selector, which is the implemented headless routing control.
     pub account: Option<String>,
 }
 
@@ -1056,7 +1055,7 @@ async fn run_headless_inner(
         !request.attachments.is_empty(),
         request.trust_hooks,
     );
-    normalize_session_config_features(&mut ensure, &session_config);
+    normalize_session_config_features(&mut ensure, &session_config)?;
     let timeout_deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let submit_command_id = CommandId::new(command_id("headless-submit"));
     let mut reconnects = ReconnectBudget::new();
@@ -1759,16 +1758,6 @@ async fn apply_headless_session_config(
     selected_provider: Option<String>,
     config: &HeadlessSessionConfig,
 ) -> Result<(), HeadlessRunError> {
-    if config.account.is_some() {
-        return Err(HeadlessRunError::Bootstrap {
-            stage: "session config",
-            code: "missing_feature",
-            message: format!(
-                "daemon does not provide the required `{FEATURE_SESSION_ACCOUNT_SELECT_V1}` capability"
-            ),
-            retryable: false,
-        });
-    }
     if config.model.is_some() {
         let response = connection
             .client
@@ -2013,12 +2002,20 @@ fn normalize_ensure_options(
     };
 }
 
-fn normalize_session_config_features(options: &mut EnsureOptions, config: &HeadlessSessionConfig) {
-    if config.model.is_some()
-        || config.effort.is_some()
-        || config.fast.is_some()
-        || config.account.is_some()
-    {
+fn normalize_session_config_features(
+    options: &mut EnsureOptions,
+    config: &HeadlessSessionConfig,
+) -> Result<(), HeadlessRunError> {
+    if config.account.is_some() {
+        return Err(HeadlessRunError::Bootstrap {
+            stage: "session config",
+            code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT,
+            message: "per-session account selection is not implemented; use `--model provider/model` to select the provider/model pair for this run"
+                .into(),
+            retryable: false,
+        });
+    }
+    if config.model.is_some() || config.effort.is_some() || config.fast.is_some() {
         options
             .required_features
             .insert(haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned());
@@ -2038,11 +2035,7 @@ fn normalize_session_config_features(options: &mut EnsureOptions, config: &Headl
             .required_features
             .insert(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned());
     }
-    if config.account.is_some() {
-        options
-            .required_features
-            .insert(FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned());
-    }
+    Ok(())
 }
 
 async fn reconnect_before_session(

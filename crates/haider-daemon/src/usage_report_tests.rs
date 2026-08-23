@@ -897,11 +897,94 @@ fn cache_reread_metric_snapshot(calls: &[(&str, u64, u64, u64)]) -> AgentUsageMe
         .expect("cache re-read usage")
 }
 
-/// MUTATION CHECK: replace `logical.min(accumulator.prev_prefix_tokens)` with `logical`; the single call reports `Some(0)` instead of `None`.
+fn cancelled_cache_reread_metric_snapshot(requests: &[(u64, u64, u64)]) -> AgentUsageMetrics {
+    let mut folder = SessionFolder::new("gpt-5.2");
+    let mut cumulative_logical = 0_u64;
+    let mut cumulative_output = 0_u64;
+    let mut cumulative_cache_read = 0_u64;
+    for (index, &(logical, output, cache_read)) in requests.iter().enumerate() {
+        let ordinal = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        let mut usage =
+            cache_reread_metrics_usage("run-cancelled-cache", logical, output, cache_read);
+        usage.request = Some(RequestUsage {
+            ordinal,
+            input: usage.input,
+            output: usage.output,
+            reasoning: None,
+            cached: Some(usage.cached),
+            source: usage.source,
+            account: usage.account.clone(),
+            normalized: usage.normalized.clone(),
+            cache_cost: usage.cache_cost,
+            cache: None,
+        });
+
+        // The actor journals a cumulative turn snapshot while `request`
+        // retains this response's local counters. Reproduce that exact shape:
+        // the folder must split completed requests before a later cancellation.
+        cumulative_logical = cumulative_logical.saturating_add(logical);
+        cumulative_output = cumulative_output.saturating_add(output);
+        cumulative_cache_read = cumulative_cache_read.saturating_add(cache_read);
+        usage.input = cumulative_logical;
+        usage.output = cumulative_output;
+        usage.cached = cumulative_cache_read;
+        usage.normalized = Some(NormalizedUsage {
+            logical_input: cumulative_logical,
+            uncached_input: cumulative_logical.saturating_sub(cumulative_cache_read),
+            billed_output: cumulative_output,
+            cache_read_input: cumulative_cache_read,
+            cache_status: CacheStatAvailability::Present,
+            cache_telemetry_input: cumulative_logical,
+            ..NormalizedUsage::default()
+        });
+        folder.push(&envelope(
+            ordinal,
+            Some("run-cancelled-cache"),
+            Some("agent-cache"),
+            ordinal,
+            usage_payload(usage),
+        ));
+    }
+    let terminal_seq = u64::try_from(requests.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    folder.push(&envelope(
+        terminal_seq,
+        Some("run-cancelled-cache"),
+        None,
+        terminal_seq,
+        serde_json::to_value(EventPayload::RunState(
+            haider_protocol::state::RunState::Cancelled,
+        ))
+        .expect("cancelled state"),
+    ));
+    let snapshot = folder
+        .agent_snapshot(
+            &SessionId::new("s-usage"),
+            Some(&AgentId::new("agent-cache")),
+            terminal_seq,
+        )
+        .expect("cancelled cache snapshot");
+    assert!(!snapshot.live);
+    snapshot.usage.expect("cancelled cache usage")
+}
+
+/// MUTATION CHECK: replace `logical.min(accumulator.prev_prefix_tokens)` with
+/// `logical`; the genuinely single completed request reports `Some(0)` instead
+/// of the required absence.
 #[test]
-fn cache_reread_metric_single_call_is_none() {
-    let usage = cache_reread_metric_snapshot(&[("run-only", 1_000, 100, 0)]);
+fn cache_reread_metric_single_completed_request_then_cancelled_is_none() {
+    let usage = cancelled_cache_reread_metric_snapshot(&[(1_000, 100, 0)]);
     assert_eq!(usage.cache_reread_hit_basis_points, None);
+}
+
+/// MUTATION CHECK: remove `request_ordinal` from `UsageChunkKey`; the two
+/// request-local rows collapse back to one lane snapshot and the metric becomes
+/// `None` after cancellation.
+#[test]
+fn cache_reread_metric_two_completed_requests_then_cancelled_is_present() {
+    let usage = cancelled_cache_reread_metric_snapshot(&[(1_000, 100, 0), (1_100, 100, 900)]);
+    assert_eq!(usage.cache_reread_hit_basis_points, Some(8_181));
 }
 
 /// MUTATION CHECK: remove `chronological_chunks.sort_by_key`; key-order folding drops the expected 10_000 to 5_000.

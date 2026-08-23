@@ -7,7 +7,7 @@
 mod cli_main;
 
 use cli_main::models::{auth_state, availability_name};
-use cli_main::session_config::{ConfigOptions, parse_options, resolve_model_selector};
+use cli_main::session_config::{ConfigError, ConfigOptions, parse_options, resolve_model_selector};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
 use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
@@ -102,6 +102,21 @@ fn setter_feature_preconditions_are_per_flag() {
     }
     .required_features();
     assert!(with_speed.contains(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1));
+
+    let with_account = ConfigOptions {
+        account: Some("work".into()),
+        ..Default::default()
+    }
+    .required_features();
+    assert_eq!(
+        with_account, base,
+        "an unimplemented account selector must not invent a daemon feature"
+    );
+    assert!(
+        ConfigError::AccountSelectionUnsupported
+            .to_string()
+            .contains("--model provider/model")
+    );
 }
 
 /// MUTATION CHECK: stop requiring a REGISTERED provider prefix, or accept

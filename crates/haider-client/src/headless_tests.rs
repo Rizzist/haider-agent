@@ -1,11 +1,38 @@
 #![allow(clippy::expect_used)]
 
 use super::{
-    HeadlessAttachment, HeadlessRunError, headless_submit_body, load_attachment,
-    load_pdf_attachment,
+    EnsureOptions, HeadlessAttachment, HeadlessRunError, HeadlessSessionConfig,
+    headless_submit_body, load_attachment, load_pdf_attachment, normalize_session_config_features,
 };
 use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{CommandId, RequestBody};
+
+/// MUTATION CHECK: restore the client-only `session_account_select_v1`
+/// requirement and its bare `missing_feature` failure. This assertion then
+/// receives `Ok(())` instead of the actionable pre-connect error.
+#[test]
+fn unsupported_account_selection_names_model_selector_workaround() {
+    let mut ensure = EnsureOptions::default();
+    let config = HeadlessSessionConfig {
+        account: Some("work".into()),
+        ..HeadlessSessionConfig::default()
+    };
+    let error = normalize_session_config_features(&mut ensure, &config)
+        .expect_err("account selection is not a daemon capability");
+    assert!(matches!(
+        &error,
+        HeadlessRunError::Bootstrap {
+            stage: "session config",
+            code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT,
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(
+        error.to_string().contains("--model provider/model"),
+        "the error must name the implemented routing control: {error}"
+    );
+}
 
 /// MUTATION CHECK: ignore the run-scoped trust bit or change ordinary turn
 /// bytes. Expected RUNTIME failure: the concrete request variant observed by

@@ -240,20 +240,23 @@ try:
         """The daemon's own ledger for the one thing the PTY cannot show:
         HOW MANY times the menu resolved. `menu_resolutions` is the CAS
         table the answer path writes through (one row per menu, by primary
-        key); the event counts come from the committed envelopes. Read
-        read-only, while the daemon still lives, so its WAL is readable."""
+        key); the event counts come from the committed envelopes. The planted
+        card identifies this probe's menu, session and run so unrelated
+        profile activity cannot change these counts. Read read-only, while the
+        daemon still lives, so its WAL is readable."""
         counts = {
             "menu_opened": 0,
-            "menu_answered": 0,
+            "menu_answered": None,
             "tool_result": 0,
-            "run_failed": 0,
-            "resolutions": 0,
+            "run_failed": None,
+            "resolutions": None,
         }
         connection = sqlite3.connect(
             "file:" + os.path.join(store, "store.sqlite") + "?mode=ro", uri=True
         )
         try:
             blob_rows = 0
+            envelopes = []
             for (envelope,) in connection.execute("select envelope_json from events"):
                 # v0.0.931+: new rows are msgpack BLOBs (bytes); legacy rows
                 # stay JSON text. Decode both; without the msgpack module,
@@ -262,25 +265,80 @@ try:
                     try:
                         import msgpack  # type: ignore
 
-                        payload = msgpack.unpackb(envelope, raw=False)["payload"]
+                        decoded = msgpack.unpackb(envelope, raw=False)
                     except ImportError:
                         blob_rows += 1
                         continue
                 else:
-                    payload = json.loads(envelope)["payload"]
-                kind = payload.get("type")
-                if kind == "tool_result" and payload.get("call_id") != CALL:
-                    continue
-                if kind in counts:
-                    counts[kind] += 1
+                    decoded = json.loads(envelope)
+                envelopes.append(decoded)
+
+            def is_sentinel_menu(payload):
+                options = payload.get("options", [])
+                return (
+                    payload.get("type") == "menu_opened"
+                    and payload.get("kind") == "choice"
+                    and payload.get("title") == f"{CARD} choose a target"
+                    and payload.get("body") == ["the daemon owns this list"]
+                    and payload.get("origin") == "request_input"
+                    and any(
+                        option.get("key") == "alpha"
+                        and option.get("label") == f"{PICK} alpha"
+                        for option in options
+                    )
+                )
+
+            openings = [
+                envelope
+                for envelope in envelopes
+                if is_sentinel_menu(envelope.get("payload", {}))
+            ]
+            menu_coordinates = {
+                (envelope.get("session_id"), envelope["payload"].get("id"))
+                for envelope in openings
+            }
+            call_results = [
+                envelope
+                for envelope in envelopes
+                if envelope.get("payload", {}).get("type") == "tool_result"
+                and envelope["payload"].get("call_id") == CALL
+            ]
+            run_coordinates = {
+                (envelope.get("session_id"), envelope.get("run_id"))
+                for envelope in openings + call_results
+                if envelope.get("run_id") is not None
+            }
+
+            counts["menu_opened"] = len(openings)
+            if menu_coordinates:
+                counts["menu_answered"] = sum(
+                    envelope.get("payload", {}).get("type") == "menu_answered"
+                    and (
+                        envelope.get("session_id"),
+                        envelope["payload"].get("menu"),
+                    )
+                    in menu_coordinates
+                    for envelope in envelopes
+                )
+                counts["resolutions"] = sum(
+                    (session_id, menu_id) in menu_coordinates
+                    for session_id, menu_id in connection.execute(
+                        "select session_id, menu_id from menu_resolutions"
+                    )
+                )
+            counts["tool_result"] = len(call_results)
+            if run_coordinates:
+                counts["run_failed"] = sum(
+                    envelope.get("payload", {}).get("type") == "run_failed"
+                    and (envelope.get("session_id"), envelope.get("run_id"))
+                    in run_coordinates
+                    for envelope in envelopes
+                )
             if blob_rows:
                 print(
                     f"[probe] {blob_rows} msgpack envelope rows skipped — "
                     "`pip install msgpack` for full coverage"
                 )
-            counts["resolutions"] = connection.execute(
-                "select count(*) from menu_resolutions"
-            ).fetchone()[0]
         finally:
             connection.close()
         return counts
@@ -551,23 +609,27 @@ finally:
     if not os.environ.get("LIVE_PROBE_PROFILE"):
         shutil.rmtree(profile, ignore_errors=True)
 
-# The half of "exactly once" no terminal can show: the daemon's ledger. One
-# `MenuOpened`, one `MenuAnswered`, one `menu_resolutions` row (its primary
-# key is (session, menu) — a second resolution cannot even be stored), one
-# `ToolResult` for CALL, and NO `RunFailed`. A worker resumed twice would
-# either double the tool result or run a turn with no script segment left
-# and journal the failure.
-checks.append(
-    (
-        "the daemon journaled the menu answered exactly ONCE",
-        journal is not None
-        and journal["menu_opened"] == 1
-        and journal["menu_answered"] == 1
-        and journal["resolutions"] == 1
-        and journal["tool_result"] == 1
-        and journal["run_failed"] == 0,
+# The half of "exactly once" no terminal can show: the daemon's ledger. Keep
+# these as five separately reported facts: a bare composite False hid which
+# behavior was wrong for 25 releases. Menu facts are scoped to the planted
+# card's (session, menu), failures to its (session, run), and ToolResult to the
+# planted call id. `menu_resolutions` can hold only one row for that coordinate
+# because (session_id, menu_id) is its primary key.
+for key, label, expected in (
+    ("menu_opened", "sentinel menu_opened events", 1),
+    ("menu_answered", "sentinel menu_answered events", 1),
+    ("resolutions", "sentinel menu_resolutions rows", 1),
+    ("tool_result", f"tool_result events for call_id {CALL}", 1),
+    ("run_failed", "sentinel-run run_failed events", 0),
+):
+    value = journal[key] if journal is not None else None
+    actual = value if value is not None else "UNAVAILABLE"
+    checks.append(
+        (
+            f"journal {label}: EXPECTED {expected}, ACTUAL {actual}",
+            value == expected,
+        )
     )
-)
 
 # No secret may ever ride a live frame (the M3 sentinel leg's PTY half).
 checks.append(("no `sk-` key material in any frame", not re.search(r"sk-[A-Za-z0-9_\-]{8,}", text)))

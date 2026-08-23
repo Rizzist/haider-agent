@@ -19,7 +19,6 @@ use super::run::{
 };
 
 const SESSION_CONFIG_SCHEMA: &str = "haider.session_config.v1";
-const SESSION_ACCOUNT_SELECT_FEATURE: &str = "session_account_select_v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfigOptions {
@@ -58,9 +57,6 @@ impl ConfigOptions {
         }
         if self.fast.is_some() {
             features.insert(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned());
-        }
-        if self.account.is_some() {
-            features.insert(SESSION_ACCOUNT_SELECT_FEATURE.to_owned());
         }
         if self.agent_type.is_some() {
             features.insert(haider_rpc::FEATURE_SESSION_AGENT_TYPE_SELECT_V1.to_owned());
@@ -114,6 +110,7 @@ pub(crate) enum ConfigError {
     Protocol(&'static str),
     MissingMetadata,
     InvalidSelector(String),
+    AccountSelectionUnsupported,
     /// rev933b finding 6: setters apply sequentially and are individually
     /// durable — a mid-sequence failure must DISCLOSE what already
     /// committed instead of reporting a clean failure.
@@ -147,6 +144,10 @@ impl std::fmt::Display for ConfigError {
                 "session has no typed configuration metadata; it may have been created by an older daemon"
             ),
             Self::InvalidSelector(message) => write!(formatter, "invalid_argument: {message}"),
+            Self::AccountSelectionUnsupported => write!(
+                formatter,
+                "invalid_argument: per-session account selection is not implemented; use `--model provider/model` to select the provider/model pair"
+            ),
             Self::Partial { applied, error } => write!(
                 formatter,
                 "PARTIALLY applied — committed: {}; then failed: {error}                  (run `config --json` to read the durable state)",
@@ -170,6 +171,9 @@ pub(crate) async fn session_config_command(session_id: &str, rest: &[String]) ->
             return ExitCode::from(EX_USAGE);
         }
     };
+    if options.account.is_some() {
+        return failure(&ConfigError::AccountSelectionUnsupported);
+    }
     let profile = match resolve_profile(&ProfileEnv::capture()) {
         Ok(profile) => profile,
         Err(error) => {
@@ -332,9 +336,7 @@ async fn apply_mutations(
     applied: &mut Vec<&'static str>,
 ) -> Result<(), ConfigError> {
     if options.account.is_some() {
-        return Err(ConfigError::MissingFeatures(BTreeSet::from([
-            SESSION_ACCOUNT_SELECT_FEATURE.to_owned(),
-        ])));
+        return Err(ConfigError::AccountSelectionUnsupported);
     }
     if let Some(selector) = options.model.as_deref() {
         let (provider, model) = resolve_model_selector(selector, providers)?;
@@ -731,6 +733,7 @@ fn failure_code(error: &ConfigError) -> ExitCode {
             | EnsureError::ProfileMismatch { .. },
         )
         | ConfigError::MissingFeatures(_)
+        | ConfigError::AccountSelectionUnsupported
         | ConfigError::Protocol(_)
         | ConfigError::InvalidSelector(_) => EX_PROTOCOL,
         ConfigError::Ensure(_) => EX_UNAVAILABLE,
