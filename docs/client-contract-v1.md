@@ -1144,24 +1144,50 @@ change. Months-old session payloads remain raw-decodable.
 
 ## 16. Known absences and limits of this revision
 
-These are not guesses; they are explicit gaps in the current source contract:
+These are not guesses; they are explicit gaps in the current source contract.
 
-- roster deltas cannot announce removal; full `session.list` reconciliation
-  is required;
-- the RPC resident-binding baseline remains the single most-recent live
+**Two kinds of absence, and they warrant different client behaviour.** An absent
+field looks identical from the client either way, so each entry below is
+labelled:
+
+- **[STRUCTURAL]** — the value does not exist in the daemon. "Unknown" is
+  *permanently* correct. Render unknown and stop hoping: no future release fills
+  it without the underlying capability being built first, which would be a
+  contract change announced by a feature bit.
+- **[UNPUBLISHED]** — the value exists internally but is not surfaced. "Unknown"
+  is *temporary*. A client may reasonably expect it to appear and should not
+  design around its permanent absence.
+
+Neither kind licenses a substitute. This distinction governs what a client
+should *expect*, never what it may *invent*; §1.1's prohibition on calculating
+a replacement applies identically to both. The nearest available number is the
+most dangerous thing in the room precisely because it resembles the missing one.
+
+- **[STRUCTURAL]** roster deltas cannot announce removal; full `session.list`
+  reconciliation is required;
+- **[STRUCTURAL]** the RPC resident-binding baseline remains the single most-recent live
   publication, not an inventory of surfaces. `binding_token` lets a client
   correlate publications to tokens it minted and retire terminal reads, but
   does not make the daemon own or enumerate panes;
-- there is no independent current-todo snapshot; normal raw replay supplies
+- **[STRUCTURAL]** there is no independent current-todo snapshot; normal raw replay supplies
   the durable lifecycle;
-- `SessionSummary.account_alias` is not populated, so a per-session account is
-  unknown and must not be replaced with the global active account;
-- old account/provider/usage payloads that omit `availability` retain their
+- **[STRUCTURAL]** `SessionSummary.account_alias` is not populated because
+  **there is no per-session account binding to report**. `RequestBody` carries
+  no account-selection request, session creation accepts only provider/model,
+  and turn setup resolves the alias from the globally-resolved account. The
+  field is empty because the fact does not exist, not because a publisher
+  dropped it — so "unknown" is permanently correct until per-session binding is
+  built. It must not be replaced with the global active account, which would be
+  right for the current session by luck and silently wrong for every historical
+  one. For the same reason `haider run --account` cannot work: it gated on
+  `session_account_select_v1`, a feature string with zero daemon-side
+  definitions, and now refuses honestly instead;
+- **[STRUCTURAL]** old account/provider/usage payloads that omit `availability` retain their
   old ambiguous zero/empty sentinels. The new client can say “unknown,” but
   cannot reconstruct whether an old daemon measured an empty value;
-- a native sidecar is best-effort. The source defines validation and retry but
+- **[UNPUBLISHED]** a native sidecar is best-effort. The source defines validation and retry but
   no latency deadline by which it must catch the journal head;
-- `title=None`, `effort=None`, and several lineage/config optionals deliberately
+- **[STRUCTURAL]** `title=None`, `effort=None`, and several lineage/config optionals deliberately
   combine an old-daemon case with a real domain absence. This document records
   the ambiguity instead of inventing a discriminator.
 
