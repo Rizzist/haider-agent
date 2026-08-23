@@ -491,7 +491,7 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap_or_else(|error| panic!("utf8: {error}"));
         assert!(!text.contains(secret));
         assert!(!text.contains(path_text));
-        assert!(text.lines().all(|line| line.len() + 1 <= MAX_RECORD_BYTES));
+        assert!(text.lines().all(|line| line.len() < MAX_RECORD_BYTES));
 
         let (_next, evidence) = EffectDiagnostics::open(root.path().to_path_buf())
             .await

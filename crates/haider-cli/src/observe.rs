@@ -607,25 +607,7 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
             let scalars = roster.get(&digest.session_id);
             let mut view = summary_view(digest);
             if let Some(summary) = scalars {
-                // The roster summary is the LIVE observation; take the
-                // cancel pair from it together, never one from each source.
-                view.cache = summary
-                    .agent_metrics
-                    .as_ref()
-                    .and_then(|metrics| metrics.usage.as_ref())
-                    .map(|usage| CacheView {
-                        lifetime_basis_points: usage.cache_hit_basis_points,
-                        reread_basis_points: usage.cache_reread_hit_basis_points,
-                    });
-                view.run_id = summary.run_id.as_ref().map(|run| run.as_str().to_owned());
-                view.worker_generation = Some(summary.worker_generation);
-                view.effort = summary.effort.clone();
-                view.fast = summary.fast;
-                view.agent_type = summary.agent_type.clone();
-                view.seen_at_ms = summary.seen_at_ms;
-                view.last_activity_ms = summary.last_activity_ms;
-                view.waiting_why = summary.waiting_why.clone();
-                view.needs_input = summary.needs_input.clone();
+                merge_roster_summary(&mut view, summary);
             }
             view
         })
@@ -918,6 +900,43 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
             .filter_map(|menu| menu.opened_at_ms)
             .min(),
     }
+}
+
+/// Merge additive `session.list` truth into the older observe-digest view.
+/// Missing promoted fields preserve the digest metadata fallback so clients
+/// remain useful with pre-promotion daemons.
+pub(crate) fn merge_roster_summary(
+    view: &mut SessionSummaryView,
+    summary: &haider_rpc::SessionSummary,
+) {
+    // The roster summary is the LIVE observation. Take each typed value when
+    // present; a 0.0.942 summary can carry `last_model` but has no promoted
+    // provider, so the digest's nested metadata remains its compatibility
+    // source.
+    if let Some(provider) = &summary.provider {
+        view.provider = Some(provider.clone());
+    }
+    if let Some(model) = &summary.last_model {
+        view.model = Some(model.clone());
+    }
+    view.cache = summary
+        .agent_metrics
+        .as_ref()
+        .and_then(|metrics| metrics.usage.as_ref())
+        .map(|usage| CacheView {
+            lifetime_basis_points: usage.cache_hit_basis_points,
+            reread_basis_points: usage.cache_reread_hit_basis_points,
+        });
+    // The cancel coordinates are another pair from the same live summary.
+    view.run_id = summary.run_id.as_ref().map(|run| run.as_str().to_owned());
+    view.worker_generation = Some(summary.worker_generation);
+    view.effort = summary.effort.clone();
+    view.fast = summary.fast;
+    view.agent_type = summary.agent_type.clone();
+    view.seen_at_ms = summary.seen_at_ms;
+    view.last_activity_ms = summary.last_activity_ms;
+    view.waiting_why = summary.waiting_why.clone();
+    view.needs_input = summary.needs_input.clone();
 }
 
 pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {

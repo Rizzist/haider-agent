@@ -540,18 +540,19 @@ async fn concurrent_duplicate_fork_discards_the_losing_candidate_actor() {
         | SessionForkOutcome::IdempotentReplay { created } => created.session_id,
     };
     assert_eq!(second_id, created_id, "duplicates return one durable child");
-    let actors = hub.inner.actors.lock().expect("actor registry");
-    let resident_candidates = [&candidate_a, &candidate_b]
-        .into_iter()
-        .filter(|candidate| actors.contains_key(*candidate))
-        .cloned()
-        .collect::<Vec<_>>();
+    let resident_candidates = {
+        let actors = hub.inner.actors.lock().expect("actor registry");
+        [&candidate_a, &candidate_b]
+            .into_iter()
+            .filter(|candidate| actors.contains_key(*candidate))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
         resident_candidates,
         vec![created_id],
         "only the committed child candidate remains resident"
     );
-    drop(actors);
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }

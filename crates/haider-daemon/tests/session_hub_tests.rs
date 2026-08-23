@@ -3474,6 +3474,76 @@ async fn session_summary_carries_its_committed_workspace_cwd() {
     store.close().await.expect("store closes");
 }
 
+/// The promoted provider and nested compatibility copy have one authority:
+/// the committed typed metadata row.
+///
+/// MUTATION CHECK (executed): replace the promoted provider clone in
+/// `session_summaries` with the literal `mutated-provider`. Expected RUNTIME
+/// failure: the top-level assertion differs from `metadata.provider` while the
+/// nested value remains `anthropic`.
+#[tokio::test]
+async fn session_summary_provider_matches_metadata_authority() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("summary-known-provider");
+    create_typed_session(&store, &session_id, "anthropic").await;
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("created session summary");
+    assert_eq!(summary.provider.as_deref(), Some("anthropic"));
+    assert_eq!(
+        summary.provider.as_deref(),
+        summary
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.provider.as_str()),
+        "the promoted and nested provider must never disagree"
+    );
+    let wire = serde_json::to_value(&summary).expect("summary serializes");
+    assert_eq!(wire["provider"], "anthropic");
+    assert_eq!(wire["metadata"]["provider"], "anthropic");
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// A legacy session has no typed provider authority. Its summary must express
+/// that as wire absence, never an empty string or a manufactured default.
+///
+/// MUTATION CHECK (executed): remove `skip_serializing_if` from the promoted
+/// provider's serde attributes. Expected RUNTIME failure: the serialized
+/// summary contains `"provider": null` instead of omitting the key.
+#[tokio::test]
+async fn session_summary_unknown_provider_is_omitted() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("summary-unknown-provider");
+    append_one(
+        &hub,
+        &session_id,
+        store.worker_generation(),
+        "legacy-provider-seed",
+    )
+    .await;
+
+    let summary = list_summaries(&hub)
+        .await
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .expect("legacy session summary");
+    assert_eq!(summary.metadata, None);
+    assert_eq!(summary.provider, None);
+    let wire = serde_json::to_value(&summary).expect("summary serializes");
+    assert!(
+        wire.get("provider").is_none(),
+        "unknown provider must be absent, not null, empty, or a placeholder: {wire}"
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// The first watch tick is a full baseline; subsequent ticks carry only
 /// changed/new summaries, and a stable roster is silent. v1 intentionally
 /// has no removal tombstone.

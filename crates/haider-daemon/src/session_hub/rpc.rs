@@ -10221,6 +10221,10 @@ pub(crate) async fn session_summaries(
         let (footprint_tokens, footprint_truth) =
             summary_footprint_fields(turns, footprint.as_ref());
         let agent_metrics = snapshot.agent_metrics;
+        // Promote the provider from the exact metadata value published below.
+        // Keeping one source makes disagreement between the two locations
+        // impossible.
+        let provider = metadata.as_ref().map(|metadata| metadata.provider.clone());
         let last_model = snapshot.last_model;
         let title = metadata
             .as_ref()
@@ -10259,6 +10263,7 @@ pub(crate) async fn session_summaries(
             needs_input,
             workspace_cwd: metadata.as_ref().map(|metadata| metadata.cwd.clone()),
             metadata,
+            provider,
             last_model,
             turn_count: Some(turns),
             footprint_tokens,
@@ -10557,6 +10562,7 @@ mod roster_wave_tests {
             head_seq: u64::try_from(index).expect("test index fits") + 1,
             worker_generation: 1,
             metadata: None,
+            provider: None,
             last_model: None,
             workspace_cwd: None,
             turn_count: None,

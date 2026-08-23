@@ -4153,6 +4153,7 @@ async fn perform_manual_compaction(
     Ok(accepted)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_shell_exec(
     metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,

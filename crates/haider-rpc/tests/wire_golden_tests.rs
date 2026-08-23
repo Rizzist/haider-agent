@@ -682,6 +682,7 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         waiting_why: None,
         needs_input: None,
         metadata: None,
+        provider: None,
         last_model: None,
         workspace_cwd: Some("/work/original".into()),
         turn_count: None,
@@ -718,6 +719,51 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
     }))
     .expect("older summary decodes");
     assert_eq!(older.workspace_cwd, None);
+}
+
+/// A 0.0.942 summary has no promoted provider field. New readers retain the
+/// nested provider for compatibility while treating the top-level location as
+/// unknown; decoding must never manufacture the promotion.
+///
+/// MUTATION CHECK (executed): remove the explicit `default` from
+/// `SessionSummary.provider`. Expected RUNTIME failure: the wire-law assertion
+/// rejects the declaration. Serde currently gives missing `Option<T>` fields
+/// an implicit `None`, so the real payload decode below intentionally remains
+/// alongside the source-level guard rather than pretending it pins the
+/// required explicit annotation by itself.
+#[test]
+fn session_summary_without_top_level_provider_still_decodes() {
+    let frame = include_str!("../src/frame.rs");
+    assert!(
+        frame.contains(
+            "#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub provider: Option<String>"
+        ),
+        "provider must retain the explicit additive wire law"
+    );
+    let v0_0_942 = serde_json::json!({
+        "session_id": "session-provider-compat",
+        "head_seq": 17,
+        "worker_generation": 15,
+        "metadata": {
+            "cwd": "/work/original",
+            "provider": "anthropic",
+            "model": "claude-sonnet",
+            "max_tokens": 4096,
+            "created_at_ms": 1_800_000_000_000_u64
+        },
+        "last_model": "claude-sonnet"
+    });
+    let decoded: haider_rpc::SessionSummary =
+        serde_json::from_value(v0_0_942).expect("0.0.942 summary decodes");
+    assert_eq!(decoded.provider, None, "absence remains unknown");
+    assert_eq!(
+        decoded
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.provider.as_str()),
+        Some("anthropic"),
+        "the compatibility copy remains readable"
+    );
 }
 
 /// R7 additive-field tolerance for the two turn mutation methods
@@ -2097,6 +2143,7 @@ fn session_rename_frames_are_additive_and_golden() {
         waiting_why: None,
         needs_input: None,
         metadata: None,
+        provider: None,
         last_model: None,
         workspace_cwd: None,
         turn_count: None,
@@ -2671,6 +2718,7 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
         waiting_why: None,
         needs_input: None,
         metadata: None,
+        provider: None,
         last_model: None,
         workspace_cwd: None,
         turn_count: None,

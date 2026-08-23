@@ -1047,6 +1047,13 @@ pub struct SessionSummary {
     /// readers must not infer anything from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
+    /// Additive roster-truth field: the provider paired with this session's
+    /// model selection, sourced from the same committed metadata published in
+    /// `metadata.provider`. `None` when an older daemon omits the field or the
+    /// session has no typed metadata — readers must never infer a provider
+    /// from its absence; absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Additive roster-truth field: the model active at this committed
     /// session head. The latest durable `model_selected` fact wins, falling
     /// back to the create-time metadata model when no selection fact exists.

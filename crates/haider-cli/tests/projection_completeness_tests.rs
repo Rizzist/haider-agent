@@ -99,10 +99,18 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
             "agent_metrics",
             "flattened into `cache`; fleet carries a DIFFERENT snapshot (roots/rollup) and never had usage",
         ),
-        ("last_model", "flattened into `model`"),
         ("parent_session_id", "lineage is its own view"),
         ("kind", "lineage is its own view"),
         ("account_alias", "accounts view surfaces this"),
+    ];
+
+    // These wire names are promoted or renamed in the CLI, so merely finding
+    // the output key is insufficient: `provider` already existed through
+    // nested digest metadata and let the new top-level field pass this guard
+    // without being read. Require the roster source expression itself.
+    let source_sensitive_projection: &[(&str, &str)] = &[
+        ("provider", "&summary.provider"),
+        ("last_model", "&summary.last_model"),
     ];
 
     let wire = wire_fields(&frame, "SessionSummary");
@@ -119,7 +127,15 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
                 .iter()
                 .any(|(name, _)| *name == field.as_str())
         })
-        .filter(|field| !observe.contains(&format!("\"{field}\"")))
+        .filter(|field| {
+            source_sensitive_projection
+                .iter()
+                .find(|(name, _)| *name == field.as_str())
+                .map_or_else(
+                    || !observe.contains(&format!("\"{field}\"")),
+                    |(_, source)| !observe.contains(source),
+                )
+        })
         .collect();
 
     assert!(

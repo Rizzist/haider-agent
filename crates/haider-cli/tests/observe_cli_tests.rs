@@ -13,7 +13,7 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_rpc::{
     FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
     FleetStateCountsWire, ObserveMenuWire, ObserveRunStateWire, ObserveSubagentWire,
-    SessionFleetSnapshot, SessionObserveDigest,
+    SessionFleetSnapshot, SessionObserveDigest, SessionSummary,
 };
 
 #[allow(dead_code)]
@@ -24,9 +24,9 @@ use cli_main::observe::{
     AccountView, DaemonView, FleetListEntry, FleetOptions, ObserveJson, Parsed, SessionDocument,
     SessionsDocument, SnapshotOptions, StatusDocument, UpdateView, depth_view,
     exit_code_for_observe_error, fleet_candidates, fleet_human_text, fleet_list_human_text,
-    parse_events_options, parse_fleet_options, parse_session_options, parse_snapshot_options,
-    session_human_text, sessions_human_text, stamp_update_view, summary_view,
-    write_raw_envelope_jsonl,
+    merge_roster_summary, parse_events_options, parse_fleet_options, parse_session_options,
+    parse_snapshot_options, session_human_text, sessions_human_text, stamp_update_view,
+    summary_view, write_raw_envelope_jsonl,
 };
 use cli_main::run::{
     EX_BLOCKED, EX_CANCELLED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT,
@@ -337,6 +337,51 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
         .find(|subagent| subagent["id"] == "agent-without-callsign")
         .expect("unnamed daemon subagent");
     assert!(unnamed["callsign"].is_null());
+}
+
+/// `haider sessions --json` prefers the typed roster pair when a new daemon
+/// supplies it, while a 0.0.942-shaped roster keeps the digest metadata
+/// fallback instead of going blind.
+///
+/// MUTATION CHECK (executed): delete the `summary.provider` merge in
+/// `merge_roster_summary`. Expected RUNTIME failure: JSON retains the stale
+/// digest provider `openai` instead of projecting top-level `anthropic`.
+#[test]
+fn sessions_json_projects_top_level_provider_beside_last_model() {
+    let mut current = summary_view(digest(
+        "session-provider-current",
+        ObserveRunStateWire::Idle,
+        None,
+    ));
+    let current_summary: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-provider-current",
+        "head_seq": 14,
+        "worker_generation": 8,
+        "provider": "anthropic",
+        "last_model": "claude-sonnet"
+    }))
+    .expect("current summary decodes");
+    merge_roster_summary(&mut current, &current_summary);
+    let current_json = current.json();
+    assert_eq!(current_json["provider"], "anthropic");
+    assert_eq!(current_json["model"], "claude-sonnet");
+
+    let mut legacy = summary_view(digest(
+        "session-provider-legacy",
+        ObserveRunStateWire::Idle,
+        None,
+    ));
+    let legacy_summary: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-provider-legacy",
+        "head_seq": 12,
+        "worker_generation": 7,
+        "last_model": "gpt-roster"
+    }))
+    .expect("0.0.942-shaped summary decodes");
+    merge_roster_summary(&mut legacy, &legacy_summary);
+    let legacy_json = legacy.json();
+    assert_eq!(legacy_json["provider"], "openai");
+    assert_eq!(legacy_json["model"], "gpt-roster");
 }
 
 /// MUTATION CHECK: accept ambiguous snapshot/watch flags or remove the
