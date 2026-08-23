@@ -1468,8 +1468,14 @@ fn publish_attachments(
             let queued = attachment.queued_bytes.load(Ordering::Acquire);
             if queued.saturating_add(*weight) > byte_budget {
                 metrics.catch_up_overflows.fetch_add(1, Ordering::Relaxed);
-                let _ = attachment.lagged.send(Some(attachment.last_buffered_seq));
                 attachment.active = false;
+                if attachment
+                    .lagged
+                    .send(Some(attachment.last_buffered_seq))
+                    .is_err()
+                {
+                    orphaned.push(attachment_id.clone());
+                }
                 break;
             }
             attachment.queued_bytes.fetch_add(*weight, Ordering::AcqRel);
@@ -1488,8 +1494,14 @@ fn publish_attachments(
                         orphaned.push(attachment_id.clone());
                     } else {
                         metrics.catch_up_overflows.fetch_add(1, Ordering::Relaxed);
-                        let _ = attachment.lagged.send(Some(attachment.last_buffered_seq));
                         attachment.active = false;
+                        if attachment
+                            .lagged
+                            .send(Some(attachment.last_buffered_seq))
+                            .is_err()
+                        {
+                            orphaned.push(attachment_id.clone());
+                        }
                     }
                     break;
                 }
@@ -1498,6 +1510,123 @@ fn publish_attachments(
     }
     for attachment_id in orphaned {
         attachments.remove(&attachment_id);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod discarded_result_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum LagTrigger {
+        ByteBudgetOverflow,
+        EventChannelGap,
+    }
+
+    fn lag_test_envelope() -> RawEnvelope {
+        haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id: EventId::new("discarded-result-lag"),
+            seq: 1,
+            session_id: SessionId::new("discarded-result-session"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("discarded-result-device"),
+            authority_epoch: 0,
+            worker_generation: 0,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Omit,
+            },
+            payload: serde_json::Value::Null,
+        }
+    }
+
+    fn exercise_lag_transition(
+        trigger: LagTrigger,
+        keep_lag_receiver: bool,
+    ) -> (Option<bool>, Option<u64>) {
+        let attachment_id = AttachmentId::new("discarded-result-attachment");
+        let envelope = lag_test_envelope();
+        let (events, _event_receiver) = mpsc::channel(1);
+        if matches!(trigger, LagTrigger::EventChannelGap) {
+            events
+                .try_send(QueuedEnvelope {
+                    weight: 1,
+                    envelope: Arc::new(envelope.clone()),
+                })
+                .unwrap();
+        }
+        let (lagged, lag_receiver) = watch::channel(Option::<u64>::None);
+        let lag_receiver = keep_lag_receiver.then_some(lag_receiver);
+        let mut attachments = HashMap::from([(
+            attachment_id.clone(),
+            ActorAttachment {
+                events,
+                lagged,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+                last_buffered_seq: 0,
+                active: true,
+            },
+        )]);
+        let byte_budget = match trigger {
+            LagTrigger::ByteBudgetOverflow => 0,
+            LagTrigger::EventChannelGap => usize::MAX,
+        };
+
+        publish_attachments(
+            &mut attachments,
+            &[envelope],
+            byte_budget,
+            &HubMetrics::default(),
+        );
+
+        let active = attachments
+            .get(&attachment_id)
+            .map(|attachment| attachment.active);
+        let published = lag_receiver.and_then(|receiver| *receiver.borrow());
+        (active, published)
+    }
+
+    /// MUTATION CHECK: restore both lag publications to discarded
+    /// `let _ = ...send(...)` calls. Expected failure: each trigger leaves
+    /// its receiver-less attachment present as inactive/current actor state.
+    #[test]
+    fn failed_lag_publication_removes_the_orphaned_attachment() {
+        for trigger in [LagTrigger::ByteBudgetOverflow, LagTrigger::EventChannelGap] {
+            let (active, published) = exercise_lag_transition(trigger, false);
+            assert_eq!(
+                active, None,
+                "{trigger:?} must remove an attachment that cannot receive its only lag transition"
+            );
+            assert_eq!(published, None);
+        }
+    }
+
+    /// MUTATION CHECK: make receiver cleanup unconditional after lag
+    /// publication. Expected failure: each healthy attachment disappears
+    /// instead of remaining inactive for store-backed re-registration.
+    #[test]
+    fn successful_lag_publication_keeps_the_attachment_for_reregistration() {
+        for trigger in [LagTrigger::ByteBudgetOverflow, LagTrigger::EventChannelGap] {
+            let (active, published) = exercise_lag_transition(trigger, true);
+            assert_eq!(
+                active,
+                Some(false),
+                "{trigger:?} must retain the healthy attachment on the existing lag path"
+            );
+            assert_eq!(
+                published,
+                Some(0),
+                "{trigger:?} must publish the lag cursor"
+            );
+        }
     }
 }
 

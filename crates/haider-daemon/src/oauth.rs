@@ -4346,10 +4346,16 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 
 fn respond(route: &OAuthRoute, body: ResponseBody) {
-    let _ = route.sink.try_send(WireFrame::Response {
-        request_id: route.request_id.clone(),
-        body,
-    });
+    if route
+        .sink
+        .try_send(WireFrame::Response {
+            request_id: route.request_id.clone(),
+            body,
+        })
+        .is_err()
+    {
+        route.sink.close_after_required_delivery_failure();
+    }
 }
 
 fn respond_error(route: &OAuthRoute, code: &str, message: &str, retryable: bool) {

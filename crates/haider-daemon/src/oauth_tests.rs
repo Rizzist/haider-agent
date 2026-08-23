@@ -894,6 +894,76 @@ impl FrameSink for CaptureSink {
     }
 }
 
+#[derive(Default)]
+struct RefusingRequiredResponseSink {
+    attempts: AtomicUsize,
+    closed: AtomicBool,
+}
+
+impl FrameSink for RefusingRequiredResponseSink {
+    fn try_send(&self, _frame: WireFrame) -> Result<(), FrameSendError> {
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        Err(FrameSendError)
+    }
+
+    fn close_after_required_delivery_failure(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+/// MUTATION CHECK: restore the terminal OAuth response to a discarded
+/// `let _ = route.sink.try_send(...)`. Expected failure: the flow is live and
+/// the reply was refused, but `closed` remains false so the caller gets no
+/// response or reconnect signal.
+#[tokio::test]
+async fn refused_terminal_oauth_response_closes_after_state_advances() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let coordinator = OAuthCoordinator::new(
+        "terminal-response-instance".into(),
+        OAuthProviderCatalog::with_test_registrations([
+            server.registration(Arc::new(FakeIdentityVerifier))
+        ])
+        .expect("catalog"),
+        OAuthCoordinatorConfig {
+            max_flows: 1,
+            max_invalid_callbacks: 1,
+            flow_ttl: Duration::from_secs(5),
+        },
+    )
+    .expect("coordinator");
+    let sink = Arc::new(RefusingRequiredResponseSink::default());
+    coordinator
+        .try_start(
+            "terminal-response-connection",
+            "fake-oauth".into(),
+            "terminal-response-alias".into(),
+            "terminal-response-attempt".into(),
+            OAuthRoute {
+                request_id: RequestId::new("terminal-response-request"),
+                sink: sink.clone(),
+            },
+        )
+        .expect("start handoff");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sink.attempts.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal response attempt");
+    assert_eq!(
+        coordinator.flow_count(),
+        1,
+        "OAuth state advances before its terminal start response is admitted"
+    );
+    assert!(
+        sink.closed.load(Ordering::Acquire),
+        "refusal must close the transport so the caller reconnects and rereads state"
+    );
+    assert!(coordinator.shutdown().await);
+}
+
 async fn coordinator_for(
     server: &FakeOAuthServer,
     ttl: Duration,
