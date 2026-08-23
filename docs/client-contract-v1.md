@@ -38,8 +38,66 @@ Everything else is unknown. In particular:
 - `Some(0)` and `Some(false)` are measured values; `None` is a different fact;
 - an unavailable subsystem is not an empty subsystem;
 - a lower-precedence projection may fill a value only when the higher door is
-  unavailable, and must remain visibly a fallback. It must never overwrite a
-  present higher-precedence value.
+  unavailable and must remain visibly a fallback. An exact additive-field
+  compatibility source explicitly named by this contract may fill only when
+  the promoted field is absent. Neither may overwrite a present
+  higher-precedence value.
+
+### 1.1 Facts you must not derive
+
+The following facts are already published. Clients MUST read the named source
+and MUST NOT build a substitute, even when the substitute appears to work.
+
+- **Prompt-cache rates.** The authority is
+  `SessionSummary.cache_reread_hit_basis_points` and
+  `SessionSummary.cache_lifetime_hit_basis_points` from `session.list` or
+  `SessionRosterDelta`. For an older summary that lacks those promotions, the
+  same-summary compatibility sources are respectively
+  `agent_metrics.usage.cache_reread_hit_basis_points` and
+  `agent_metrics.usage.cache_hit_basis_points`; use them only under the
+  presence rule in §9.1. Never compute either rate from token counts. Even
+  arithmetically correct division creates a second definition of the
+  denominator and coverage. The observed symptom was a footer and a web
+  client reporting 63.71% and 48% for a session whose published re-read rate
+  was 90.58%.
+
+- **Provider.** The authority for a roster row is the top-level
+  `SessionSummary.provider`. Never infer it from `last_model`, never install a
+  provider default, and never replace absence with a placeholder. Model names
+  are not provider identities, especially with configured providers. Absent
+  means unknown. The observed default was wrong for 209 of 209 rows.
+
+- **Command catalog.** The authority is the current `command.list` result for
+  the supplied query, session context, and dynamic slots. Never hard-code or
+  mirror slash-command names. The catalog is context-dependent and also
+  publishes ownership; a mirror can look complete while both its rows and
+  behavior drift. The observed substitute hand-mirrored roughly 40 commands.
+
+- **Resident binding.** The authority is the baseline and push
+  `ResidentSessionBinding` frame. Never scrape a terminal or OSC escape for
+  this fact. The frame is profile-global, last-writer-wins across N live
+  publishers; it is not a per-surface, pane, or terminal identity source. The
+  observed substitute turned the OSC 7791 compatibility announcement into a
+  second state transport and therefore could not preserve those authority
+  semantics.
+
+- **Roster facts.** For facts rendered in a roster, the winning projection is
+  the top-level field of `SessionSummary` from `session.list` or
+  `SessionRosterDelta` at that row's `head_seq`; the field-specific precedence
+  table is §8. A digest, raw-event fold, native-pipe row, or separate roster
+  store MUST NOT overwrite that projection. When a winning field is absent,
+  use only an exact additive compatibility source explicitly named by this
+  contract. A lower projection is allowed only when the winning door is
+  unavailable and must remain visibly a fallback; otherwise the fact is
+  unknown. The observed substitute kept two roster sources without a
+  precedence rule, let the poorer projection win, and destroyed a metric
+  across every row.
+
+Per-session account identity was considered for this list but is not a
+published fact today: `SessionSummary.account_alias` is currently always
+absent. There is therefore no authoritative value to tell a client to read.
+Clients must render it unknown and must not substitute the profile-global
+active account; see §16.
 
 ## 2. Profile identity and daemon discovery
 
@@ -162,8 +220,8 @@ affordance before the response exists.
 | `hooks_v1` | `hooks.list`, `hooks.trust`, `hooks.revoke`, `turn.submit_with_hook_trust`, hook events |
 | `hooks_server_v1` | long-lived JSONL hook runtime facts; no new method |
 | `agent_message_v1` | `agent.message` |
-| `shell_exec_v1` | `shell.exec` |
-| `user_command_v1` | direct-command context provenance and `shell.exec.run_id` |
+| `shell_exec_v1` | receipt-backed direct user `shell.exec` |
+| `user_command_v1` | direct user shell-command provenance/output committed into later model context and the synthetic `shell.exec.run_id` cancellation coordinate; paired with `shell_exec_v1`, unrelated to catalog `Custom` rows |
 | `tool_inventory_v1` | `tools.inventory` |
 | `vault_stage_v1` | `vault.stage` |
 | `account_login_api_v1` | `account.login_api` |
@@ -214,6 +272,28 @@ affordance before the response exists.
 | `session_attach_sealed_v1` | `session.attach.sealed_replay` |
 | `export_seq_v1` | CLI export `seq`, `head_seq`, and exact `--since`; no RPC method |
 | `pipe_native_v2` | `session.pipe_path` plus v2-or-newer native sidecar laws (current file version is 5) |
+
+### 4.1 The one feature whose absence is deliberately ambiguous
+
+Normally a feature token means “this daemon implements the named surface,” so
+its absence reads as unimplemented. `FEATURE_USER_COMMAND_V1`
+(`"user_command_v1"`) is the sole exception. In
+`crates/haider-daemon/src/connection.rs:1821`, `encode_welcome_for_peer`
+removes only this token and retries the otherwise unchanged `Welcome` when
+advertising that token is exactly what pushes the frame past the peer's
+receive-frame limit. Every other encoding failure remains fatal. The reason
+is that one additive feature must not make the whole pre-existing connection
+surface unavailable to a tightly bounded peer.
+
+For this token only, absence means **conservatively unavailable**, not
+necessarily **unimplemented**. That ambiguity does not authorize probing: the
+omitted token reports the direct-user-command semantics unavailable, and a
+typed client rejects before sending a mutating `shell.exec`. The feature is
+paired with `shell_exec_v1`: it covers committing a direct user shell
+command's provenance and output into later model context and returning a
+synthetic-run cancellation coordinate. It has nothing to do with
+`CommandCatalogItemKindWire::Custom` rows or the `custom_commands` slot of
+`command.list`.
 
 The additive `availability` field on `account.list`, `provider.list`, and
 `usage.report` has no separate token. Field presence is its feature test.
@@ -362,7 +442,7 @@ generation, or surface owner/revision as if they were one observation.
 
 | Fact being rendered | Winning client door | Lower projections and rule |
 |---|---|---|
-| Roster row, provider, last model, title, workspace, turn count, footprint, lineage, run badge/id, cache headline | `SessionSummary` from `session.list` or `SessionRosterDelta` at that head | A digest or raw-event fold is fallback only. An absent summary field stays unknown; it must not be overwritten by a guessed/default value. |
+| Roster row, provider, last model, title, workspace, turn count, footprint, lineage, run badge/id, cache headline | `SessionSummary` from `session.list` or `SessionRosterDelta` at that head | A digest or raw-event fold is fallback only. An absent top-level field stays unknown unless this contract names an exact compatibility source, as it does for the promoted cache fields in §1.1; it must never be overwritten by a guessed/default value. |
 | Detailed current run/menu/branch/subagent state | `SessionObserveDigest` at its `head_seq` | Raw events are durable facts but a client need not rebuild the daemon reducer. `metadata_only=true` authorizes only metadata/title/head/generation; projected defaults are not state. |
 | Durable event fact and replay cursor | `RawEnvelope` from read/attach | Summary/digest are projections and cannot invent or reorder the event. Preserve raw payload. |
 | Transcript display rows | a current-generation native pipe followed to full coverage | Raw item/node events are the durable fallback. At equal coverage, do not show both pipe and fallback rows. Pipe is not authority for run, account, roster, or permission state. |
@@ -370,7 +450,7 @@ generation, or surface owner/revision as if they were one observation.
 | Accounts/defaults/active aliases | `account.list` snapshot | `AccountsChanged` only invalidates. Provider rows do not replace descriptors. |
 | Provider/model inventory | `provider.list` snapshot | Account rows and a client hardcoded model list do not override it. `provider.models_refresh` produces a newer snapshot. |
 | Cross-account usage | `usage.report` | Session summaries contain only per-session promoted cache metrics, not the account report. |
-| Per-session cache health | `SessionSummary.cache_reread_hit_basis_points` | The nested same-summary `agent_metrics.usage.cache_reread_hit_basis_points` is its identical source. A locally derived rate is fallback only when both are absent and must be labeled derived. |
+| Per-session cache health | `SessionSummary.cache_reread_hit_basis_points`; use `cache_lifetime_hit_basis_points` only for the separately labeled lifetime/all-input share | The same-summary nested `agent_metrics.usage.cache_reread_hit_basis_points` and `cache_hit_basis_points` are compatibility sources only when their promoted field is absent. Never calculate a substitute from token counts. |
 | Volatile composer/status | surface watch response/delta | Journal and terminal scraping are not fallback sources. Reconnect/watch again after owner loss. |
 | Resident profile binding | `ResidentSessionBinding` baseline/push | OSC 7791 is a compatibility announcement only. The RPC value does not identify a pane; see §11. |
 | Commands and ownership | `command.list` result | Never mirror `COMMANDS`. `ClientView` is deliberately client-owned; `Unknown` is non-executable. |
@@ -396,6 +476,26 @@ another. If equal coordinates disagree, report a compatibility fault through
   availability field is omitted; those combinations are ambiguous and MUST
   render as unknown availability. Required zero coordinates elsewhere retain
   the field-specific meanings in §9.9.
+
+Fallback chains must also distinguish presence from truthiness. This common
+adoption pattern is wrong:
+
+```javascript
+value = promoted || nested; // WRONG
+```
+
+It prefers the older nested projection when `promoted` is the measured value
+zero—exactly when the promoted cache fact says the cache served nothing. Test
+whether the promoted field is present, not whether it is truthy:
+
+```javascript
+value = Object.hasOwn(summary, "cache_reread_hit_basis_points")
+  ? summary.cache_reread_hit_basis_points
+  : summary.agent_metrics?.usage?.cache_reread_hit_basis_points;
+```
+
+The same law applies to every promoted optional: present `0`, `false`, or an
+empty collection wins over an older fallback.
 
 ### 9.2 Session summary optionals
 
@@ -554,7 +654,8 @@ For each account:
   scope `run` absent means no run coordinate.
 - `CacheStatAvailability` and the request records decide whether cache splits
   exist. Never derive cache health by dividing cached tokens by some other
-  denominator when the published reread rate is available.
+  denominator. If the published rates and their exact nested compatibility
+  sources are absent, the rates are unknown.
 
 For the per-session headline, basis points are integers from 0 through 10,000.
 Use `cache_reread_hit_basis_points`. The lifetime/all-input rate includes first
@@ -940,6 +1041,17 @@ The machine-checkable contract lives in these fixtures/tests:
 - `snapshot_availability_is_compatible_in_both_n_minus_one_directions`:
   a v0.0.942-shaped reader ignores the new field while reading a new payload,
   and the current reader decodes an old payload with `availability=None`.
+
+### 15.1 A green check says what ran
+
+Test discovery is part of the receipt. In one crate, `cargo test` stopped at
+the first failing test binary, so three later binaries never ran while the
+gate printed `fail=0` and a crate containing 106 tests reported 47. In a
+downstream client, the test script hand-listed 44 file paths, so a newly added
+test file never ran; glob discovery immediately exposed three failures,
+including one in a file its author had never executed. Neither instrument was
+wrong; each answered a narrower question than the gate was asked to answer.
+**A green check is a claim about what RAN, not about what EXISTS.**
 
 Wire v1 evolves additively: new optional object fields with defaults, new
 unknown-tolerant variants, new feature-gated methods, or raw event families.
