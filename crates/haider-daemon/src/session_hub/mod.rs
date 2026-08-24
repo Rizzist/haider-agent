@@ -127,7 +127,7 @@ use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{
-    BranchId, DeviceId, EventId, GraphId, ItemId, MenuId, RunId, SessionId,
+    BranchId, CredentialAlias, DeviceId, EventId, GraphId, ItemId, MenuId, RunId, SessionId,
 };
 use haider_protocol::menu::{
     AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind,
@@ -1855,6 +1855,30 @@ impl SessionHub {
         &self,
     ) -> Result<Option<Arc<crate::usage_report::UsageReportService>>, SessionHubError> {
         Ok(lock(&self.inner.usage_report)?.clone())
+    }
+
+    pub(crate) async fn capture_haider_code_plan_status(
+        &self,
+        account_alias: CredentialAlias,
+        snapshot: haider_protocol::usage::HaiderCodePlanSnapshotV1,
+        meter: crate::haider_code_plan::PlanMeterValues,
+    ) -> Result<(), SessionHubError> {
+        if let Some(service) = self.usage_report_service()? {
+            service
+                .capture_haider_code_plan_status(&self.inner.store, account_alias, snapshot, meter)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn clear_haider_code_plan_status(
+        &self,
+        account_alias: &CredentialAlias,
+    ) -> Result<(), SessionHubError> {
+        if let Some(service) = self.usage_report_service()? {
+            service.clear_haider_code_plan_status(account_alias).await;
+        }
+        Ok(())
     }
 
     pub(crate) fn subscribe_haider_code_plan_changes(&self) -> watch::Receiver<u64> {

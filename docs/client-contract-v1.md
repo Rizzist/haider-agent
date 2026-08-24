@@ -813,6 +813,13 @@ For each account:
 - meter `metered { windows: [] }` is a successful reading with no published
   windows. `local_only` means no server meter exists. `unavailable { reason }`
   means the reading failed. These are not interchangeable.
+- Haider Code is the API-key exception to the usual local-only rule: its
+  meter provenance is a successfully held `HaiderCodePlanStatus` snapshot
+  from the existing account-plan push/poll path, not a separate usage probe.
+  Before any such status arrives it remains `local_only`; a held status makes
+  it `metered`, including `metered { windows: [] }` when no allowance percent
+  was published. A failed attempt with no new status does not fabricate a
+  meter reading or a zero window.
 - window `utilization=0.0` is measured zero use; `resets_at_ms` and `label`
   absent mean the provider did not publish them.
 - local integer zeros are measured journal-derived zeros.
@@ -873,6 +880,16 @@ must not zero-fill the former. A range element follows the same law:
 total means at least one slot was sampled and folded to zero. Hourly and daily
 views are folds on read over slot records; clients must not expect or create
 duplicate stored rollups.
+
+Meter history freezes provider-published integer facts at arrival. Haider
+Code's weekly sample comes from the plan-status push described above; exact
+used basis points are computed only from a provider integer percent remaining,
+never reconstructed from the public display float. Optional `credits` and
+`hold` are point-in-time integer balances, not allowance windows. If either
+balance was absent, its field remains absent in storage and on the wire; a
+reader must never display that absence as zero. Haider Code's current
+structured account `hold` flags/reason are not an integer held balance and
+must not be coerced into this field.
 
 Lane descriptors are an append-only dictionary. `role` separates `root` and
 `subagent` lanes, including when every other descriptor field matches. An

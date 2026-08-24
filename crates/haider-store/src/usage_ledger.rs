@@ -228,7 +228,10 @@ impl UsageLedgerWriter {
             .as_object_mut()
             .ok_or_else(|| corrupt("meter record did not encode as an object"))?;
         insert_optional(object, "resets_at_ms", sample.resets_at_ms);
+        insert_optional(object, "grace_until_ms", sample.grace_until_ms);
         insert_optional_clone(object, "plan", sample.plan.as_ref());
+        insert_optional(object, "credits", sample.credits);
+        insert_optional(object, "hold", sample.hold);
         insert_optional(object, "stale", sample.stale);
         append_json_line(&mut file, &value)?;
         file.sync_data()
@@ -583,8 +586,11 @@ fn read_day_file(path: &Path) -> StoreResult<UsageHistoryDayV1> {
                     window: required_string(&value, "window")?,
                     basis_points,
                     resets_at_ms: optional_u64(&value, "resets_at_ms")?,
+                    grace_until_ms: optional_u64(&value, "grace_until_ms")?,
                     sampled_at_ms: required_u64(&value, "sampled_at_ms")?,
                     plan: optional_string(&value, "plan")?,
+                    credits: optional_i64(&value, "credits")?,
+                    hold: optional_i64(&value, "hold")?,
                     stale: optional_bool(&value, "stale")?,
                 });
             }
@@ -1044,6 +1050,16 @@ fn optional_u64(value: &Value, key: &str) -> StoreResult<Option<u64>> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| corrupt(format!("usage-history field `{key}` is not an integer"))),
+    }
+}
+
+fn optional_i64(value: &Value, key: &str) -> StoreResult<Option<i64>> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(raw) => raw
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| corrupt(format!("usage-history field {key} is not an integer"))),
     }
 }
 

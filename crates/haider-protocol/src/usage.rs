@@ -84,9 +84,21 @@ pub struct UsageHistoryMeterSampleV1 {
     pub basis_points: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until_ms: Option<u64>,
     pub sampled_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Provider-published integer credit balance, carried verbatim. This is
+    /// a point-in-time balance, not a rate-limit window; absence means the
+    /// provider did not publish it and must never be rendered as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<i64>,
+    /// Provider-published integer held balance, carried verbatim. This is a
+    /// point-in-time balance, not a rate-limit window; absence means the
+    /// provider did not publish it and must never be rendered as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale: Option<bool>,
 }

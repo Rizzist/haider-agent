@@ -2986,8 +2986,11 @@ fn usage_history_wire_preserves_absence() {
                 window: "five_hour".into(),
                 basis_points: 6_789,
                 resets_at_ms: None,
+                grace_until_ms: None,
                 sampled_at_ms: 1,
                 plan: None,
+                credits: None,
+                hold: None,
                 stale: None,
             }],
             version_changes: Vec::new(),
@@ -2999,6 +3002,29 @@ fn usage_history_wire_preserves_absence() {
     assert!(value["day"]["slots"][0].is_null());
     assert!(value["day"]["slots"][1].is_object());
     assert_eq!(value["day"]["meter_samples"][0]["basis_points"], 6_789);
+    assert!(
+        value["day"]["meter_samples"][0]
+            .as_object()
+            .is_some_and(|sample| !sample.contains_key("credits") && !sample.contains_key("hold")),
+        "absent balances must remain absent on the wire"
+    );
+    let legacy_sample: UsageHistoryMeterSampleV1 = serde_json::from_value(serde_json::json!({
+        "account": "work",
+        "window": "weekly",
+        "basis_points": 0,
+        "sampled_at_ms": 1
+    }))
+    .expect("pre-balance sample decodes");
+    assert_eq!(legacy_sample.credits, None);
+    assert_eq!(legacy_sample.hold, None);
+    let published_zero = UsageHistoryMeterSampleV1 {
+        credits: Some(0),
+        hold: Some(0),
+        ..legacy_sample
+    };
+    let published_zero = serde_json::to_value(published_zero).expect("published zero encodes");
+    assert_eq!(published_zero["credits"], 0);
+    assert_eq!(published_zero["hold"], 0);
 
     let range = ResponseBody::UsageHistoryRange {
         through_date: "2026-08-24".into(),

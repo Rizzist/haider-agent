@@ -48,9 +48,36 @@ pub(crate) enum PlanTransientFailure {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PlanFetchOutcome {
-    Snapshot(HaiderCodePlanSnapshotV1),
+    Snapshot(PlanSnapshot),
     Unauthorized,
     Transient(PlanTransientFailure),
+}
+
+/// Provider-number provenance that the public plan-status DTO intentionally
+/// does not encode. Only integer JSON tokens enter this shape; a decimal
+/// token remains available in `snapshot` for display but cannot later be
+/// rounded back into ledger authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlanMeterValues {
+    pub weekly_percent_remaining: Option<u64>,
+    pub credits: Option<i64>,
+    pub hold: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlanSnapshot {
+    pub snapshot: HaiderCodePlanSnapshotV1,
+    pub meter: PlanMeterValues,
+}
+
+impl PlanSnapshot {
+    #[cfg(test)]
+    pub(crate) fn without_meter(snapshot: HaiderCodePlanSnapshotV1) -> Self {
+        Self {
+            snapshot,
+            meter: PlanMeterValues::default(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -147,7 +174,28 @@ pub(crate) fn classify_account_response(status: u16, body: &[u8]) -> PlanFetchOu
         return PlanFetchOutcome::Transient(PlanTransientFailure::HttpStatus(status));
     }
     match parse_haider_code_account(body) {
-        Ok(snapshot) => PlanFetchOutcome::Snapshot(snapshot),
+        Ok(snapshot) => {
+            let raw = serde_json::from_slice::<serde_json::Value>(body).ok();
+            let integer_at = |pointer: &str| {
+                raw.as_ref()
+                    .and_then(|value| value.pointer(pointer))
+                    .and_then(serde_json::Value::as_u64)
+            };
+            PlanFetchOutcome::Snapshot(PlanSnapshot {
+                snapshot,
+                meter: PlanMeterValues {
+                    weekly_percent_remaining: integer_at("/weekly_allowance/percent_remaining"),
+                    credits: raw
+                        .as_ref()
+                        .and_then(|value| value.pointer("/usage_credits_usd"))
+                        .and_then(serde_json::Value::as_i64),
+                    // The current `hold` plan field is structured account
+                    // state (flags/reason), not an integer held balance. Do
+                    // not coerce that independent fact into a ledger amount.
+                    hold: None,
+                },
+            })
+        }
         Err(_) => PlanFetchOutcome::Transient(PlanTransientFailure::MalformedPayload),
     }
 }
@@ -243,6 +291,13 @@ pub(crate) trait PlanInterestSource: Send + Sync {
         account_alias: CredentialAlias,
         outcome: HaiderCodePlanOutcomeV1,
     );
+    async fn capture(
+        &self,
+        account_alias: CredentialAlias,
+        snapshot: HaiderCodePlanSnapshotV1,
+        meter: PlanMeterValues,
+    );
+    async fn clear(&self, account_alias: &CredentialAlias);
 }
 
 #[async_trait::async_trait]
@@ -293,6 +348,21 @@ impl PlanInterestSource for SessionHub {
                 outcome,
             },
         );
+    }
+
+    async fn capture(
+        &self,
+        account_alias: CredentialAlias,
+        snapshot: HaiderCodePlanSnapshotV1,
+        meter: PlanMeterValues,
+    ) {
+        let _capture_result = self
+            .capture_haider_code_plan_status(account_alias, snapshot, meter)
+            .await;
+    }
+
+    async fn clear(&self, account_alias: &CredentialAlias) {
+        let _clear_result = self.clear_haider_code_plan_status(account_alias).await;
     }
 }
 
@@ -380,6 +450,9 @@ pub(crate) async fn run_plan_poller(
             continue;
         }
         let Some(account) = account_source.active_account() else {
+            if let Some(descriptor) = observed_account.as_ref() {
+                interest_source.clear(&descriptor.alias).await;
+            }
             observed_account = None;
             cached_publication = None;
             deadline = None;
@@ -398,6 +471,9 @@ pub(crate) async fn run_plan_poller(
 
         let account_changed = observed_account.as_ref() != Some(&account.descriptor);
         if account_changed {
+            if let Some(descriptor) = observed_account.as_ref() {
+                interest_source.clear(&descriptor.alias).await;
+            }
             observed_account = Some(account.descriptor.clone());
             cached_publication = None;
             deadline = Some(Instant::now());
@@ -447,12 +523,14 @@ pub(crate) async fn run_plan_poller(
         // a duplicate replay after its replacement response is published.
         account_changes.borrow_and_update();
         let Some(current) = account_source.active_account() else {
+            interest_source.clear(&account.descriptor.alias).await;
             observed_account = None;
             cached_publication = None;
             deadline = None;
             continue;
         };
         if !same_account(&account, &current) {
+            interest_source.clear(&account.descriptor.alias).await;
             observed_account = Some(current.descriptor);
             cached_publication = None;
             deadline = Some(Instant::now());
@@ -462,15 +540,23 @@ pub(crate) async fn run_plan_poller(
         let recipients = interest_source.recipients().await;
 
         match fetched {
-            PlanFetchOutcome::Snapshot(snapshot) => {
-                deadline = Some(Instant::now() + cadence(&snapshot));
-                let outcome = published_outcome(snapshot);
+            PlanFetchOutcome::Snapshot(reading) => {
+                deadline = Some(Instant::now() + cadence(&reading.snapshot));
+                interest_source
+                    .capture(
+                        account.descriptor.alias.clone(),
+                        reading.snapshot.clone(),
+                        reading.meter,
+                    )
+                    .await;
+                let outcome = published_outcome(reading.snapshot);
                 cached_publication = Some((account.descriptor.alias.clone(), outcome.clone()));
                 if !recipients.is_empty() {
                     interest_source.publish(&recipients, account.descriptor.alias, outcome);
                 }
             }
             PlanFetchOutcome::Unauthorized => {
+                interest_source.clear(&account.descriptor.alias).await;
                 cached_publication = Some((
                     account.descriptor.alias.clone(),
                     HaiderCodePlanOutcomeV1::Unauthorized,

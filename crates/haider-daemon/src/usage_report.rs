@@ -9,6 +9,10 @@
 //!   typed `unavailable` with a bounded reason — cached like a success so
 //!   failures cannot turn into hammering, and never replaced by stale
 //!   "good" numbers.
+//! - **Haider Code plan meter** — no independent probe exists. The
+//!   active-session `/v1/account` plan-status push deposits the held snapshot
+//!   here and appends its exact-integer weekly allowance opportunistically.
+//!   With no held status, the API-key account remains honest `local_only`.
 //! - **Local accounting** — a journal fold per session: cumulative
 //!   [`haider_protocol::EventPayload::Usage`] snapshots keyed by
 //!   `(run, agent)` (last snapshot wins; summing them would double-count),
@@ -43,7 +47,8 @@ use haider_protocol::provider::{
 use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageRequestScopeV1,
-    CacheUsageRequestV1, CacheUsageStatsV1, LocalUsageStatsV1, UsageReportV1,
+    CacheUsageRequestV1, CacheUsageStatsV1, HaiderCodePlanSnapshotV1, LocalUsageStatsV1,
+    UsageHistoryMeterSampleV1, UsageReportV1, UsageWindowV1,
 };
 use haider_provider::{MeterReading, MeterUnavailable, UsageMeterEndpoint};
 use serde::Deserialize;
@@ -231,6 +236,11 @@ struct MeterCacheEntry {
     token_identity: OpenAiTokenIdentity,
 }
 
+#[derive(Debug, Clone)]
+struct HeldHaiderCodePlan {
+    snapshot: HaiderCodePlanSnapshotV1,
+}
+
 /// The installed `usage.report` service (hub seam, like the worker manager).
 pub(crate) struct UsageReportService {
     snapshot: AccountsSnapshot,
@@ -238,6 +248,7 @@ pub(crate) struct UsageReportService {
     http: Arc<dyn UsageMeterHttp>,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     cache: tokio::sync::Mutex<HashMap<(String, CredentialAlias), MeterCacheEntry>>,
+    haider_code_plans: tokio::sync::Mutex<HashMap<CredentialAlias, HeldHaiderCodePlan>>,
 }
 
 fn system_now_ms() -> u64 {
@@ -269,7 +280,67 @@ impl UsageReportService {
             http,
             clock,
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            haider_code_plans: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Holds one successfully received Haider Code plan status and freezes
+    /// its weekly allowance into history when (and only when) the source JSON
+    /// published an integer percent. This is fed by the existing plan poller;
+    /// it never starts a second probe or changes that poller's cadence.
+    pub(crate) async fn capture_haider_code_plan_status(
+        &self,
+        store: &haider_core::SqliteStoreHandle,
+        account_alias: CredentialAlias,
+        snapshot: HaiderCodePlanSnapshotV1,
+        meter: crate::haider_code_plan::PlanMeterValues,
+    ) -> Result<(), haider_protocol::error::HaiderError> {
+        self.haider_code_plans.lock().await.insert(
+            account_alias.clone(),
+            HeldHaiderCodePlan {
+                snapshot: snapshot.clone(),
+            },
+        );
+
+        let Some(allowance) = snapshot.weekly_allowance.as_ref() else {
+            return Ok(());
+        };
+        let Some(percent_remaining) = meter.weekly_percent_remaining else {
+            // A float remains usable by the current report surface, but the
+            // history reader must never reconstruct an integer from it.
+            return Ok(());
+        };
+        let Some(used_percent) = 100_u64.checked_sub(percent_remaining) else {
+            return Ok(());
+        };
+        // Exact provider-integer arithmetic: used basis points are
+        // (100 - published whole percent remaining) * 100. No float enters
+        // this derivation and no reader is permitted to reconstruct it.
+        let Some(basis_points) = used_percent
+            .checked_mul(100)
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            return Ok(());
+        };
+
+        store
+            .append_usage_meter_sample(UsageHistoryMeterSampleV1 {
+                account: account_alias.as_str().to_owned(),
+                window: "weekly".into(),
+                basis_points,
+                resets_at_ms: allowance.resets_at_ms,
+                grace_until_ms: allowance.grace_until_ms,
+                sampled_at_ms: (self.clock)(),
+                plan: snapshot.plan.clone(),
+                credits: meter.credits,
+                hold: meter.hold,
+                stale: snapshot.cached,
+            })
+            .await
+    }
+
+    pub(crate) async fn clear_haider_code_plan_status(&self, account_alias: &CredentialAlias) {
+        self.haider_code_plans.lock().await.remove(account_alias);
     }
 
     fn descriptors(&self) -> Vec<CredentialDescriptor> {
@@ -287,49 +358,65 @@ impl UsageReportService {
         store: &haider_core::SqliteStoreHandle,
     ) -> Result<UsageReportV1, haider_protocol::error::HaiderError> {
         let local = collect_local_stats(store).await?;
+        let haider_code_plans = self.haider_code_plans.lock().await.clone();
         let mut accounts = Vec::new();
         for descriptor in self.descriptors() {
             let mut plan = None;
             let mut identity = Some(descriptor.identity.clone()).filter(|id| !id.is_empty());
-            let meter = match meter_for(&descriptor) {
-                None => AccountMeterStateV1::LocalOnly,
-                Some(endpoint) => {
-                    let entry = self.metered(endpoint, &descriptor).await;
-                    if let Some(email) = entry.token_identity.email {
-                        identity = Some(email);
+            let meter = if descriptor.provider == haider_provider::HAIDER_CODE_PROVIDER_NAME {
+                match haider_code_plans.get(&descriptor.alias) {
+                    Some(held) => {
+                        plan.clone_from(&held.snapshot.plan);
+                        AccountMeterStateV1::Metered {
+                            windows: haider_code_windows(&held.snapshot),
+                        }
                     }
-                    plan = entry.token_identity.plan;
-                    match entry.outcome {
-                        Ok(reading) => {
-                            if reading.plan.is_some() {
-                                plan.clone_from(&reading.plan);
-                            }
-                            if entry.fresh {
-                                for (window, basis_points) in
-                                    reading.windows.iter().zip(&reading.basis_points)
-                                {
-                                    store
-                                        .append_usage_meter_sample(
-                                            haider_protocol::usage::UsageHistoryMeterSampleV1 {
-                                                account: descriptor.alias.as_str().to_owned(),
-                                                window: window.window.clone(),
-                                                basis_points: *basis_points,
-                                                resets_at_ms: window.resets_at_ms,
-                                                sampled_at_ms: entry.fetched_at_ms,
-                                                plan: plan.clone(),
-                                                stale: None,
-                                            },
-                                        )
-                                        .await?;
+                    None => AccountMeterStateV1::LocalOnly,
+                }
+            } else {
+                match meter_for(&descriptor) {
+                    None => AccountMeterStateV1::LocalOnly,
+                    Some(endpoint) => {
+                        let entry = self.metered(endpoint, &descriptor).await;
+                        if let Some(email) = entry.token_identity.email {
+                            identity = Some(email);
+                        }
+                        plan = entry.token_identity.plan;
+                        match entry.outcome {
+                            Ok(reading) => {
+                                if reading.plan.is_some() {
+                                    plan.clone_from(&reading.plan);
+                                }
+                                if entry.fresh {
+                                    for (window, basis_points) in
+                                        reading.windows.iter().zip(&reading.basis_points)
+                                    {
+                                        store
+                                            .append_usage_meter_sample(
+                                                haider_protocol::usage::UsageHistoryMeterSampleV1 {
+                                                    account: descriptor.alias.as_str().to_owned(),
+                                                    window: window.window.clone(),
+                                                    basis_points: *basis_points,
+                                                    resets_at_ms: window.resets_at_ms,
+                                                    grace_until_ms: None,
+                                                    sampled_at_ms: entry.fetched_at_ms,
+                                                    plan: plan.clone(),
+                                                    credits: None,
+                                                    hold: None,
+                                                    stale: None,
+                                                },
+                                            )
+                                            .await?;
+                                    }
+                                }
+                                AccountMeterStateV1::Metered {
+                                    windows: reading.windows,
                                 }
                             }
-                            AccountMeterStateV1::Metered {
-                                windows: reading.windows,
-                            }
+                            Err(unavailable) => AccountMeterStateV1::Unavailable {
+                                reason: unavailable.reason,
+                            },
                         }
-                        Err(unavailable) => AccountMeterStateV1::Unavailable {
-                            reason: unavailable.reason,
-                        },
                     }
                 }
             };
@@ -426,6 +513,21 @@ impl UsageReportService {
         };
         (outcome, token_identity)
     }
+}
+
+fn haider_code_windows(snapshot: &HaiderCodePlanSnapshotV1) -> Vec<UsageWindowV1> {
+    let Some(allowance) = snapshot.weekly_allowance.as_ref() else {
+        return Vec::new();
+    };
+    let Some(percent_remaining) = allowance.percent_remaining else {
+        return Vec::new();
+    };
+    vec![UsageWindowV1 {
+        window: "weekly".into(),
+        utilization: ((100.0 - percent_remaining) / 100.0).clamp(0.0, 1.0),
+        resets_at_ms: allowance.resets_at_ms,
+        label: None,
+    }]
 }
 
 // --- local accounting -----------------------------------------------------

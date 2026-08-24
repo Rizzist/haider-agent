@@ -16,8 +16,8 @@ use tokio::sync::{Notify, watch};
 
 use super::haider_code_plan::{
     ActivePlanAccount, HaiderCodePlanHttp, PlanAccountSource, PlanCredentialSource,
-    PlanFetchOutcome, PlanInterestSource, PlanTransientFailure, cadence, classify_account_response,
-    published_outcome, run_plan_poller,
+    PlanFetchOutcome, PlanInterestSource, PlanMeterValues, PlanSnapshot, PlanTransientFailure,
+    cadence, classify_account_response, published_outcome, run_plan_poller,
 };
 
 fn descriptor(alias: &str) -> CredentialDescriptor {
@@ -113,6 +113,7 @@ struct FakeInterest {
     recipients: Mutex<Vec<String>>,
     changes: watch::Sender<u64>,
     publications: Mutex<Vec<Publication>>,
+    captures: Mutex<Vec<(CredentialAlias, HaiderCodePlanSnapshotV1, PlanMeterValues)>>,
 }
 
 impl FakeInterest {
@@ -121,11 +122,16 @@ impl FakeInterest {
             recipients: Mutex::new(recipients),
             changes: watch::Sender::new(0),
             publications: Mutex::new(Vec::new()),
+            captures: Mutex::new(Vec::new()),
         }
     }
 
     fn publications(&self) -> Vec<Publication> {
         self.publications.lock().expect("publication lock").clone()
+    }
+
+    fn captures(&self) -> Vec<(CredentialAlias, HaiderCodePlanSnapshotV1, PlanMeterValues)> {
+        self.captures.lock().expect("capture lock").clone()
     }
 
     fn wake(&self) {
@@ -159,6 +165,20 @@ impl PlanInterestSource for FakeInterest {
                 outcome,
             });
     }
+
+    async fn capture(
+        &self,
+        account_alias: CredentialAlias,
+        snapshot: HaiderCodePlanSnapshotV1,
+        meter: PlanMeterValues,
+    ) {
+        self.captures
+            .lock()
+            .expect("capture lock")
+            .push((account_alias, snapshot, meter));
+    }
+
+    async fn clear(&self, _account_alias: &CredentialAlias) {}
 }
 
 struct FakeHttp {
@@ -233,6 +253,10 @@ fn snapshot(refresh_after_s: Option<u64>) -> HaiderCodePlanSnapshotV1 {
     }
 }
 
+fn fetched_snapshot(refresh_after_s: Option<u64>) -> PlanFetchOutcome {
+    PlanFetchOutcome::Snapshot(PlanSnapshot::without_meter(snapshot(refresh_after_s)))
+}
+
 async fn wait_for(mut predicate: impl FnMut() -> bool) {
     for _ in 0..100 {
         if predicate() {
@@ -269,8 +293,8 @@ async fn refresh_after_s_drives_the_next_poll() {
     let credentials = Arc::new(FakeCredentials::new(&[("first", b"hk-first")]));
     let interest = Arc::new(FakeInterest::new(vec!["connection".into()]));
     let http = Arc::new(FakeHttp::new([
-        PlanFetchOutcome::Snapshot(snapshot(Some(23))),
-        PlanFetchOutcome::Snapshot(snapshot(Some(23))),
+        fetched_snapshot(Some(23)),
+        fetched_snapshot(Some(23)),
     ]));
     let (stop, task) = start_fake_poller(accounts, credentials, interest, Arc::clone(&http)).await;
 
@@ -294,8 +318,8 @@ async fn interest_wakes_do_not_bypass_the_server_cadence() {
     let credentials = Arc::new(FakeCredentials::new(&[("first", b"hk-first")]));
     let interest = Arc::new(FakeInterest::new(vec!["connection".into()]));
     let http = Arc::new(FakeHttp::new([
-        PlanFetchOutcome::Snapshot(snapshot(Some(23))),
-        PlanFetchOutcome::Snapshot(snapshot(Some(23))),
+        fetched_snapshot(Some(23)),
+        fetched_snapshot(Some(23)),
     ]));
     let (stop, task) = start_fake_poller(
         accounts,
@@ -328,6 +352,49 @@ fn cadence_clamps_bad_values_and_defaults_only_when_absent() {
     assert_eq!(cadence(&snapshot(Some(0))), Duration::from_secs(15));
     assert_eq!(cadence(&snapshot(Some(37))), Duration::from_secs(37));
     assert_eq!(cadence(&snapshot(None)), Duration::from_secs(60));
+}
+
+/// MUTATION CHECK: put ledger capture in the client publication/replay path.
+/// Expected runtime failure: waking interest replays the held frame and
+/// increments captures from one to two without another provider arrival.
+#[tokio::test]
+async fn one_provider_arrival_is_captured_once_not_on_cached_replay() {
+    let accounts = Arc::new(FakeAccounts::new(1, descriptor("first")));
+    let credentials = Arc::new(FakeCredentials::new(&[("first", b"hk-first")]));
+    let interest = Arc::new(FakeInterest::new(vec!["connection".into()]));
+    let mut status = snapshot(Some(60));
+    status
+        .weekly_allowance
+        .as_mut()
+        .expect("weekly allowance")
+        .percent_remaining = Some(61.0);
+    let http = Arc::new(FakeHttp::new([PlanFetchOutcome::Snapshot(PlanSnapshot {
+        snapshot: status,
+        meter: PlanMeterValues {
+            weekly_percent_remaining: Some(61),
+            credits: None,
+            hold: None,
+        },
+    })]));
+    let (stop, task) = start_fake_poller(
+        accounts,
+        credentials,
+        Arc::clone(&interest),
+        Arc::clone(&http),
+    )
+    .await;
+
+    wait_for(|| interest.captures().len() == 1 && interest.publications().len() == 1).await;
+    interest.wake();
+    wait_for(|| interest.publications().len() == 2).await;
+    assert_eq!(http.call_count(), 1);
+    let captures = interest.captures();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].0, CredentialAlias::new("first"));
+    assert_eq!(captures[0].2.weekly_percent_remaining, Some(61));
+
+    stop.send_replace(true);
+    task.await.expect("poller joins");
 }
 
 /// MUTATION CHECK: deserialize an unknown allowance state as `Ok`. Expected
@@ -369,6 +436,51 @@ fn payload_ignores_unknown_fields_and_defaults_absent_optionals() {
     assert_eq!(parsed.refresh_after_s, None);
     assert_eq!(parsed.hold, None);
     assert_eq!(parsed.usage_credits_usd, None);
+}
+
+/// MUTATION CHECK: reconstruct basis points from the public `f64` plan DTO
+/// instead of retaining the source JSON-number kind. Expected runtime
+/// failure: the decimal token incorrectly gains integer meter provenance.
+#[test]
+fn meter_provenance_accepts_only_provider_integer_tokens() {
+    let integer = classify_account_response(
+        200,
+        br#"{"weekly_allowance":{"percent_remaining":61},"usage_credits_usd":9,"hold":{"api_locked":false}}"#,
+    );
+    let PlanFetchOutcome::Snapshot(integer) = integer else {
+        panic!("integer plan snapshot");
+    };
+    assert_eq!(integer.meter.weekly_percent_remaining, Some(61));
+    assert_eq!(integer.meter.credits, Some(9));
+    assert_eq!(integer.meter.hold, None);
+    assert_eq!(
+        integer
+            .snapshot
+            .hold
+            .as_ref()
+            .and_then(|hold| hold.api_locked),
+        Some(false),
+        "structured account hold state remains in plan status"
+    );
+
+    let decimal = classify_account_response(
+        200,
+        br#"{"weekly_allowance":{"percent_remaining":61.0},"usage_credits_usd":9.0}"#,
+    );
+    let PlanFetchOutcome::Snapshot(decimal) = decimal else {
+        panic!("decimal plan snapshot");
+    };
+    assert_eq!(
+        decimal
+            .snapshot
+            .weekly_allowance
+            .as_ref()
+            .and_then(|allowance| allowance.percent_remaining),
+        Some(61.0),
+        "the plan-status display still preserves the provider float"
+    );
+    assert_eq!(decimal.meter.weekly_percent_remaining, None);
+    assert_eq!(decimal.meter.credits, None);
 }
 
 /// MUTATION CHECK: classify a literal HTTP 401 as transport failure or a
@@ -426,7 +538,10 @@ async fn unauthorized_hold_and_network_are_three_distinct_outcomes() {
         subscribe_banned: Some(false),
         reason: Some("verify billing".into()),
     });
-    let halted = publications_for(PlanFetchOutcome::Snapshot(held)).await;
+    let halted = publications_for(PlanFetchOutcome::Snapshot(PlanSnapshot::without_meter(
+        held,
+    )))
+    .await;
     assert!(matches!(
         halted.as_slice(),
         [Publication {
@@ -492,8 +607,8 @@ async fn poller_follows_an_account_switch_during_a_request() {
     ]));
     let interest = Arc::new(FakeInterest::new(vec!["connection".into()]));
     let http = Arc::new(FakeHttp::blocking_first([
-        PlanFetchOutcome::Snapshot(snapshot(Some(60))),
-        PlanFetchOutcome::Snapshot(snapshot(Some(60))),
+        fetched_snapshot(Some(60)),
+        fetched_snapshot(Some(60)),
     ]));
     let (stop, task) = start_fake_poller(
         Arc::clone(&accounts),
@@ -527,9 +642,7 @@ async fn no_active_provider_session_means_no_network_request() {
     let accounts = Arc::new(FakeAccounts::new(1, descriptor("first")));
     let credentials = Arc::new(FakeCredentials::new(&[("first", b"hk-first")]));
     let interest = Arc::new(FakeInterest::new(Vec::new()));
-    let http = Arc::new(FakeHttp::new([PlanFetchOutcome::Snapshot(snapshot(Some(
-        15,
-    )))]));
+    let http = Arc::new(FakeHttp::new([fetched_snapshot(Some(15))]));
     let (stop, task) = start_fake_poller(accounts, credentials, interest, Arc::clone(&http)).await;
 
     tokio::task::yield_now().await;

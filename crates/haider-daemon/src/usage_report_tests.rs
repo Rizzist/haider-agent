@@ -20,13 +20,17 @@ use haider_protocol::provider::{
     UsageRequestKind, UsageScope, UsageSource,
 };
 use haider_protocol::session::ModelSelected;
-use haider_protocol::usage::AccountMeterStateV1;
+use haider_protocol::usage::{
+    AccountMeterStateV1, HaiderCodeAllowanceStateV1, HaiderCodePlanSnapshotV1,
+    HaiderCodeWeeklyAllowanceV1,
+};
 use haider_provider::MeterUnavailable;
 
 use super::{
     MeterTokenSource, OpenAiTokenIdentity, SessionFolder, UsageMeterHttp, UsageReportService,
     attribute_session, meter_for, openai_token_identity,
 };
+use crate::haider_code_plan::{PlanFetchOutcome, PlanMeterValues, classify_account_response};
 
 /// The exact anthropic-oauth body captured LIVE on 2026-08-05 (also frozen
 /// as `haider-provider/tests/fixtures/usage/anthropic_oauth_usage_live.json`).
@@ -174,6 +178,244 @@ async fn api_key_and_custom_accounts_are_local_only_and_never_probe_http() {
         }
     );
     assert_eq!(http.calls(), 0, "no meter endpoint may be probed");
+}
+
+/// MUTATION CHECK: route Haider Code through the OAuth-only `meter_for`, use
+/// the public float to derive history basis points, or default missing credit
+/// balances to zero. Expected runtime failure: LocalOnly/Metered transitions,
+/// exact 3900 bp, sample count, or `credits=None` changes.
+#[tokio::test]
+async fn haider_code_held_plan_is_metered_and_arrival_appends_one_exact_sample() {
+    let clock = Arc::new(AtomicU64::new(1_777_075_200_000));
+    let service = service_with_clock(
+        vec![descriptor("haider-code", "haider-main", AuthMethod::ApiKey)],
+        None,
+        Arc::new(StubHttp::new([])),
+        Arc::clone(&clock),
+    );
+    let (_root, store) = empty_store().await;
+
+    let before = service.report(&store).await.expect("report before status");
+    assert_eq!(before.accounts[0].meter, AccountMeterStateV1::LocalOnly);
+
+    let snapshot = HaiderCodePlanSnapshotV1 {
+        plan: Some("go-max".into()),
+        plan_label: Some("Go Max".into()),
+        weekly_allowance: Some(HaiderCodeWeeklyAllowanceV1 {
+            percent_remaining: Some(61.0),
+            state: Some(HaiderCodeAllowanceStateV1::Ok),
+            resets_at_ms: Some(1_900_000_000_000),
+            grace_until_ms: Some(1_900_000_060_000),
+        }),
+        usage_credits_usd: None,
+        auto_topup_enabled: None,
+        hold: None,
+        models_live: None,
+        refresh_after_s: Some(37),
+        cached: Some(false),
+    };
+    service
+        .capture_haider_code_plan_status(
+            &store,
+            CredentialAlias::new("haider-main"),
+            snapshot,
+            PlanMeterValues {
+                weekly_percent_remaining: Some(61),
+                credits: None,
+                hold: None,
+            },
+        )
+        .await
+        .expect("capture plan status");
+
+    let after = service.report(&store).await.expect("report after status");
+    assert_eq!(after.accounts[0].plan.as_deref(), Some("go-max"));
+    let AccountMeterStateV1::Metered { windows } = &after.accounts[0].meter else {
+        panic!("held Haider Code plan must be metered");
+    };
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].window, "weekly");
+    assert!((windows[0].utilization - 0.39).abs() < 1e-12);
+
+    let day = store
+        .usage_history_day("2026-04-25".into())
+        .await
+        .expect("history read")
+        .expect("history day");
+    assert_eq!(day.meter_samples.len(), 1);
+    let sample = &day.meter_samples[0];
+    assert_eq!(sample.account, "haider-main");
+    assert_eq!(sample.window, "weekly");
+    assert_eq!(sample.basis_points, 3_900);
+    assert_eq!(sample.resets_at_ms, Some(1_900_000_000_000));
+    assert_eq!(sample.grace_until_ms, Some(1_900_000_060_000));
+    assert_eq!(sample.plan.as_deref(), Some("go-max"));
+    assert_eq!(sample.credits, None, "absence is not a zero balance");
+    assert_eq!(sample.hold, None, "structured hold state is not a balance");
+    assert_eq!(sample.stale, Some(false));
+
+    let _ = service.report(&store).await.expect("second report");
+    let day = store
+        .usage_history_day("2026-04-25".into())
+        .await
+        .expect("second history read")
+        .expect("history day");
+    assert_eq!(
+        day.meter_samples.len(),
+        1,
+        "report rendering must not duplicate an arrival sample"
+    );
+}
+
+/// MUTATION CHECK: drop `meter.credits` at the capture-to-ledger seam.
+/// Expected runtime failure: the raw provider integer no longer reaches the
+/// frozen sample verbatim even though classification retained its provenance.
+#[tokio::test]
+async fn haider_code_integer_credit_arrival_reaches_ledger_verbatim() {
+    let clock = Arc::new(AtomicU64::new(1_777_075_200_000));
+    let service = service_with_clock(
+        vec![descriptor("haider-code", "haider-main", AuthMethod::ApiKey)],
+        None,
+        Arc::new(StubHttp::new([])),
+        clock,
+    );
+    let (_root, store) = empty_store().await;
+    let reading = classify_account_response(
+        200,
+        br#"{
+          "plan":"go",
+          "weekly_allowance":{"percent_remaining":61},
+          "usage_credits_usd":-17
+        }"#,
+    );
+    let PlanFetchOutcome::Snapshot(reading) = reading else {
+        panic!("provider plan snapshot");
+    };
+    service
+        .capture_haider_code_plan_status(
+            &store,
+            CredentialAlias::new("haider-main"),
+            reading.snapshot,
+            reading.meter,
+        )
+        .await
+        .expect("capture integer balance");
+
+    let day = store
+        .usage_history_day("2026-04-25".into())
+        .await
+        .expect("history read")
+        .expect("history day");
+    assert_eq!(day.meter_samples.len(), 1);
+    assert_eq!(day.meter_samples[0].basis_points, 3_900);
+    assert_eq!(day.meter_samples[0].credits, Some(-17));
+}
+
+#[tokio::test]
+async fn haider_code_float_percent_is_held_but_never_written_to_history() {
+    let clock = Arc::new(AtomicU64::new(1_777_075_200_000));
+    let service = service_with_clock(
+        vec![descriptor("haider-code", "haider-main", AuthMethod::ApiKey)],
+        None,
+        Arc::new(StubHttp::new([])),
+        clock,
+    );
+    let (_root, store) = empty_store().await;
+    let snapshot = HaiderCodePlanSnapshotV1 {
+        plan: Some("go".into()),
+        plan_label: None,
+        weekly_allowance: Some(HaiderCodeWeeklyAllowanceV1 {
+            percent_remaining: Some(61.25),
+            state: None,
+            resets_at_ms: None,
+            grace_until_ms: None,
+        }),
+        usage_credits_usd: None,
+        auto_topup_enabled: None,
+        hold: None,
+        models_live: None,
+        refresh_after_s: None,
+        cached: None,
+    };
+    service
+        .capture_haider_code_plan_status(
+            &store,
+            CredentialAlias::new("haider-main"),
+            snapshot,
+            PlanMeterValues::default(),
+        )
+        .await
+        .expect("hold float status");
+
+    let report = service.report(&store).await.expect("float report");
+    assert!(matches!(
+        report.accounts[0].meter,
+        AccountMeterStateV1::Metered { .. }
+    ));
+    assert!(
+        store
+            .usage_history_day("2026-04-25".into())
+            .await
+            .expect("history read")
+            .is_none(),
+        "a float percentage cannot be reconstructed into a ledger sample"
+    );
+}
+
+/// Review finding (954c integration): an OUT-OF-RANGE provider integer
+/// (percent_remaining > 100) must skip the sample, not saturate into a
+/// fabricated basis-points value — checked_sub's None arm is load-bearing.
+///
+/// MUTATION CHECK (executed at review): replace the checked_sub-else-skip
+/// with `saturating_sub(..).max(1)` — this pin fails with a fabricated
+/// sample where none may exist.
+#[tokio::test]
+async fn haider_code_out_of_range_percent_never_fabricates_a_sample() {
+    let clock = Arc::new(AtomicU64::new(1_777_075_200_000));
+    let service = service_with_clock(
+        vec![descriptor("haider-code", "haider-main", AuthMethod::ApiKey)],
+        None,
+        Arc::new(StubHttp::new([])),
+        clock,
+    );
+    let (_root, store) = empty_store().await;
+    let snapshot = HaiderCodePlanSnapshotV1 {
+        plan: Some("go".into()),
+        plan_label: None,
+        weekly_allowance: Some(HaiderCodeWeeklyAllowanceV1 {
+            percent_remaining: Some(150.0),
+            state: None,
+            resets_at_ms: None,
+            grace_until_ms: None,
+        }),
+        usage_credits_usd: None,
+        auto_topup_enabled: None,
+        hold: None,
+        models_live: None,
+        refresh_after_s: None,
+        cached: None,
+    };
+    service
+        .capture_haider_code_plan_status(
+            &store,
+            CredentialAlias::new("haider-main"),
+            snapshot,
+            PlanMeterValues {
+                weekly_percent_remaining: Some(150),
+                credits: None,
+                hold: None,
+            },
+        )
+        .await
+        .expect("hold out-of-range status");
+    assert!(
+        store
+            .usage_history_day("2026-04-25".into())
+            .await
+            .expect("history read")
+            .is_none(),
+        "an out-of-range provider integer must skip, never saturate into bp"
+    );
 }
 
 /// LAW (oauth_meter_reading_normalizes_and_respects_the_poll_floor): a live

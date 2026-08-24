@@ -144,8 +144,11 @@ fn meter_basis_points_are_written_verbatim() {
             window: "five_hour".into(),
             basis_points: 6_789,
             resets_at_ms: Some(1_900_000_000_000),
+            grace_until_ms: Some(1_900_000_060_000),
             sampled_at_ms: 1_777_075_200_000,
             plan: Some("max".into()),
+            credits: Some(17),
+            hold: Some(-3),
             stale: Some(false),
         })
         .expect("append meter");
@@ -153,6 +156,8 @@ fn meter_basis_points_are_written_verbatim() {
         .expect("read meter day")
         .expect("meter day exists");
     assert_eq!(day.meter_samples[0].basis_points, 6_789);
+    assert_eq!(day.meter_samples[0].credits, Some(17));
+    assert_eq!(day.meter_samples[0].hold, Some(-3));
 
     // MUTATION CHECK: normalizing or percent-rounding the supplied integer
     // makes this exact equality fail.
