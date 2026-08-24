@@ -901,11 +901,40 @@ pub struct UsageGroup {
     pub accounts: Vec<usize>,
 }
 
+/// `/usage` viewing scope (954 UI wave). `Accounts` is the full
+/// per-provider detail (the U2 layout, unchanged); `Global` is the
+/// cross-account aggregate: every meter at a glance plus summed local
+/// journal counters. Summing is legitimate ONLY for same-unit local
+/// facts — meters are never summed (different windows, different plans),
+/// and partially-priced cost sums say so instead of understating
+/// silently. `Models` (per-model across providers) arrives with the
+/// usage-history ledger RPC; no dead tab ships before its data source.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum UsageScope {
+    #[default]
+    Accounts,
+    Global,
+}
+
+impl UsageScope {
+    /// The `s` key cycles scopes; two today, ledger scopes join the ring.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Accounts => Self::Global,
+            Self::Global => Self::Accounts,
+        }
+    }
+}
+
 /// The `/usage` screen state (U2). The report is U1's `usage.report`
 /// snapshot CONSUMED whole — meter windows, typed unavailability, local
 /// counters; nothing here re-derives or fabricates a reading.
 #[derive(Debug, Default)]
 pub struct UsageState {
+    /// The active viewing scope. Reset to `Accounts` on every screen
+    /// entry (the reveal-mask precedent: a screen opens predictably).
+    pub scope: UsageScope,
     /// The last committed `usage.report` snapshot. `None` until the first
     /// reply lands (live) — the demo never fabricates one.
     pub report: Option<haider_protocol::usage::UsageReportV1>,
@@ -8318,6 +8347,9 @@ impl AppModel {
     /// up re-filters and (live) re-reads.
     fn enter_usage(&mut self, filter: Option<&str>) {
         self.dirty = true;
+        // 954: like the reveal mask, the scope resets on entry — the
+        // screen always opens on the per-account detail.
+        self.usage.scope = UsageScope::default();
         let filter = filter
             .map(str::trim)
             .filter(|token| !token.is_empty())
@@ -8413,6 +8445,12 @@ impl AppModel {
                 // visit only — the screen always opens masked and closing
                 // restores the mask.
                 self.usage.revealed = !self.usage.revealed;
+                self.dirty = true;
+            }
+            KeyCode::Char('s') => {
+                // 954: `s` cycles the viewing scope (accounts ⇄ global).
+                self.usage.scope = self.usage.scope.next();
+                self.usage.scroll.set(0);
                 self.dirty = true;
             }
             // A manual re-read (live only — the demo has nothing to fetch

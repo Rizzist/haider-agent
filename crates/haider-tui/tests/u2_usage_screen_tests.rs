@@ -16,6 +16,7 @@ use haider_protocol::ids::CredentialAlias;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1, UsageWindowV1,
 };
+use haider_tui::app::UsageScope;
 use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode, Screen};
 use haider_tui::commands::{COMMANDS, has_arg_slots, offers_arg_completions, palette_items};
 use haider_tui::format::{
@@ -318,6 +319,59 @@ fn masked_runs_cap_at_eight_without_padding_short_runs() {
 }
 
 // ---- per-state rendering ---------------------------------------------
+
+/// 954 scope law: `s` cycles accounts ⇄ global. Global renders ONE line
+/// per account (every tab, not just selected), headlining the window with
+/// the LEAST runway, and keeps the shared THIS DEVICE totals footer; the
+/// per-provider detail (window names like `five_hour` on their own lines)
+/// does not render. Re-entering the screen resets to the accounts detail
+/// (the reveal-mask precedent: a screen opens predictably).
+///
+/// MUTATION CHECK (executed): make `UsageScope::next` return `self` — the
+/// `global breadcrumb renders` assertion fails; restore, green.
+#[test]
+fn s_cycles_scope_and_global_renders_compact_overview() {
+    let mut model = usage_model();
+    let (rows, _) = draw(&model, 110, 30);
+    assert!(
+        rows.join("\n").contains("· accounts"),
+        "the screen opens on the accounts scope"
+    );
+
+    model.handle(key(KeyCode::Char('s')));
+    let (rows, _) = draw(&model, 110, 30);
+    let text = rows.join("\n");
+    assert!(text.contains("· global"), "global breadcrumb renders");
+    assert!(
+        text.contains("(five_hour)"),
+        "global headlines the least-runway window by name"
+    );
+    assert!(
+        !text.contains("resets in"),
+        "per-window reset detail does not render in global"
+    );
+    assert!(
+        text.contains("THIS DEVICE"),
+        "the totals footer serves both scopes"
+    );
+
+    model.handle(key(KeyCode::Char('s')));
+    let (rows, _) = draw(&model, 110, 30);
+    assert!(
+        rows.join("\n").contains("resets in"),
+        "s cycles back to the accounts detail (reset lines return)"
+    );
+
+    model.handle(key(KeyCode::Char('s')));
+    assert_eq!(model.usage.scope, UsageScope::Global);
+    model.handle(key(KeyCode::Esc));
+    run_slash(&mut model, "/usage");
+    assert_eq!(
+        model.usage.scope,
+        UsageScope::Accounts,
+        "re-entry resets to the accounts scope"
+    );
+}
 
 /// A `metered` OAuth account renders one bar per window with % and reset
 /// time, plus the (masked) identity · plan · auth-flavor line.

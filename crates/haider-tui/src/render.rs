@@ -2296,6 +2296,7 @@ fn render_usage(
     // F2b: each provider group's header line, for cursor-follow scrolling.
     let mut header_lines: Vec<usize> = Vec::new();
 
+    let global = model.usage.scope == crate::app::UsageScope::Global;
     lines.push(Line::from(vec![
         Span::styled(
             "USAGE",
@@ -2304,7 +2305,11 @@ fn render_usage(
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ),
         Span::styled(
-            " — meters are provider truth · stats are this device's journal",
+            if global { " · global" } else { " · accounts" },
+            theme.gold_style(),
+        ),
+        Span::styled(
+            " — meters are provider truth · stats are this device's journal · s switches scope",
             theme.dim_style(),
         ),
     ]));
@@ -2617,7 +2622,86 @@ fn render_usage(
                 theme.dim_style(),
             ));
         }
-        for (index, group) in groups.iter().enumerate() {
+        // 954 global scope: one line per account — every account of every
+        // group (not just selected tabs) — then the shared THIS DEVICE
+        // totals footer below. The headline window is the one with the
+        // LEAST runway (max utilization): the wall you will hit first.
+        if global {
+            for group in &groups {
+                for &slot in &group.accounts {
+                    let Some(account) = report.accounts.get(slot) else {
+                        continue;
+                    };
+                    let alias = account.alias.as_str();
+                    let mut spans = vec![
+                        Span::styled(format!("  {alias:<18}"), theme.bright_style()),
+                        Span::styled(
+                            format!("{:<14}", ellipsize(&account.provider, 13)),
+                            theme.dim_style(),
+                        ),
+                    ];
+                    match &account.meter {
+                        haider_protocol::usage::AccountMeterStateV1::Metered { windows } => {
+                            if let Some(worst) = windows.iter().max_by(|a, b| {
+                                a.utilization
+                                    .partial_cmp(&b.utilization)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            }) {
+                                spans.push(Span::styled(
+                                    crate::format::remaining_bar(
+                                        worst.utilization,
+                                        crate::format::USAGE_BAR_CELLS,
+                                    ),
+                                    usage_bar_style(theme, worst.utilization),
+                                ));
+                                spans.push(Span::styled(
+                                    format!(
+                                        "  {:>9}",
+                                        crate::format::fmt_remaining(worst.utilization)
+                                    ),
+                                    theme.bright_style(),
+                                ));
+                                spans.push(Span::styled(
+                                    format!(" ({})", ellipsize(&worst.window, 14)),
+                                    theme.dim_style(),
+                                ));
+                            } else {
+                                // A successful reading with no published
+                                // windows is NOT "no meter" — say what it is.
+                                spans.push(Span::styled(
+                                    "metered · no windows published",
+                                    theme.dim_style(),
+                                ));
+                            }
+                        }
+                        haider_protocol::usage::AccountMeterStateV1::Unavailable { .. } => {
+                            spans.push(Span::styled("meter unavailable", theme.warn_style()));
+                        }
+                        haider_protocol::usage::AccountMeterStateV1::LocalOnly => {
+                            spans.push(Span::styled("local only", theme.dim_style()));
+                        }
+                    }
+                    let local = &account.local;
+                    spans.push(Span::styled(
+                        format!(
+                            "  in {} · out {} · cached {}",
+                            fmt_tok(local.input_tokens),
+                            fmt_tok(local.output_tokens),
+                            fmt_tok(local.cached_tokens),
+                        ),
+                        theme.dim_style(),
+                    ));
+                    lines.push(Line::from(spans));
+                }
+            }
+            if !groups.is_empty() {
+                lines.push(Line::raw(""));
+            }
+        }
+        // Accounts scope renders the full per-provider detail; global
+        // renders nothing here (the compact list above already did).
+        let detail_groups: &[crate::app::UsageGroup] = if global { &[] } else { &groups };
+        for (index, group) in detail_groups.iter().enumerate() {
             let selected_tab = model.usage.selected_tab(group);
             let Some(account) = group
                 .accounts
