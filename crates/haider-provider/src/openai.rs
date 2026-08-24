@@ -4215,10 +4215,13 @@ fn openai_explicit_cache_enabled(request: &TurnRequest, codex_responses_lite: bo
 }
 
 fn openai_lite_cache_breakpoint_enabled() -> bool {
-    // HAIDER953 experiment, default OFF. The v0.0.947 law applies: acceptance
-    // on public api.openai.com or the Codex WSS transport is zero evidence for
-    // the HTTPS responses-lite surface. Keep this gated until a live HTTPS
-    // POST to chatgpt.com/backend-api/codex/responses accepts the field.
+    // HAIDER953 experiment, default OFF — VERDICT (2026-08-24, live): the
+    // HTTPS responses-lite surface (POST chatgpt.com/backend-api/codex/
+    // responses, installed signed daemon, gated request) REJECTED the field
+    // with HTTP 400 (typed provider_error). Explicit breakpoints are NOT
+    // available on this transport; the public-API parameter does not carry
+    // over (the v0.0.947 law, now confirmed by same-surface evidence). The
+    // gate stays as the documented negative result; do not enable.
     std::env::var(OPENAI_LITE_CACHE_BREAKPOINT_ENV).is_ok_and(|value| value == "1")
 }
 
