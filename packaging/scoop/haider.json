@@ -1,5 +1,5 @@
 {
-  "version": "0.0.952",
+  "version": "0.0.953",
   "description": "Provider-agnostic coding-agent TUI and runtime",
   "homepage": "https://github.com/Rizzist/haider-agent",
   "license": {
@@ -8,9 +8,9 @@
   },
   "architecture": {
     "64bit": {
-      "url": "https://github.com/Rizzist/haider-agent/releases/download/v0.0.952/haider-v0.0.952-x86_64-pc-windows-msvc.zip",
-      "hash": "264fb5c557339459430cdb4fdd61d1557af8fdae81d168b461c930403ca5c8de",
-      "extract_dir": "haider-v0.0.952-x86_64-pc-windows-msvc"
+      "url": "https://github.com/Rizzist/haider-agent/releases/download/v0.0.953/haider-v0.0.953-x86_64-pc-windows-msvc.zip",
+      "hash": "076d5438612352182e9ef9e1b336d6e1df5e2e29496002301ae63dc091b43031",
+      "extract_dir": "haider-v0.0.953-x86_64-pc-windows-msvc"
     }
   },
   "bin": [
