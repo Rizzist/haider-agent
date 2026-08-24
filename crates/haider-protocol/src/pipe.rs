@@ -1052,9 +1052,7 @@ fn sidecar_projection(
                     role: "tool",
                     name: tool,
                     summary,
-                    status: tool_join
-                        .as_ref()
-                        .and_then(ToolExchangeJoin::result_status),
+                    status: tool_join.as_ref().and_then(ToolExchangeJoin::result_status),
                     args_preview: tool_join.as_ref().and_then(ToolExchangeJoin::args_preview),
                     result_preview: tool_join
                         .as_ref()
